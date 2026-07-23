@@ -5,7 +5,7 @@
 MsaSparseGqaFmha wraps the fmha_sm100 paged sparse GQA kernel and
 participates in the standard TrtllmAttention.forward dispatch loop. The
 owning MiniMax-M3 MSA attention layer runs an MsaIndexer to select the
-per-query KV blocks and publishes them on forward_args.sparse_prediction;
+per-query KV blocks and publishes them on forward_args.sparse_runtime_params;
 this class attends over them.
 """
 
@@ -173,7 +173,7 @@ class MsaSparseGqaFmha(Fmha):
     """SM100 paged GQA FMHA powered by MSA's fmha_sm100 kernel.
 
     Handles every MiniMax-M3 MSA layer. Sparse layers pass the indexer's
-    selected KV block indices on forward_args.sparse_prediction.sparse_attn_indices
+    selected KV block indices on forward_args.sparse_runtime_params.sparse_attn_indices
     and attend those blocks; dense layers leave the indices None and attend the
     full page table.
 
@@ -216,7 +216,7 @@ class MsaSparseGqaFmha(Fmha):
         # Sparse layers attend the per-query top-k blocks with the sparse plan;
         # dense layers leave the indices None and attend the full page table
         # with the dense plan.
-        kv_block_indexes = forward_args.sparse_prediction.sparse_attn_indices
+        kv_block_indexes = forward_args.sparse_runtime_params.sparse_attn_indices
         plan = (
             metadata.msa_decode_gqa_plan
             if kv_block_indexes is not None

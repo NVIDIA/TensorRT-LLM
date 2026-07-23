@@ -148,10 +148,14 @@ own the meaning of any additional entries. Context- and generation-phase
 helpers stay within each algorithm module and are not part of the generic hook
 facade.
 
-Sparse prediction inputs stay out of shared MLA APIs. For example, DSA stores
-the current top-k tensor in DSA metadata immediately around the absorption
-call, and the DSA backend consumes it directly; `mla.py` has no `topk_indices`
-parameter.
+Sparse prediction inputs stay out of shared MLA APIs. Algorithm modules wrap
+their module-to-backend inputs in a `SparseBackendForwardArgs` subclass and
+pass it through the registered `AttentionForwardArgs.sparse_backend_args`
+field. For example, DSA owns `DSABackendForwardArgs`, whose indexer
+intermediates are consumed by `DSATrtllmAttention.sparse_attn_predict`.
+Shared sparse carriers, including `SparseBackendForwardArgs.topk_indices` and
+the backend-to-AttentionOp `SparseRuntimeParams`, live in
+`attention_backend/sparse/params.py`.
 
 For MLA-related tasks, first check whether the work fits the current
 projection structure, can stay on an existing backend and metadata family, and
@@ -403,7 +407,7 @@ Working rules:
 | `tensorrt_llm/_torch/attention_backend/fmha/` | Internal TRTLLM FMHA libraries |
 | `tensorrt_llm/_torch/attention_backend/vanilla.py` | Torch fallback backend and metadata |
 | `tensorrt_llm/_torch/attention_backend/flashinfer.py` | FlashInfer backend and metadata |
-| `tensorrt_llm/_torch/attention_backend/sparse/hooks.py` | Module-layer sparse-attention hook contract and algorithm dispatch |
+| `tensorrt_llm/_torch/attention_backend/sparse/hooks.py` | Sparse module hooks and backend prediction orchestration |
 | `tensorrt_llm/_torch/attention_backend/sparse/<algorithm>/module.py` | Algorithm-specific module-hook implementations |
 | `tensorrt_llm/_torch/attention_backend/sparse/` | Sparse prediction backends, metadata, cache managers, and kernels |
 

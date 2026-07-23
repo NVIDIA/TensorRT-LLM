@@ -1283,11 +1283,13 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         use_custom_topk: bool = True,
         q_scale: Optional[torch.Tensor] = None,
-        update_k_cache: bool = True,
+        is_generation: Optional[bool] = None,
     ) -> torch.Tensor:
-        """Run the indexer TopK kernel for both prefill and decode phases.
+        """Run the indexer TopK kernel for one phase or the full batch.
 
-        q_scale is only consumed by the FP4 dispatch; FP8 path ignores it.
+        When ``is_generation`` is ``None``, the inputs contain the full mixed
+        batch. Otherwise they contain only the selected context or generation
+        phase. ``q_scale`` is only consumed by the FP4 dispatch.
         """
         # DSACacheManager / DeepseekV4CacheManager force quant_block_size to
         # 128 (FP8 path) or 32 (MXFP4 path); both round-trip to the same
@@ -1296,23 +1298,32 @@ class Indexer(nn.Module):
         assert metadata.kv_cache_manager is None or \
             metadata.kv_cache_manager.quant_block_size in (32, 128), \
             f"Unexpected quant_block_size {metadata.kv_cache_manager.quant_block_size if metadata.kv_cache_manager else 'N/A'}"
-        # Update the indexer k cache before prefill chunks gather from it.
-        if update_k_cache:
-            self._update_k_cache(k_fp8, k_scale, metadata)
-
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
         num_tokens = metadata.num_tokens
 
-        has_decode = num_generations > 0
-        has_prefill = num_contexts > 0
         num_gen_tokens = num_tokens - num_ctx_tokens
+        if is_generation is None:
+            has_prefill = num_contexts > 0
+            has_decode = num_generations > 0
+            token_offset = num_ctx_tokens
+            cache_name = "indexer_topk_out_buffer"
+        else:
+            has_prefill = not is_generation and num_contexts > 0
+            has_decode = is_generation and num_generations > 0
+            token_offset = 0
+            expected_tokens = num_gen_tokens if is_generation else num_ctx_tokens
+            assert hidden_states.shape[0] == expected_tokens, (
+                "Phase-specific DSA prediction received "
+                f"{hidden_states.shape[0]} tokens, expected {expected_tokens}.")
+            cache_name = ("indexer_topk_out_buffer_gen"
+                          if is_generation else "indexer_topk_out_buffer_ctx")
 
         topk_indices_buffer = metadata.get_empty(
             metadata.cuda_graph_buffers,
             (hidden_states.shape[0], self.index_topk),
-            cache_name="indexer_topk_out_buffer",
+            cache_name=cache_name,
             dtype=torch.int32,
             capture_graph=metadata.is_cuda_graph)
         if not use_custom_topk:
@@ -1514,8 +1525,7 @@ class Indexer(nn.Module):
             assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
 
             # Reshape q for decode phase: [num_gen_tokens, ...] -> [batch_size, next_n, ...]
-            q_decode = q_fp8[num_ctx_tokens:num_ctx_tokens + num_gen_tokens,
-                             ...]
+            q_decode = q_fp8[token_offset:token_offset + num_gen_tokens, ...]
             batch_size = num_generations
             next_n = num_gen_tokens // num_generations
             # Because fp8_paged_mqa_logits can only support next_n == 1/2/4 on sm100, and
@@ -1551,8 +1561,8 @@ class Indexer(nn.Module):
                 scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
 
             assert num_gen_tokens == batch_size * next_n
-            weights_decode = weights[num_ctx_tokens:num_ctx_tokens +
-                                     num_gen_tokens, ...]
+            weights_decode = weights[token_offset:token_offset + num_gen_tokens,
+                                     ...]
 
             # Get k cache and call fp8_paged_mqa_logits / fp8_fp4_paged_mqa_logits
             # with prepared decode metadata.
@@ -1593,7 +1603,7 @@ class Indexer(nn.Module):
                     # came in via the FP8 plumbing as int8; reinterpret with
                     # no copy). sf_q is the q_scale slice reshaped to
                     # (B, next_n, H) int32 -- mirrors the non-DSL FP4 branch.
-                    decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
+                    decode_q_scale = q_scale[token_offset:token_offset +
                                              num_gen_tokens, ...]
                     decode_q_scale = decode_q_scale.view(
                         q_decode.shape[0], q_decode.shape[1], self.n_heads)
@@ -1642,7 +1652,7 @@ class Indexer(nn.Module):
                         dsl_q, k_cache, weights_decode, fp8_ctx_lens,
                         fp8_block_table, fp8_schedule_meta, indexer_max_seq_len)
             else:
-                decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
+                decode_q_scale = q_scale[token_offset:token_offset +
                                          num_gen_tokens,
                                          ...] if self.use_fp4 else None
                 if self.use_fp4:
@@ -1695,14 +1705,14 @@ class Indexer(nn.Module):
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode, context_lens
                         if self.compress_ratio > 1 else gen_kv_lens_cuda,
-                        topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                        topk_indices_buffer[token_offset:token_offset +
                                             num_gen_tokens, :], self.index_topk,
                         next_n)
                 else:
                     torch.ops.trtllm.indexer_topk_decode(
                         logits_decode,
                         gen_kv_lens_cuda,
-                        topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                        topk_indices_buffer[token_offset:token_offset +
                                             num_gen_tokens, :],
                         next_n,
                         self.index_topk,
@@ -1739,7 +1749,7 @@ class Indexer(nn.Module):
                 topk_indices_decode = topk_indices_decode.masked_fill(
                     ~mask_decode, -1)
                 # Store in buffer
-                topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                topk_indices_buffer[token_offset:token_offset +
                                     num_gen_tokens, :topk_indices_decode.
                                     shape[-1]] = topk_indices_decode.to(
                                         dtype=torch.int32)
@@ -1747,15 +1757,15 @@ class Indexer(nn.Module):
             if self._enable_heuristic_topk:
                 local_layer = metadata.kv_cache_manager.layer_offsets[
                     self.layer_idx]
-                decode_topk = topk_indices_buffer[
-                    num_ctx_tokens:num_ctx_tokens + num_gen_tokens]
+                decode_topk = topk_indices_buffer[token_offset:token_offset +
+                                                  num_gen_tokens]
                 last_mtp_topk = decode_topk[next_n - 1::next_n]
                 metadata.heuristic_prev_topk[
                     local_layer, :num_generations].copy_(last_mtp_topk)
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
-            topk_indices_buffer[num_ctx_tokens:num_tokens, :] = \
+            topk_indices_buffer[token_offset:token_offset + num_gen_tokens, :] = \
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
         return topk_indices_buffer
 
@@ -1870,18 +1880,55 @@ class Indexer(nn.Module):
 
         return q_fp8, k_fp8, k_scale, weights, q_scale
 
+    def forward_from_projected(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        hidden_states: torch.Tensor,
+        indexer_intermediates: List[torch.Tensor],
+        is_generation: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Run sparse prediction from graph-captured indexer projections.
+
+        Projected inputs cover the full batch. Phase-specific prediction slices
+        Q-side inputs here while retaining the full-batch K inputs needed by
+        context prediction.
+        """
+        if is_generation is None:
+            phase_start = 0
+            phase_end = metadata.num_tokens
+        elif is_generation:
+            phase_start = metadata.num_ctx_tokens
+            phase_end = metadata.num_tokens
+        else:
+            phase_start = 0
+            phase_end = metadata.num_ctx_tokens
+
+        q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
+        q_fp8_phase = q_fp8[phase_start:phase_end]
+        weights_phase = weights[phase_start:phase_end]
+        q_scale_phase = (q_scale[phase_start:phase_end]
+                         if q_scale is not None else None)
+
+        return self.sparse_attn_indexer(
+            metadata,
+            hidden_states,
+            q_fp8_phase,
+            k_fp8,
+            k_scale,
+            weights_phase,
+            q_scale=q_scale_phase,
+            is_generation=is_generation,
+        )
+
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
         q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
             qr, hidden_states, position_ids)
+        indexer_intermediates = [q_fp8, k_fp8, k_scale, weights, q_scale]
+        self._update_k_cache(k_fp8, k_scale, metadata)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
-        return self.sparse_attn_indexer(metadata,
-                                        hidden_states,
-                                        q_fp8,
-                                        k_fp8,
-                                        k_scale,
-                                        weights,
-                                        q_scale=q_scale)
+        return self.forward_from_projected(metadata, hidden_states,
+                                           indexer_intermediates)

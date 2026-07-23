@@ -28,8 +28,8 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionBackend, PositionalEmbeddingParams, RopeParams)
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
-    DeepseekV4CacheManager, make_deepseek_v4_sparse_metadata_params)
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+    DeepseekV4CacheManager
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import \
     forward_context_sparse_attn as forward_context_deepseek_v4_mla
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import \
@@ -37,9 +37,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import \
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (HAS_FAST_HADAMARD,
                                                               DSACacheManager)
 from tensorrt_llm._torch.attention_backend.sparse.dsa.module import \
-    forward_context_sparse_attn as forward_context_dsa_mla
-from tensorrt_llm._torch.attention_backend.sparse.dsa.module import \
-    forward_generation_sparse_attn as forward_generation_dsa_mla
+    _forward_dsa_attn
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -1516,46 +1514,25 @@ def mla_forward_impl_with_dsa_wo_linear(mla, attn_metadata, q, qr,
                          dtype=dtype,
                          device=device)
 
-    topk_indices_local = mla.mqa.indexer(
-        qr,
-        hidden_states,
-        attn_metadata,
+    indexer_intermediates = list(
+        mla.mqa.indexer.pre_indexer_proj(qr, hidden_states, position_ids))
+    _forward_dsa_attn(
+        mla,
+        q,
+        compressed_kv,
+        k_pe,
+        latent_cache,
+        indexer_intermediates,
         position_ids,
+        attn_metadata,
+        output,
     )
-
-    # Validate indexer output against expected causal indices (since seq_len < topk=2048)
     if num_contexts > 0:
-        # Transform context indices from local to global
-        ctx_topk_local = topk_indices_local[:num_ctx_tokens]
-
-        forward_context_dsa_mla(
-            mla,
-            q=q[:num_ctx_tokens],
-            compressed_kv=compressed_kv[:num_ctx_tokens],
-            k_pe=k_pe[:num_ctx_tokens],
-            attn_metadata=attn_metadata,
-            output=output[:num_ctx_tokens],
-            latent_cache=latent_cache[:num_ctx_tokens],
-            topk_indices=ctx_topk_local,  # Use global indices
-        )
         print(
             f"  ✓ Context forward: {num_ctx_tokens} tokens from {num_contexts} requests"
         )
 
     if num_generations > 0:
-        # Transform generation indices from local to global
-        gen_topk_local = topk_indices_local[num_ctx_tokens:num_ctx_tokens +
-                                            num_gen_tokens]
-        forward_generation_dsa_mla(
-            mla,
-            q=q[num_ctx_tokens:],
-            compressed_kv=compressed_kv[num_ctx_tokens:],
-            k_pe=k_pe[num_ctx_tokens:],
-            attn_metadata=attn_metadata,
-            output=output[num_ctx_tokens:],
-            latent_cache=latent_cache[num_ctx_tokens:],
-            topk_indices=gen_topk_local,  # Use global indices
-        )
         print(
             f"  ✓ Generation forward: {num_gen_tokens} tokens from {num_generations} requests"
         )
@@ -2107,11 +2084,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                          num_heads * v_head_dim,
                          dtype=dtype,
                          device=device)
-    if sparse_config.algorithm == "deepseek_v4":
-        sparse_metadata_params = make_deepseek_v4_sparse_metadata_params(
-            sparse_config)
-    else:
-        sparse_metadata_params = sparse_config.to_sparse_metadata_params()
+    sparse_metadata_params = sparse_config.to_sparse_metadata_params()
 
     attn_metadata = AttentionCls.Metadata(
         seq_lens=torch.tensor(batch_query_lens, dtype=torch.int),

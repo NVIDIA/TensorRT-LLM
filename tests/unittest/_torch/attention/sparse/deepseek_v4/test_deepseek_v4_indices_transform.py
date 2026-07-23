@@ -28,7 +28,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
     DeepseekV4AttentionType,
     DeepseekV4CacheManager,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.backend import get_token_bytes
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import get_token_bytes
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.kernels import (
     deepseek_v4_local_to_global_indices,
 )

@@ -41,8 +41,8 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
+from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import SparseParams
-from .sparse.prediction import prepare_sparse_prediction
 from .sparse.skip_softmax import SkipSoftmaxParams
 
 
@@ -1603,7 +1603,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 seq_start=num_ctx,
             )
 
-        forward_args.sparse_prediction = prepare_sparse_prediction(
+        forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
             self, q, k, metadata, forward_args)
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
@@ -1661,7 +1661,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 assert k.shape[0] == num_tokens
                 assert v.shape[0] == num_tokens
         else:
-            is_sparse_attn = forward_args.sparse_prediction.sparse_attn_indices is not None and forward_args.sparse_prediction.sparse_attn_indices.numel(
+            sparse_attn_indices = forward_args.sparse_runtime_params.sparse_attn_indices
+            is_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel(
             ) > 0
             if attention_input_type == AttentionInputType.context_only and is_sparse_attn:
                 assert forward_args.is_fused_qkv
@@ -1737,9 +1738,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         sparse_params = self.sparse_params
         if isinstance(sparse_params, SkipSoftmaxParams):
-            forward_args.skip_softmax_kernel_params = (
-                sparse_params.scheduler.get_kernel_params(
-                    timestep=forward_args.timestep))
+            forward_args.sparse_runtime_params = (
+                sparse_params.scheduler.get_runtime_params(
+                    runtime_params=forward_args.sparse_runtime_params,
+                    timestep=forward_args.timestep,
+                ))
 
         # max_context_q_len_override is only set when encoder CUDA graphs are enabled.
         if metadata.max_context_q_len_override is not None:

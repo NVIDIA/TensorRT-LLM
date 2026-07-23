@@ -13,8 +13,10 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 
+from .params import DeepseekV4AttentionType
+
 if TYPE_CHECKING:
-    from .backend import DeepseekV4TrtllmAttentionMetadata
+    from .metadata import DeepseekV4TrtllmAttentionMetadata
 
 
 class KVCacheDtype(IntEnum):
@@ -144,9 +146,6 @@ class Compressor(nn.Module):
             - mxfp4 indexer:                           (fp4_output, ue8m0 scale)
             - no compressed tokens:                    (None, None)
         """
-        # Import at runtime to avoid circular dependency
-        from .backend import DeepseekV4AttentionType
-
         # Extract metadata
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations

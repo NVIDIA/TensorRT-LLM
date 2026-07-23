@@ -141,6 +141,9 @@ sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(q, k, metadata, fo
 sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(q, k, metadata, forward_args)
 ```
 
+`hooks.py` writes these results to `SparseRuntimeParams`. SkipSoftmax writes
+its thresholds to the same runtime interface consumed by `AttentionOp`.
+
 Different KV heads are allowed to emit different sparse index sets; Q
 heads that map to the same KV head share the KV head's sparse pattern.
 
@@ -149,10 +152,10 @@ Algorithm implementations live under
 
 - `rocket/` — RocketKV backend, metadata, cache manager, parameters, and kernels.
 - `dsa/` — DSA backend, indexer, metadata, cache manager, parameters, custom ops, and kernels.
-- `deepseek_v4/` — DeepSeek-V4 prediction, cache, metadata, and index conversion kernels.
+- `deepseek_v4/` — DeepSeek-V4 backend, indexer, metadata, cache manager,
+  parameters, module hooks, and index conversion kernels.
 - `skip_softmax/` — SkipSoftmax parameter parsing and runtime scheduler.
-- `kernels/` — kernels shared by multiple sparse algorithms (importance scoring, Top-K).
-- `prediction.py` — common prediction-hook orchestration and payload construction.
+- `hooks.py` — module hooks and common backend prediction orchestration.
 - `registry.py` — backend, metadata, and cache-manager dispatch helpers.
 
 Dense and sparse MLA share the same `MLA` module interface. Algorithm-specific

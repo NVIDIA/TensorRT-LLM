@@ -1021,6 +1021,17 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             is_full = True
         return is_full
 
+    @classmethod
+    def _has_shared_indexer_layers(cls, pretrained_config) -> bool:
+        if pretrained_config is None:
+            return False
+        pattern = getattr(pretrained_config, "index_topk_pattern", None)
+        num_layers = getattr(pretrained_config, "num_hidden_layers", None)
+        if num_layers is None:
+            num_layers = len(pattern) if pattern is not None else 0
+        return any(not cls._is_full_indexer_layer(pretrained_config, layer_idx)
+                   for layer_idx in range(num_layers))
+
     def to_sparse_params(self, **kwargs):
         from tensorrt_llm._torch.attention_backend.sparse.dsa import DSAParams
 
@@ -1073,6 +1084,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
+            has_shared_indexer_layers=self._has_shared_indexer_layers(
+                pretrained_config),
         )
 
 
@@ -1130,7 +1143,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         return False
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import \
             DeepSeekV4Params
 
         pretrained_config = kwargs.get("pretrained_config", None)
@@ -1160,7 +1173,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         )
 
     def to_sparse_metadata_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import \
             DeepSeekV4MetadataParams
 
         pretrained_config = kwargs.get("pretrained_config", None)

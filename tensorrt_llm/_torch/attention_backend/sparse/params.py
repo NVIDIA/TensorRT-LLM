@@ -12,49 +12,46 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Base sparse parameter interfaces for attention backend boundaries.
-
-User-facing SparseAttentionConfig live in LLM / VisualGen args and
-ModelConfig. They lower through ``to_sparse_params()`` for per-backend runtime
-state and ``to_sparse_metadata_params()`` for metadata allocation/update state.
-
-Concrete sparse algorithm params live with their backend implementations;
-shared kernel-facing carriers live here when they are part of the generic
-attention-forward contract.
-"""
+"""Shared sparse attention parameter types."""
 
 from dataclasses import dataclass
+from typing import Optional
+
+import torch
 
 
 class SparseParams:
-    """Base for per AttentionBackend instance sparse runtime parameters.
-
-    User-facing SparseAttentionConfig objects lower into this type through
-    ``to_sparse_params()`` before an AttentionBackend is constructed. That
-    lowering can resolve per-model or per-layer settings without passing
-    configs into backend instances.
-    """
+    """Base parameters for a sparse attention backend."""
 
     algorithm: str
 
 
 class SparseMetadataParams:
-    """Base for sparse settings needed by AttentionMetadata.
-
-    Derived from the same user-facing SparseAttentionConfig through
-    ``to_sparse_metadata_params()``, but kept separate from SparseParams because
-    metadata owns batch/runtime buffers rather than per-layer
-    ``AttentionBackend`` behavior.
-    """
+    """Base parameters for sparse attention metadata."""
 
 
-@dataclass
-class SkipSoftmaxKernelParams:
-    """Skip-softmax thresholds passed to attention backend kernels."""
+@dataclass(kw_only=True, slots=True)
+class SparseBackendForwardArgs:
+    """Sparse inputs passed from an attention module to its backend."""
 
-    # The kernel divides this by the context length to get the skip threshold;
-    # zero turns skip-softmax off.
+    # Shared by algorithms that accept precomputed top-k indices.
+    topk_indices: Optional[torch.Tensor] = None
+
+
+@dataclass(kw_only=True, slots=True)
+class SparseRuntimeParams:
+    """Sparse runtime parameters passed from a backend to the attention op."""
+
+    sparse_kv_indices: Optional[torch.Tensor] = None
+    sparse_kv_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices: Optional[torch.Tensor] = None
+    sparse_attn_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices_block_size: int = 0
+    # DeepSeek-V4 compressed-cache inputs.
+    sparse_mla_topk_lens: Optional[torch.Tensor] = None
+    compressed_kv_cache_pool_ptr: Optional[int] = None
+
+    # SkipSoftmax prefill threshold; kernels divide it by context length.
     threshold_scale_factor_prefill: float = 0.0
-    # Only autoregressive (LLM) decoding has a decode phase; diffusion and
-    # visual generation leave this at zero.
+    # SkipSoftmax decode threshold; diffusion models leave it at zero.
     threshold_scale_factor_decode: float = 0.0

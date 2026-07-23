@@ -37,7 +37,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 )
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
 from tensorrt_llm._torch.attention_backend.sparse.dsa.module import (
-    forward_context_sparse_attn,
+    _forward_dsa_attn,
     should_use_short_mha,
 )
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -388,20 +388,20 @@ def _make_metadata(
 
 
 def _run_forward(
-    mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, topk_indices=None
+    mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, indexer_inputs=None
 ):
-    """Run forward_context_sparse_attn on cloned inputs and return the output tensor."""
+    """Run the production DSA attention dispatcher on cloned inputs."""
     output = torch.empty(q.shape[0], NUM_HEADS * V_HEAD_DIM, dtype=q.dtype, device=q.device)
-    forward_context_sparse_attn(
+    _forward_dsa_attn(
         mla,
         q=q.clone(),
         compressed_kv=compressed_kv.clone(),
         k_pe=k_pe.clone(),
+        latent_cache=latent_cache.clone(),
+        indexer_intermediates=indexer_inputs or [],
+        position_ids=position_ids.clone(),
         attn_metadata=metadata,
         output=output,
-        latent_cache=latent_cache.clone(),
-        topk_indices=topk_indices,
-        position_ids=position_ids.clone(),
     )
     return output
 
@@ -475,16 +475,9 @@ def test_standard_path_when_exceeds_threshold():
     qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
 
     metadata = _make_metadata(attn_cls, seq_lens, kv_mgr, mapping, sparse_config)
-    topk_indices = mla.mqa.indexer(
-        qr,
-        hidden_states,
-        metadata,
-        position_ids,
-    )
+    inputs = list(mla.mqa.indexer.pre_indexer_proj(qr, hidden_states, position_ids))
 
-    output = _run_forward(
-        mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, topk_indices
-    )
+    output = _run_forward(mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, inputs)
     assert torch.isfinite(output).all()
     kv_mgr.shutdown()
 
@@ -530,16 +523,15 @@ def test_agrees_with_absorption_path():
             mla_module.short_seq_mha_threshold > 0
             and total_tokens <= mla_module.short_seq_mha_threshold
         )
-        topk = None
+        inputs = None
         if not use_short:
-            topk = mla_module.mqa.indexer(
-                qr.clone(),
-                hidden_states.clone(),
-                meta,
-                position_ids.clone(),
+            inputs = list(
+                mla_module.mqa.indexer.pre_indexer_proj(
+                    qr.clone(), hidden_states.clone(), position_ids.clone()
+                )
             )
         out = _run_forward(
-            mla_module, q, compressed_kv, k_pe, latent_cache, position_ids, meta, topk
+            mla_module, q, compressed_kv, k_pe, latent_cache, position_ids, meta, inputs
         )
         kv_mgr.shutdown()
         return out

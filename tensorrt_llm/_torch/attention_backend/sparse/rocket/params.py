@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""RocketKV parameter types."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -19,7 +21,7 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 
 @dataclass(frozen=True)
 class RocketKVMetadataParams(SparseMetadataParams):
-    """RocketKV metadata settings derived from user config."""
+    """RocketKV metadata parameters."""
 
     prompt_budget: int
     window_size: int
@@ -29,7 +31,7 @@ class RocketKVMetadataParams(SparseMetadataParams):
 
 @dataclass(frozen=True)
 class RocketKVParams(SparseParams):
-    """RocketKV sparse attention backend parameters."""
+    """RocketKV backend parameters."""
 
     algorithm: Literal["rocket"] = field(init=False, default="rocket")
     window_size: int = 32

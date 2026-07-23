@@ -18,6 +18,8 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
+from ..params import SparseBackendForwardArgs
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed import AllReduceParams
 
@@ -427,7 +429,7 @@ def forward_generation_sparse_attn(
         output_sf=output_sf,
         latent_cache=latent_cache,
         q_pe=q_pe,
-        topk_indices=topk_indices,
+        sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk_indices),
         cu_q_seqlens=cu_q_seqlens,
         cu_kv_seqlens=cu_kv_seqlens,
         fmha_scheduler_counter=fmha_scheduler_counter,
@@ -511,7 +513,7 @@ def forward_context_sparse_attn(
         q_pe=q_pe,
         quant_q_buffer=quant_q_buffer,
         quant_scale_qkv=quant_scale_qkv,
-        topk_indices=topk_indices,
+        sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk_indices),
         dsv4_inv_rope_cos_sin_cache=inverse_rope_cos_sin,
         enable_dsv4_epilogue_fusion=sparse_epilogue_output is not None,
     )

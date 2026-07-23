@@ -22,10 +22,11 @@ from .indexer import (
     warmup_heuristic_topk_decode,
 )
 from .metadata import DSAtrtllmAttentionMetadata
-from .params import DSAMetadataParams, DSAParams
+from .params import DSABackendForwardArgs, DSAMetadataParams, DSAParams
 
 __all__ = [
     "HAS_FAST_HADAMARD",
+    "DSABackendForwardArgs",
     "DSACacheManager",
     "DSAMetadataParams",
     "DSAParams",

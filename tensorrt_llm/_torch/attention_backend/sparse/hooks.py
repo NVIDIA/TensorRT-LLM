@@ -1,22 +1,35 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Module-layer hooks for sparse attention algorithms.
+"""Module and backend hooks for sparse attention algorithms.
 
 Algorithms implement only the hooks they need in
 ``sparse/<algorithm>/module.py``. This module validates those hooks and owns
-algorithm dispatch without depending on either ``Attention`` or ``MLA``.
+module dispatch. Backend prediction hooks use the backend subclass directly.
 """
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from importlib import import_module
 from inspect import Parameter, signature
 from types import ModuleType
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
+
+if TYPE_CHECKING:
+    import torch
+
+    from ..interface import AttentionForwardArgs, AttentionMetadata
+    from ..trtllm import TrtllmAttention
+    from .params import SparseRuntimeParams
 
 SparseAttnHook = Callable[..., object]
 
-__all__ = ["SparseAttnHooks", "get_sparse_attn_hooks"]
+__all__ = [
+    "SparseAttnHooks",
+    "get_sparse_attn_hooks",
+    "prepare_sparse_runtime_params",
+]
 
 _SPARSE_ATTN_HOOK_MODULE_PATHS = {
     "rocket": ".rocket.module",
@@ -78,6 +91,7 @@ _ALTERNATE_HOOK_PARAMETER_NAMES = {
             "relative_attention_bias",
             "relative_attention_max_distance",
             "has_lora",
+            "kwargs",
         ),
     ),
     "project_sparse_attn_output": (
@@ -133,6 +147,11 @@ def _get_hook(
             raise TypeError(
                 f"Sparse attention hook {algorithm!r}.{hook_name} must declare these parameters "
                 f"as keyword-only: {', '.join(invalid_keyword_only)}"
+            )
+    if parameter_names and parameter_names[-1] == "kwargs":
+        if parameters[-1].kind != Parameter.VAR_KEYWORD:
+            raise TypeError(
+                f"Sparse attention hook {algorithm!r}.{hook_name} must declare 'kwargs' as **kwargs"
             )
     return hook
 
@@ -209,3 +228,32 @@ def get_sparse_attn_hooks(module) -> SparseAttnHooks:
     if algorithm is None:
         return _EMPTY_SPARSE_ATTN_HOOKS
     return _get_sparse_attn_hooks_for_algorithm(algorithm)
+
+
+def prepare_sparse_runtime_params(
+    backend: "TrtllmAttention",
+    q: "torch.Tensor",
+    k: Optional["torch.Tensor"],
+    metadata: "AttentionMetadata",
+    forward_args: "AttentionForwardArgs",
+) -> "SparseRuntimeParams":
+    """Run backend prediction hooks and update attention-op parameters."""
+    runtime_params = forward_args.sparse_runtime_params
+    if backend.sparse_params is None:
+        return runtime_params
+
+    kv_indices, kv_offsets = backend.sparse_kv_predict(q, k, metadata, forward_args)
+    attn_indices, attn_offsets = backend.sparse_attn_predict(q, k, metadata, forward_args)
+    block_size = (
+        backend.sparse_params.indices_block_size
+        if attn_indices is not None or attn_offsets is not None
+        else runtime_params.sparse_attn_indices_block_size
+    )
+    return replace(
+        runtime_params,
+        sparse_kv_indices=kv_indices,
+        sparse_kv_offsets=kv_offsets,
+        sparse_attn_indices=attn_indices,
+        sparse_attn_offsets=attn_offsets,
+        sparse_attn_indices_block_size=block_size,
+    )

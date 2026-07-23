@@ -2752,7 +2752,7 @@ class TestSkipSoftmaxAttentionConfig:
     @staticmethod
     def _kernel_params(config: SkipSoftmaxAttentionConfig, **kwargs):
         sparse_params = config.to_sparse_params(**kwargs)
-        return sparse_params.scheduler.get_kernel_params()
+        return sparse_params.scheduler.get_runtime_params()
 
     def test_python_api_parses_skip_softmax_config(self):
         args = TorchLlmArgs(

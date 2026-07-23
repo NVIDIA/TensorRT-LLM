@@ -55,13 +55,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer_quant_block_size: int = 128
     # Enable indexer skip for short sequences
     enable_indexer_skip: bool = False
-    # Cross-layer indexer sharing: previous full layer's top-k, reused by
-    # "shared" layers (None for a dense per-layer indexer).
+    # Preallocated storage and the current step's valid view for cross-layer
+    # indexer sharing.
+    shared_topk_indices_buffer: Optional[torch.Tensor] = None
     shared_topk_indices: Optional[torch.Tensor] = None
-    # Top-k selected for the current attention call. The DSA module sets it
-    # immediately before entering the shared MLA absorption implementation;
-    # the DSA backend consumes it without exposing top-k through MLA APIs.
-    runtime_topk_indices: Optional[torch.Tensor] = None
     # Whether skip the indexer for context requests
     skip_indexer_for_ctx_reqs: bool = False
     # Whether skip the indexer for generation requests
@@ -168,7 +165,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Cross-layer indexer sharing is per-step state; clear it so a "shared"
         # layer can never reuse a previous step's top-k before a full layer runs.
         self.shared_topk_indices = None
-        self.runtime_topk_indices = None
 
         # Get kv lengths
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
@@ -549,6 +545,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        if sparse_metadata_params.has_shared_indexer_layers:
+            self.shared_topk_indices_buffer = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens, self.num_sparse_topk),
+                cache_name="shared_topk_indices",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+        else:
+            self.shared_topk_indices_buffer = None
+        self.shared_topk_indices = None
         # Topk indices buffer to support skip indexer for requests with short sequence lengths
         if self.enable_indexer_skip:
             self.topk_indices_buffer = self.get_empty(
