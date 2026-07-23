@@ -66,7 +66,6 @@ def _make_selection_buffers(
     bufs.prompt_offsets = torch.zeros(max_requests, dtype=torch.int32, device=device)
     if eviction_mode == "union":
         bufs.selection_rows_per_request = 1
-        bufs.row_prompt_offsets = bufs.prompt_offsets
         bufs.combined = torch.empty((max_requests, width), dtype=torch.float32, device=device)
         # Padded rows carry zero valid width; their provisional TopK entries
         # must still be in-range ordinals for the finalizer's score gather.
@@ -81,9 +80,6 @@ def _make_selection_buffers(
     else:
         selection_rows = num_kv_heads if eviction_mode == "per_head" else num_layers * num_kv_heads
         bufs.selection_rows_per_request = selection_rows
-        bufs.row_prompt_offsets = torch.zeros(
-            max_requests * selection_rows, dtype=torch.int32, device=device
-        )
         bufs.row_mean = torch.empty(
             max_requests, num_layers, num_query_heads, 1, dtype=torch.float32, device=device
         )
@@ -112,7 +108,7 @@ def _make_selection_buffers(
     bufs.settle_args = (
         bufs.selection_scores_rows,
         bufs.selection_row_lengths,
-        bufs.row_prompt_offsets,
+        bufs.prompt_offsets,
         bufs.provisional_rows,
         bufs.keep_rows,
     )
@@ -258,11 +254,9 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         max_requests=request_count,
     )
     bufs.valid_widths.copy_(torch.tensor(valid_widths, dtype=torch.int32, device=device))
-    # The union row-major view aliases the per-request buffer.
     bufs.prompt_offsets[:request_count].copy_(
         torch.tensor([prompt_len] * request_count, dtype=torch.int32, device=device)
     )
-    assert bufs.row_prompt_offsets is bufs.prompt_offsets
     bufs.combined.copy_(scores.amax(dim=1))
     settle_top_tokens(bufs)
     actual = bufs.keep.cpu()

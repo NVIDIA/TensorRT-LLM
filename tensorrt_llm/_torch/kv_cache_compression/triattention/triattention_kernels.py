@@ -281,8 +281,9 @@ def _settle_ties_kernel(
     row_output = output_indices + row * KEEP_COUNT
     row_scores = scores + row * WIDTH
     row_selected = provisional_indices + row * KEEP_COUNT
-    # Rebases the decode-relative ordinals to absolute positions.
-    prompt_len = tl.load(prompt_offsets + row)
+    # Rebases the decode-relative ordinals to absolute positions (per request:
+    # every selection row of a request shares its pinned prompt length).
+    prompt_len = tl.load(prompt_offsets + request)
 
     threshold = float("inf")
     for start in tl.static_range(0, KEEP_COUNT, BLOCK):

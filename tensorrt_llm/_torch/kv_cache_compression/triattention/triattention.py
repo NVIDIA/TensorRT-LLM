@@ -327,7 +327,6 @@ def init_eviction_buffers(
     bufs.prompt_offsets = bufs.token_starts_device
     if union:
         bufs.selection_rows_per_request = 1
-        bufs.row_prompt_offsets = bufs.prompt_offsets
         bufs.combined = torch.empty(
             (max_requests, decode_width), dtype=torch.float32, device=device
         )
@@ -359,9 +358,6 @@ def init_eviction_buffers(
                 f"scores {score_rect}, selection {selection_rect}"
             )
         bufs.selection_rows_per_request = selection_rows
-        bufs.row_prompt_offsets = torch.zeros(
-            (max_requests * selection_rows,), dtype=torch.int32, device=device
-        )
         # [request, layer, head, token] layout read by the reduce kernels.
         bufs.score_output = torch.empty(
             max_requests,
@@ -441,7 +437,7 @@ def init_eviction_buffers(
     bufs.settle_args = (
         bufs.selection_scores_rows,
         bufs.selection_row_lengths,
-        bufs.row_prompt_offsets,
+        bufs.prompt_offsets,
         bufs.provisional_rows,
         bufs.keep_rows,
     )
@@ -605,12 +601,6 @@ def execute_eviction_round(
             # Guards the pinned metadata until the asynchronous copies complete.
             bufs.copy_done.record(stream)
             bufs.copy_pending = True
-        # Per-head modes re-expand the prompt lengths into their row-major view.
-        if bufs.row_prompt_offsets is not bufs.prompt_offsets:
-            bufs.row_prompt_offsets.view(bufs.max_requests, bufs.selection_rows_per_request).copy_(
-                bufs.prompt_offsets.unsqueeze(1).expand(-1, bufs.selection_rows_per_request)
-            )
-
     request_count = bufs.max_requests
     union = bufs.eviction_mode == "union"
     try:

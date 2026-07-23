@@ -112,9 +112,10 @@ def _staged_offsets(counts, device):
     return torch.tensor(offsets, dtype=torch.int32, device=device)
 
 
-def _make_settle_inputs(rows_total, width, keep_count, seed, device):
+def _make_settle_inputs(request_count, selection_rows, width, keep_count, seed, device):
     """One seeded settle problem: heavily tied scores, ragged rows, a
-    top-k stand-in, and per-row prompt rebases."""
+    top-k stand-in, and per-request prompt rebases."""
+    rows_total = request_count * selection_rows
     generator = torch.Generator(device=device).manual_seed(seed)
     # Heavily tied integer scores force the tie-quota emission path.
     scores = torch.randint(
@@ -127,8 +128,9 @@ def _make_settle_inputs(rows_total, width, keep_count, seed, device):
         dtype=torch.int32,
         device=device,
     )
-    row_prompt_offsets = torch.tensor(
-        [3 * (row % 3) for row in range(rows_total)], dtype=torch.int32, device=device
+    # Per-request prompt lengths (the kernel indexes them by request).
+    prompt_offsets = torch.tensor(
+        [3 * (request % 3) for request in range(request_count)], dtype=torch.int32, device=device
     )
     # Stand-in for the CuTE top-k: in-range indices covering the top
     # scores of each row with arbitrary tie breaking.
@@ -136,7 +138,7 @@ def _make_settle_inputs(rows_total, width, keep_count, seed, device):
     for row in range(rows_total):
         masked[row, int(row_lengths[row]) :] = float("-inf")
     provisional = torch.topk(masked, keep_count, dim=1).indices.to(torch.int32).contiguous()
-    return scores, row_lengths, row_prompt_offsets, provisional
+    return scores, row_lengths, prompt_offsets, provisional
 
 
 @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
@@ -148,9 +150,10 @@ def test_settle_matches_torch_oracle(eviction_mode, width, keep_count):
     rows_total = request_count * selection_rows
 
     for seed in range(5):
-        scores, row_lengths, row_prompt_offsets, provisional = _make_settle_inputs(
-            rows_total, width, keep_count, seed, device
+        scores, row_lengths, prompt_offsets, provisional = _make_settle_inputs(
+            request_count, selection_rows, width, keep_count, seed, device
         )
+        row_prompt_offsets = prompt_offsets.repeat_interleave(selection_rows)
         # Identical stale garbage on both sides so untouched regions must
         # match too.
         output_stale = torch.randint(
@@ -165,7 +168,7 @@ def test_settle_matches_torch_oracle(eviction_mode, width, keep_count):
         _settle_ties_kernel[(request_count, selection_rows)](
             scores,
             row_lengths,
-            row_prompt_offsets,
+            prompt_offsets,
             provisional,
             output_actual,
             WIDTH=width,
@@ -207,9 +210,10 @@ def test_pack_matches_torch_oracle_on_pre_settled_rows(eviction_mode, has_swa, w
     swa_offsets = _staged_offsets(swa_counts, device)
 
     for seed in range(5):
-        scores, row_lengths, row_prompt_offsets, provisional = _make_settle_inputs(
-            rows_total, width, keep_count, seed, device
+        scores, row_lengths, prompt_offsets, provisional = _make_settle_inputs(
+            request_count, selection_rows, width, keep_count, seed, device
         )
+        row_prompt_offsets = prompt_offsets.repeat_interleave(selection_rows)
         # Pre-settled decision rows straight from the settle oracle: short
         # rows keep stale garbage past their emitted count, which the pack
         # must forward verbatim.

@@ -198,7 +198,6 @@ def test_execute_eviction_round_orders_both_manager_streams():
         phase_num_freqs=1,
         phase_f_block=1,
         prompt_offsets=prompt_offsets,
-        row_prompt_offsets=prompt_offsets,
         round_starts_device=None,
         valid_seq_lens_device=None,
         token_starts_device=None,
