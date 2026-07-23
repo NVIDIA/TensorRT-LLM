@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -437,3 +438,73 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndDefaultTransSize)
 }
 
 // TODO: pybinding
+
+TEST_F(CacheTransBufferTest, TestHybridRecurrentStatesPool)
+{
+    // Regression test for https://nvbugs/6479324: on hybrid (Mamba/linear-attention)
+    // models the recurrent-states pool's sentinel window sorts first, making it pool 0.
+    // The disagg transfer path must (a) not use it as the canonical KV transport pool
+    // for wire dtype / per-token sizing, and (b) fail loudly at construction when its
+    // dtype differs from the KV pools, since the formatter transfers its blocks over
+    // the KV wire with the canonical dtype (a silent mismatch previously surfaced as
+    // a permanent generation-side transfer stall).
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 8;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 2;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr maxAttentionWindow = 16;
+    auto constexpr recurrentStatesBytes = 64;
+    SizeType32 constexpr recurrentStatesWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata const linearAttentionMetadata{
+        .linearLayerIndices = {0},
+        .cacheType = recurrentStatesWindow,
+        .allRecurrentStatesBytes = recurrentStatesBytes,
+    };
+    using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+    auto const blocksPerWindow = BlocksPerWindow{
+        {recurrentStatesWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+        {maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+    };
+    auto const stream = std::make_shared<CudaStream>();
+
+    auto makeCacheManager = [&](tensorrt_llm::DataType recurrentStatesDtype)
+    {
+        auto const poolConfigurations = std::vector<PoolConfiguration>{
+            {recurrentStatesWindow, sizePerHead, recurrentStatesDtype},
+            {maxAttentionWindow, sizePerHead, tensorrt_llm::DataType::kFP8},
+        };
+        auto cacheManager = std::make_unique<KVCacheManager>(std::vector<SizeType32>{0, numKvHeads}, sizePerHead,
+            tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
+            std::vector<SizeType32>{recurrentStatesWindow, maxAttentionWindow}, tensorrt_llm::DataType::kFP8,
+            /*sinkTokenLength=*/0, stream, maxAttentionWindow, /*chunkSize=*/0, /*enableBlockReuse=*/false,
+            CacheType::kSELF, std::nullopt, nullptr, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true,
+            nullptr,
+            /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
+            /*indexerKCacheUseFp4=*/false, linearAttentionMetadata, poolConfigurations);
+        cacheManager->allocatePools(/*useUvm=*/false);
+        return cacheManager;
+    };
+
+    {
+        // Uniform dtype: the canonical KV transport pool must be the attention pool,
+        // and construction must succeed.
+        auto cacheManager = makeCacheManager(tensorrt_llm::DataType::kFP8);
+        auto const kvPoolIdx = CacheTransBufferManager::kvTransportPoolIdx(cacheManager.get());
+        EXPECT_EQ(cacheManager->getBlockManager().getPoolWindowSize(kvPoolIdx), maxAttentionWindow);
+        EXPECT_EQ(cacheManager->getPrimaryPool(kvPoolIdx)->getDataType(), tensorrt_llm::DataType::kFP8);
+        auto transBufferManager
+            = std::make_unique<CacheTransBufferManager>(cacheManager.get(), std::optional<size_t>{tokensPerBlock * 4});
+    }
+    {
+        // Differing recurrent-states dtype: unsupported on the disagg KV wire; must
+        // fail loudly at construction instead of stalling transfers at runtime.
+        auto cacheManager = makeCacheManager(tensorrt_llm::DataType::kHALF);
+        EXPECT_THROW(std::make_unique<CacheTransBufferManager>(cacheManager.get(),
+                         std::optional<size_t>{tokensPerBlock * 4}),
+            tensorrt_llm::common::TllmException);
+    }
+}

@@ -1454,12 +1454,20 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             if mamba_layer_mask[layer_idx] else max_seq_len
             for layer_idx in self.pp_layers
         }
+        # The recurrent-states pool is a byte blob (allRecurrentStatesBytes); its
+        # declared dtype only matters when the KV dtype has container/scale
+        # semantics that would corrupt the blob (NVFP4: 2 elements per container
+        # plus block-scale companion pools).  Keep the manager dtype otherwise:
+        # the disagg KV wire transfers recurrent-window blocks with the KV pools'
+        # dtype, and a differing dtype breaks split/concat and stalls transfers
+        # (https://nvbugs/6479324).
         kwargs["pool_configurations"] = [
             PoolConfiguration(
                 window_size=window_size,
                 head_dim=head_dim,
                 dtype=torch_dtype_to_binding(self.ssm_state_dtype)
-                if window_size == recurrent_states_window else dtype,
+                if window_size == recurrent_states_window
+                and dtype == DataType.NVFP4 else dtype,
             ) for window_size in sorted(local_windows)
         ]
 
