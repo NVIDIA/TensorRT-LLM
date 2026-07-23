@@ -58,7 +58,7 @@ class HfWeightLoader(BaseWeightLoader):
     """
 
     @staticmethod
-    def _layer_bucket_name(weight_name: str) -> Tuple[str, int]:
+    def _layer_bucket_name(weight_name: str) -> tuple[str, int]:
         """Return a stable, layer-atomic bucket for a checkpoint tensor."""
         match = re.match(r"^(?:model\.)?layers\.(\d+)\.", weight_name)
         if match is not None:
@@ -68,11 +68,12 @@ class HfWeightLoader(BaseWeightLoader):
             return ("mtp", int(match.group(1)))
         return ("top", 0)
 
-    def iter_layer_weight_buckets(self,
-                                  checkpoint_dir: str,
-                                  mapping: Mapping,
-                                  use_consolidated: bool = False,
-                                  **kwargs) -> Iterator[ConsumableWeightsDict]:
+    def iter_layer_weight_buckets(
+            self,
+            checkpoint_dir: str,
+            mapping: Mapping,
+            use_consolidated: bool = False,
+            **kwargs: Any) -> Iterator[ConsumableWeightsDict]:
         """Yield real CPU tensors one semantic layer at a time.
 
         The safetensors index is used only as metadata. Tensor storage remains
@@ -111,27 +112,48 @@ class HfWeightLoader(BaseWeightLoader):
                 f"weights in {checkpoint_dir}.")
 
         files_by_name = {os.path.basename(path): path for path in weight_files}
-        index_files = sorted(
-            glob.glob(f"{checkpoint_dir}/*.safetensors.index.json"))
-        entries: List[Tuple[str, str]] = []
-        use_index = bool(index_files) and not use_consolidated and all(
-            "consolidated" not in name for name in files_by_name)
-        if use_index:
-            with open(index_files[0], encoding="utf-8") as index_file:
+        index_files = [
+            path for path in sorted(
+                glob.glob(f"{checkpoint_dir}/*.safetensors.index.json"))
+            if ("consolidated" in os.path.basename(path)) == use_consolidated
+        ]
+        if len(index_files) > 1:
+            checkpoint_kind = "consolidated" if use_consolidated else "ordinary"
+            raise RuntimeError(
+                f"Multiple safetensors indexes match {checkpoint_kind} "
+                f"checkpoint weights: {index_files}")
+
+        entries: list[tuple[str, str]] = []
+        if index_files:
+            index_path = index_files[0]
+            with open(index_path, encoding="utf-8") as index_file:
                 weight_map = json.load(index_file).get("weight_map", {})
             missing_files = set(weight_map.values()) - set(files_by_name)
             if missing_files:
                 raise RuntimeError(
-                    f"Safetensors index {index_files[0]} references missing "
+                    f"Safetensors index {index_path} references missing "
                     f"checkpoint files: {sorted(missing_files)}")
+            available_keys: dict[str, set[str]] = {}
+            for file_name in set(weight_map.values()):
+                with safetensors.safe_open(files_by_name[file_name],
+                                           framework="pt",
+                                           device="cpu") as handle:
+                    available_keys[file_name] = set(handle.keys())
+            missing_keys = [
+                weight_name for weight_name, file_name in weight_map.items()
+                if weight_name not in available_keys[file_name]
+            ]
+            if missing_keys:
+                raise RuntimeError(
+                    f"Safetensors index {index_path} references missing tensor "
+                    f"keys: {sorted(missing_keys)}")
             for weight_name, file_name in weight_map.items():
                 entries.append((weight_name, files_by_name[file_name]))
             if not entries:
                 raise RuntimeError(
-                    f"Safetensors index {index_files[0]} has an empty weight_map."
-                )
+                    f"Safetensors index {index_path} has an empty weight_map.")
         else:
-            seen_keys = set()
+            seen_keys: set[str] = set()
             for path in sorted(weight_files):
                 with safetensors.safe_open(path, framework="pt",
                                            device="cpu") as handle:
@@ -142,13 +164,17 @@ class HfWeightLoader(BaseWeightLoader):
                                 f"files without an index: {key}")
                         seen_keys.add(key)
                         entries.append((key, path))
+            if not entries:
+                raise RuntimeError(
+                    f"Selected safetensors checkpoint in {checkpoint_dir} "
+                    "contains no tensors.")
 
-        buckets = {}
+        buckets: dict[tuple[str, int], list[tuple[str, str]]] = {}
         for weight_name, path in entries:
             bucket = self._layer_bucket_name(weight_name)
             buckets.setdefault(bucket, []).append((weight_name, path))
 
-        def bucket_sort_key(bucket):
+        def bucket_sort_key(bucket: tuple[str, int]) -> tuple[int, int]:
             kind, index = bucket
             return ({"top": 0, "layer": 1, "mtp": 2}[kind], index)
 

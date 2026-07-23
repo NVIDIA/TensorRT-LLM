@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for semantic-layer checkpoint orchestration in ModelLoader."""
 
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from typing import Self
 from unittest.mock import MagicMock
 
 import pytest
@@ -16,39 +18,60 @@ from tensorrt_llm.llmapi.llm_args import LoadFormat
 
 
 class _LayerwiseModel(nn.Module):
-    def __init__(self, events, *, fail_on_bucket=None):
+    def __init__(
+        self, events: list[tuple[object, ...]], *, fail_on_bucket: str | None = None
+    ) -> None:
         super().__init__()
         self._events = events
         self._fail_on_bucket = fail_on_bucket
         self.llm_checkpoint_dir = "/model-checkpoint"
 
-    def _apply(self, _fn):
+    def _apply(self, _fn: Callable[[torch.Tensor], torch.Tensor]) -> Self:
         return self
 
-    def to(self, *_args, **_kwargs):
+    def to(self, *_args: object, **_kwargs: object) -> Self:
         return self
 
-    def load_weights(self, weights, weight_mapper, *, initial_bucket_loading=False):
+    def load_weights(
+        self,
+        weights: dict[str, object],
+        weight_mapper: object,
+        *,
+        initial_bucket_loading: bool = False,
+    ) -> None:
         bucket_name = next(iter(weights))
         self._events.append(("load", bucket_name, weight_mapper, initial_bucket_loading))
         if bucket_name == self._fail_on_bucket:
             raise RuntimeError("bucket load failed")
 
-    def post_load_weights(self):
+    def post_load_weights(self) -> None:
         self._events.append(("post_load",))
 
 
 class _UnsupportedModel(_LayerwiseModel):
-    def load_weights(self, weights, weight_mapper):
+    def load_weights(self, weights: dict[str, object], weight_mapper: object) -> None:
         self._events.append(("load", next(iter(weights)), weight_mapper))
 
 
+class _MapperlessLayerwiseModel(_LayerwiseModel):
+    def load_weights(
+        self, weights: dict[str, object], *, initial_bucket_loading: bool = False
+    ) -> None:
+        self._events.append(("load", next(iter(weights)), None, initial_bucket_loading))
+
+
 @contextmanager
-def _moe_context(_config, _mapping):
+def _moe_context(_config: object, _mapping: object) -> Iterator[None]:
     yield None
 
 
-def _make_loader(monkeypatch, model, *, spec_config=None, layerwise_loading=True):
+def _make_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    model: nn.Module,
+    *,
+    spec_config: object | None = None,
+    layerwise_loading: bool = True,
+) -> ModelLoader:
     loader = ModelLoader(
         llm_args=SimpleNamespace(
             load_format=LoadFormat.AUTO,
@@ -79,16 +102,18 @@ def _make_loader(monkeypatch, model, *, spec_config=None, layerwise_loading=True
     return loader
 
 
-def _make_checkpoint_loader(events, buckets):
+def _make_checkpoint_loader(
+    events: list[tuple[object, ...]], buckets: list[dict[str, object]]
+) -> tuple[MagicMock, MagicMock]:
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "HF"
     mapper = MagicMock(name="weight_mapper")
 
-    def initialize_mapper(_model, _config):
+    def initialize_mapper(_model: nn.Module, _config: object) -> MagicMock:
         events.append(("mapper", mapper))
         return mapper
 
-    def iter_buckets(checkpoint_dir, **kwargs):
+    def iter_buckets(checkpoint_dir: str, **kwargs: object) -> Iterator[dict[str, object]]:
         events.append(("iterate", checkpoint_dir, kwargs))
         try:
             yield from buckets
@@ -100,8 +125,10 @@ def _make_checkpoint_loader(events, buckets):
     return checkpoint_loader, mapper
 
 
-def test_layerwise_model_loader_orders_mapper_buckets_sync_and_post_load(monkeypatch):
-    events = []
+def test_layerwise_model_loader_orders_mapper_buckets_sync_and_post_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
     model = _LayerwiseModel(events)
     loader = _make_loader(monkeypatch, model)
     checkpoint_loader, mapper = _make_checkpoint_loader(
@@ -136,8 +163,10 @@ def test_layerwise_model_loader_orders_mapper_buckets_sync_and_post_load(monkeyp
     checkpoint_loader.load_weights.assert_not_called()
 
 
-def test_layerwise_model_loader_is_disabled_by_default_config(monkeypatch):
-    events = []
+def test_layerwise_model_loader_is_disabled_by_default_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
     model = _LayerwiseModel(events)
     loader = _make_loader(monkeypatch, model, layerwise_loading=False)
     checkpoint_loader, mapper = _make_checkpoint_loader(events, [{"layers.0.weight": object()}])
@@ -153,8 +182,10 @@ def test_layerwise_model_loader_is_disabled_by_default_config(monkeypatch):
     assert ("load", "eager.weight", mapper, False) in events
 
 
-def test_layerwise_model_loader_rejects_unsupported_model_before_iteration(monkeypatch):
-    events = []
+def test_layerwise_model_loader_rejects_unsupported_model_before_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
     loader = _make_loader(monkeypatch, _UnsupportedModel(events))
     checkpoint_loader, _mapper = _make_checkpoint_loader(events, [{"top.weight": object()}])
 
@@ -166,8 +197,50 @@ def test_layerwise_model_loader_rejects_unsupported_model_before_iteration(monke
     assert events == []
 
 
-def test_layerwise_model_loader_rejects_draft_checkpoint_before_iteration(monkeypatch):
-    events = []
+def test_layerwise_model_loader_skips_mapper_for_mapperless_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+    model = _MapperlessLayerwiseModel(events)
+    loader = _make_loader(monkeypatch, model)
+    checkpoint_loader, _mapper = _make_checkpoint_loader(events, [{"top.weight": object()}])
+
+    loaded_model, _ = loader.load("/checkpoint", checkpoint_loader)
+
+    assert loaded_model is model
+    checkpoint_loader.get_initialized_weight_mapper.assert_not_called()
+    assert ("load", "top.weight", None, True) in events
+
+
+@pytest.mark.parametrize(
+    ("allow_partial_loading", "initial_bucket_loading", "message"),
+    [
+        (True, False, "allow_partial_loading is not supported for this model"),
+        (False, True, "initial_bucket_loading is not supported for this model"),
+    ],
+)
+def test_call_load_weights_rejects_unsupported_options(
+    allow_partial_loading: bool, initial_bucket_loading: bool, message: str
+) -> None:
+    loader = ModelLoader.__new__(ModelLoader)
+
+    def load_weights(_weights: dict[str, torch.Tensor]) -> None:
+        pass
+
+    with pytest.raises(RuntimeError, match=message):
+        loader._call_load_weights(
+            load_weights,
+            {},
+            None,
+            allow_partial_loading=allow_partial_loading,
+            initial_bucket_loading=initial_bucket_loading,
+        )
+
+
+def test_layerwise_model_loader_rejects_draft_checkpoint_before_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
     spec_config = MagicMock()
     spec_config.spec_dec_mode.need_load_draft_weights.return_value = True
     loader = _make_loader(monkeypatch, _LayerwiseModel(events), spec_config=spec_config)
@@ -181,8 +254,10 @@ def test_layerwise_model_loader_rejects_draft_checkpoint_before_iteration(monkey
     assert events == []
 
 
-def test_layerwise_model_loader_closes_iterator_and_stops_after_consumer_error(monkeypatch):
-    events = []
+def test_layerwise_model_loader_closes_iterator_and_stops_after_consumer_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
     model = _LayerwiseModel(events, fail_on_bucket="layers.1.weight")
     loader = _make_loader(monkeypatch, model)
     checkpoint_loader, mapper = _make_checkpoint_loader(

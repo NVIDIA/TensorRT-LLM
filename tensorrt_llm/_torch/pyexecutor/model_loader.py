@@ -10,8 +10,12 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
-    AutoCheckpointMapper, BaseCheckpointLoader)
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+    AutoCheckpointMapper
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    ConsumableWeightsDict
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 from tensorrt_llm._torch.weight_sharing import (
     IdentityCheckPolicy, PostTransformFeature, PostTransformProfile,
     PostTransformProfileRegistry, PostTransformQualificationDecision,
@@ -615,8 +619,10 @@ class ModelLoader:
                             "enable_hf_layerwise_loading is enabled, but "
                             f"{type(model).__name__}.load_weights does not support "
                             "initial_bucket_loading.")
-                    self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                        model, config)
+                    self.weight_mapper = (
+                        checkpoint_loader.get_initialized_weight_mapper(
+                            model, config)
+                        if "weight_mapper" in load_parameters else None)
                     logger.info(
                         "Loading HF checkpoint with one semantic layer per host-memory bucket."
                     )
@@ -1425,11 +1431,12 @@ class ModelLoader:
         return config
 
     def _call_load_weights(self,
-                           load_method: Callable,
-                           weights,
-                           weight_mapper,
+                           load_method: Callable[..., None],
+                           weights: dict[str, torch.Tensor]
+                           | ConsumableWeightsDict,
+                           weight_mapper: BaseWeightMapper | None,
                            allow_partial_loading: bool = False,
-                           initial_bucket_loading: bool = False):
+                           initial_bucket_loading: bool = False) -> None:
         """Call a model weight loader with only the options it declares.
 
         Args:
@@ -1441,7 +1448,7 @@ class ModelLoader:
                 initial semantic-layer checkpoint load.
 
         Raises:
-            AssertionError: If a requested option is unsupported by the model
+            RuntimeError: If a requested option is unsupported by the model
                 method.
         """
         args = inspect.signature(load_method).parameters
@@ -1450,11 +1457,12 @@ class ModelLoader:
             kargs["weight_mapper"] = weight_mapper
         if "allow_partial_loading" in args:
             kargs["allow_partial_loading"] = allow_partial_loading
-        else:
-            assert allow_partial_loading is False, "allow_partial_loading is not supported for this model"
+        elif allow_partial_loading:
+            raise RuntimeError(
+                "allow_partial_loading is not supported for this model")
         if "initial_bucket_loading" in args:
             kargs["initial_bucket_loading"] = initial_bucket_loading
-        else:
-            assert initial_bucket_loading is False, \
-                "initial_bucket_loading is not supported for this model"
+        elif initial_bucket_loading:
+            raise RuntimeError(
+                "initial_bucket_loading is not supported for this model")
         load_method(weights, **kargs)
