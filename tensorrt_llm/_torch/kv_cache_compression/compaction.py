@@ -127,29 +127,9 @@ def init_compaction_buffers(
     capacities: Dict[str, int],
     draft: Optional[Dict[str, object]] = None,
 ) -> Tuple[Dict[str, object], ...]:
-    """Agree on the decision rows and return opaque launch plans per geometry.
-
-    Move sources must be increasing kept ordinals with
-    destination_bases[request] + move <= source[move] (C++ in-place copy
-    contract). ``target`` carries the resolved dense/SWA grouping inputs from
-    the runtime layout (``per_layer_sources`` selects 3-D per-layer move rows;
-    ``layer_pool_ids`` the canonical layer -> V2 pool id tuple that indexes
-    ``kv_block_offsets``; ``swa_destination_bases`` the caller-owned SWA
-    rebase row) plus the decision inputs :func:`compact` packs each round:
-    ``kept_ordinal_rows`` (``max_requests * decision_rows`` rows of
-    ``keep_count`` int32 kept ordinals, forwarded verbatim), the
-    per-request ``decision_rows`` count (1 = one shared row broadcast over
-    every KV head), and the staged per-request ``valid_seq_lens`` the
-    protected tail rides after. ``draft`` is one all-or-none resolved branch
-    (its dense-only moves broadcast the one shared decision row over the
-    draft's own KV heads); ``capacities`` the request/keep/tail capacity
-    numbers.
-
-    Returns one plan per compacted cache family (target, then the optional
-    draft): plain contract fields -- decision inputs, move-index buffers,
-    pack geometry ints, and per-pool batched native-operand records built
-    here at init time -- that only :func:`compact` reads at launch.
-    """
+    """Agree on the decision rows and return opaque launch plans per geometry:
+    one plan per compacted cache family (target, then the optional draft),
+    with init-built contract fields that only :func:`compact` reads at launch."""
     layer_pools = target["layer_pools"]
     dense_layers = tuple(int(layer) for layer in target["dense_layers"])
     swa_layers = tuple(int(layer) for layer in target["swa_layers"])
@@ -380,14 +360,8 @@ def compact(
     plans: Tuple[Dict[str, object], ...],
     request_count: int,
 ) -> None:
-    """Pack each plan's move sources and fire its native compacts, in plan order.
-
-    Pure mover: the caller has already materialized its kept ordinals into the
-    agreed decision rows for the active ``request_count`` cohort, and the
-    caller owns the completion ordering of the whole round. Every launch
-    argument comes straight off the plan's init-built contract fields; the
-    round constructs no containers and runs no torch ops of its own.
-    """
+    """Pack each plan's move sources and fire its native compacts, in plan order
+    (pure mover: the caller owns the decision rows and the round's completion ordering)."""
     for plan in plans:
         _pack_move_sources_kernel[(request_count, plan["decision_rows"])](
             plan["kept_ordinal_rows"],

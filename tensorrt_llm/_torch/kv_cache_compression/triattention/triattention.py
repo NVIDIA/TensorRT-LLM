@@ -135,10 +135,8 @@ class TriAttention(KVCacheCompressionManager):
                 "TriAttention union eviction requires normalize_scores=True: "
                 "the fused union pipeline always z-normalizes score rows"
             )
-        # Hard-coded semantics: the prompt is always pinned and the budget
-        # counts decode tokens only (physical KV reclaim requires both).
-        # Calibration is the official TriAttention .pt; TRT-LLM does not
-        # compute calibration. The config boundary requires both paths.
+        # Prompt always pinned; budget counts decode tokens only. Calibration
+        # is the official TriAttention .pt (TRT-LLM never computes it).
         self.model_path = config.model_path
         self.calibration_path = config.calibration_path
         self.calibration: Optional[Dict[str, torch.Tensor]] = None
@@ -719,13 +717,6 @@ class TriAttention(KVCacheCompressionManager):
         """Build the round's buffers, compiled score launches, and compaction data
         in place as plain attributes on this manager
         (the compiled kernels capture raw pool addresses: scored pools must stay alive and stay put).
-
-        ``layout`` is the runtime KV layout dict, passed whole; ``calibration``
-        carries the local q_real/q_imag/mlr_coef [L, H, F] slices and
-        freq_scale_sq; ``draft`` is one all-or-none resolved branch (its layout
-        dict plus tail/page-table capacities); ``capacities`` the capacity
-        numbers. Static round policy (mode, ``normalize_scores``, the shared
-        ``self._phase`` table) reads off the manager itself.
         """
         import cutlass
         import cutlass.cute as cute
@@ -1351,11 +1342,8 @@ class TriAttention(KVCacheCompressionManager):
         self,
         prepared: Sequence[Dict[str, object]],
     ) -> None:
-        """Run one eviction round over the prepared cohort: stage the page-table
-        snapshots and round metadata, then score, select, settle, and compact, and
-        finally order the manager streams after this cohort's compact (every launch
-        covers the full request capacity; padded rows carry zero lengths and stay
-        inert)."""
+        """Run one eviction round over the prepared cohort (every launch covers
+        the full request capacity; padded rows carry zero lengths and stay inert)."""
         manager = self.kv_cache_manager
         draft_manager = self.draft_kv_cache_manager
         with nvtx_range_debug("triattention.page_table_stage", color="orange"):

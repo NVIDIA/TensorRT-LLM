@@ -11,9 +11,6 @@ import triton.language as tl
 
 # ---- Mean-phase gather: per-request phase-row fetch + width derivation ----
 
-
-# Positions past this row count are not exactly representable in fp32.
-
 # Score z-normalization epsilon; must stay a plain float (the CuTe DSL traces it).
 STD_EPSILON = 1e-6
 
@@ -179,12 +176,7 @@ def prepare_per_head_scores(
     per_layer: bool,
     normalize_scores: bool,
 ) -> None:
-    """Normalize and reduce score rows for either per-head eviction mode.
-
-    ``selection_scores_rows``/``selection_row_lengths`` are the canonical
-    row-major selection buffers over the full request capacity
-    (``capacity * selection_rows`` rows); ``valid_widths`` also spans the
-    capacity, so the per-request row count derives from the shapes."""
+    """Normalize and reduce score rows for either per-head eviction mode."""
     request_count, num_layers, num_q_heads, width = scores.shape
     selection_rows = int(selection_scores_rows.shape[0]) // int(valid_widths.shape[0])
     num_kv_heads = selection_rows // num_layers if per_layer else selection_rows
