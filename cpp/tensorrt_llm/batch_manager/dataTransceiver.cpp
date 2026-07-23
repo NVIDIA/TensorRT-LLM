@@ -40,6 +40,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -226,6 +227,13 @@ using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 namespace
 {
 
+// Bound sender-side terminal state during timeout storms. No-peer markers are
+// eligible for cap-driven reclamation after the minimum retention interval,
+// then move into the separately bounded finalized-handshake replay history.
+constexpr std::size_t kMaxPendingPreHandshakeCancellations{65'536};
+constexpr std::size_t kMaxFinalizedHandshakeIds{65'536};
+constexpr auto kPreHandshakeCancellationRetention = std::chrono::seconds{30};
+
 int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
 {
     constexpr int32_t kDATA_TAG{43};
@@ -332,14 +340,21 @@ public:
         bool handledWithoutTransfer{false};
     };
 
-    Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
+    Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer,
+        std::size_t maxPendingPreHandshakeCancellations, std::chrono::milliseconds preHandshakeCancellationRetention)
         : mManager{manager}
         , mSelfState{cacheLayer.getCacheState(), executor::kv_cache::CommState{manager->getCommState()}}
         , mCacheTransferLayer{std::move(cacheLayer)}
         , mBufferManager{std::make_shared<runtime::CudaStream>()}
+        , mMaxPendingPreHandshakeCancellations{maxPendingPreHandshakeCancellations}
+        , mPreHandshakeCancellationRetention{preHandshakeCancellationRetention}
     {
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
+        TLLM_CHECK_WITH_INFO(mMaxPendingPreHandshakeCancellations > 0,
+            "The maximum number of pending pre-handshake cancellations must be positive");
+        TLLM_CHECK_WITH_INFO(
+            mPreHandshakeCancellationRetention.count() > 0, "Pre-handshake cancellation retention must be positive");
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
         mCanPollFinalizedHandshakeReplays
             = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr;
@@ -504,7 +519,8 @@ public:
             bool isTerminal = false;
             {
                 std::scoped_lock lock(mSenderMutex);
-                isTerminal = mFinalizedHandshakeIds.find(requestId) != mFinalizedHandshakeIds.end();
+                isTerminal = mFinalizedHandshakeIds.find(requestId) != mFinalizedHandshakeIds.end()
+                    || mPreHandshakeCancellationDeadlines.find(requestId) != mPreHandshakeCancellationDeadlines.end();
                 if (isTerminal)
                 {
                     armFinalizedHandshakeReplayDrainLocked();
@@ -539,7 +555,9 @@ public:
             // queued request cannot become a transfer session between the
             // cancellation decision and session lookup.
             std::scoped_lock lock(mSenderMutex, mMtxForMap);
-            if (rejectTerminalRequest && mFinalizedHandshakeIds.find(requestId) != mFinalizedHandshakeIds.end())
+            if (rejectTerminalRequest
+                && (mFinalizedHandshakeIds.find(requestId) != mFinalizedHandshakeIds.end()
+                    || mPreHandshakeCancellationDeadlines.find(requestId) != mPreHandshakeCancellationDeadlines.end()))
             {
                 // A known-terminal peer request is a late replay. Never create
                 // an orphan session that would head-of-line block the response
@@ -601,11 +619,71 @@ public:
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
     }
 
+    void reclaimExpiredPreHandshakeCancellationLocked()
+    {
+        auto const now = std::chrono::steady_clock::now();
+        while (mPreHandshakeCancellationDeadlines.size() >= mMaxPendingPreHandshakeCancellations
+            && !mPreHandshakeCancellationOrder.empty() && mPreHandshakeCancellationOrder.front().first <= now)
+        {
+            auto const [deadline, requestId] = mPreHandshakeCancellationOrder.front();
+            auto const deadlineIt = mPreHandshakeCancellationDeadlines.find(requestId);
+            if (deadlineIt != mPreHandshakeCancellationDeadlines.end() && deadlineIt->second == deadline)
+            {
+                // Move an expired no-peer marker into the bounded replay
+                // history before erasing it, so a late peer remains terminal.
+                recordFinalizedHandshakeLocked(requestId);
+                mPreHandshakeCancellationDeadlines.erase(deadlineIt);
+            }
+            mPreHandshakeCancellationOrder.pop_front();
+        }
+    }
+
+    bool recordCancellationLocked(RequestIdType requestId, bool isPreHandshake)
+    {
+        if (isPreHandshake)
+        {
+            if (mPreHandshakeCancellationDeadlines.find(requestId) != mPreHandshakeCancellationDeadlines.end())
+            {
+                return true;
+            }
+            if (mPreHandshakeCancellationDeadlines.size() >= mMaxPendingPreHandshakeCancellations)
+            {
+                reclaimExpiredPreHandshakeCancellationLocked();
+                if (mPreHandshakeCancellationDeadlines.size() >= mMaxPendingPreHandshakeCancellations)
+                {
+                    return false;
+                }
+            }
+
+            auto const deadline = std::chrono::steady_clock::now() + mPreHandshakeCancellationRetention;
+            auto const [deadlineIt, inserted] = mPreHandshakeCancellationDeadlines.emplace(requestId, deadline);
+            TLLM_CHECK(inserted);
+            try
+            {
+                mPreHandshakeCancellationOrder.emplace_back(deadline, requestId);
+            }
+            catch (...)
+            {
+                mPreHandshakeCancellationDeadlines.erase(deadlineIt);
+                throw;
+            }
+            return true;
+        }
+
+        if (mCancelledRequests.find(requestId) != mCancelledRequests.end())
+        {
+            return true;
+        }
+        mCancelledRequests.insert(requestId);
+        return true;
+    }
+
     bool cancelRequest(LlmRequest const& llmRequest)
     {
         bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
         bool isCancelled = false;
         bool isCurrentRequest = false;
+        bool cancellationAdmissionDeclined = false;
         std::optional<Response> cancelledResponse;
         {
             // Serialize the sender queue and transfer-session lookup. This
@@ -621,23 +699,31 @@ public:
                 bool const hasTransferSession = sessionIt != mRequestToSession.end();
                 if (!isCurrentRequest && (inflightCancelEnabled || !hasTransferSession))
                 {
-                    mCancelledRequests.insert(llmRequest.mRequestId);
-                    cancelledResponse.emplace(std::move(it->second));
-                    mReadyResponses.erase(it);
-                    isCancelled = true;
+                    bool const isPreHandshake = !hasTransferSession;
+                    if (recordCancellationLocked(llmRequest.mRequestId, isPreHandshake))
+                    {
+                        cancelledResponse.emplace(std::move(it->second));
+                        mReadyResponses.erase(it);
+                        isCancelled = true;
+                    }
+                    else
+                    {
+                        cancellationAdmissionDeclined = true;
+                    }
                 }
                 else if (inflightCancelEnabled)
                 {
                     // The legacy path cannot interrupt a current/active transfer. The opt-in path preserves the
                     // response until sendResponse coordinates ready=false or the in-flight flag stops the transfer.
-                    mCancelledRequests.insert(llmRequest.mRequestId);
-                    isCancelled = true;
+                    isCancelled = recordCancellationLocked(llmRequest.mRequestId, false);
                 }
             }
-            else if (mCancelledRequests.find(llmRequest.mRequestId) != mCancelledRequests.end())
+            else if (mCancelledRequests.find(llmRequest.mRequestId) != mCancelledRequests.end()
+                || mPreHandshakeCancellationDeadlines.find(llmRequest.mRequestId)
+                    != mPreHandshakeCancellationDeadlines.end())
             {
-                // Cancellation is idempotent while the late-peer tombstone is
-                // retained for the ready=false handshake.
+                // Cancellation is idempotent while its active or no-peer
+                // terminal marker is retained.
                 isCancelled = true;
             }
         }
@@ -649,7 +735,7 @@ public:
                         "Context KV cache request cancelled before a peer was ready for request %zu",
                         llmRequest.mRequestId)));
         }
-        if (inflightCancelEnabled && (!isCancelled || isCurrentRequest))
+        if (inflightCancelEnabled && !cancellationAdmissionDeclined && (!isCancelled || isCurrentRequest))
         {
             std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
             auto flagIt = mInFlightCancelFlags.find(llmRequest.mRequestId);
@@ -661,7 +747,17 @@ public:
         }
         if (!isCancelled)
         {
-            TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            if (cancellationAdmissionDeclined)
+            {
+                TLLM_LOG_DEBUG(
+                    "Cannot cancel request %zu before its peer arrives: the pending pre-handshake "
+                    "cancellation limit of %zu was reached",
+                    llmRequest.mRequestId, mMaxPendingPreHandshakeCancellations);
+            }
+            else
+            {
+                TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            }
         }
         else
         {
@@ -918,8 +1014,11 @@ private:
                 bool pollForFinalizedReplay = false;
                 {
                     std::unique_lock lock(mSenderMutex);
-                    auto const hasLocalWork
-                        = [this]() { return mTerminate || !mReadyResponses.empty() || !mCancelledRequests.empty(); };
+                    auto const hasLocalWork = [this]()
+                    {
+                        return mTerminate || !mReadyResponses.empty() || !mCancelledRequests.empty()
+                            || !mPreHandshakeCancellationDeadlines.empty();
+                    };
                     auto const canPollForFinalizedReplay = mCanPollFinalizedHandshakeReplays
                         && !mFinalizedHandshakeIds.empty()
                         && std::chrono::steady_clock::now() < mFinalizedHandshakeReplayDrainUntil;
@@ -962,7 +1061,9 @@ private:
                         [this, reqId]()
                         {
                             return mTerminate || mReadyResponses.find(reqId) != mReadyResponses.end()
-                                || mCancelledRequests.find(reqId) != mCancelledRequests.end();
+                                || mCancelledRequests.find(reqId) != mCancelledRequests.end()
+                                || mPreHandshakeCancellationDeadlines.find(reqId)
+                                != mPreHandshakeCancellationDeadlines.end();
                         });
                     if (mTerminate)
                     {
@@ -1058,6 +1159,8 @@ private:
             pendingResponses.swap(mReadyResponses);
             mCurrentRequest = std::nullopt;
             mCancelledRequests.clear();
+            mPreHandshakeCancellationDeadlines.clear();
+            mPreHandshakeCancellationOrder.clear();
             mRemainSendCount.clear();
         }
         for (auto& entry : pendingResponses)
@@ -1068,7 +1171,7 @@ private:
 
     void notifyRejectedPeersNoThrow(RequestIdType requestId, std::vector<Connection const*> const& connections) noexcept
     {
-        TLLM_LOG_WARNING("Rejecting a finalized KV cache handshake replay for request %zu", requestId);
+        TLLM_LOG_DEBUG("Rejecting a terminal KV cache handshake for request %zu", requestId);
         for (auto const* connection : connections)
         {
             try
@@ -1088,10 +1191,18 @@ private:
 
     void recordFinalizedHandshakeLocked(RequestIdType requestId)
     {
-        constexpr size_t kMaxFinalizedHandshakeIds = 65'536;
-        if (mFinalizedHandshakeIds.insert(requestId).second)
+        auto const [idIt, inserted] = mFinalizedHandshakeIds.insert(requestId);
+        if (inserted)
         {
-            mFinalizedHandshakeOrder.push_back(requestId);
+            try
+            {
+                mFinalizedHandshakeOrder.push_back(requestId);
+            }
+            catch (...)
+            {
+                mFinalizedHandshakeIds.erase(idIt);
+                throw;
+            }
             if (mFinalizedHandshakeOrder.size() > kMaxFinalizedHandshakeIds)
             {
                 mFinalizedHandshakeIds.erase(mFinalizedHandshakeOrder.front());
@@ -1122,6 +1233,8 @@ public:
 private:
     std::optional<RequestIdType> mCurrentRequest;
     std::set<LlmRequest::RequestIdType> mCancelledRequests;
+    std::unordered_map<RequestIdType, std::chrono::steady_clock::time_point> mPreHandshakeCancellationDeadlines;
+    std::deque<std::pair<std::chrono::steady_clock::time_point, RequestIdType>> mPreHandshakeCancellationOrder;
     std::deque<RequestIdType> mFinalizedHandshakeOrder;
     std::unordered_set<RequestIdType> mFinalizedHandshakeIds;
     std::map<RequestIdType, Response> mReadyResponses;
@@ -1147,6 +1260,8 @@ private:
     std::ofstream mMeasuresFile;
     std::mutex mInFlightCancelMutex;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<std::atomic<bool>>> mInFlightCancelFlags;
+    std::size_t const mMaxPendingPreHandshakeCancellations;
+    std::chrono::milliseconds const mPreHandshakeCancellationRetention;
 };
 
 class CacheReceiver::Impl
@@ -1908,7 +2023,16 @@ void CacheReceiver::ImplDeleter::operator()(Impl* ptr)
 
 CacheSender::CacheSender(
     executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
-    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer)))}
+    : CacheSender(manager, selfIndex, std::move(cacheLayer), kMaxPendingPreHandshakeCancellations,
+        kPreHandshakeCancellationRetention)
+{
+}
+
+CacheSender::CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex,
+    CacheTransferLayer cacheLayer, std::size_t maxPendingPreHandshakeCancellations,
+    std::chrono::milliseconds preHandshakeCancellationRetention)
+    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer),
+        maxPendingPreHandshakeCancellations, preHandshakeCancellationRetention))}
 {
 }
 

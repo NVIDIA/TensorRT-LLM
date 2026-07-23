@@ -59,6 +59,7 @@
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
+#include <thread>
 
 #include "gtest/gtest.h"
 #include <gmock/gmock.h>
@@ -72,6 +73,23 @@ namespace texec = tensorrt_llm::executor;
 
 using testing::Return;
 using testing::ReturnRef;
+
+namespace tensorrt_llm::testing
+{
+
+class CacheSenderTestAccess
+{
+public:
+    static std::unique_ptr<batch_manager::CacheSender> make(executor::kv_cache::ConnectionManager* manager,
+        runtime::SizeType32 selfIndex, batch_manager::CacheTransferLayer cacheLayer,
+        std::size_t maxPendingPreHandshakeCancellations, std::chrono::milliseconds preHandshakeCancellationRetention)
+    {
+        return std::unique_ptr<batch_manager::CacheSender>(new batch_manager::CacheSender(manager, selfIndex,
+            std::move(cacheLayer), maxPendingPreHandshakeCancellations, preHandshakeCancellationRetention));
+    }
+};
+
+} // namespace tensorrt_llm::testing
 
 // ---------------------------------------
 //            RequestInfoTest
@@ -594,6 +612,17 @@ protected:
             CacheTransferLayer(*mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)));
     }
 
+    std::unique_ptr<CacheSender> makeControlledSender(ControlledConnectionManager& connectionManager,
+        std::size_t maxPendingPreHandshakeCancellations, std::chrono::milliseconds preHandshakeCancellationRetention)
+    {
+        constexpr int maxNumTokens{1024};
+        mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
+        std::vector<CacheTransBufferManager*> bufferManagers{mCacheTransBufferManager.get()};
+        return tensorrt_llm::testing::CacheSenderTestAccess::make(&connectionManager, 0,
+            CacheTransferLayer(*mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)),
+            maxPendingPreHandshakeCancellations, preHandshakeCancellationRetention);
+    }
+
     std::unique_ptr<CacheReceiver> makeControlledReceiver(ControlledConnectionManager& connectionManager)
     {
         constexpr int maxNumTokens{1024};
@@ -783,6 +812,141 @@ TEST_F(SymmetricalCacheTest, DefaultOffCancelsOnlyQueuedSenderAcrossRanks)
         EXPECT_THROW(future.get(), std::exception);
     }
     removeRequestFromCache(request);
+}
+
+TEST_F(SymmetricalCacheTest, DefaultOffNoPeerCancellationTombstonesAreReclaimedAtCapacity)
+{
+    if (tensorrt_llm::common::getEnvDisaggEnableInflightCancel())
+    {
+        GTEST_SKIP() << "This test validates the default-off cancellation path.";
+    }
+    auto const worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+
+    ControlledConnectionManager connectionManager;
+    constexpr std::size_t maxPendingPreHandshakeCancellations{1};
+    constexpr auto preHandshakeCancellationRetention = std::chrono::seconds{2};
+    auto sender = makeControlledSender(
+        connectionManager, maxPendingPreHandshakeCancellations, preHandshakeCancellationRetention);
+    std::shared_ptr<LlmRequest> firstRequest{makeLlmRequest(10)};
+    std::shared_ptr<LlmRequest> secondRequest{makeLlmRequest(11)};
+
+    auto firstFuture = sender->sendAsync(firstRequest);
+    EXPECT_TRUE(connectionManager.waitForRecvConnectCalls(1, std::chrono::seconds{10}));
+    EXPECT_TRUE(sender->cancelRequest(*firstRequest));
+    EXPECT_TRUE(sender->cancelRequest(*firstRequest));
+    ASSERT_EQ(firstFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_THROW(firstFuture.get(), std::exception);
+
+    auto secondFuture = sender->sendAsync(secondRequest);
+    EXPECT_FALSE(sender->cancelRequest(*secondRequest));
+    EXPECT_EQ(secondFuture.wait_for(std::chrono::milliseconds{0}), std::future_status::timeout);
+
+    std::this_thread::sleep_for(preHandshakeCancellationRetention);
+    bool secondCancellationAccepted = false;
+    auto const retryDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (!secondCancellationAccepted && std::chrono::steady_clock::now() < retryDeadline)
+    {
+        secondCancellationAccepted = sender->cancelRequest(*secondRequest);
+        if (!secondCancellationAccepted)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        }
+    }
+    ASSERT_TRUE(secondCancellationAccepted);
+    ASSERT_EQ(secondFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_THROW(secondFuture.get(), std::exception);
+    EXPECT_FALSE(sender->cancelRequest(*firstRequest));
+
+    connectionManager.getConnection().releaseReadySignal();
+    connectionManager.publishRequestInfo(makeControlledRequestInfo(firstRequest->mRequestId, connectionManager));
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(1, std::chrono::seconds{10}));
+    EXPECT_EQ(connectionManager.getConnection().getReadySignals(), (std::deque<bool>{false}));
+}
+
+TEST_F(SymmetricalCacheTest, DefaultOffPreHandshakeCancellationRejectsEachLatePeer)
+{
+    if (tensorrt_llm::common::getEnvDisaggEnableInflightCancel())
+    {
+        GTEST_SKIP() << "This test validates the default-off cancellation path.";
+    }
+    auto const worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+
+    ControlledConnectionManager connectionManager;
+    connectionManager.getConnection().releaseReadySignal();
+    constexpr std::size_t maxPendingPreHandshakeCancellations{1};
+    constexpr auto preHandshakeCancellationRetention = std::chrono::milliseconds{200};
+    auto sender = makeControlledSender(
+        connectionManager, maxPendingPreHandshakeCancellations, preHandshakeCancellationRetention);
+    std::shared_ptr<LlmRequest> cancelledRequest{makeLlmRequest(12)};
+
+    constexpr SizeType32 numLayers{4};
+    constexpr SizeType32 numKvHeadsPerRank{1};
+    constexpr SizeType32 sizePerHead{64};
+    constexpr SizeType32 tokensPerBlock{8};
+    constexpr SizeType32 peerTensorParallelism{2};
+    texec::kv_cache::CacheState peerCacheState{numLayers, numKvHeadsPerRank, sizePerHead, tokensPerBlock,
+        peerTensorParallelism, /*pipelineParallelism=*/1, /*contextParallelism=*/1, std::vector<SizeType32>{numLayers},
+        tensorrt_llm::DataType::kFLOAT};
+    auto makePeerRequestInfo = [&](SizeType32 selfIdx)
+    {
+        texec::DataTransceiverState peerState;
+        peerState.setCommState(texec::kv_cache::CommState{std::vector<SizeType32>{0, 1}, selfIdx});
+        peerState.setCacheState(peerCacheState);
+        return RequestInfo{cancelledRequest->mRequestId, std::move(peerState)};
+    };
+
+    auto cancelledFuture = sender->sendAsync(cancelledRequest);
+    EXPECT_TRUE(connectionManager.waitForRecvConnectCalls(1, std::chrono::seconds{10}));
+    EXPECT_TRUE(sender->cancelRequest(*cancelledRequest));
+    ASSERT_EQ(cancelledFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_THROW(cancelledFuture.get(), std::exception);
+
+    // Reclaim the expired marker under cap pressure while installing a
+    // replacement marker atomically. The transition must not stop the
+    // non-Agent receive loop between late TP peers for the finalized request.
+    std::this_thread::sleep_for(preHandshakeCancellationRetention * 2);
+    std::shared_ptr<LlmRequest> replacementRequest{makeLlmRequest(13)};
+    auto replacementFuture = sender->sendAsync(replacementRequest);
+    EXPECT_TRUE(sender->cancelRequest(*replacementRequest));
+    ASSERT_EQ(replacementFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_THROW(replacementFuture.get(), std::exception);
+    EXPECT_FALSE(sender->cancelRequest(*cancelledRequest));
+
+    connectionManager.publishRequestInfo(makePeerRequestInfo(0));
+    EXPECT_TRUE(connectionManager.waitForRecvConnectCalls(2, std::chrono::seconds{10}));
+    bool const firstPeerRejectedBeforeSecond
+        = connectionManager.getConnection().waitForReadySignalCount(1, std::chrono::seconds{1});
+    EXPECT_TRUE(firstPeerRejectedBeforeSecond);
+    if (firstPeerRejectedBeforeSecond)
+    {
+        EXPECT_EQ(connectionManager.getConnection().getReadySignals(), (std::deque<bool>{false}));
+    }
+
+    // Always publish the second peer so a failing implementation that created
+    // a partial TP2 session can unwind instead of hanging during teardown.
+    connectionManager.publishRequestInfo(makePeerRequestInfo(1));
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(2, std::chrono::seconds{10}));
+    EXPECT_EQ(connectionManager.getConnection().getReadySignals(), (std::deque<bool>{false, false}));
+
+    std::shared_ptr<LlmRequest> liveRequest{makeLlmRequest(14)};
+    addRequestToCache(liveRequest);
+    auto liveFuture = sender->sendAsync(liveRequest);
+    connectionManager.publishRequestInfo(makeControlledRequestInfo(liveRequest->mRequestId, connectionManager));
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(3, std::chrono::seconds{10}));
+    EXPECT_EQ(connectionManager.getConnection().getReadySignals(), (std::deque<bool>{false, false, true}));
+    ASSERT_EQ(liveFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_NO_THROW(liveFuture.get());
+    removeRequestFromCache(liveRequest);
 }
 
 TEST_F(SymmetricalCacheTest, DefaultOffDoesNotCancelPartialAsymmetricHandshake)
