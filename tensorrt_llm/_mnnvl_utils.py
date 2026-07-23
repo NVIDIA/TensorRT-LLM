@@ -390,13 +390,13 @@ class MnnvlMemory:
         # only through PCIe/SYS. Per-device NVLink state therefore cannot
         # distinguish them from an NVSwitch fabric.
         device_name = torch.cuda.get_device_name(dev_id).upper()
-        if " NVL" in device_name:
-            return True
-
         # NVML may report SYSTEM between peers on later NVSwitch platforms, so
         # use this fallback only for the affected Hopper SKUs.
         if not any(sku in device_name for sku in ("H100", "H200")):
             return False
+
+        if " NVL" in device_name:
+            return True
 
         try:
             MnnvlMemory._ensure_nvml_initialized()

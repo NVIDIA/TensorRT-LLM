@@ -80,7 +80,7 @@ def test_nvswitch_topology_remains_supported(
     assert not MnnvlMemory._is_pcie_nvl_sku(0)
 
 
-@patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA B200")
+@patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA B200 NVL")
 @patch.object(MnnvlMemory, "_ensure_nvml_initialized")
 def test_b200_does_not_use_hopper_topology_fallback(mock_initialize, mock_get_device_name) -> None:
     assert not MnnvlMemory._is_pcie_nvl_sku(0)
