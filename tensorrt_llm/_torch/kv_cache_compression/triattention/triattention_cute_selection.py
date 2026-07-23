@@ -50,13 +50,8 @@ def _select_normalize_union_config(
     width: int,
     sm_count: int,
 ) -> tuple[int, int, int]:
-    """Return tokens per lane, token subtiles, and row-cluster CTAs.
-
-    Heuristic: prefer the small token tile (more CTAs, cluster-widened per
-    row) while the whole grid still fits the residency bound below; past it,
-    fall back to the large tile with no clustering so each CTA carries more
-    tokens instead of oversubscribing the SMs.
-    """
+    """Return tokens per lane, token subtiles, and row-cluster CTAs
+    (small clustered tile while the grid fits residency, else the large tile)."""
     row_cluster_ctas = max(1, _MAX_ROW_CLUSTER_CTAS // request_count)
     small_token_tile = _WARP_SIZE * _SMALL_TOKENS_PER_LANE * _SMALL_TOKEN_SUBTILES
     token_tiles = (width + small_token_tile - 1) // small_token_tile
@@ -125,10 +120,8 @@ def _ld_cluster_f32(mapped_addr):
 def _gmem_lane_tile(iterator, flat_index, tokens_per_lane, assumed_align):
     """One lane's gmem tile of ``tokens_per_lane`` fp32 values.
 
-    Folds the (possibly 64-bit) flat index into the pointer BEFORE any
-    element access, so nothing routes through the DSL's 32-bit dynamic
-    coordinate; ``assumed_align`` is the only per-site difference between
-    the vectorized and fallback arms.
+    Folds the 64-bit flat index into the pointer BEFORE element access, so
+    nothing routes through the DSL's 32-bit dynamic coordinate.
     """
     return cute.make_tensor(
         cute.make_ptr(
@@ -207,10 +200,8 @@ class _TriAttentionNormalizeUnionKernel:
                 stream=stream,
             )
         else:
-            # 1D-flattened cluster grid: the X extent is divisible by the
-            # cluster size and cluster peers are consecutive CTAs, so the
-            # kernel's (request, token-tile, rank) decode must keep exactly
-            # this factor order.
+            # Cluster peers are consecutive CTAs: the kernel's (request,
+            # token-tile, rank) decode must keep this factor order.
             kernel.launch(
                 grid=(
                     request_count * self.num_token_tiles * self.row_cluster_ctas,
@@ -236,12 +227,8 @@ class _TriAttentionNormalizeUnionKernel:
         lane_idx: cutlass.Int32,
         from_cluster_peers: cutlass.Constexpr,
     ):
-        """Final peer reduce + union-row store, shared by both arms.
-
-        The peer-reduction source is the ONLY difference between the
-        single-CTA and cluster arms (other warps' smem rows vs DSM cluster
-        peers), selected at trace time by ``from_cluster_peers``.
-        """
+        """Final peer reduce + union-row store, shared by both arms
+        (the peer source is the only difference, picked at trace time)."""
         for token_subtile in cutlass.range_constexpr(self.token_subtiles):
             reduced_values = cute.make_rmem_tensor((self.tokens_per_lane,), cutlass.Float32)
             for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
@@ -269,13 +256,8 @@ class _TriAttentionNormalizeUnionKernel:
                         )
                 reduced_values[token_slot] = union_value
             subtile_first_token = first_token + token_subtile * self.subtile_token_tile
-            # The output row covers this request's own window,
-            # [0, valid - start); the straddling subtile falls back to the
-            # per-token stores. union_scores spans request_count * width
-            # < 2^31 by the host score-plane audit
-            # (triattention.init_eviction_buffers), so the i32 union_index
-            # cannot wrap here -- unlike the scratch, whose offsets fold
-            # through Int64.
+            # Straddling subtiles fall back to per-token stores; union_scores
+            # stays < 2^31 by the host audit, so the i32 index cannot wrap.
             if cutlass.const_expr(self.width % self.tokens_per_lane == 0) and cutlass.dynamic_expr(
                 subtile_first_token + self.tokens_per_lane <= valid_width
             ):
@@ -472,15 +454,10 @@ class _TriAttentionNormalizeUnionKernel:
                         cute.coalesce(score_value_tiles[token_subtile]),
                     )
                 else:
-                    # Fold the 64-bit flat index into the pointer BEFORE the
-                    # per-element loads, exactly like the vectorized branch:
-                    # the score scratch exceeds 2^31 elements at large
-                    # request counts, and indexing ``scores`` with the flat
-                    # Int64 goes through the DSL's 32-bit dynamic coordinate,
-                    # which wraps. This branch runs whenever a request's
-                    # window start is not lane-aligned (any pinned prompt
-                    # length not divisible by ``tokens_per_lane``), so real
-                    # serve cohorts hit it on every eviction round.
+                    # Fold the 64-bit index into the pointer BEFORE the loads:
+                    # the scratch exceeds 2^31 elements and the DSL's 32-bit
+                    # dynamic coordinate wraps. Unaligned window starts hit
+                    # this arm on every real serve round.
                     score_tail = _gmem_lane_tile(
                         scores.iterator, score_index, self.tokens_per_lane, 4
                     )

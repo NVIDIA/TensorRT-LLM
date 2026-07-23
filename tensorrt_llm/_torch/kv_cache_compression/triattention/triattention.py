@@ -13,52 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TriAttention KV-cache compression: periodic physical KV eviction.
+"""TriAttention KV-cache compression: periodic physical KV eviction during generation.
 
-Every ``beta`` confirmed generation tokens TriAttention scores each cached token with a
-trigonometric importance score (computed from offline-calibrated statistics of
-the model's pre-RoPE query vectors) and physically deletes the tokens below the
-top-B keep set. There is no context-phase work and no per-step attention mask:
-the eviction runs in the compression manager's final
-``on_generation_step_end`` hook.
-
-TriAttention is a :class:`BaseKVCacheCompressionManager` and nothing more -- it
-has no attention backend of its own; decode runs the model's standard dense
-kernel over the compacted cache. TriAttention derives each request's effective
-confirmed physical length after V2's native update/rewind and publishes the
-cumulative evicted count on ``LlmRequest.py_num_compressed_tokens``; attention
-metadata reads it back through the KV cache manager on the next step.
-Physical reclaim uses V2's existing resize path directly after compaction. An
-already-enqueued speculative suffix is excluded from scoring and appended
-unchanged to the retained prefix by the same per-layer compact operation.
-With one-model speculative decoding, the separate draft KV cache is compacted
-in the same round with the target's kept token set (union mode only), so
-target and draft always share one physical KV length.
-
-Structure: ``init_eviction_buffers`` is the ONE one-time constructor for the
-whole eviction stack -- it validates the geometry, allocates every buffer,
-compiles the mode-needed CuTe entries eagerly, and builds the C++ compaction
-launch data (``init_compaction_buffers``). The result is a plain namespace of
-tensors, events, and ints. ``stage_eviction_cohort`` and
-``run_eviction_round`` are the per-round flow: straight-line module functions
-that feed the kernels directly.
-
-KV layout: the decode kernel stores keys in HND layout
-``[num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim]``. The Python
-gather / score / compact code MUST read ``get_buffers`` with ``kv_layout="HND"``;
-reading the default NHD silently swaps the token and head axes and scrambles the
-cache.
-
-Position handling: kept keys retain their original RoPE rotation (no re-RoPE on
-compaction). The model engine keeps the decode query at its true absolute
-position while the attention metadata uses the compacted physical length, so a
-query against a kept key at its original rotation still yields the correct
-relative distance.
-
-Calibration is NOT computed here: the user calibrates with the official tool
-(github.com/WeianMao/triattention) and passes that .pt via ``calibration_path``;
-the manager converts it to our runtime schema at load (see _resolve_calibration).
-The scoring math follows the same upstream reference (``methods/pruning_utils.py``).
+Every ``beta`` confirmed tokens, cached tokens are scored with a trigonometric
+importance score from offline calibration and tokens outside the top-``budget``
+keep set are physically deleted; decode runs the model's standard attention over
+the compacted cache. Kept keys keep their original RoPE rotation (no re-RoPE).
+KV pools must be read with ``kv_layout="HND"``. Calibration comes from the
+official tool (github.com/WeianMao/triattention) and is converted at load.
 """
 
 from types import SimpleNamespace
@@ -95,19 +57,16 @@ if TYPE_CHECKING:
 # Required keys for the calibration ``.pt`` consumed by TriAttention.
 _REQUIRED_CALIBRATION_KEYS = frozenset({"E_q", "E_q_norm", "omega", "freq_scale_sq"})
 
-# Generation requests skipped by every eviction step (hoisted: the resolve
-# loop runs per request per decode step).
+# Generation requests skipped by every eviction step.
 _SKIP_REQUEST_STATES = (
     LlmRequestState.GENERATION_COMPLETE,
     LlmRequestState.CONTEXT_INIT,
 )
 
-# Upper bound of the geometric integration offset ladder [1, 2, 4, ...]; no
-# caller ever tuned it, so it is a constant rather than a constructor knob.
+# Upper bound of the geometric integration offset ladder [1, 2, 4, ...].
 _OFFSET_MAX_LENGTH = 65536
 
 
-# Stream-affinity contract: the staged buffers and compiled launches are bound
 def _protected_tail_capacity(manager: KVCacheManagerV2, what: str) -> int:
     """The V2 tail (extra KV + draft reserve + 1) moved with every compaction."""
     capacity = int(manager.num_extra_kv_tokens) + int(manager._kv_reserve_draft_tokens) + 1
@@ -127,8 +86,7 @@ def _allocate_page_table_plane(
 ) -> Tuple[Dict[int, int], int, torch.Tensor, torch.Tensor]:
     """Allocate one staged block-offset plane (host pinned + device).
 
-    The ``("pool", id)`` page-table keys ARE the snapshot slot numbering:
-    one scheme, one constructor contract.
+    The ``("pool", id)`` page-table keys are the snapshot slot numbering.
     """
     representative_slots = {
         representative: int(key[1])
@@ -144,14 +102,7 @@ def _allocate_page_table_plane(
 
 
 def attach_compaction_bundle(bufs: SimpleNamespace, compaction: Dict[str, object]) -> None:
-    """Flatten one compaction bundle into prebound launch fields.
-
-    The bundle's families/draft_pack dicts stay as the build-time
-    description; the round loop fires bare op calls over the tuples
-    prebound here (the args are init-frozen, so per-round dict-chasing is
-    pure overhead). Tests attach standalone bundles through the same
-    helper.
-    """
+    """Flatten one compaction bundle into the prebound launch fields the round fires."""
     bufs.compaction_families = compaction["families"]
     bufs.settle_pack_tensors = compaction["settle_pack_tensors"]
     bufs.settle_pack_shape = compaction["settle_pack_shape"]
@@ -177,8 +128,7 @@ def attach_compaction_bundle(bufs: SimpleNamespace, compaction: Dict[str, object
     draft_args: Tuple[tuple, ...] = ()
     for family in compaction["families"]:
         if family["name"] == "draft":
-            # The draft's own pack launch must precede its moves; keeping the
-            # draft family separate preserves the pack-before-moves order.
+            # Kept separate: the draft pack launch must precede the draft moves.
             draft_args = group_args(family)
         else:
             target_args.extend(group_args(family))
@@ -189,11 +139,7 @@ def attach_compaction_bundle(bufs: SimpleNamespace, compaction: Dict[str, object
         bufs.draft_pack_args = None
         bufs.draft_pack_kwargs = None
         return
-    # One more pack launch broadcasts the target keep set over the draft KV
-    # heads and appends the draft's own tail ordinals. HAS_SETTLE=False
-    # compiles the settle half away (the ordinals arrive pre-settled), so
-    # the settle-side pointer arguments are None; the pack half reads the
-    # settled ordinals through output_indices.
+    # Pack-only launch (HAS_SETTLE=False): settle-side pointers are None.
     bufs.draft_pack_args = (
         None,
         None,
@@ -262,18 +208,10 @@ def init_eviction_buffers(
     draft_page_table_token_capacity: Optional[int] = None,
     draft_protected_tail_capacity: int = 0,
 ) -> SimpleNamespace:
-    """Build the ONE plain namespace of buffers for the whole eviction stack.
+    """Build the one namespace of buffers, compiled launches, and compaction data.
 
-    The single one-time constructor: buffer staging, eager CuTe compilation
-    for exactly the entries the eviction mode launches, selection buffers,
-    and the C++ compaction launch data. Runs outside CUDA graph capture
-    (compilation allocates and synchronizes); the CuTe runner validates its
-    own geometry contract and raises loudly -- there is no fallback path.
-    The returned namespace holds tensors, events, compiled runners, and
-    ints; all flow logic lives in ``stage_eviction_cohort`` and
-    ``run_eviction_round``. The buffers retain references to every scored
-    layer pool: the compiled kernels encode immutable TMA descriptors from
-    their raw device addresses, so the pools must stay alive and stay put.
+    Runs once per geometry, outside CUDA graph capture. The compiled kernels
+    capture raw pool addresses, so the scored pools must stay alive and stay put.
     """
     from .triattention_cute_score_fused import N as PADDED_HEAD_COLUMNS
     from .triattention_cute_score_fused import TriAttentionCuteScoreRunner
@@ -282,8 +220,6 @@ def init_eviction_buffers(
     max_requests = int(max_requests)
     seq_len = int(seq_len)
     page_table_token_capacity = int(page_table_token_capacity)
-    # Decode-width capacity of the score buffers; per-request prompt lengths
-    # are staged runtime metadata.
     decode_width = int(decode_width)
     keep_count = int(keep_count)
 
@@ -337,44 +273,34 @@ def init_eviction_buffers(
             device,
         )
 
-    # ---- per-round metadata table: ONE host-to-device copy per round -------
-    # Three metadata rows (logical position, valid length, prompt length) plus
-    # one move-offsets row per compacted cache family; offsets rows have
-    # request_capacity + 1 entries, hence the extra column.
+    # ---- per-round metadata table: one host-to-device copy per round -------
+    # Rows: logical position, valid length, prompt length, then one
+    # move-offsets row per family (offsets rows need the +1 column).
     bufs.request_metadata_host = torch.empty(
         (6, max_requests + 1), dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
     )
     bufs._bulk_copy_idx_src = torch.arange(
         max_requests, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
     )
-    # Zero-filled so an unstaged cohort gathers the phase table's row 0
-    # instead of indexing it with uninitialized round starts.
+    # Zero-filled: an unstaged cohort must gather the phase table's row 0.
     bufs.request_metadata_device = torch.zeros(
         (6, max_requests + 1), dtype=torch.int32, device=device
     )
     bufs.round_starts_device = bufs.request_metadata_device[0, :max_requests]
     bufs.valid_seq_lens_device = bufs.request_metadata_device[1, :max_requests]
-    # Per-request pinned prompt lengths: the score kernel starts each
-    # request's decode window here, so one bucket may mix prompt lengths.
+    # Per-request pinned prompt lengths (per-request decode window starts).
     bufs.token_starts_device = bufs.request_metadata_device[2, :max_requests]
-    # Rows 3-5 carry the per-family move offsets; the compaction bundle holds
-    # these views as each family's ``offsets``, so they are wiring, not state.
     dense_move_offsets_row = bufs.request_metadata_device[3]
     swa_move_offsets_row = bufs.request_metadata_device[4]
     draft_move_offsets_row = bufs.request_metadata_device[5]
     bufs.mean_cos = torch.empty((max_requests, num_freqs), dtype=torch.float32, device=device)
     bufs.mean_sin = torch.empty_like(bufs.mean_cos)
-    # The phase table depends only on the shared calibration; the manager
-    # shares one dict with every buffer namespace. ``phase=None`` is the ONE
-    # documented test seam: unit fixtures get a private table built here.
+    # ``phase=None`` is the one documented test seam (private table built here).
     if phase is None:
         phase = build_mean_phase_table(offsets, omega, initial_rows=seq_len)
     bufs.phase = phase
 
-    # ---- score state: ONE fused group across ALL dense layers --------------
-    # Segments carry their own page-table slot, so distinct per-layer
-    # storages/block tables share a single launch. Pool geometry, dtype, and
-    # layout are validated by the CuTe runner itself below.
+    # ---- score state: one fused group across all dense layers --------------
     p0 = layer_pools[dense_layers[0]]
     _, kv_factor, num_kv_heads, tokens_per_block, head_dim = p0.shape
     bufs.num_layers = len(dense_layers)
@@ -382,9 +308,8 @@ def init_eviction_buffers(
     bufs.num_kv_heads = int(num_kv_heads)
     bufs.num_freqs = int(num_freqs)
     bufs.tokens_per_block = int(tokens_per_block)
-    # Calibration tables span every model layer; segments index them by
-    # ABSOLUTE layer id ON DEVICE where they cannot be range-checked, so
-    # validate the extent once here, loudly.
+    # Segments index calibration by absolute layer id on device, where it
+    # cannot be range-checked: validate the extent here.
     num_calibrated_layers = q_real.numel() // (bufs.num_q_heads * bufs.num_freqs)
     if min(dense_layers) < 0 or max(dense_layers) >= num_calibrated_layers:
         raise ValueError("scored layer index exceeds the calibrated layer extent")
@@ -403,20 +328,13 @@ def init_eviction_buffers(
     seg_page_off = slot_idx * block_offsets.stride(0) + req_idx * block_offsets.stride(1)
 
     max_segments = max_requests * bufs.num_layers
-    # The K1 epilogue folds the head axis as a DSL dynamic coordinate
-    # (kv_head * N <= 7 score planes of max_segments * seq_len columns each),
-    # so the largest 32-bit-folded offset is 7 planes x the plane stride;
-    # every downstream i32 offset (including the seg_out_offset cast below)
-    # is bounded by it. Wraparound would be a silent wild read, not a clean
-    # error, hence the loud audit.
+    # The score plane must stay 32-bit indexable (wraparound = silent wild read).
     if (PADDED_HEAD_COLUMNS - 1) * max_segments * seq_len >= 2**31:
         raise ValueError(
             "score bucket overflows the 32-bit score plane: "
             f"{(PADDED_HEAD_COLUMNS - 1) * max_segments * seq_len}"
         )
-    # The kernel scores each request's window into a head-major scratch;
-    # all buffers below are persistent because the compiled kernels capture
-    # their device pointers.
+    # Persistent buffers: the compiled kernels capture their device pointers.
     bufs.padded_head_columns = PADDED_HEAD_COLUMNS
     bufs.cute_scratch = torch.empty(
         bufs.num_kv_heads * PADDED_HEAD_COLUMNS * max_segments * seq_len,
@@ -430,16 +348,11 @@ def init_eviction_buffers(
     bufs.gather_columns = torch.arange(decode_width, dtype=torch.int64, device=device).view(
         1, 1, 1, 1, -1
     )
-    # Compile the SM100 CuTe entries this mode launches -- HERE at buffer
-    # construction, outside any CUDA graph capture (compilation allocates and
-    # synchronizes). Union rounds run the fused score+stats+union pipeline;
-    # the per-head modes run the score-only entry. There is deliberately no
-    # other score path and no fallback.
+    # Compile the mode's SM100 CuTe entries; no other score path, no fallback.
     union = eviction_mode == "union"
     bufs.union_rows = None
     if union:
-        # Union output rows are sized by the whole bucket (the widest
-        # possible window); consumers mask by the per-request widths.
+        # Bucket-wide rows; consumers mask by the per-request widths.
         bufs.union_rows = torch.empty((max_requests, seq_len), dtype=torch.float32, device=device)
     try:
         bufs.runner = TriAttentionCuteScoreRunner(
@@ -456,10 +369,7 @@ def init_eviction_buffers(
             seg_page_off=seg_page_off,
             seg_req_id=bufs.seg_req,
             seg_layer_id=seg_layer,
-            # The kernels read per-request lengths and window starts straight
-            # from the staged metadata rows (pointer capture; the rows are
-            # int32 views into the persistent metadata table, so the round
-            # needs no per-round re-marshaling copies for them).
+            # Pointer capture of the staged metadata rows.
             valid_seq_lens=bufs.valid_seq_lens_device,
             seg_out_offset=seg_out_offset,
             token_starts=bufs.token_starts_device,
@@ -482,32 +392,25 @@ def init_eviction_buffers(
     )
 
     # ---- selection buffers --------------------------------------------------
-    # Per-request valid decode widths, refreshed each round from the staged
-    # lengths; prompt offsets alias the staged per-request prompt lengths so
-    # the values are written once per round.
     bufs.valid_widths = torch.full((max_requests,), decode_width, dtype=torch.int32, device=device)
     bufs.prompt_offsets = bufs.token_starts_device
     if union:
         bufs.selection_rows_per_request = 1
         bufs.row_prompt_offsets = bufs.prompt_offsets
-        # The fused pipeline writes normalized per-request union rows straight
-        # into ``combined``; only the top-k settle-and-pack stage remains.
         bufs.combined = torch.empty(
             (max_requests, decode_width), dtype=torch.float32, device=device
         )
         bufs.final_indices = torch.empty(
             (max_requests, keep_count), dtype=torch.int32, device=device
         )
-        # Kept decode ordinals only: rows are prompt-length independent, so
-        # one buffer namespace serves cohorts with mixed prompt lengths.
+        # Kept decode ordinals only (prompt-length independent rows).
         bufs.keep = torch.empty((max_requests, keep_count), dtype=torch.int32, device=device)
         # Row-major views consumed by the top-k settle launch.
         bufs.selection_scores_rows = bufs.combined
         bufs.selection_row_lengths = bufs.valid_widths
         bufs.provisional_rows = bufs.final_indices
         bufs.keep_rows = bufs.keep
-        # Padded rows carry zero valid width; their provisional TopK entries
-        # must still be in-range ordinals for the finalizer's score gather.
+        # Padded rows still need in-range ordinals for the finalizer's gather.
         bufs.final_indices.zero_()
         bufs.score_output = None
     else:
@@ -516,9 +419,7 @@ def init_eviction_buffers(
             if eviction_mode == "per_head"
             else bufs.num_layers * bufs.num_kv_heads
         )
-        # The Triton stats/reduce/settle kernels fold score-row offsets in
-        # int32; both per-head rectangles must stay 32-bit indexable
-        # (wraparound = silent wild reads, not a clean error).
+        # Both rectangles must stay 32-bit indexable (wraparound = wild reads).
         score_rect = max_requests * bufs.num_layers * bufs.num_q_heads * decode_width
         selection_rect = max_requests * selection_rows * max(decode_width, keep_count)
         if max(score_rect, selection_rect) >= 2**31:
@@ -530,8 +431,7 @@ def init_eviction_buffers(
         bufs.row_prompt_offsets = torch.zeros(
             (max_requests * selection_rows,), dtype=torch.int32, device=device
         )
-        # Decode-only per-head scores gathered from the CuTe scratch, the
-        # ``[request, layer, head, token]`` layout the reduce kernels read.
+        # [request, layer, head, token] layout read by the reduce kernels.
         bufs.score_output = torch.empty(
             max_requests,
             bufs.num_layers,
@@ -561,7 +461,6 @@ def init_eviction_buffers(
         bufs.top_indices_i32.zero_()
 
     # ---- compaction launch data + settle/pack fusion ------------------------
-    # One settle program per (request, selection row).
     bufs.settle_grid = (max_requests, bufs.selection_rows_per_request)
     draft_kwargs = {}
     if draft_layers:
@@ -591,22 +490,15 @@ def init_eviction_buffers(
         swa_window=swa_window,
         layer_pool_keys=list(layer_pool_keys),
         protected_tail_capacity=int(protected_tail_capacity),
-        # Tails vary per round (in-flight growth), so the per-family move
-        # offsets ride the staged metadata rows each round.
+        # Per-round tails: the move offsets ride the staged metadata rows.
         dense_move_offsets=dense_move_offsets_row,
         swa_move_offsets=swa_move_offsets_row,
         **draft_kwargs,
     )
-    # Flatten the launch data to plain prebound fields: ONE fused launch
-    # settles the kept ordinals and packs the dense/SWA move sources
-    # (``settle_top_tokens``); ``run_eviction_round`` fires the draft pack
-    # and every family's C++ moves as bare prebound calls.
     attach_compaction_bundle(bufs, compaction)
 
     # ---- round-ordering events ----------------------------------------------
     bufs.copy_done = torch.cuda.Event()
-    # First record publishes constructor allocations to the V2 copy stream;
-    # later records protect pinned metadata before the next cohort reuses it.
     bufs.copy_done.record(torch.cuda.current_stream(device))
     bufs.bulk_copy_done = torch.cuda.Event()
     bufs.bulk_consume_done = torch.cuda.Event()
@@ -626,18 +518,11 @@ def _stage_block_offsets(
 ) -> None:
     """Copy one request group's V2 block offsets before live compaction.
 
-    Uses the V2 block-offset kernel with an immutable pinned snapshot of the
-    selected host-table rows: this enqueues asynchronous host-memory reads,
-    and TriAttention later resizes the same cache, which mutates the
-    manager's table in place. The IndexMapper synchronously resolves request
-    slots and gathers only their beam-0 K block offsets, decoupling both live
-    inputs before the native asynchronous copy consumes the snapshot with
-    identity indices. ``dst[pool, r, 0(K), :]`` holds ``base_page *
-    index_scales``; score and compact decode that K plane inline.
+    Gathers an immutable pinned snapshot of the beam-0 K block offsets before
+    the asynchronous device copy (resize later mutates the live host table).
     """
     if bufs.copy_pending and not bufs.copy_done.query():
         bufs.copy_done.synchronize()
-    # The native device copy reads only K and derives V with kv_offset.
     manager.index_mapper.gather_k_block_offsets(
         manager.host_kv_cache_block_offsets,
         source,
@@ -671,20 +556,15 @@ def stage_eviction_cohort(
 ) -> None:
     """Copy one eviction cohort into the reusable device buffers.
 
-    ``token_starts`` carries each request's pinned prompt length; the score
-    kernel starts that request's decode window there, so the cohort may mix
-    prompt lengths.
+    ``token_starts`` carries each request's pinned prompt length (per-request
+    decode window start), so one cohort may mix prompt lengths.
     """
     request_count = len(request_ids)
     stream = torch.cuda.current_stream(bufs.device)
-    # Reuse guard: staging over a cohort whose pages are still being read
-    # would silently corrupt the in-flight compaction.
     if bufs.page_tables_active:
         raise RuntimeError("previous page-table cohort is still active")
     request_metadata = torch.as_tensor((round_starts, seq_lens, token_starts), dtype=torch.int32)
-    # Grow the phase table while this cohort's round starts are still host
-    # integers: a stale-capacity gather is an out-of-bounds index_select on
-    # the device.
+    # Must grow while the round starts are still host integers.
     grow_mean_phase_table(bufs.phase, int(max(round_starts)) + 1)
     _stage_block_offsets(
         bufs,
@@ -706,11 +586,8 @@ def stage_eviction_cohort(
             bufs.draft_copy_block_count,
         )
     bufs.request_metadata_host[:3, :request_count].copy_(request_metadata)
-    # Rows past this cohort are padding: zero lengths keep the score kernel
-    # and selection inert for them.
+    # Zero lengths keep the score kernel and selection inert for padded rows.
     bufs.request_metadata_host[:3, request_count:].zero_()
-    # This round's per-family move offsets ride the same table, so the single
-    # device copy below carries them too.
     for row, family_offsets in (
         (3, dense_move_offsets),
         (4, swa_move_offsets),
@@ -721,17 +598,13 @@ def stage_eviction_cohort(
                 torch.as_tensor(family_offsets, dtype=torch.int32)
             )
     try:
-        # Copy the fixed backing once. Only the first ``request_count``
-        # columns are consumed by this cohort.
         bufs.request_metadata_device.copy_(bufs.request_metadata_host, non_blocking=True)
     finally:
-        # Guard the pinned metadata until its asynchronous copies complete.
-        # Page-table device-buffer reuse is guarded separately after compact.
+        # Guards the pinned metadata until the asynchronous copies complete.
         bufs.copy_done.record(stream)
         bufs.copy_pending = True
     bufs.page_tables_active = True
-    # The staged per-request prompt lengths are shared with the selection;
-    # per-head modes re-expand them into their row-major view here.
+    # Per-head modes re-expand the prompt lengths into their row-major view.
     if bufs.row_prompt_offsets is not bufs.prompt_offsets:
         bufs.row_prompt_offsets.view(bufs.max_requests, bufs.selection_rows_per_request).copy_(
             bufs.prompt_offsets.unsqueeze(1).expand(-1, bufs.selection_rows_per_request)
@@ -739,12 +612,7 @@ def stage_eviction_cohort(
 
 
 def mark_page_tables_consumed(bufs: SimpleNamespace, *manager_streams: torch.cuda.Stream) -> None:
-    """Order V2 page-table reuse and resize after this cohort's compact.
-
-    Every passed manager stream (target, and the draft when co-compressed)
-    waits on one event recorded after the compact launches, so neither cache
-    can free or reallocate pages this cohort is still reading.
-    """
+    """Order V2 page-table reuse and resize after this cohort's compact."""
     if not bufs.page_tables_active:
         raise RuntimeError("TriAttention page tables were not staged")
     bufs.bulk_consume_done.record(torch.cuda.current_stream(bufs.device))
@@ -754,14 +622,10 @@ def mark_page_tables_consumed(bufs: SimpleNamespace, *manager_streams: torch.cud
 
 
 def settle_top_tokens(bufs: SimpleNamespace) -> None:
-    """Pick the top-k with the CuTE selector, then settle its output.
+    """Pick the top-k, settle ties to sorted ordinals, and pack the move sources.
 
-    The CuTE top-k is fast but breaks score ties arbitrarily and emits
-    indices in arbitrary order; the settle kernel recomputes the threshold
-    membership with lowest-index-wins ties, rebases each row by its prompt
-    offset, and writes sorted ordinals. The same launch packs each request's
-    dense/SWA compaction move sources from the ordinals it just settled
-    (buffers built without compaction compile the pack half away).
+    The settle kernel resolves the selector's arbitrary tie-breaks with
+    lowest-index-wins and rebases each row by its prompt offset.
     """
     # The trailing 1 is next_n: decode scores one query token per request.
     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
@@ -789,24 +653,15 @@ def settle_top_tokens(bufs: SimpleNamespace) -> None:
 
 
 def run_eviction_round(bufs: SimpleNamespace, normalize_scores: bool) -> None:
-    """One staged eviction round, kernels fired directly in sequence.
+    """Fire one staged eviction round: score, select, settle, compact.
 
-    Union: phase gather (also derives valid widths), fused score+stats+union
-    (two CuTe launches), top-k, settle-and-pack, C++ compacts. Per-head
-    modes: phase gather, score-only CuTe launch, decode-window gather,
-    stats+reduce kernels, top-k, settle-and-pack, C++ compacts. A
-    co-compressed draft adds its own pack launch before its C++ moves.
-    Every launch covers the full request capacity; padded rows past the
-    staged cohort carry zero lengths and stay inert.
+    Every launch covers the full request capacity; padded rows carry zero
+    lengths and stay inert.
     """
     request_count = bufs.max_requests
     union = bufs.eviction_mode == "union"
     with nvtx_range("triattention.score", color="blue"):
-        # mean_cos/mean_sin feed the compiled score launches, which captured
-        # their device pointers: refresh them in place from this round's
-        # staged round starts. The same launch derives the per-request valid
-        # decode widths; the compiled kernels read valid lengths and window
-        # starts straight from the staged metadata rows (pointer capture).
+        # In-place refresh: the compiled score launches captured these pointers.
         gather_mean_phases(
             bufs.phase,
             bufs.round_starts_device,
@@ -816,8 +671,6 @@ def run_eviction_round(bufs: SimpleNamespace, normalize_scores: bool) -> None:
             bufs.token_starts_device,
             bufs.valid_widths,
             request_count,
-            # The prompt offsets may have been re-staged since construction;
-            # the same launch rebases this round's SWA landing positions.
             swa_destination_bases=bufs.swa_destination_bases,
             rebase_delta=bufs.swa_rebase_delta,
         )
@@ -829,12 +682,9 @@ def run_eviction_round(bufs: SimpleNamespace, normalize_scores: bool) -> None:
             bufs.combined[:request_count, :columns].copy_(bufs.union_rows[:request_count, :columns])
         else:
             bufs.runner.launch(request_count, bufs.mean_cos, bufs.mean_sin)
-            # The kernel wrote each request's window scores (from its pinned
-            # prompt length) into the head-major scratch, padded to the MMA
-            # tile N=8 per KV head. Gather each request's decode window into
-            # the [request, layer, head, token] layout the reduce kernels
-            # read; columns past a request's valid width carry unscored
-            # scratch data masked by ``valid_widths``.
+            # Gather each decode window from the head-major scratch into the
+            # [request, layer, head, token] layout the reduce kernels read;
+            # columns past a request's valid width are masked downstream.
             group_size = bufs.num_q_heads // bufs.num_kv_heads
             num_segments = request_count * bufs.num_layers
             pad = bufs.padded_head_columns
@@ -876,8 +726,7 @@ def run_eviction_round(bufs: SimpleNamespace, normalize_scores: bool) -> None:
             )
         settle_top_tokens(bufs)
     with nvtx_range("triattention.compact", color="purple"):
-        # Bare prebound calls (``attach_compaction_bundle``); the draft's own
-        # pack launch precedes its moves.
+        # Prebound calls; the draft pack launch precedes the draft moves.
         for args in bufs.compact_launch_args:
             torch.ops.trtllm.sparse_kv_cache_compact_layers(*args)
         if bufs.draft_pack_args is not None:
@@ -891,12 +740,9 @@ def run_eviction_round(bufs: SimpleNamespace, normalize_scores: bool) -> None:
 class TriAttention(BaseKVCacheCompressionManager):
     """Periodic physical KV eviction driven by trigonometric importance scoring.
 
-    Overrides ``on_generation_step_end``: every ``beta`` confirmed generation tokens it
-    reads the cached keys through the ``KVCacheManagerV2``, scores each token
-    with offline-calibrated stats, and physically evicts the tokens below the
-    keep set. Full-attention layers are scored; kernel-masked SWA layers preserve
-    their latest window in the same compacted prefix. Every layer ends with the
-    same request-wide cached length.
+    Scores full-attention layers every ``beta`` confirmed tokens and evicts
+    below the keep set; kernel-masked SWA layers keep their latest window.
+    Every layer ends with the same request-wide cached length.
     """
 
     adjusts_generation_kv_length = True
@@ -919,9 +765,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         self.beta = beta
         if self.budget <= 0 or self.beta <= 0:
             raise ValueError("TriAttention budget and beta must both be positive")
-        # Which token set each eviction round keeps. The user-facing meaning of
-        # each mode is documented on TriAttentionKvCacheCompressionConfig
-        # (llm_args); implementation notes live above the selection helpers.
         self.eviction_mode = eviction_mode
         if self.eviction_mode not in ("union", "per_head", "per_layer_perhead"):
             raise ValueError(
@@ -930,27 +773,20 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
         self.normalize_scores = bool(normalize_scores)
         if self.eviction_mode == "union" and not self.normalize_scores:
-            # The fused score+stats+union CuTe pipeline is THE union path
-            # and always z-normalizes.
             raise ValueError(
                 "TriAttention union eviction requires normalize_scores=True: "
                 "the fused union pipeline always z-normalizes score rows"
             )
         self.pin_prefill = bool(pin_prefill)
-        # cpt=False (default): budget counts DECODE tokens only (pinned prompt is
-        # extra). cpt=True: budget INCLUDES the pinned prompt.
+        # False (default): the budget counts decode tokens only.
         self.count_prompt_tokens = bool(count_prompt_tokens)
         if not self.pin_prefill or self.count_prompt_tokens:
             raise ValueError(
                 "TriAttention physical KV reclaim requires pin_prefill=True and "
                 "count_prompt_tokens=False so finalized prompt KV is preserved"
             )
-        # All physical moves use the C++ V2 compaction operation.
-        # No other compaction path exists.
-        # Calibration is the OFFICIAL TriAttention .pt (passed via
-        # calibration_path), resolved + converted on the first request
-        # (on_request_init). TRT-LLM does NOT compute calibration; model_path is
-        # used for RoPE tables and local layer_types/sliding_window metadata.
+        # Calibration is the official TriAttention .pt, converted on the
+        # first request; TRT-LLM does not compute calibration.
         self.model_path = model_path
         if self.model_path is None:
             raise ValueError(
@@ -965,31 +801,22 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._F: Optional[int] = None
         self._freq_scale_sq: Optional[torch.Tensor] = None
 
-        # Geometric integration offsets (built lazily on first eviction so the
-        # device matches the cache pool).
+        # Geometric integration offsets, built lazily on first eviction.
         self._offsets: Optional[torch.Tensor] = None
-        # Mean-phase table dict, shared by reference with every buffer
-        # namespace so it persists across buffer rebuilds.
+        # Mean-phase table dict, shared by reference with every buffer namespace.
         self._phase: Optional[Dict[str, object]] = None
 
-        # Request presence records successful initialization. Each value is a
-        # plain dict {generation_steps, evicted_tokens}.
+        # Per-request {generation_steps, evicted_tokens}.
         self._request_states: Dict[int, Dict[str, object]] = {}
-        # The overlap executor prepares B(n) before finalizing B(n-1). Keep a
-        # bare reference to that in-flight batch; its membership id-set and
-        # the fixed-linear growth constant (1 + the reserved draft width,
-        # which bounds every step's actual draft) are resolved lazily on the
-        # first overlap miss. The final hook treats those slots as an opaque
-        # suffix.
+        # In-flight overlap batch reference; membership id-set and the growth
+        # constant (1 + reserved draft width) resolve lazily.
         self._prepared_generation_batch: Optional[object] = None
         self._prepared_generation_ids: Optional[set] = None
         self._generation_growth: Optional[int] = None
-        # Manager-invariant validation and tail capacity are memoized (the
-        # loud raises still fire on the first request).
+        # Memoized manager invariants.
         self._v2_validated = False
         self._protected_tail_cache: Optional[int] = None
-        # The eviction buffers are built once at the first eviction, sized to
-        # capacity bounds, and reused for the manager's lifetime.
+        # Built once at the first eviction, reused for the manager's lifetime.
         self._buffers: Optional[SimpleNamespace] = None
         self._buffers_fingerprint: Optional[tuple] = None
         self._local_to_global_layers_cache: Optional[List[int]] = None
@@ -1000,11 +827,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._draft_runtime_kv_layout_cache: Optional[Dict[str, object]] = None
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
-        """Mark capacity-only decode and resolve calibration once.
-
-        Loads the user-supplied OFFICIAL calibration .pt and converts it to our
-        runtime schema (see _resolve_calibration). TRT-LLM does not calibrate.
-        """
+        """Validate once and resolve the official calibration for the first request."""
         request_id = request.py_request_id
         if request_id not in self._request_states:
             self._validate_v2_compatibility()
@@ -1020,7 +843,6 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _validate_request_capacity(self, request: "LlmRequest") -> None:
         """Require enough target page-table capacity to reach first eviction."""
         manager = self.kv_cache_manager
-        # V2 mirrors the resolved speculative draft length (0 without spec).
         speculative_overshoot = int(manager.max_draft_len)
         first_eviction_decode_length = (
             self.budget // self.beta + 1
@@ -1082,10 +904,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         self.calibration = self._resolve_calibration()
         self._H = int(self.calibration["E_q"].shape[1])
         self._F = int(self.calibration["E_q"].shape[2])
-        # Squared per-frequency RoPE scaling factor (required calibration key).
         self._freq_scale_sq = self.calibration["freq_scale_sq"].to(dtype=torch.float32)
-        # Pre-split query stats + MLR coefficient for the score kernel so
-        # it doesn't recompute (E_q_norm - |E_q|) per call. Shapes [L, H, F].
+        # Pre-split query stats + MLR coefficient, shapes [L, H, F].
         _Eq = self.calibration["E_q"]
         self._triattn_q_real = _Eq.real.to(torch.float32).contiguous()
         self._triattn_q_imag = _Eq.imag.to(torch.float32).contiguous()
@@ -1095,11 +915,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._calibrated = True
 
     def _validate_v2_compatibility(self) -> None:
-        """Reject runtime modes outside the V2 physical-compaction contract.
-
-        Manager-invariant, so the O(num_layers) scans run once; the loud
-        raise still fires on the first request.
-        """
+        """Reject runtime modes outside the V2 physical-compaction contract (memoized)."""
         if self._v2_validated:
             return
         manager = self.kv_cache_manager
@@ -1118,9 +934,8 @@ class TriAttention(BaseKVCacheCompressionManager):
             raise ValueError("TriAttention requires beam-width-one decoding")
         if manager.enable_swa_scratch_reuse:
             raise RuntimeError("TriAttention does not support V2 SWA scratch page-table remapping")
-        # Speculative feature gates (resolved draft length, linear drafting,
-        # mode whitelist) run in the factory, where spec_config lives. The
-        # draft cache itself is validated here whenever one is attached.
+        # Speculative feature gates run in the factory; the draft cache itself
+        # is validated here.
         draft_manager = self.draft_kv_cache_manager
         if draft_manager is not None:
             if not draft_manager.is_draft:
@@ -1162,23 +977,12 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
         self._v2_validated = True
 
-    # The framework drives all request-lifecycle hooks. TriAttention resolves
-    # calibration on request init, evicts periodically at generation-step end,
-    # and removes per-request state at finish. It scores from offline
-    # calibration, not from live queries or attention scores, so it needs no
-    # per-layer attention hook: the whole eviction runs once per period in
-    # on_generation_step_end, which loops the layers and reads each layer's keys
-    # straight from the KV pool.
-
     def on_generation_step_end(self, scheduled_batch: "ScheduledRequests", **kwargs) -> None:
         """Compact after native KV-cache updates have finalized this iteration.
 
-        The compression manager is ordered after KVCacheManagerV2, so capacity
-        already reflects the written token and any rewind. The overlap scheduler
-        may already have enqueued the next forward; CUDA stream ordering keeps
-        compaction after that reader. The resize happens only after compaction;
-        it detaches the compacted tail without blocking the host, while V2's
-        per-slot finish events prevent early page reuse.
+        Runs after KVCacheManagerV2 (capacity reflects the written token and
+        any rewind); CUDA stream ordering keeps compaction after any already
+        enqueued overlap forward.
         """
         with nvtx_range_debug("triattention.generation_step_end", color="blue"):
             self._periodic_evict(scheduled_batch)
@@ -1191,12 +995,7 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _inflight_generation_growth(
         self, scheduled_batch: "ScheduledRequests", request_id: int
     ) -> int:
-        """Return exact newer target allocation width under overlap scheduling.
-
-        The width is the fixed-linear constant ``1 + reserved draft`` for
-        members of the prepared batch (the reserve bounds every step's
-        actual draft; the configured-tail guard enforces the bound).
-        """
+        """Return the in-flight allocation width (1 + reserved draft) under overlap."""
         prepared = self._prepared_generation_batch
         if prepared is None or scheduled_batch is prepared:
             return 0
@@ -1216,8 +1015,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         self,
         scheduled_batch: "ScheduledRequests",
     ) -> None:
-        """Count confirmed tokens; every ``beta`` tokens score the cache
-        and physically evict to the pinned prompt plus top-B decode tokens."""
+        """Every ``beta`` confirmed tokens, evict to the pinned prompt + top-B set."""
         gen_requests = scheduled_batch.generation_requests
         if not gen_requests:
             return
@@ -1247,17 +1045,12 @@ class TriAttention(BaseKVCacheCompressionManager):
         prepared: List[Dict[str, object]] = []
         protected_tail_capacity = self._configured_protected_tail_capacity()
 
-        # Resolve every active target cache before changing cadence state (the
-        # captured cache objects thread all the way to resize -- V2 map
-        # lookups happen once per step), building the due cohort's
-        # per-request eviction metadata in the same pass --
-        # ``_evict_requests`` trusts it as-is.
+        # The resolved cache objects thread all the way to resize; the due
+        # cohort's metadata is built in the same pass.
         with nvtx_range("triattention.metadata", color="cyan"):
             for request, request_id, kv_cache in resolved_requests:
-                # Step accounting and the beta cadence gate come first: a
-                # non-due request costs two dict ops and two int ops. The
-                # capacity/tail math and the consistency raises run in the
-                # due branch, at the point their values are consumed.
+                # Cadence gate first; capacity/tail math and the consistency
+                # raises run in the due branch.
                 request_state = self._request_states[request_id]
                 previous_step = request_state["generation_steps"]
                 step = previous_step + 1 + int(request.py_num_accepted_draft_tokens)
@@ -1265,11 +1058,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                 if previous_step // self.beta >= step // self.beta:
                     continue
                 raw_capacity = int(kv_cache.capacity)
-                # One-engine speculative decoding keeps a fixed reserve E.
-                # Under overlap, B(n) is allocated/enqueued before finalizing
-                # B(n-1), so its exact scheduler growth Q is also opaque. Both
-                # spans are contiguous after the stable target prefix and move
-                # byte-for-byte.
+                # Speculative reserve + in-flight overlap growth: contiguous
+                # after the stable prefix, moved byte-for-byte.
                 protected_tail = int(mgr.num_extra_kv_tokens) + self._inflight_generation_growth(
                     scheduled_batch, request_id
                 )
@@ -1310,9 +1100,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                         "kv_cache": kv_cache,
                         "draft_kv_cache": draft_kv_cache,
                         "seq_len": int(seq_len),
-                        # Restore the uncompressed confirmed logical position
-                        # from the physical prefix and cumulative eviction
-                        # count.
+                        # Uncompressed logical position (prefix + evicted).
                         "round_start": int(seq_len + request_state["evicted_tokens"]),
                         "prompt_len": min(int(request.py_prompt_len), int(seq_len)),
                         "expected_keep_count": expected_keep_count,
@@ -1320,18 +1108,10 @@ class TriAttention(BaseKVCacheCompressionManager):
                     }
                 )
 
-        # Compact all affected dense and kernel-masked SWA layers, then release
-        # the unreachable tail directly through V2's public resize primitive.
-        # Prompt lengths and tails are per-request metadata, so the whole due
-        # cohort runs as one batched round (the buffers hold max_batch_size
-        # requests, which bounds any generation batch).
         if not prepared:
             return
         num_layers = self._num_layers_from_manager()
-        # Ungated NVTX with the due count in the message, so any nsys capture
-        # shows how many requests each eviction round carries. This path runs
-        # outside CUDA-graph capture, so the dynamic message is safe; the cost
-        # is one host-side f-string per eviction round.
+        # Ungated NVTX: the due count in the message shows each round's size.
         with nvtx_range(
             f"triattention.evict_request_group reqs={len(prepared)}",
             color="purple",
@@ -1340,13 +1120,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._resize_compacted_requests(capacity_targets, protected_tails)
 
     def _resize_compacted_requests(self, capacity_targets, protected_tails) -> None:
-        """Release each compacted tail through the caches resolved this hook.
-
-        ``capacity_targets`` threads the ``(request_id, kv_cache,
-        draft_kv_cache, keep_count)`` tuples resolved by ``_periodic_evict``
-        within this same synchronous hook, so no V2 map re-lookup happens
-        here; only the cheap is_active guard remains.
-        """
+        """Release each compacted tail through the resolved cache objects."""
         if not capacity_targets:
             return
         with nvtx_range("triattention.resize", color="red"):
@@ -1367,9 +1141,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                             f"to {resized_capacity} tokens"
                         )
                 if self.draft_kv_cache_manager is not None:
-                    # The draft cache was compacted with the same kept token
-                    # set, so it shrinks to the same retained length plus its
-                    # own protected tail.
+                    # Same kept set: the draft shrinks to the same retained
+                    # length plus its own tail.
                     draft_protected_tail = self._draft_protected_tail_capacity()
                     for rid, _, draft_kv_cache, target_capacity in capacity_targets:
                         if not draft_kv_cache.is_active:
@@ -1382,13 +1155,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                             )
 
     def _minimum_evictable_length(self, request: "LlmRequest", seq_len: int) -> int:
-        """Return the largest cache length for which selection is an identity.
-
-        With a decode-only budget, pinned prompt tokens do not consume ``budget``.
-        Selection therefore keeps every token until the cache exceeds
-        ``prompt_len + budget``. The constructor guarantees the decode-only
-        budget (``pin_prefill=True``, ``count_prompt_tokens=False``).
-        """
+        """Return the largest cache length for which selection is an identity
+        (decode-only budget: everything is kept up to ``prompt_len + budget``)."""
         prompt_len = min(int(request.py_prompt_len), seq_len)
         return prompt_len + self.budget
 
@@ -1428,11 +1196,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         return self._protected_tail_cache
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
-        """Drop this request's per-request length and eviction state."""
+        """Drop this request's eviction state; the buffers stay resident."""
         self._request_states.pop(request.py_request_id, None)
-        # The buffers stay resident across idle periods: their memory is a
-        # deliberate one-time cost and rebuilding it per burst would reintroduce
-        # allocation on the decode hot path.
 
     # ================================================================== #
     # Helpers (eviction / scoring / V2 cache access / calibration)       #
@@ -1485,9 +1250,8 @@ class TriAttention(BaseKVCacheCompressionManager):
     ) -> Tuple[List[int], List[int], Optional[int]]:
         """Return dense layers, kernel-masked SWA layers, and the SWA window.
 
-        TriAttention initialization has already rejected real V2 windowed
-        lifecycles. A sliding layer found here is therefore stored at full length
-        and applies its window only in the attention kernel.
+        SWA layers here are stored at full length; the window applies only in
+        the attention kernel.
         """
         cached = self._attention_layer_partition_cache
         if cached is not None:
@@ -1553,10 +1317,8 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _runtime_kv_layout(self, num_layers: int) -> Dict[str, object]:
         """Return stable V2 pool views and layer groups for eviction.
 
-        KVCacheManagerV2 keeps GPU virtual addresses and layer geometry stable,
-        while opt-in pool rebalance can change the page dimension. Cache all
-        layer views, then query the live page count for one representative per
-        physical pool before reuse (fail-closed rebalance check).
+        Cached; re-checks live pool page counts before reuse (pool rebalance
+        is rejected fail-closed).
         """
         cached = self._runtime_kv_layout_cache
         manager = self.kv_cache_manager
@@ -1608,9 +1370,8 @@ class TriAttention(BaseKVCacheCompressionManager):
     ) -> Dict[str, object]:
         """Build the manager-lifetime layer and pool views one eviction reads.
 
-        ``dense_storage_groups`` restricts the compaction groups to the dense
-        layers (target cache); None groups every layer (draft cache, which has
-        no SWA partition). ``what`` prefixes error messages ("" or "draft ").
+        ``dense_storage_groups=None`` groups every layer (draft cache);
+        ``what`` prefixes error messages.
         """
         num_layers = len(global_layers)
         maybe_layer_pools = [manager.get_buffers(layer, kv_layout="HND") for layer in global_layers]
@@ -1655,12 +1416,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         )
 
     def _draft_runtime_kv_layout(self) -> Dict[str, object]:
-        """Return stable draft V2 pool views, mirroring ``_runtime_kv_layout``.
-
-        The draft cache is compacted with the target's kept token set, so its
-        layout has no scoring role: every draft layer is dense and there is no
-        SWA partition.
-        """
+        """Return stable draft V2 pool views, mirroring ``_runtime_kv_layout``."""
         manager = self.draft_kv_cache_manager
         if manager is None:
             raise RuntimeError("TriAttention has no draft KV cache manager to lay out")
@@ -1734,12 +1490,7 @@ class TriAttention(BaseKVCacheCompressionManager):
     ) -> SimpleNamespace:
         """Return the eviction buffers, building them once at first use.
 
-        The request capacity follows the executor's max batch size (memory
-        scales linearly with it) and the decode-width capacity follows the
-        eviction bound (compaction keeps the scored decode region near
-        ``budget`` plus one period of growth), so one set of buffers serves
-        every round. It is rebuilt only when the pool views change or a
-        round outgrows it.
+        Rebuilt only when the pool views change or a round outgrows them.
         """
         if not prepared:
             raise ValueError("TriAttention eviction requires at least one request")
@@ -1779,25 +1530,15 @@ class TriAttention(BaseKVCacheCompressionManager):
             needed_width,
             self.budget + 2 * self.beta + int(mgr.max_total_draft_tokens or 0),
         )
-        # Bucket the score scratch by what cohorts actually present instead of
-        # pinning it to max_seq_len: with pinned prompts the post-compaction
-        # length is bounded by prompt + budget + slack, so one power-of-two
-        # bucket serves the steady state, and a cohort that outgrows it simply
-        # rebuilds the buffers through the capacity check above. A
-        # max_seq_len floor would make the scratch unindexable in 32 bits and
-        # tens of GiB at large batch for work that never scores past ~1K
-        # tokens per request.
+        # Power-of-two bucket sized by the presented cohorts, NOT max_seq_len
+        # (a max_seq_len floor would break 32-bit indexing at large batch).
         seq_capacity = max(int(needed_page_tokens), 1024)
         seq_capacity = 1 << (seq_capacity - 1).bit_length()
         seq_capacity = min(seq_capacity, max(int(mgr.max_seq_len), int(needed_page_tokens)))
-        # The CuTe score kernel stores full compute tiles into a scratch
-        # strided by this bucket capacity, so the capacity must be
-        # tile-aligned (the geometry gate rejects anything else). Rounding up
-        # costs at most one tile of scratch per segment.
+        # The bucket capacity must be tile-aligned (mis-tiled buckets stripe
+        # the score scratch silently).
         score_tile_tokens = max(64, int(mgr.tokens_per_block))
         seq_capacity = -(-seq_capacity // score_tile_tokens) * score_tile_tokens
-        # Mis-tiled buckets stripe the score scratch silently; the builder
-        # guarantees alignment right here.
         assert seq_capacity % score_tile_tokens == 0
         page_table_token_capacity = max(needed_page_tokens, seq_capacity + tail_capacity)
 
@@ -1827,7 +1568,7 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         first_pool = layout["layer_pools"][layout["dense_layers"][0]]
         if self._offsets is None:
-            # Upstream pruning_utils.build_geometric_offsets: [1, 2, 4, ... <= max].
+            # Upstream geometric offsets [1, 2, 4, ... <= max].
             self._offsets = torch.tensor(
                 [float(1 << i) for i in range(_OFFSET_MAX_LENGTH.bit_length())],
                 device=first_pool.device,
@@ -1883,11 +1624,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         prepared: Sequence[Dict[str, object]],
         capacity: int,
     ) -> Tuple[List[int], Optional[List[int]], Optional[List[int]]]:
-        """Build this round's per-family move offsets, padded to the capacity.
-
-        Rows past the cohort repeat the final offset, so padded requests move
-        nothing in the pack kernel and the C++ compact launches.
-        """
+        """Build this round's per-family move offsets, padded to the capacity
+        (padded rows repeat the final offset and move nothing)."""
 
         def padded_offsets(moves_per_request: List[int]) -> List[int]:
             offsets = [0]
@@ -1945,13 +1683,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         prepared: List[Dict[str, object]],
         num_layers: int,
     ) -> List[Tuple[int, int]]:
-        """Score and compact a prepared cohort, returning ``(request_id, capacity)`` targets.
+        """Score and compact a prepared cohort, returning the resize targets.
 
-        ``prepared`` carries the per-request eviction metadata resolved by
-        ``_periodic_evict`` (every entry is due and evictable). Only
-        full-attention layers participate in scoring. For kernel-masked SWA
-        layers, the latest model window is rebased to the tail of the common
-        compacted prefix before the request-wide capacity is reduced.
+        Only full-attention layers are scored; kernel-masked SWA layers keep
+        their latest window rebased into the compacted prefix.
         """
         with nvtx_range_debug("triattention.resolve_layout", color="blue"):
             layout = self._runtime_kv_layout(num_layers)
@@ -1992,10 +1727,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                 raise RuntimeError("TriAttention attempted an identity compaction")
             request_state = self._request_states[item["request_id"]]
             request_state["evicted_tokens"] += evicted
-            # Publish the cumulative count on the request: this is the
-            # manager's only channel to the runtime. The model engine
-            # reads it back where it builds num_cached_tokens_per_seq,
-            # so the kernels see the compacted KV length next step.
+            # The manager's only channel to the runtime: the engine subtracts
+            # it where it builds num_cached_tokens_per_seq.
             item["request"].py_num_compressed_tokens = request_state["evicted_tokens"]
             capacity_targets.append(
                 (item["request_id"], item["kv_cache"], item["draft_kv_cache"], keep_count)

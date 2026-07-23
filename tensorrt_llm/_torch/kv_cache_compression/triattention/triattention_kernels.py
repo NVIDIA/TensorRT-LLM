@@ -1,22 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU kernels for the TriAttention KV-eviction pipeline.
+"""Triton kernels, launch helpers, and mean-phase table builders for TriAttention.
 
-Scoring runs EXCLUSIVELY through the SM100 CuTe-DSL fused score pack
-(``triattention_cute_score_fused.py``): mean aggregation, BF16 KV pools,
-head size 64/128, 32/128-token pages, GQA group 4 or 8, per-request score
-window starts. Any geometry outside that contract raises loudly at
-workspace construction. The per-head modes use the pack's score-only entry
-plus the row-stats kernel; union eviction runs the fused
-score+stats+union pipeline. One-time buffer staging and runner compilation
-live in ``triattention.init_eviction_buffers``; this module keeps the
-Triton kernels, their launch helpers, and the mean-phase table builders.
-
-House rules honored throughout:
-  * fp32 math (loads up-cast to fp32, fp32 accumulators, fp32 score output).
-  * int64 for every flat buffer offset that can exceed 2^31.
-  * mask ragged valid-width tails (and frequency tails) in every load and store.
-  * the kernels are vendored in this module (no lazy-load hub).
+Scoring itself runs through the SM100 CuTe pack in
+``triattention_cute_score_fused.py``. House rules: fp32 math, int64 for any
+flat offset that can exceed 2^31, mask every ragged tail, kernels vendored here.
 """
 
 from __future__ import annotations
@@ -32,15 +20,11 @@ import triton.language as tl
 # --------------------------------------------------------------------------- #
 
 
-# Positions past this row count are no longer exactly representable in fp32,
-# so a larger table would silently degrade every downstream phase.
+# Positions past this row count are not exactly representable in fp32.
 _MEAN_PHASE_MAX_ROWS = 1 << 24
 
-# Score z-normalization epsilon, shared with the CuTe union pipeline
-# (triattention_cute_selection.py imports it): both kernels bake the same
-# literal, keeping the eviction modes' normalization consistent. Plain float
-# (the CuTe DSL traces it directly); the Triton stats kernel receives it as
-# an explicit constexpr parameter.
+# Score z-normalization epsilon, shared with the CuTe union pipeline. Plain
+# float: the CuTe DSL traces it; the Triton kernel takes it as a constexpr arg.
 STD_EPSILON = 1e-6
 
 
@@ -61,19 +45,13 @@ def _gather_mean_phase_kernel(
     F_BLOCK: tl.constexpr,
     HAS_SWA: tl.constexpr,
 ):
-    """Copy each request's precomputed phase-table row into the fixed buffers.
-
-    The same launch derives the request's valid decode width (valid length
-    minus window start), and with SWA layers also rebases the round's SWA
-    landing positions (window start plus the init-frozen delta), so the
-    round needs no separate subtraction or rebase launches.
-    """
+    """Copy each request's phase-table row; derive valid widths and, with
+    SWA layers, the rebased SWA landing positions in the same launch."""
     request = tl.program_id(0)
     frequency = tl.arange(0, F_BLOCK)
     frequency_mask = frequency < NUM_FREQS
     table_row = tl.load(round_starts + request).to(tl.int64)
-    # Clamp stale or padded round starts into the table instead of faulting;
-    # staged cohorts are host-validated, so live rows are never clamped.
+    # Clamp stale or padded round starts instead of faulting.
     table_row = tl.minimum(tl.maximum(table_row, 0), table_rows - 1)
     source_offset = table_row * NUM_FREQS + frequency
     output_offset = request * NUM_FREQS + frequency
@@ -90,15 +68,9 @@ def _gather_mean_phase_kernel(
 def build_mean_phase_table(
     offsets: torch.Tensor, omega: torch.Tensor, initial_rows: int
 ) -> Dict[str, object]:
-    """Build the plain-dict mean-phase table shared by every workspace.
+    """Build the plain-dict mean-phase table shared (by reference) by every workspace.
 
-    Row ``p`` holds ``mean_o(trig((p + offset_o) * omega_f))`` over the
-    calibration offsets for every frequency, so refreshing a round's
-    ``mean_cos``/``mean_sin`` is one pure-gather launch over the staged round
-    starts. The dict is shared BY REFERENCE between the manager and its
-    workspace, so ``grow_mean_phase_table`` reaches both. Grow the table while
-    the round starts are still host integers; the gather kernel clamps stale
-    rows instead of faulting.
+    Row ``p`` holds ``mean_o(trig((p + offset_o) * omega_f))`` per frequency.
     """
     phase: Dict[str, object] = {
         "offsets": offsets.contiguous(),
@@ -127,8 +99,7 @@ def grow_mean_phase_table(phase: Dict[str, object], rows: int) -> None:
     positions = torch.arange(target, device=omega.device, dtype=torch.float32)
     cos_table = torch.zeros((target, omega.numel()), dtype=torch.float32, device=omega.device)
     sin_table = torch.zeros_like(cos_table)
-    # Accumulate offset-by-offset in fp32 (fixed summation order keeps the
-    # table bit-stable across rebuilds).
+    # Fixed summation order keeps the table bit-stable across rebuilds.
     for offset in phase["offset_values"]:
         angle = torch.outer(positions + offset, omega)
         cos_table += torch.cos(angle)
@@ -152,13 +123,8 @@ def gather_mean_phases(
     swa_destination_bases: Optional[torch.Tensor] = None,
     rebase_delta: int = 0,
 ) -> None:
-    """Refresh the fixed mean buffers and valid widths from staged metadata.
-
-    With SWA layers the same launch rebases ``swa_destination_bases``
-    (window start + ``rebase_delta``); without them the HAS_SWA branch is
-    compiled away and the pointer argument is None. Writes in place because
-    the compiled CuTe score launch captured the destination buffers' device
-    pointers. CUDA-only; eviction never runs under CUDA graph capture.
+    """Refresh the mean buffers, valid widths, and (with SWA) the rebased
+    landing positions, in place: the compiled score launch captured the pointers.
     """
     num_freqs = phase["omega"].numel()
     _gather_mean_phase_kernel[(request_count,)](
@@ -241,10 +207,8 @@ def _score_per_head_reduce_kernel(
 ):
     """Reduce query-head score rows into one selector row per KV-head domain.
 
-    per_layer: row (layer, kv_head) = max over the KV head's query group.
-    Otherwise: row kv_head = mean over layers of that per-layer group max.
-    Optionally z-normalizes each query-head row with the precomputed
-    mean/inv-std before reducing.
+    per_layer: row (layer, kv_head) = max over the KV head's query group;
+    otherwise row kv_head = mean over layers of that per-layer group max.
     """
     request = tl.program_id(0)
     selection_row = tl.program_id(1)
@@ -318,8 +282,7 @@ def prepare_per_head_scores(
     num_kv_heads = int(num_kv_heads)
     _, num_layers, num_query_heads, width = scores.shape
     selection_rows = num_layers * num_kv_heads if per_layer else num_kv_heads
-    # 256 lanes / 4 warps: one program spans the row in a few static loop
-    # trips without starving occupancy; matches the settle/pack shape.
+    # 256 lanes / 4 warps, matching the settle/pack shape.
     stats_block = 256
     rows = num_layers * num_query_heads
     if normalize_scores:
@@ -362,10 +325,7 @@ def prepare_per_head_scores(
 # --------------------------------------------------------------------------- #
 
 
-# Launch shape of the settle/pack kernel: tokens per program along the
-# width/move axis, and its warp count. One pair for every launch site (the
-# fused settle, the draft pack, and the standalone test packs) so a retune
-# cannot diverge silently.
+# Settle/pack launch shape, shared by every launch site.
 SETTLE_PACK_BLOCK = 256
 SETTLE_PACK_NUM_WARPS = 4
 
@@ -398,24 +358,12 @@ def _settle_ties_and_pack_compaction_sources_kernel(
 ):
     """Settle one selection row's ties, then pack its compaction move sources.
 
-    One program per (request, selection row). The settle half recovers the
-    threshold from the provisional top-k, counts the strictly greater
-    scores, then emits the kept ordinals in increasing order
-    (lowest-index-wins ties), rebased by the row's pinned prompt length.
-    The pack half then writes the move sources for the packed rows this
-    selection row feeds: the kept ordinals it just wrote, the request's
-    protected tail, plus the SWA rows (latest window). Union selection has
-    one row per request feeding every KV head's packed row, so that single
-    program writes all of them. ``HAS_SETTLE=False`` compiles the settle
-    half away, packing pre-settled ordinals read from ``output_indices`` --
-    the draft co-compaction flow, whose keep set is the target's and needs
-    no settling.
-
-    The increasing-ordinal emission and the tail placement are LOAD-BEARING
-    for the consumer: sparseKvCacheCompactOp.cpp's forward tiled in-place
-    copy requires increasing source ordinals with
-    ``destinationBases[request] + move <= source[move]`` (the SWA window
-    inequality is the SWA-family instance of the same invariant).
+    One program per (request, selection row): settle emits the kept ordinals
+    (lowest-index-wins ties, prompt-rebased), pack writes the move sources
+    (kept ordinals + protected tail + SWA rows). ``HAS_SETTLE=False`` packs
+    pre-settled ordinals from ``output_indices`` (draft co-compaction).
+    Emission order is load-bearing: the C++ compact requires increasing
+    ordinals with ``destination_bases[request] + move <= source[move]``.
     """
     request = tl.program_id(0)
     selection_domain = tl.program_id(1)
@@ -424,9 +372,7 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     if HAS_SETTLE:
         row_scores = scores + row * WIDTH
         row_selected = provisional_indices + row * KEEP_COUNT
-        # Scores are decode-relative; this row's pinned prompt length rebases
-        # the emitted ordinals to absolute positions (per row, so one launch
-        # may mix prompt lengths).
+        # Rebases the decode-relative ordinals to absolute positions.
         prompt_len = tl.load(prompt_offsets + row)
 
         threshold = float("inf")
@@ -438,11 +384,8 @@ def _settle_ties_and_pack_compaction_sources_kernel(
                 mask=selected_mask,
                 other=0,
             )
-            # Rows shorter than KEEP_COUNT arrive padded with -1 sentinels
-            # from the top-k's short-row path (zero-width padded rows are all
-            # sentinels). Mask those lanes out of the gather so no lane
-            # dereferences ``row_scores - 1`` and a sentinel never joins the
-            # threshold; rows without sentinels load exactly as before.
+            # Short rows arrive padded with -1 sentinels from the top-k;
+            # masked out so no lane dereferences ``row_scores - 1``.
             selected_valid = selected_mask & (token_index >= 0)
             selected_score = tl.load(
                 row_scores + token_index,
@@ -490,9 +433,7 @@ def _settle_ties_and_pack_compaction_sources_kernel(
             ties_seen += tl.sum(tied_i32)
 
     if HAS_SETTLE:
-        # The emission above scatters through other lanes of this program;
-        # make those global stores visible to every lane before the pack
-        # half reads the row back.
+        # Make the settled row's scattered stores visible before the pack half.
         tl.debug_barrier()
     dense_begin = tl.load(dense_offsets + request)
     dense_end = tl.load(dense_offsets + request + 1)
@@ -511,8 +452,7 @@ def _settle_ties_and_pack_compaction_sources_kernel(
         )
         dense_source = tl.where(move < KEEP_COUNT, selected, valid_len + move - KEEP_COUNT)
         if UNION:
-            # The one union row per request feeds every KV head's packed
-            # row with the same move sources.
+            # The one union row per request feeds every KV head's packed row.
             for head in tl.static_range(0, NUM_KV_HEADS):
                 tl.store(
                     dense_indices + head * DENSE_TOTAL + dense_begin.to(tl.int64) + move,
@@ -536,9 +476,7 @@ def _settle_ties_and_pack_compaction_sources_kernel(
             else:
                 swa_mask = move < swa_count
                 if PER_LAYER:
-                    # Per-layer selection has one dense domain per (layer,
-                    # head). SWA uses one shared source row per head, so
-                    # only the first layer's domains write it.
+                    # SWA has one shared row per head; first layer's domains write it.
                     swa_mask = swa_mask & (selection_domain < NUM_KV_HEADS)
                 head = selection_domain % NUM_KV_HEADS
                 swa_output = head.to(tl.int64) * SWA_TOTAL + swa_begin.to(tl.int64) + move

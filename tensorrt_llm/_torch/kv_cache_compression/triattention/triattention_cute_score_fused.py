@@ -128,10 +128,8 @@ class _TriAttentionScoreKernel:
         # cos/sin/mlr coefficient planes per frequency.
         self.k_coeff = 3 * num_freqs
         self.tokens_per_block = tokens_per_block
-        # One 128-token compute tile either matches a page exactly
-        # (128-token pages: one TMA box per phase) or spans several pages
-        # (32-token pages: four page fragments per phase, one TMA box each
-        # into the same transaction barrier).
+        # One compute tile = one page (128-token pages) or four page
+        # fragments (32-token pages), one TMA box each.
         self.box_tokens = min(CTA_M, tokens_per_block)
         self.fragments_per_phase = CTA_M // self.box_tokens
         self.pages_per_tile = self.fragments_per_phase
@@ -233,12 +231,7 @@ class _TriAttentionScoreKernel:
     ):
         """One raw-K band's fragment copies into an acquired pipeline stage.
 
-        The CALLER owns the pipeline handshake (producer_acquire before,
-        state.advance after): the double-buffered prefetch shares ONE
-        acquire/advance across its dynamic destination arms, so the
-        handshake cannot live here. ``band`` is the trace-time real/imag
-        plane index; ``page_fragments`` is only read for the multi-fragment
-        specialization (None otherwise).
+        The caller owns the pipeline handshake (acquire before, advance after).
         """
         raw_tma_atom, raw_tma_global_partition, kv_head, raw_tma_descriptor_ptr = stage_args
         for fragment in cutlass.range_constexpr(self.fragments_per_phase):
@@ -305,10 +298,8 @@ class _TriAttentionScoreKernel:
             tcgen05.CtaGroup.ONE,
             self.mma_tiler[:2],
         )
-        # Split raw-K transport: one real and one imaginary stage per
-        # raw-page buffer, each a CTA_M x num_freqs bf16 tile
-        # (raw_tma_copy_bytes per phase); the descriptor encoder picks the
-        # SW64/SW128 swizzle from the num_freqs row width.
+        # One real + one imaginary CTA_M x num_freqs bf16 stage per
+        # raw-page buffer; swizzle follows the num_freqs row width.
         raw_bf16_direct_a_smem_layout = sm100_utils.make_smem_layout_a(
             raw_bf16_tiled_mma,
             (CTA_M, N, self.num_freqs),
@@ -511,11 +502,7 @@ class _TriAttentionScoreKernel:
         valid_seq_len = valid_seq_lens[req_id]
         page_off = seg_page_off[segment]
         out_base = seg_out_offset[segment]
-        # Per-request score window start (the request's pinned prompt
-        # length), loaded like the other per-segment metadata: each CTA
-        # owns one segment, so its whole schedule derives from one start.
-        # Scratch writes stay absolute; only the scoring/stats domain and
-        # the first scored page move per request.
+        # Per-request score window start; scratch writes stay absolute.
         score_start = cutlass.Int32(token_starts[req_id])
 
         smem = utils.SmemAllocator()
@@ -555,11 +542,8 @@ class _TriAttentionScoreKernel:
             (self.raw_tma_feature_extent, self.box_tokens),
             coord=(None, None, None),
         )
-        # One smem view and TMA partition per page fragment of the
-        # 128-token tile, for each of the four stage slices. Fragment f
-        # lands box_tokens rows deeper in the same stage; the offset is a
-        # whole multiple of the swizzle period, so the descriptor swizzle
-        # stays phase-aligned.
+        # One smem view/TMA partition per page fragment; fragment offsets
+        # are whole swizzle periods.
         raw_tma_shared_partition_real = []
         raw_tma_shared_partition_imag = []
         raw_tma_shared_partition_real_next = []
@@ -675,10 +659,7 @@ class _TriAttentionScoreKernel:
                     )
                     if cutlass.const_expr(self.fragments_per_phase > 1):
                         for fragment in cutlass.range_constexpr(1, self.pages_per_tile):
-                            # The tail tile may not reach this fragment's
-                            # page; clamp to the first fragment (those
-                            # scores lie past the valid width and are
-                            # masked downstream) so the TMA never
+                            # Clamp the tail fragment's page so the TMA never
                             # dereferences an unstaged block entry.
                             fragment_page_id = producer_prefetched_page_id_lane0
                             if tile_start_token + fragment * self.box_tokens < valid_seq_len:
@@ -735,10 +716,8 @@ class _TriAttentionScoreKernel:
             num_threads=EPILOGUE_THREADS,
         )
         cute.arch.mbarrier_init_fence()
-        # Build the per-(head, frequency) score coefficients: the cos/sin
-        # bands rotated by the mean future phase (scale*(qr*C - qi*S),
-        # scale*(qr*S + qi*C)) split into bf16 value+residual pairs, and the
-        # MLR magnitude coefficient split into fp16 pairs.
+        # Per-(head, frequency) score coefficients, split into bf16/fp16
+        # value+residual pairs.
         for weight_round in cutlass.range_constexpr(N * self.k_coeff // THREADS):
             linear_index = tidx + weight_round * THREADS
             qg = linear_index // self.k_coeff
@@ -746,11 +725,8 @@ class _TriAttentionScoreKernel:
             coefficient_kind = feature // self.num_freqs
             frequency = feature % self.num_freqs
             mean_offset = req_id * self.num_freqs + frequency
-            # GQA groups below the minimum MMA tile N=8 ride padded
-            # columns: they read the group's first head (any valid
-            # address) and force zero coefficients, so the padded score
-            # columns come out zero and land in scratch rows the union
-            # finalizer never reads.
+            # Padded GQA columns read the group's first head and force
+            # zero coefficients.
             qg_read = qg
             if cutlass.const_expr(self.group_size < N):
                 if qg_read >= self.group_size:
@@ -879,10 +855,7 @@ class _TriAttentionScoreKernel:
             raw_imag_stage = raw_real_stage + 1
             if cutlass.const_expr(not self.write_partial_stats):
                 if warp_idx == self.producer_warp_id:
-                    # Phase 0 fills the packed real-band stage view
-                    # (CTA_M x num_freqs bf16, raw_tma_copy_bytes).
-                    # Every producer-warp lane participates in the
-                    # PipelineTmaAsync barrier election.
+                    # Phase 0 fills the packed real-band stage view.
                     raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
                     self._stage_raw_band_copies(
                         raw_tma_pipeline,
@@ -1178,13 +1151,8 @@ class _TriAttentionScoreKernel:
                 # phase after all of its asynchronous consumers finish.
                 raw_tma_pipeline.consumer_release(raw_tma_consumer_state)
                 raw_tma_consumer_state.advance()
-            # Every term multiplying sum_seq must stay 64-bit: with
-            # request*layer segments of seq_len columns the score-plane
-            # stride alone can exceed 2^31. The scratch head axis is
-            # padded to the MMA tile N=8 per KV head (group-4 columns
-            # 4..7 land in padded score planes holding zero scores). The
-            # host audit in triattention.init_eviction_buffers bounds the
-            # 32-bit head-axis fold (kv_head * N <= 7 planes) here.
+            # Every term multiplying sum_seq must stay 64-bit (the plane
+            # stride can exceed 2^31; the host audit bounds the head fold).
             output_offset = cutlass.Int64(kv_head * N) * sum_seq + out_base + tile_start_token
             page_output = cute.make_tensor(
                 output.iterator + output_offset,
@@ -1217,10 +1185,7 @@ class _TriAttentionScoreKernel:
                         tTR_rAcc,
                     )
                     tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))
-                    # The window start is a per-request runtime value, so
-                    # the tile-interior fast path is a dynamic predicate;
-                    # only the straddling first tile takes the per-token
-                    # branch.
+                    # Only the straddling first tile takes the per-token branch.
                     if cutlass.dynamic_expr(
                         tile_start_token >= score_start and tile_start_token + CTA_M <= self.seq_len
                     ):
@@ -1300,10 +1265,8 @@ class _TriAttentionScoreKernel:
                     sStats[stats_scratch_base + 1] = stats_square_sum
             cute.arch.barrier()
             if warp_idx == 0:
-                # Padded head columns (GQA group below the MMA tile N=8)
-                # carry zero scores; only the real heads' statistics are
-                # merged and written, in the compact row layout the union
-                # finalizer reads (row = segment * num_q_heads + q_head).
+                # Only real heads' statistics merge into the compact row
+                # layout (row = segment * num_q_heads + q_head).
                 if lane_idx < self.group_size:
                     stats_sum = cutlass.Float32(0.0)
                     stats_square_sum = cutlass.Float32(0.0)
@@ -1577,11 +1540,8 @@ class TriAttentionCuteScoreRunner:
         variants = [(1, SMALL_WORKLOAD_PAGE_SHARDS)]
         if max_requests > 1:
             variants.append((max_requests, 2))
-        # ONE compile ritual: per-head runners compile the score-only entry,
-        # the union runner ONLY its fused stats+union pipeline (plus the
-        # normalize finalizer below). Same cache keys and compile order as
-        # the former per-variant blocks; write_partial_stats=False is the
-        # kernel's default, so passing it explicitly is a no-op.
+        # Per-head runners compile the score-only entry; the union runner
+        # only its fused stats+union pipeline.
         kernel_kwargs = dict(
             num_layers=num_layers,
             seq_len=seq_len,
@@ -1676,10 +1636,8 @@ class TriAttentionCuteScoreRunner:
                                 num_layers=num_layers,
                                 seq_len=seq_len,
                                 num_q_heads=num_q_heads,
-                                # The score scratch pads each KV head's group
-                                # of score planes to the MMA tile N=8; the
-                                # finalizer maps real head rows onto those
-                                # padded planes (identity for GQA group 8).
+                                # The finalizer maps real head rows onto the
+                                # N=8-padded score planes.
                                 num_kv_heads=num_kv_heads,
                                 page_shards=page_shards,
                                 tokens_per_lane=tokens_per_lane,

@@ -15,17 +15,8 @@
 
 """Batched physical KV-cache compaction for eviction-based compression.
 
-Contract: the caller supplies increasing kept decode ordinals per selection
-row (absolute positions), each request's valid length and pinned prompt
-length, and the staged V2 block offsets; the surviving KV then moves in
-place through batched C++ compact launches, fed by per-request move indices
-packed on device. Everything is plain tensors and dicts:
-``init_compaction_buffers`` allocates the launch data once per geometry and
-returns one bundle whose fields the eviction driver fires directly each
-round -- the target's dense/SWA packing rides the driver's fused settle
-launch (described by the bundle's ``settle_pack_tensors``/
-``settle_pack_shape``); the driver also fires the co-compressed draft's own
-pack launch (``draft_pack``) and every family's C++ moves.
+``init_compaction_buffers`` allocates plain-dict launch data once per
+geometry; the eviction driver fires the bundle's fields directly each round.
 """
 
 from collections import OrderedDict
@@ -40,12 +31,8 @@ def _make_move_indices(
     request_count: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Packed source-index buffer sized for the widest per-request moves.
-
-    The per-request move offsets are always caller-owned rows (refreshed
-    together with the round metadata in one copy), so only the index
-    rectangle is allocated here.
-    """
+    """Packed source-index buffer sized for the widest per-request moves
+    (the move offsets are caller-owned rows)."""
     return torch.empty(
         (*index_prefix, moves_per_request * request_count), dtype=torch.int32, device=device
     )
@@ -57,13 +44,9 @@ def _compact_groups(
     device: torch.device,
     per_layer_slots: Optional[Dict[int, int]] = None,
 ) -> Tuple[Dict[str, object], ...]:
-    """Batch layers into one C++ launch per uniform V2 pool.
-
-    Each returned dict is the plain launch data for one
-    ``sparse_kv_cache_compact_layers`` call. ``per_layer_slots`` maps each
-    layer to its selection row; it is only set when every dense layer keeps
-    its own token set (per-layer eviction).
-    """
+    """Batch layers into one ``sparse_kv_cache_compact_layers`` launch per
+    uniform V2 pool. ``per_layer_slots`` maps layers to selection rows
+    (per-layer eviction only)."""
     grouped = OrderedDict()
     for layer, pool, page_table in entries:
         key = (
@@ -130,41 +113,12 @@ def init_compaction_buffers(
     swa_move_offsets: Optional[torch.Tensor] = None,
     draft_move_offsets: Optional[torch.Tensor] = None,
 ) -> Dict[str, object]:
-    """Allocate the per-geometry compaction launch data as one plain dict.
+    """Allocate per-geometry compaction launch data for the driver's round.
 
-    ``union``/``per_layer`` are the two selection-geometry facts consumed
-    here: one shared selection row per request (union), or one per
-    (layer, KV head) (per_layer), else one per KV head. Dense layers keep
-    the prompt in place and compact the selected decode tokens plus any
-    target KV reserved for the next overlapped forward; kernel-masked SWA
-    layers keep the latest window plus the same protected tail. A
-    co-compressed draft cache reuses the target's single-row kept ordinals
-    (broadcast over the draft's own KV-head count) plus the draft's own
-    protected tail, landing at the same destination base.
-
-    The driver's settle launch packs increasing kept decode ordinals
-    (absolute positions) per selection row into the index buffers here;
-    prompt tokens never move, so the rectangle is prompt-length independent
-    and ``prompt_offsets`` carries each request's pinned prompt length. The
-    increasing order is LOAD-BEARING: sparseKvCacheCompactOp.cpp's forward
-    tiled in-place copy requires increasing source ordinals with
-    ``destinationBases[request] + move <= source[move]``. ``kv_block_offsets`` is the staged V2 snapshot
-    ``[slot, request, K/V, block]`` (offset = ``2*page + plane``);
-    ``protected_tail_capacity`` is the widest per-request tail this geometry
-    must support -- actual per-round lengths arrive through the staged
-    move-offset rows, which are caller-owned. Nothing launches here: the
-    target's dense/SWA packing rides the driver's fused settle launch
-    (``settle_pack_tensors`` + ``settle_pack_shape`` describe it) and the
-    driver's round function fires the draft pack (``draft_pack``) and every
-    family's C++ moves directly.
-
-    Returns EXACTLY the launch data the driver fires: ``families`` (each
-    ``{"name", "groups", "source", "offsets", "destination_bases"}``),
-    ``settle_pack_tensors``/``settle_pack_shape``, ``draft_pack`` (``None``
-    or ``{"indices", "offsets", "dense_total", "move_capacity",
-    "num_kv_heads"}``), ``swa_destination_bases``, and ``swa_rebase_delta``
-    (per-round SWA destination rebase). The bundle is launch data, not an
-    input mirror.
+    Selection rows: union = one per request; per_layer = one per (layer, KV
+    head); else one per KV head. Move sources must be increasing kept ordinals
+    with destination_bases[request] + move <= source[move] (C++ in-place copy
+    contract). Returns the launch bundle the round function fires directly.
     """
     device = layer_pools[dense_layers[0]].device
     request_count = int(request_count)
@@ -174,8 +128,7 @@ def init_compaction_buffers(
     swa_layers = tuple(int(layer) for layer in swa_layers)
     layer_pool_keys = tuple(layer_pool_keys)
 
-    # The C++ compact op takes the KV-head count from each launch's pool
-    # shape [pages, K/V, heads, tokens, dim].
+    # Pool shape [pages, K/V, heads, tokens, dim].
     num_kv_heads = int(layer_pools[dense_layers[0]].shape[2])
     dense_index_prefix = (len(dense_layers), num_kv_heads) if per_layer else (num_kv_heads,)
     dense_move_indices = _make_move_indices(
@@ -199,14 +152,9 @@ def init_compaction_buffers(
     swa_move_indices = None
     swa_entries = []
     if not swa_layers:
-        # No SWA family: drop the unused offsets row. With SWA layers the
-        # argument must stay live so the family reads the per-round staged
-        # offsets instead of its construction-time sizes.
         swa_move_offsets = None
         swa_window = 0
     else:
-        # Per-request window validity (prompt + decode keep >= window) is
-        # prompt-dependent and checked by the caller each round.
         swa_window = int(swa_window)
         swa_destination_bases = torch.empty_like(prompt_offsets)
         swa_move_indices = _make_move_indices(
@@ -226,14 +174,10 @@ def init_compaction_buffers(
         ]
 
     dense_slots = {layer: slot for slot, layer in enumerate(dense_layers)} if per_layer else None
-    # Selection rows carry decode-only kept ordinals (already absolute), so
-    # the rectangle is prompt-length independent. HAS_SWA specializes the SWA
-    # loads and stores away, so without SWA layers the SWA pointer arguments
-    # are None (the Triton optional-pointer convention).
+    # Without SWA layers the SWA pointer args are None (HAS_SWA=False).
     has_swa = swa_move_indices is not None
     swa_total = int(swa_move_indices.shape[-1]) if has_swa else 0
-    # Widest per-request move count any staged offsets may express; the
-    # packing loop covers exactly this many move slots per packed row.
+    # Widest per-request move count any staged offsets may express.
     move_capacity = decode_keep_count + protected_tail_capacity
     if has_swa:
         move_capacity = max(move_capacity, swa_window + protected_tail_capacity)
@@ -257,9 +201,6 @@ def init_compaction_buffers(
     families = [
         dict(
             name="dense",
-            # The fused selection-side settle launch packs the dense/SWA move
-            # sources when it finalizes the kept ordinals; only the C++ moves
-            # consume these buffers. Each round then packs exactly once.
             groups=_compact_groups(dense_entries, layer_pool_keys, device, dense_slots),
             source=dense_move_indices,
             offsets=dense_move_offsets,
@@ -267,7 +208,6 @@ def init_compaction_buffers(
         )
     ]
     if swa_layers:
-        # The fused dense pack fills the SWA move buffers in the same launch.
         families.append(
             dict(
                 name="swa",
@@ -281,8 +221,7 @@ def init_compaction_buffers(
     if draft_layers:
         draft_tail = int(draft_protected_tail_capacity or 0)
         draft_layers = tuple(int(layer) for layer in draft_layers)
-        # The draft forms its own launch groups so it may use a different
-        # KV-head count than the target.
+        # Own launch groups: the draft may use a different KV-head count.
         draft_num_kv_heads = int(draft_layer_pools[draft_layers[0]].shape[2])
         draft_move_indices = _make_move_indices(
             (draft_num_kv_heads,),
@@ -302,10 +241,7 @@ def init_compaction_buffers(
             )
             for layer in draft_layers
         ]
-        # In union mode the pack kernel reads selection row 0 for every packed
-        # row, so the driver fires one more pack launch broadcasting the
-        # target keep set over the draft KV heads and appending the draft's
-        # own tail ordinals; these are that launch's geometry constants.
+        # Geometry constants for the draft's own pack launch.
         draft_pack = dict(
             indices=draft_move_indices,
             offsets=draft_move_offsets,
@@ -331,7 +267,6 @@ def init_compaction_buffers(
         settle_pack_shape=settle_pack_shape,
         draft_pack=draft_pack,
         swa_destination_bases=swa_destination_bases,
-        # The prompt offsets may be re-staged each round; the driver rebases
-        # the SWA landing positions with this delta before the moves.
+        # Per-round SWA destination rebase delta.
         swa_rebase_delta=decode_keep_count - swa_window,
     )
