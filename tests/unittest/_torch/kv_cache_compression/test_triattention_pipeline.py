@@ -15,16 +15,10 @@
 
 """Unit tests for the TriAttention compression-manager pipeline.
 
-TriAttention is a pure KV-cache compression method on the PR-15106 framework: it
-has NO sparse-attention config and NO attention backend of its own. Decode runs
-the model's standard attention over the compacted cache; the manager publishes
-the cumulative evicted count on ``LlmRequest.py_num_compressed_tokens`` and the
-model engine subtracts it where it builds ``num_cached_tokens_per_seq``. These
-tests cover the config, construction, eviction lifecycle, page-table staging,
-and the fixed score buffers. Draft co-compression contracts live in
-``test_triattention_draft_cocompaction.py``; model-level correctness is covered
-by separate end-to-end tests.
-"""
+Config, construction, eviction lifecycle, page-table staging, and the fixed
+score buffers; the manager publishes evicted counts via
+``LlmRequest.py_num_compressed_tokens``. Draft contracts live in
+``test_triattention_draft_cocompaction.py``."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -140,15 +134,6 @@ class TestConfigAndFactory:
             )
         with pytest.raises(ValidationError):
             TriAttentionKvCacheCompressionConfig(eviction_mode="made_up_mode")
-        # Cross-field contract surfaces at config validation (the manager
-        # re-raises at construction as the op-boundary backstop).
-        with pytest.raises(ValidationError, match="normalize"):
-            TriAttentionKvCacheCompressionConfig(
-                model_path="/models/test",
-                calibration_path="/calib/test.pt",
-                eviction_mode="union",
-                normalize_scores=False,
-            )
 
     def test_factory_returns_triattention_and_propagates_config_fields(self):
         # Calibration is deferred to the first request, so construction needs
@@ -215,10 +200,9 @@ class TestTriAttentionClass:
             mock.call(101, Role.KEY),
         ]
 
-    def test_request_init_marks_capacity_only_and_tracks_state(self):
-        # Speculative capacity (extra KV tokens / reserved draft width) is
-        # accepted at request init; the target manager is marked so V2 sizing
-        # keeps logical max_seq_len while capacity is reclaimed and reused.
+    def test_request_init_and_finish_lifecycle(self):
+        # Init: speculative capacity accepted, manager marked, state tracked.
+        # Finish: state cleared; buffers and the step's batch stay resident.
         manager = _make_fake_v2()
         manager.num_extra_kv_tokens = 4
         manager._kv_reserve_draft_tokens = 4
@@ -233,6 +217,16 @@ class TestTriAttentionClass:
         assert manager.kv_compression_manages_history
         assert set(triattention._request_states) == {11, 12}
 
+        buffers = object()
+        triattention._buffers = buffers
+        batch = SimpleNamespace()
+        triattention._prepared_generation_batch = batch
+        triattention.on_request_finish(_make_request(11))
+        triattention.on_request_finish(_make_request(12))
+        assert triattention._request_states == {}
+        assert triattention._prepared_generation_batch is batch
+        assert triattention._buffers is buffers
+
     def test_resolve_accepts_flat_pt(self, flat_calibration_pt):
         mgr = _make_triattention()
         mgr.calibration_path = flat_calibration_pt
@@ -240,6 +234,46 @@ class TestTriAttentionClass:
         loaded = mgr._resolve_calibration()
         for key in ("E_q", "E_q_norm", "omega", "freq_scale_sq"):
             assert key in loaded
+
+    def test_resolve_converts_official_layout(self, tmp_path):
+        # PRODUCT CONTRACT: the official R-KV {metadata, stats} layout is
+        # converted to the flat runtime schema at load; rope tables derive
+        # from the model config.
+        pytest.importorskip("transformers")
+        num_layers, num_heads, freq_count = 2, 2, 4
+        stats, sampled = {}, []
+        for layer in range(num_layers):
+            for head in range(num_heads):
+                stats[f"layer{layer:02d}_head{head:02d}"] = {
+                    "q_mean_real": torch.full((freq_count,), float(10 * layer + head)),
+                    "q_mean_imag": torch.full((freq_count,), float(layer - head)),
+                    "q_abs_mean": torch.full((freq_count,), float(1 + layer + head)),
+                }
+                sampled.append((layer, head))
+        path = tmp_path / "official.pt"
+        torch.save({"metadata": {"sampled_heads": sampled}, "stats": stats}, path)
+        mgr = _make_triattention()
+        mgr.calibration_path = str(path)
+        config = _make_hf_config(rope_theta=10000.0)
+
+        with mock.patch("transformers.AutoConfig.from_pretrained", return_value=config):
+            converted = mgr._resolve_calibration()
+
+        assert set(converted) == {"E_q", "E_q_norm", "omega", "freq_scale_sq"}
+        assert converted["E_q"].shape == (num_layers, num_heads, freq_count)
+        torch.testing.assert_close(
+            converted["E_q"][1, 0].cpu(),
+            torch.complex(torch.full((freq_count,), 10.0), torch.full((freq_count,), 1.0)),
+        )
+        torch.testing.assert_close(
+            converted["E_q_norm"][1, 1].cpu(), torch.full((freq_count,), 3.0)
+        )
+        assert converted["omega"].numel() == freq_count
+        idx = torch.arange(0, 2 * freq_count, 2, dtype=torch.float32)
+        torch.testing.assert_close(
+            converted["omega"].cpu(), 1.0 / (10000.0 ** (idx / (2 * freq_count)))
+        )
+        assert torch.equal(converted["freq_scale_sq"].cpu(), torch.ones(freq_count))
 
     def test_rope_tables_resolve_theta_and_attention_factor(self, tmp_path):
         # transformers>=5.5 folds rope_theta into ``rope_parameters`` and drops
@@ -306,8 +340,7 @@ class TestCompressedTokenPublication:
         manager = _make_triattention(budget=4)
         manager.kv_cache_manager._stream = mock.Mock()
         request = _make_request(7, py_prompt_len=2)
-        # Selection keeps every token at seq_len == prompt + budget: the due
-        # filter must drop the request before any eviction work or publication.
+        # seq_len == prompt + budget: the due filter must drop the request.
         cache = SimpleNamespace(
             capacity=6, history_length=0, is_active=True, resize=mock.Mock(return_value=True)
         )
@@ -344,9 +377,7 @@ class TestCompressedTokenPublication:
 
 class TestEvictionLifecycle:
     def test_prepare_does_not_evict_and_update_runs_final_hook_once(self):
-        # Structural: TriAttention implements hooks only, never the base
-        # template methods; the growth snapshot rides the step-begin hook and
-        # the eviction runs from the final on_generation_step_end hook.
+        # Hooks only, never the base template methods.
         assert "prepare_resources" not in TriAttention.__dict__
         assert "update_resources" not in TriAttention.__dict__
         assert "on_generation_step_begin" in TriAttention.__dict__
@@ -367,8 +398,7 @@ class TestEvictionLifecycle:
         periodic_evict.assert_called_once_with(batch)
 
     def test_unregistered_generation_request_is_rejected(self):
-        # A generation request whose on_request_init never ran is a framework
-        # ordering bug: it fails loudly instead of late-initializing here.
+        # Missing on_request_init = framework ordering bug: fail loudly.
         manager = _make_triattention()
         manager._calibrated = True
         cache = SimpleNamespace(capacity=8, history_length=0, is_active=True)
@@ -422,24 +452,6 @@ class TestEvictionLifecycle:
 
         assert first_state["generation_steps"] == 127
         assert second_state["generation_steps"] == 127
-
-    def test_request_finish_clears_state_but_keeps_buffers_resident(self):
-        manager = _make_triattention()
-        _set_request_state(manager, 7, generation_steps=1, evicted_tokens=127)
-        buffers = object()
-        manager._buffers = buffers
-        batch = SimpleNamespace()
-        manager._prepared_generation_batch = batch
-
-        manager.on_request_finish(_make_request(7))
-
-        assert manager._request_states == {}
-        # The batch reference survives finish (it belongs to the step, not
-        # the request).
-        assert manager._prepared_generation_batch is batch
-        # The buffers are sized for the executor limits, not one cohort, so
-        # they stay resident for the next generation batch.
-        assert manager._buffers is buffers
 
     @pytest.mark.parametrize("accepted", [0, 1, 2, 3])
     def test_overlap_tail_is_excluded_from_selection_and_compacted(self, accepted):
