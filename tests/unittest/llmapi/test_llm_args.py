@@ -3397,9 +3397,8 @@ class TestGlm5TransceiverPreference:
 
     @staticmethod
     def _pretrained_config(architectures, model_type):
-        from unittest.mock import MagicMock
-        cfg = MagicMock()
-        cfg.architectures = architectures
+        from transformers import PretrainedConfig
+        cfg = PretrainedConfig(architectures=architectures)
         cfg.model_type = model_type
         return cfg
 
