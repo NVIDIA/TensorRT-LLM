@@ -400,6 +400,27 @@ def get_pytest_commands(script_prefix_lines, runtime_mode):
     return ("", worker_pytest_command, disagg_server_pytest_command, benchmark_pytest_command)
 
 
+def pin_pytest_to_selected_test(script_prefix_lines, selected_test_line):
+    """Make pytest run exactly the test selected above.
+
+    The inbound pytestCommand still carries the pytest-split args
+    (--splitting-algorithm/--splits/--group), which pick a test by historical
+    durations and can disagree with the lines[split_group - 1] choice used
+    for job sizing and testOutputDir — server logs then land in another
+    test's folder. Point --test-list at a single-test list (written by the
+    launch script at runtime) and drop the split args so both always agree.
+    """
+    idx, line = next(
+        (i, ln) for i, ln in enumerate(script_prefix_lines) if "export pytestCommand=" in ln
+    )
+    full_list_path = re.search(r'--test-list[=\s]+([^\s"]+)', line).group(1)
+    selected_list_path = os.path.join(os.path.dirname(full_list_path), "selected_test_list.txt")
+    line = re.sub(r'--test-list[=\s]+[^\s"]+', f"--test-list={selected_list_path}", line)
+    line = re.sub(r'\s*--(?:splitting-algorithm|splits|group)[=\s]+[^\s"]+', "", line)
+    script_prefix_lines[idx] = line
+    script_prefix_lines.append(f"printf '%s\\n' '{selected_test_line}' > {selected_list_path}")
+
+
 def get_test_output_dir(script_prefix_lines, test_case_name):
     """Build the per-test output directory from the inbound pytestCommand.
 
@@ -487,6 +508,8 @@ def main():
     with open(args.script_prefix, "r") as f:
         script_prefix_content = f.read()
     script_prefix_lines = script_prefix_content.split("\n")
+
+    pin_pytest_to_selected_test(script_prefix_lines, sel)
 
     with open(args.srun_args, "r") as f:
         srun_args_content = f.read()
