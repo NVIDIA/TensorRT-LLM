@@ -325,6 +325,11 @@ def generate_fmha_cu(project_dir, venv_python):
         move_if_updated(cu_file, dst_file)
         generated_files.add(str(dst_file.resolve()))
 
+    if not generated_files:
+        raise RuntimeError(
+            f"FMHA generation produced no *_sm*.cu files in {fmha_v2_cu_dir}; "
+            "generation may have failed silently.")
+
     # Remove extra files
     for root, _, files in os.walk(fmha_v2_cu_dir):
         for file in files:
