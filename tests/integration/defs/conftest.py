@@ -240,15 +240,6 @@ def bert_example_root(llm_root):
 
 
 @pytest.fixture(scope="module")
-def enc_dec_example_root(llm_root):
-    "Get encoder-decoder example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "enc_dec")
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
 def whisper_example_root(llm_root, llm_venv):
     "Get whisper example root"
     example_root = os.path.join(llm_root, "examples", "models", "core",
@@ -257,39 +248,6 @@ def whisper_example_root(llm_root, llm_venv):
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
     ])
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def opt_example_root(llm_root, llm_venv):
-    "Get opt example root"
-
-    example_root = os.path.join(llm_root, "examples", "models", "contrib",
-                                "opt")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def llama_example_root(llm_root, llm_venv):
-    "Get llama example root"
-
-    example_root = os.path.join(llm_root, "examples", "models", "core", "llama")
-    try:
-        llm_venv.run_cmd([
-            "-m",
-            "pip",
-            "install",
-            "-r",
-            os.path.join(example_root, "requirements.txt"),
-        ])
-    except:
-        print("pip install error!")
-
     return example_root
 
 
@@ -367,41 +325,6 @@ def gpt_example_root(llm_root, llm_venv):
     return example_root
 
 
-@pytest.fixture(scope="module")
-def gptj_example_root(llm_root, llm_venv):
-    "Get gptj example root"
-    example_root = os.path.join(llm_root, "examples", "models", "contrib",
-                                "gptj")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def glm_4_9b_example_root(llm_root, llm_venv):
-    "Get glm-4-9b example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "glm-4-9b")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def exaone_example_root(llm_root, llm_venv):
-    "Get EXAONE example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "exaone")
-
-    return example_root
-
-
 @pytest.fixture(scope="function")
 def llm_exaone_model_root(request) -> str:
     "Get EXAONE model root"
@@ -419,26 +342,6 @@ def llm_exaone_model_root(request) -> str:
 
 
 @pytest.fixture(scope="module")
-def falcon_example_root(llm_root, llm_venv):
-    "Get falcon example root"
-    example_root = os.path.join(llm_root, "examples", "models", "contrib",
-                                "falcon")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="session")
-def plugin_gen_path(llm_root):
-    "Path to the plugin_gen.py script"
-    return os.path.join(llm_root, "tensorrt_llm", "tools", "plugin_gen",
-                        "plugin_gen.py")
-
-
-@pytest.fixture(scope="module")
 def internlm2_example_root(llm_root, llm_venv):
     "Get internlm2 example root"
     example_root = os.path.join(llm_root, "examples", "models", "core",
@@ -452,132 +355,9 @@ def internlm2_example_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="module")
-def qwen_example_root(llm_root, llm_venv):
-    "Get qwen example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core", "qwen")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def draft_target_model_example_root(llm_root, llm_venv):
-    "Get Draft-Target-Model example root"
-    example_root = os.path.join(llm_root, "examples", "draft_target_model")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def ngram_example_root(llm_root, llm_venv):
-    "Get NGram example root"
-    example_root = os.path.join(llm_root, "examples", "ngram")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
 def medusa_example_root(llm_root, llm_venv):
     "Get medusa example root"
     example_root = os.path.join(llm_root, "examples", "medusa")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def redrafter_example_root(llm_root, llm_venv):
-    "Get ReDrafter example root"
-    example_root = os.path.join(llm_root, "examples", "redrafter")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def eagle_example_root(llm_root, llm_venv):
-    "Get EAGLE example root"
-    example_root = os.path.join(llm_root, "examples", "eagle")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def mamba_example_root(llm_root, llm_venv):
-    "Get mamba example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core", "mamba")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    yield example_root
-
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(llm_root, "requirements.txt")
-    ])
-
-
-@pytest.fixture(scope="module")
-def nemotron_nas_example_root(llm_root, llm_venv):
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "nemotron_nas")
-
-    yield example_root
-
-
-@pytest.fixture(scope="module")
-def nemotron_example_root(llm_root, llm_venv):
-    "Get nemotron example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "nemotron")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def commandr_example_root(llm_root, llm_venv):
-    "Get commandr example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "commandr")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def deepseek_v2_example_root(llm_root, llm_venv):
-    "Get deepseek v2 example root"
-    example_root = os.path.join(llm_root, "examples", "models", "contrib",
-                                "deepseek_v2")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -2263,8 +2043,6 @@ def pytest_configure(config):
         print_warning(
             "Warning: --periodic-junit requires --output-dir to be set. "
             "Periodic reporting disabled.")
-
-    _get_s3_output().register_plugin(config)
 
 
 def deselect_by_test_model_suites(test_model_suites, items, test_prefix,

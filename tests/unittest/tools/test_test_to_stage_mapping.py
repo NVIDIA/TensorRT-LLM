@@ -97,6 +97,17 @@ def test_s3_stdout_echo_requires_explicit_opt_in():
         context = lines[max(0, idx - 3):idx]
         assert any('if (ENABLE_S3_ECHO_STDOUT)' in line for line in context)
 
+    progress_lines = [
+        idx for idx, line in enumerate(lines)
+        if 'console_output_style=progress-even-when-capture-no' in line
+    ]
+    assert progress_lines, 'Expected upload-only pytest progress configuration'
+
+    for idx in progress_lines:
+        context = lines[max(0, idx - 3):idx]
+        assert any('if (ENABLE_UPLOAD_TEST_RESULTS)' in line
+                   for line in context)
+
 
 @pytest.mark.skip(reason="https://nvbugs/5547275")
 @pytest.mark.parametrize("direction",
@@ -251,8 +262,15 @@ def test_backend_filtering_consistency(stage_query):
                 f"at least one stage containing '{backend.upper()}', " \
                 f"but got stages: {stages}"
 
-            # Check that test does NOT map to stages of other backends
-            other_backends = all_backends - {backend}
+            # Check that test does NOT map to stages of backends it is not
+            # declared under (tests may legitimately be listed under several
+            # backends across test-db files).
+            declared_backends = {
+                b.strip()
+                for _, _, b in stage_query.test_map[test_name]
+                if b and b.strip()
+            }
+            other_backends = all_backends - declared_backends
             for stage in stages:
                 stage_upper = stage.upper()
                 for other_backend in other_backends:
