@@ -19,10 +19,11 @@ Exactly two recipes are supported, read from the checkpoint's
 
 * ``UniPCMultistepScheduler`` without fixed sigmas — base checkpoints:
   request tables drive steps/guidance; T2I rebuilds with ``flow_shift=3.0``.
-* ``FlowMatchEulerDiscreteScheduler`` with a nonempty
-  ``fixed_step_sampler_config.t_list`` — distilled checkpoints: the step
-  count is locked to the schedule, classifier-free guidance is baked into
-  the weights (scale 1.0), and the stochastic steps draw seeded noise.
+* ``FlowMatchEulerDiscreteScheduler`` with ``stochastic_sampling`` enabled
+  and a nonempty ``fixed_step_sampler_config.t_list`` — distilled
+  checkpoints: the step count is locked to the schedule, classifier-free
+  guidance is baked into the weights (scale 1.0), and every step draws
+  seeded SDE noise.
 
 The pipeline owns the scheduler instances; :class:`Cosmos3SamplingPolicy` is
 an immutable value object of config-derived facts whose methods take
@@ -90,6 +91,12 @@ def load_scheduler(checkpoint_dir: str, subfolder: str = "scheduler") -> Any:
 class Cosmos3SamplingPolicy:
     """Immutable sampling facts of a loaded Cosmos3 checkpoint.
 
+    Construct via :meth:`from_scheduler`, which validates the recipe at load
+    time. A default-constructed policy (all fields ``None``) is the explicit
+    pre-load placeholder the pipeline holds before its scheduler exists: not
+    distilled, no flow-shift rebuild capability (``set_flow_shift`` is a
+    no-op), and replaced by ``from_scheduler`` when components load.
+
     Methods take scheduler instances as arguments; the current flow shift is
     read from the supplied scheduler's config rather than tracked here.
     """
@@ -103,9 +110,9 @@ class Cosmos3SamplingPolicy:
     def from_scheduler(cls, scheduler: Any) -> "Cosmos3SamplingPolicy":
         """Derive the policy from a loaded scheduler's config.
 
-        Valid recipes: UniPC without fixed sigmas (base) and FlowMatchEuler
-        with a nonempty ``fixed_step_sampler_config.t_list`` (distilled);
-        anything else fails here, at load time.
+        Valid recipes: UniPC without fixed sigmas (base) and stochastic
+        FlowMatchEuler with a nonempty ``fixed_step_sampler_config.t_list``
+        (distilled); anything else fails here, at load time.
         """
         fixed_sigmas = _resolve_distilled_sigmas(scheduler.config)
         is_unipc = isinstance(scheduler, UniPCMultistepScheduler)
@@ -125,6 +132,20 @@ class Cosmos3SamplingPolicy:
             return cls(fixed_sigmas=None, unipc_base_config=scheduler.config)
 
         if is_flow_match and fixed_sigmas is not None:
+            if not _config_get(scheduler.config, "stochastic_sampling", False):
+                raise ValueError(
+                    "Unsupported Cosmos3 sampling recipe: FlowMatchEulerDiscreteScheduler "
+                    "declares a fixed step schedule without stochastic_sampling. The "
+                    "distilled recipe draws SDE noise at every step; running the schedule "
+                    "as an ODE would sample the checkpoint incorrectly."
+                )
+            fixed_step_cfg = _config_get(scheduler.config, "fixed_step_sampler_config")
+            sample_type = _config_get(fixed_step_cfg, "sample_type")
+            if sample_type is not None and sample_type != "sde":
+                raise ValueError(
+                    "Unsupported Cosmos3 sampling recipe: fixed_step_sampler_config "
+                    f"declares sample_type={sample_type!r}; only 'sde' is supported."
+                )
             logger.info(
                 f"Distilled Cosmos3 checkpoint: fixed {len(fixed_sigmas)}-step schedule "
                 f"{list(fixed_sigmas)}, classifier-free guidance baked in."
@@ -135,8 +156,8 @@ class Cosmos3SamplingPolicy:
             f"Unsupported Cosmos3 sampling recipe: {type(scheduler).__name__} with "
             f"fixed sigmas {'present' if fixed_sigmas is not None else 'absent'}. "
             "Supported: UniPCMultistepScheduler without fixed sigmas (base), "
-            "FlowMatchEulerDiscreteScheduler with fixed_step_sampler_config.t_list "
-            "(distilled)."
+            "stochastic FlowMatchEulerDiscreteScheduler with "
+            "fixed_step_sampler_config.t_list (distilled)."
         )
 
     @property
