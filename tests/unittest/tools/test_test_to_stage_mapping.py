@@ -262,8 +262,15 @@ def test_backend_filtering_consistency(stage_query):
                 f"at least one stage containing '{backend.upper()}', " \
                 f"but got stages: {stages}"
 
-            # Check that test does NOT map to stages of other backends
-            other_backends = all_backends - {backend}
+            # Check that test does NOT map to stages of backends it is not
+            # declared under (tests may legitimately be listed under several
+            # backends across test-db files).
+            declared_backends = {
+                b.strip()
+                for _, _, b in stage_query.test_map[test_name]
+                if b and b.strip()
+            }
+            other_backends = all_backends - declared_backends
             for stage in stages:
                 stage_upper = stage.upper()
                 for other_backend in other_backends:
