@@ -1911,7 +1911,7 @@ def test_cosmos3_t2i_4step_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
