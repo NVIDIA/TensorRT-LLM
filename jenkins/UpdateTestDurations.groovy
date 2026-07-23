@@ -207,6 +207,7 @@ pipeline {
 
                         sh """
                             cd ${LLM_ROOT}
+                            python3 -u scripts/release_check.py --files-from ${DURATION_FILE_PATH}
                             git add ${DURATION_FILE_PATH}
                             git commit -s -m "[None][infra] Auto-update test durations from OpenSearch (last ${params.DAYS} days)"
                         """
@@ -224,7 +225,7 @@ pipeline {
                                 git remote set-url origin ${authedUrl}
                                 git fetch origin ${params.TARGET_BRANCH}
                                 git rebase origin/${params.TARGET_BRANCH}
-                                git push origin HEAD:${params.TARGET_BRANCH}
+                                #git push origin HEAD:${params.TARGET_BRANCH}
                             """
                         }
                     }
