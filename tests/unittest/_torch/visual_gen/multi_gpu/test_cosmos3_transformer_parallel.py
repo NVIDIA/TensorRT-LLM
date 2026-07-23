@@ -78,7 +78,7 @@ _COSMOS3_TEST_CONFIG = dict(
     num_attention_heads=8,
     num_key_value_heads=4,
     head_dim=64,
-    rope_scaling={"rope_type": "default", "mrope_section": [16, 12, 12]},
+    rope_scaling={"rope_type": "default", "mrope_section": [12, 10, 10]},
     rms_norm_eps=1e-6,
     vocab_size=1024,
     rope_theta=1_000_000.0,
@@ -91,13 +91,14 @@ _COSMOS3_TEST_CONFIG = dict(
 
 # attn2d needs an LSE-capable backend (FA4); FA4's CUTE kernels run with head_dim=128.
 # Same architecture as _COSMOS3_TEST_CONFIG otherwise (heads still divisible by
-# Ulysses=2 for the attn2d+ulysses case). mrope_section is unchanged: the interleave
-# slices clip to head_dim//2 (=64 here), so [16, 12, 12] stays valid.
+# Ulysses=2 for the attn2d+ulysses case). mrope_section must sum to head_dim//2
+# (=64 here), so this config uses the real checkpoint sections.
 _COSMOS3_FA4_CONFIG = dict(
     _COSMOS3_TEST_CONFIG,
     head_dim=128,
     hidden_size=8 * 128,
     intermediate_size=1024,
+    rope_scaling={"rope_type": "default", "mrope_section": [24, 20, 20]},
 )
 
 # Video: [B, C, T, H, W]. patch_size=2 → seq_len = T * (H/2) * (W/2).
