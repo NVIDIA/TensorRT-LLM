@@ -169,8 +169,8 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         sm = get_sm_version()
         self._needs_mask_repack = sm < 100 or sm in (120, 121)
 
-    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
-        super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
+    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata, spec_metadata):
+        super()._prepare_attn_metadata_for_spec_dec(attn_metadata, spec_metadata)
 
         batch_size = attn_metadata.num_seqs
         if hasattr(attn_metadata, "kv_lens_cuda"):
@@ -684,7 +684,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         # Save attn/spec metadata before the draft loop mutates it.
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         original_force_prepare_spec_dec_tree_mask = attn_metadata.force_prepare_spec_dec_tree_mask
-        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+        self._prepare_attn_metadata_for_spec_dec(attn_metadata, spec_metadata)
         attn_metadata.force_prepare_spec_dec_tree_mask = True
 
         # (c) Run the MTP draft tree loop -> build + store the next tree.
