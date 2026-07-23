@@ -716,6 +716,7 @@ class NVLinkOneSided(Communication):
         Returns:
             Tensor view into workspace [ep_size, max_tokens_per_rank, hidden_size]
         """
+        self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError(
                 "get_combine_payload_tensor_in_workspace called before a successful dispatch"
