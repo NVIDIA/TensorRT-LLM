@@ -438,6 +438,7 @@ def create_py_executor(
         logger.warning(
             f"Disabling chunked context for {llm_args.attn_backend} backend")
         enable_chunked_context = False
+        llm_args.enable_chunked_prefill = False
 
     spec_config = llm_args.speculative_config
     if spec_config is not None and spec_config.decoding_type == "AUTO":
@@ -745,6 +746,7 @@ def create_py_executor(
             model_engine.attn_runtime_features.chunked_prefill = False
             if draft_model_engine is not None:
                 draft_model_engine.attn_runtime_features.chunked_prefill = False
+            llm_args.enable_chunked_prefill = False
 
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
