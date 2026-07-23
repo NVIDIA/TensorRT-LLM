@@ -964,6 +964,61 @@ class MiniMaxM3Attention(Attention):
         )
         return qkv
 
+    def _fused_fp8_index_qk_norm_rope(
+        self,
+        idx_qk: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> Optional[torch.Tensor]:
+        """Produce raw-E4M3 index-Q and insert index-K in one M3-only kernel.
+
+        This path is deliberately narrower than the general fused QK kernel:
+        it is enabled only for the MSA FP8-indexer configuration and the exact
+        M3 Gemma-RMSNorm + NeoX partial-RoPE geometry. The kernel rounds the
+        normalized/RoPE values through BF16 before E4M3 conversion, matching
+        the former fused-BF16-kernel followed by ``Tensor.to(E4M3)`` contract.
+        """
+        if not isinstance(self.attn, MiniMaxM3MsaSparseAttention):
+            return None
+        if self.attn.indexer_kv_dtype != "fp8":
+            return None
+        if position_ids is None or idx_qk.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                "MiniMax-M3 fused FP8 indexer requires BF16 activations and position_ids."
+            )
+        if (
+            self.rotary_emb is None
+            or self.pos_embd_params is None
+            or self.pos_embd_params.rope is None
+        ):
+            raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires partial RoPE.")
+        if not self.pos_embd_params.is_neox:
+            raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires NeoX RoPE.")
+        if not self.use_gemma_norm:
+            raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires Gemma RMSNorm.")
+
+        rotary_dim = int(self.pos_embd_params.rope.dim)
+        index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+        if index_k_cache.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "MiniMax-M3 fused FP8 indexer requires an E4M3 index-K cache, "
+                f"got {index_k_cache.dtype}."
+            )
+        num_tokens = int(idx_qk.shape[0])
+        return torch.ops.trtllm.minimax_m3_fp8_indexer_qk_norm_rope(
+            idx_qk.contiguous(),
+            index_k_cache,
+            attn_metadata.msa_out_cache_loc[:num_tokens],
+            self.sparse_num_index_heads,
+            self.sparse_index_dim,
+            rotary_dim,
+            self.index_q_norm.variance_epsilon,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+            self.pos_embd_params.rope.theta,
+            position_ids.reshape(-1).contiguous().to(torch.int32),
+        ).flatten(1)
+
     def _expect_fused_qk_norm_rope(self, position_ids: Optional[torch.Tensor]) -> bool:
         """Whether the fused path must run rather than fall back.
 
@@ -1433,7 +1488,7 @@ class MiniMaxM3Attention(Attention):
         only) and builds the ``forward_args`` the FMHA reads.
         """
         if self.is_sparse_attention_layer:
-            assert idx_q is not None and idx_k is not None
+            assert idx_q is not None
             # Publish the selected blocks so the FMHA runs the sparse path.
             kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
             forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
@@ -1528,6 +1583,10 @@ class MiniMaxM3Attention(Attention):
 
         def _index_norm_rope():
             idx_qk = self.index_qk_proj(hidden_states)
+            fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
+            if fp8_idx_q is not None:
+                # Index-K was inserted directly into the paged side cache.
+                return fp8_idx_q, None
             fused_idx = self._fused_qk_norm_rope(
                 idx_qk,
                 position_ids,
