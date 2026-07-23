@@ -3387,3 +3387,60 @@ class TestTransceiverRuntimeAutoResolution:
         # An explicit backend bypasses the env vars entirely.
         assert CacheTransceiverConfig(
             backend="UCX")._resolve_default_backend() == ("UCX", None)
+
+
+class TestGlm5TransceiverPreference:
+    """GLM-5 defaults to the Python KV-cache transceiver in disagg.
+
+    DeepseekV3ForCausalLM is shared by DeepSeek-V3/V3.2 and GLM-5
+    (GlmMoeDsaForCausalLM); the preference must apply to GLM checkpoints
+    only.
+    """
+
+    @staticmethod
+    def _pretrained_config(architectures, model_type):
+        from transformers import PretrainedConfig
+        cfg = PretrainedConfig(architectures=architectures)
+        cfg.model_type = model_type
+        return cfg
+
+    @pytest.mark.parametrize(
+        "architectures,model_type,expected",
+        [
+            (["GlmMoeDsaForCausalLM"], "glm_moe_dsa", "PYTHON"),
+            (["DeepseekV3ForCausalLM"], "deepseek_v3", None),
+            (["DeepseekV32ForCausalLM"], "deepseek_v32", None),
+            # Each predicate in isolation: the architecture match and the
+            # model_type fallback must each suffice on their own.
+            (["GlmMoeDsaForCausalLM"], "deepseek_v32", "PYTHON"),
+            (["DeepseekV32ForCausalLM"], "glm_moe_dsa", "PYTHON"),
+        ])
+    def test_preference_per_architecture(self, architectures, model_type,
+                                         expected):
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        cfg = self._pretrained_config(architectures, model_type)
+        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
+            cfg) == expected
+
+    def test_no_config_defers_to_cpp(self):
+        """Without a pretrained config the class defers to the C++ default."""
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime() is None
+
+    def test_glm5_resolves_auto_to_python_on_nixl(self):
+        """GLM-5 on NIXL adopts the Python transceiver from 'auto'.
+
+        End-to-end through _resolve_transceiver_runtime_auto with the real
+        model class and a GLM pretrained config.
+        """
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+        )
+        cfg = self._pretrained_config(["GlmMoeDsaForCausalLM"], "glm_moe_dsa")
+        _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
