@@ -67,12 +67,24 @@ class VanillaAttentionMetadata(AttentionMetadata):
         super().__post_init__()
         self.kv_layout = "NHD"
 
+    def _uses_layer_specific_cache_indices(self) -> bool:
+        if self.kv_cache_manager is None:
+            return False
+        return (getattr(self.kv_cache_manager, "is_vswa", False)
+                or getattr(self.kv_cache_manager, "is_linear_attention", False)
+                or getattr(self.kv_cache_manager, "num_pools", 1) > 1)
+
     def prepare(self) -> None:
         super().prepare()
-        # indices of used cache blocks for each sequence
+        if self.kv_cache_manager is None:
+            self.block_ids_per_seq = None
+            return
         assert self.request_ids is not None
-        self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids) if self.kv_cache_manager is not None else None
+        # Metadata is shared across layers, so a layer-specific lookup must
+        # happen when the attention layer executes.
+        self.block_ids_per_seq = (
+            None if self._uses_layer_specific_cache_indices() else
+            self.kv_cache_manager.get_batch_cache_indices(self.request_ids))
 
 
 class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
@@ -117,6 +129,15 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
     @classmethod
     def support_mla(cls) -> bool:
         return True
+
+    def _get_block_ids_per_seq(
+            self, metadata: VanillaAttentionMetadata) -> list[list[int]]:
+        if metadata.block_ids_per_seq is not None:
+            return metadata.block_ids_per_seq
+        assert metadata.kv_cache_manager is not None
+        assert metadata.request_ids is not None
+        return metadata.kv_cache_manager.get_batch_cache_indices(
+            metadata.request_ids, layer_idx=self.layer_idx)
 
     def _single_request_sparse_attn_predict(
             self, q: torch.Tensor, k: Optional[torch.Tensor],
@@ -522,9 +543,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             kv_layout=metadata.kv_layout,
         )
         past = metadata.kv_cache_params.num_cached_tokens_per_seq
-        cache_indices = [
-            block_ids[0] for block_ids in metadata.block_ids_per_seq
-        ]
+        block_ids_per_seq = self._get_block_ids_per_seq(metadata)
+        cache_indices = [block_ids[0] for block_ids in block_ids_per_seq]
 
         # MLA scales by the q/k head_dim (qk_nope + qk_rope), not the latent dim.
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -663,9 +683,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 attention_mask=forward_args.attention_mask)
 
         past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
-        cache_indices = [
-            block_ids[0] for block_ids in metadata.block_ids_per_seq
-        ]
+        block_ids_per_seq = self._get_block_ids_per_seq(metadata)
+        cache_indices = [block_ids[0] for block_ids in block_ids_per_seq]
         kv_cache_tensor = metadata.kv_cache_manager.get_buffers(
             self.layer_idx, kv_layout=metadata.kv_layout)
 

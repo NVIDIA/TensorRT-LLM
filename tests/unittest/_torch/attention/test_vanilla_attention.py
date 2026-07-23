@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +20,155 @@ from tensorrt_llm.mapping import Mapping
 
 
 class TestVanillaAttention(unittest.TestCase):
+
+    @patch(
+        "tensorrt_llm._torch.attention_backend.interface.AttentionMetadata.prepare"
+    )
+    def test_prepare_defers_cache_indices_for_layer_specific_pools(
+            self, mock_prepare):
+        for manager_attributes in ({
+                "is_vswa": True
+        }, {
+                "is_linear_attention": True
+        }, {
+                "num_pools": 2
+        }):
+            with self.subTest(**manager_attributes):
+                manager = MagicMock()
+                manager.is_vswa = False
+                manager.is_linear_attention = False
+                manager.num_pools = 1
+                for name, value in manager_attributes.items():
+                    setattr(manager, name, value)
+                metadata = object.__new__(VanillaAttentionMetadata)
+                metadata.kv_cache_manager = manager
+                metadata.request_ids = [11]
+
+                metadata.prepare()
+
+                self.assertIsNone(metadata.block_ids_per_seq)
+                manager.get_batch_cache_indices.assert_not_called()
+        self.assertEqual(mock_prepare.call_count, 3)
+
+    @patch(
+        "tensorrt_llm._torch.attention_backend.interface.AttentionMetadata.prepare"
+    )
+    def test_single_pool_cache_indices_remain_prepared_once(self, mock_prepare):
+        manager = MagicMock()
+        manager.is_vswa = False
+        manager.is_linear_attention = False
+        manager.num_pools = 1
+        manager.get_batch_cache_indices.return_value = [[7]]
+        metadata = object.__new__(VanillaAttentionMetadata)
+        metadata.kv_cache_manager = manager
+        metadata.request_ids = [11]
+
+        metadata.prepare()
+        attention = VanillaAttention(layer_idx=3,
+                                     num_heads=1,
+                                     head_dim=1,
+                                     num_kv_heads=1)
+
+        self.assertEqual(attention._get_block_ids_per_seq(metadata), [[7]])
+        manager.get_batch_cache_indices.assert_called_once_with([11])
+        mock_prepare.assert_called_once_with()
+
+    def test_layer_specific_cache_indices_follow_attention_layer(self):
+        events = []
+        manager = MagicMock()
+
+        def get_batch_cache_indices(request_ids, layer_idx):
+            events.append(("indices", layer_idx))
+            return [[10 + layer_idx]]
+
+        def get_buffers(layer_idx, *, kv_layout):
+            events.append(("buffer", layer_idx))
+            return torch.empty(1)
+
+        manager.get_batch_cache_indices.side_effect = get_batch_cache_indices
+        manager.get_buffers.side_effect = get_buffers
+        metadata = SimpleNamespace(
+            block_ids_per_seq=None,
+            kv_cache_manager=manager,
+            request_ids=[11],
+            multi_item_part_lens=None,
+            kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=[0]),
+            seq_lens=torch.tensor([1]),
+            seq_lens_kv=torch.tensor([1]),
+            kv_layout="NHD",
+        )
+        layer_zero = VanillaAttention(layer_idx=0,
+                                      num_heads=1,
+                                      head_dim=1,
+                                      num_kv_heads=1)
+        layer_one = VanillaAttention(layer_idx=1,
+                                     num_heads=1,
+                                     head_dim=1,
+                                     num_kv_heads=1)
+        for attention in (layer_zero, layer_one):
+            with patch.object(
+                    attention,
+                    "_single_request_forward",
+                    return_value=torch.zeros(1, 1, 1),
+            ):
+                attention.forward(
+                    torch.zeros(1, 1),
+                    torch.zeros(1, 1),
+                    torch.zeros(1, 1),
+                    metadata,
+                )
+
+        self.assertEqual(manager.get_batch_cache_indices.call_args_list, [
+            unittest.mock.call([11], layer_idx=0),
+            unittest.mock.call([11], layer_idx=1),
+        ])
+        self.assertEqual(events, [
+            ("indices", 0),
+            ("buffer", 0),
+            ("indices", 1),
+            ("buffer", 1),
+        ])
+
+    def test_mla_generation_uses_layer_specific_cache_indices(self):
+        layer_idx = 4
+        mla_params = SimpleNamespace(
+            kv_lora_rank=1,
+            qk_rope_head_dim=1,
+            qk_nope_head_dim=1,
+            v_head_dim=1,
+        )
+        attention = VanillaAttention(
+            layer_idx=layer_idx,
+            num_heads=1,
+            head_dim=2,
+            num_kv_heads=1,
+            mla_params=mla_params,
+        )
+        manager = MagicMock()
+        manager.get_batch_cache_indices.return_value = [[0]]
+        metadata = SimpleNamespace(
+            block_ids_per_seq=None,
+            kv_cache_manager=manager,
+            request_ids=[11],
+            seq_lens=torch.tensor([1]),
+            kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=[0]),
+            kv_layout="NHD",
+        )
+        kv_cache = torch.zeros(1, 1, 1, 1, 2)
+
+        with patch(
+                "tensorrt_llm._torch.attention_backend.utils.append_mla_latent_cache",
+                return_value=kv_cache,
+        ):
+            result = attention._mla_forward_generation(
+                torch.zeros(1, 2),
+                metadata,
+                torch.zeros(1, 2),
+            )
+
+        self.assertEqual(result.shape, (1, 1))
+        manager.get_batch_cache_indices.assert_called_once_with(
+            [11], layer_idx=layer_idx)
 
     def test_sdpa_fallback_uses_metadata_cross_flag_for_causal_mask(self):
         vanilla_attn = VanillaAttention(layer_idx=0,
