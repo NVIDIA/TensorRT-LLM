@@ -53,11 +53,11 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 #include <cuda_bf16.h>
+#include <cute/atom/mma_traits_sm100.hpp>
 #include <cutlass/arch/barrier.h>
 
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
-#include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/utils.cuh>
@@ -65,14 +65,35 @@
 namespace fused_mhc
 {
 
-// Reuse DeepGEMM's swizzle helper
-using deep_gemm::mma::sm100::advance_umma_desc_lo;
-using deep_gemm::mma::sm100::make_umma_desc;
 using deep_gemm::ptx::get_lane_idx;
 using deep_gemm::ptx::tcgen05_after_thread_sync;
 using deep_gemm::ptx::tcgen05_before_thread_sync;
 using deep_gemm::utils::get_num_aligned_tmem_cols;
 using deep_gemm::utils::PatternVisitor;
+
+template <cute::UMMA::Major kMajor, uint32_t kBlockN, uint32_t kBlockSwizzledK>
+__device__ __forceinline__ cute::UMMA::SmemDescriptor makeBUmmaDescriptor(float* smemPtr)
+{
+    constexpr uint32_t kSwizzleBytes = 128U;
+    static_assert(kMajor == cute::UMMA::Major::K, "B UMMA descriptor must be K-major");
+    static_assert(kBlockSwizzledK * sizeof(float) == kSwizzleBytes, "B UMMA descriptor must use 128-byte swizzling");
+
+    auto const smemLayoutB = cute::tile_to_shape(
+        cute::UMMA::Layout_K_SW128_Atom<float>{}, cute::Shape<cute::Int<kBlockN>, cute::Int<kBlockSwizzledK>>{});
+    auto const tensorB = cute::make_tensor(cute::make_smem_ptr(smemPtr), smemLayoutB);
+    auto desc = cute::UMMA::make_umma_desc<kMajor>(tensorB);
+    // A single K swizzle atom does not use the leading byte offset. Keep it zero to preserve the existing descriptor.
+    desc.leading_byte_offset_ = 0U;
+    return desc;
+}
+
+__device__ __forceinline__ uint32_t advanceBUmmaDescriptorLo(
+    uint32_t const base, uint32_t const elementOffset, uint32_t const kIndex)
+{
+    constexpr uint32_t kElementBytes = static_cast<uint32_t>(sizeof(float));
+    constexpr uint32_t kDescriptorAddressShift = 4U;
+    return base + (((elementOffset + kIndex) * kElementBytes) >> kDescriptorAddressShift);
+}
 
 template <uint32_t kSwizzleMode, uint32_t kSwizzleBase = 16>
 __device__ __forceinline__ uint32_t get_swizzled_smem_offset(uint32_t const& offset, uint32_t const& lane_idx)
@@ -310,7 +331,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                 UMMA_N, kMajorA, kMajorB>();
             auto const& runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
             static_assert(N_B_STAGES <= 32, "Too many B stages");
-            auto b_desc = make_umma_desc<kMajorB, BLOCK_N, BLOCK_SWIZZLED_BK, kSwizzleBMode>(smem_b[0], 0, 0);
+            auto b_desc = makeBUmmaDescriptor<kMajorB, BLOCK_N, BLOCK_SWIZZLED_BK>(smem_b[0]);
             uint32_t const& b_desc_lo = lane_idx < N_B_STAGES ? b_desc.lo + lane_idx * SMEM_B_PER_STAGE / 16 : 0u;
 
             for (uint32_t s = 0; s < num_total_stages; ++s)
@@ -327,8 +348,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                     uint32_t const& atom_idx = (k * UMMA_K) / BLOCK_SWIZZLED_BK;
                     uint32_t const& in_atom_idx = (k * UMMA_K) % BLOCK_SWIZZLED_BK;
                     uint32_t const& offset = atom_idx * BLOCK_N * BLOCK_SWIZZLED_BK;
-                    b_desc.lo = advance_umma_desc_lo<kMajorB, BLOCK_N, kSwizzleBMode, float>(
-                        b_desc_base_lo, offset, in_atom_idx);
+                    b_desc.lo = advanceBUmmaDescriptorLo(b_desc_base_lo, offset, in_atom_idx);
                     umma_t::fma(BLOCK_K * cast_stage_idx + k * UMMA_K, b_desc, BLOCK_K * kNumCastStages, s > 0 or k > 0,
                         runtime_instr_desc);
                 }
@@ -862,7 +882,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                 UMMA_N, kMajorA, kMajorB>();
             auto const& runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
             static_assert(N_B_STAGES <= 32, "Too many B stages");
-            auto b_desc = make_umma_desc<kMajorB, BLOCK_N, BLOCK_SWIZZLED_BK, kSwizzleBMode>(smem_b[0], 0, 0);
+            auto b_desc = makeBUmmaDescriptor<kMajorB, BLOCK_N, BLOCK_SWIZZLED_BK>(smem_b[0]);
             uint32_t const& b_desc_lo = lane_idx < N_B_STAGES ? b_desc.lo + lane_idx * SMEM_B_PER_STAGE / 16 : 0u;
 
             for (uint32_t s = 0; s < num_total_stages; ++s)
@@ -879,8 +899,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                     uint32_t const& atom_idx = (k * UMMA_K) / BLOCK_SWIZZLED_BK;
                     uint32_t const& in_atom_idx = (k * UMMA_K) % BLOCK_SWIZZLED_BK;
                     uint32_t const& offset = atom_idx * BLOCK_N * BLOCK_SWIZZLED_BK;
-                    b_desc.lo = advance_umma_desc_lo<kMajorB, BLOCK_N, kSwizzleBMode, float>(
-                        b_desc_base_lo, offset, in_atom_idx);
+                    b_desc.lo = advanceBUmmaDescriptorLo(b_desc_base_lo, offset, in_atom_idx);
                     umma_t::fma(BLOCK_K * cast_stage_idx + k * UMMA_K, b_desc, BLOCK_K * kNumCastStages, s > 0 or k > 0,
                         runtime_instr_desc);
                 }
