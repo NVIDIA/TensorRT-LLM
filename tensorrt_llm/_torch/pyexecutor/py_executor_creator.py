@@ -1100,6 +1100,7 @@ def create_py_executor(
                 execution_stream=execution_stream,
                 dwdp_manager=dwdp_manager,
                 max_num_sequences=max_num_seq_slots,
+                publish_disaggregated_params=True,
             )
 
     _adjust_torch_mem_fraction()
