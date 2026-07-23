@@ -39,6 +39,7 @@ from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
@@ -2150,6 +2151,22 @@ def validate_kv_cache_compression_with_spec(
                 "TriAttention speculative compatibility requires a separate "
                 "draft KV cache; shared target/draft pools cannot be "
                 "compacted safely")
+        if not draft_kv_cache_manager.is_draft:
+            raise ValueError(
+                "TriAttention speculative compatibility requires the actual "
+                "separate draft KV cache manager")
+        if config.eviction_mode != "union":
+            raise ValueError(
+                "TriAttention draft KV co-compression supports only "
+                "eviction_mode='union'; draft layers are never scored")
+        if any(window is not None for window in
+               draft_kv_cache_manager.max_attention_window_vec) or any(
+                   not isinstance(layer, AttentionLayerConfig)
+                   or layer.sliding_window_size is not None for layer in
+                   draft_kv_cache_manager.kv_cache_manager_py_config.layers):
+            raise ValueError(
+                "TriAttention draft KV co-compression requires "
+                "full-attention draft V2 lifecycles")
 
 
 def create_kv_cache_compression_manager(

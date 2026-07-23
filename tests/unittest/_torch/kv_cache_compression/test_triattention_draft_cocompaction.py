@@ -238,64 +238,36 @@ def test_execute_eviction_round_orders_both_manager_streams():
 @pytest.mark.parametrize(
     "gate,match",
     [
-        # One representative per guard family (the per-mode/per-config
-        # variants raise through the same checks).
-        ("union_only_per_head", "union"),
-        ("draft_kv_factor", "standard key/value cache"),
-        # Same check family on the TARGET cache (MLA SELFKONLY, kv_factor 1).
-        ("target_kv_factor", "standard key/value KV cache"),
-        ("full_attention_draft", "full-attention draft"),
+        # One representative per call-site guard family (the per-mode/per-config
+        # variants raise through the same checks). kv_factor geometry needs no
+        # admission gate: the native compact op TORCH_CHECKs every pool's K/V
+        # plane count at the first compact.
         ("callsite_dflash", "standard paged cache compacted together"),
+        ("union_only_per_head", "union"),
+        ("full_attention_draft", "full-attention draft"),
     ],
 )
 def test_draft_admission_gates_raise(gate, match):
+    # Draft/spec admission is owned by the executor call-site gate: rejected
+    # before any compression manager exists.
+    from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
+    from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig, MTPDecodingConfig
+
     draft_manager = _make_fake_v2(is_draft=True)
     if gate == "full_attention_draft":
         draft_manager.max_attention_window_vec = [128]
-    if gate.startswith("callsite_"):
-        # Call-site speculative gate: rejected before any manager exists.
-        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
-        from tensorrt_llm.llmapi.llm_args import (
-            DFlashDecodingConfig,
-            TriAttentionKvCacheCompressionConfig,
-        )
-
-        spec_config = DFlashDecodingConfig(max_draft_len=3)
-        with pytest.raises(ValueError, match=match):
-            validate_kv_cache_compression_with_spec(
-                TriAttentionKvCacheCompressionConfig(
-                    model_path="/models/test", calibration_path="/calib/test.pt", budget=8
-                ),
-                spec_config,
-                draft_manager,
-            )
-        return
-
-    def construct():
-        return TriAttention(
-            _make_fake_v2(),
-            _make_tri_config(
-                budget=8,
-                eviction_mode="per_head" if gate == "union_only_per_head" else "union",
-            ),
-            draft_kv_cache_manager=None if gate == "target_kv_factor" else draft_manager,
-        )
-
-    if gate in ("union_only_per_head", "full_attention_draft"):
-        # Manager-lifetime capability gates run once, at construction.
-        with pytest.raises(ValueError, match=match):
-            construct()
-        return
-    manager = construct()
-    # Flipping kv_factor after construction exercises TriAttention's own
-    # capability gate directly.
-    if gate == "draft_kv_factor":
-        draft_manager.kv_factor = 1
-    if gate == "target_kv_factor":
-        manager.kv_cache_manager.kv_factor = 1
+    spec_config = (
+        DFlashDecodingConfig(max_draft_len=3)
+        if gate == "callsite_dflash"
+        else MTPDecodingConfig(max_draft_len=1)
+    )
+    config = _make_tri_config(
+        budget=8,
+        eviction_mode="per_head" if gate == "union_only_per_head" else "union",
+    )
 
     with pytest.raises(ValueError, match=match):
-        manager._validate_v2_compatibility()
+        validate_kv_cache_compression_with_spec(config, spec_config, draft_manager)
 
 
 def test_compressed_count_is_monotone_and_tracks_confirmed_length():

@@ -305,12 +305,9 @@ def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
 
     fake_v2 = KVCacheManagerV2.__new__(KVCacheManagerV2)
     fake_v2.enable_block_reuse = enable_block_reuse
-    fake_v2.enable_swa_scratch_reuse = False
     fake_v2.is_draft = is_draft
     fake_v2.kv_compression_manages_history = False
     fake_v2.kv_factor = 2
-    fake_v2.mapping = SimpleNamespace(enable_attention_dp=False)
-    fake_v2.is_disagg = False
     fake_v2.max_beam_width = 1
     fake_v2.max_batch_size = 8
     fake_v2.num_extra_kv_tokens = 0

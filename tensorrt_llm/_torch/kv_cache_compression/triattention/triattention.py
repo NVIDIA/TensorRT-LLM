@@ -37,7 +37,6 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     copy_batch_block_offsets_to_device,
 )
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
 from ..compaction import compact, init_compaction_buffers
 from .triattention_kernels import (
@@ -154,9 +153,6 @@ class TriAttention(KVCacheCompressionManager):
         # In-flight overlap batch reference; membership resolves lazily.
         self._prepared_generation_batch: Optional[object] = None
         self._prepared_generation_ids: Optional[set] = None
-        # Manager-lifetime capability gates: everything read there is fixed at
-        # construction, so validation runs once here.
-        self._validate_v2_compatibility()
         # Manager-lifetime constants (V2 fixes every input at construction):
         # protected tails are num_extra + reserved draft width + 1 sampled token.
         self._protected_tail_capacity = (
@@ -259,59 +255,6 @@ class TriAttention(KVCacheCompressionManager):
             self.calibration["E_q_norm"].to(torch.float32) - _Eq.abs().to(torch.float32)
         ).contiguous()
         self._calibrated = True
-
-    def _validate_v2_compatibility(self) -> None:
-        # The base manager already enforces KVCacheManagerV2 target/draft types,
-        # and V2 construction guarantees beam width one.
-        manager = self.kv_cache_manager
-        if manager.kv_factor != 2:
-            raise ValueError(
-                "TriAttention requires a standard key/value KV cache; "
-                "MLA/SELFKONLY caches are not supported"
-            )
-        if manager.mapping.enable_attention_dp:
-            raise ValueError("TriAttention does not support attention DP")
-        if manager.is_disagg:
-            raise ValueError("TriAttention does not support disaggregated serving")
-        if manager.enable_swa_scratch_reuse:
-            raise RuntimeError("TriAttention does not support V2 SWA scratch page-table remapping")
-        # Speculative feature gates run in the factory; the draft cache itself
-        # is validated here (V2 already forces scratch reuse off for drafts).
-        draft_manager = self.draft_kv_cache_manager
-        if draft_manager is not None:
-            if not draft_manager.is_draft:
-                raise ValueError(
-                    "TriAttention speculative compatibility requires the actual "
-                    "separate draft KV cache manager"
-                )
-            if draft_manager.kv_factor != 2:
-                raise ValueError(
-                    "TriAttention compresses the draft KV cache together with "
-                    "the target, so the draft cache must be a standard "
-                    "key/value cache"
-                )
-            if self.eviction_mode != "union":
-                raise ValueError(
-                    "TriAttention draft KV co-compression supports only "
-                    "eviction_mode='union'; per-head keep sets are not defined "
-                    "for draft layers, which are never scored"
-                )
-            if any(window is not None for window in draft_manager.max_attention_window_vec) or any(
-                not isinstance(layer, AttentionLayerConfig) or layer.sliding_window_size is not None
-                for layer in draft_manager.kv_cache_manager_py_config.layers
-            ):
-                raise ValueError(
-                    "TriAttention draft KV co-compression requires full-attention "
-                    "draft V2 lifecycles"
-                )
-        if any(window is not None for window in manager.max_attention_window_vec) or any(
-            not isinstance(layer, AttentionLayerConfig) or layer.sliding_window_size is not None
-            for layer in manager.kv_cache_manager_py_config.layers
-        ):
-            raise ValueError(
-                "TriAttention requires full-attention V2 lifecycles; native SWA, "
-                "VSWA, and SSM pools are not supported"
-            )
 
     def on_generation_step_end(self, scheduled_batch: "ScheduledRequests", **kwargs) -> None:
         """Compact after native KV-cache updates have finalized this iteration

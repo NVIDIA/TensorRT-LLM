@@ -27,6 +27,7 @@ TriAttention is integrated into TensorRT LLM as a KV-cache compression manager o
 1. TriAttention requires `enable_block_reuse=False` in the KV-cache configuration — the eviction physically rewrites stored keys, which is incompatible with block reuse. The construction step rejects a cache manager that has block reuse enabled.
 2. TriAttention requires the V2 KV-cache manager (`use_kv_cache_manager_v2=True`).
 3. TriAttention does not compute calibration. Bring the official tool's calibration `.pt`; see [Calibration](#calibration).
+4. Requires full-attention KVCacheManagerV2 lifecycles; attention-DP, disaggregated serving, native SWA/VSWA/SSM pools, and MLA caches are unsupported.
 
 ## Calibration
 

@@ -471,7 +471,6 @@ class TestEvictionLifecycle:
             draft_kv_cache_manager=draft_manager,
         )
 
-        manager._validate_v2_compatibility()
         assert manager.kv_cache_manager.kv_compression_manages_history is True
         assert draft_manager.kv_compression_manages_history is True
         from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
