@@ -255,9 +255,13 @@ async def test_async_benchmark_duration():
             post_proc_params=PostprocParams(),
             requests=requests,
             streaming=False,
+            concurrency=1,
             duration=1,  # 1 second limit
         )
 
-    # Out of 3 requests taking 0.6s each, only 2 should complete within 1s limit
-    # Since we fixed the assertion, this should now finish gracefully without AssertionError
+    # With concurrency=1, requests run back-to-back (0.6s each): requests 1
+    # and 2 complete at 0.6s and 1.2s; request 3 acquires its slot past the
+    # 1s deadline and is skipped. Without a concurrency limit all three would
+    # start immediately and finish within 0.6s, before the deadline — duration
+    # cannot bound an unbounded-concurrency run (see LlmManager warning).
     assert len(stats.requests) == 2
