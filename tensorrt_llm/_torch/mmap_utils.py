@@ -77,7 +77,9 @@ def is_reloadable_file_backed_tensor(tensor) -> bool:
             if (
                 not path.startswith("/")
                 or path.endswith(" (deleted)")
-                or path.startswith(("/dev/shm/", "/run/shm/"))
+                # These are kernel-reported mapping paths, not directories in
+                # which this code creates or trusts temporary files.
+                or path.startswith(("/dev/shm/", "/run/shm/"))  # nosec B108
             ):
                 return False
             return True
