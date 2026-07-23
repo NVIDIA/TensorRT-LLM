@@ -88,18 +88,7 @@ Even with Piecewise CUDA Graph enabled, you may still observe bubbles in the con
 
 Torch compile cannot work with multi-ModelEngine config.
 
-1. Speculative Decoding in Two-Model Style
-
-``` yaml
-speculative_config:
-  decoding_type: "MTP"
-  mtp_eagle_one_model: False # Not supported
-
-speculative_config:
-  decoding_type: "Eagle3"
-  eagle3_one_model: False # Not supported
-```
-
+1. NGram or User-Provided Speculative Decoding
 2. Multimodal Model Family
 
 ## Development Guide

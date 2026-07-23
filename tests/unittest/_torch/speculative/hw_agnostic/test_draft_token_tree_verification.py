@@ -35,7 +35,6 @@ def run_test(
         max_draft_len=max_draft_len,
         max_total_draft_tokens=max_total_draft_tokens,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=False,
         eagle_choices=eagle_choices,
         use_dynamic_tree=use_dynamic_tree,
     )

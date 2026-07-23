@@ -533,7 +533,6 @@ class ServerConfig:
         else:
             self.eagle3_layers_to_capture = []
         self.speculative_model = speculative_config.get("speculative_model", "")
-        self.eagle3_one_model = speculative_config.get("eagle3_one_model", False)
 
         # match_mode: "config" (default) or "scenario"
         self.match_mode = server_config_data.get("match_mode", "config")
@@ -662,7 +661,6 @@ class ServerConfig:
             "l_max_draft_len": self.max_draft_len,
             "l_force_num_accepted_tokens": self.force_num_accepted_tokens,
             "s_speculative_model_dir": self.speculative_model,
-            "b_eagle3_one_model": self.eagle3_one_model,
             "s_server_log_link": "",
             "s_server_env_var": self.env_vars,
         }

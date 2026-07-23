@@ -1769,13 +1769,9 @@ class DecodingBaseConfig(StrictBaseModel):
         "in a future release. Non-greedy sampling is now auto-detected per "
         "request; this flag no longer has any effect.")
 
-    # If set, drafting is allowed to use chain drafter.
-    _allow_chain_drafter: bool = PrivateAttr(True)
-    # If set, drafting uses greedy sampling, irrespective of sampling parameters.
-    _allow_greedy_draft_tokens: bool = PrivateAttr(True)
     # Internal: record decoding_type alias used during parsing (for warnings).
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
-    # If set, drafting will use separate KV cache in one-model speculative decoding.
+    # If set, drafting will use separate KV cache in one-engine speculative decoding.
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
     _translated_from_max_concurrency: bool = PrivateAttr(False)
@@ -2056,11 +2052,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     _num_draft_hidden_layers: Optional[int] = PrivateAttr(default=None)
     max_non_leaves_per_layer: Optional[int] = Field(
         default=None, description="The number of non-leaves in each layer.")
-    eagle3_one_model: Optional[bool] = Field(
-        default=True,
-        description=
-        "Whether to use the faster one-model implementation (draft as submodule) or the two-model implementation."
-    )
     eagle3_layers_to_capture: Optional[Set[int]] = Field(
         default=None,
         description=
@@ -2090,10 +2081,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
-        if not self.eagle3_one_model:
-            logger.warning(
-                "Eagle3 2-model is deprecated and will be removed in release 1.4."
-            )
 
         self.num_eagle_layers = self.max_draft_len
 
@@ -2195,8 +2182,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self.eagle3_one_model:
-            return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
         return TorchSpeculativeDecodingMode.EAGLE3
 
     @functools.cached_property
@@ -2452,7 +2437,6 @@ class SADecodingConfig(DecodingBaseConfig):
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Draft_Target"] = Field(default="Draft_Target")
-    _draft_target_one_model: bool = PrivateAttr(True)
 
     @model_validator(mode="after")
     def validate_draft_target_config(self):
@@ -2471,8 +2455,6 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self._draft_target_one_model:
-            return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
         return TorchSpeculativeDecodingMode.DRAFT_TARGET
 
 
@@ -2497,11 +2479,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
         default=False,
         description=
         "Force vanilla MTP mode (sequential MTP layers). When False, uses EAGLE-style MTP for single-layer checkpoints."
-    )
-    mtp_eagle_one_model: bool = Field(
-        default=True,
-        description=
-        "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
     )
 
     use_dynamic_tree: bool = Field(
@@ -2603,28 +2580,17 @@ class MTPDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = self.max_draft_len  # linear chain
         return self
 
-    @model_validator(mode="after")
-    def log_two_model_deprecation_warning(self):
-        if not self.mtp_eagle_one_model:
-            logger.warning(
-                "2-model style MTP is deprecated and will be removed in release 1.4."
-            )
-        return self
-
     def supports_backend(self, backend: str) -> bool:
         return backend in ("pytorch", "_autodeploy")
 
     @property
     def num_capture_layers(self) -> int:
-        # MTP_EAGLE (two-model) feeds captured target hidden states into the
-        # separate draft engine, so the shared Eagle3ResourceManager must
-        # allocate a hidden_states buffer for it. MTP_EAGLE_ONE_MODEL passes
-        # the target model's hidden_states straight to the MTP layer
-        # (see Eagle3OneModelWorker.prepare_1st_drafter_inputs / _run_draft_forward,
-        # both gated on self.is_mtp_eagle), so no capture buffer is needed
-        # and we should skip allocation to avoid disabling post-MLP/MoE
-        # fusion via the layer-capture hook.
-        return 1 if self.spec_dec_mode.is_mtp_eagle() else 0
+        # MTP_EAGLE passes the target model's hidden_states straight to the MTP
+        # layer (see Eagle3OneModelWorker.prepare_1st_drafter_inputs /
+        # _run_draft_forward, both gated on self.is_mtp_eagle), so no capture
+        # buffer is needed. Skipping allocation also avoids disabling the
+        # post-MLP/MoE fusion via the layer-capture hook.
+        return 0
 
     @property
     def spec_dec_mode(self):
@@ -2634,9 +2600,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         # num_nextn_predict_layers is set from the model's pretrained config by
         # update_spec_config_from_model_config. Treat None (before model load) as 1.
         n = self.num_nextn_predict_layers if self.num_nextn_predict_layers is not None else 1
-        if n == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
-            return TorchSpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
-        elif n == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
+        if n == 1 and not self.use_mtp_vanilla:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
 
@@ -3016,9 +2980,7 @@ class ExecutorMemoryType(StrEnum):
     EXTRA_RESOURCES = "executor_extra"
     KV_CACHE = "kv_cache"
     MODEL_ENGINE_MAIN = "model"
-    MODEL_ENGINE_DRAFT = "draft_model"
     MODEL_WEIGHTS_MAIN = "model_weights"
-    MODEL_WEIGHTS_DRAFT = "draft_model_weights"
 
 
 @dataclass
@@ -5315,10 +5277,9 @@ class TorchLlmArgs(BaseLlmArgs):
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
 
             if self.speculative_config.use_rejection_sampling:
-                # Supported paths: Eagle3 one-model, MTP-Eagle one-model,
-                # vanilla MTP, PARD, DFlash, DraftTarget one-model. Classify by
-                # spec-dec mode; MTP-Eagle one-model shares the Eagle3 one-model
-                # worker/metadata/sampler, so it rides the same unified
+                # Supported paths: Eagle3, MTP-Eagle, vanilla MTP, PARD, DFlash,
+                # DraftTarget. Classify by spec-dec mode; MTP-Eagle shares the
+                # Eagle3 worker/metadata/sampler, so it rides the same unified
                 # production/acceptance path.
                 #
                 # Every supported path runs a neural draft head that yields a
@@ -5334,20 +5295,21 @@ class TorchLlmArgs(BaseLlmArgs):
                 is_supported = (isinstance(self.speculative_config,
                                            Eagle3DecodingConfig)
                                 or spec_mode == TorchSpeculativeDecodingMode.MTP
-                                or spec_mode.is_mtp_eagle_one_model()
+                                or spec_mode.is_mtp_eagle()
                                 or spec_mode.is_pard() or spec_mode.is_dflash()
                                 or spec_mode.is_dspark()
-                                or spec_mode.is_draft_target_one_model())
+                                or spec_mode.is_draft_target())
 
                 # Combinations that break the proposal-distribution invariant.
                 # SA is gated for every method; relaxed / parallel / guided gates
                 # apply only to the newly wired methods (vanilla MTP, PARD,
-                # DFlash, DraftTarget one-model).
-                is_new_rejection_method = (
-                    spec_mode == TorchSpeculativeDecodingMode.MTP
-                    or spec_mode.is_pard() or spec_mode.is_dflash()
-                    or spec_mode.is_dspark()
-                    or spec_mode.is_draft_target_one_model())
+                # DFlash, DraftTarget).
+                is_new_rejection_method = (spec_mode
+                                           == TorchSpeculativeDecodingMode.MTP
+                                           or spec_mode.is_pard()
+                                           or spec_mode.is_dflash()
+                                           or spec_mode.is_dspark()
+                                           or spec_mode.is_draft_target())
                 # Plain tensor parallelism is supported (the draft path
                 # all-gathers vocab-sharded draft logits before rejection, see
                 # SpecWorkerBase.maybe_gather_sharded_draft_logits).
@@ -5391,9 +5353,8 @@ class TorchLlmArgs(BaseLlmArgs):
                         if not is_supported:
                             reasons.append(
                                 f"spec mode {spec_mode.name} is not a supported "
-                                "rejection-sampling path (supported: the Eagle3 "
-                                "one-model path, vanilla MTP, PARD, DFlash, and "
-                                "DraftTarget one-model)")
+                                "rejection-sampling path (supported: Eagle3, "
+                                "vanilla MTP, PARD, DFlash, and DraftTarget)")
                         if rs_sa_active:
                             reasons.append("SA (sa_config) is active")
                         if rs_dynamic_tree_topk_unsupported:
@@ -5438,8 +5399,7 @@ class TorchLlmArgs(BaseLlmArgs):
                                 "Install flashinfer-python or set "
                                 "use_rejection_sampling=False.")
                 # The enabled paths (Eagle3, vanilla MTP, PARD, DFlash,
-                # DraftTarget one-model) share the SpecMetadata slot-indexed
-                # dispatch.
+                # DraftTarget) share the SpecMetadata slot-indexed dispatch.
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
@@ -5573,8 +5533,6 @@ class TorchLlmArgs(BaseLlmArgs):
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
-                if self.backend == "_autodeploy":
-                    self.speculative_config._draft_target_one_model = False
 
             # If speculative_config.draft_len_schedule is provided, cuda_graph_config.enable_padding is automatically set to True.
             # Also we add the draft_len_schedule keys into batch_sizes for better cuda graph coverage in dynamic draft length.

@@ -972,7 +972,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         is_spec_dec_dynamic_tree,
         max_draft_len,
         max_total_draft_tokens,
-        model_is_wrapped: bool = False,
         spec_metadata: Optional['SpecMetadata'] = None,
         spec_tree_manager: Optional['SpecTreeManager'] = None,
         num_contexts: int = 0,
@@ -986,7 +985,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             is_spec_dec_dynamic_tree: bool, whether using dynamic tree.
             max_draft_len: int, the number of the draft layers.
             max_total_draft_tokens: int, the number of all nodes in the tree (except the root).
-            model_is_wrapped: Optional[bool] = False, whether the drafter model is wrapped (i.e, CDL).
             spec_metadata: Optional['SpecMetadata'] = None, the metadata of the spec-dec.
             spec_tree_manager: Optional['SpecTreeManager'] = None, the spec_tree_manager for draft token tree.
             num_contexts: int = 0, the number of context (prefill) requests in the
@@ -1109,60 +1107,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
                 cpp_query_len = n_dt
 
-            # Case 2/3: static tree
+            # Case 2: static tree (target model verification)
             elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
                 assert spec_metadata.spec_dec_mode.is_eagle3(
                 ), "Tree decoding is only supported for Eagle3 now"
 
-                is_target_model = not getattr(spec_metadata, 'is_draft_model',
-                                              False)
+                # Update the spec-dec parameters with the SpecTreeManager prepared
+                # in advance for target-model verification of the static tree.
+                self.spec_decoding_position_offsets[:batch_size, :].copy_(
+                    spec_tree_manager.spec_dec_position_offsets[0, :],
+                    non_blocking=True)
+                self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
+                    spec_tree_manager.spec_dec_packed_mask[0, :, :],
+                    non_blocking=True)
+                self.spec_decoding_generation_lengths[:batch_size].fill_(
+                    spec_tree_manager.max_total_draft_tokens + 1)
 
-                # Case 2: static tree and target model
-                if is_target_model:
-                    # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
-                    self.spec_decoding_position_offsets[:batch_size, :].copy_(
-                        spec_tree_manager.spec_dec_position_offsets[0, :],
-                        non_blocking=True)
-                    self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
-                        spec_tree_manager.spec_dec_packed_mask[0, :, :],
-                        non_blocking=True)
-                    self.spec_decoding_generation_lengths[:batch_size].fill_(
-                        spec_tree_manager.max_total_draft_tokens + 1)
-
-                # Case 3: static tree and the first drafter layer
-                else:
-                    assert model_is_wrapped == True, "The drafter model should be wrapped"
-                    # The first drafter layer will take the padded tokens as input (padding to the max_draft_len + 1)
-                    # But the spec-dec parameters are still in the shape of max_total_draft_tokens + 1.
-                    # Considering that these spec-dec params are accessed consecutively (without padding) in the attention Op,
-                    # we need to write them consecutively when setting them.
-                    # For the next drafter layers, we will prepare these spec-dec params in the drafting loops.
-
-                    # position_offsets
-                    position_offset = torch.arange(
-                        max_draft_len + 1,
-                        dtype=torch.int,
-                        device='cpu',
-                        pin_memory=prefer_pinned()).repeat(batch_size)
-                    self.spec_decoding_position_offsets.reshape(
-                        -1)[:(max_draft_len + 1) * batch_size].copy_(
-                            position_offset, non_blocking=True)
-                    # packed_mask
-                    dummy_idx = torch.arange(max_draft_len + 1)
-                    spec_decoding_packed_mask = torch.pow(
-                        2, dummy_idx + 1) - 1  # [max_draft_len + 1]
-                    spec_decoding_packed_mask = spec_decoding_packed_mask.repeat(
-                        batch_size)  # [batch_size * (max_draft_len + 1)]
-                    self.spec_decoding_packed_mask.reshape(
-                        -1)[:(max_draft_len + 1) * batch_size].copy_(
-                            spec_decoding_packed_mask, non_blocking=True)
-                    self.generate_spec_decoding_generation_length(
-                        runtime_draft_len=max_draft_len)
-                    if (self.spec_decoding_position_offsets is not None
-                            and self.spec_decoding_position_offsets.dim() == 1):
-                        cpp_query_len = max_draft_len + 1
-
-            # Case 4: linear tree
+            # Case 3: linear tree
             else:
                 # Currently dynamic draft length is only supported for linear tree
                 # Dynamic draft length needs position offsets and packed mask to be shaped for each runtime draft length.

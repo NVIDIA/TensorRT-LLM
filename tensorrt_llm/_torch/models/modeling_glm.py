@@ -482,7 +482,6 @@ class Glm4DecoderLayer(DecoderLayer):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-        is_separate_draft_engine: bool = False,
     ):
         super().__init__()
         self.model_config = model_config
@@ -498,9 +497,6 @@ class Glm4DecoderLayer(DecoderLayer):
         self.mapping = model_config.mapping
         mapping = self.mapping
         layer_idx_for_attention = layer_idx
-        if is_separate_draft_engine:
-            # KVCacheManager only support 1 layer for separate draft engine
-            layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
         if getattr(config, "use_qk_norm", False) and config.use_qk_norm:
             self.self_attn = Glm4Attention(model_config, layer_idx=layer_idx_for_attention)
@@ -822,9 +818,8 @@ class Glm4MTP(Glm4DecoderLayer):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-        is_separate_draft_engine: bool = False,
     ):
-        super().__init__(model_config, layer_idx, aux_stream_dict, is_separate_draft_engine)
+        super().__init__(model_config, layer_idx, aux_stream_dict)
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size

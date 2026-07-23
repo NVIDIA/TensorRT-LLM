@@ -2517,11 +2517,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _is_draft_batch(requests: list[LlmRequest]) -> bool:
         """Whether this batch belongs to the draft model.
 
-        Batches are homogeneous by construction: ModelDrafter builds all-draft
-        batches for its sample_async/update_requests calls on this shared
-        sampler, and PyExecutor's batches are all-target. The pending-steps
-        accounting relies on this to skip draft batches wholesale; assert it so
-        a mixed batch fails loudly instead of silently corrupting the counters.
+        Callers provide homogeneous all-draft or all-target batches. The
+        pending-steps accounting relies on this to skip draft batches
+        wholesale; assert it so a mixed batch fails loudly instead of silently
+        corrupting the counters.
         """
         is_draft: bool = requests[0].py_is_draft
         assert all(r.py_is_draft == is_draft for r in requests), (
@@ -2581,26 +2580,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             raise ValueError("top_p_decay is not supported with beam search.")
         # A non-zero draft length means the request carries speculative draft
         # tokens and produces multiple tokens per step (req_num_steps =
-        # 1 + draft_token_length). One-model speculation (vanilla MTP, one-model
-        # Eagle3 / MTP-Eagle, SA, draft-target-one-model) uses its own
-        # SpecSamplerBase-derived sampler and never reaches TorchSampler; the
-        # drafter-based modes that DO flow draft tokens through TorchSampler
-        # (two-model draft-target, NGram, user-provided, two-model Eagle3 /
-        # MTP-Eagle) are what can make this length non-zero. top-p decay does not
-        # support these multi-token steps.
-        # NB: at admission time the draft tokens of drafter-based modes are
-        # usually not attached yet, so this check is best-effort. Two-model
-        # speculation (the only source of such requests in TorchSampler) is
-        # slated for removal, so in practice no speculative request reaches the
-        # decay path; a debug assert in _build_top_p_decay_metadata guards the
-        # invariant at sample time.
+        # 1 + draft_token_length). Speculative modes that use a dedicated
+        # SpecSamplerBase-derived sampler never reach TorchSampler. Drafter-based
+        # modes that do (NGram, user-provided) can make this length non-zero.
+        # top-p decay does not support these multi-token steps.
+        # NB: at admission time draft tokens of drafter-based modes are usually
+        # not attached yet, so this check is best-effort. A debug assert in
+        # _build_top_p_decay_metadata guards the invariant at sample time.
         if get_draft_token_length(request) > 0:
             raise ValueError(
                 "top_p_decay is not supported for requests carrying speculative "
-                "draft tokens (req_num_steps > 1). This covers the drafter-based "
-                "modes routed through TorchSampler (two-model draft-target, NGram, "
-                "user-provided, two-model Eagle3 / MTP-Eagle); one-model "
-                "speculation uses its own sampler and is unaffected."
+                "draft tokens (req_num_steps > 1). This covers drafter-based "
+                "modes routed through TorchSampler (NGram, user-provided); "
+                "other speculative modes use their own sampler and are unaffected."
             )
 
     def _can_use_fast_greedy_path(self, requests: list[LlmRequest]) -> bool:
@@ -4095,11 +4087,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         num_context_logits_prefix_sum: list[int],
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleStateTorch:
-        # NB: The sampler is either called directly by PyExecutor, for the target model,
-        #     or by ModelDrafter.prepare_draft_tokens(), for the draft model. In the former
-        #     case there are 1 + get_draft_token_length(request) tokens per request. In the
-        #     latter case, there is always only 1 token per request because draft
-        #     tokens are sampled one-by-one.
+        # NB: The sampler is called directly by PyExecutor for the target model.
+        #     There are 1 + get_draft_token_length(request) tokens per request.
         self.setup_sampler_step(scheduled_requests)
         new_tokens = self.store.new_tokens
 
@@ -4370,10 +4359,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             group_seq_slots = seq_slots[group_req_indices]
             if __debug__:
                 # Internal invariant (stripped under python -O): a decay-active
-                # row is always single-token -- the only source of multi-step
-                # rows in TorchSampler is two-model speculation (slated for
-                # removal), and decay + draft tokens is rejected per-request at
-                # admission in validate_request.
+                # row is always single-token -- multi-step rows in TorchSampler
+                # come from drafter-based modes (NGram / user-provided), and
+                # decay + draft tokens is rejected per-request at admission in
+                # validate_request.
                 decay_row_steps = group_steps[
                     torch.isin(group_seq_slots, torch.tensor(list(self._top_p_decay_slots)))
                 ]

@@ -395,16 +395,16 @@ def test_default_profile_qualifies_real_tiny_llama_lifecycle(monkeypatch):
     assert_post_transform_lifecycle_equivalent(case)
 
 
-def test_separate_draft_model_is_not_qualified_by_target_only_profile(monkeypatch):
+def test_separate_draft_weights_not_qualified_by_target_only_profile(monkeypatch):
     monkeypatch.setattr(
         ModelLoader,
         "_POST_TRANSFORM_PROFILE_REGISTRY",
-        _tiny_profile_registry(speculative_mode="eagle3_one_model"),
+        _tiny_profile_registry(speculative_mode="eagle3"),
     )
 
     decision = ModelLoader._qualify_post_transform_profile(
         _TinyModel([]),
-        speculative_mode="eagle3_one_model",
+        speculative_mode="eagle3",
         loads_draft_weights=True,
     )
 

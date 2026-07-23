@@ -2,7 +2,7 @@ import requests
 from defs.trt_test_alternative import print_error, print_info
 
 
-def check_spec_decoding_metrics(http_port="8000", expect_draft_latency=False, min_draft_tokens=1):
+def check_spec_decoding_metrics(http_port="8000", min_draft_tokens=1):
     print_info("Checking specDecodingStats in /metrics endpoint...")
 
     try:
@@ -53,15 +53,6 @@ def check_spec_decoding_metrics(http_port="8000", expect_draft_latency=False, mi
             assert spec_stats["iterLatencyMS"] >= 0.0
             assert spec_stats["draftOverhead"] >= 0.0
             assert spec_stats["draftOverhead"] <= 1.0  # Can't exceed 100%
-
-            # For 2-model mode, verify draft latency is tracked
-            if expect_draft_latency:
-                assert spec_stats["iterLatencyMS"] > 0.0, (
-                    "Two-model mode should have non-zero draft latency"
-                )
-                assert spec_stats["draftOverhead"] > 0.0, (
-                    "Two-model mode should have non-zero draft overhead"
-                )
 
         return True
 

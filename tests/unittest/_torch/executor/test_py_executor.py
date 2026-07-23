@@ -1887,7 +1887,7 @@ class TestCheckCacheTransferErrorsAdpNoop:
 class TestOneModelMTPDraftTokenScheduling:
     """Regression tests for the one-model MTP over-scheduling bug (#16101).
 
-    One-model MTP (``mtp_eagle_one_model``) has no separate drafter, so
+    One-model MTP (``MTP_EAGLE``) has no separate drafter, so
     ``get_spec_drafter()`` returns None and the ``if self.drafter is not None``
     draft-token normalization block in ``_prepare_and_schedule_batch`` is
     skipped. Without the ``elif`` fallback that mirrors it, generation requests
@@ -1963,11 +1963,10 @@ class TestOneModelMTPDraftTokenScheduling:
         disaggregated serving in one shot.
 
         The fix's state filter is {GENERATION_IN_PROGRESS,
-        DISAGG_GENERATION_INIT}, mirroring the two-model normalization, so a
-        single fix covers the aggregated decode path (GENERATION_IN_PROGRESS)
-        and the disagg decode-worker path (DISAGG_GENERATION_INIT). Context
-        requests (CONTEXT_INIT) are not generation requests and must be left
-        untouched.
+        DISAGG_GENERATION_INIT}, so a single fix covers the aggregated decode
+        path (GENERATION_IN_PROGRESS) and the disagg decode-worker path
+        (DISAGG_GENERATION_INIT). Context requests (CONTEXT_INIT) are not
+        generation requests and must be left untouched.
         """
         gen = self._make_llm_request(0, LlmRequestState.GENERATION_IN_PROGRESS)
         disagg_gen = self._make_llm_request(1, LlmRequestState.DISAGG_GENERATION_INIT)

@@ -182,7 +182,6 @@ python3 examples/llm-api/quickstart_advanced.py \
     --moe_backend=TRTLLM \
     --spec_decode_algo=MTP \
     --spec_decode_max_draft_len=3 \
-    --use_one_model \
     --tp_size=8 \
     --moe_ep_size 8 \
     --apply_chat_template

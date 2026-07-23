@@ -344,7 +344,6 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         speculative_config = Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=self.EAGLE_MODEL_PATH,
-            eagle3_one_model=True,
             eagle3_layers_to_capture={1, 15, 28},
         )
         # Note: Test crashes with trtllm attn_backend + torch-simple
@@ -389,7 +388,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
-    def test_eagle3_one_model(self, attn_backend):
+    def test_eagle3(self, attn_backend):
         """Test Eagle3 one-model speculative decoding accuracy on GSM8K."""
         kwargs = self.get_default_kwargs(attn_backend=attn_backend)
 

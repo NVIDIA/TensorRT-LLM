@@ -1184,7 +1184,6 @@ class NemotronHMTP(nn.Module):
         model_config: NemotronHModelConfig,
         layer_idx: int,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
-        is_separate_draft_engine: bool = False,
         prefix: str = "",
     ):
         super().__init__()

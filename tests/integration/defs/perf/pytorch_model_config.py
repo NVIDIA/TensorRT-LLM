@@ -337,7 +337,6 @@ def get_model_yaml_config(model_label: str,
             'config': {
                 'speculative_config': {
                     'decoding_type': 'Eagle',
-                    'eagle3_one_model': True,
                     'speculative_model': 'Qwen3-4B_eagle3',
                     'max_draft_len': 3,
                 },
