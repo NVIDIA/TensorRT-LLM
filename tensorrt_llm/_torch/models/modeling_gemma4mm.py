@@ -550,6 +550,20 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
 
     supports_encoder_cache = True
 
+    @classmethod
+    def get_model_defaults(cls, llm_args) -> dict:
+        """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
+        return {
+            "attn_backend": "FLASHINFER",
+        }
+
+    def _check_and_adjust_experts_implementation(self, *args, **kwargs):
+        # transformers 5.x ``PreTrainedModel.__init__`` calls this with an
+        # ``experts_implementation`` argument and fails for VL wrapper models
+        # that do not directly contain MoE layers. TRT-LLM manages expert
+        # implementations independently, so skip the check.
+        return None
+
     @property
     def multimodal_data_device_paths(self) -> List[str]:
         """Dotted multimodal-data paths that the engine transfers to the GPU."""
@@ -684,6 +698,91 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             raise ValueError("Gemma4 received active multimodal parameters without encoder inputs")
         return torch.cat(multimodal_embeddings, dim=0)
 
+    @staticmethod
+    def get_sub_model_config(
+        model_config: ModelConfig[Gemma4Config],
+        name: str,
+    ) -> ModelConfig:
+        assert name in ["text_config", "vision_config", "audio_config"], (
+            f"Expected subconfig name to be 'text_config', 'vision_config', "
+            f"or 'audio_config'. Got {name} instead."
+        )
+        pretrained_config = getattr(model_config.pretrained_config, name)
+        quant_config = model_config.quant_config if name == "text_config" else None
+        preferred_backend = "FLASHINFER" if name == "text_config" else "TRTLLM"
+        sub_config: ModelConfig = dataclasses.replace(
+            model_config,
+            pretrained_config=pretrained_config,
+            attn_backend=preferred_backend,
+            quant_config=quant_config,
+        )
+        if (
+            hasattr(sub_config.pretrained_config, "torch_dtype")
+            and sub_config.pretrained_config.torch_dtype is None
+        ):
+            sub_config.pretrained_config.torch_dtype = model_config.pretrained_config.torch_dtype
+        return sub_config
+
+    def post_config(self):
+        self.config = self.llm.config
+        self.model_config.pretrained_config = self.llm.config
+
+    @property
+    def language_model(self) -> torch.nn.Module:
+        return self.llm
+
+    def get_language_model_extra_forward_kwargs(
+        self,
+        *,
+        raw_input_ids: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        mm_inputs: PreparedLlmInputs,
+        lora_params=None,
+        **forward_kwargs,
+    ) -> Dict:
+        """Build Gemma4-specific language-model forward arguments."""
+        del position_ids, forward_kwargs
+        mm_token_type_ids = None
+        if raw_input_ids is not None and mm_inputs.input_ids is None:
+            mm_token_type_ids = torch.zeros_like(raw_input_ids, dtype=torch.long)
+            mm_token_type_ids[raw_input_ids == self.image_token_ids[0]] = 1
+            if self.video_token_ids is not None:
+                mm_token_type_ids[raw_input_ids == self.video_token_ids[0]] = 2
+            if self.audio_token_ids is not None:
+                mm_token_type_ids[raw_input_ids == self.audio_token_ids[0]] = 3
+
+        ple_input_ids = None
+        if mm_token_type_ids is not None and self.llm.model.hidden_size_per_layer_input:
+            text_config = getattr(self.config, "text_config", self.config)
+            pad_id = getattr(text_config, "pad_token_id", None)
+            if pad_id is not None:
+                ple_input_ids = torch.where(
+                    mm_token_type_ids > 0,
+                    torch.full_like(raw_input_ids, pad_id),
+                    raw_input_ids,
+                )
+        return {
+            "mm_token_type_ids": mm_token_type_ids,
+            "ple_input_ids": ple_input_ids,
+            "lora_params": lora_params,
+        }
+
+    @property
+    def multimodal_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
+
+    @property
+    def text_embedding_layer(self) -> Embedding:
+        return self.llm.model.embed_tokens
+
+    @property
+    def embedding_dim(self) -> int:
+        return self.text_embedding_layer.embedding_dim
+
+    @property
+    def embedding_dtype(self) -> torch.dtype:
+        return self.text_embedding_layer.weight.dtype
+
 
 @register_auto_model("Gemma4ForConditionalGeneration")
 @register_input_processor(
@@ -722,13 +821,6 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
     - Support for image_position_ids (2D patch coordinates)
     - mm_token_type_ids-based bidirectional masking
     """
-
-    @classmethod
-    def get_model_defaults(cls, llm_args) -> dict:
-        """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
-        return {
-            "attn_backend": "FLASHINFER",
-        }
 
     def __init__(self, model_config: ModelConfig[Gemma4Config]):
         if _is_mm_disagg():
@@ -843,31 +935,6 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
         self.post_config()
         self.is_loaded = True
 
-    @staticmethod
-    def get_sub_model_config(
-        model_config: ModelConfig[Gemma4Config],
-        name: str,
-    ) -> ModelConfig:
-        assert name in ["text_config", "vision_config", "audio_config"], (
-            f"Expected subconfig name to be 'text_config', 'vision_config', "
-            f"or 'audio_config'. Got {name} instead."
-        )
-        pretrained_config = getattr(model_config.pretrained_config, name)
-        quant_config = model_config.quant_config if name == "text_config" else None
-        preferred_backend = "FLASHINFER" if name == "text_config" else "TRTLLM"
-        sub_config: ModelConfig = dataclasses.replace(
-            model_config,
-            pretrained_config=pretrained_config,
-            attn_backend=preferred_backend,
-            quant_config=quant_config,
-        )
-        if (
-            hasattr(sub_config.pretrained_config, "torch_dtype")
-            and sub_config.pretrained_config.torch_dtype is None
-        ):
-            sub_config.pretrained_config.torch_dtype = model_config.pretrained_config.torch_dtype
-        return sub_config
-
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
         # Gemma4 checkpoint keys: model.language_model.X -> need model.X for LLM
         # Remap: "model.language_model.layers.0..." -> "model.layers.0..."
@@ -898,14 +965,6 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
         if self.embed_audio is not None:
             embed_a_weights = filter_weights("embed_audio", stripped)
             self.embed_audio.load_weights(embed_a_weights)
-
-    def post_config(self):
-        self.config = self.llm.config
-        self.model_config.pretrained_config = self.llm.config
-
-    @property
-    def language_model(self) -> torch.nn.Module:
-        return self.llm
 
     @nvtx_range("[Vision] process")
     def _get_image_features(
@@ -985,55 +1044,3 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
         else:
             projected = projected.reshape(-1, projected.shape[-1])
         return projected.contiguous()
-
-    def get_language_model_extra_forward_kwargs(
-        self,
-        *,
-        raw_input_ids: Optional[torch.Tensor],
-        position_ids: Optional[torch.Tensor],
-        mm_inputs: PreparedLlmInputs,
-        lora_params=None,
-        **forward_kwargs,
-    ) -> Dict:
-        """Build Gemma4-specific language-model forward arguments."""
-        del position_ids, forward_kwargs
-        mm_token_type_ids = None
-        if raw_input_ids is not None and mm_inputs.input_ids is None:
-            mm_token_type_ids = torch.zeros_like(raw_input_ids, dtype=torch.long)
-            mm_token_type_ids[raw_input_ids == self.image_token_ids[0]] = 1
-            if self.video_token_ids is not None:
-                mm_token_type_ids[raw_input_ids == self.video_token_ids[0]] = 2
-            if self.audio_token_ids is not None:
-                mm_token_type_ids[raw_input_ids == self.audio_token_ids[0]] = 3
-
-        ple_input_ids = None
-        if mm_token_type_ids is not None and self.llm.model.hidden_size_per_layer_input:
-            text_config = getattr(self.config, "text_config", self.config)
-            pad_id = getattr(text_config, "pad_token_id", None)
-            if pad_id is not None:
-                ple_input_ids = torch.where(
-                    mm_token_type_ids > 0,
-                    torch.full_like(raw_input_ids, pad_id),
-                    raw_input_ids,
-                )
-        return {
-            "mm_token_type_ids": mm_token_type_ids,
-            "ple_input_ids": ple_input_ids,
-            "lora_params": lora_params,
-        }
-
-    @property
-    def multimodal_token_ids(self) -> torch.Tensor:
-        return self._mm_token_ids
-
-    @property
-    def text_embedding_layer(self) -> Embedding:
-        return self.llm.model.embed_tokens
-
-    @property
-    def embedding_dim(self) -> int:
-        return self.text_embedding_layer.embedding_dim
-
-    @property
-    def embedding_dtype(self) -> torch.dtype:
-        return self.text_embedding_layer.weight.dtype

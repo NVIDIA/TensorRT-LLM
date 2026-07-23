@@ -219,20 +219,6 @@ class MultimodalModelMixin:
         raise NotImplementedError
 
     @property
-    def draft_config(self):
-        """Expose the inner language model's draft configuration."""
-        return self.language_model.draft_config
-
-    @property
-    def draft_model(self):
-        """Expose the inner language model's draft model."""
-        return self.language_model.draft_model
-
-    def load_draft_weights(self, *args, **kwargs):
-        """Delegate draft-weight loading to the inner language model."""
-        return self.language_model.load_draft_weights(*args, **kwargs)
-
-    @property
     def vocab_size_padded(self) -> int:
         """Return the inner language model's padded vocabulary size."""
         return self.language_model.vocab_size_padded
@@ -240,10 +226,6 @@ class MultimodalModelMixin:
     def infer_max_seq_len(self) -> int:
         """Return the inner language model's maximum sequence length."""
         return self.language_model.infer_max_seq_len()
-
-    def _check_and_adjust_experts_implementation(self, *args, **kwargs):
-        """Skip Transformers' MoE validation for multimodal wrapper models."""
-        return None
 
     def get_language_model_extra_forward_kwargs(
         self,
@@ -847,8 +829,9 @@ def _dispatch_cross_iter_prefetch(
                 chunk_end_pos=cumsum.numel(),
                 embed_mask_cumsum=cumsum,
             ),
+            mm_item_order=req.py_mm_item_order,
         )
-        for _, mm_data, cumsum in candidates
+        for req, mm_data, cumsum in candidates
     ]
 
     # Prefetch targets requests outside the current iteration, so their

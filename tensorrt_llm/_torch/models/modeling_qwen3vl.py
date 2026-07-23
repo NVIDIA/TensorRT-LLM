@@ -5,7 +5,7 @@ import copy
 import math
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -19,7 +19,10 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionPatchEmbed as HFQwen3VLVisionPatchEmbed,
 )
 
-from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
+from tensorrt_llm._torch.models.modeling_multimodal_utils import (
+    _is_mm_disagg,
+    filter_mm_token_from_input_ids,
+)
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
@@ -1234,6 +1237,16 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
             )
         return mm_embeds[0]
 
+    def _check_and_adjust_experts_implementation(self, *args, **kwargs):
+        """No-op override.
+
+        Transformers 5.x's ``PreTrainedModel.__init__`` calls this method
+        (with an ``experts_implementation`` argument) which fails for VL
+        wrapper models that do not directly contain MoE layers.  TRT-LLM
+        manages expert implementations independently, so skip the check.
+        """
+        return None
+
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -1331,6 +1344,21 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         self.deepstack_num_level = (
             len(config.vision_config.deepstack_visual_indexes) if self.use_deepstack else 0
         )
+        if self.deepstack_num_level > 0:
+            # Reuse one `(L, max_num_tokens, hidden)` scratch allocation for
+            # per-layer deepstack embeddings. The generic extra-embedding path
+            # allocates and scatters one full-sequence tensor per level.
+            self.register_buffer(
+                "deepstack_input_embeds",
+                torch.zeros(
+                    self.deepstack_num_level,
+                    model_config.max_num_tokens,
+                    config.text_config.hidden_size,
+                    device="cuda",
+                    dtype=config.text_config.torch_dtype,
+                ),
+                persistent=False,
+            )
 
         # Surface the in-vocab image / video placeholder IDs to the model
         # engine's ``_prepare_multimodal_indices`` so it selects the
@@ -1353,6 +1381,26 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     @property
     def language_model(self) -> torch.nn.Module:
         return self.llm
+
+    # Draft-model (two-model speculative decoding, e.g. DFlash / Eagle3)
+    # delegation: `ModelLoader.load` reads `draft_config` / `draft_model` and
+    # calls `load_draft_weights` on the *outer* model it resolved, but the
+    # spec-decoding wrapper (`SpecDecOneEngineForCausalLM`) is applied to the
+    # inner `self.llm` when this VLM composes it. Composite checkpoints
+    # (e.g. Qwen3.5-4B publishes text_config + vision_config) route text-only
+    # spec tests through this wrapper, so surface the inner LM's draft state.
+    # Note: `load_draft_weights` must keep an explicit signature — the loader
+    # dispatches kwargs via `inspect.getfullargspec`.
+    @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    def load_draft_weights(self, weights: Dict, weight_mapper: Optional[BaseWeightMapper] = None):
+        return self.llm.load_draft_weights(weights, weight_mapper=weight_mapper)
 
     @property
     def text_embedding_layer(self) -> Embedding:
@@ -1452,7 +1500,6 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         **forward_kwargs: Any,
     ) -> tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Separate Qwen3-VL's packed deepstack streams from primary embeddings."""
-        del multimodal_params, forward_kwargs
         if not self.use_deepstack:
             return active_embeddings, []
 
@@ -1463,6 +1510,55 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
             )
             deepstack_embeds.extend(deepstack_embed)
         return active_embeddings, deepstack_embeds
+
+    def _fuse_multimodal_embeddings(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: List[torch.Tensor],
+        mm_token_ids: Optional[Sequence[int] | torch.Tensor],
+        embedding_layer,
+        extra_embeds: Sequence[torch.Tensor],
+        text_token_indices: Optional[torch.Tensor] = None,
+        mm_token_indices: Optional[torch.Tensor] = None,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Sequence[torch.Tensor]]:
+        """Fuse primary embeddings and expand deepstack features in reusable scratch."""
+        # Qwen only needs the explicit MM indices below when deepstack features
+        # must be scattered into its reusable buffer. Without extra embeds,
+        # `fuse_input_embeds` performs its normal index fallback inside `super()`.
+        if extra_embeds and (text_token_indices is None or mm_token_indices is None):
+            text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
+                input_ids,
+                vocab_size=embedding_layer.num_embeddings,
+                mm_token_ids=mm_token_ids,
+            )
+
+        fused_input_ids, inputs_embeds, _ = super()._fuse_multimodal_embeddings(
+            input_ids=input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            mm_token_ids=mm_token_ids,
+            embedding_layer=embedding_layer,
+            # Keep auxiliary fusion out of the generic path: passing non-empty
+            # `extra_embeds` would allocate and scatter one full-sequence tensor
+            # per deepstack level before Qwen replaces them with its buffer views.
+            extra_embeds=(),
+            text_token_indices=text_token_indices,
+            mm_token_indices=mm_token_indices,
+        )
+        if not extra_embeds:
+            return fused_input_ids, inputs_embeds, ()
+
+        # Expand the per-level deepstack mm embeddings into the pre-allocated
+        # `(L, max_num_tokens, H)` buffer with a single packed scatter, avoiding `L` fresh
+        # `torch.zeros` + `L` scatters inside `fuse_input_embeds`.
+        deepstack_buffer = self.deepstack_input_embeds[:, : input_ids.shape[0], :]
+        deepstack_buffer.zero_()
+        packed_deepstack = torch.stack(tuple(extra_embeds), dim=0)
+        deepstack_buffer[:, mm_token_indices, :] = packed_deepstack.to(
+            dtype=deepstack_buffer.dtype,
+            device=deepstack_buffer.device,
+        )
+        return fused_input_ids, inputs_embeds, tuple(deepstack_buffer.unbind(0))
 
     def get_language_model_extra_forward_kwargs(
         self,
@@ -1480,7 +1576,6 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         **forward_kwargs: Any,
     ) -> Dict[str, Any]:
         """Build Qwen3-VL-specific language-model forward arguments."""
-        del forward_kwargs
         mrope_config = {}
         if not self.model_config.pretrained_config.disable_fuse_rope:
             mrope_config = self.prepare_mrope_config(

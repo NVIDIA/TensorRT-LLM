@@ -799,6 +799,14 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     def embedding_dtype(self) -> torch.dtype:
         return self.text_embedding_layer.weight.dtype
 
+    @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
     def encode_multimodal_inputs(
         self,
         multimodal_params: Sequence[MultimodalParams],

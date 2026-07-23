@@ -33,15 +33,14 @@ per-layer head_dim 256/512, interleaved VSWA, `k_eq_v` MQA on global layers,
 `layer_scalar`, final-logit softcap, tied embeddings). 12B has PLE and
 KV-sharing **off** (`hidden_size_per_layer_input=0`, `num_kv_shared_layers=0`).
 
-This module reuses the existing Gemma 4 multimodal wrapper
-(:class:`Gemma4ForConditionalGeneration`) for all engine plumbing
+This module inherits the shared Gemma 4 multimodal wrapper base
+(:class:`Gemma4MultimodalModelBase`) for all engine plumbing
 (`post_config` / `get_sub_model_config` / `infer_max_seq_len` /
 `vocab_size_padded` / `get_model_defaults`), and reuses
 :class:`Gemma4MultimodalEmbedder` (audio) and :class:`Gemma4InputProcessor`
 (HF `AutoProcessor` resolves to `Gemma4UnifiedProcessor`; the output dict
-keys match). It overrides `__init__` / `forward` / `_get_image_features` /
-`_get_audio_features` / `load_weights` to drop the encoder towers and use the
-encoder-free projections instead.
+keys match). It implements `__init__`, `_get_image_features`,
+`_get_audio_features`, and `load_weights` for the encoder-free projections.
 
 TRT-LLM provides its own `gemma4_unified` config classes
 (`_torch/configs/gemma4_unified.py`) and multimodal preprocessing (the vendored
@@ -61,7 +60,6 @@ import numpy as np
 import torch
 from torch import nn
 from torchvision.transforms.v2 import functional as tvF
-from transformers import PreTrainedModel
 from transformers.feature_extraction_sequence_utils import SequenceFeatureExtractor
 from transformers.image_processing_backends import TorchvisionBackend
 from transformers.image_processing_utils import BatchFeature
@@ -81,9 +79,9 @@ from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
 from .modeling_gemma4mm import (
-    Gemma4ForConditionalGeneration,
     Gemma4InputProcessor,
     Gemma4MultimodalEmbedder,
+    Gemma4MultimodalModelBase,
 )
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
@@ -223,16 +221,12 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
         interleave_placeholders=True,
     ),
 )
-class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
-    """Gemma 4 12B Unified (encoder-free). Reuses the Gemma 4 MM wrapper for
-    engine plumbing + the text core (:class:`Gemma4ForCausalLM`); replaces the
-    vision/audio towers with encoder-free linear embedders."""
+class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
+    """Gemma 4 12B Unified model with encoder-free multimodal projections."""
 
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config
-        # Skip Gemma4ForConditionalGeneration.__init__ (it builds vision/audio
-        # *towers* the unified architecture does not have) and init the HF base.
-        PreTrainedModel.__init__(self, config)
+        super().__init__(config)
 
         # ModelConfig always has `mapping`, and Mapping always has `local_rank`.
         local_rank = model_config.mapping.local_rank

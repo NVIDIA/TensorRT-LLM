@@ -132,6 +132,7 @@ The following optimizations are available to models that implement
 | Model Architecture | Multimodal Encoder Side Stream | Multimodal Embeddings Cache |
 | ------------------ | ------------------------------ | --------------------------- |
 | `Gemma4ForConditionalGeneration` | Yes | Yes |
+| `Gemma4UnifiedForConditionalGeneration` | Yes | Yes |
 | `Mistral3ForConditionalGeneration` | Yes | Yes |
 | `Qwen3VLForConditionalGeneration` | Yes | Yes |
 | `Qwen3VLMoeForConditionalGeneration` | Yes | Yes |
