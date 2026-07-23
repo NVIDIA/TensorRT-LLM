@@ -793,11 +793,24 @@ class DSparkDraftModel(nn.Module):
         moe_all_rank_num_tokens = (
             all_rank_num_tokens if all_rank_num_tokens is not None else [num_tokens]
         )
+        # The draft captured-context MoE must mirror the target DeepseekV4MoE's TP
+        # reduction policy. Under attention DP each rank is data-parallel (owns a
+        # distinct set of requests) and needs no cross-rank reduction; but under
+        # plain tensor parallelism (attention_dp off, tp_size > 1) the expert-sharded
+        # MoE output must be all-reduced across ranks -- exactly what the target MoE
+        # does (enable_allreduce = not (POST_MOE_FUSION or tp_size == 1)). Previously
+        # this was hard-coded to False, which dropped the reduction on the non-ADP
+        # path, corrupting the draft block proposals and roughly halving DSpark
+        # acceptance length whenever attention_dp was disabled.
+        moe_enable_allreduce = (
+            not self.model_config.mapping.enable_attention_dp
+            and self.model_config.mapping.tp_size > 1
+        )
         moe_out = stage.mlp(
             layer_input.reshape(num_tokens, hidden),
             input_ids=moe_input_ids,
             all_rank_num_tokens=moe_all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(enable_allreduce=False),
+            final_all_reduce_params=AllReduceParams(enable_allreduce=moe_enable_allreduce),
             do_finalize=True,
         ).reshape(T, block, hidden)
         h = stage.hc_ffn.post_mapping(
