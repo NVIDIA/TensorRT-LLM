@@ -80,6 +80,13 @@ def test_nvswitch_topology_remains_supported(
     assert not MnnvlMemory._is_pcie_nvl_sku(0)
 
 
+@patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA B200")
+@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
+def test_b200_does_not_use_hopper_topology_fallback(mock_initialize, mock_get_device_name) -> None:
+    assert not MnnvlMemory._is_pcie_nvl_sku(0)
+    mock_initialize.assert_not_called()
+
+
 def test_topology_probe_initializes_nvml() -> None:
     with (
         patch(
@@ -128,9 +135,13 @@ def test_supports_mnnvl_accepts_full_fabric(
     "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.get_sm_version",
     return_value=90,
 )
-@patch.object(MnnvlMemory, "supports_mnnvl", return_value=False)
+@patch(
+    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.torch.cuda.current_device",
+    return_value=0,
+)
+@patch.object(MnnvlMemory, "_is_pcie_nvl_sku", return_value=True)
 def test_deep_ep_low_latency_rejects_split_topology(
-    mock_supports_mnnvl, mock_get_sm_version
+    mock_is_pcie_nvl_sku, mock_current_device, mock_get_sm_version
 ) -> None:
     assert not DeepEPLowLatency.is_platform_supported()
 
@@ -141,8 +152,16 @@ def test_deep_ep_low_latency_rejects_split_topology(
 )
 @patch(
     "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.get_sm_version",
-    return_value=90,
+    return_value=100,
 )
-@patch.object(MnnvlMemory, "supports_mnnvl", return_value=True)
-def test_deep_ep_low_latency_accepts_full_fabric(mock_supports_mnnvl, mock_get_sm_version) -> None:
+@patch(
+    "tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency.torch.cuda.current_device",
+    return_value=0,
+)
+@patch.object(MnnvlMemory, "_is_pcie_nvl_sku", return_value=False)
+@patch.object(MnnvlMemory, "supports_mnnvl")
+def test_deep_ep_low_latency_accepts_b200_without_mnnvl_probe(
+    mock_supports_mnnvl, mock_is_pcie_nvl_sku, mock_current_device, mock_get_sm_version
+) -> None:
     assert DeepEPLowLatency.is_platform_supported()
+    mock_supports_mnnvl.assert_not_called()

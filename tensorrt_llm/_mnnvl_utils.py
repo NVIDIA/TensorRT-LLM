@@ -385,16 +385,19 @@ class MnnvlMemory:
     @staticmethod
     @functools.cache
     def _is_pcie_nvl_sku(dev_id: int) -> bool:
-        """Return whether visible GPUs form PCIe-connected NVLink islands."""
+        """Return whether visible H100/H200 GPUs form PCIe-connected NVLink islands."""
         # H100/H200 NVL PCIe SKUs bond GPUs into local NVLink islands joined
         # only through PCIe/SYS. Per-device NVLink state therefore cannot
         # distinguish them from an NVSwitch fabric.
-        if " NVL" in torch.cuda.get_device_name(dev_id).upper():
+        device_name = torch.cuda.get_device_name(dev_id).upper()
+        if " NVL" in device_name:
             return True
 
-        # Use topology as a fallback for future split-island SKUs whose device
-        # name does not contain NVL. A fabric-attached NVSwitch system reports
-        # NODE or a tighter ancestor for every visible GPU pair.
+        # NVML may report SYSTEM between peers on later NVSwitch platforms, so
+        # use this fallback only for the affected Hopper SKUs.
+        if not any(sku in device_name for sku in ("H100", "H200")):
+            return False
+
         try:
             MnnvlMemory._ensure_nvml_initialized()
             self_handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
