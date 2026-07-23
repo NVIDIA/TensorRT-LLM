@@ -40,7 +40,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_hybrid_linear
+from .config_utils import is_hybrid_linear, is_minimax_m3
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -419,6 +419,13 @@ def create_py_executor(
     tokens_per_block = kv_cache_config.tokens_per_block
     if llm_args.attn_backend == "VANILLA":
         tokens_per_block = max_num_tokens
+
+    # The MSA kernels require a page size of 128; the Triton reference uses TRT-LLM's default
+    # of 32.
+    m3_sparse_config = llm_args.sparse_attention_config
+    if is_minimax_m3(m3_sparse_config):
+        tokens_per_block = 128 if m3_sparse_config.implementation == "msa" else 32
+        kv_cache_config.tokens_per_block = tokens_per_block
 
     if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
         # Workaround for flashinfer and star attention
