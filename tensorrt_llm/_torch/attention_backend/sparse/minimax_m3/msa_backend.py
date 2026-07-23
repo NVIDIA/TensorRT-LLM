@@ -1025,6 +1025,9 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         config = self.m3_config
         idx_sm_scale = idx_sm_scale if idx_sm_scale is not None else config.sparse_index_dim**-0.5
         num_tokens = int(idx_q.shape[0])
+        head_major_output = (
+            int(metadata.num_contexts or 0) > 0 and int(metadata.num_generations or 0) == 0
+        )
         # idx_q and idx_k may be strided column-views of a fused buffer, so
         # reshape to keep them zero-copy. The proxy fmha_sm100 and the index-K
         # scatter below both honor the source strides.
@@ -1067,12 +1070,18 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             max_score = None
             # The empty case was resolved on the host, so short-circuit here.
             if metadata.msa_eager_all_blocks_empty:
-                return torch.full(
-                    (num_tokens, config.num_kv_heads, MSA_REQUIRED_TOPK),
+                output_shape = (
+                    (config.num_kv_heads, num_tokens, MSA_REQUIRED_TOPK)
+                    if head_major_output
+                    else (num_tokens, config.num_kv_heads, MSA_REQUIRED_TOPK)
+                )
+                output = torch.full(
+                    output_shape,
                     -1,
                     dtype=torch.int32,
                     device=idx_q.device,
                 )
+                return output.permute(1, 0, 2) if head_major_output else output
             n_valid_blocks = metadata.msa_eager_n_valid_blocks
             if n_valid_blocks is not None:
                 n_valid_blocks = n_valid_blocks[:num_tokens]
@@ -1087,6 +1096,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             proxy_plan=proxy_plan,
             max_score=max_score,
             n_valid_blocks=n_valid_blocks,
+            head_major_output=head_major_output,
         )
 
     def sparse_attn_predict(

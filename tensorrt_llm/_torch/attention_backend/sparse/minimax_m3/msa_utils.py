@@ -187,17 +187,25 @@ def select_blocks_from_maxscore(
     n_valid_blocks: torch.Tensor,
     init_blocks: int,
     local_blocks: int,
+    head_major_output: bool = False,
 ) -> torch.Tensor:
     """Select per-query top-k blocks from per-KV-head block scores.
 
     Applies init and local forced blocks and per-query valid-block masking
     on the amax-reduced scores [num_kv_heads, n_blocks, total_q]. Returns
     [total_q, num_kv_heads, topk] int32 ascending block ids with -1 tail
-    padding.
+    padding. When ``head_major_output`` is set, the logical result uses a
+    head-major backing so ``result.permute(1, 0, 2)`` is contiguous without a
+    copy.
     """
     nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
     return torch.ops.trtllm.minimax_m3_select_blocks(
-        max_score_kv, nvb, topk, init_blocks, local_blocks
+        max_score_kv,
+        nvb,
+        topk,
+        init_blocks,
+        local_blocks,
+        head_major_output,
     )
 
 
