@@ -147,7 +147,7 @@ pipeline {
                         echo "Generated file size: \$(wc -l < new_test_durations.json) lines"
                         echo "Sample output (first 5 lines):"
                         head -5 new_test_durations.json
-                        sudo pip3 config set global.break-system-packages true
+                        pip3 config set global.break-system-packages true
                         python3 -u scripts/release_check.py --files-from ${DURATION_FILE_PATH}
                     """
 
