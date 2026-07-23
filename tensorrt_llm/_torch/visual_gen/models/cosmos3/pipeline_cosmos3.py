@@ -38,7 +38,7 @@ from .defaults import COSMOS3_ENVELOPES, COSMOS3_EXTRA_SPECS, COSMOS3_GENERATION
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sampling import Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
-from .transformer_cosmos3 import Cosmos3VFMTransformer, resolve_arch_recipe
+from .transformer_cosmos3 import NEMOTRON_DENSE_RECIPE, Cosmos3VFMTransformer, resolve_arch_recipe
 
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
 COSMOS3_DEFAULT_SYSTEM_PROMPT = (
@@ -52,6 +52,31 @@ COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolut
 COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
 
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
+
+
+def _validate_sampling_recipe(family: str, use_native_flow_schedule: bool, sampling) -> None:
+    """Family, model_index schedule flag, and scheduler recipe must form a
+    known-supported combination — the pieces come from three different
+    checkpoint files and a mismatch samples the wrong trajectory silently.
+    """
+    if family == NEMOTRON_DENSE_RECIPE.name:
+        if sampling.is_distilled:
+            raise ValueError(
+                "Distilled (fixed-sigma FlowMatchEuler) sampling is not supported for "
+                "the Edge (nemotron_dense) family; no such checkpoint exists."
+            )
+        if not use_native_flow_schedule:
+            raise ValueError(
+                "Edge (nemotron_dense) checkpoints must declare "
+                "use_native_flow_schedule: true in model_index.json. Without it the "
+                "checkpoint's karras scheduler config would sample the wrong "
+                "trajectory; a missing flag means a broken or stale conversion."
+            )
+    elif use_native_flow_schedule:
+        raise ValueError(
+            "use_native_flow_schedule is only supported for the Edge "
+            f"(nemotron_dense) family, but this checkpoint's family is {family!r}."
+        )
 
 
 def _validate_temporal_compression(transformer, vae_scale_factor_temporal: int) -> None:
@@ -247,6 +272,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             self.sampling = Cosmos3SamplingPolicy.from_scheduler(
                 self.scheduler, native_flow_schedule=self.use_native_flow_schedule
             )
+            _validate_sampling_recipe(self.family, self.use_native_flow_schedule, self.sampling)
             # flow_shift is a per-mode table fact, not a request field, so the
             # mode schedulers are prebuilt once; forward() only picks one.
             base_scheduler = self.scheduler

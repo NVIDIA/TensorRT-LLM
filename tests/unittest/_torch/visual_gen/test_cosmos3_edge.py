@@ -787,6 +787,84 @@ class TestEdgeDefaults:
         _validate_temporal_compression(undeclared, 8)
 
 
+class TestSamplingRecipeMatrix:
+    """Family + model_index schedule flag + scheduler recipe must be validated
+    together: the three facts come from different checkpoint files, and a
+    mismatch (e.g. a stale conversion missing use_native_flow_schedule) would
+    otherwise sample the wrong trajectory silently."""
+
+    BASE = Cosmos3SamplingPolicy()
+    DISTILLED = Cosmos3SamplingPolicy(fixed_sigmas=(1.0, 0.5))
+
+    @pytest.mark.parametrize(
+        "family,native,sampling,error",
+        [
+            (QWEN3_RECIPE.name, False, BASE, None),
+            (QWEN3_RECIPE.name, False, DISTILLED, None),
+            (NEMOTRON_DENSE_RECIPE.name, True, BASE, None),
+            (NEMOTRON_DENSE_RECIPE.name, False, BASE, "use_native_flow_schedule"),
+            (QWEN3_RECIPE.name, True, BASE, "use_native_flow_schedule"),
+            (NEMOTRON_DENSE_RECIPE.name, True, DISTILLED, "istilled"),
+            (NEMOTRON_DENSE_RECIPE.name, False, DISTILLED, "istilled"),
+        ],
+    )
+    def test_startup_matrix(self, family, native, sampling, error):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+            _validate_sampling_recipe,
+        )
+
+        if error is None:
+            _validate_sampling_recipe(family, native, sampling)
+        else:
+            with pytest.raises(ValueError, match=error):
+                _validate_sampling_recipe(family, native, sampling)
+
+    def test_component_loading_rejects_edge_without_native_flag(self, tmp_path):
+        """End to end through load_standard_components: a UniPC Edge
+        checkpoint whose model_index omits the flag must fail at load."""
+        import json
+
+        scheduler_dir = tmp_path / "scheduler"
+        scheduler_dir.mkdir()
+        (scheduler_dir / "scheduler_config.json").write_text(
+            json.dumps(
+                {
+                    "_class_name": "UniPCMultistepScheduler",
+                    "num_train_timesteps": 1000,
+                    "flow_shift": 1.0,
+                    "prediction_type": "flow_prediction",
+                    "use_flow_sigmas": True,
+                    "use_karras_sigmas": True,
+                    "solver_order": 2,
+                }
+            )
+        )
+        (tmp_path / "model_index.json").write_text(
+            json.dumps({"_class_name": "Cosmos3OmniPipeline"})
+        )
+
+        def fresh_pipeline():
+            pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
+            pipeline.default_use_system_prompt = False
+            # Mirror __init__: the flag starts False and only the checkpoint's
+            # model_index may turn it on.
+            pipeline.use_native_flow_schedule = False
+            return pipeline
+
+        skip = ["text_tokenizer", "tokenizer", "vae", "sound_tokenizer"]
+        with pytest.raises(ValueError, match="use_native_flow_schedule"):
+            fresh_pipeline().load_standard_components(str(tmp_path), torch.device("cpu"), skip)
+
+        (tmp_path / "model_index.json").write_text(
+            json.dumps({"_class_name": "Cosmos3OmniPipeline", "use_native_flow_schedule": True})
+        )
+        pipeline = fresh_pipeline()
+        pipeline.load_standard_components(str(tmp_path), torch.device("cpu"), skip)
+        assert pipeline.sampling.native_flow_schedule is True
+        assert pipeline.mode_schedulers["video"].config.use_karras_sigmas is False
+        assert float(pipeline.mode_schedulers["video"].config.flow_shift) == 3.0
+
+
 class TestEnvelopeAdvisory:
     def _warnings(self, monkeypatch):
         records = []
