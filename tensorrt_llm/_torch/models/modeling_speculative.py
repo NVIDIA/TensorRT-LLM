@@ -1897,8 +1897,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
     def __init__(self,
                  model: TModel,
                  model_config: ModelConfig[TConfig],
-                 hidden_size: Optional[int] = None,
-                 vocab_size: Optional[int] = None):
+                 hidden_size: int | None = None,
+                 vocab_size: int | None = None) -> None:
         # Composite configs (e.g. vision-language wrappers) may not expose
         # hidden_size/vocab_size at the top level; callers can pass the
         # text-config values explicitly.
