@@ -147,8 +147,13 @@ pipeline {
                         echo "Generated file size: \$(wc -l < new_test_durations.json) lines"
                         echo "Sample output (first 5 lines):"
                         head -5 new_test_durations.json
+
+                        # Run pre-commit format check (e.g. trailing newline) on the new file.
+                        # pre-commit may fix the file in-place; subsequent steps use the result.
+                        git config --global --add safe.directory \$(pwd)
+                        echo "new_test_durations.json" > /tmp/files_to_check.txt
                         pip3 config set global.break-system-packages true
-                        python3 -u scripts/release_check.py --files-from ${DURATION_FILE_PATH}
+                        python3 -u scripts/release_check.py --files-from /tmp/files_to_check.txt
                     """
 
                     // Always archive the freshly generated file so the user can download
