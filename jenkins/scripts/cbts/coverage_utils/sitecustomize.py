@@ -83,6 +83,18 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             return
         _tracker.switch_test_context(nodeid or "")
 
+    def record_test_outcome(nodeid, outcome):
+        """Record a test's pytest outcome for the merge-side completeness signal (outer pytest only)."""
+        if _stop_event.is_set():
+            return
+        _tracker.record_outcome(nodeid or "", outcome)
+
+    def note_expected_workers(nodeid, n):
+        """Record that the coordinator spawned n subprocess pool workers for a test."""
+        if _stop_event.is_set():
+            return
+        _tracker.note_expected_workers(nodeid or "", n)
+
     def _save_active():
         try:
             _tracker.save()
@@ -124,7 +136,21 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
                 file=sys.stderr,
             )
 
+    # Every instrumented process saves periodically so its coverage survives a non-clean exit;
+    # pool workers in particular lose their atexit save when the pool is torn down at test end.
+    def _periodic_save():
+        while not _stop_event.wait(_PERIODIC_SAVE_SECONDS):
+            _save_active()
+
+    threading.Thread(
+        target=_periodic_save,
+        daemon=True,
+        name="cbts-periodic-save",
+    ).start()
+
     if not _skip_daemons:
+        # Coordinator / long-lived non-pytest processes also patch mpi_session and poll the marker
+        # file to switch context; pool workers and the outer pytest need neither (single context).
 
         def _watch_mpi_session():
             # Wait until the host has imported the target modules so this daemon triggers no racing import.
@@ -151,16 +177,6 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             target=_watch_mpi_session,
             daemon=True,
             name="cbts-mpi-patcher",
-        ).start()
-
-        def _periodic_save():
-            while not _stop_event.wait(_PERIODIC_SAVE_SECONDS):
-                _save_active()
-
-        threading.Thread(
-            target=_periodic_save,
-            daemon=True,
-            name="cbts-periodic-save",
         ).start()
 
         _MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", "/tmp/cbts/current_test.txt")

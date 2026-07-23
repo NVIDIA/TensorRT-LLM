@@ -23,6 +23,8 @@ _ENV_WHITELIST_PREFIXES = ("TRTLLM", "TLLM", "COVERAGE_", "CBTS_", "PYTHON")
 
 _PATCHED_MARKER = "_cbts_patched_start_mpi_pool"
 
+_POOL_PATCHED_MARKER = "_cbts_patched_pool_init"
+
 
 def install_mpi_pool_patch(*, raise_on_refactor=True):
     """Widen ``MpiPoolSession._start_mpi_pool``'s env whitelist; idempotent."""
@@ -68,16 +70,42 @@ def install_mpi_pool_patch(*, raise_on_refactor=True):
     return True
 
 
-def _switch_test_context(nodeid):
-    """Switch the per-test tracking context via the sitecustomize bootstrap, if active."""
+def install_expected_workers_patch():
+    """Count subprocess pool workers per test (any ``MPIPoolExecutor``) for the completeness signal; idempotent."""
+    try:
+        from mpi4py.futures import MPIPoolExecutor
+    except ImportError:
+        return False
+
+    init = MPIPoolExecutor.__init__
+    if getattr(init, _POOL_PATCHED_MARKER, False):
+        return False
+
+    def _patched_init(self, *args, **kwargs):
+        # Attribute the workers to the test running now; disagg's raw pool is counted here too.
+        try:
+            max_workers = kwargs.get("max_workers", args[0] if args else None)
+            n = int(max_workers) if max_workers else 1
+            _sitecustomize_call("note_expected_workers", os.environ.get("CBTS_TEST_ID", ""), n)
+        except Exception:
+            pass
+        return init(self, *args, **kwargs)
+
+    setattr(_patched_init, _POOL_PATCHED_MARKER, True)
+    MPIPoolExecutor.__init__ = _patched_init
+    return True
+
+
+def _sitecustomize_call(func_name, *args):
+    """Forward to a sitecustomize bootstrap hook (context switch / outcome / worker count), if active."""
     try:
         import sitecustomize
 
-        switch = getattr(sitecustomize, "switch_test_context", None)
+        fn = getattr(sitecustomize, func_name, None)
     except ImportError:
-        switch = None
-    if switch is not None:
-        switch(nodeid)
+        fn = None
+    if fn is not None:
+        fn(*args)
 
 
 # Bind pytest only when already loaded, so importing this module for install_mpi_pool_patch stays cheap.
@@ -85,9 +113,10 @@ if "pytest" in sys.modules:
     import pytest
 
     def pytest_configure(config):  # noqa: D401 - pytest hook
-        """Apply ``mpi_session`` monkeypatch with a compatibility guard."""
+        """Apply the ``mpi_session`` env monkeypatch and the pool-worker accounting patch."""
         del config
         install_mpi_pool_patch(raise_on_refactor=True)
+        install_expected_workers_patch()
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_protocol(item, nextitem):  # noqa: D401 - pytest hook
@@ -105,6 +134,16 @@ if "pytest" in sys.modules:
         # Propagate nodeid via env so subprocesses pick it up in sitecustomize.py.
         os.environ["CBTS_TEST_ID"] = nodeid
 
-        _switch_test_context(nodeid)
+        _sitecustomize_call("switch_test_context", nodeid)
 
         yield
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_makereport(item, call):  # noqa: D401 - pytest hook
+        """Record each test's outcome so the merge can flag coverage that isn't safe to trust."""
+        del call
+        outcome = yield
+        report = outcome.get_result()
+        # The call phase is the test body; a non-passing setup is the test's effective outcome.
+        if report.when == "call" or (report.when == "setup" and report.outcome != "passed"):
+            _sitecustomize_call("record_test_outcome", item.nodeid, report.outcome)
