@@ -26,7 +26,7 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 
-_BEAM_SEARCH_PAD_TOKEN = -1
+BEAM_SEARCH_PAD_TOKEN = -1
 
 
 @dataclass(kw_only=True)
@@ -50,66 +50,27 @@ class BeamSearchMetadata(StrategyMetadata):
     beam_idx_arange: torch.Tensor
 
 
-def top_k_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    top_k: int,
-    temperature: float,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return top_k_top_p_sampling_batch(
-        logits,
-        top_k=top_k,
-        temperature=temperature,
-        generator=generator,
-        top_p=1,
-    )
-
-
-def top_p_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    top_p: float,
-    temperature: float,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return top_k_top_p_sampling_batch(
-        logits,
-        top_p=top_p,
-        top_k=logits.size(1),
-        temperature=temperature,
-        generator=generator,
-    )
-
-
-def temperature_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    temperature: float,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return top_k_top_p_sampling_batch(
-        logits,
-        top_p=1,
-        top_k=logits.size(1),
-        temperature=temperature,
-        generator=generator,
-    )
-
-
 def top_k_top_p_sampling_batch(
     logits: torch.Tensor,
     *,
-    top_k: int,
-    top_p: float,
     temperature: float,
+    top_k: Optional[int] = None,
+    top_p: float = 1.0,
     generator: Optional[torch.Generator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Temperature + optional top-k / top-p filtering + multinomial sampling.
+
+    ``top_k=None`` (or ``vocab_size``) disables top-k filtering; ``top_p=1``
+    disables top-p filtering. With both disabled this is plain temperature
+    sampling.
+    """
     logits_dim = logits.dim()
     assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
     assert temperature > 0, "non-greedy sampling requires valid temperature"
     logits = logits / max(temperature, 1e-5)
     batch_size, vocab_size = logits.size()
+    if top_k is None:
+        top_k = vocab_size
 
     assert top_k > 1, "non-greedy sampling requires valid top_k"
     need_top_k = top_k < vocab_size
@@ -274,7 +235,7 @@ def beam_search_sampling_batch(
 
     next_tokens = next_tokens % vocab_size
     ended_predecessor_mask = torch.gather(dim=1, index=predecessor_beam, input=finished_beams_mask)
-    next_tokens = torch.where(ended_predecessor_mask, _BEAM_SEARCH_PAD_TOKEN, next_tokens)
+    next_tokens = torch.where(ended_predecessor_mask, BEAM_SEARCH_PAD_TOKEN, next_tokens)
 
     old_cum_log_probs = beam_search_args.cum_log_probs[beam_search_args.seq_slots].view(-1)
     beam_search_args.new_log_probs[beam_search_args.seq_slots, :beam_width_out] = (
@@ -322,24 +283,19 @@ def sample_rejected(
     return cast(int, new_token.item())
 
 
-_GREEDY_TEMPERATURE_THRESHOLD = 1e-4
+# Rows whose temperature is at or below this threshold are treated as greedy.
+# Contract with the spec-decoding metadata layer: greedy requests are
+# normalized to a sentinel temperature strictly below this threshold (see
+# DISABLE_TEMP_VAL in speculative/interface.py, which derives from it).
+GREEDY_TEMPERATURE_THRESHOLD = 1e-4
 
 
-def greedy(
-    logits: torch.Tensor,
-    *,
-    return_probs: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Greedy decoding; returns exact one-hot when return_probs=True."""
-    return greedy_search_sampling_batch(logits, return_probs=return_probs)
-
-
-def _safely_apply_temperature_inplace(
+def safely_apply_temperature_inplace(
     logits_inout: torch.Tensor, temp: torch.Tensor
 ) -> torch.Tensor:
     """Divide logits by per-row temperature in place, guarding the greedy sentinel.
 
-    Greedy requests carry a temperature of 0 / <= ``_GREEDY_TEMPERATURE_THRESHOLD``.
+    Greedy requests carry a temperature of 0 / <= ``GREEDY_TEMPERATURE_THRESHOLD``.
     Dividing by it would blow logits up to inf/nan and corrupt downstream sampling
     (argmax / softmax / multinomial). Those rows are clamped to a temperature of 1.0
     so the division is numerically safe; callers are expected to overwrite the greedy
@@ -349,11 +305,11 @@ def _safely_apply_temperature_inplace(
     ``logits_inout`` is modified in place (``div_``) and also returned for
     convenience; ``temp`` is left untouched.
     """
-    safe_temp = torch.where(temp <= _GREEDY_TEMPERATURE_THRESHOLD, torch.ones_like(temp), temp)
+    safe_temp = torch.where(temp <= GREEDY_TEMPERATURE_THRESHOLD, torch.ones_like(temp), temp)
     return logits_inout.div_(safe_temp.unsqueeze(dim=1))
 
 
-class _Fusions:
+class Fusions:
     @staticmethod
     @torch.compile(dynamic=None, fullgraph=True)
     def _gather_scatter_impl(
@@ -375,7 +331,7 @@ class _Fusions:
         torch._dynamo.mark_dynamic(dst_index_cuda, 0)
         torch._dynamo.mark_dynamic(src_cuda, 0)
         torch._dynamo.mark_dynamic(src_index_cuda, 0)
-        _Fusions._gather_scatter_impl(dst_cuda, dst_index_cuda, src_cuda, src_index_cuda)
+        Fusions._gather_scatter_impl(dst_cuda, dst_index_cuda, src_cuda, src_index_cuda)
 
     @staticmethod
     @torch.compile(dynamic=None, fullgraph=True)
@@ -393,7 +349,7 @@ class _Fusions:
     ) -> torch.Tensor:
         torch._dynamo.mark_dynamic(group_logprobs_cuda, 0)
         torch._dynamo.mark_dynamic(sampled_logprobs_cuda, 0)
-        return _Fusions._determine_sampled_rank_impl(group_logprobs_cuda, sampled_logprobs_cuda)
+        return Fusions._determine_sampled_rank_impl(group_logprobs_cuda, sampled_logprobs_cuda)
 
     @staticmethod
     @torch.compile(
@@ -416,4 +372,106 @@ class _Fusions:
     def gather_log_softmax(inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor) -> torch.Tensor:
         torch._dynamo.mark_dynamic(inputs_cuda, 0)
         torch._dynamo.mark_dynamic(indices_cuda, 0)
-        return _Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda)
+        return Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda)
+
+    # --- Top-P Decay ops ---------------------------------------------------
+    # Host-launch-bound per-step ops (a few dozen elements per row), fused with
+    # Inductor to keep the launch count low. mode="max-autotune-no-cudagraphs":
+    # cudagraphs is unsafe here (the update mutates persistent per-slot state
+    # in place and the gather's output is consumed outside the compiled region;
+    # cudagraph static output buffers get overwritten by subsequent replays).
+    # mark_dynamic on the batch-varying dims avoids recompilation as the batch
+    # composition changes. Compilation is lazy: the first decay-active request
+    # pays it (roughly a second); non-decay workloads never trigger it. See
+    # TorchSampler.TopPDecayStore for the feature-level semantics.
+
+    @staticmethod
+    @torch.compile(mode="max-autotune-no-cudagraphs")
+    def _top_p_decay_update_impl(
+        runtime_top_p: torch.Tensor,
+        initial_top_p: torch.Tensor,
+        top_p_decay: torch.Tensor,
+        top_p_min: torch.Tensor,
+        reset_ids: torch.Tensor,
+        is_decay_slot: torch.Tensor,
+        step_tokens: torch.Tensor,
+        sampled_slots: torch.Tensor,
+    ) -> None:
+        active = is_decay_slot[sampled_slots]
+        current = runtime_top_p[sampled_slots]
+        updated = torch.where(
+            step_tokens[sampled_slots] == reset_ids[sampled_slots],
+            initial_top_p[sampled_slots],
+            torch.maximum(current * top_p_decay[sampled_slots], top_p_min[sampled_slots]),
+        )
+        runtime_top_p[sampled_slots] = torch.where(active, updated, current)
+
+    @staticmethod
+    def top_p_decay_update(
+        *,
+        runtime_top_p: torch.Tensor,
+        initial_top_p: torch.Tensor,
+        top_p_decay: torch.Tensor,
+        top_p_min: torch.Tensor,
+        reset_ids: torch.Tensor,
+        is_decay_slot: torch.Tensor,
+        step_tokens: torch.Tensor,
+        sampled_slots: torch.Tensor,
+    ) -> None:
+        """Fused in-place update of ``runtime_top_p`` for the sampled decay slots.
+
+        Applies the Top-P Decay recurrence (see ``TorchSampler.TopPDecayStore``
+        for the feature-level semantics) to every sampled row whose slot is
+        decay-active per ``is_decay_slot``.
+
+        All per-slot tensors are 1-D of length ``max_num_sequences``;
+        ``step_tokens`` is a slot-indexed 1-D (possibly strided) int32 view of
+        the new-tokens buffer for a fixed step/beam
+        (``new_tokens[step, :, beam]``); ``sampled_slots`` is 1-D of length
+        ``num_sampled`` (this iteration's rows). ``runtime_top_p`` is mutated
+        in place; nothing is returned.
+        """
+        torch._dynamo.mark_dynamic(sampled_slots, 0)
+        Fusions._top_p_decay_update_impl(
+            runtime_top_p,
+            initial_top_p,
+            top_p_decay,
+            top_p_min,
+            reset_ids,
+            is_decay_slot,
+            step_tokens,
+            sampled_slots,
+        )
+
+    @staticmethod
+    @torch.compile(mode="max-autotune-no-cudagraphs")
+    def _top_p_decay_gather_impl(
+        runtime_top_p: torch.Tensor,
+        is_decay_slot: torch.Tensor,
+        static_top_p: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.where(is_decay_slot[slots], runtime_top_p[slots], static_top_p)
+
+    @staticmethod
+    def top_p_decay_gather(
+        *,
+        runtime_top_p: torch.Tensor,
+        is_decay_slot: torch.Tensor,
+        static_top_p: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fused pre-sample per-row top-p gather for decay-active rows.
+
+        Returns a new per-row tensor::
+
+            row_top_p[i] = runtime_top_p[slots[i]]  if is_decay_slot[slots[i]]
+                         = static_top_p[i]          otherwise
+
+        ``runtime_top_p`` / ``is_decay_slot`` are per-slot arrays;
+        ``static_top_p`` and ``slots`` are per-row (length = the group's
+        per-step row count).
+        """
+        torch._dynamo.mark_dynamic(slots, 0)
+        torch._dynamo.mark_dynamic(static_top_p, 0)
+        return Fusions._top_p_decay_gather_impl(runtime_top_p, is_decay_slot, static_top_p, slots)

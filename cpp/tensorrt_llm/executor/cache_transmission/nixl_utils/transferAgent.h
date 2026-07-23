@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <thread>
 
@@ -38,21 +39,6 @@ struct NixlHelper
     [[nodiscard]] static nixl_xfer_dlist_t convertXferDist(FileDescs const& descs);
     static void posixGpuToFileFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
     static void posixFileToGpuFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
-
-    /// @brief Coalesce contiguous memory regions to reduce memory registration overhead.
-    /// Adjacent memory regions with the same deviceId will be merged into a single region.
-    /// @param descs Memory descriptors to coalesce
-    /// @return Coalesced MemoryDescs
-    [[nodiscard]] static MemoryDescs coalesceMemoryDescs(MemoryDescs const& descs);
-
-    /// @brief Coalesce contiguous memory regions in src and dst to reduce transfer count.
-    /// If src[i] and src[i+1] are contiguous, and dst[i] and dst[i+1] are also contiguous
-    /// (with same deviceId), they will be merged into a single transfer.
-    /// @param srcDescs Source memory descriptors
-    /// @param dstDescs Destination memory descriptors
-    /// @return Pair of coalesced (src, dst) MemoryDescs
-    [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> coalesceTransferDescs(
-        TransferDescs const& srcDescs, TransferDescs const& dstDescs);
 };
 
 class NixlTransferStatus final : public TransferStatus
@@ -73,11 +59,17 @@ public:
     [[nodiscard]] int getLastStatus() const noexcept;
     [[nodiscard]] std::string getLastStatusStr() const;
 
+    [[nodiscard]] bool release() override;
+
 private:
+    [[nodiscard]] nixl_status_t queryStatus() const;
+
     // weak_ptr so the status outliving the owning agent is safe (lock() returns null after reset).
     std::weak_ptr<nixlAgent> mWeakAgent;
     nixlXferReqH* mHandle{};
     mutable std::atomic<int> mLastStatus{0};
+    bool const mSynchronizeHandleAccess;
+    mutable std::mutex mHandleMutex;
 };
 
 class NixlTransferAgent final : public BaseTransferAgent

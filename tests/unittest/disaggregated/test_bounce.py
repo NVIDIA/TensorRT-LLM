@@ -106,6 +106,25 @@ class TestConfigFromSize:
         assert isinstance(cfg, bcfg.Config)
         assert cfg.sizing.capacity_mb == 2048
 
+    def test_min_blocks_defaults_and_overrides(self, monkeypatch):
+        monkeypatch.delenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", raising=False)
+        assert bcfg.config_from_size(2048).min_blocks == 96  # keeps the Config default
+        assert bcfg.config_from_size(2048, 1).min_blocks == 1  # explicit arg still overrides
+        assert bcfg.config_from_size(2048, 250).min_blocks == 250
+        # The gate is lowered for tests via the env override (no user-facing config field).
+        monkeypatch.setenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", "1")
+        assert bcfg.config_from_size(2048).min_blocks == 1  # env override
+        assert bcfg.config_from_size(2048, 250).min_blocks == 250  # explicit arg beats env
+
+    def test_min_blocks_env_is_parsed_defensively(self, monkeypatch):
+        # A bad value must not crash setup (falls back to the default); a non-positive value clamps to 1.
+        for bad in ("", "auto", "1.5"):
+            monkeypatch.setenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", bad)
+            assert bcfg.config_from_size(2048).min_blocks == 96
+        for nonpos in ("0", "-5"):
+            monkeypatch.setenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", nonpos)
+            assert bcfg.config_from_size(2048).min_blocks == 1
+
 
 # --------------------------------------------------------------------------- #
 # wire format — KV_AGENT_RESULT struct prefix + bounce result tail
@@ -177,13 +196,19 @@ def test_fanin_bounce_safe_gate():
     expected_transfers) must fall back to the per-fragment path.
     """
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+
     safe = tfr.Receiver._fanin_bounce_safe
 
-    def ov(dup, pp):
-        return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp)
+    def ov(dup, pp, ranks=(0,)):
+        return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp, ranks=list(ranks))
 
-    def ri(lpp):
-        return SimpleNamespace(layer_num_per_pp=lpp)
+    def ri(lpp, page_table=None):
+        return SimpleNamespace(layer_num_per_pp=lpp, page_table=page_table)
+
+    def pt(mapper_kind):
+        view = SimpleNamespace(mapper_kind=mapper_kind)
+        return SimpleNamespace(layer_groups=[SimpleNamespace(pool_views=[view])])
 
     # single PP stage (overlap_pp_size <= 1): only duplicate_head_factor matters
     assert safe(ov(1, 1), ri([24])) is True
@@ -197,6 +222,12 @@ def test_fanin_bounce_safe_gate():
     assert safe(ov(1, 4), ri([20])) is False
     # duplicate heads blocks even an otherwise-even PP split
     assert safe(ov(2, 4), ri([20, 20, 20, 20])) is False
+    # replicated views (one elected sender per destination) make multi-writer
+    # contributions unequal -> fall back; single-writer overlap stays safe,
+    # and sharded-only view schemes are unaffected
+    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.REPLICATED))) is False
+    assert safe(ov(1, 1, ranks=(0,)), ri([24], pt(MapperKind.REPLICATED))) is True
+    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.NHD))) is True
 
 
 # --------------------------------------------------------------------------- #
@@ -312,6 +343,24 @@ class TestFanInReserve:
         req = _recv_req([1])  # total = 3, not divisible by 2
         assert t.reserve(req, num_writers=2) is False
         assert req.bounce_dst_base is None
+
+    def test_reserve_heterogeneous_fanin_falls_back(self, monkeypatch):
+        # Two groups with different per-block sizes: the equal split would overrun a sub-region, so
+        # fall back (even though the total is divisible).
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100, 200])
+        req = _recv_req([2, 2])  # total = 2*100 + 2*200 = 600
+        assert t.reserve(req, num_writers=2) is False
+        assert req.bounce_dst_base is None
+
+    def test_reserve_uniform_multigroup_fanin_ok(self, monkeypatch):
+        # Uniform slot bytes across present groups -> even byte split -> bounce allowed.
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100, 100])
+        assert t.reserve(_recv_req([2, 2]), num_writers=2) is True
+
+    def test_reserve_heterogeneous_single_writer_ok(self, monkeypatch):
+        # num_writers==1 has no split, so heterogeneous slot bytes are fine.
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100, 200])
+        assert t.reserve(_recv_req([2, 2]), num_writers=1) is True
 
     def test_reserve_single_writer_ok(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[3])
@@ -481,6 +530,20 @@ class TestFanInReserve:
         assert t.is_bounced(rid_slice) is False
         assert t._recv_alloc.released  # slot freed
         t.release_idle_reservation(rid_slice)  # already gone -> no-op, must not raise
+
+    def test_orphan_reservation_quarantines_and_is_idempotent(self, monkeypatch):
+        # Giving up on an in-flight reservation must quarantine the region (a write may still land),
+        # not release or leak it; a second give-up is a no-op.
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        req = _recv_req([2])
+        assert t.reserve(req, num_writers=1) is True
+        rid_slice = (req.unique_rid, req.slice_id)
+        t.orphan_reservation(rid_slice)
+        assert t._recv_alloc.quarantined == [0]  # quarantined, not released
+        assert t._recv_alloc.released == []
+        assert t.is_bounced(rid_slice) is False  # settled and removed from the live map
+        t.orphan_reservation(rid_slice)  # already gone -> no-op, must not raise
+        assert t._recv_alloc.quarantined == [0]
 
 
 # --------------------------------------------------------------------------- #

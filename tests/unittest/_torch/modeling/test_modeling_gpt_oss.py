@@ -47,6 +47,10 @@ configs = """
 """
 
 
+def test_gpt_oss_prefers_python_transceiver() -> None:
+    assert GptOssForCausalLM.get_preferred_transceiver_runtime() == "PYTHON"
+
+
 def dump_config_json(dst_dir):
     if os.path.exists(dst_dir):
         shutil.rmtree(dst_dir)

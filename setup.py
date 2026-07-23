@@ -14,6 +14,9 @@
 # limitations under the License.
 import os
 import platform
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -70,6 +73,23 @@ def get_version():
     if version is None:
         raise RuntimeError(f"Could not set version from {version_file}")
 
+    # For develop / editable installs (`pip install -e .` or
+    # `python setup.py develop`), append the git commit hash as a PEP 440
+    # local version segment so the installed package is identifiable,
+    # e.g. "1.3.0rc21+58d8964d13".
+    is_develop = any(arg in sys.argv for arg in ("develop", "editable_wheel"))
+    if is_develop:
+        try:
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "--short=10", "HEAD"],
+                cwd=Path(__file__).resolve().parent,
+                stderr=subprocess.DEVNULL).decode().strip()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            commit = ""
+        commit = re.sub(r"[^A-Za-z0-9.]", "", commit)
+        if commit:
+            version = f"{version}+{commit}"
+
     return version
 
 
@@ -109,6 +129,7 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+mx_deps = ["modelexpress==0.4.1"]
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
     constraints, _ = parse_requirements(constraints_file)
@@ -116,15 +137,13 @@ if constraints_file.exists():
 
 if on_windows:
     package_data = [
-        'libs/th_common.dll', 'libs/tensorrt_llm.dll',
-        'libs/nvinfer_plugin_tensorrt_llm.dll', 'bindings.*.pyd', "include/**/*"
+        'libs/th_common.dll', 'libs/tensorrt_llm.dll', 'bindings.*.pyd',
+        "include/**/*"
     ]
 else:
     package_data = [
-        'bin/executorWorker',
         'libs/libtensorrt_llm.so',
         'libs/libth_common.so',
-        'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so',
         'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so',
@@ -147,7 +166,6 @@ else:
         'deep_gemm/include/**/*',
         'deep_gemm/*.py',
         'deep_gemm_cpp_tllm.*.so',
-        'scripts/install_tensorrt.sh',
         'flash_mla/LICENSE',
         'flash_mla/*.py',
         'flash_mla_cpp_tllm.*.so',
@@ -170,7 +188,6 @@ package_data += [
     # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
     '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
     '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
-    '_torch/visual_gen/cute_dsl_kernels/blackwell/attention/cubins/**/*.so',
     'usage/schemas/*.json',
 ]
 
@@ -406,6 +423,9 @@ else:
 # internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
 packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 
+msa_package_dir = {"fmha_sm100": "3rdparty/MSA/python/fmha_sm100"}
+packages += ["fmha_sm100"]
+
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
@@ -420,6 +440,7 @@ setup(
     url="https://github.com/NVIDIA/TensorRT-LLM",
     download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",
     packages=packages,
+    package_dir=msa_package_dir,
     exclude_package_data=exclude_package_data,
     # TODO Add windows support for python bindings.
     classifiers=[
@@ -432,15 +453,21 @@ setup(
     license="Apache License 2.0",
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
-        'tensorrt_llm': package_data,
+        'tensorrt_llm':
+        package_data,
         'triton_kernels': ['LICENSE', 'VERSION', 'README.md'],
+        'fmha_sm100': [
+            '*.py',
+            'csrc/**/*',
+            'cute/**/*',
+            'cutlass/include/**/*',
+            'cutlass/tools/util/include/**/*',
+            'cutlass/LICENSE.txt',
+        ],
     },
     license_files=get_license(),
     entry_points={
         'console_scripts': [
-            'trtllm-build=tensorrt_llm.commands.build:main',
-            'trtllm-prune=tensorrt_llm.commands.prune:main',
-            'trtllm-refit=tensorrt_llm.commands.refit:main',
             'trtllm-bench=tensorrt_llm.commands.bench:main',
             'trtllm-serve=tensorrt_llm.commands.serve:main',
             'trtllm-eval=tensorrt_llm.commands.eval:main'
@@ -449,10 +476,7 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
-        # MX remains prototype-only and is intentionally not declared as an
-        # optional package extra until its external dependency completes OSS
-        # allowlist onboarding. Keep install instructions in docs/PR text
-        # rather than packaging metadata.
+        "mx": mx_deps,
     },
     zip_safe=True,
     install_requires=required_deps,
