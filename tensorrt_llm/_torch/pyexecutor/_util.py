@@ -62,7 +62,7 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (BaseKVCacheCompressionManager, KVCacheManager,
+from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
@@ -2156,7 +2156,7 @@ def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
-) -> Optional[BaseKVCacheCompressionManager]:
+) -> Optional[KVCacheCompressionManager]:
     """Build the KV-cache compression manager for ``config.algorithm``, or return
     None if no algorithm matches.
 
@@ -2171,8 +2171,8 @@ def create_kv_cache_compression_manager(
 
         return TriAttention(
             kv_cache_manager,
+            config=config,
             draft_kv_cache_manager=draft_kv_cache_manager,
-            **config.to_manager_kwargs(),
         )
 
     logger.warning(

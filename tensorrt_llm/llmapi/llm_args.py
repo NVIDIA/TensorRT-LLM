@@ -3398,7 +3398,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
 ]
 
 
-class BaseKvCacheCompressionConfig(StrictBaseModel):
+class KvCacheCompressionConfig(StrictBaseModel):
     """Config for KV-cache compression: a compression manager runs a KV-reduction
     algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.
 
@@ -3422,21 +3422,11 @@ class BaseKvCacheCompressionConfig(StrictBaseModel):
         return KvCacheCompressionMode.from_string(self.algorithm)
 
 
-class TriAttentionKvCacheCompressionConfig(BaseKvCacheCompressionConfig):
-    """KV-cache compression config for TriAttention.
-
-    TriAttention periodically evicts cached tokens during generation, guided by
-    an offline-calibrated trigonometric importance score
-    (github.com/WeianMao/triattention). It runs on the KV-cache compression
-    framework with the standard ``KVCacheManagerV2``, whose ``update_resources``
-    returns eviction-freed blocks to the pool for the capacity gain. TRT-LLM does
-    not compute calibration: supply the official tool's ``.pt`` via ``calibration_path`` and
-    it is converted to the runtime schema at load. TriAttention is a pure
-    compression method: it has no sparse-attention config and no attention
-    backend of its own -- decode runs the model's standard attention over the
-    compacted cache, and the manager publishes each request's evicted count on
-    ``LlmRequest.py_num_compressed_tokens`` for the engine to subtract.
-    """
+class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
+    """TriAttention KV-cache compression: periodic decode-time eviction scored by
+    offline calibration (github.com/WeianMao/triattention; supply the official
+    .pt via ``calibration_path``). Pure compression — decode runs the model's
+    standard attention over the compacted cache."""
     algorithm: Literal["triattention"] = "triattention"
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
         default="union",
@@ -3486,23 +3476,6 @@ class TriAttentionKvCacheCompressionConfig(BaseKvCacheCompressionConfig):
                 "TRT-LLM consumes an official calibration file and does not "
                 "compute one.")
         return self
-
-    def to_manager_kwargs(self) -> dict:
-        """Constructor kwargs for the TriAttention manager."""
-        return {
-            "budget": self.budget,
-            "beta": self.beta,
-            "model_path": self.model_path,
-            "calibration_path": self.calibration_path,
-            "eviction_mode": self.eviction_mode,
-            "normalize_scores": self.normalize_scores,
-        }
-
-
-KvCacheCompressionConfig: TypeAlias = Annotated[
-    Union[TriAttentionKvCacheCompressionConfig],
-    Field(discriminator="algorithm"),
-]
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
@@ -4254,11 +4227,15 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype")
 
     # KV cache compression config (separate from sparse attention: changes which
-    # KV is stored, not the attention computation)
-    kv_cache_compression_config: Optional[KvCacheCompressionConfig] = Field(
-        default=None,
-        description="KV-cache compression config; None disables compression.",
-        status="prototype")
+    # KV is stored, not the attention computation). Dispatch is by the
+    # ``algorithm`` tag; grow this into a discriminated union when a second
+    # algorithm lands.
+    kv_cache_compression_config: Optional[
+        TriAttentionKvCacheCompressionConfig] = Field(
+            default=None,
+            description=
+            "KV-cache compression config; None disables compression.",
+            status="prototype")
 
     # Speculative decoding parameters
     speculative_config: Optional[SpeculativeConfig] = Field(

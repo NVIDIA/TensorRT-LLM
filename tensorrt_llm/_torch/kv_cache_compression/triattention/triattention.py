@@ -31,7 +31,7 @@ import triton
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.resource_manager import BaseKVCacheCompressionManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheCompressionManager
 from tensorrt_llm._utils import nvtx_range, nvtx_range_debug, prefer_pinned
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     copy_batch_block_offsets_to_device,
@@ -49,6 +49,7 @@ from .triattention_kernels import (
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
+    from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
 
 
 # Required keys for the calibration ``.pt`` consumed by TriAttention.
@@ -681,7 +682,7 @@ def execute_eviction_round(
             draft_manager._stream.wait_event(bufs.compaction_done_event)
 
 
-class TriAttention(BaseKVCacheCompressionManager):
+class TriAttention(KVCacheCompressionManager):
     """Periodic physical KV eviction driven by trigonometric importance scoring."""
 
     adjusts_generation_kv_length = True
@@ -689,21 +690,16 @@ class TriAttention(BaseKVCacheCompressionManager):
     def __init__(
         self,
         kv_cache_manager: KVCacheManagerV2,
-        budget: int,
+        config: "TriAttentionKvCacheCompressionConfig",
         draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
-        beta: int = 128,
-        model_path: Optional[str] = None,
-        calibration_path: Optional[str] = None,
-        eviction_mode: str = "union",
-        normalize_scores: bool = True,
     ):
         super().__init__(kv_cache_manager, draft_kv_cache_manager)
         # budget/beta positivity and the eviction_mode literal are validated at
         # the config boundary (TriAttentionKvCacheCompressionConfig).
-        self.budget = budget
-        self.beta = beta
-        self.eviction_mode = eviction_mode
-        self.normalize_scores = bool(normalize_scores)
+        self.budget = config.budget
+        self.beta = config.beta
+        self.eviction_mode = config.eviction_mode
+        self.normalize_scores = bool(config.normalize_scores)
         if self.eviction_mode == "union" and not self.normalize_scores:
             raise ValueError(
                 "TriAttention union eviction requires normalize_scores=True: "
@@ -713,8 +709,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         # counts decode tokens only (physical KV reclaim requires both).
         # Calibration is the official TriAttention .pt; TRT-LLM does not
         # compute calibration. The config boundary requires both paths.
-        self.model_path = model_path
-        self.calibration_path = calibration_path
+        self.model_path = config.model_path
+        self.calibration_path = config.calibration_path
         self.calibration: Optional[Dict[str, torch.Tensor]] = None
         self._calibrated = False
         self._freq_scale_sq: Optional[torch.Tensor] = None

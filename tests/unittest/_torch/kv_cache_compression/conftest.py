@@ -324,13 +324,25 @@ def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     return fake_v2
 
 
+def make_tri_config(**overrides):
+    """A real TriAttentionKvCacheCompressionConfig with test calibration inputs
+    (the config validator requires both ``model_path`` and ``calibration_path``)."""
+    from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
+
+    options = {
+        "budget": 8,
+        "model_path": "/models/test",
+        "calibration_path": "/calib/test.pt",
+    }
+    options.update(overrides)
+    return TriAttentionKvCacheCompressionConfig(**options)
+
+
 def make_triattention(**overrides):
     """Construct a fully initialized manager for method-level unit tests."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
-    options = {"budget": 8, "model_path": "/models/test"}
-    options.update(overrides)
-    return TriAttention(make_fake_v2(), **options)
+    return TriAttention(make_fake_v2(), make_tri_config(**overrides))
 
 
 def make_prepared_item(

@@ -31,6 +31,7 @@ from conftest import make_fake_v2 as _make_fake_v2
 from conftest import make_prepared_item as _make_prepared_item
 from conftest import make_request as _make_request
 from conftest import make_staging_manager as _make_staging_manager
+from conftest import make_tri_config as _make_tri_config
 from conftest import make_triattention as _make_triattention
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
 from conftest import torch_tri_score_oracle as _torch_tri_score_oracle
@@ -103,8 +104,8 @@ class TestConfigAndFactory:
         assert tri_args.kv_cache_compression_config.budget == 2048
         assert tri_args.kv_cache_compression_config.beta == 128
 
-        # The union dispatches on the algorithm tag, so an unknown algorithm
-        # fails config validation instead of falling back to a base config.
+        # Dispatch is by the algorithm tag, so an unknown algorithm fails
+        # config validation instead of falling back to a base config.
         with pytest.raises(ValidationError):
             TorchLlmArgs(
                 model="dummy",
@@ -182,7 +183,7 @@ class TestTriAttentionClass:
         manager = _make_fake_v2()
         manager.num_extra_kv_tokens = 4
         manager._kv_reserve_draft_tokens = 4
-        triattention = TriAttention(manager, budget=8, model_path="/models/test")
+        triattention = TriAttention(manager, _make_tri_config(budget=8))
         triattention._attention_layer_partition_cache = ([], [], None)
         triattention._calibrated = True
 
@@ -368,7 +369,7 @@ class TestEvictionLifecycle:
         fake_v2 = _make_fake_v2()
         fake_v2.num_extra_kv_tokens = num_extra_kv_tokens
         fake_v2._kv_reserve_draft_tokens = kv_reserve_draft_tokens
-        mgr = TriAttention(fake_v2, budget=8, model_path="/models/test")
+        mgr = TriAttention(fake_v2, _make_tri_config(budget=8))
         mgr._calibrated = True
         cache = SimpleNamespace(
             capacity=seq_len,
@@ -500,8 +501,7 @@ class TestEvictionLifecycle:
         draft_manager.max_seq_len = 8192
         manager = TriAttention(
             _make_fake_v2(),
-            budget=8,
-            model_path="/models/test",
+            _make_tri_config(budget=8),
             draft_kv_cache_manager=draft_manager,
         )
 
@@ -536,7 +536,7 @@ class TestEvictionLifecycle:
         manager.kv_cache_map = {
             7: SimpleNamespace(capacity=106, is_active=True),
         }
-        triattention = TriAttention(manager, budget=8, model_path="/models/test")
+        triattention = TriAttention(manager, _make_tri_config(budget=8))
         batch = SimpleNamespace(
             context_requests=[],
             generation_requests=[_make_request(7, py_draft_tokens=[1, 2, 3])],

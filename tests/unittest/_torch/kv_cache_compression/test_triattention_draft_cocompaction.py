@@ -19,6 +19,7 @@ from conftest import make_fake_v2 as _make_fake_v2
 from conftest import make_prepared_item as _make_prepared_item
 from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import make_request as _make_request
+from conftest import make_tri_config as _make_tri_config
 from conftest import make_triattention as _make_triattention
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
 from conftest import run_compaction as _run_compaction
@@ -272,9 +273,10 @@ def test_draft_admission_gates_raise(gate, match):
     def construct():
         return TriAttention(
             _make_fake_v2(),
-            budget=8,
-            model_path="/models/test",
-            eviction_mode="per_head" if gate == "union_only_per_head" else "union",
+            _make_tri_config(
+                budget=8,
+                eviction_mode="per_head" if gate == "union_only_per_head" else "union",
+            ),
             draft_kv_cache_manager=None if gate == "target_kv_factor" else draft_manager,
         )
 

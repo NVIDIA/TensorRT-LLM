@@ -2412,7 +2412,7 @@ class BlockManager:
 # --------------------------------------------------------------------- #
 
 
-class BaseKVCacheCompressionManager(BaseResourceManager):
+class KVCacheCompressionManager(BaseResourceManager):
     """Framework-level base class for all KV-cache compression managers.
 
     Inherits :class:`BaseResourceManager` so PyExecutor's main loop
