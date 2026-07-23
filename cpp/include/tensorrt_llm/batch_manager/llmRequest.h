@@ -222,6 +222,7 @@ public:
             mState = LlmRequestState::kENCODER_INIT;
         }
 
+        adoptContextPhaseDraftTokens();
         initialize(*inputTokens, returnLogProbs, arrivalTime);
     }
 
@@ -290,6 +291,7 @@ public:
         {
             mState = LlmRequestState::kENCODER_INIT;
         }
+        adoptContextPhaseDraftTokens();
         initialize(inputTokens, returnLogProbs);
     }
 
@@ -522,6 +524,7 @@ public:
         default: throw std::runtime_error("Unsupported request type found.");
         }
 
+        adoptContextPhaseDraftTokens();
         initialize(req.getInputTokenIds(), req.getOutputConfig().returnLogProbs);
     }
 
@@ -540,9 +543,29 @@ public:
         return mContextPhaseParams;
     }
 
+    /// @brief Get the number of generation tokens carried by context phase handoff.
+    /// @return Number of first generation tokens plus draft tokens.
+    [[nodiscard]] SizeType32 getNumContextPhaseGenerationTokens() const noexcept
+    {
+        if (!mContextPhaseParams.has_value())
+        {
+            return 0;
+        }
+
+        auto const& contextPhaseParams = mContextPhaseParams.value();
+        auto numTokens = static_cast<SizeType32>(contextPhaseParams.getFirstGenTokens().size());
+        auto const& draftTokens = contextPhaseParams.getDraftTokens();
+        if (draftTokens.has_value())
+        {
+            numTokens += static_cast<SizeType32>(draftTokens->size());
+        }
+        return numTokens;
+    }
+
     void setContextPhaseParams(executor::ContextPhaseParams contextPhaseParams)
     {
         mContextPhaseParams = std::move(contextPhaseParams);
+        adoptContextPhaseDraftTokens();
     }
 
     /// @brief Get the state params of the context
@@ -2253,6 +2276,20 @@ protected:
     std::optional<std::vector<std::tuple<std::string, int>>> mAgentHierarchy{std::nullopt};
 
 private:
+    void adoptContextPhaseDraftTokens()
+    {
+        if (hasDraftTokens() || !mContextPhaseParams.has_value())
+        {
+            return;
+        }
+
+        auto const& draftTokens = mContextPhaseParams.value().getDraftTokens();
+        if (draftTokens.has_value() && !draftTokens->empty())
+        {
+            mDraftTokens = std::make_shared<VecTokens>(*draftTokens);
+        }
+    }
+
     void initialize(
         VecTokens const& inputTokens, bool outputLogProbs, std::optional<TimePoint> arrivalTime = std::nullopt)
     {
