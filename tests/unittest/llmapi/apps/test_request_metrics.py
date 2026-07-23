@@ -377,3 +377,17 @@ async def test_file_middleware_intercepts_detail_headers(tmp_path):
     assert saved["disagg_request_id"] == 17
     assert saved["time_breakdown_metrics"]["step_metrics"]
     assert saved["time_breakdown_metrics"]["ctx_chunk_metrics"]
+
+
+@pytest.mark.asyncio
+async def test_jsonl_writer_drops_only_malformed_record(tmp_path):
+    writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+    await writer.start()
+    writer.submit({"phases": {}})
+    writer.submit(_record())
+    await writer.close()
+
+    output_file = next(tmp_path.glob("perf_metrics-test-*.jsonl"))
+    records = [json.loads(line) for line in output_file.read_text().splitlines()]
+    assert writer.dropped_records == 1
+    assert records[0]["request_id"] == 42
