@@ -524,6 +524,67 @@ def test_autotuner_tuning_configs():
     runner_0([x, w], tactic=deserialized_tactic)
 
 
+def test_load_cache_skips_non_literal_tactic():
+    """Regression: a cache entry whose tactic repr is not a Python literal must
+    be skipped on load, never crash the load.
+
+    ``trtllm::tunable_fp4_quantize`` caches an ``Fp4QuantTactic`` IntEnum whose
+    ``repr`` is ``"<Fp4QuantTactic.TRTLLM: -1>"``. ``ast.literal_eval`` rejects
+    that with ``SyntaxError``. Before the fix, ``_deserialize_cache_data`` only
+    caught ``(ValueError, TypeError)`` and had no ``continue``, so the
+    ``SyntaxError`` propagated out of ``load_cache`` and crashed the autotuner
+    warmup. The load must now skip the bad entry (that op re-profiles) while
+    every literal-safe entry in the same file still loads correctly.
+    """
+    import ast
+    import enum
+
+    class _Tactic(enum.IntEnum):
+        TRTLLM = -1
+        FLASHINFER = 1
+
+    poisoned_repr = repr(_Tactic.TRTLLM)  # "<_Tactic.TRTLLM: -1>"
+    # Precondition: this really is the SyntaxError-raising shape we care about.
+    with pytest.raises(SyntaxError):
+        ast.literal_eval(poisoned_repr)
+
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    good_key = "('op_good', 'R', '0', ((1, 128),))"
+    bad_key = "('op_bad', 'R', '0', ((2, 128),))"
+    doc = {
+        "metadata": cache._serialize_metadata(),
+        "shared": {},
+        "rank_0": {
+            good_key: {
+                "runner_id": 0,
+                "tactic": "7",
+                "min_time": 0.001
+            },
+            bad_key: {
+                "runner_id": 1,
+                "tactic": poisoned_repr,
+                "min_time": 0.002
+            },
+        },
+    }
+    temp_dir = tempfile.TemporaryDirectory()
+    cache_path = os.path.join(temp_dir.name, "poisoned_cache.json")
+    with open(cache_path, "w") as f:
+        json.dump(doc, f)
+
+    # Must not raise (previously raised SyntaxError out of load_cache).
+    cache.load_cache(cache_path, rank=0)
+
+    # The literal-safe entry survived with its exact tactic ...
+    good = ("op_good", "R", "0", ((1, 128), ))
+    assert good in cache.cache
+    assert cache.cache[good][1] == 7
+    # ... and the non-literal entry was skipped, not silently mis-decoded.
+    bad = ("op_bad", "R", "0", ((2, 128), ))
+    assert bad not in cache.cache
+
+
 def test_kernel_testing_single_context():
     """Test kernel testing with a single choose_one context"""
     x, w = torch.randn(16, 64), torch.randn(64, 128)

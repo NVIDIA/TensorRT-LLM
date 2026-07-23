@@ -804,10 +804,18 @@ class AutoTunerProfilingCache:
                 continue
             try:
                 tactic = ast.literal_eval(value["tactic"])
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, SyntaxError):
+                # A tactic whose repr is not a Python literal (e.g. an IntEnum
+                # member serialized as "<Fp4QuantTactic.TRTLLM: -1>") cannot be
+                # reconstructed. Skip the entry instead of crashing the load:
+                # the affected op simply misses the cache and is re-profiled.
+                # SyntaxError must be caught here because repr(Enum) parses as
+                # invalid syntax, and a missing `continue` would otherwise reuse
+                # the previous iteration's tactic (silent wrong kernel).
                 logger.warning_once(
-                    f"[AutoTuner] Could not deserialize tactic: {value['tactic']} for cache key {key_str}",
+                    f"[AutoTuner] Could not deserialize tactic: {value['tactic']} for cache key {key_str}; skipping entry.",
                     key=value["tactic"])
+                continue
 
             runner_id = value["runner_id"]
             min_time = value["min_time"]
