@@ -288,6 +288,7 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
         py_kv_transfer_timed_out=True,
         py_decoding_iter=3,
         finish_by_reason=Mock(),
+        is_generation_only_request=Mock(return_value=False),
     )
     executor = object.__new__(PyExecutor)
     executor.active_requests = [request]
@@ -301,6 +302,11 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
     executor.async_transfer_manager.requests_in_transfer.return_value = {
         request.py_request_id: request
     }
+    executor.async_transfer_manager.has_transfer_owner.return_value = False
+    executor.async_transfer_manager.has_any_transfer_owner.side_effect = lambda candidate: (
+        executor.async_transfer_manager.requests_in_transfer().get(candidate.py_request_id)
+        is candidate
+    )
     monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_enabled", lambda: True)
 
     PyExecutor._handle_canceled_requests(executor)

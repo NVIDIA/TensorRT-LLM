@@ -25,6 +25,11 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._cuda_virt_mem import PooledPhysMe
 
 _MIB = 1024 * 1024
 
+# A Buffer that was not explicitly closed has no proof that transport users
+# are quiescent. Retain its VirtMem object until process exit instead of
+# allowing destructor order to unmap a potentially live one-sided target.
+_UNSAFE_VMM_RETENTION: list[VirtMem] = []
+
 
 def _div_up(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -78,11 +83,23 @@ class Buffer:
             self._vm = None  # type: ignore[assignment]
 
     def __del__(self):
-        # A destructor must never raise, but a leaked region should be visible, so log the failure.
+        # Explicit owners call close() only after lifecycle drain. A destructor
+        # has no such evidence, so it must fail safe by intentionally leaking
+        # the mapping until process teardown.
         try:
-            self.close()
+            vm = getattr(self, "_vm", None)
+            if vm is None:
+                return
+            retained = globals().get("_UNSAFE_VMM_RETENTION")
+            if retained is not None:
+                retained.append(vm)
+                self._vm = None  # type: ignore[assignment]
+            logger.warning(
+                f"[kv-bounce] retaining unclosed buffer '{getattr(self, '_name', '?')}' "
+                "until process exit"
+            )
         except Exception as e:
-            logger.debug(f"[kv-bounce] buffer '{getattr(self, '_name', '?')}' cleanup failed: {e}")
+            logger.debug(f"[kv-bounce] buffer retention failed: {e}")
 
 
 # region starts are rounded to this for copy alignment (negligible waste)
@@ -94,7 +111,15 @@ class SlotAllocator:
     reuses a hole freed out of order rather than skipping it. Reserve is thread-safe and blocking.
     The whole buffer is one registration, so a write can stripe across the network links."""
 
-    __slots__ = ("_buf", "_cap", "_cv", "_in_use", "_quarantine", "_next_slot_id")
+    __slots__ = (
+        "_buf",
+        "_cap",
+        "_closed",
+        "_cv",
+        "_in_use",
+        "_quarantine",
+        "_next_slot_id",
+    )
 
     def __init__(self, capacity_bytes: int, phys_chunk_size: int, name: str = "kv_bounce"):
         if capacity_bytes <= 0:
@@ -102,10 +127,11 @@ class SlotAllocator:
         self._buf = Buffer(capacity_bytes, phys_chunk_size, name=name)
         self._cap = self._buf.size  # rounded up to a chunk multiple
         self._in_use: Dict[int, Tuple[int, int]] = {}  # each live slot maps to its start and size
-        # Quarantined slots not yet reusable: an orphaned writer's write may still be landing
-        # and cannot be aborted, so each is held out of the pool until its deadline passes.
-        self._quarantine: Dict[int, Tuple[int, int, float]] = {}
+        # Quarantined slots are never made reusable by elapsed time. A caller must provide explicit
+        # quiescence evidence through release_quarantined(), or close must refuse the arena.
+        self._quarantine: Dict[int, Tuple[int, int]] = {}
         self._next_slot_id = 0
+        self._closed = False
         self._cv = threading.Condition(threading.Lock())
 
     @property
@@ -116,7 +142,7 @@ class SlotAllocator:
         """Ranges that must not be handed out: live and quarantined, treated the same."""
         for s, n in self._in_use.values():
             yield s, n
-        for s, n, _dl in self._quarantine.values():
+        for s, n in self._quarantine.values():
             yield s, n
 
     def _find_free_start(self, size: int) -> Optional[int]:
@@ -138,6 +164,8 @@ class SlotAllocator:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._cv:
             while True:
+                if self._closed:
+                    return None
                 start = self._find_free_start(size)
                 if start is not None:
                     slot_id = self._next_slot_id
@@ -156,37 +184,45 @@ class SlotAllocator:
             self._in_use.pop(slot_id, None)
             self._cv.notify_all()
 
-    def quarantine(self, slot_id: int, grace_s: float) -> None:
-        """Hold a slot out of the free pool for the grace period instead of releasing it, because its
-        region may still be under an in-doubt write. An infinite grace holds it until close."""
+    def quarantine(self, slot_id: int) -> None:
+        """Hold a slot indefinitely because an in-doubt remote writer may still access it."""
         with self._cv:
             entry = self._in_use.pop(slot_id, None)
             if entry is not None:
-                start, size = entry
-                # a finite time plus infinity is infinity, so an infinite grace never expires
-                deadline = time.monotonic() + grace_s
-                self._quarantine[slot_id] = (start, size, deadline)
+                self._quarantine[slot_id] = entry
             self._cv.notify_all()
 
-    def reclaim_expired(self) -> int:
-        """Return quarantined slots past their deadline to the free pool and report how many. Runs
-        off a timer, not tied to reserve, so it makes progress even when the arena is full."""
-        now = time.monotonic()
+    def release_quarantined(self, slot_id: int) -> bool:
+        """Release one quarantined slot after the caller proves remote access is quiescent."""
         with self._cv:
-            expired = [sid for sid, (_s, _n, dl) in self._quarantine.items() if dl <= now]
-            for sid in expired:
-                del self._quarantine[sid]
-            if expired:
+            released = self._quarantine.pop(slot_id, None) is not None
+            if released:
                 self._cv.notify_all()
-        return len(expired)
+            return released
 
     @property
     def quarantined_bytes(self) -> int:
         """Bytes currently held in quarantine, for observability."""
-        return sum(n for _s, n, _dl in self._quarantine.values())
+        with self._cv:
+            return sum(n for _s, n in self._quarantine.values())
+
+    @property
+    def has_outstanding(self) -> bool:
+        """Whether a live or quarantined slot still owns any part of the arena."""
+        with self._cv:
+            return bool(self._in_use or self._quarantine)
 
     def reg_descs(self) -> "RegMemoryDescs":
         return self._buf.reg_descs()
 
     def close(self) -> None:
+        with self._cv:
+            if self._in_use or self._quarantine:
+                raise RuntimeError(
+                    "[kv-bounce] cannot close an arena with live or quarantined slots"
+                )
+            # Close admission while holding the allocator gate. A blocked or
+            # racing reserve must observe this state before the VMM is unmapped.
+            self._closed = True
+            self._cv.notify_all()
         self._buf.close()

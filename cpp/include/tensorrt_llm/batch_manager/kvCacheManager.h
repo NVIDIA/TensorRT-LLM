@@ -999,7 +999,8 @@ public:
 
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
-    //! \brief Pin blocks associated with a sequence to prevent eviction.
+    //! \brief Pin each distinct physical block associated with a sequence once.
+    //! \details Blocks shared by multiple beams acquire one pin reference, not one per beam.
     void pinBlocks(GenerationRequest& sequence);
 
     //! \brief Release blocks of the sequence.
@@ -1256,7 +1257,8 @@ public:
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
         std::vector<BlockKey> const& blockKeys);
 
-    //! \brief Unpin blocks by block ids directly
+    //! \brief Unpin blocks by block ids directly.
+    //! \details Every id must be unique and identify an outstanding pin reference.
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep);
@@ -1555,8 +1557,9 @@ public:
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
-    /// @brief Pin all blocks associated with a sequence across all window managers.
+    /// @brief Pin each distinct physical block associated with a sequence once across all window managers.
     /// @param sequence The generation request whose blocks should be pinned.
+    /// @note Block-ID unpinning currently supports single-window managers only.
     void pinBlocks(GenerationRequest& sequence);
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
@@ -2214,6 +2217,8 @@ public:
         std::vector<BlockKey> const& blockKeys, SizeType32 windowSize)
         = 0;
 
+    /// @brief Consume one outstanding pin reference for each unique block id.
+    /// @note Callers must not pass duplicate ids or ids without an outstanding pin.
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
 
     /// @brief Release cached blocks for a token sequence beyond a given prefix length.

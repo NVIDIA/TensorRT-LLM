@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -79,6 +79,9 @@ class _FakeExecutor:
 
     def _check_disagg_ctx_cache_transfer_status(self, _):
         return None
+
+    def _requires_physical_transfer_drain(self):
+        return PyExecutor._requires_physical_transfer_drain(self)
 
 
 class TestSendKvAsyncReleasesIndexSlot:

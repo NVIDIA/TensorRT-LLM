@@ -333,6 +333,38 @@ def log_memory_usage(stage: str):
     )
 
 
+def _teardown_kv_cache_managers_after_transceiver_shutdown(
+        py_executor, kv_cache_creator, resources) -> None:
+    """Preserve manager-owned memory through transport and owner teardown."""
+    transceiver = getattr(py_executor, "kv_cache_transceiver", None)
+    if transceiver is not None:
+        shutdown_result = transceiver.shutdown()
+        requires_physical_drain = (getattr(
+            transceiver, "requires_physical_drain_before_request_release",
+            False) is True)
+        if requires_physical_drain and shutdown_result is not True:
+            raise RuntimeError(
+                "KV cache transceiver did not prove physical drain; refusing "
+                "to tear down KV cache managers")
+        if shutdown_result is False:
+            raise RuntimeError(
+                "KV cache transceiver still owns active transfer targets; "
+                "refusing to tear down KV cache managers")
+
+    transfer_manager = getattr(py_executor, "async_transfer_manager", None)
+    has_inflight_requests = getattr(transfer_manager,
+                                    "has_any_inflight_requests", None)
+    if (has_inflight_requests is not None and has_inflight_requests() is True):
+        # This helper has no request-level owner-retirement phase. Even an
+        # explicit transceiver drain cannot retire a connector sibling or clear
+        # the AsyncTransferManager ledger, and a legacy ``None`` result proves
+        # nothing about either. Capacity warmup is expected to have no owners.
+        raise RuntimeError(
+            "Asynchronous transfer ownership is still active; refusing to "
+            "tear down KV cache managers")
+    kv_cache_creator.teardown_managers(resources)
+
+
 def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: Optional[str] = None,
@@ -1033,12 +1065,8 @@ def create_py_executor(
         # that NIXL-registered (pinned) GPU memory is deregistered first;
         # otherwise the old KV cache memory stays pinned and the subsequent
         # KV cache allocation will OOM.
-        try:
-            if hasattr(py_executor, 'kv_cache_transceiver'
-                       ) and py_executor.kv_cache_transceiver is not None:
-                py_executor.kv_cache_transceiver.shutdown()
-        finally:
-            kv_cache_creator.teardown_managers(resources)
+        _teardown_kv_cache_managers_after_transceiver_shutdown(
+            py_executor, kv_cache_creator, resources)
 
         # Release Phase-1 CUDA graph pools before final KV allocation to avoid overshoot.
         for eng in [model_engine, draft_model_engine]:

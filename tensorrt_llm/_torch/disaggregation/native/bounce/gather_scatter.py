@@ -116,21 +116,38 @@ def _uniform_nelem(sizes: np.ndarray):
 
 # reusable pinned staging for the metadata copy, one per stream, so the copy is a true async transfer
 _meta_lock = threading.Lock()
-_meta_buffers = {}  # each stream maps to its pinned host buffer, device buffer, and capacity
+_meta_buffers = {}  # each (device, stream) maps to pinned/device buffers and capacity
+
+
+def _meta_buffer_key(stream_handle: int, dev) -> tuple[int, int]:
+    """Return a cache key that cannot alias an equal stream handle on another device."""
+    device_index = dev.index
+    if device_index is None:
+        raise ValueError("CUDA metadata buffers require an explicit device index")
+    return int(device_index), int(stream_handle)
 
 
 def _get_meta_buffers(stream_handle: int, need: int, dev):
     """Return the pinned host and device buffers for the stream, large enough for the request,
     growing them under a lock."""
+    key = _meta_buffer_key(stream_handle, dev)
     with _meta_lock:
-        ent = _meta_buffers.get(stream_handle)
+        ent = _meta_buffers.get(key)
         if ent is None or ent[2] < need:
             new_cap = max(need, (ent[2] * 2 if ent else 0), 4096)
             pinned = torch.empty(new_cap, dtype=torch.int64, pin_memory=prefer_pinned())
             devt = torch.empty(new_cap, dtype=torch.int64, device=dev)
             ent = (pinned, devt, new_cap)
-            _meta_buffers[stream_handle] = ent
+            _meta_buffers[key] = ent
         return ent[0], ent[1]
+
+
+def release_meta_buffers(stream_handle: int, device_id: int) -> None:
+    """Release metadata staging owned by a quiesced stream."""
+    with _meta_lock:
+        buffers = _meta_buffers.pop((int(device_id), int(stream_handle)), None)
+    # Tensor destruction may enter the CUDA allocator; do it outside the cache lock.
+    del buffers
 
 
 def _launch_batched_copy(
