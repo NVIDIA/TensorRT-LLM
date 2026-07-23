@@ -77,72 +77,11 @@ _SUPPORTED_PAGE_SHARDS = (2, 3)
 SMALL_WORKLOAD_PAGE_SHARDS = 3
 
 
-class _TriScoreEpilogue:
-    """Minimal TMEM-to-global epilogue for the score specialization."""
-
-    def __init__(self) -> None:
-        self.acc_dtype = cutlass.Float32
-
-    def epilog_tmem_copy_and_partition(
-        self,
-        tidx: cutlass.Int32,
-        accumulator: cute.Tensor,
-        output: cute.Tensor,
-        epilogue_tile: cute.Tile,
-        use_2cta_instrs: bool,
-    ) -> tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
-        copy_atom = sm100_utils.get_tmem_load_op(
-            self.cta_tile_shape_mnk,
-            self.c_layout,
-            self.c_dtype,
-            self.acc_dtype,
-            epilogue_tile,
-            use_2cta_instrs,
-        )
-        accumulator_epilogue = cute.flat_divide(
-            accumulator[((None, None), 0, 0)],
-            epilogue_tile,
-        )
-        tiled_copy = tcgen05.make_tmem_copy(
-            copy_atom,
-            accumulator_epilogue[(None, None, 0, 0)],
-        )
-        thread_copy = tiled_copy.get_slice(tidx)
-        thread_accumulator = thread_copy.partition_S(accumulator_epilogue)
-        output_epilogue = cute.flat_divide(
-            output[((None, None), 0, 0, None, None, None)],
-            epilogue_tile,
-        )
-        thread_output = thread_copy.partition_D(output_epilogue)
-        register_accumulator = cute.make_rmem_tensor(
-            thread_output[(None, None, None, 0, 0, 0, 0, 0)].shape,
-            self.acc_dtype,
-        )
-        return tiled_copy, thread_accumulator, register_accumulator
-
-    def epilog_gmem_copy_and_partition(
-        self,
-        tidx: cutlass.Int32,
-        tiled_copy: cute.TiledCopy,
-        output: cute.Tensor,
-        epilogue_tile: cute.Tile,
-    ) -> tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
-        output_epilogue = cute.flat_divide(
-            output[((None, None), 0, 0, None, None, None)],
-            epilogue_tile,
-        )
-        thread_copy = tiled_copy.get_slice(tidx)
-        thread_output = thread_copy.partition_D(output_epilogue)
-        register_output = cute.make_rmem_tensor(
-            thread_output[(None, None, None, 0, 0, 0, 0, 0)].shape,
-            self.c_dtype,
-        )
-        copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.c_dtype)
-        return copy_atom, register_output, thread_output
-
-
-class _TriAttentionScoreKernel(_TriScoreEpilogue):
+class _TriAttentionScoreKernel:
     """Assign one CTA to each segment/KV-head task and retain W across pages."""
+
+    # Accumulator dtype of the TMEM-to-global epilogue below.
+    acc_dtype = cutlass.Float32
 
     def __init__(
         self,
@@ -160,7 +99,6 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         write_partial_stats: bool = False,
     ) -> None:
         """Build the single validated production specialization."""
-        super().__init__()
         if pool_dtype is not cutlass.BFloat16:
             raise ValueError("TriAttention CuTe score requires BF16 K pages")
         if num_freqs not in (32, 64):
@@ -224,6 +162,63 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             raise ValueError(f"K pages must be contiguous [{tokens_per_block}, {2 * num_freqs}]")
         if self.s_page % RAW_K_VECTOR_ELEMENTS or self.s_kv_head % RAW_K_VECTOR_ELEMENTS:
             raise ValueError("K page and KV-head strides must preserve 16-byte alignment")
+
+    def epilog_tmem_copy_and_partition(
+        self,
+        tidx: cutlass.Int32,
+        accumulator: cute.Tensor,
+        output: cute.Tensor,
+        epilogue_tile: cute.Tile,
+        use_2cta_instrs: bool,
+    ) -> tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        copy_atom = sm100_utils.get_tmem_load_op(
+            self.cta_tile_shape_mnk,
+            self.c_layout,
+            self.c_dtype,
+            self.acc_dtype,
+            epilogue_tile,
+            use_2cta_instrs,
+        )
+        accumulator_epilogue = cute.flat_divide(
+            accumulator[((None, None), 0, 0)],
+            epilogue_tile,
+        )
+        tiled_copy = tcgen05.make_tmem_copy(
+            copy_atom,
+            accumulator_epilogue[(None, None, 0, 0)],
+        )
+        thread_copy = tiled_copy.get_slice(tidx)
+        thread_accumulator = thread_copy.partition_S(accumulator_epilogue)
+        output_epilogue = cute.flat_divide(
+            output[((None, None), 0, 0, None, None, None)],
+            epilogue_tile,
+        )
+        thread_output = thread_copy.partition_D(output_epilogue)
+        register_accumulator = cute.make_rmem_tensor(
+            thread_output[(None, None, None, 0, 0, 0, 0, 0)].shape,
+            self.acc_dtype,
+        )
+        return tiled_copy, thread_accumulator, register_accumulator
+
+    def epilog_gmem_copy_and_partition(
+        self,
+        tidx: cutlass.Int32,
+        tiled_copy: cute.TiledCopy,
+        output: cute.Tensor,
+        epilogue_tile: cute.Tile,
+    ) -> tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
+        output_epilogue = cute.flat_divide(
+            output[((None, None), 0, 0, None, None, None)],
+            epilogue_tile,
+        )
+        thread_copy = tiled_copy.get_slice(tidx)
+        thread_output = thread_copy.partition_D(output_epilogue)
+        register_output = cute.make_rmem_tensor(
+            thread_output[(None, None, None, 0, 0, 0, 0, 0)].shape,
+            self.c_dtype,
+        )
+        copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.c_dtype)
+        return copy_atom, register_output, thread_output
 
     @cute.jit
     def __call__(
@@ -1620,112 +1615,71 @@ class TriAttentionCuteScoreRunner:
         variants = [(1, SMALL_WORKLOAD_PAGE_SHARDS)]
         if max_requests > 1:
             variants.append((max_requests, 2))
+        # ONE compile ritual: per-head runners compile the score-only entry,
+        # the union runner ONLY its fused stats+union pipeline (plus the
+        # normalize finalizer below). Same cache keys and compile order as
+        # the former per-variant blocks; write_partial_stats=False is the
+        # kernel's default, so passing it explicitly is a no-op.
+        kernel_kwargs = dict(
+            num_layers=num_layers,
+            seq_len=seq_len,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            num_freqs=num_freqs,
+            tokens_per_block=tokens_per_block,
+            pool_shape=tuple(int(value) for value in layer_pools[layer_indices[0]].shape),
+            pool_strides=tuple(int(value) for value in layer_pools[layer_indices[0]].stride()),
+            pool_dtype=cutlass.BFloat16,
+        )
+        if self.enable_partial_stats:
+            variant_key = "triattention_cute_score_stats"
+            compiled_entries = self._compiled_stats
+        else:
+            variant_key = "triattention_cute_score"
+            compiled_entries = self._compiled
         for request_count, page_shards in variants:
-            if not self.enable_partial_stats:
-                # Per-head modes launch the score-only entry; the union
-                # runner compiles ONLY its fused stats+union pipeline below.
-                cache_key = (
-                    "triattention_cute_score",
-                    static_geometry,
-                    tensor_specs,
-                    request_count,
-                    page_shards,
-                )
-                with _COMPILE_LOCK:
-                    compiled = _COMPILED_KERNELS.get(cache_key)
-                    if compiled is None:
-                        kernel = _TriAttentionScoreKernel(
-                            num_layers=num_layers,
-                            seq_len=seq_len,
-                            num_q_heads=num_q_heads,
-                            num_kv_heads=num_kv_heads,
-                            num_freqs=num_freqs,
-                            tokens_per_block=tokens_per_block,
-                            pool_shape=tuple(
-                                int(value) for value in layer_pools[layer_indices[0]].shape
-                            ),
-                            pool_strides=tuple(
-                                int(value) for value in layer_pools[layer_indices[0]].stride()
-                            ),
-                            pool_dtype=cutlass.BFloat16,
-                            page_shards=page_shards,
-                        )
-                        stream = cuda.CUstream(torch.cuda.current_stream(output.device).cuda_stream)
-                        compiled = cute.compile(
-                            kernel,
-                            *self._cute_prefix,
-                            _to_cute(mean_cos.view(-1)),
-                            _to_cute(mean_sin.view(-1)),
-                            *self._cute_tail,
-                            cutlass.Int32(1),
-                            stream,
-                        )
-                        _COMPILED_KERNELS[cache_key] = compiled
-                self._compiled[request_count] = compiled
+            cache_key = (
+                variant_key,
+                static_geometry,
+                tensor_specs,
+                request_count,
+                page_shards,
+            )
+            with _COMPILE_LOCK:
+                compiled = _COMPILED_KERNELS.get(cache_key)
+                if compiled is None:
+                    kernel = _TriAttentionScoreKernel(
+                        **kernel_kwargs,
+                        page_shards=page_shards,
+                        write_partial_stats=self.enable_partial_stats,
+                    )
+                    stream = cuda.CUstream(torch.cuda.current_stream(output.device).cuda_stream)
+                    compiled = cute.compile(
+                        kernel,
+                        *self._cute_prefix,
+                        _to_cute(mean_cos.view(-1)),
+                        _to_cute(mean_sin.view(-1)),
+                        *self._cute_tail,
+                        cutlass.Int32(1),
+                        stream,
+                    )
+                    _COMPILED_KERNELS[cache_key] = compiled
+            compiled_entries[request_count] = compiled
             self._page_shards[request_count] = page_shards
-            if self.enable_partial_stats:
-                stats_cache_key = (
-                    "triattention_cute_score_stats",
-                    static_geometry,
-                    tensor_specs,
-                    request_count,
-                    page_shards,
-                )
-                with _COMPILE_LOCK:
-                    compiled_stats = _COMPILED_KERNELS.get(stats_cache_key)
-                    if compiled_stats is None:
-                        stats_kernel = _TriAttentionScoreKernel(
-                            num_layers=num_layers,
-                            seq_len=seq_len,
-                            num_q_heads=num_q_heads,
-                            num_kv_heads=num_kv_heads,
-                            num_freqs=num_freqs,
-                            tokens_per_block=tokens_per_block,
-                            pool_shape=tuple(
-                                int(value) for value in layer_pools[layer_indices[0]].shape
-                            ),
-                            pool_strides=tuple(
-                                int(value) for value in layer_pools[layer_indices[0]].stride()
-                            ),
-                            pool_dtype=cutlass.BFloat16,
-                            page_shards=page_shards,
-                            write_partial_stats=True,
-                        )
-                        stream = cuda.CUstream(torch.cuda.current_stream(output.device).cuda_stream)
-                        compiled_stats = cute.compile(
-                            stats_kernel,
-                            *self._cute_prefix,
-                            _to_cute(mean_cos.view(-1)),
-                            _to_cute(mean_sin.view(-1)),
-                            *self._cute_tail,
-                            cutlass.Int32(1),
-                            stream,
-                        )
-                        _COMPILED_KERNELS[stats_cache_key] = compiled_stats
-                self._compiled_stats[request_count] = compiled_stats
 
         if max_requests > 1:
-            small_score = self._compiled.get(1)
-            large_score = self._compiled.get(max_requests)
-            small_stats = self._compiled_stats.get(1)
-            large_stats = self._compiled_stats.get(max_requests)
+            small = compiled_entries.get(1)
+            large = compiled_entries.get(max_requests)
             for request_count in range(1, max_requests + 1):
                 # Shard-pick heuristic: give small cohorts the extra page
                 # shard while the 2-shard grid stays under two waves
                 # (2 * sm_count CTAs); larger cohorts already fill the GPU.
                 two_shard_ctas = request_count * num_layers * num_kv_heads * 2
                 use_extra_score_shard = two_shard_ctas < 2 * self.sm_count
-                if not self.enable_partial_stats:
-                    self._compiled[request_count] = (
-                        small_score if use_extra_score_shard else large_score
-                    )
+                compiled_entries[request_count] = small if use_extra_score_shard else large
                 self._page_shards[request_count] = (
                     SMALL_WORKLOAD_PAGE_SHARDS if use_extra_score_shard else 2
                 )
-                if self.enable_partial_stats:
-                    self._compiled_stats[request_count] = (
-                        small_stats if use_extra_score_shard else large_stats
-                    )
 
         if self.enable_partial_stats:
             from .triattention_cute_selection import (
@@ -1819,14 +1773,6 @@ class TriAttentionCuteScoreRunner:
             request_count,
             stream,
         )
-        self._launch_union_finalize(request_count, union_scores, stream)
-
-    def _launch_union_finalize(
-        self,
-        request_count: int,
-        union_scores: torch.Tensor,
-        stream: cuda.CUstream,
-    ) -> None:
         self._compiled_normalize_union[request_count](
             _to_cute(self.partial_stats),
             *self._cute_selection_prefix,
