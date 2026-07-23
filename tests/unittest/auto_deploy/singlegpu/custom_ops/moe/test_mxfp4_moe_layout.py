@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-from triton_kernels.tensor_details.layout import HopperMXValueLayout, StridedLayout
+from triton_kernels.tensor_details.layout import (
+    HopperMXScaleLayout,
+    HopperMXValueLayout,
+    StridedLayout,
+)
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe import mxfp4_moe
 
@@ -42,6 +46,40 @@ def test_mxfp4_value_layout_keeps_default_layout_pre_blackwell(monkeypatch):
     value_layout = mxfp4_moe._mxfp4_value_layout(mx_axis=-2)
 
     assert value_layout == HopperMXValueLayout(mx_axis=-2, mma_version=3)
+
+
+def test_mxfp4_scale_layout_skips_conversion_on_blackwell(monkeypatch):
+    monkeypatch.setattr(mxfp4_moe, "cuda_capability_geq", lambda major, minor=0: major >= 10)
+
+    scale_layout = mxfp4_moe._mxfp4_scale_layout(mx_axis=-2)
+
+    assert scale_layout is None
+
+
+def test_mxfp4_scale_layout_skips_conversion_for_strided_fallback(monkeypatch):
+    monkeypatch.setattr(mxfp4_moe, "cuda_capability_geq", lambda major, minor=0: False)
+    monkeypatch.setattr(
+        mxfp4_moe.layout,
+        "make_default_matmul_mxfp4_w_scale_layout",
+        lambda mx_axis, num_warps: StridedLayout(-2),
+    )
+
+    scale_layout = mxfp4_moe._mxfp4_scale_layout(mx_axis=-2)
+
+    assert scale_layout is None
+
+
+def test_mxfp4_scale_layout_keeps_hopper_layout(monkeypatch):
+    monkeypatch.setattr(mxfp4_moe, "cuda_capability_geq", lambda major, minor=0: False)
+    monkeypatch.setattr(
+        mxfp4_moe.layout,
+        "make_default_matmul_mxfp4_w_scale_layout",
+        lambda mx_axis, num_warps: HopperMXScaleLayout(mx_axis=mx_axis, num_warps=num_warps),
+    )
+
+    scale_layout = mxfp4_moe._mxfp4_scale_layout(mx_axis=-2)
+
+    assert scale_layout == HopperMXScaleLayout(mx_axis=-2, num_warps=4)
 
 
 def test_mxfp4_weight_layout_cache_reuses_equivalent_views(monkeypatch):

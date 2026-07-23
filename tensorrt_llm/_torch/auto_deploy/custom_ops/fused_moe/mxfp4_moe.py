@@ -75,15 +75,31 @@ def _mxfp4_value_layout(mx_axis: int):
     return value_layout
 
 
+def _mxfp4_scale_layout(mx_axis: int, num_warps: int = 4):
+    # Keep scale and value layouts paired. On Hopper, matmul derives SWAP_XW
+    # and its warp count from HopperMXScaleLayout; leaving scales strided while
+    # values are swizzled selects an incompatible kernel configuration.
+    if cuda_capability_geq(10):
+        return None
+    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=mx_axis, num_warps=num_warps
+    )
+    if isinstance(scale_layout, layout.StridedLayout):
+        return None
+    return scale_layout
+
+
 def _swizzle_mxfp4(w, w_scale):
     # The mx axis is the K dim of the (num_experts, K, N) weights, i.e. -2 in
     # the trailing-dims convention required by triton 3.7.0.
     value_layout = _mxfp4_value_layout(mx_axis=-2)
+    scale_layout = _mxfp4_scale_layout(mx_axis=-2)
     w = wrap_torch_tensor(w, dtype=FP4)
     if value_layout is not None:
         w = convert_layout(w, value_layout)
-    # Scales keep their natural strided layout (identity, as before 3.7.0).
     w_scale = wrap_torch_tensor(w_scale)
+    if scale_layout is not None:
+        w_scale = convert_layout(w_scale, scale_layout)
     return w, w_scale
 
 
@@ -92,9 +108,15 @@ RouteFn = Callable[[torch.Tensor], tuple[TritonRoutingData, torch.Tensor, torch.
 
 def _mxfp4_layout_cache_key() -> tuple[object, ...]:
     value_layout = _mxfp4_value_layout(mx_axis=-2)
+    scale_layout = _mxfp4_scale_layout(mx_axis=-2)
     # Layout instances are frozen dataclasses, so repr() deterministically
     # captures both the layout type and its parameters (None → "None").
-    return (type(value_layout).__module__, repr(value_layout))
+    return (
+        type(value_layout).__module__,
+        repr(value_layout),
+        type(scale_layout).__module__,
+        repr(scale_layout),
+    )
 
 
 def _source_tensor(tensor: torch.Tensor) -> torch.Tensor:
