@@ -1954,11 +1954,17 @@ async def process_streaming_events(
     for initial_response in initial_responses:
         yield initial_response
 
+    final_res = None
     async for res in generator:
         final_res = res
         events = streaming_processor.process_single_output(res)
         for event in events:
             yield event
+
+    # An empty/aborted stream yields nothing; there is no final response to
+    # build, and calling get_final_response with an unset result would raise.
+    if final_res is None:
+        return
 
     final_response = await streaming_processor.get_final_response(final_res)
 
