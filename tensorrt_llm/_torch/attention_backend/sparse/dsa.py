@@ -1929,13 +1929,31 @@ class Indexer(nn.Module):
             kv_cache_manager, 'use_fp4', False) else head_dim
         compress_ratio = _effective_compress_ratio_divisor(
             _select_indexer_compress_ratio(metadata.compress_ratios))
+        # INDEXER_COMPRESS is stored per-compressed-token: the K-cache page is the
+        # compressed block size (raw tokens_per_block // indexer compress ratio),
+        # so the indexer slot mappings must stride by that, not the raw
+        # tokens_per_block. Derive it from the LIVE compress ratio here instead of
+        # metadata._tokens_per_block: that value is frozen in the base metadata
+        # __post_init__ (dsa.py) which runs inside super().__post_init__() BEFORE
+        # the DeepseekV4 metadata installs its real compress_ratios, so the
+        # derivation sees the pre-override [1] and leaves the raw tokens_per_block
+        # (256). The stale raw stride over-strides the fullkv indexer gather by
+        # the compress ratio and runs off the indexer K-cache under reuse
+        # retention (measured: flat = block_ids*256*bpt crosses the pool at
+        # block_ids ~= upper_bound/ratio). NOTE: the on_update slot_mapping_fp8 is
+        # dead on DSv4 — the shared DSA scatter is no-op'd
+        # (DeepseekV4Indexer._update_k_cache) and the indexer reads go paged via
+        # the block table — so this IndexerParams stride is the live indexer
+        # consumer. DSA v3.2 has ratio-divisor 1, so the value is unchanged there.
+        indexer_tokens_per_block = (
+            metadata.kv_cache_manager.tokens_per_block // compress_ratio)
         return IndexerParams(
             num_contexts=metadata.num_contexts,
             num_generations=metadata.num_generations,
             num_ctx_tokens=metadata.num_ctx_tokens,
             head_dim=head_dim,
             quant_block_size=metadata.indexer_quant_block_size,
-            tokens_per_block=metadata._tokens_per_block,
+            tokens_per_block=indexer_tokens_per_block,
             compress_ratio=compress_ratio,
             request_ids=metadata.request_ids,
             num_past_tokens=metadata.kv_cache_params.num_cached_tokens_per_seq,
@@ -2430,6 +2448,30 @@ class Indexer(nn.Module):
                             chunk.token_start:chunk.token_end, :].fill_(-1)
                         continue
                     num_k_tokens = chunk.k_token_end - chunk.k_token_start
+                    if os.environ.get("TRTLLM_DEBUG_INDEXER_GATHER_BOUNDS",
+                                      "0") == "1":
+                        # The C++ indexer_k_cache_gather_op has no internal
+                        # bounds check, unlike its Python sibling
+                        # _gather_k_cache_for_chunk. Assert the flat byte indices
+                        # stay inside the indexer K-cache before launch. Costs a
+                        # device sync on the prefill hot path, so it is env-gated
+                        # and default-off. Catches an over-strided slot mapping
+                        # (e.g. a raw-vs-compressed tokens_per_block mismatch)
+                        # before it becomes an illegal memory access.
+                        _sm = metadata.slot_mapping_fp8_fullkv[
+                            chunk.k_token_start:chunk.k_token_end]
+                        _sc = metadata.slot_mapping_scale_fullkv[
+                            chunk.k_token_start:chunk.k_token_end]
+                        _numel = k_cache_4d.numel()
+                        _max_fp8 = int(_sm.max().item()) + gather_head_dim
+                        _max_scale = int(_sc.max().item()) + 4
+                        assert _max_fp8 <= _numel and _max_scale <= _numel, (
+                            "indexer_k_cache_gather OOB: max byte index "
+                            f"fp8={_max_fp8} scale={_max_scale} > "
+                            f"k_cache.numel()={_numel}. The fullkv slot mapping "
+                            "over-strides the indexer K-cache (check "
+                            "IndexerParams.tokens_per_block vs the compressed "
+                            "block size).")
                     chunk_k_fp8, chunk_k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
                         k_cache_4d, metadata.slot_mapping_fp8_fullkv,
                         metadata.slot_mapping_scale_fullkv, chunk.k_token_start,
