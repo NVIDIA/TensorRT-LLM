@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import itertools
 import os
 import time
@@ -18,6 +21,9 @@ from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
+
+PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_VISUAL_GEN_START_STOP"
+PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -74,7 +80,7 @@ def _parse_profile_range():
        either ``stop`` or ``stop-shutdown`` works. For multi-request capture,
        use a numeric range with ``--capture-range-end=repeat:N``.
     """
-    val = os.environ.get("TLLM_PROFILE_VISUAL_GEN_START_STOP")
+    val = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME)
     if not val:
         return None
     val = val.strip()
@@ -140,6 +146,9 @@ class BasePipeline(nn.Module):
         # CUDA profiler scoping (TLLM_PROFILE_VISUAL_GEN_START_STOP env var)
         self._profile_range = _parse_profile_range()
         self._profiling_active: bool = False
+        self._torch_profiler = None
+        self._torch_profile_trace_path: Optional[str] = None
+        self._setup_torch_profiler()
         # Single-shot guards for predenoise/postdenoise modes — fire once
         # around the first non-warmup denoise() invocation, then disarm.
         self._predenoise_pending: bool = self._profile_range == "predenoise"
@@ -153,10 +162,38 @@ class BasePipeline(nn.Module):
         # graphed transformer.forward if should_compute == True.
         self._setup_cuda_graphs()
 
+    def _setup_torch_profiler(self) -> None:
+        """Configure PyTorch tracing for the VisualGen profiler range."""
+        torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME)
+        if not torch_trace_path:
+            return
+        if self._profile_range is None:
+            logger.warning(
+                f"{PROFILE_START_STOP_ENV_VAR_NAME} environment variable "
+                "needs to be set to enable the torch trace. Example to profile "
+                f"denoise steps 0-4: export {PROFILE_START_STOP_ENV_VAR_NAME}=0-4"
+            )
+            return
+
+        trace_base, trace_ext = os.path.splitext(torch_trace_path)
+        self._torch_profile_trace_path = f"{trace_base}-rank-{self.rank}{trace_ext}"
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+            torch.profiler.ProfilerActivity.XPU,
+        ]
+        self._torch_profiler = torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            with_modules=True,
+        )
+
     def _cuda_profiler_start(self):
         """Start CUDA profiler if configured and not already active."""
         if self._profile_range is not None and not self._profiling_active:
             torch.cuda.cudart().cudaProfilerStart()
+            if self._torch_profiler is not None:
+                self._torch_profiler.start()
             self._profiling_active = True
             if self.rank == 0:
                 logger.info("CUDA profiler started")
@@ -164,6 +201,11 @@ class BasePipeline(nn.Module):
     def _cuda_profiler_stop(self):
         """Stop CUDA profiler if currently active."""
         if self._profiling_active:
+            if self._torch_profiler is not None:
+                self._torch_profiler.stop()
+                self._torch_profiler.export_chrome_trace(self._torch_profile_trace_path)
+                if self.rank == 0:
+                    logger.info(f"PyTorch profiler trace saved to {self._torch_profile_trace_path}")
             torch.cuda.cudart().cudaProfilerStop()
             self._profiling_active = False
             if self.rank == 0:
