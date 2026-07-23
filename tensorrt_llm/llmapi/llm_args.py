@@ -3452,10 +3452,6 @@ class TriAttentionKvCacheCompressionConfig(BaseKvCacheCompressionConfig):
         description="Z-normalize each head's scores over the decode region "
         "before selection (upstream default). `union` eviction requires True: "
         "its fused score+stats+union pipeline always normalizes.")
-    pin_prefill: bool = Field(
-        default=True,
-        description="Always preserve the prompt (prefill) tokens; only decode "
-        "tokens compete for the budget (upstream behaviour).")
     budget: int = Field(
         default=2048,
         gt=0,
@@ -3479,11 +3475,6 @@ class TriAttentionKvCacheCompressionConfig(BaseKvCacheCompressionConfig):
         "(produced by github.com/WeianMao/triattention). TRT-LLM does not "
         "compute calibration; it converts this file to the runtime schema at "
         "load.")
-    count_prompt_tokens: bool = Field(
-        default=False,
-        description="If False (default), the KV budget counts only DECODE tokens "
-        "(the pinned prompt is kept on top). Physical capacity reclaim currently "
-        "requires False.")
 
     @model_validator(mode="after")
     def _require_calibration_inputs(self):
@@ -3505,8 +3496,6 @@ class TriAttentionKvCacheCompressionConfig(BaseKvCacheCompressionConfig):
             "calibration_path": self.calibration_path,
             "eviction_mode": self.eviction_mode,
             "normalize_scores": self.normalize_scores,
-            "pin_prefill": self.pin_prefill,
-            "count_prompt_tokens": self.count_prompt_tokens,
         }
 
 

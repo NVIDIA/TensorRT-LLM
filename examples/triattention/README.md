@@ -121,6 +121,5 @@ trtllm-eval --model <path_to_model> --config config.yaml longbench_v2 --max_outp
     * `per_head`: each KV head keeps its own set, shared across layers (mean of per-layer maxima).
     * `per_layer_perhead`: each head keeps its own set, fully independent per layer.
 * **`normalize_scores`** (bool, default=True): Z-normalize each head's scores over the decode region before selection (upstream default). `union` eviction requires `True` (the fused union pipeline always z-normalizes; construction rejects `False`).
-* **`pin_prefill`** (bool, default=True): Always preserve the prompt (prefill) tokens; only decode tokens compete for the budget (upstream behaviour).
 * **`calibration_path`** (str): Path to the calibration `.pt` from the official tool. Required — TensorRT LLM does not compute calibration.
 * **`model_path`** (str): Checkpoint path, used to derive the model's RoPE tables when converting the official calibration file and to classify kernel-masked sliding-window (SWA) layers from the model config.

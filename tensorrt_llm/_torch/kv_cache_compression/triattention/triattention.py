@@ -667,8 +667,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         calibration_path: Optional[str] = None,
         eviction_mode: str = "union",
         normalize_scores: bool = True,
-        pin_prefill: bool = True,
-        count_prompt_tokens: bool = False,
     ):
         super().__init__(kv_cache_manager, draft_kv_cache_manager)
         self.budget = budget
@@ -687,14 +685,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                 "TriAttention union eviction requires normalize_scores=True: "
                 "the fused union pipeline always z-normalizes score rows"
             )
-        self.pin_prefill = bool(pin_prefill)
-        # False (default): the budget counts decode tokens only.
-        self.count_prompt_tokens = bool(count_prompt_tokens)
-        if not self.pin_prefill or self.count_prompt_tokens:
-            raise ValueError(
-                "TriAttention physical KV reclaim requires pin_prefill=True and "
-                "count_prompt_tokens=False so finalized prompt KV is preserved"
-            )
+        # Hard-coded semantics: the prompt is always pinned and the budget
+        # counts decode tokens only (physical KV reclaim requires both).
         # Calibration is the official TriAttention .pt; TRT-LLM does not compute calibration.
         self.model_path = model_path
         if self.model_path is None:
