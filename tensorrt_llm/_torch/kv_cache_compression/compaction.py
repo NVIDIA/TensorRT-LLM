@@ -121,60 +121,6 @@ def _make_move_indices(
     )
 
 
-def _make_compact_launches(
-    entries: List[Tuple[int, torch.Tensor, torch.Tensor]],
-    layer_pool_ids: Tuple[int, ...],
-    *,
-    move_indices: torch.Tensor,
-    move_offsets: torch.Tensor,
-    destination_bases: torch.Tensor,
-    per_layer_slots: Optional[Dict[int, int]] = None,
-) -> Tuple[Dict[str, object], ...]:
-    """Batch layers into one launch record per uniform V2 pool (grouped by
-    canonical pool id plus pool/page-table geometry), carrying the native
-    ``sparse_kv_cache_compact_layers`` operands as plain named fields."""
-    device = entries[0][1].device
-    grouped = OrderedDict()
-    for layer, pool, page_table in entries:
-        key = (
-            layer_pool_ids[layer],
-            str(pool.dtype),
-            str(pool.device),
-            tuple(int(value) for value in pool.shape[1:]),
-            tuple(int(value) for value in page_table.shape),
-        )
-        grouped.setdefault(key, []).append((layer, pool, page_table))
-
-    launches = []
-    for group_entries in grouped.values():
-        layers = tuple(entry[0] for entry in group_entries)
-        pools = list(entry[1] for entry in group_entries)
-        page_tables = tuple(entry[2] for entry in group_entries)
-        source_layer_indices = None
-        if per_layer_slots is not None:
-            source_layer_indices = torch.tensor(
-                [per_layer_slots[layer] for layer in layers],
-                dtype=torch.int32,
-                device=device,
-            )
-        launches.append(
-            dict(
-                pools=pools,
-                pool_pointers=torch.tensor(
-                    [pool.data_ptr() for pool in pools],
-                    dtype=torch.int64,
-                    device=device,
-                ),
-                page_table=page_tables[0],
-                move_indices=move_indices,
-                move_offsets=move_offsets,
-                destination_bases=destination_bases,
-                source_layer_indices=source_layer_indices,
-            )
-        )
-    return tuple(launches)
-
-
 def init_compaction_buffers(
     *,
     target: Dict[str, object],
@@ -201,8 +147,8 @@ def init_compaction_buffers(
 
     Returns one plan per compacted cache family (target, then the optional
     draft): plain contract fields -- decision inputs, move-index buffers,
-    pack geometry ints, and the grouped native launch records -- that only
-    :func:`compact` interprets.
+    pack geometry ints, and per-pool batched native-operand records built
+    here at init time -- that only :func:`compact` reads at launch.
     """
     layer_pools = target["layer_pools"]
     dense_layers = tuple(int(layer) for layer in target["dense_layers"])
@@ -263,16 +209,20 @@ def init_compaction_buffers(
     if swa_move_indices is not None:
         move_capacity = max(move_capacity, swa_window + protected_tail_capacity)
 
-    target_launches = list(
-        _make_compact_launches(
+    # Families: (entries, pool ids, move indices, move offsets, destination
+    # bases, per-layer slots, is_draft). One grouping loop below batches each
+    # family into per-pool native-operand records (all init-time construction).
+    families = [
+        (
             dense_entries,
             layer_pool_ids,
-            move_indices=dense_move_indices,
-            move_offsets=dense_move_offsets,
-            destination_bases=token_starts,
-            per_layer_slots=dense_slots,
-        )
-    )
+            dense_move_indices,
+            dense_move_offsets,
+            token_starts,
+            dense_slots,
+            False,
+        ),
+    ]
     if swa_layers:
         # SWA layers stage against their own page-table slots.
         swa_entries = [
@@ -283,35 +233,18 @@ def init_compaction_buffers(
             )
             for layer in swa_layers
         ]
-        target_launches.extend(
-            _make_compact_launches(
+        families.append(
+            (
                 swa_entries,
                 layer_pool_ids,
-                move_indices=swa_move_indices,
-                move_offsets=swa_move_offsets,
-                destination_bases=target["swa_destination_bases"],
+                swa_move_indices,
+                swa_move_offsets,
+                target["swa_destination_bases"],
+                None,
+                False,
             )
         )
-
-    target_plan = dict(
-        kept_ordinal_rows=kept_ordinal_rows,
-        valid_seq_lens=valid_seq_lens,
-        decision_rows=decision_rows,
-        per_layer_sources=per_layer_sources,
-        dense_move_offsets=dense_move_offsets,
-        dense_move_indices=dense_move_indices,
-        swa_move_offsets=swa_move_offsets,
-        swa_move_indices=swa_move_indices,
-        swa_window=swa_window,
-        keep_count=keep_count,
-        move_capacity=move_capacity,
-        num_kv_heads=num_kv_heads,
-        dense_total=int(dense_move_indices.shape[-1]),
-        swa_total=int(swa_move_indices.shape[-1]) if swa_move_indices is not None else 0,
-        launches=tuple(target_launches),
-    )
-
-    plans = [target_plan]
+    draft_move_indices = None
     if draft is not None:
         if decision_rows != 1:
             raise ValueError(
@@ -342,13 +275,86 @@ def init_compaction_buffers(
             )
             for layer in draft_dense_layers
         ]
-        draft_launches = _make_compact_launches(
-            draft_entries,
-            draft_layer_pool_ids,
-            move_indices=draft_move_indices,
-            move_offsets=draft["dense_move_offsets"],
-            destination_bases=token_starts,
+        families.append(
+            (
+                draft_entries,
+                draft_layer_pool_ids,
+                draft_move_indices,
+                draft["dense_move_offsets"],
+                token_starts,
+                None,
+                True,
+            )
         )
+
+    target_launches: List[Dict[str, object]] = []
+    draft_launch_records: List[Dict[str, object]] = []
+    for (
+        entries,
+        pool_ids,
+        move_indices,
+        move_offsets,
+        destination_bases,
+        slots,
+        is_draft,
+    ) in families:
+        grouped = OrderedDict()
+        for layer, pool, page_table in entries:
+            key = (
+                pool_ids[layer],
+                str(pool.dtype),
+                str(pool.device),
+                tuple(int(value) for value in pool.shape[1:]),
+                tuple(int(value) for value in page_table.shape),
+            )
+            grouped.setdefault(key, []).append((layer, pool, page_table))
+        for group_entries in grouped.values():
+            layers = tuple(entry[0] for entry in group_entries)
+            pools = list(entry[1] for entry in group_entries)
+            page_tables = tuple(entry[2] for entry in group_entries)
+            source_layer_indices = None
+            if slots is not None:
+                source_layer_indices = torch.tensor(
+                    [slots[layer] for layer in layers],
+                    dtype=torch.int32,
+                    device=device,
+                )
+            record = dict(
+                pools=pools,
+                pool_pointers=torch.tensor(
+                    [pool.data_ptr() for pool in pools],
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                page_table=page_tables[0],
+                move_indices=move_indices,
+                move_offsets=move_offsets,
+                destination_bases=destination_bases,
+                source_layer_indices=source_layer_indices,
+            )
+            (draft_launch_records if is_draft else target_launches).append(record)
+    draft_launches = tuple(draft_launch_records)
+
+    target_plan = dict(
+        kept_ordinal_rows=kept_ordinal_rows,
+        valid_seq_lens=valid_seq_lens,
+        decision_rows=decision_rows,
+        per_layer_sources=per_layer_sources,
+        dense_move_offsets=dense_move_offsets,
+        dense_move_indices=dense_move_indices,
+        swa_move_offsets=swa_move_offsets,
+        swa_move_indices=swa_move_indices,
+        swa_window=swa_window,
+        keep_count=keep_count,
+        move_capacity=move_capacity,
+        num_kv_heads=num_kv_heads,
+        dense_total=int(dense_move_indices.shape[-1]),
+        swa_total=int(swa_move_indices.shape[-1]) if swa_move_indices is not None else 0,
+        launches=tuple(target_launches),
+    )
+
+    plans = [target_plan]
+    if draft is not None:
         draft_plan = dict(
             kept_ordinal_rows=kept_ordinal_rows,
             valid_seq_lens=valid_seq_lens,
