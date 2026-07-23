@@ -760,9 +760,17 @@ class AutoTunerProfilingCache:
             # Convert any simple object to string for JSON compatibility
             key_str = str(key)
             runner_id, tactic, min_time = value
-            tactic_str = repr(tactic)
+            # Enum tactics (e.g. Fp4QuantTactic) repr as "<Fp4QuantTactic.TRTLLM: -1>",
+            # which ast.literal_eval can't parse back -> load_cache crash. Serialize
+            # the underlying value (reload yields that value; an IntEnum compares
+            # equal to it and kernels take the int).
+            is_enum = isinstance(tactic, enum.Enum)
+            tactic_check = tactic.value if is_enum else tactic
+            tactic_str = repr(tactic_check)
             try:
-                assert tactic == ast.literal_eval(
+                # Verify the serialized value round-trips (compare against the
+                # value we store, not the enum member — else non-IntEnum fails).
+                assert tactic_check == ast.literal_eval(
                     tactic_str
                 ), f"Tactic is not compatible with json.dumps/json.loads"
             except Exception as e:
