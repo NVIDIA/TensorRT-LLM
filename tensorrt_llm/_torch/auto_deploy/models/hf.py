@@ -260,6 +260,35 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         merged_unused = deep_merge_dicts(unused_kwargs, nested_unused_kwargs)
         return model_config, merged_unused
 
+    @staticmethod
+    def _construct_with_kwargs(build_fn, **kwargs) -> nn.Module:
+        """Call ``build_fn(**kwargs)``, dropping config-level leftovers the constructor rejects.
+
+        ``model_kwargs`` may carry config overrides (e.g. ``use_cache``) that
+        ``_recursive_update_config`` could not place on a composite
+        ``PretrainedConfig`` and that therefore land in the leftover kwargs.
+        Those must not reach the model ``__init__`` — some HF models raise e.g.
+        ``TypeError: Gemma3ForConditionalGeneration.__init__() got an unexpected
+        keyword argument 'use_cache'``. We cannot filter against the constructor
+        signature up front because ``from_config`` consumes some kwargs (e.g.
+        ``trust_remote_code``) itself before forwarding the rest, so we strip the
+        offending key reported by the ``TypeError`` and retry instead.
+        """
+        kwargs = dict(kwargs)
+        while True:
+            try:
+                return build_fn(**kwargs)
+            except TypeError as e:
+                match = re.search(r"unexpected keyword argument '([^']+)'", str(e))
+                if match is None or match.group(1) not in kwargs:
+                    raise
+                dropped = match.group(1)
+                ad_logger.warning(
+                    f"Dropping model kwarg '{dropped}' that the model constructor does not "
+                    "accept (it could not be applied to the model config)."
+                )
+                kwargs.pop(dropped)
+
     def _build_model(self, device: DeviceLikeType) -> nn.Module:
         """Build the model on the desired device."""
         model_config, unused_kwargs = self._get_model_config()
@@ -276,14 +305,15 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
                         f"`{custom_model_cls.__name__}` must have a `_from_config` class method. "
                         "Consider inheriting from `PreTrainedModel`."
                     )
-                model = custom_model_cls._from_config(model_config, **unused_kwargs)
+                model = self._construct_with_kwargs(
+                    lambda **kw: custom_model_cls._from_config(model_config, **kw),
+                    **unused_kwargs,
+                )
             else:
-                model = self.automodel_cls.from_config(
-                    model_config,
-                    **{
-                        "trust_remote_code": True,
-                        **unused_kwargs,
-                    },
+                model = self._construct_with_kwargs(
+                    lambda **kw: self.automodel_cls.from_config(model_config, **kw),
+                    trust_remote_code=True,
+                    **unused_kwargs,
                 )
 
         if device == "meta":
