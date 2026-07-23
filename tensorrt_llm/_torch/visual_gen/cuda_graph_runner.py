@@ -72,6 +72,8 @@ class CUDAGraphRunner:
     ):
         self.config = config
         self.enabled = config.use_cuda_graph
+        # When False, uncaptured keys run eagerly instead of triggering capture.
+        self.allow_capture = True
         self._shared_pool = shared_pool
         self._extra_key_fns: Dict[str, ExtraKeyFn] = {}
 
@@ -194,6 +196,8 @@ class CUDAGraphRunner:
             key = self.get_graph_key(*args, **kwargs)
 
             if key not in self.graphs:
+                if not self.allow_capture:
+                    return fn(*args, **kwargs)
                 self.capture(key, fn, args, kwargs)
                 return self.replay(key, args, kwargs)
             else:

@@ -1409,3 +1409,79 @@ def test_autotune_post_tune_merge_before_save(tmp_path):
     # The temporary full-world distributed state was restored.
     assert tuner.mapping is prev_mapping
     assert tuner._dist is prev_dist
+
+
+def _post_tune_merge_worker(world_size):
+    """Run on each MPI rank: seed a distinct cache, then merge for real."""
+    rank = tensorrt_llm.mpi_rank()
+    mapping = Mapping(world_size=world_size,
+                      rank=rank,
+                      tp_size=world_size,
+                      pp_size=1)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.setup_distributed_state(mapping)
+
+    # Shared key: rank 1's tactic is faster (should win). Plus a rank-unique key.
+    shared = ("gemm", "X")
+    tuner.profiling_cache.cache = {
+        shared: (0, ("cutlass", 10), 1.0) if rank == 0 else
+        (0, ("cublaslt", 0), 0.5),
+        (f"only_rank{rank}", "K"): (0, ("trtllm", ), 1.0),
+    }
+    tuner.post_tune_merge_tactics()
+
+    cache = tuner.profiling_cache.cache
+    return {
+        "shared": cache[shared],
+        "has_r0": ("only_rank0", "K") in cache,
+        "has_r1": ("only_rank1", "K") in cache,
+    }
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_post_tune_merge_tactics_multi_rank(mpi_pool_executor):
+    # Real 2-rank merge over an actual process group (not a FakeDist): every
+    # rank must converge to the same cache — the min-time winner for the shared
+    # key and both ranks' unique keys kept.
+    world_size = 2
+    results = list(
+        mpi_pool_executor.map(_post_tune_merge_worker,
+                              *zip(*[(world_size, )] * world_size)))
+    assert len(results) == world_size
+    for r in results:
+        assert r["shared"] == (0, ("cublaslt", 0), 0.5)
+        assert r["has_r0"] and r["has_r1"]
+
+
+def _autotune_dist_allgather_worker(world_size):
+    import torch.distributed as dist
+
+    from tensorrt_llm._torch.visual_gen.mapping import _VisualGenAutotuneDist
+    rank = tensorrt_llm.mpi_rank()
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29557")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo",
+                                world_size=world_size,
+                                rank=rank)
+    # VG's real mesh has tp_size=1; the communicator must gather over the whole
+    # world regardless, so the mapping's tp axis is irrelevant to the gather.
+    d = _VisualGenAutotuneDist(
+        Mapping(world_size=world_size, rank=rank, tp_size=world_size))
+    return d.tp_cp_allgather(f"rank{rank}")
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_visual_gen_autotune_dist_world_allgather(mpi_pool_executor):
+    # _VisualGenAutotuneDist.tp_cp_allgather must gather every rank's object over
+    # the default world group (not the single-rank tp subgroup), and construct
+    # without running TorchDist.__init__.
+    world_size = 2
+    results = list(
+        mpi_pool_executor.map(_autotune_dist_allgather_worker,
+                              *zip(*[(world_size, )] * world_size)))
+    for got in results:
+        assert got == ["rank0", "rank1"]

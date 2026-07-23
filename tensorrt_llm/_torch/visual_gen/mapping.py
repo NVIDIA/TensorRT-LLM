@@ -18,6 +18,7 @@ from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl, SingleProcessGroup
+from tensorrt_llm._torch.distributed.communicator import Distributed, TorchDist
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -26,6 +27,29 @@ _DEVICE_MESH_DIM_ORDER_LEGACY = "cfg-tp-cp-ulysses"
 # Attention2D mesh: split CP into a 2D tile (cp_row × cp_col) so row/col
 # subgroups and seq flatten (cp_row, cp_col, ulysses) are well-defined.
 _DEVICE_MESH_DIM_ORDER_ATTN2D = "cfg-tp-cp_row-cp_col-ulysses"
+
+
+class _VisualGenAutotuneDist(TorchDist):
+    """Autotuner communicator whose collective spans the whole world.
+
+    VisualGen's device mesh has no TP axis over the tuned GEMMs (its parallelism
+    is on cfg/ulysses), so the mesh's tp group would gather a single rank. Gather
+    over the default world group instead, since every rank runs the transformer.
+    """
+
+    def __init__(self, mapping: Mapping):
+        # Skip TorchDist.__init__ on purpose: it registers a global comm
+        # singleton (set_torch_comm) and builds mesh/local subgroups via
+        # collectives — hijacking it here would clobber the real comm. The merge
+        # only needs a world-group all_gather (tp_cp_allgather below), which runs
+        # on the default group; Distributed.__init__ just records the mapping.
+        Distributed.__init__(self, mapping)
+        assert dist.is_initialized()
+
+    def tp_cp_allgather(self, obj: object) -> list[object]:
+        gathered: list[object] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, obj)
+        return gathered
 
 
 class VisualGenMapping(DeviceMeshTopologyImpl):
@@ -554,4 +578,13 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             world_size=self.tp_size,
             rank=self.tp_rank,
             tp_size=self.tp_size,
+        )
+
+    def to_autotuner_mapping(self) -> Mapping:
+        """Mapping that makes the autotuner treat all world ranks as one tuning
+        group (tp_size == world_size), so its post-tune cross-rank merge engages."""
+        return Mapping(
+            world_size=self.world_size,
+            rank=self._rank,
+            tp_size=self.world_size,
         )
