@@ -232,9 +232,10 @@ def make_bare_staging(device, *, max_requests, copy_block_count, page_count=None
     staging.copy_block_count = copy_block_count
     if page_count is not None:
         staging.page_count = page_count
+    staging.keep_count = 4
+    staging.compaction = {"has_swa": False}
     staging.bulk_copy_done = torch.cuda.Event()
     staging.bulk_consume_done = torch.cuda.Event()
-    staging.page_tables_active = False
     staging.copy_done = torch.cuda.Event()
     staging.copy_pending = False
     staging._bulk_offsets_src = torch.empty(
@@ -283,7 +284,6 @@ def make_buffer_stubs(manager, *, decode_width=260):
         storage_groups={0: [0, 1]},
         layer_group_representative={0: 0, 1: 0},
         layer_pool_keys=(("pool", 0), ("pool", 0)),
-        pool_view_fingerprint=(("fixed",),),
     )
     buffers = SimpleNamespace(
         decode_width=decode_width,
@@ -337,6 +337,32 @@ def make_triattention(**overrides):
     return TriAttention(make_fake_v2(), **options)
 
 
+def make_prepared_item(
+    request=None,
+    *,
+    request_id=0,
+    seq_len,
+    round_start=None,
+    prompt_len=0,
+    expected_keep_count=0,
+    protected_tail=0,
+    kv_cache=None,
+    draft_kv_cache=None,
+):
+    """One prepared-cohort item shaped exactly like ``_periodic_evict`` builds."""
+    return {
+        "request": request,
+        "request_id": request_id,
+        "kv_cache": kv_cache,
+        "draft_kv_cache": draft_kv_cache,
+        "seq_len": int(seq_len),
+        "round_start": int(seq_len if round_start is None else round_start),
+        "prompt_len": int(prompt_len),
+        "expected_keep_count": int(expected_keep_count),
+        "protected_tail": int(protected_tail),
+    }
+
+
 def make_request(request_id, **overrides):
     """Build the explicit request fields consumed by TriAttention."""
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -357,24 +383,16 @@ def make_request(request_id, **overrides):
 
 @contextmanager
 def mocked_eviction_internals(manager):
-    """Run the real ``_evict_requests`` body around mocked GPU launches."""
+    """Run the real ``_evict_requests`` body around a mocked round executor."""
     from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
     buffers = SimpleNamespace(max_requests=8)
-    layout = dict(swa_layers=[], swa_window=None)
     with (
-        mock.patch.object(manager, "_runtime_kv_layout", return_value=layout),
+        mock.patch.object(manager, "_runtime_kv_layout", return_value={}),
         mock.patch.object(manager, "_buffers_for", return_value=buffers),
-        mock.patch.object(module, "stage_eviction_cohort") as stage,
-        mock.patch.object(module, "run_eviction_round") as run_round,
-        mock.patch.object(module, "mark_page_tables_consumed") as consumed,
+        mock.patch.object(module, "execute_eviction_round") as execute,
     ):
-        yield SimpleNamespace(
-            buffers=buffers,
-            stage=stage,
-            run_round=run_round,
-            consumed=consumed,
-        )
+        yield SimpleNamespace(buffers=buffers, execute=execute)
 
 
 def torch_tri_score_oracle(
@@ -546,7 +564,7 @@ def launch_split_scores(
     bufs, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
 ):
     """The production score-only leg plus the decode-window gather
-    (``run_eviction_round``'s per-head sequence, parameterized by count)."""
+    (``execute_eviction_round``'s per-head sequence, parameterized by count)."""
     stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts)
     assert request_count in bufs.runner._compiled
     bufs.runner.launch(request_count, mean_cos, mean_sin)

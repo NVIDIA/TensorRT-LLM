@@ -9,7 +9,9 @@ import torch
 from conftest import build_compaction as _build_compaction
 from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_cute_buffers as _make_cute_buffers
+from conftest import make_prepared_item as _make_prepared_item
 from conftest import make_ramp_pools as _make_ramp_pools
+from conftest import make_staging_manager as _make_staging_manager
 from conftest import run_compaction as _run_compaction
 from conftest import set_protected_tails as _set_protected_tails
 
@@ -446,7 +448,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     """Keep score and compaction layer axes aligned across interleaved V2 pools."""
     pytest.importorskip("cutlass")
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        run_eviction_round,
+        execute_eviction_round,
     )
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -512,18 +514,25 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         layer_pool_keys=[("pool", 0), ("pool", 1), ("pool", 0)],
     )
     assert bufs.compaction["has_swa"] is False
-    bufs.block_offsets_device.zero_()
-    bufs.block_offsets_device[..., :2].copy_(_encode_block_offsets(torch.stack(page_tables)))
-    bufs.round_starts_device.fill_(0)
-    bufs.valid_seq_lens_device.fill_(seq_len)
-    bufs.token_starts_device.fill_(0)
-    # Stage this round's move offsets into the buffers' OWN metadata row:
-    # the pack launch and the native moves consume the buffers' own
-    # contract (keep_count moves per request, no protected tail).
-    bufs.request_metadata_device[3, :2].copy_(
-        torch.tensor([0, keep_count], dtype=torch.int32, device=device)
+
+    # Stage through the round executor: the gather double writes both
+    # page-table slots' K page ids and the bulk copy encodes the K/V rows;
+    # the derived move offsets stage the buffers' own contract (keep_count
+    # moves per request, no protected tail).
+    def gather_k_block_offsets(host_table, source, request_ids, num_blocks):
+        assert request_ids == [7]
+        source[..., 0, :].zero_()
+        source[0, 0, 0, :2].copy_(page_tables[0][0].cpu())
+        source[1, 0, 0, :2].copy_(page_tables[1][0].cpu())
+
+    manager = _make_staging_manager(
+        torch.zeros(2, 1, 2, 8, dtype=torch.int32),
+        gather_k_block_offsets,
+        torch.cuda.Stream(device=device),
+        num_slots=2,
     )
-    run_eviction_round(bufs, normalize_scores=False)
+    prepared = [_make_prepared_item(request_id=7, seq_len=seq_len, round_start=0)]
+    execute_eviction_round(bufs, manager, None, prepared, normalize_scores=False)
     assert torch.equal(bufs.keep, expected_keep)
     torch.cuda.synchronize(device)
 
@@ -548,9 +557,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
     import tensorrt_llm
     import tensorrt_llm.bindings
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        mark_page_tables_consumed,
-        run_eviction_round,
-        stage_eviction_cohort,
+        execute_eviction_round,
     )
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -673,20 +680,21 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
 
         def evict_once() -> tuple[torch.Tensor, torch.Tensor]:
             before = snapshot(seq_len + protected_tail)
-            stage_eviction_cohort(
-                bufs,
-                manager,
-                [request_id],
-                [0],
-                [prompt_len],
-                [seq_len],
-                dense_move_offsets=[0, keep_count + protected_tail],
-            )
-            # THE union path (fused pipeline). Z-normalization is monotonic
-            # per row, so the raw-score keep set is unchanged.
-            run_eviction_round(bufs, normalize_scores=True)
+            prepared = [
+                _make_prepared_item(
+                    request_id=request_id,
+                    seq_len=seq_len,
+                    round_start=0,
+                    prompt_len=prompt_len,
+                    protected_tail=protected_tail,
+                )
+            ]
+            # THE union path (fused pipeline) through the one round executor;
+            # the derived move offsets stage keep_count + protected_tail
+            # moves. Z-normalization is monotonic per row, so the raw-score
+            # keep set is unchanged.
+            execute_eviction_round(bufs, manager, None, prepared, normalize_scores=True)
             selected = bufs.keep[0].clone().to(torch.long)
-            mark_page_tables_consumed(bufs, manager._stream)
             torch.cuda.synchronize(device)
             assert cache.resize(compacted_capacity, None)
             after = snapshot(compacted_capacity)

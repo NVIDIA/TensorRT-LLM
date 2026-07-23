@@ -5,7 +5,7 @@
 the draft's own KV heads, the draft's tail appends as ordinals, both land
 at ``destination_base = prompt_len``. Covers the physical moves, packed
 indices, stream ordering, admission gates, the published compressed-token
-invariant, and buffer rebuild/invalidation."""
+invariant, and buffer reuse/rebuild."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -16,6 +16,7 @@ from conftest import build_compaction as _build_compaction
 from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_buffer_stubs as _make_buffer_stubs
 from conftest import make_fake_v2 as _make_fake_v2
+from conftest import make_prepared_item as _make_prepared_item
 from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import make_request as _make_request
 from conftest import make_triattention as _make_triattention
@@ -23,10 +24,7 @@ from conftest import mocked_eviction_internals as _mocked_eviction_internals
 from conftest import run_compaction as _run_compaction
 from conftest import set_protected_tails as _set_protected_tails
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-    TriAttention,
-    mark_page_tables_consumed,
-)
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
 
 def _fresh_request_state():
@@ -174,29 +172,81 @@ def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle(draft_protect
         assert torch.equal(draft_indices[head, : expected_offsets[-1]], expected_row)
 
 
-def test_mark_page_tables_consumed_orders_both_manager_streams():
+def test_execute_eviction_round_orders_both_manager_streams():
+    """The round executor snapshots both page-table planes, then records one
+    completion event and BOTH cache-manager streams wait on it -- even when
+    the round body fails -- so neither manager can free or reallocate pages
+    this cohort is still reading."""
+    from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
+
     event = mock.Mock()
+    host = torch.zeros(6, 9, dtype=torch.int32)
+    prompt_offsets = object()
     buffers = SimpleNamespace(
         device=torch.device("cuda", torch.cuda.current_device()),
-        page_tables_active=True,
+        max_requests=8,
+        keep_count=4,
+        eviction_mode="union",
+        compaction={"has_swa": False},
+        copy_pending=False,
+        copy_done=mock.Mock(),
         bulk_consume_done=event,
+        request_metadata_host=host,
+        request_metadata_host_np=host.numpy(),
+        request_metadata_device=torch.zeros_like(host),
+        phase={"cos": None, "sin": None, "rows": 8},
+        phase_num_freqs=1,
+        phase_f_block=1,
+        prompt_offsets=prompt_offsets,
+        row_prompt_offsets=prompt_offsets,
+        round_starts_device=None,
+        valid_seq_lens_device=None,
+        token_starts_device=None,
+        valid_widths=None,
+        mean_cos=None,
+        mean_sin=None,
+        swa_destination_bases=None,
+        swa_rebase_delta=0,
+        copy_block_count=0,
+        _bulk_offsets_src=None,
+        block_offsets_device=None,
+        draft_copy_block_count=0,
+        _draft_bulk_offsets_src=None,
+        draft_block_offsets_device=None,
     )
     target_stream = mock.Mock()
     draft_stream = mock.Mock()
+    manager = SimpleNamespace(_stream=target_stream)
+    draft_manager = SimpleNamespace(
+        _stream=draft_stream, num_extra_kv_tokens=0, _kv_reserve_draft_tokens=0
+    )
     compute_stream = SimpleNamespace()
+    prepared = [_make_prepared_item(request_id=7, seq_len=8)]
 
-    with mock.patch.object(torch.cuda, "current_stream", return_value=compute_stream):
-        mark_page_tables_consumed(buffers, target_stream, draft_stream)
+    class Boom(RuntimeError):
+        pass
 
-    # One event records the compact launches; BOTH cache managers wait on it,
-    # so neither can free or reallocate pages this cohort is still reading.
+    score_kernel = mock.MagicMock()
+    score_kernel.__getitem__.return_value.side_effect = Boom
+    with (
+        mock.patch.object(torch.cuda, "current_stream", return_value=compute_stream),
+        mock.patch.object(module, "grow_mean_phase_table"),
+        mock.patch.object(module, "_stage_block_offsets") as stage,
+        mock.patch.object(module, "_gather_mean_phase_kernel", score_kernel),
+        mock.patch.object(module, "compact") as compact,
+    ):
+        with pytest.raises(Boom):
+            module.execute_eviction_round(
+                buffers, manager, draft_manager, prepared, normalize_scores=True
+            )
+
+    # Both page-table planes were snapshotted before the round body fired.
+    assert stage.call_count == 2
+    compact.assert_not_called()
+    # One event records the round; BOTH cache managers wait on it.
     event.record.assert_called_once_with(compute_stream)
     target_stream.wait_event.assert_called_once_with(event)
     draft_stream.wait_event.assert_called_once_with(event)
-    assert buffers.page_tables_active is False
-
-    with pytest.raises(RuntimeError, match="not staged"):
-        mark_page_tables_consumed(buffers, target_stream, draft_stream)
 
 
 @pytest.mark.parametrize(
@@ -234,16 +284,25 @@ def test_draft_admission_gates_raise(gate, match):
                 draft_manager,
             )
         return
-    manager = TriAttention(
-        _make_fake_v2(),
-        budget=8,
-        model_path="/models/test",
-        eviction_mode="per_head" if gate == "union_only_per_head" else "union",
-        draft_kv_cache_manager=None if gate == "target_kv_factor" else draft_manager,
-    )
+
+    def construct():
+        return TriAttention(
+            _make_fake_v2(),
+            budget=8,
+            model_path="/models/test",
+            eviction_mode="per_head" if gate == "union_only_per_head" else "union",
+            draft_kv_cache_manager=None if gate == "target_kv_factor" else draft_manager,
+        )
+
+    if gate in ("union_only_per_head", "full_attention_draft"):
+        # Manager-lifetime capability gates run once, at construction.
+        with pytest.raises(ValueError, match=match):
+            construct()
+        return
+    manager = construct()
+    # Flipping kv_factor after construction exercises TriAttention's own
+    # capability gate directly.
     if gate == "draft_kv_factor":
-        # Flipping kv_factor after construction exercises TriAttention's own
-        # runtime gate.
         draft_manager.kv_factor = 1
     if gate == "target_kv_factor":
         manager.kv_cache_manager.kv_factor = 1
@@ -301,10 +360,9 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
                 assert confirmed == 2 + 4
                 # The staged logical position restores the uncompressed
                 # length: physical confirmed plus everything evicted so far
-                # (stage_eviction_cohort args: bufs, manager, ids, round_starts,
-                # prompt lengths, seq lens, page-table lens).
-                round_starts = internals.stage.call_args.args[3]
-                assert round_starts[0] == uncompressed
+                # (the prepared item's round_start).
+                prepared = internals.execute.call_args.args[3]
+                assert prepared[0]["round_start"] == uncompressed
             # The published count equals the uncompressed confirmed logical
             # length minus the physical confirmed length, and never decreases.
             assert request.py_num_compressed_tokens == uncompressed - confirmed
@@ -313,15 +371,19 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
 
     assert eviction_rounds == 3
     assert previous_published == 12
-    # Each round the draft cache shrinks with the target and both manager
-    # streams are ordered after the compact launches.
+    # Each round the draft cache shrinks with the target, and the one
+    # executor call carries both managers, whose streams it orders after the
+    # compact launches.
     assert draft_cache.resize.call_args_list == [mock.call(7, None)] * eviction_rounds
-    assert internals.consumed.call_args_list == (
-        [mock.call(internals.buffers, target._stream, draft_manager._stream)] * eviction_rounds
-    )
+    assert len(internals.execute.call_args_list) == eviction_rounds
+    for call in internals.execute.call_args_list:
+        assert call.args[0] is internals.buffers
+        assert call.args[1] is target
+        assert call.args[2] is draft_manager
+        assert call.kwargs == {"normalize_scores": True}
 
 
-def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
+def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
     from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
     manager = _make_triattention(budget=4)
@@ -343,19 +405,10 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
             pool_representatives=(),
             layer_pool_keys=(),
             pool_page_counts=(4,),
-            pool_view_fingerprint=(),
         )
     )
     prepared = [
-        {
-            "request": _make_request(7),
-            "request_id": 7,
-            "seq_len": 8,
-            "round_start": 8,
-            "prompt_len": 0,
-            "expected_keep_count": 4,
-            "protected_tail": 0,
-        }
+        _make_prepared_item(_make_request(7), request_id=7, seq_len=8, expected_keep_count=4)
     ]
 
     with mock.patch.object(
@@ -384,21 +437,28 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
         assert kwargs["layout"] is layout
         assert list(kwargs["layout"]["layer_pool_keys"]) == list(layout["layer_pool_keys"])
 
-        # A second round with unchanged pools reuses the resident buffers
+        # A second round within the resident capacities reuses the buffers
         # (and with them the compaction launch data they carry).
         assert manager._buffers_for(layout, prepared) is resources
         assert prepare.call_count == 1
 
-        # A pool change invalidates the whole buffer namespace, compaction
-        # included.
-        layout["pool_view_fingerprint"] = (("moved",),)
+        # A cohort that outgrows the resident capacities rebuilds the whole
+        # buffer namespace, compaction included.
+        grown = [
+            _make_prepared_item(
+                _make_request(7),
+                request_id=7,
+                seq_len=8 + buffers.decode_width,
+                expected_keep_count=4,
+            )
+        ]
         rebuilt_buffers = SimpleNamespace(
-            decode_width=buffers.decode_width,
+            decode_width=buffers.decode_width + 8,
             page_table_token_capacity=buffers.page_table_token_capacity,
             max_requests=buffers.max_requests,
         )
         prepare.return_value = rebuilt_buffers
-        rebuilt = manager._buffers_for(layout, prepared)
+        rebuilt = manager._buffers_for(layout, grown)
         assert rebuilt is not resources
         assert rebuilt is rebuilt_buffers
         assert prepare.call_count == 2
