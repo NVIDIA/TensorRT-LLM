@@ -1,11 +1,12 @@
-max_batch_size: 128
+max_batch_size: 16
 cuda_graph_config:
   enable_padding: true
+  max_batch_size: 128
 enable_attention_dp: true
 print_iter_log: true
 kv_cache_config:
   dtype: fp8
-  free_gpu_memory_fraction: 0.7
+  free_gpu_memory_fraction: 0.75
 stream_interval: 10
 moe_config:
   backend: CUTLASS
@@ -19,5 +20,5 @@ speculative_config:
 tensor_parallel_size: 8
 moe_expert_parallel_size: 8
 trust_remote_code: true
-max_num_tokens: 8512
-max_seq_len: 9416
+max_num_tokens: 8320
+max_seq_len: 9472
