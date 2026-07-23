@@ -160,16 +160,32 @@ struct XQAKernelRuntimeHasher
 };
 
 // XQA kernel can be uniquely identified by (LoadHashKey, RuntimeHashKey).
+// The JIT compile context (see CompileEngine::compile) additionally depends on
+// engine-level switches that RuntimeHashKey does not capture and that select
+// different kernel code: is_spec_dec_tree and skip-softmax. Two engines living
+// in one process (the registry behind DecoderXQARunner::getResourceGlobal is
+// process-global) that fold into the same RuntimeHashKey would otherwise share
+// one cubin slot, and the second engine would launch a kernel compiled for the
+// other engine's configuration, failing with CUDA_ERROR_INVALID_VALUE. Only
+// prepare/run-stable engine constants may be added here: prepare() inserts
+// with configure-time params and run() looks up with per-step params, so any
+// field that varies between the two (e.g. the raw q_seq_len, which the tile
+// bucketing in RuntimeHashKey exists to absorb) would break every lookup.
 struct XQAKernelFullHashKey
 {
     XQAKernelLoadHashKey load_key;
     XQAKernelRuntimeHashKey runtime_key;
+    bool is_spec_dec_tree = false;
+    bool use_skip_softmax_attn = false;
 
     XQAKernelFullHashKey() = default;
 
-    XQAKernelFullHashKey(XQAKernelLoadHashKey const& loadKey, XQAKernelRuntimeHashKey const& runtimeKey)
+    XQAKernelFullHashKey(XQAKernelLoadHashKey const& loadKey, XQAKernelRuntimeHashKey const& runtimeKey,
+        bool isSpecDecTree = false, bool useSkipSoftmaxAttn = false)
         : load_key(loadKey)
         , runtime_key(runtimeKey)
+        , is_spec_dec_tree(isSpecDecTree)
+        , use_skip_softmax_attn(useSkipSoftmaxAttn)
     {
     }
 
@@ -181,7 +197,8 @@ struct XQAKernelFullHashKey
 
     bool operator==(XQAKernelFullHashKey const& other) const
     {
-        return load_key == other.load_key && runtime_key == other.runtime_key;
+        return load_key == other.load_key && runtime_key == other.runtime_key
+            && is_spec_dec_tree == other.is_spec_dec_tree && use_skip_softmax_attn == other.use_skip_softmax_attn;
     }
 
     size_t getSerializationSize() const
@@ -200,7 +217,10 @@ struct XQAKernelFullHasher
 {
     size_t operator()(XQAKernelFullHashKey const& s) const
     {
-        return XQAKernelLoadHasher()(s.load_key) ^ XQAKernelRuntimeHasher()(s.runtime_key);
+        size_t key = XQAKernelLoadHasher()(s.load_key) ^ XQAKernelRuntimeHasher()(s.runtime_key);
+        key <<= 2;
+        key ^= (static_cast<size_t>(s.is_spec_dec_tree) << 1) | static_cast<size_t>(s.use_skip_softmax_attn);
+        return key;
     }
 };
 
