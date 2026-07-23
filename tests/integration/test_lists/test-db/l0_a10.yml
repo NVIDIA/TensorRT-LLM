@@ -183,6 +183,7 @@ l0_a10:
   - unittest/scripts
   - unittest/kv_cache_manager_v2_tests # 4 min
   - unittest/dynamo
+  - unittest/test_lazy_torchvision_imports.py
   - unittest/api_stability
   - unittest/bindings
 - condition:
