@@ -250,12 +250,39 @@ class TestCompressedTokenPublication:
         manager = _make_triattention(top_B=4)
         manager.kv_cache_manager._stream = mock.Mock()
         request = _make_request(7, py_prompt_len=2)
-        # Selection keeps every token: seq_len == prompt + budget + 1 evicts
-        # one token; seq_len == prompt + budget must never publish.
-        _set_request_state(manager, 7, confirmed_kv_length=6)
+        # Selection keeps every token at seq_len == prompt + budget: the due
+        # filter must drop the request before any eviction work or publication.
+        cache = SimpleNamespace(
+            capacity=6, history_length=0, is_active=True, resize=mock.Mock(return_value=True)
+        )
+        manager.kv_cache_manager.kv_cache_map = {7: cache}
+        manager._calibrated = True
+        state = _set_request_state(manager, 7, generation_steps=127)
 
+        with _mocked_eviction_internals(manager) as internals:
+            manager._periodic_evict(SimpleNamespace(generation_requests=[request]))
+
+        internals.run_round.assert_not_called()
+        assert request.py_num_compressed_tokens == 0
+        assert state["evicted_tokens"] == 0
+        cache.resize.assert_not_called()
+
+        # A prepared entry that violates the keep contract fails loudly in the
+        # bookkeeping loop instead of publishing an identity compaction.
         with _mocked_eviction_internals(manager):
-            assert manager._evict_requests([(request, 7)], 2) == []
+            with pytest.raises(RuntimeError, match="identity compaction"):
+                manager._evict_requests(
+                    [
+                        _prepared_eviction(
+                            request,
+                            request_id=7,
+                            seq_len=6,
+                            expected_keep_count=6,
+                            prompt_len=2,
+                        )
+                    ],
+                    2,
+                )
         assert request.py_num_compressed_tokens == 0
 
 
@@ -317,6 +344,7 @@ class TestEvictionLifecycle:
             pp_layers=[0, 1],
             _stream=mock.Mock(),
             num_extra_kv_tokens=0,
+            _kv_reserve_draft_tokens=0,
         )
         mgr._L = 2
         mgr._request_states = {}
@@ -374,6 +402,9 @@ class TestEvictionLifecycle:
         cache = mgr.kv_cache_manager.kv_cache_map[7]
         cache.capacity = confirmed + tail
         mgr.kv_cache_manager.num_extra_kv_tokens = reserve
+        # The configured tail capacity (reserve + draft reserve + 1) must
+        # cover this round's actual tail, as in production.
+        mgr.kv_cache_manager._kv_reserve_draft_tokens = current_growth
         mgr._prepared_generation_batch = (
             SimpleNamespace(generation_requests=[request]),
             {7: current_growth},
@@ -391,10 +422,21 @@ class TestEvictionLifecycle:
         with mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict:
             mgr._periodic_evict(batch)
 
+        # The resolved per-request metadata is threaded in as-is: the tail is
+        # excluded from seq_len and the keep target is prompt + budget.
         evict.assert_called_once_with(
-            [(request, 7)],
+            [
+                {
+                    "request": request,
+                    "request_id": 7,
+                    "seq_len": confirmed,
+                    "round_start": confirmed,
+                    "prompt_len": 1024,
+                    "expected_keep_count": retained,
+                    "protected_tail": tail,
+                }
+            ],
             2,
-            protected_tail_lengths={7: tail},
         )
         assert mgr._request_states[7]["confirmed_kv_length"] == retained
         cache.resize.assert_called_once_with(retained + tail, None)
@@ -675,9 +717,25 @@ class TestFixedScoreMetadata:
 
         with _mocked_eviction_internals(manager) as internals:
             manager._evict_requests(
-                [(first, 7), (second, 8)],
+                [
+                    _prepared_eviction(
+                        first,
+                        request_id=7,
+                        seq_len=8,
+                        prompt_len=3,
+                        expected_keep_count=7,
+                        protected_tail=2,
+                    ),
+                    _prepared_eviction(
+                        second,
+                        request_id=8,
+                        seq_len=10,
+                        prompt_len=5,
+                        expected_keep_count=9,
+                        protected_tail=3,
+                    ),
+                ],
                 2,
-                protected_tail_lengths={7: 2, 8: 3},
             )
 
         # One batched staging call carries the whole cohort: request ids,

@@ -1149,58 +1149,82 @@ class TriAttention(BaseKVCacheCompressionManager):
         if not resolved_requests:
             return
         protected_tails: Dict[int, int] = {}
-        due_requests = []
+        prepared: List[Dict[str, object]] = []
+        protected_tail_capacity = self._configured_protected_tail_capacity()
 
-        # Resolve every active target cache before changing cadence state. The
-        # captured cache objects also avoid repeating the V2 map lookup here.
-        for request, request_id, kv_cache in resolved_requests:
-            raw_capacity = int(kv_cache.capacity)
-            # One-engine speculative decoding keeps a fixed reserve E. Under
-            # overlap, B(n) is allocated/enqueued before finalizing B(n-1), so
-            # its exact scheduler growth Q is also opaque. Both spans are
-            # contiguous after the stable target prefix and move byte-for-byte.
-            protected_tail = int(mgr.num_extra_kv_tokens) + self._inflight_generation_growth(
-                scheduled_batch, request_id
-            )
-            seq_len = raw_capacity - protected_tail
-            if seq_len < 0 or protected_tail < 0:
-                raise RuntimeError(
-                    f"Request {request_id} has an inconsistent protected target tail: "
-                    f"confirmed={seq_len}, capacity={raw_capacity}, "
-                    f"protected_tail={protected_tail}"
+        # Resolve every active target cache before changing cadence state (the
+        # captured cache objects also avoid repeating the V2 map lookup here),
+        # building the due cohort's per-request eviction metadata in the same
+        # pass -- ``_evict_requests`` trusts it as-is.
+        with nvtx_range("triattention.metadata", color="cyan"):
+            for request, request_id, kv_cache in resolved_requests:
+                raw_capacity = int(kv_cache.capacity)
+                # One-engine speculative decoding keeps a fixed reserve E.
+                # Under overlap, B(n) is allocated/enqueued before finalizing
+                # B(n-1), so its exact scheduler growth Q is also opaque. Both
+                # spans are contiguous after the stable target prefix and move
+                # byte-for-byte.
+                protected_tail = int(mgr.num_extra_kv_tokens) + self._inflight_generation_growth(
+                    scheduled_batch, request_id
                 )
-            if seq_len < kv_cache.history_length:
-                raise RuntimeError(
-                    f"Request {request_id} KV length {seq_len} is below finalized "
-                    f"history {kv_cache.history_length}"
-                )
-            request_state = self._request_states[request_id]
-            request_state["confirmed_kv_length"] = seq_len
-            previous_step = request_state["generation_steps"]
-            confirmed_delta = 1 + int(request.py_num_accepted_draft_tokens)
-            step = previous_step + confirmed_delta
-            request_state["generation_steps"] = step
-            if previous_step // self.beta >= step // self.beta:
-                continue
-            if seq_len <= self._minimum_evictable_length(request, seq_len):
-                continue
-            if self.draft_kv_cache_manager is not None:
-                draft_kv_cache = self.draft_kv_cache_manager.kv_cache_map.get(request_id)
-                if draft_kv_cache is None or not draft_kv_cache.is_active:
+                seq_len = raw_capacity - protected_tail
+                if seq_len < 0 or protected_tail < 0:
                     raise RuntimeError(
-                        "TriAttention cannot co-compress a missing or "
-                        f"suspended draft KV cache; request {request_id} must "
-                        "be resumed before the final update hook"
+                        f"Request {request_id} has an inconsistent protected target tail: "
+                        f"confirmed={seq_len}, capacity={raw_capacity}, "
+                        f"protected_tail={protected_tail}"
                     )
-            protected_tails[request_id] = protected_tail
-            due_requests.append((request, request_id))
+                if protected_tail > protected_tail_capacity:
+                    raise RuntimeError(
+                        f"Request {request_id} protected tail {protected_tail} exceeds "
+                        f"configured capacity {protected_tail_capacity}"
+                    )
+                if seq_len < kv_cache.history_length:
+                    raise RuntimeError(
+                        f"Request {request_id} KV length {seq_len} is below finalized "
+                        f"history {kv_cache.history_length}"
+                    )
+                request_state = self._request_states[request_id]
+                request_state["confirmed_kv_length"] = seq_len
+                previous_step = request_state["generation_steps"]
+                confirmed_delta = 1 + int(request.py_num_accepted_draft_tokens)
+                step = previous_step + confirmed_delta
+                request_state["generation_steps"] = step
+                if previous_step // self.beta >= step // self.beta:
+                    continue
+                expected_keep_count = self._minimum_evictable_length(request, seq_len)
+                if seq_len <= expected_keep_count:
+                    continue
+                if self.draft_kv_cache_manager is not None:
+                    draft_kv_cache = self.draft_kv_cache_manager.kv_cache_map.get(request_id)
+                    if draft_kv_cache is None or not draft_kv_cache.is_active:
+                        raise RuntimeError(
+                            "TriAttention cannot co-compress a missing or "
+                            f"suspended draft KV cache; request {request_id} must "
+                            "be resumed before the final update hook"
+                        )
+                protected_tails[request_id] = protected_tail
+                prepared.append(
+                    {
+                        "request": request,
+                        "request_id": request_id,
+                        "seq_len": int(seq_len),
+                        # Restore the uncompressed confirmed logical position
+                        # from the physical prefix and cumulative eviction
+                        # count.
+                        "round_start": int(seq_len + request_state["evicted_tokens"]),
+                        "prompt_len": min(int(request.py_prompt_len), int(seq_len)),
+                        "expected_keep_count": expected_keep_count,
+                        "protected_tail": protected_tail,
+                    }
+                )
 
         # Compact all affected dense and kernel-masked SWA layers, then release
         # the unreachable tail directly through V2's public resize primitive.
         # Prompt lengths and tails are per-request metadata, so the whole due
         # cohort runs as one batched round (the workspace holds max_batch_size
         # requests, which bounds any generation batch).
-        if not due_requests:
+        if not prepared:
             return
         num_layers = self._num_layers_from_manager()
         # Ungated NVTX with the due count in the message, so any nsys capture
@@ -1208,14 +1232,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         # outside CUDA-graph capture, so the dynamic message is safe; the cost
         # is one host-side f-string per eviction round.
         with nvtx_range(
-            f"triattention.evict_request_group reqs={len(due_requests)}",
+            f"triattention.evict_request_group reqs={len(prepared)}",
             color="purple",
         ):
-            capacity_targets = self._evict_requests(
-                due_requests,
-                num_layers,
-                protected_tail_lengths=protected_tails,
-            )
+            capacity_targets = self._evict_requests(prepared, num_layers)
         self._resize_compacted_requests(capacity_targets, protected_tails)
 
     def _resize_compacted_requests(self, capacity_targets, protected_tails) -> None:
@@ -1820,55 +1840,19 @@ class TriAttention(BaseKVCacheCompressionManager):
 
     def _evict_requests(
         self,
-        evict_reqs,
+        prepared: List[Dict[str, object]],
         num_layers: int,
-        protected_tail_lengths: Optional[Dict[int, int]] = None,
     ) -> List[Tuple[int, int]]:
-        """Score and compact requests, returning ``(request_id, capacity)`` targets.
+        """Score and compact a prepared cohort, returning ``(request_id, capacity)`` targets.
 
-        Only full-attention layers participate in scoring. For kernel-masked SWA
+        ``prepared`` carries the per-request eviction metadata resolved by
+        ``_periodic_evict`` (every entry is due and evictable). Only
+        full-attention layers participate in scoring. For kernel-masked SWA
         layers, the latest model window is rebased to the tail of the common
         compacted prefix before the request-wide capacity is reduced.
         """
-        if protected_tail_lengths is None:
-            protected_tail_lengths = {}
-        protected_tail_capacity = self._configured_protected_tail_capacity()
         with nvtx_range_debug("triattention.resolve_layout", color="blue"):
             layout = self._runtime_kv_layout(num_layers)
-
-        # Resolve request length and page metadata before mutating any layer.
-        prepared: List[Dict[str, object]] = []
-        with nvtx_range("triattention.metadata", color="cyan"):
-            for request, rid in evict_reqs:
-                request_state = self._request_states.get(rid)
-                seq_len = None if request_state is None else request_state["confirmed_kv_length"]
-                if seq_len is None:
-                    raise RuntimeError(f"Missing confirmed KV length for request {rid}")
-                # Restore the uncompressed confirmed logical position from the
-                # physical prefix and cumulative eviction count.
-                round_start = seq_len + request_state["evicted_tokens"]
-                minimum_evictable_length = self._minimum_evictable_length(request, seq_len)
-                if seq_len <= minimum_evictable_length:
-                    continue
-                protected_tail = int(protected_tail_lengths.get(rid, 0))
-                if protected_tail < 0 or protected_tail > protected_tail_capacity:
-                    raise RuntimeError(
-                        f"Request {rid} protected tail {protected_tail} exceeds "
-                        f"configured capacity {protected_tail_capacity}"
-                    )
-                prepared.append(
-                    {
-                        "request": request,
-                        "request_id": rid,
-                        "seq_len": int(seq_len),
-                        "round_start": int(round_start),
-                        "prompt_len": min(int(request.py_prompt_len), int(seq_len)),
-                        "expected_keep_count": minimum_evictable_length,
-                        "protected_tail": protected_tail,
-                    }
-                )
-        if not prepared:
-            return []
         with nvtx_range_debug("triattention.staging_lookup", color="blue"):
             ws = self._workspace_for(layout, prepared)
             if layout["swa_layers"] and layout["swa_window"]:
