@@ -105,6 +105,27 @@ This selects `eval_extra_llm_options_sa.yaml` and the SA-required
 change). Scores should match the non-SA run within noise — SA speculative
 decoding is lossless.
 
+For a serving throughput benchmark (synthetic 8K-input/1K-output requests at
+concurrency 64 and 256), submit:
+
+```bash
+sbatch examples/kimi_k3/run_serving_benchmark_kimi_k3.sbatch \
+    --model /path/to/kimi-k3-checkpoint \
+    --image /path/to/tensorrt-llm-container.sqsh
+```
+
+Optional arguments `--isl`, `--osl`, and `--concurrencies` override the
+workload shape. Note: at the benchmark's max_seq_len of 9344 (8K + 1K), this
+currently requires the unmerged KDA prefill varlen tile-overrun guard
+(branch `tali/k3-kda-prefill-oob-fix`, commit `0f0fface8c`); on unpatched
+`c77636a022` the server wedges during TRTLLM-Gen FMHA warmup.
+
+Results (one JSON per concurrency) are written to
+`kimi-k3-serving-benchmark-<job-id>/` in the submission directory. Reference
+numbers, measured 2026-07-23 at commit `c77636a022` plus that guard on 2+2
+cross-rack GB300 nodes: concurrency 64 — 587 output tok/s, mean TPOT
+101.4 ms; concurrency 256 — 1735 output tok/s, mean TPOT 136.8 ms.
+
 Scheduler options must precede the script path; model and image arguments
 follow it. The scripts default to the `batch` partition and the
 `coreai_comparch_trtllm` account. Change the corresponding `#SBATCH` settings
