@@ -466,6 +466,18 @@ AgentConnectionManager::AgentConnectionManager(
 AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
     batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag)
 {
+    return recvConnectionAndRequestInfoImpl(requestInfo, terminateFlag, true);
+}
+
+AgentConnection const* AgentConnectionManager::tryRecvConnectionAndRequestInfo(
+    batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag)
+{
+    return recvConnectionAndRequestInfoImpl(requestInfo, terminateFlag, false);
+}
+
+AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfoImpl(
+    batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag, bool waitForRequest)
+{
     while (!terminateFlag.load())
     {
         if (!mIsRunning)
@@ -629,6 +641,10 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
             {
                 it++;
             }
+        }
+        if (!waitForRequest)
+        {
+            return nullptr;
         }
     }
     return nullptr;

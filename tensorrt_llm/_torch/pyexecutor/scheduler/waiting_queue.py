@@ -73,8 +73,8 @@ class WaitingQueue(ABC):
         pass
 
     @abstractmethod
-    def remove_by_ids(self, request_ids: set[int]) -> None:
-        """Remove requests with the given IDs."""
+    def remove_by_ids(self, request_ids: set[int]) -> list[RequestQueueItem]:
+        """Remove and return requests with the given IDs."""
         pass
 
     @abstractmethod
@@ -139,11 +139,13 @@ class FCFSWaitingQueue(deque, WaitingQueue):
         """
         self.extendleft(reversed(list(requests)))
 
-    def remove_by_ids(self, request_ids: set[int]) -> None:
-        """Remove requests with the given IDs."""
+    def remove_by_ids(self, request_ids: set[int]) -> list[RequestQueueItem]:
+        """Remove and return requests with the given IDs."""
+        removed_requests = [req for req in self if req.id in request_ids]
         filtered_requests = [req for req in self if req.id not in request_ids]
         self.clear()
         self.extend(filtered_requests)
+        return removed_requests
 
     def __bool__(self) -> bool:
         """Check if queue has any requests."""
@@ -243,10 +245,12 @@ class PriorityWaitingQueue(WaitingQueue):
         for request in reversed(list(requests)):
             self._push_front(request)
 
-    def remove_by_ids(self, request_ids: set[int]) -> None:
-        """Remove requests with the given IDs."""
+    def remove_by_ids(self, request_ids: set[int]) -> list[RequestQueueItem]:
+        """Remove and return requests with the given IDs."""
+        removed_requests = [entry[2] for entry in self._heap if entry[2].id in request_ids]
         self._heap = [e for e in self._heap if e[2].id not in request_ids]
         heapq.heapify(self._heap)
+        return removed_requests
 
     def __bool__(self) -> bool:
         return len(self._heap) > 0

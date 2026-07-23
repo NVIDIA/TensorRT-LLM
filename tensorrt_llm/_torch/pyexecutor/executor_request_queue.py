@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import datetime
 import queue
@@ -153,17 +156,24 @@ class ExecutorRequestQueue:
 
     def get_from_request_queue(
             self,
-            timeout: Optional[datetime.timedelta]) -> List[RequestQueueItem]:
+            timeout: Optional[datetime.timedelta],
+            *,
+            cap_batch_wait_to_timeout: bool = False) -> List[RequestQueueItem]:
         """Fetch requests from the queue with optional timeout.
 
         Args:
             timeout: Optional timeout for waiting on queue.
+            cap_batch_wait_to_timeout: Include the batching wait in ``timeout``
+                instead of adding it after the initial wait.
 
         Returns:
             List of RequestQueueItem fetched from the queue.
         """
         items = []
         timeout_secs = timeout.total_seconds() if timeout is not None else None
+        total_deadline = None
+        if cap_batch_wait_to_timeout and timeout_secs is not None:
+            total_deadline = time.monotonic() + timeout_secs
 
         try:
             if self.request_queue.empty() and (timeout_secs is None
@@ -185,6 +195,8 @@ class ExecutorRequestQueue:
             return items
 
         deadline = time.monotonic() + self.batch_wait_timeout_ms / 1000.0
+        if total_deadline is not None:
+            deadline = min(deadline, total_deadline)
         while len(items) < self.max_batch_size:
             remaining_timeout = deadline - time.monotonic()
 

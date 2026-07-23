@@ -43,17 +43,23 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <random>
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
+#include <thread>
 
 #include "gtest/gtest.h"
 #include <gmock/gmock.h>
@@ -67,6 +73,23 @@ namespace texec = tensorrt_llm::executor;
 
 using testing::Return;
 using testing::ReturnRef;
+
+namespace tensorrt_llm::testing
+{
+
+class CacheSenderTestAccess
+{
+public:
+    static std::unique_ptr<batch_manager::CacheSender> make(executor::kv_cache::ConnectionManager* manager,
+        runtime::SizeType32 selfIndex, batch_manager::CacheTransferLayer cacheLayer,
+        std::size_t maxPendingPreHandshakeCancellations, std::chrono::milliseconds preHandshakeCancellationRetention)
+    {
+        return std::unique_ptr<batch_manager::CacheSender>(new batch_manager::CacheSender(manager, selfIndex,
+            std::move(cacheLayer), maxPendingPreHandshakeCancellations, preHandshakeCancellationRetention));
+    }
+};
+
+} // namespace tensorrt_llm::testing
 
 // ---------------------------------------
 //            RequestInfoTest
@@ -87,6 +110,203 @@ T serializeDeserialize(T const& val)
     std::istringstream iss(oss.str());
     return T::deserialize(iss);
 }
+
+class ControlledConnection final : public texec::kv_cache::Connection
+{
+public:
+    void setSerializedRequestInfo(std::string serializedRequestInfo)
+    {
+        std::scoped_lock lock(mMutex);
+        mSerializedRequestInfo = std::move(serializedRequestInfo);
+    }
+
+    void send(texec::kv_cache::DataContext const& ctx, void const* data, size_t size) const override
+    {
+        if (ctx.getTag() != TransceiverTag::kREADY_SIGNAL_TAG)
+        {
+            return;
+        }
+
+        TLLM_CHECK(size == sizeof(bool));
+        bool isReady{false};
+        std::memcpy(&isReady, data, sizeof(isReady));
+
+        std::unique_lock lock(mMutex);
+        mReadySignal = isReady;
+        mReadySignalObserved = true;
+        mReadySignalsSent.push_back(isReady);
+        mConditionVariable.notify_all();
+        mConditionVariable.wait(lock, [this] { return mReleaseReadySignal; });
+    }
+
+    void recv(texec::kv_cache::DataContext const& ctx, void* data, size_t size) const override
+    {
+        std::unique_lock lock(mMutex);
+        if (ctx.getTag() == TransceiverTag::kREADY_SIGNAL_TAG)
+        {
+            TLLM_CHECK(size == sizeof(bool));
+            ++mReadySignalReceiveCalls;
+            mConditionVariable.notify_all();
+            while (mReadySignalsToReceive.empty() && !ctx.getTransferTerminate().load(std::memory_order_relaxed))
+            {
+                mConditionVariable.wait_for(lock, std::chrono::milliseconds{1});
+            }
+            if (ctx.getTransferTerminate().load(std::memory_order_relaxed))
+            {
+                bool const isReady = false;
+                std::memcpy(data, &isReady, sizeof(isReady));
+                return;
+            }
+            bool const isReady = mReadySignalsToReceive.front();
+            mReadySignalsToReceive.pop_front();
+            std::memcpy(data, &isReady, sizeof(isReady));
+            return;
+        }
+        if (ctx.getTag() == TransceiverTag::kINFO_SIZE_TAG)
+        {
+            auto const infoSize = static_cast<std::uint64_t>(mSerializedRequestInfo.size());
+            TLLM_CHECK(size == sizeof(infoSize));
+            std::memcpy(data, &infoSize, sizeof(infoSize));
+            return;
+        }
+        TLLM_CHECK(ctx.getTag() == TransceiverTag::kINFO_TAG);
+        TLLM_CHECK(size == mSerializedRequestInfo.size());
+        std::memcpy(data, mSerializedRequestInfo.data(), size);
+    }
+
+    bool waitForReadySignal(std::chrono::milliseconds timeout) const
+    {
+        std::unique_lock lock(mMutex);
+        return mConditionVariable.wait_for(lock, timeout, [this] { return mReadySignalObserved; });
+    }
+
+    bool getReadySignal() const
+    {
+        std::scoped_lock lock(mMutex);
+        TLLM_CHECK(mReadySignalObserved);
+        return mReadySignal;
+    }
+
+    bool waitForReadySignalCount(std::size_t count, std::chrono::milliseconds timeout) const
+    {
+        std::unique_lock lock(mMutex);
+        return mConditionVariable.wait_for(lock, timeout, [this, count] { return mReadySignalsSent.size() >= count; });
+    }
+
+    std::deque<bool> getReadySignals() const
+    {
+        std::scoped_lock lock(mMutex);
+        return mReadySignalsSent;
+    }
+
+    void releaseReadySignal()
+    {
+        {
+            std::scoped_lock lock(mMutex);
+            mReleaseReadySignal = true;
+        }
+        mConditionVariable.notify_all();
+    }
+
+    bool waitForReadySignalReceiveCalls(std::size_t count, std::chrono::milliseconds timeout) const
+    {
+        std::unique_lock lock(mMutex);
+        return mConditionVariable.wait_for(lock, timeout, [this, count] { return mReadySignalReceiveCalls >= count; });
+    }
+
+    void provideReadySignalToReceive(bool isReady)
+    {
+        {
+            std::scoped_lock lock(mMutex);
+            mReadySignalsToReceive.push_back(isReady);
+        }
+        mConditionVariable.notify_all();
+    }
+
+private:
+    mutable std::mutex mMutex;
+    mutable std::condition_variable mConditionVariable;
+    mutable std::string mSerializedRequestInfo;
+    mutable bool mReadySignalObserved{false};
+    mutable bool mReadySignal{false};
+    mutable bool mReleaseReadySignal{false};
+    mutable std::deque<bool> mReadySignalsSent;
+    mutable std::size_t mReadySignalReceiveCalls{0};
+    mutable std::deque<bool> mReadySignalsToReceive;
+};
+
+class ControlledConnectionManager final : public texec::kv_cache::ConnectionManager
+{
+public:
+    void publishRequestInfo(RequestInfo const& requestInfo)
+    {
+        std::ostringstream stream;
+        RequestInfo::serialize(requestInfo, stream);
+        mConnection.setSerializedRequestInfo(stream.str());
+        {
+            std::scoped_lock lock(mMutex);
+            mRequestInfoAvailable = true;
+        }
+        mConditionVariable.notify_all();
+    }
+
+    texec::kv_cache::Connection const* recvConnect(
+        texec::kv_cache::DataContext const& ctx, void* data, size_t size) override
+    {
+        std::unique_lock lock(mMutex);
+        ++mRecvConnectCalls;
+        mConditionVariable.notify_all();
+        while (!mRequestInfoAvailable && !ctx.getTransferTerminate().load(std::memory_order_relaxed))
+        {
+            mConditionVariable.wait_for(lock, std::chrono::milliseconds{1});
+        }
+        if (ctx.getTransferTerminate().load(std::memory_order_relaxed))
+        {
+            return nullptr;
+        }
+
+        TLLM_CHECK(ctx.getTag() == TransceiverTag::kID_TAG);
+        TLLM_CHECK(size == sizeof(TransceiverTag::Id));
+        auto const id = TransceiverTag::Id::REQUEST_SEND;
+        std::memcpy(data, &id, sizeof(id));
+        mRequestInfoAvailable = false;
+        return &mConnection;
+    }
+
+    std::vector<texec::kv_cache::Connection const*> getConnections(texec::kv_cache::CommState const&) override
+    {
+        return {&mConnection};
+    }
+
+    texec::kv_cache::CommState const& getCommState() const override
+    {
+        return mCommState;
+    }
+
+    bool isRunning() const override
+    {
+        return true;
+    }
+
+    ControlledConnection& getConnection()
+    {
+        return mConnection;
+    }
+
+    bool waitForRecvConnectCalls(std::size_t count, std::chrono::milliseconds timeout)
+    {
+        std::unique_lock lock(mMutex);
+        return mConditionVariable.wait_for(lock, timeout, [this, count] { return mRecvConnectCalls >= count; });
+    }
+
+private:
+    ControlledConnection mConnection;
+    texec::kv_cache::CommState mCommState{std::vector<SizeType32>{0}, 0};
+    std::mutex mMutex;
+    std::condition_variable mConditionVariable;
+    bool mRequestInfoAvailable{false};
+    std::size_t mRecvConnectCalls{0};
+};
 
 } // namespace
 
@@ -330,12 +550,23 @@ protected:
         return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
     }
 
-    void addRequestAndTransportCache(std::shared_ptr<LlmRequest> const& llmRequest)
+    void addRequestToCache(std::shared_ptr<LlmRequest> const& llmRequest)
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         mManager->addSequenceBatch(
             {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
+    }
+
+    void removeRequestFromCache(std::shared_ptr<LlmRequest> const& llmRequest)
+    {
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+        mManager->removeSequence(llmRequest->mRequestId, llmRequest);
+    }
+
+    void addRequestAndTransportCache(std::shared_ptr<LlmRequest> const& llmRequest)
+    {
+        addRequestToCache(llmRequest);
         if (isSender)
         {
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -370,6 +601,44 @@ protected:
                 }
             }
         }
+    }
+
+    std::unique_ptr<CacheSender> makeControlledSender(ControlledConnectionManager& connectionManager)
+    {
+        constexpr int maxNumTokens{1024};
+        mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
+        std::vector<CacheTransBufferManager*> bufferManagers{mCacheTransBufferManager.get()};
+        return std::make_unique<CacheSender>(&connectionManager, 0,
+            CacheTransferLayer(*mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)));
+    }
+
+    std::unique_ptr<CacheSender> makeControlledSender(ControlledConnectionManager& connectionManager,
+        std::size_t maxPendingPreHandshakeCancellations, std::chrono::milliseconds preHandshakeCancellationRetention)
+    {
+        constexpr int maxNumTokens{1024};
+        mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
+        std::vector<CacheTransBufferManager*> bufferManagers{mCacheTransBufferManager.get()};
+        return tensorrt_llm::testing::CacheSenderTestAccess::make(&connectionManager, 0,
+            CacheTransferLayer(*mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)),
+            maxPendingPreHandshakeCancellations, preHandshakeCancellationRetention);
+    }
+
+    std::unique_ptr<CacheReceiver> makeControlledReceiver(ControlledConnectionManager& connectionManager)
+    {
+        constexpr int maxNumTokens{1024};
+        mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
+        std::vector<CacheTransBufferManager*> bufferManagers{mCacheTransBufferManager.get()};
+        return std::make_unique<CacheReceiver>(&connectionManager, 0,
+            CacheTransferLayer(*mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)));
+    }
+
+    RequestInfo makeControlledRequestInfo(
+        LlmRequest::RequestIdType requestId, ControlledConnectionManager const& connectionManager) const
+    {
+        texec::DataTransceiverState state;
+        state.setCommState(connectionManager.getCommState());
+        state.setCacheState(*mCacheState);
+        return RequestInfo{requestId, std::move(state)};
     }
 
     bool isSender{false};
@@ -425,6 +694,401 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     {
         future.get();
     }
+}
+
+TEST_F(SymmetricalCacheTest, DefaultOffDoesNotCancelCurrentSender)
+{
+    if (tensorrt_llm::common::getEnvDisaggEnableInflightCancel())
+    {
+        GTEST_SKIP() << "This test validates the default-off cancellation path.";
+    }
+    auto const worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+
+    ControlledConnectionManager connectionManager;
+    auto sender = makeControlledSender(connectionManager);
+    std::shared_ptr<LlmRequest> request{makeLlmRequest(10)};
+    addRequestToCache(request);
+    auto const requestInfo = makeControlledRequestInfo(request->mRequestId, connectionManager);
+
+    auto future = sender->sendAsync(request);
+    connectionManager.publishRequestInfo(requestInfo);
+    auto const readySignalObserved = connectionManager.getConnection().waitForReadySignal(std::chrono::seconds{10});
+    auto const readySignal = readySignalObserved && connectionManager.getConnection().getReadySignal();
+    auto const cancellationAccepted = sender->cancelRequest(*request);
+    connectionManager.getConnection().releaseReadySignal();
+
+    EXPECT_TRUE(readySignalObserved);
+    EXPECT_TRUE(readySignal);
+    EXPECT_FALSE(cancellationAccepted);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_NO_THROW(future.get());
+    removeRequestFromCache(request);
+}
+
+TEST_F(SymmetricalCacheTest, DefaultOffCancelsOnlyQueuedSenderAcrossRanks)
+{
+    if (tensorrt_llm::common::getEnvDisaggEnableInflightCancel())
+    {
+        GTEST_SKIP() << "This test validates the default-off cancellation path.";
+    }
+    auto const worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+
+    ControlledConnectionManager connectionManager;
+    auto sender = makeControlledSender(connectionManager);
+    std::shared_ptr<LlmRequest> request{makeLlmRequest(11)};
+    addRequestToCache(request);
+    auto const requestInfo = makeControlledRequestInfo(request->mRequestId, connectionManager);
+    auto future = sender->sendAsync(request);
+    auto const worldRank = mComm->getRank();
+
+    bool readySignalObserved = false;
+    if (worldRank == 0)
+    {
+        connectionManager.publishRequestInfo(requestInfo);
+        readySignalObserved = connectionManager.getConnection().waitForReadySignal(std::chrono::seconds{10});
+    }
+    mComm->barrier();
+
+    auto const cancellationAccepted = sender->cancelRequest(*request);
+    int const localAccepted = cancellationAccepted ? 1 : 0;
+    std::vector<int> allAccepted(worldSize, 0);
+    mComm->allgather(&localAccepted, allAccepted.data(), 1, tensorrt_llm::mpi::MpiType::kINT32);
+    auto const repeatedCancellationAccepted = sender->cancelRequest(*request);
+    int const localRepeatedAccepted = repeatedCancellationAccepted ? 1 : 0;
+    std::vector<int> allRepeatedAccepted(worldSize, 0);
+    mComm->allgather(&localRepeatedAccepted, allRepeatedAccepted.data(), 1, tensorrt_llm::mpi::MpiType::kINT32);
+
+    bool futureReadyBeforeLatePeer = false;
+    if (worldRank == 1)
+    {
+        futureReadyBeforeLatePeer = future.wait_for(std::chrono::seconds{1}) == std::future_status::ready;
+    }
+
+    bool lateReadySignalObserved = false;
+    bool lateReadySignal = true;
+    if (worldRank == 0)
+    {
+        connectionManager.getConnection().releaseReadySignal();
+    }
+    else
+    {
+        connectionManager.publishRequestInfo(requestInfo);
+        lateReadySignalObserved = connectionManager.getConnection().waitForReadySignal(std::chrono::seconds{10});
+        lateReadySignal = lateReadySignalObserved && connectionManager.getConnection().getReadySignal();
+        connectionManager.getConnection().releaseReadySignal();
+    }
+
+    EXPECT_EQ(allAccepted, (std::vector<int>{0, 1}));
+    EXPECT_EQ(allRepeatedAccepted, (std::vector<int>{0, 1}));
+    if (worldRank == 0)
+    {
+        EXPECT_TRUE(readySignalObserved);
+        EXPECT_FALSE(cancellationAccepted);
+    }
+    else
+    {
+        EXPECT_TRUE(futureReadyBeforeLatePeer);
+        EXPECT_TRUE(lateReadySignalObserved);
+        EXPECT_FALSE(lateReadySignal);
+        EXPECT_TRUE(cancellationAccepted);
+    }
+    ASSERT_EQ(future.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    if (worldRank == 0)
+    {
+        EXPECT_NO_THROW(future.get());
+    }
+    else
+    {
+        EXPECT_THROW(future.get(), std::exception);
+    }
+    removeRequestFromCache(request);
+}
+
+TEST_F(SymmetricalCacheTest, DefaultOffNoPeerCancellationTombstonesAreReclaimedAtCapacity)
+{
+    if (tensorrt_llm::common::getEnvDisaggEnableInflightCancel())
+    {
+        GTEST_SKIP() << "This test validates the default-off cancellation path.";
+    }
+    auto const worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+
+    ControlledConnectionManager connectionManager;
+    constexpr std::size_t maxPendingPreHandshakeCancellations{1};
+    constexpr auto preHandshakeCancellationRetention = std::chrono::seconds{2};
+    auto sender = makeControlledSender(
+        connectionManager, maxPendingPreHandshakeCancellations, preHandshakeCancellationRetention);
+    std::shared_ptr<LlmRequest> firstRequest{makeLlmRequest(10)};
+    std::shared_ptr<LlmRequest> secondRequest{makeLlmRequest(11)};
+
+    auto firstFuture = sender->sendAsync(firstRequest);
+    EXPECT_TRUE(connectionManager.waitForRecvConnectCalls(1, std::chrono::seconds{10}));
+    EXPECT_TRUE(sender->cancelRequest(*firstRequest));
+    EXPECT_TRUE(sender->cancelRequest(*firstRequest));
+    ASSERT_EQ(firstFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_THROW(firstFuture.get(), std::exception);
+
+    auto secondFuture = sender->sendAsync(secondRequest);
+    EXPECT_FALSE(sender->cancelRequest(*secondRequest));
+    EXPECT_EQ(secondFuture.wait_for(std::chrono::milliseconds{0}), std::future_status::timeout);
+
+    std::this_thread::sleep_for(preHandshakeCancellationRetention);
+    bool secondCancellationAccepted = false;
+    auto const retryDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (!secondCancellationAccepted && std::chrono::steady_clock::now() < retryDeadline)
+    {
+        secondCancellationAccepted = sender->cancelRequest(*secondRequest);
+        if (!secondCancellationAccepted)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        }
+    }
+    ASSERT_TRUE(secondCancellationAccepted);
+    ASSERT_EQ(secondFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_THROW(secondFuture.get(), std::exception);
+    EXPECT_FALSE(sender->cancelRequest(*firstRequest));
+
+    connectionManager.getConnection().releaseReadySignal();
+    connectionManager.publishRequestInfo(makeControlledRequestInfo(firstRequest->mRequestId, connectionManager));
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(1, std::chrono::seconds{10}));
+    EXPECT_EQ(connectionManager.getConnection().getReadySignals(), (std::deque<bool>{false}));
+}
+
+TEST_F(SymmetricalCacheTest, DefaultOffPreHandshakeCancellationRejectsEachLatePeer)
+{
+    if (tensorrt_llm::common::getEnvDisaggEnableInflightCancel())
+    {
+        GTEST_SKIP() << "This test validates the default-off cancellation path.";
+    }
+    auto const worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+
+    ControlledConnectionManager connectionManager;
+    connectionManager.getConnection().releaseReadySignal();
+    constexpr std::size_t maxPendingPreHandshakeCancellations{1};
+    constexpr auto preHandshakeCancellationRetention = std::chrono::milliseconds{200};
+    auto sender = makeControlledSender(
+        connectionManager, maxPendingPreHandshakeCancellations, preHandshakeCancellationRetention);
+    std::shared_ptr<LlmRequest> cancelledRequest{makeLlmRequest(12)};
+
+    constexpr SizeType32 numLayers{4};
+    constexpr SizeType32 numKvHeadsPerRank{1};
+    constexpr SizeType32 sizePerHead{64};
+    constexpr SizeType32 tokensPerBlock{8};
+    constexpr SizeType32 peerTensorParallelism{2};
+    texec::kv_cache::CacheState peerCacheState{numLayers, numKvHeadsPerRank, sizePerHead, tokensPerBlock,
+        peerTensorParallelism, /*pipelineParallelism=*/1, /*contextParallelism=*/1, std::vector<SizeType32>{numLayers},
+        tensorrt_llm::DataType::kFLOAT};
+    auto makePeerRequestInfo = [&](SizeType32 selfIdx)
+    {
+        texec::DataTransceiverState peerState;
+        peerState.setCommState(texec::kv_cache::CommState{std::vector<SizeType32>{0, 1}, selfIdx});
+        peerState.setCacheState(peerCacheState);
+        return RequestInfo{cancelledRequest->mRequestId, std::move(peerState)};
+    };
+
+    auto cancelledFuture = sender->sendAsync(cancelledRequest);
+    EXPECT_TRUE(connectionManager.waitForRecvConnectCalls(1, std::chrono::seconds{10}));
+    EXPECT_TRUE(sender->cancelRequest(*cancelledRequest));
+    ASSERT_EQ(cancelledFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_THROW(cancelledFuture.get(), std::exception);
+
+    // Reclaim the expired marker under cap pressure while installing a
+    // replacement marker atomically. The transition must not stop the
+    // non-Agent receive loop between late TP peers for the finalized request.
+    std::this_thread::sleep_for(preHandshakeCancellationRetention * 2);
+    std::shared_ptr<LlmRequest> replacementRequest{makeLlmRequest(13)};
+    auto replacementFuture = sender->sendAsync(replacementRequest);
+    EXPECT_TRUE(sender->cancelRequest(*replacementRequest));
+    ASSERT_EQ(replacementFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_THROW(replacementFuture.get(), std::exception);
+    EXPECT_FALSE(sender->cancelRequest(*cancelledRequest));
+
+    connectionManager.publishRequestInfo(makePeerRequestInfo(0));
+    EXPECT_TRUE(connectionManager.waitForRecvConnectCalls(2, std::chrono::seconds{10}));
+    bool const firstPeerRejectedBeforeSecond
+        = connectionManager.getConnection().waitForReadySignalCount(1, std::chrono::seconds{1});
+    EXPECT_TRUE(firstPeerRejectedBeforeSecond);
+    if (firstPeerRejectedBeforeSecond)
+    {
+        EXPECT_EQ(connectionManager.getConnection().getReadySignals(), (std::deque<bool>{false}));
+    }
+
+    // Always publish the second peer so a failing implementation that created
+    // a partial TP2 session can unwind instead of hanging during teardown.
+    connectionManager.publishRequestInfo(makePeerRequestInfo(1));
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(2, std::chrono::seconds{10}));
+    EXPECT_EQ(connectionManager.getConnection().getReadySignals(), (std::deque<bool>{false, false}));
+
+    std::shared_ptr<LlmRequest> liveRequest{makeLlmRequest(14)};
+    addRequestToCache(liveRequest);
+    auto liveFuture = sender->sendAsync(liveRequest);
+    connectionManager.publishRequestInfo(makeControlledRequestInfo(liveRequest->mRequestId, connectionManager));
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(3, std::chrono::seconds{10}));
+    EXPECT_EQ(connectionManager.getConnection().getReadySignals(), (std::deque<bool>{false, false, true}));
+    ASSERT_EQ(liveFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_NO_THROW(liveFuture.get());
+    removeRequestFromCache(liveRequest);
+}
+
+TEST_F(SymmetricalCacheTest, DefaultOffDoesNotCancelPartialAsymmetricHandshake)
+{
+    if (tensorrt_llm::common::getEnvDisaggEnableInflightCancel())
+    {
+        GTEST_SKIP() << "This test validates the default-off cancellation path.";
+    }
+    auto const worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+
+    ControlledConnectionManager connectionManager;
+    auto sender = makeControlledSender(connectionManager);
+    std::shared_ptr<LlmRequest> request{makeLlmRequest(12)};
+    addRequestToCache(request);
+
+    constexpr SizeType32 numLayers{4};
+    constexpr SizeType32 numKvHeadsPerRank{1};
+    constexpr SizeType32 sizePerHead{64};
+    constexpr SizeType32 tokensPerBlock{8};
+    constexpr SizeType32 peerTensorParallelism{2};
+    texec::kv_cache::CacheState peerCacheState{numLayers, numKvHeadsPerRank, sizePerHead, tokensPerBlock,
+        peerTensorParallelism, /*pipelineParallelism=*/1, /*contextParallelism=*/1, std::vector<SizeType32>{numLayers},
+        tensorrt_llm::DataType::kFLOAT};
+    auto makePeerRequestInfo = [&](SizeType32 selfIdx)
+    {
+        texec::DataTransceiverState peerState;
+        peerState.setCommState(texec::kv_cache::CommState{std::vector<SizeType32>{0, 1}, selfIdx});
+        peerState.setCacheState(peerCacheState);
+        return RequestInfo{request->mRequestId, std::move(peerState)};
+    };
+
+    auto future = sender->sendAsync(request);
+    EXPECT_TRUE(connectionManager.waitForRecvConnectCalls(1, std::chrono::seconds{10}));
+    auto const firstRequestInfo = makePeerRequestInfo(0);
+    connectionManager.publishRequestInfo(firstRequestInfo);
+
+    // Entering recvConnect a second time proves the first peer's RequestInfo
+    // created a partial TP2 session. Default-off cancellation must now drain.
+    EXPECT_TRUE(connectionManager.waitForRecvConnectCalls(2, std::chrono::seconds{10}));
+    EXPECT_FALSE(sender->cancelRequest(*request));
+    EXPECT_EQ(future.wait_for(std::chrono::milliseconds{0}), std::future_status::timeout);
+
+    auto const secondRequestInfo = makePeerRequestInfo(1);
+    connectionManager.publishRequestInfo(secondRequestInfo);
+    auto const readySignalObserved = connectionManager.getConnection().waitForReadySignal(std::chrono::seconds{10});
+    auto const readySignal = readySignalObserved && connectionManager.getConnection().getReadySignal();
+    connectionManager.getConnection().releaseReadySignal();
+
+    EXPECT_TRUE(readySignalObserved);
+    EXPECT_TRUE(readySignal);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_NO_THROW(future.get());
+    removeRequestFromCache(request);
+}
+
+TEST_F(SymmetricalCacheTest, LateTerminalRequestInfoIsRejectedWithoutBlockingNextRequest)
+{
+    auto const worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+
+    ControlledConnectionManager connectionManager;
+    connectionManager.getConnection().releaseReadySignal();
+    auto sender = makeControlledSender(connectionManager);
+    std::shared_ptr<LlmRequest> firstRequest{makeLlmRequest(17)};
+    addRequestToCache(firstRequest);
+    auto const firstRequestInfo = makeControlledRequestInfo(firstRequest->mRequestId, connectionManager);
+    auto firstFuture = sender->sendAsync(firstRequest);
+    connectionManager.publishRequestInfo(firstRequestInfo);
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(1, std::chrono::seconds{10}));
+    ASSERT_EQ(firstFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_NO_THROW(firstFuture.get());
+    removeRequestFromCache(firstRequest);
+
+    // A queued live response wakes the sender. Finalized replay peers are
+    // rejected without consuming that response or poisoning the next transfer.
+    connectionManager.publishRequestInfo(firstRequestInfo);
+    std::shared_ptr<LlmRequest> nextRequest{makeLlmRequest(18)};
+    addRequestToCache(nextRequest);
+    auto nextFuture = sender->sendAsync(nextRequest);
+
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(2, std::chrono::seconds{10}));
+    EXPECT_TRUE(connectionManager.waitForRecvConnectCalls(3, std::chrono::seconds{10}));
+    connectionManager.publishRequestInfo(firstRequestInfo);
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(3, std::chrono::seconds{10}));
+    EXPECT_TRUE(connectionManager.waitForRecvConnectCalls(4, std::chrono::seconds{10}));
+    EXPECT_EQ(connectionManager.getConnection().getReadySignals(), (std::deque<bool>{true, false, false}));
+
+    connectionManager.publishRequestInfo(makeControlledRequestInfo(nextRequest->mRequestId, connectionManager));
+
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(4, std::chrono::seconds{10}));
+    EXPECT_EQ(connectionManager.getConnection().getReadySignals(), (std::deque<bool>{true, false, false, true}));
+    ASSERT_EQ(nextFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_NO_THROW(nextFuture.get());
+    removeRequestFromCache(nextRequest);
+}
+
+TEST_F(SymmetricalCacheTest, DefaultOffReceiverDoesNotCancelQueuedRequest)
+{
+    if (tensorrt_llm::common::getEnvDisaggEnableInflightCancel())
+    {
+        GTEST_SKIP() << "This test validates the default-off cancellation path.";
+    }
+    auto const worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+
+    ControlledConnectionManager connectionManager;
+    auto receiver = makeControlledReceiver(connectionManager);
+    std::shared_ptr<LlmRequest> firstRequest{makeLlmRequest(13)};
+    std::shared_ptr<LlmRequest> queuedRequest{makeLlmRequest(14)};
+    addRequestToCache(firstRequest);
+    addRequestToCache(queuedRequest);
+
+    auto firstFuture = receiver->receiveAsync(firstRequest);
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalReceiveCalls(1, std::chrono::seconds{10}));
+    auto queuedFuture = receiver->receiveAsync(queuedRequest);
+
+    EXPECT_FALSE(receiver->cancelRequest(*queuedRequest));
+    EXPECT_EQ(queuedFuture.wait_for(std::chrono::milliseconds{0}), std::future_status::timeout);
+
+    connectionManager.getConnection().provideReadySignalToReceive(false);
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalReceiveCalls(2, std::chrono::seconds{10}));
+    connectionManager.getConnection().provideReadySignalToReceive(false);
+
+    ASSERT_EQ(firstFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    ASSERT_EQ(queuedFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_THROW(firstFuture.get(), std::exception);
+    EXPECT_THROW(queuedFuture.get(), std::exception);
+    removeRequestFromCache(firstRequest);
+    removeRequestFromCache(queuedRequest);
 }
 
 #if ENABLE_MULTI_DEVICE

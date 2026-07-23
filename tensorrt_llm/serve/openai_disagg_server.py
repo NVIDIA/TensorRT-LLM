@@ -15,13 +15,15 @@
 
 # yapf: disable
 import asyncio
+import json
 import signal
 import socket
 import traceback
 from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from typing import Any, AsyncGenerator, Callable, Optional
 
 import aiohttp
+import anyio
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -40,11 +42,12 @@ from tensorrt_llm.serve.cluster_storage import (
 from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
-from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
+from tensorrt_llm.serve.openai_client import (OpenAIClient, OpenAIHttpClient,
+                                              UpstreamRequestTimeoutError)
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionRequest, CompletionRequest, UCompletionRequest,
+    ChatCompletionRequest, CompletionRequest, ErrorResponse, UCompletionRequest,
     UCompletionResponse, ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
@@ -58,6 +61,34 @@ _LOG_CONTROL_CHARACTERS = {
     code: f"\\x{code:02x}"
     for code in (*range(32), 127)
 }
+REQUEST_CLEANUP_GRACE_SECS = 10.0
+
+
+class DisaggregatedRequestTimeoutError(TimeoutError):
+    """The end-to-end disaggregated request deadline expired."""
+
+    def __init__(self, timeout_secs: int):
+        self.timeout_secs = timeout_secs
+        super().__init__(
+            f"Disaggregated request exceeded the configured "
+            f"{timeout_secs}-second deadline")
+
+
+class _CleanupStreamingResponse(StreamingResponse):
+    """Close upstream work even if ASGI disconnects before iteration starts."""
+
+    def __init__(self, *args, cleanup, cleanup_runner, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cleanup = cleanup
+        self._cleanup_runner = cleanup_runner
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._cleanup_runner(self._cleanup,
+                                       "stream response cleanup")
+
 
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, perf_metrics_collector: DisaggPerfMetricsCollector):
@@ -110,6 +141,8 @@ class OpenAIDisaggServer:
                  coordinator_url: Optional[str] = None):
         self._config = config
         self._req_timeout_secs = req_timeout_secs
+        self._cleanup_grace_secs = REQUEST_CLEANUP_GRACE_SECS
+        self._background_cleanup_tasks: set[asyncio.Task] = set()
         self._server_start_timeout_secs = server_start_timeout_secs
         self._metadata_server_cfg = metadata_server_cfg
         self._metrics_interval_secs = metrics_interval_secs
@@ -167,12 +200,7 @@ class OpenAIDisaggServer:
             # The cluster manager (via setup) owns server preparation + monitoring.
             await self._service.setup()
             yield
-            await self._service.teardown()
-            if self._perf_metrics_collector._background_tasks:
-                await asyncio.gather(
-                    *self._perf_metrics_collector._background_tasks,
-                    return_exceptions=True,
-                )
+            await self._shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
 
@@ -202,6 +230,58 @@ class OpenAIDisaggServer:
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
+
+    async def _shutdown(self) -> None:
+        pending_cleanup = await self._drain_background_cleanup_before_shutdown()
+        try:
+            await self._service.teardown()
+        finally:
+            await self._observe_background_cleanup_after_shutdown(
+                pending_cleanup)
+            if self._perf_metrics_collector._background_tasks:
+                await asyncio.gather(
+                    *self._perf_metrics_collector._background_tasks,
+                    return_exceptions=True,
+                )
+
+    async def _drain_background_cleanup_before_shutdown(
+            self) -> tuple[asyncio.Task, ...]:
+        cleanup_tasks = tuple(self._background_cleanup_tasks)
+        if not cleanup_tasks:
+            return ()
+
+        done, pending = await asyncio.wait(
+            cleanup_tasks, timeout=self._cleanup_grace_secs)
+        for task in done:
+            self._consume_cleanup_task(task, "server shutdown cleanup")
+        if not pending:
+            return ()
+
+        logger.warning(
+            f"Canceling {len(pending)} cleanup task(s) that remained active "
+            "during server shutdown")
+        for task in pending:
+            task.cancel()
+        done, pending = await asyncio.wait(
+            pending, timeout=self._cleanup_grace_secs)
+        for task in done:
+            self._consume_cleanup_task(task, "server shutdown cancellation")
+        return tuple(pending)
+
+    async def _observe_background_cleanup_after_shutdown(
+            self, cleanup_tasks: tuple[asyncio.Task, ...]) -> None:
+        if not cleanup_tasks:
+            return
+        for task in cleanup_tasks:
+            task.cancel()
+        done, pending = await asyncio.wait(
+            cleanup_tasks, timeout=self._cleanup_grace_secs)
+        for task in done:
+            self._consume_cleanup_task(task, "post-shutdown cleanup")
+        if pending:
+            logger.error(
+                f"{len(pending)} cleanup task(s) did not stop during server shutdown"
+            )
 
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
         async def disagg_id_generator():
@@ -273,6 +353,8 @@ class OpenAIDisaggServer:
         # CompletionRequest first and 400 every chat body, so override the wrapper's
         # annotation with request_type (as openai_server.py does).
         async def wrapper(req: request_type, raw_req: Request) -> Response:
+            deadline = (asyncio.get_running_loop().time()
+                        + self._req_timeout_secs)
             try:
                 self._perf_metrics_collector.total_requests.inc()
                 if req.stream:
@@ -286,18 +368,233 @@ class OpenAIDisaggServer:
                     raise HTTPException(status_code=400, detail=str(e)) from e
                 self._extract_conversation_id(req, raw_req)
                 hooks = RawRequestResponseHooks(raw_req, self._perf_metrics_collector)
-                response_or_generator = await entry_point(req, hooks)
+                response_or_generator = await self._await_response_or_disconnect(
+                    entry_point, req, hooks, raw_req, deadline)
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
-                    return StreamingResponse(content=response_or_generator, media_type="text/event-stream")
+                    upstream_generator = response_or_generator
+                    response_or_generator = self._stream_with_deadline(
+                        upstream_generator, deadline)
+                    return _CleanupStreamingResponse(
+                        content=response_or_generator,
+                        media_type="text/event-stream",
+                        cleanup=upstream_generator.aclose,
+                        cleanup_runner=self._run_cleanup_bounded)
                 else:
                     return JSONResponse(content=response_or_generator.model_dump())
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                self._handle_exception(e)
+                return self._handle_exception(e)
         return wrapper
 
+    async def _await_response_or_disconnect(self, entry_point: Callable,
+                                            req: UCompletionRequest,
+                                            hooks: ResponseHooks,
+                                            raw_req: Request,
+                                            deadline: float):
+        request_task = asyncio.create_task(entry_point(req, hooks))
+        disconnect_task = asyncio.create_task(
+            self._wait_for_disconnect(raw_req))
+        request_task_observed = False
+        streaming_response_ready = False
+        try:
+            remaining = max(0, deadline - asyncio.get_running_loop().time())
+            done, _ = await asyncio.wait(
+                (request_task, disconnect_task),
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED)
+            # Prefer a completed response if completion and disconnect race.
+            if request_task in done:
+                request_task_observed = True
+                response = await request_task
+                streaming_response_ready = getattr(req, "stream", False)
+                return response
+
+            if disconnect_task in done:
+                await disconnect_task
+                raise asyncio.CancelledError()
+            raise DisaggregatedRequestTimeoutError(self._req_timeout_secs)
+        finally:
+            if not request_task_observed:
+                await self._run_cleanup_bounded(
+                    lambda: self._cancel_and_close_unclaimed_request_task(
+                        request_task), "unclaimed request cleanup")
+            if streaming_response_ready:
+                # StreamingResponse becomes the sole ASGI receive owner after
+                # this method returns. Never background the previous listener,
+                # or the two consumers can race and lose a disconnect event.
+                await self._cancel_and_wait_strict(
+                    disconnect_task, "stream receive handoff")
+            else:
+                await self._cancel_and_wait(disconnect_task)
+
+    @staticmethod
+    async def _cancel_and_close_unclaimed_request_task(
+            request_task: asyncio.Task) -> None:
+        """Cancel setup and close a stream returned while cancellation races."""
+        if not request_task.done():
+            request_task.cancel()
+        try:
+            response = await request_task
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.debug("Suppressed unclaimed request exception during cleanup: "
+                         f"{traceback.format_exc()}")
+            return
+
+        close_response = getattr(response, "aclose", None)
+        if close_response is not None:
+            await close_response()
+
+    async def _stream_with_deadline(
+            self, response_generator: AsyncGenerator[Any, None],
+            deadline: float) -> AsyncGenerator[Any, None]:
+        iterator = response_generator.__aiter__()
+        try:
+            while True:
+                next_task = asyncio.create_task(anext(iterator))
+                try:
+                    remaining = max(
+                        0, deadline - asyncio.get_running_loop().time())
+                    done, _ = await asyncio.wait(
+                        (next_task, ),
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED)
+                    if next_task in done:
+                        try:
+                            yield await next_task
+                        except StopAsyncIteration:
+                            return
+                        except UpstreamRequestTimeoutError as e:
+                            async for chunk in self._stream_timeout_response(e):
+                                yield chunk
+                            return
+                        continue
+
+                    await self._cancel_and_wait(next_task)
+                    timeout_error = DisaggregatedRequestTimeoutError(
+                        self._req_timeout_secs)
+                    async for chunk in self._stream_timeout_response(
+                            timeout_error):
+                        yield chunk
+                    return
+                except asyncio.CancelledError:
+                    # Starlette cancels this stream from an AnyIO cancel scope
+                    # when the client disconnects. Keep this cleanup local and
+                    # shielded so the upstream read reaches a terminal state.
+                    with anyio.CancelScope(shield=True):
+                        await self._cancel_and_wait(next_task)
+                    raise
+        finally:
+            await self._run_cleanup_bounded(iterator.aclose,
+                                            "upstream stream cleanup")
+
+    @staticmethod
+    async def _wait_for_disconnect(raw_req: Request) -> None:
+        """Own the ASGI receive channel until StreamingResponse takes over.
+
+        FastAPI has consumed the request body before entering this handler.
+        This watcher exclusively owns the receive channel until it is canceled
+        before ``StreamingResponse`` assumes ownership. Blocking on the channel
+        avoids polling during that handoff.
+        """
+        while True:
+            message = await raw_req.receive()
+            if message["type"] == "http.disconnect":
+                return
+
+    async def _cancel_and_wait(self, *tasks: asyncio.Task) -> None:
+        for task in tasks:
+            if task is not None and not task.done():
+                task.cancel()
+        with anyio.CancelScope(shield=True):
+            await self._wait_for_cleanup_tasks(tasks,
+                                               "canceled request cleanup")
+
+    @staticmethod
+    async def _cancel_and_wait_strict(task: asyncio.Task, label: str) -> None:
+        if not task.done():
+            task.cancel()
+        with anyio.CancelScope(shield=True):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug(f"Suppressed exception during {label}: "
+                             f"{traceback.format_exc()}")
+
+    async def _run_cleanup_bounded(self, cleanup, label: str) -> None:
+        cleanup_task = asyncio.create_task(cleanup())
+        with anyio.CancelScope(shield=True):
+            await self._wait_for_cleanup_tasks((cleanup_task, ), label)
+
+    async def _wait_for_cleanup_tasks(self, tasks, label: str) -> None:
+        cleanup_tasks = tuple(task for task in tasks if task is not None)
+        if not cleanup_tasks:
+            return
+        done, pending = await asyncio.wait(
+            cleanup_tasks,
+            timeout=getattr(self, "_cleanup_grace_secs",
+                            REQUEST_CLEANUP_GRACE_SECS),
+        )
+        for task in done:
+            self._consume_cleanup_task(task, label)
+        for task in pending:
+            self._track_background_cleanup(task, label)
+        if pending:
+            cleanup_grace_secs = getattr(self, "_cleanup_grace_secs",
+                                         REQUEST_CLEANUP_GRACE_SECS)
+            logger.warning(
+                f"{label} exceeded the {cleanup_grace_secs}-second cleanup grace; "
+                f"continuing cleanup in the background")
+
+    def _track_background_cleanup(self, task: asyncio.Task,
+                                  label: str) -> None:
+        background_tasks = self.__dict__.setdefault(
+            "_background_cleanup_tasks", set())
+        if task in background_tasks:
+            return
+        background_tasks.add(task)
+
+        def cleanup_done(completed_task: asyncio.Task) -> None:
+            background_tasks.discard(completed_task)
+            self._consume_cleanup_task(completed_task, label)
+
+        task.add_done_callback(cleanup_done)
+
+    @staticmethod
+    def _consume_cleanup_task(task: asyncio.Task, label: str) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug(f"Suppressed exception during {label}: "
+                         f"{traceback.format_exc()}")
+
+    @staticmethod
+    async def _stream_timeout_response(
+            exception: TimeoutError) -> AsyncGenerator[str, None]:
+        error_response = ErrorResponse(message=str(exception),
+                                       type="RequestTimeoutError",
+                                       code=504)
+        yield f"data: {json.dumps({'error': error_response.model_dump()})}\n\n"
+        yield "data: [DONE]\n\n"
+
     def _handle_exception(self, exception):
-        if isinstance(exception, CppExecutorError):
+        if isinstance(exception, (DisaggregatedRequestTimeoutError,
+                                  UpstreamRequestTimeoutError)):
+            self._perf_metrics_collector.http_exceptions.inc()
+            logger.error(f"Request timeout: {exception}")
+            error_response = ErrorResponse(message=str(exception),
+                                           type="RequestTimeoutError",
+                                           code=504)
+            return JSONResponse(content=error_response.model_dump(),
+                                status_code=error_response.code)
+        elif isinstance(exception, CppExecutorError):
             logger.error("CppExecutorError: ", traceback.format_exc())
             signal.raise_signal(signal.SIGINT)
         elif isinstance(exception, HTTPException):

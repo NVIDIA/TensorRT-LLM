@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,9 +15,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
+#include <chrono>
+#include <future>
 #include <gtest/gtest.h>
+#include <optional>
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 using namespace tensorrt_llm::runtime;
@@ -205,6 +209,11 @@ TEST_P(AgentCommTest, AgentConnectionManagerConnect)
     auto connection1 = connectionManager1->recvConnectionAndRequestInfo(recvRequestInfo, std::atomic<bool>(false));
     ASSERT_EQ(recvRequestInfo.getRequestId(), requestId);
 
+    tensorrt_llm::batch_manager::RequestInfo absentRequestInfo;
+    auto absentConnection
+        = connectionManager1->tryRecvConnectionAndRequestInfo(absentRequestInfo, std::atomic<bool>(false));
+    ASSERT_EQ(absentConnection, nullptr);
+
     auto sendBuffer = mTransBufferManager->getSendBuffer(cacheBufferIds[0].value());
     auto sendSize = 1024;
     std::vector<char> sendData(sendSize);
@@ -230,6 +239,69 @@ TEST_P(AgentCommTest, AgentConnectionManagerConnect)
         ASSERT_EQ(recvData[i], 'a');
     }
     TLLM_LOG_INFO("after finish");
+}
+
+TEST_P(AgentCommTest, CacheSenderRejectsStandaloneFinalizedReplay)
+{
+    namespace tbm = tensorrt_llm::batch_manager;
+    namespace tr = tensorrt_llm::runtime;
+    namespace texec = tensorrt_llm::executor;
+
+    std::vector<tbm::BaseTransBufferManager*> bufferManagers{mTransBufferManager.get()};
+    auto receiverManager = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
+    auto senderManager = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
+    auto receiverCommState = receiverManager->getCommState();
+    auto senderCommState = senderManager->getCommState();
+
+    auto* receiverConnection = const_cast<AgentConnection*>(
+        dynamic_cast<AgentConnection const*>(receiverManager->getConnections(senderCommState).at(0)));
+    ASSERT_NE(receiverConnection, nullptr);
+
+    std::vector<tbm::kv_cache_manager::CacheTransBufferManager*> cacheBufferManagers{mTransBufferManager.get()};
+    tbm::CacheSender sender(senderManager.get(), 0,
+        tbm::CacheTransferLayer(*mCacheState,
+            tbm::kv_cache_manager::createCacheFormatter(mCacheManager.get(), cacheBufferManagers, false)));
+
+    tbm::LlmRequest::RequestIdType constexpr requestId{29};
+    tr::SamplingConfig const samplingConfig{1};
+    auto const inputTokens = std::make_shared<tbm::LlmRequest::VecTokens>(tbm::LlmRequest::VecTokens{1});
+    auto request = std::make_shared<tbm::LlmRequest>(requestId, 1, inputTokens, samplingConfig, /*isStreaming=*/false);
+    auto responseFuture = sender.sendAsync(request);
+    ASSERT_TRUE(sender.cancelRequest(*request));
+    ASSERT_EQ(responseFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_THROW(responseFuture.get(), std::exception);
+
+    texec::DataTransceiverState receiverState{*mCacheState, receiverCommState};
+    tbm::RequestInfo requestInfo{requestId, receiverState};
+    std::vector<std::optional<size_t>> cacheBufferIds{std::optional<size_t>{0}};
+    int constexpr validConnectionIdx{0};
+    std::atomic<bool> terminate{false};
+    int32_t constexpr kDataTag{43};
+    int32_t constexpr dataTag = ((requestId & 0xFFF) << 8) | (kDataTag & 0xFF);
+
+    auto sendRequestAndAwaitRejection = [&]() -> std::optional<bool>
+    {
+        receiverConnection->sendRequestAndBufferInfo(requestInfo, cacheBufferIds, validConnectionIdx);
+        auto readyFuture = std::async(std::launch::async,
+            [&]() {
+                return receiverConnection->recvReadySignal(DataContext{dataTag, terminate});
+            });
+        if (readyFuture.wait_for(std::chrono::seconds{10}) != std::future_status::ready)
+        {
+            terminate.store(true, std::memory_order_relaxed);
+            return std::nullopt;
+        }
+        return readyFuture.get();
+    };
+
+    // The first handshake consumes the queued cancellation and finalizes the
+    // request. The replay must be rejected while the sender has no local work.
+    auto firstReady = sendRequestAndAwaitRejection();
+    ASSERT_TRUE(firstReady.has_value());
+    EXPECT_FALSE(*firstReady);
+    auto replayReady = sendRequestAndAwaitRejection();
+    ASSERT_TRUE(replayReady.has_value());
+    EXPECT_FALSE(*replayReady);
 }
 
 INSTANTIATE_TEST_SUITE_P(AvailableBackends, AgentCommTest, ::testing::ValuesIn(getAvailableBackends()),
