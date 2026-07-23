@@ -492,10 +492,15 @@ class KimiKDARuntime(nn.Module):
             rms_norm_eps=cfg.rms_norm_eps,
             dtype=torch.bfloat16,
             layer_idx=layer_idx,
-            # Prefill dispatches through the mixer's KDAKernelDispatch:
-            # in-tree trtllm::kda_prefill on sm_100/sm_103 when the CuTe DSL
-            # toolchain is importable, FLA chunk_kda otherwise.
-            use_optimized_prefill=True,
+            # Prefill defaults to the FLA path while two issues in the
+            # in-tree trtllm::kda_prefill kernels are being resolved: an
+            # illegal-address crash at the autotuner-warmup shape (partial
+            # final chunk reads past exactly-sized buffers) and stalls at
+            # the first eval-scale batches (root cause under
+            # investigation). TLLM_KDA_ENABLE_OPT_PREFILL=1 opts back in
+            # for kernel development.
+            use_optimized_prefill=os.getenv("TLLM_KDA_ENABLE_OPT_PREFILL",
+                                            "0") == "1",
             use_optimized_decode=True,
         )
         self.proj_size = lin["num_heads"] * lin["head_dim"]

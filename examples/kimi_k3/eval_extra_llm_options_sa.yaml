@@ -1,24 +1,10 @@
-# Extra LLM-API options for Kimi K3 GSM8K/eval runs WITH suffix-automaton
-# speculative decoding (longest-match). SA runs stay eager (no CUDA graphs /
-# overlap scheduler) and need max_batch_size <= 8 (SpeculativeState
-# buffers). Like the non-SA config, SA now uses the DEP16 deployment
-# (attention-DP + MoE EP dispatch/combine): SA x attention-DP is
-# parity-certified (52-prompt logits parity, 0 drift, twice reproduced;
-# baseline-calibrated control), and DEP16 is also the memory-viable
-# deployment on GB300 — plain EP replicates attention (~239 vs ~193
-# GiB/rank weights) and only fits the minimal max_draft_len=2 eager
-# configuration. MoE backend selection is automatic (fused TRTLLM-Gen
-# SiTU op on SM100/SM103), same as the non-SA config.
 enable_attention_dp: true
 moe_expert_parallel_size: 16
 disable_overlap_scheduler: true
 cuda_graph_config: null
-enable_chunked_prefill: false
 kv_cache_config:
   enable_block_reuse: false
-  free_gpu_memory_fraction: 0.25
-  tokens_per_block: 64
+  free_gpu_memory_fraction: 0.6
 speculative_config:
   decoding_type: SA
   max_draft_len: 2
-  max_matching_ngram_size: -1
