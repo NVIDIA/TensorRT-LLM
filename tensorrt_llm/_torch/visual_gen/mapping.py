@@ -555,3 +555,12 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             rank=self.tp_rank,
             tp_size=self.tp_size,
         )
+
+    def to_autotuner_mapping(self) -> Mapping:
+        """Mapping that makes the autotuner treat all world ranks as one tuning
+        group (tp_size == world_size), so its post-tune cross-rank merge engages."""
+        return Mapping(
+            world_size=self.world_size,
+            rank=self._rank,
+            tp_size=self.world_size,
+        )
