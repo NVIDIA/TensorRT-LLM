@@ -24,7 +24,6 @@ cache-family geometry and the decision format only; the plans' internals
 are private to it.
 """
 
-from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -226,11 +225,8 @@ def init_compaction_buffers(
         )
     draft_move_indices = None
     if draft is not None:
-        if decision_rows != 1:
-            raise ValueError(
-                "draft packing broadcasts one shared decision row per request; "
-                f"got {decision_rows} decision rows"
-            )
+        # Union-only drafts (one shared decision row) are enforced by the
+        # executor call-site gate; the plan builder just packs.
         draft_layer_pools = draft["layer_pools"]
         draft_dense_layers = tuple(int(layer) for layer in draft["dense_layers"])
         draft_layer_pool_ids = tuple(int(pool_id) for pool_id in draft["layer_pool_ids"])
@@ -278,7 +274,7 @@ def init_compaction_buffers(
         slots,
         is_draft,
     ) in families:
-        grouped = OrderedDict()
+        grouped = {}
         for layer, pool, page_table in entries:
             key = (
                 pool_ids[layer],
@@ -291,7 +287,6 @@ def init_compaction_buffers(
         for group_entries in grouped.values():
             layers = tuple(entry[0] for entry in group_entries)
             pools = list(entry[1] for entry in group_entries)
-            page_tables = tuple(entry[2] for entry in group_entries)
             source_layer_indices = None
             if slots is not None:
                 source_layer_indices = torch.tensor(
@@ -306,7 +301,7 @@ def init_compaction_buffers(
                     dtype=torch.int64,
                     device=device,
                 ),
-                page_table=page_tables[0],
+                page_table=group_entries[0][2],
                 move_indices=move_indices,
                 move_offsets=move_offsets,
                 destination_bases=destination_bases,
