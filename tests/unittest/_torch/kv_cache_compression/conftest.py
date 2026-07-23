@@ -115,8 +115,10 @@ def make_ramp_pools(
 def build_compaction(**overrides):
     """``init_compaction_buffers`` with the suite's 2-layer defaults:
     translates ``eviction_mode`` into ``per_layer_sources``/``decision_rows``,
-    allocates the caller-owned move-offset rows (capacity cumsum), and hands
-    the test's pre-settled ``kept_token_ordinals`` in as the decision rows."""
+    allocates the caller-owned move-offset rows (capacity cumsum) and SWA
+    destination bases, and hands the test's pre-settled
+    ``kept_token_ordinals`` in as the decision rows. Returns the opaque
+    ``plans`` plus a test-side mirror of the caller-owned inputs."""
     from tensorrt_llm._torch.kv_cache_compression.compaction import init_compaction_buffers
 
     args = dict(
@@ -124,8 +126,7 @@ def build_compaction(**overrides):
         dense_layers=[0, 1],
         swa_layers=[],
         layer_group_representative={0: 0, 1: 1},
-        layer_pool_keys=[("dense", 0), ("dense", 0)],
-        page_table_slots={0: 0, 1: 0},
+        layer_pool_ids=[0, 0],
         request_count=2,
         decode_keep_count=4,
         swa_window=None,
@@ -140,16 +141,16 @@ def build_compaction(**overrides):
     tail = int(args.get("protected_tail_capacity", 0))
     draft_tail = int(args.get("draft_protected_tail_capacity") or 0)
     has_draft = bool(args.get("draft_layers"))
+    has_swa = bool(args["swa_layers"])
     device = args["layer_pools"][args["dense_layers"][0]].device
-    swa_window = int(args["swa_window"] or 0) if args["swa_layers"] else 0
+    swa_window = int(args["swa_window"] or 0) if has_swa else 0
+    swa_destination_bases = torch.empty_like(args["prompt_offsets"]) if has_swa else None
 
     def capacity_offsets(count):
         return torch.arange(0, (request_count + 1) * count, count, dtype=torch.int32, device=device)
 
     args.setdefault("dense_move_offsets", capacity_offsets(keep_count + tail))
-    args.setdefault(
-        "swa_move_offsets", capacity_offsets(swa_window + tail) if args["swa_layers"] else None
-    )
+    args.setdefault("swa_move_offsets", capacity_offsets(swa_window + tail) if has_swa else None)
     if has_draft:
         args.setdefault("draft_move_offsets", capacity_offsets(keep_count + draft_tail))
     num_kv_heads = int(args["layer_pools"][args["dense_layers"][0]].shape[2])
@@ -162,23 +163,22 @@ def build_compaction(**overrides):
             layer_pools=args["draft_layer_pools"],
             dense_layers=args["draft_layers"],
             layer_group_representative=args["draft_layer_group_representative"],
-            layer_pool_keys=args["draft_layer_pool_keys"],
+            layer_pool_ids=args["draft_layer_pool_ids"],
             kv_block_offsets=args["draft_kv_block_offsets"],
-            page_table_slots=args["draft_page_table_slots"],
             dense_move_offsets=args["draft_move_offsets"],
             protected_tail_capacity=draft_tail,
         )
-    compaction = init_compaction_buffers(
+    plans = init_compaction_buffers(
         target=dict(
             layer_pools=args["layer_pools"],
             dense_layers=args["dense_layers"],
             swa_layers=args["swa_layers"],
             swa_window=args["swa_window"],
             layer_group_representative=args["layer_group_representative"],
-            layer_pool_keys=args["layer_pool_keys"],
+            layer_pool_ids=args["layer_pool_ids"],
             kv_block_offsets=args["kv_block_offsets"],
-            page_table_slots=args["page_table_slots"],
             token_starts=args["prompt_offsets"],
+            swa_destination_bases=swa_destination_bases,
             dense_move_offsets=args["dense_move_offsets"],
             swa_move_offsets=args["swa_move_offsets"],
             per_layer_sources=per_layer,
@@ -193,10 +193,11 @@ def build_compaction(**overrides):
         ),
         draft=draft,
     )
-    # Test-side mirror of the construction inputs: production reads only the
-    # contract's public keys; the standalone helpers here need the
-    # caller-owned move-offset rows back.
-    compaction.update(
+    # Opaque plans plus a test-side mirror of the caller-owned construction
+    # inputs (production binds the same values on its buffer namespace); the
+    # standalone helpers here need the move-offset rows and SWA staging back.
+    return dict(
+        plans=plans,
         prompt_offsets=args["prompt_offsets"],
         request_count=request_count,
         decode_keep_count=keep_count,
@@ -205,14 +206,17 @@ def build_compaction(**overrides):
         dense_move_offsets=args["dense_move_offsets"],
         swa_move_offsets=args["swa_move_offsets"],
         draft_move_offsets=args["draft_move_offsets"] if has_draft else None,
+        has_swa=has_swa,
+        swa_window=swa_window,
+        swa_destination_bases=swa_destination_bases,
+        swa_rebase_delta=keep_count - swa_window,
     )
-    return compaction
 
 
 def run_compaction(compaction):
     """Replica of the round's move stage in production order: SWA
-    destination rebase, then ``compact`` packs the decision rows into move
-    sources and fires the native target and draft moves."""
+    destination rebase, then ``compact`` loops the opaque plans (each packs
+    its decision rows into move sources and fires its native moves)."""
     from tensorrt_llm._torch.kv_cache_compression.compaction import compact
 
     if compaction["swa_destination_bases"] is not None:
@@ -221,7 +225,7 @@ def run_compaction(compaction):
             compaction["swa_rebase_delta"],
             out=compaction["swa_destination_bases"],
         )
-    compact(compaction, compaction["request_count"])
+    compact(compaction["plans"], compaction["request_count"])
 
 
 def make_bare_staging(device, *, max_requests, staged_blocks_per_seq):
@@ -229,7 +233,7 @@ def make_bare_staging(device, *, max_requests, staged_blocks_per_seq):
     staging = SimpleNamespace()
     staging.max_requests = max_requests
     staging.keep_count = 4
-    staging.compaction_plan = {"has_swa": False}
+    staging.swa_window = None
     staging.draft_protected_tail_capacity = None
     staging.block_offsets_ready_event = torch.cuda.Event()
     staging.compaction_done_event = torch.cuda.Event()
@@ -265,7 +269,6 @@ def make_buffer_stubs(manager, *, decode_width=260):
     manager._phase = {"rows": 8}
     manager.calibration = {"omega": torch.ones(2)}
     manager._local_score_calibration = mock.Mock(return_value=(torch.ones(2, 2, 2),) * 3)
-    manager._page_table_pool_keys = mock.Mock(return_value=[("pool", 0)])
     pool = torch.empty(8, 2, 1, 4, 4)
     layout = dict(
         manager=SimpleNamespace(num_pools=1),
@@ -276,7 +279,7 @@ def make_buffer_stubs(manager, *, decode_width=260):
         swa_window=None,
         storage_groups={0: [0, 1]},
         layer_group_representative={0: 0, 1: 0},
-        layer_pool_keys=(("pool", 0), ("pool", 0)),
+        layer_pool_ids=(0, 0),
     )
     buffers = SimpleNamespace(
         decode_width=decode_width,
@@ -479,13 +482,13 @@ def make_cute_buffers(
     page_table_token_capacity=None,
     protected_tail_capacity=0,
     storage_groups=None,
-    layer_pool_keys=None,
+    layer_pool_ids=None,
     normalize_scores=True,
 ):
     """Real eviction buffers over the one-shared-slot default layout; split
     reference legs use ``eviction_mode="per_head"`` over the same pools.
-    ``storage_groups``/``layer_pool_keys`` override the page-table grouping
-    (keys are ``(name, slot)`` tuples; the slot is ``key[1]``)."""
+    ``storage_groups``/``layer_pool_ids`` override the page-table grouping
+    (``layer_pool_ids`` is the canonical per-layer V2 pool id list)."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
         init_eviction_buffers,
     )
@@ -497,11 +500,11 @@ def make_cute_buffers(
     if decode_width is None:
         decode_width = seq_len
     if storage_groups is None:
-        storage_groups = {("pool", 0): list(range(num_layers))}
-    if layer_pool_keys is None:
-        layer_pool_keys = [("pool", 0)] * num_layers
+        storage_groups = {0: list(range(num_layers))}
+    if layer_pool_ids is None:
+        layer_pool_ids = [0] * num_layers
     layout = dict(
-        manager=SimpleNamespace(num_pools=max(key[1] for key in layer_pool_keys) + 1),
+        manager=SimpleNamespace(num_pools=max(layer_pool_ids) + 1),
         layer_pools=layer_pools,
         dense_layers=list(range(num_layers)),
         swa_layers=[],
@@ -510,7 +513,7 @@ def make_cute_buffers(
         layer_group_representative={
             layer: layers[0] for layers in storage_groups.values() for layer in layers
         },
-        layer_pool_keys=layer_pool_keys,
+        layer_pool_ids=layer_pool_ids,
     )
     return init_eviction_buffers(
         eviction_mode=eviction_mode,
@@ -558,10 +561,14 @@ def launch_split_scores(
     bufs, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
 ):
     """The production score-only leg plus the decode-window gather
-    (``execute_eviction_round``'s per-head sequence, parameterized by count)."""
+    (``execute_eviction_round``'s per-head sequence, parameterized by count).
+    Test mean phases load into the runner's ctor-bound buffers, exactly like
+    the production in-place gather refresh."""
     stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts)
+    bufs.mean_cos[:request_count].copy_(mean_cos[:request_count])
+    bufs.mean_sin[:request_count].copy_(mean_sin[:request_count])
     assert request_count in bufs.runner._compiled
-    bufs.runner.launch(request_count, mean_cos, mean_sin)
+    bufs.runner.launch(request_count)
     num_segments = request_count * bufs.num_layers
     group_size = bufs.num_q_heads // bufs.num_kv_heads
     source = (

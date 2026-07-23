@@ -60,7 +60,7 @@ def _launched_draft_compaction(draft_protected_tails):
 
     compaction = _build_compaction(
         layer_pools=target_pools,
-        layer_pool_keys=[("pool", 0), ("pool", 0)],
+        layer_pool_ids=[0, 0],
         kept_token_ordinals=keep.to(torch.int32),
         valid_sequence_lengths=torch.tensor(valid_seq_lens, dtype=torch.int32, device=device),
         kv_block_offsets=_encode_block_offsets(target_tables),
@@ -69,10 +69,9 @@ def _launched_draft_compaction(draft_protected_tails):
         draft_layer_pools=[draft_pool],
         draft_layers=[0],
         draft_layer_group_representative={0: 0},
-        draft_layer_pool_keys=[("draft_pool", 0)],
+        draft_layer_pool_ids=[0],
         draft_protected_tail_capacity=max(draft_protected_tails),
         draft_kv_block_offsets=_encode_block_offsets(draft_tables),
-        draft_page_table_slots={0: 0},
     )
     _set_protected_tails(compaction, target_protected_tails, draft_protected_tails)
     _run_compaction(compaction)
@@ -103,7 +102,6 @@ def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle(draft_protect
     prompt_len = built.prompt_len
 
     expected_offsets = [0]
-    expected_moves = []
     for request in range(built.request_count):
         valid = built.valid_seq_lens[request]
         # Target dense layers compact the union keep set plus the target tail.
@@ -154,22 +152,13 @@ def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle(draft_protect
                 before[:, head].index_select(1, draft_source),
             )
 
-        expected_moves.append(draft_source.to(torch.int32))
         expected_offsets.append(expected_offsets[-1] + int(draft_source.numel()))
 
-    # Packed indices must match the same broadcast-plus-tail oracle: the
-    # test-owned draft offsets row and the contract's draft move sources.
-    expected_row = torch.cat(expected_moves)
+    # The test-owned draft move-offset row must match the broadcast-plus-tail
+    # oracle; the packed move sources themselves are covered byte-exactly by
+    # the pool assertions above (the ramp payload makes every wrong move land
+    # on different bytes) and by the pack-kernel oracle suite.
     assert built.compaction["draft_move_offsets"].cpu().tolist() == expected_offsets
-    draft_indices = built.compaction["draft_move_indices"]
-    # Capacity-sized buffer; this round's moves pack at the front.
-    capacity_total = built.request_count * (
-        int(built.keep.shape[1]) + max(built.draft_protected_tails)
-    )
-    assert draft_indices.shape == (int(built.draft_pool.shape[2]), capacity_total)
-    for head in range(int(draft_indices.shape[0])):
-        # Union mode broadcasts one keep set over every draft KV head.
-        assert torch.equal(draft_indices[head, : expected_offsets[-1]], expected_row)
 
 
 def test_execute_eviction_round_orders_both_manager_streams():
@@ -185,7 +174,8 @@ def test_execute_eviction_round_orders_both_manager_streams():
         max_requests=8,
         keep_count=4,
         eviction_mode="union",
-        compaction_plan={"has_swa": False},
+        swa_window=None,
+        compaction_plan=(),
         draft_protected_tail_capacity=1,
         copy_pending=False,
         staging_reuse_event=mock.Mock(),
@@ -400,7 +390,7 @@ def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
             dense_layers=[],
             layer_group_representative={},
             pool_representatives=(),
-            layer_pool_keys=(),
+            layer_pool_ids=(),
             pool_page_counts=(4,),
         )
     )
@@ -432,7 +422,7 @@ def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
         assert kwargs["capacities"]["keep_count"] == manager.budget
         assert kwargs["phase"] is manager._phase
         assert kwargs["layout"] is layout
-        assert list(kwargs["layout"]["layer_pool_keys"]) == list(layout["layer_pool_keys"])
+        assert list(kwargs["layout"]["layer_pool_ids"]) == list(layout["layer_pool_ids"])
 
         # A second round within the resident capacities reuses the buffers
         # (and with them the compaction launch data they carry).

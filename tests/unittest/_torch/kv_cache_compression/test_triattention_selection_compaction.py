@@ -490,13 +490,15 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         decode_width=bucket_capacity,
         keep_count=keep_count,
         storage_groups={
-            ("pool", 0): dense_groups[0],
-            ("pool", 1): dense_groups[1],
+            0: dense_groups[0],
+            1: dense_groups[1],
         },
-        layer_pool_keys=[("pool", 0), ("pool", 1), ("pool", 0)],
+        layer_pool_ids=[0, 1, 0],
         normalize_scores=False,
     )
-    assert bufs.compaction_plan["has_swa"] is False
+    # No SWA in this layout: no window, no rebase row for the phase gather.
+    assert bufs.swa_window is None
+    assert bufs.swa_destination_bases is None
     # Native V2 staging contract: [pool, request, K/V, block] int32 pair with
     # a 4-aligned block width (PackedInt copy ABI) and a pinned host snapshot.
     assert bufs.block_offsets_host.shape == bufs.block_offsets_device.shape
@@ -771,11 +773,11 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
         dense_layers=[0],
         swa_layers=[1],
         layer_group_representative={0: 0},
-        layer_pool_keys=[("dense", 0), ("swa", 0)],
+        # Dense layer 0 stages in plane 0, the SWA layer in its own plane 1.
+        layer_pool_ids=[0, 1],
         kept_token_ordinals=keep.to(torch.int32),
         valid_sequence_lengths=valid_seq_lens,
         kv_block_offsets=_encode_block_offsets(torch.stack((dense_tables, swa_tables))),
-        page_table_slots={0: 0, 1: 1},
         prompt_offsets=torch.tensor([2, 2], dtype=torch.int32, device=device),
         swa_window=2,
         protected_tail_capacity=max(protected_tails),

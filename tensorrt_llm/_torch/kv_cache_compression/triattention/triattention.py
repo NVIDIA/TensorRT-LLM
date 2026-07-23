@@ -111,11 +111,11 @@ def init_eviction_buffers(
     swa_layers = list(layout["swa_layers"])
     swa_window = layout["swa_window"]
     layer_group_representative = layout["layer_group_representative"]
-    layer_pool_keys = list(layout["layer_pool_keys"])
+    # Canonical layer -> V2 pool id tuple; it IS the staged plane slot map.
+    layer_pool_ids = tuple(layout["layer_pool_ids"])
     dense_groups = list(layout["storage_groups"].values())
     page_representatives = [group[0] for group in dense_groups]
     page_representatives.extend(layer for layer in swa_layers if layer not in page_representatives)
-    page_table_keys = [layer_pool_keys[layer] for layer in page_representatives]
     num_page_table_slots = int(layout["manager"].num_pools)
 
     device = layer_pools[page_representatives[0]].device
@@ -143,11 +143,6 @@ def init_eviction_buffers(
     bufs.page_table_token_capacity = page_table_token_capacity
 
     # ---- block-offset staging (target, plus the co-compressed draft) -------
-    # Representative layer -> V2 pool id, resolved once here (init-local).
-    pool_id_by_representative_layer = {
-        representative: int(key[1])
-        for representative, key in zip(page_representatives, page_table_keys)
-    }
     bufs.block_offsets_host, bufs.block_offsets_device = _allocate_block_offset_staging(
         layer_pools[page_representatives[0]],
         num_pools=num_page_table_slots,
@@ -158,14 +153,9 @@ def init_eviction_buffers(
     bufs.draft_block_offsets_device = None
     bufs.draft_block_offsets_host = None
     bufs.draft_protected_tail_capacity = None
-    draft_page_slots: Dict[int, int] = {}
     if draft is not None:
         draft_layout = draft["layout"]
         draft_representatives = list(draft_layout["pool_representatives"])
-        draft_page_slots = {
-            representative: int(draft_layout["layer_pool_keys"][representative][1])
-            for representative in draft_representatives
-        }
         draft_anchor_pool = draft_layout["layer_pools"][draft_representatives[0]]
         # Construction-boundary invariant: the round shares one stream/event
         # contract, so the draft pools must live on the target device.
@@ -201,6 +191,11 @@ def init_eviction_buffers(
     dense_move_offsets_row = bufs.request_metadata_device[3]
     swa_move_offsets_row = bufs.request_metadata_device[4]
     draft_move_offsets_row = bufs.request_metadata_device[5]
+    # SWA staging geometry, bound once (the compaction plans stay opaque):
+    # the phase gather rebases each request's SWA destination base in place.
+    bufs.swa_window = int(swa_window) if swa_layers else None
+    bufs.swa_destination_bases = torch.empty_like(bufs.token_starts_device) if swa_layers else None
+    bufs.swa_rebase_delta = keep_count - bufs.swa_window if swa_layers else 0
     bufs.mean_cos = torch.empty((max_requests, num_freqs), dtype=torch.float32, device=device)
     bufs.mean_sin = torch.empty_like(bufs.mean_cos)
     bufs.phase = phase
@@ -216,7 +211,7 @@ def init_eviction_buffers(
     bufs.num_freqs = int(num_freqs)
     bufs.tokens_per_block = int(tokens_per_block)
     _rep_of = {layer: layers[0] for layers in dense_groups for layer in layers}
-    dense_layer_slots = [pool_id_by_representative_layer[_rep_of[layer]] for layer in dense_layers]
+    dense_layer_slots = [layer_pool_ids[_rep_of[layer]] for layer in dense_layers]
     seg_req_id = torch.arange(max_requests, dtype=torch.int32, device=device).repeat_interleave(
         bufs.num_layers
     )
@@ -296,6 +291,7 @@ def init_eviction_buffers(
         mean_sin=bufs.mean_sin,
         freq_scale_sq=freq_scale_sq,
         output=bufs.score_scratch,
+        union_scores=bufs.union_scores,
         enable_partial_stats=union,
     )
     logger.info(
@@ -361,7 +357,7 @@ def init_eviction_buffers(
             (max_requests * selection_rows, keep_count), dtype=torch.int32, device=device
         )
 
-    # ---- compaction contract + decision-materialization prebinds ------------
+    # ---- compaction plans + decision-materialization prebinds ---------------
     per_layer = eviction_mode == "per_layer_perhead"
     draft_contract = None
     if draft is not None:
@@ -370,28 +366,28 @@ def init_eviction_buffers(
             layer_pools=draft_layout["layer_pools"],
             dense_layers=list(draft_layout["dense_layers"]),
             layer_group_representative=draft_layout["layer_group_representative"],
-            layer_pool_keys=list(draft_layout["layer_pool_keys"]),
+            layer_pool_ids=tuple(draft_layout["layer_pool_ids"]),
             kv_block_offsets=bufs.draft_block_offsets_device,
-            page_table_slots=draft_page_slots,
             dense_move_offsets=draft_move_offsets_row,
             protected_tail_capacity=int(draft["protected_tail_capacity"]),
         )
-    contract = init_compaction_buffers(
+    # Opaque launch plans: only compact() interprets them.
+    bufs.compaction_plan = init_compaction_buffers(
         target=dict(
             layer_pools=layer_pools,
             dense_layers=list(dense_layers),
             swa_layers=list(swa_layers),
             swa_window=swa_window,
             layer_group_representative=layer_group_representative,
-            layer_pool_keys=list(layer_pool_keys),
+            layer_pool_ids=layer_pool_ids,
             kv_block_offsets=bufs.block_offsets_device,
-            page_table_slots=pool_id_by_representative_layer,
             token_starts=bufs.token_starts_device,
+            swa_destination_bases=bufs.swa_destination_bases,
             # Per-round tails: the move offsets ride the staged metadata rows.
             dense_move_offsets=dense_move_offsets_row,
             swa_move_offsets=swa_move_offsets_row,
             per_layer_sources=per_layer,
-            # The decision rows the contract packs into move sources.
+            # The decision rows the plans pack into move sources.
             kept_ordinal_rows=bufs.kept_ordinal_rows,
             decision_rows=bufs.selection_rows_per_request,
             valid_seq_lens=bufs.valid_seq_lens_device,
@@ -403,9 +399,6 @@ def init_eviction_buffers(
         ),
         draft=draft_contract,
     )
-    bufs.compaction_plan = contract
-    bufs.swa_destination_bases = contract["swa_destination_bases"]
-    bufs.swa_rebase_delta = contract["swa_rebase_delta"]
     # The decision side: the settle launch materializes the kept-ordinal rows.
     bufs.settle_args = (
         bufs.selection_scores_rows,
@@ -480,8 +473,8 @@ def _cohort_move_offsets(
     tails = [int(item["protected_tail"]) for item in prepared]
     dense = padded_offsets([bufs.keep_count + tail for tail in tails])
     swa = None
-    if bufs.compaction_plan["has_swa"]:
-        swa = padded_offsets([int(bufs.compaction_plan["swa_window"]) + tail for tail in tails])
+    if bufs.swa_window is not None:
+        swa = padded_offsets([bufs.swa_window + tail for tail in tails])
     draft = None
     if bufs.draft_protected_tail_capacity is not None:
         draft = padded_offsets(
@@ -596,15 +589,15 @@ def execute_eviction_round(
                 num_warps=1,
             )
             if union:
-                bufs.runner.launch_union_fusion(
-                    request_count, bufs.mean_cos, bufs.mean_sin, bufs.union_scores[:request_count]
-                )
+                # The runner's ctor bound the mean/union buffers; the launch
+                # takes only the active cohort size.
+                bufs.runner.launch_union_fusion(request_count)
                 columns = min(bufs.union_scores.shape[1], bufs.selection_scores_rows.shape[1])
                 bufs.selection_scores_rows[:request_count, :columns].copy_(
                     bufs.union_scores[:request_count, :columns]
                 )
             else:
-                bufs.runner.launch(request_count, bufs.mean_cos, bufs.mean_sin)
+                bufs.runner.launch(request_count)
                 # Gather each decode window into the [request, layer, head, token] layout of the reduces.
                 group_size = bufs.num_q_heads // bufs.num_kv_heads
                 num_segments = request_count * bufs.num_layers
@@ -1171,7 +1164,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             manager,
             global_layers,
             dense_layers=dense_layers,
-            dense_storage_groups=self._dense_layer_pool_groups(dense_layers, global_layers),
             swa_layers=swa_layers,
             swa_window=swa_window,
             what="",
@@ -1185,12 +1177,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         global_layers: List[int],
         *,
         dense_layers: List[int],
-        dense_storage_groups: Optional[Dict[object, List[int]]],
         swa_layers: List[int],
         swa_window: Optional[int],
         what: str,
     ) -> Dict[str, object]:
-        num_layers = len(global_layers)
         maybe_layer_pools = [manager.get_buffers(layer, kv_layout="HND") for layer in global_layers]
         if any(pool is None for pool in maybe_layer_pools):
             missing = [
@@ -1198,16 +1188,16 @@ class TriAttention(BaseKVCacheCompressionManager):
             ]
             raise RuntimeError(f"Missing {what}KV pools for attention layers {missing}")
         layer_pools = [pool for pool in maybe_layer_pools if pool is not None]
-        all_layers = list(range(num_layers))
-        layer_pool_keys = tuple(
-            self._page_table_pool_keys(all_layers, global_layers, manager=manager)
-        )
-        all_storage_groups: Dict[object, List[int]] = {}
-        for layer, pool_key in zip(all_layers, layer_pool_keys):
-            all_storage_groups.setdefault(pool_key, []).append(layer)
-        storage_groups = (
-            dense_storage_groups if dense_storage_groups is not None else all_storage_groups
-        )
+        # Canonical pool IDs, resolved once; every grouping derives from them.
+        layer_pool_ids = self._page_table_pool_ids(manager, global_layers)
+        all_storage_groups: Dict[int, List[int]] = {}
+        for layer, pool_id in enumerate(layer_pool_ids):
+            all_storage_groups.setdefault(pool_id, []).append(layer)
+        # Scored/compacted groups cover the dense layers only; SWA layers
+        # stage and compact as their own representatives.
+        storage_groups: Dict[int, List[int]] = {}
+        for layer in dense_layers:
+            storage_groups.setdefault(layer_pool_ids[layer], []).append(layer)
         layer_group_representative = {
             layer: layers[0] for layers in storage_groups.values() for layer in layers
         }
@@ -1221,7 +1211,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             swa_window=swa_window,
             storage_groups=storage_groups,
             layer_group_representative=layer_group_representative,
-            layer_pool_keys=layer_pool_keys,
+            layer_pool_ids=layer_pool_ids,
             pool_representatives=pool_representatives,
             pool_page_counts=tuple(
                 int(layer_pools[layer].shape[0]) for layer in pool_representatives
@@ -1252,7 +1242,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             manager,
             global_layers,
             dense_layers=list(range(len(global_layers))),
-            dense_storage_groups=None,
             swa_layers=[],
             swa_window=None,
             what="draft ",
@@ -1366,34 +1355,19 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._buffers = bufs
         return bufs
 
-    def _page_table_pool_keys(
-        self,
-        local_layers: List[int],
+    @staticmethod
+    def _page_table_pool_ids(
+        manager: KVCacheManagerV2,
         global_layers: List[int],
-        manager: Optional[KVCacheManagerV2] = None,
-    ) -> List[object]:
-        if manager is None:
-            manager = self.kv_cache_manager
+    ) -> Tuple[int, ...]:
+        """Canonical local layer -> V2 pool id tuple (the staged plane slots).
+
+        V2 owns the mapping; its own lookup errors are the precise ones."""
         layer_offsets = manager.layer_offsets
         layer_to_pool = manager.layer_to_pool_mapping_dict
-        # V2 owns the mapping; its own lookup errors are the precise ones.
-        return [
-            ("pool", int(layer_to_pool[layer_offsets[global_layers[layer]]]))
-            for layer in local_layers
-        ]
-
-    def _dense_layer_pool_groups(
-        self,
-        dense_layers: List[int],
-        global_layers: List[int],
-    ) -> Dict[object, List[int]]:
-        groups: Dict[object, List[int]] = {}
-        for layer, pool_key in zip(
-            dense_layers,
-            self._page_table_pool_keys(dense_layers, global_layers),
-        ):
-            groups.setdefault(pool_key, []).append(layer)
-        return groups
+        return tuple(
+            int(layer_to_pool[layer_offsets[global_layer]]) for global_layer in global_layers
+        )
 
     def _evict_requests(
         self,

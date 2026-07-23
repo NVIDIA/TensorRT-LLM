@@ -1382,6 +1382,7 @@ class TriAttentionCuteScoreRunner:
         mean_sin: torch.Tensor,
         freq_scale_sq: torch.Tensor,
         output: torch.Tensor,
+        union_scores: torch.Tensor | None = None,
         enable_partial_stats: bool = False,
     ) -> None:
         # Pool shape [pages, K/V, heads, tokens, dim] of the anchor scored layer.
@@ -1395,8 +1396,13 @@ class TriAttentionCuteScoreRunner:
         self.width = int(seq_len)
         self.num_q_heads = int(num_q_heads)
         self.num_kv_heads = num_kv_heads
+        self.device = output.device
         self.sm_count = int(torch.cuda.get_device_properties(output.device).multi_processor_count)
         self.enable_partial_stats = bool(enable_partial_stats)
+        if self.enable_partial_stats and union_scores is None:
+            raise ValueError(
+                "TriAttention union fusion requires the persistent union_scores output"
+            )
         # One [stats_row, page_shard, {count, mean, m2}] record array.
         partial_stats_elements = (
             max_requests * num_layers * num_q_heads * SMALL_WORKLOAD_PAGE_SHARDS * STATS_FIELDS
@@ -1443,16 +1449,18 @@ class TriAttentionCuteScoreRunner:
             _to_cute(anchor_pool),
             _to_cute(self.descriptors, assumed_align=128),
         )
+        # Ctor-bound persistent launch operands (one from_dlpack wrap each):
+        # the round path refreshes their contents in place and launches with
+        # the active cohort size only.
+        self._cute_mean_cos = _to_cute(mean_cos.view(-1))
+        self._cute_mean_sin = _to_cute(mean_sin.view(-1))
+        self._cute_union_scores = (
+            _to_cute(union_scores.view(-1)) if self.enable_partial_stats else None
+        )
         self._compiled: dict[int, object] = {}
         self._compiled_stats: dict[int, object] = {}
         self._compiled_normalize_union: dict[int, object] = {}
         self._page_shards: dict[int, int] = {}
-        compile_output_rows = max_requests if self.enable_partial_stats else 1
-        self._normalize_union_compile_output = torch.empty(
-            (compile_output_rows, self.width),
-            dtype=torch.float32,
-            device=output.device,
-        )
         self._cute_selection_prefix = (
             _to_cute(output),
             _to_cute(valid_seq_lens, assumed_align=4),
@@ -1460,8 +1468,6 @@ class TriAttentionCuteScoreRunner:
             _to_cute(token_starts, assumed_align=4),
         )
         self._cute_partial_stats = _to_cute(self.partial_stats)
-        # Launch-path from_dlpack wraps, cached per persistent buffer identity.
-        self._cute_launch_cache: dict[str, tuple[torch.Tensor, cute.Tensor]] = {}
         static_geometry = (
             max_requests,
             num_layers,
@@ -1520,8 +1526,8 @@ class TriAttentionCuteScoreRunner:
                     compiled = cute.compile(
                         kernel,
                         *self._cute_prefix,
-                        _to_cute(mean_cos.view(-1)),
-                        _to_cute(mean_sin.view(-1)),
+                        self._cute_mean_cos,
+                        self._cute_mean_sin,
                         *self._cute_tail,
                         cutlass.Int32(1),
                         stream,
@@ -1564,7 +1570,7 @@ class TriAttentionCuteScoreRunner:
                         static_geometry,
                         tensor_specs,
                         config_key,
-                        _tensor_spec(self._normalize_union_compile_output),
+                        _tensor_spec(union_scores),
                         _tensor_spec(self.partial_stats),
                     )
                     with _COMPILE_LOCK:
@@ -1589,7 +1595,7 @@ class TriAttentionCuteScoreRunner:
                                 kernel,
                                 _to_cute(self.partial_stats),
                                 *self._cute_selection_prefix,
-                                _to_cute(self._normalize_union_compile_output.view(-1)),
+                                self._cute_union_scores,
                                 cutlass.Int32(1),
                                 stream,
                             )
@@ -1597,45 +1603,28 @@ class TriAttentionCuteScoreRunner:
                     compiled_configs[config_key] = compiled_selection
                 self._compiled_normalize_union[request_count] = compiled_selection
 
-    def _cute_cached(self, key: str, tensor: torch.Tensor) -> cute.Tensor:
-        """One from_dlpack per persistent buffer; rewrap only on identity change."""
-        cached = self._cute_launch_cache.get(key)
-        if cached is not None and cached[0] is tensor:
-            return cached[1]
-        wrapped = _to_cute(tensor.view(-1))
-        self._cute_launch_cache[key] = (tensor, wrapped)
-        return wrapped
-
-    def launch(
-        self,
-        request_count: int,
-        mean_cos: torch.Tensor,
-        mean_sin: torch.Tensor,
-    ) -> None:
-        """Launch the CuTe score kernel on the current PyTorch stream."""
-        stream = cuda.CUstream(torch.cuda.current_stream(mean_cos.device).cuda_stream)
+    def launch(self, request_count: int) -> None:
+        """Launch the CuTe score kernel on the current PyTorch stream over the
+        active cohort (every tensor operand is ctor-bound)."""
+        stream = cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
         self._compiled[request_count](
             *self._cute_prefix,
-            self._cute_cached("mean_cos", mean_cos),
-            self._cute_cached("mean_sin", mean_sin),
+            self._cute_mean_cos,
+            self._cute_mean_sin,
             *self._cute_tail,
             request_count,
             stream,
         )
 
-    def launch_union_fusion(
-        self,
-        request_count: int,
-        mean_cos: torch.Tensor,
-        mean_sin: torch.Tensor,
-        union_scores: torch.Tensor,
-    ) -> None:
-        """Launch score plus stats followed by normalized union reduction."""
-        stream = cuda.CUstream(torch.cuda.current_stream(mean_cos.device).cuda_stream)
+    def launch_union_fusion(self, request_count: int) -> None:
+        """Launch score plus stats followed by normalized union reduction over
+        the active cohort (every tensor operand is ctor-bound; the union rows
+        land in the ctor-bound ``union_scores``)."""
+        stream = cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
         self._compiled_stats[request_count](
             *self._cute_prefix,
-            self._cute_cached("mean_cos", mean_cos),
-            self._cute_cached("mean_sin", mean_sin),
+            self._cute_mean_cos,
+            self._cute_mean_sin,
             *self._cute_tail,
             request_count,
             stream,
@@ -1643,7 +1632,7 @@ class TriAttentionCuteScoreRunner:
         self._compiled_normalize_union[request_count](
             self._cute_partial_stats,
             *self._cute_selection_prefix,
-            self._cute_cached("union_scores", union_scores),
+            self._cute_union_scores,
             request_count,
             stream,
         )

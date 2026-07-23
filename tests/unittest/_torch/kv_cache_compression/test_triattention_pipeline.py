@@ -152,7 +152,7 @@ class TestTriAttentionClass:
             swa_window=None,
             storage_groups={0: [0, 2], 1: [1]},
             layer_group_representative={0: 0, 1: 1, 2: 0},
-            layer_pool_keys=(0, 1, 0),
+            layer_pool_ids=(0, 1, 0),
             # These are local layer slots. Layer 2 shares layer 0's pool.
             pool_representatives=(0, 1),
             pool_page_counts=(4, 8),
@@ -735,7 +735,7 @@ class TestFixedScoreMetadata:
         offsets_buffers = SimpleNamespace(
             max_requests=8,
             keep_count=4,
-            compaction_plan={"has_swa": False},
+            swa_window=None,
             draft_protected_tail_capacity=None,
         )
         dense, swa, draft = _cohort_move_offsets(offsets_buffers, prepared)
@@ -809,8 +809,8 @@ class TestFixedScoreMetadata:
             decode_width=seq_len - prompt_len,
             keep_count=4,
             # One storage group and page-table slot per layer (distinct pools).
-            storage_groups={("pool", layer): [layer] for layer in layer_order},
-            layer_pool_keys=[("pool", layer) for layer in layer_order],
+            storage_groups={layer: [layer] for layer in layer_order},
+            layer_pool_ids=list(layer_order),
             normalize_scores=False,
         )
         valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)

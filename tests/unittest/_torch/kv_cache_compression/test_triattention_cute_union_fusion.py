@@ -22,13 +22,18 @@ _SM100_ONLY = pytest.mark.skipif(
 def _launch_union_fusion(
     bufs, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin, union_out
 ):
-    """The fused score+stats+normalized-union pipeline (THE union path)."""
+    """The fused score+stats+normalized-union pipeline (THE union path).
+    Test mean phases load into the runner's ctor-bound buffers; the fused
+    rows land in the ctor-bound ``bufs.union_scores`` and copy out."""
     _stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts)
+    bufs.mean_cos[:request_count].copy_(mean_cos[:request_count])
+    bufs.mean_sin[:request_count].copy_(mean_sin[:request_count])
     assert (
         request_count in bufs.runner._compiled_stats
         and request_count in bufs.runner._compiled_normalize_union
     )
-    bufs.runner.launch_union_fusion(request_count, mean_cos, mean_sin, union_out[:request_count])
+    bufs.runner.launch_union_fusion(request_count)
+    union_out[:request_count].copy_(bufs.union_scores[:request_count])
 
 
 def _reference_union_scores(scores_rows: torch.Tensor, valid_widths: torch.Tensor) -> torch.Tensor:
