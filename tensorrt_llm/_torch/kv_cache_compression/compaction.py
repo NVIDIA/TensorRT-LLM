@@ -165,7 +165,10 @@ def init_compaction_buffers(
     ``kept_token_ordinals`` carries increasing kept decode ordinals (absolute
     positions) per request; prompt tokens never move, so the rectangle is
     prompt-length independent and ``prompt_offsets`` carries each request's
-    pinned prompt length. ``kv_block_offsets`` is the staged V2 snapshot
+    pinned prompt length. The increasing order is LOAD-BEARING:
+    sparseKvCacheCompactOp.cpp's forward tiled in-place copy requires
+    increasing source ordinals with ``destinationBases[request] + move <=
+    source[move]``. ``kv_block_offsets`` is the staged V2 snapshot
     ``[slot, request, K/V, block]`` (offset = ``2*page + plane``);
     ``protected_tail_capacity`` is the widest per-request tail this geometry
     must support -- actual per-round lengths arrive through the staged

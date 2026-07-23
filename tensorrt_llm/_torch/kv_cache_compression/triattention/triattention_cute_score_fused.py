@@ -274,8 +274,10 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             tcgen05.CtaGroup.ONE,
             self.mma_tiler[:2],
         )
-        # Split raw-K transport: two K_SW64 4-KiB stages per raw-page buffer,
-        # one each for the real and imaginary K bands.
+        # Split raw-K transport: one real and one imaginary stage per
+        # raw-page buffer, each a CTA_M x num_freqs bf16 tile
+        # (raw_tma_copy_bytes per phase); the descriptor encoder picks the
+        # SW64/SW128 swizzle from the num_freqs row width.
         raw_bf16_direct_a_smem_layout = sm100_utils.make_smem_layout_a(
             raw_bf16_tiled_mma,
             (CTA_M, N, self.num_freqs),
@@ -397,7 +399,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         self.shared_storage = SharedStorage
         # 64-bit: at large request counts this product exceeds 2^31 (the
         # score scratch spans request*layer segments of seq_len columns), so
-        # the head-plane stride must reach the kernel as Int64.
+        # the score-plane stride must reach the kernel as Int64.
         sum_seq = cutlass.Int64(request_count * self.num_layers * self.seq_len)
         num_ctas = request_count * self.num_layers * self.num_kv_heads * self.page_shards
         self.kernel(
@@ -514,8 +516,8 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         cpasync_raw_k_imag = cpasync_raw_k_0[(None, None, None, 1)]
         cpasync_raw_k_real_next = cpasync_raw_k_0[(None, None, None, 2)]
         cpasync_raw_k_imag_next = cpasync_raw_k_0[(None, None, None, 3)]
-        # Each stage slice retains the K_SW64 pointer flags.  Reuse only
-        # the feature-first outer mapping for the corresponding TMA
+        # Each stage slice retains the swizzled smem pointer flags.  Reuse
+        # only the feature-first outer mapping for the corresponding TMA
         # destination so the swizzle is not applied twice.
         raw_tma_source_tiles = cute.local_tile(
             raw_tma_source,
@@ -600,10 +602,10 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             swizzle=raw_bf16_b_smem_layout.inner,
         )
 
-        page_index = score_start // self.tile_tokens + page_shard
-        page_start = page_index * self.tile_tokens
-        shard_first_page_start = page_start
-        pages_processed = cutlass.Int32(0)
+        tile_index = score_start // self.tile_tokens + page_shard
+        tile_start_token = tile_index * self.tile_tokens
+        shard_first_tile_start_token = tile_start_token
+        tiles_processed = cutlass.Int32(0)
         if cutlass.const_expr(self.write_partial_stats):
             stats_page_scores_m128 = cute.make_rmem_tensor((N,), cutlass.Float32)
             stats_origins_m128 = cute.make_rmem_tensor((N,), cutlass.Float32)
@@ -622,16 +624,15 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             )
             physical_page_fragments = cute.make_rmem_tensor((self.pages_per_tile,), cutlass.Int32)
             prefetched_page_fragments = cute.make_rmem_tensor((self.pages_per_tile,), cutlass.Int32)
-        shard_has_page = valid_seq_len > score_start and page_start < valid_seq_len
-        empty_shard = valid_seq_len <= score_start or page_start >= valid_seq_len
+        shard_has_page = valid_seq_len > score_start and tile_start_token < valid_seq_len
+        empty_shard = valid_seq_len <= score_start or tile_start_token >= valid_seq_len
         if cutlass.dynamic_expr(shard_has_page):
             if warp_idx == self.producer_warp_id:
                 if lane_idx == 0:
                     # The staged K-plane entries encode physical_page *
-                    # kv_factor (2); decode to the pool page index here,
-                    # matching the production score kernel.
+                    # kv_factor (2); decode to the pool page index here.
                     producer_prefetched_page_id_lane0 = (
-                        cutlass.Int32(page_ids[page_off + page_index * self.pages_per_tile]) // 2
+                        cutlass.Int32(page_ids[page_off + tile_index * self.pages_per_tile]) // 2
                     )
                     if cutlass.const_expr(self.fragments_per_phase > 1):
                         for fragment in cutlass.range_constexpr(1, self.pages_per_tile):
@@ -641,11 +642,11 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                             # masked downstream) so the TMA never
                             # dereferences an unstaged block entry.
                             fragment_page_id = producer_prefetched_page_id_lane0
-                            if page_start + fragment * self.box_tokens < valid_seq_len:
+                            if tile_start_token + fragment * self.box_tokens < valid_seq_len:
                                 fragment_page_id = (
                                     cutlass.Int32(
                                         page_ids[
-                                            page_off + page_index * self.pages_per_tile + fragment
+                                            page_off + tile_index * self.pages_per_tile + fragment
                                         ]
                                     )
                                     // 2
@@ -839,8 +840,8 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                     raw_tma_producer_state.advance()
         while (
             valid_seq_len > score_start
-            and page_start < valid_seq_len
-            and pages_processed < self.max_tiles
+            and tile_start_token < valid_seq_len
+            and tiles_processed < self.max_tiles
         ):
             physical_page = cutlass.Int32(0)
             if warp_idx == self.producer_warp_id:
@@ -857,14 +858,15 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             for page_half in cutlass.range_constexpr(self.halves_per_page):
                 raw_page_buffer = cutlass.Int32(0)
                 if cutlass.const_expr(self.write_partial_stats):
-                    raw_page_buffer = pages_processed % RAW_PAGE_BUFFERS
+                    raw_page_buffer = tiles_processed % RAW_PAGE_BUFFERS
                 raw_real_stage = raw_page_buffer * 2
                 raw_imag_stage = raw_real_stage + 1
                 if cutlass.const_expr(not self.write_partial_stats):
                     if warp_idx == self.producer_warp_id:
-                        # Phase 0 fills the packed 4-KiB K_SW64 real
-                        # view. Every producer-warp lane participates
-                        # in the PipelineTmaAsync barrier election.
+                        # Phase 0 fills the packed real-band stage view
+                        # (CTA_M x num_freqs bf16, raw_tma_copy_bytes).
+                        # Every producer-warp lane participates in the
+                        # PipelineTmaAsync barrier election.
                         raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
                         for fragment in cutlass.range_constexpr(self.fragments_per_phase):
                             fragment_page = physical_page
@@ -919,17 +921,19 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                     next_page_id_lane0 = cutlass.Int32(0)
                     if warp_idx == self.producer_warp_id:
                         if lane_idx == 0:
-                            next_page_start = page_start + self.tile_tokens * self.page_shards
-                            next_pages_processed = pages_processed + 1
+                            next_tile_start_token = (
+                                tile_start_token + self.tile_tokens * self.page_shards
+                            )
+                            next_pages_processed = tiles_processed + 1
                             if (
-                                next_page_start < valid_seq_len
+                                next_tile_start_token < valid_seq_len
                                 and next_pages_processed < self.max_tiles
                             ):
                                 next_page_id_lane0 = (
                                     cutlass.Int32(
                                         page_ids[
                                             page_off
-                                            + (page_index + self.page_shards) * self.pages_per_tile
+                                            + (tile_index + self.page_shards) * self.pages_per_tile
                                         ]
                                     )
                                     // 2
@@ -941,14 +945,14 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                                         # fragment's page.
                                         next_fragment_page_id = next_page_id_lane0
                                         if (
-                                            next_page_start + fragment * self.box_tokens
+                                            next_tile_start_token + fragment * self.box_tokens
                                             < valid_seq_len
                                         ):
                                             next_fragment_page_id = (
                                                 cutlass.Int32(
                                                     page_ids[
                                                         page_off
-                                                        + (page_index + self.page_shards)
+                                                        + (tile_index + self.page_shards)
                                                         * self.pages_per_tile
                                                         + fragment
                                                     ]
@@ -988,10 +992,12 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                             prefetch_next_raw = True
                             prefetched_page_half = page_half + 1
                         else:
-                            next_page_start = page_start + self.tile_tokens * self.page_shards
-                            next_pages_processed = pages_processed + 1
+                            next_tile_start_token = (
+                                tile_start_token + self.tile_tokens * self.page_shards
+                            )
+                            next_pages_processed = tiles_processed + 1
                             prefetch_next_raw = (
-                                next_page_start < valid_seq_len
+                                next_tile_start_token < valid_seq_len
                                 and next_pages_processed < self.max_tiles
                             )
                             prefetched_physical_page = cute.arch.shuffle_sync(
@@ -1231,7 +1237,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                         )
                     acc_pipeline.producer_commit(acc_producer_state)
                     acc_producer_state.advance()
-                    if pages_processed == 0:
+                    if tiles_processed == 0:
                         if cutlass.const_expr(page_half == 0):
                             cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
                 acc_pipeline.consumer_wait(acc_consumer_state)
@@ -1242,12 +1248,17 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                     raw_tma_pipeline.consumer_release(raw_tma_consumer_state)
                     raw_tma_consumer_state.advance()
                 # Every term multiplying sum_seq must stay 64-bit: with
-                # request*layer segments of seq_len columns the head-plane
+                # request*layer segments of seq_len columns the score-plane
                 # stride alone can exceed 2^31. The scratch head axis is
                 # padded to the MMA tile N=8 per KV head (group-4 columns
-                # 4..7 land in padded planes holding zero scores).
+                # 4..7 land in padded score planes holding zero scores). The
+                # host audit in triattention.init_eviction_buffers bounds the
+                # 32-bit head-axis fold (kv_head * N <= 7 planes) here.
                 output_offset = (
-                    cutlass.Int64(kv_head * N) * sum_seq + out_base + page_start + page_half * CTA_M
+                    cutlass.Int64(kv_head * N) * sum_seq
+                    + out_base
+                    + tile_start_token
+                    + page_half * CTA_M
                 )
                 page_output = cute.make_tensor(
                     output.iterator + output_offset,
@@ -1285,7 +1296,8 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                         # only the straddling first tile takes the per-token
                         # branch.
                         if cutlass.dynamic_expr(
-                            page_start >= score_start and page_start + CTA_M <= self.seq_len
+                            tile_start_token >= score_start
+                            and tile_start_token + CTA_M <= self.seq_len
                         ):
                             cute.copy(
                                 simt_atom,
@@ -1293,7 +1305,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                                 tTR_gC[(None, None, None, subtile_idx)],
                             )
                         else:
-                            output_token = page_start + epilogue_tidx
+                            output_token = tile_start_token + epilogue_tidx
                             if cutlass.dynamic_expr(
                                 output_token >= score_start and output_token < self.seq_len
                             ):
@@ -1310,7 +1322,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                                 stats_page_scores_m128[stats_head] = cutlass.Float32(
                                     stats_output[stats_value]
                                 )
-                                if pages_processed == 0:
+                                if tiles_processed == 0:
                                     if cutlass.const_expr(page_half == 0):
                                         if tidx == 0:
                                             sStats[stats_head] = cutlass.Float32(
@@ -1329,11 +1341,11 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                     raw_tma_pipeline.consumer_release(raw_tma_consumer_state)
                     raw_tma_consumer_state.advance()
                 if cutlass.const_expr(self.write_partial_stats):
-                    if pages_processed == 0:
+                    if tiles_processed == 0:
                         if cutlass.const_expr(page_half == 0):
                             for stats_head in cutlass.range_constexpr(N):
                                 stats_origins_m128[stats_head] = sStats[stats_head]
-                    stats_token = page_start + tidx
+                    stats_token = tile_start_token + tidx
                     if tidx < EPILOGUE_THREADS:
                         if cutlass.dynamic_expr(
                             stats_token >= score_start and stats_token < valid_seq_len
@@ -1349,9 +1361,9 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                                 stats_square_sums_m128[stats_head] = (
                                     stats_square_sums_m128[stats_head] + stats_delta * stats_delta
                                 )
-            page_index += self.page_shards
-            page_start += self.tile_tokens * self.page_shards
-            pages_processed += 1
+            tile_index += self.page_shards
+            tile_start_token += self.tile_tokens * self.page_shards
+            tiles_processed += 1
         if warp_idx == self.producer_warp_id:
             raw_tma_pipeline.producer_tail(raw_tma_producer_state)
             acc_pipeline.producer_tail(acc_producer_state)
@@ -1381,13 +1393,17 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                         stats_scratch_base = 8 + (stats_warp * N + lane_idx) * 2
                         stats_sum = stats_sum + sStats[stats_scratch_base]
                         stats_square_sum = stats_square_sum + sStats[stats_scratch_base + 1]
-                    stats_count_i32 = pages_processed * self.tile_tokens
-                    if pages_processed > 0:
-                        stats_invalid_prefix = score_start - shard_first_page_start
+                    stats_count_i32 = tiles_processed * self.tile_tokens
+                    if tiles_processed > 0:
+                        stats_invalid_prefix = score_start - shard_first_tile_start_token
                         if cutlass.dynamic_expr(stats_invalid_prefix > 0):
                             stats_count_i32 = stats_count_i32 - stats_invalid_prefix
-                        stats_last_page = page_start - self.tile_tokens * self.page_shards
-                        stats_invalid_tail = stats_last_page + self.tile_tokens - valid_seq_len
+                        stats_last_tile_start_token = (
+                            tile_start_token - self.tile_tokens * self.page_shards
+                        )
+                        stats_invalid_tail = (
+                            stats_last_tile_start_token + self.tile_tokens - valid_seq_len
+                        )
                         if cutlass.dynamic_expr(stats_invalid_tail > 0):
                             stats_count_i32 = stats_count_i32 - stats_invalid_tail
                     stats_count = cutlass.Float32(stats_count_i32)
@@ -1724,6 +1740,9 @@ class TriAttentionCuteScoreRunner:
             small_stats = self._compiled_stats.get(1)
             large_stats = self._compiled_stats.get(max_requests)
             for request_count in range(1, max_requests + 1):
+                # Shard-pick heuristic: give small cohorts the extra page
+                # shard while the 2-shard grid stays under two waves
+                # (2 * sm_count CTAs); larger cohorts already fill the GPU.
                 two_shard_ctas = request_count * num_layers * num_kv_heads * 2
                 use_extra_score_shard = two_shard_ctas < 2 * self.sm_count
                 self._compiled[request_count] = (
@@ -1771,7 +1790,7 @@ class TriAttentionCuteScoreRunner:
                                 seq_len=seq_len,
                                 num_q_heads=num_q_heads,
                                 # The score scratch pads each KV head's group
-                                # of head planes to the MMA tile N=8; the
+                                # of score planes to the MMA tile N=8; the
                                 # finalizer maps real head rows onto those
                                 # padded planes (identity for GQA group 8).
                                 num_kv_heads=num_kv_heads,

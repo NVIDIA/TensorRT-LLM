@@ -33,13 +33,14 @@ namespace torch_ext
 {
 
 //! Adapt one uniform group of KVCacheManagerV2 HND layer pools to the
-//! existing sparse-KV post-FMHA updater. Layers share one V2 block-offset
-//! table; per-request destinationBases replace the former arbitrary
-//! destination tensor because every compaction move targets one contiguous
-//! interval per request. Within each request and KV head, the caller must
-//! supply increasing source ordinals with destinationBases[request] + move
-//! <= source[move], which makes the updater's forward tiled in-place copy
-//! safe.
+//! batched compaction kernels: dedicated double-buffered cp.async pipelined
+//! bf16 kernels, one CTA per (layer, KV head, request), addressed through a
+//! flat V2 K-plane block-offset table shared by all layers. Per-request
+//! destinationBases replace the former arbitrary destination tensor because
+//! every compaction move targets one contiguous interval per request.
+//! Within each request and KV head, the caller must supply increasing
+//! source ordinals with destinationBases[request] + move <= source[move],
+//! which makes the forward tiled in-place copy safe.
 void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor const& poolPointers,
     th::Tensor const& pageTable, th::Tensor const& sourceIndices, th::Tensor const& sourceOffsets,
     th::Tensor const& destinationBases, std::optional<th::Tensor> const& sourceLayerIndices)
@@ -64,7 +65,8 @@ void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor
     auto const batchSize = static_cast<int32_t>(pageTable.size(0));
     auto const pageTableRequestStride = pageTable.stride(0);
 
-    for (int32_t layer = 0; layer < numLayers; ++layer)
+    // Layer 0 defined the reference geometry in the firstPool checks above.
+    for (int32_t layer = 1; layer < numLayers; ++layer)
     {
         auto const& pool = pools[layer];
         TORCH_CHECK(pool.is_cuda() && pool.get_device() == device && pool.scalar_type() == dtype && pool.dim() == 5
@@ -115,7 +117,7 @@ void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor
 
     // source_offsets carve each request's move range out of source_indices;
     // the values live on device and the kernel trusts them. The index buffer
-    // may be wider than one round's total move count, so the head-plane
+    // may be wider than one round's total move count, so the head-row
     // stride passed below comes from the tensor shape, not from the offsets.
     TORCH_CHECK(sourceOffsets.is_cuda() && sourceOffsets.get_device() == device
             && sourceOffsets.scalar_type() == th::kInt32 && sourceOffsets.is_contiguous() && sourceOffsets.dim() == 1
@@ -133,7 +135,7 @@ void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor
     auto const sourceHeadStride = sourceIndices.size(-1);
     if (dtype == th::kBFloat16)
     {
-        tk::invokeSparseKvCacheCompactV2Layers<__nv_bfloat16>(poolPointers.data_ptr<int64_t>(),
+        tk::invokeSparseKvCacheCompactLayers<__nv_bfloat16>(poolPointers.data_ptr<int64_t>(),
             pageTable.data_ptr<int32_t>(), numLayers, pageTableRequestStride, sourceIndices.data_ptr<int32_t>(),
             sourceLayerPtr, sourceLayerStride, sourceHeadStride, sourceOffsets.data_ptr<int32_t>(), bases, batchSize,
             numKvHeads, tokensPerBlock, headDim, stream);

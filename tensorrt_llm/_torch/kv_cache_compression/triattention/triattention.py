@@ -347,11 +347,15 @@ def init_eviction_buffers(
     seg_page_off = slot_idx * block_offsets.stride(0) + req_idx * block_offsets.stride(1)
 
     max_segments = max_requests * bufs.num_layers
-    # Head axis pads to the MMA tile N=8; one padded scratch plane must stay
-    # 32-bit indexable (wraparound = silent wild reads, not a clean error).
+    # The K1 epilogue folds the head axis as a DSL dynamic coordinate
+    # (kv_head * N <= 7 score planes of max_segments * seq_len columns each),
+    # so the largest 32-bit-folded offset is 7 planes x the plane stride;
+    # every downstream i32 offset (including the seg_out_offset cast below)
+    # is bounded by it. Wraparound would be a silent wild read, not a clean
+    # error, hence the loud audit.
     if (8 - 1) * max_segments * seq_len >= 2**31:
         raise ValueError(
-            f"score bucket overflows the 32-bit scratch plane: {(8 - 1) * max_segments * seq_len}"
+            f"score bucket overflows the 32-bit score plane: {(8 - 1) * max_segments * seq_len}"
         )
     # The kernel scores each request's window into a head-major scratch;
     # all buffers below are persistent because the compiled kernels capture
@@ -359,6 +363,7 @@ def init_eviction_buffers(
     bufs.cute_scratch = torch.empty(
         bufs.num_kv_heads * 8 * max_segments * seq_len, dtype=torch.float32, device=device
     )
+    # int32 is safe here: covered by the 2^31 score-plane audit above.
     seg_out_offset = (torch.arange(max_segments, dtype=torch.int64, device=device) * seq_len).to(
         torch.int32
     )
@@ -451,6 +456,16 @@ def init_eviction_buffers(
             if eviction_mode == "per_head"
             else bufs.num_layers * bufs.num_kv_heads
         )
+        # The Triton stats/reduce/settle kernels fold score-row offsets in
+        # int32; both per-head rectangles must stay 32-bit indexable
+        # (wraparound = silent wild reads, not a clean error).
+        score_rect = max_requests * bufs.num_layers * bufs.num_q_heads * decode_width
+        selection_rect = max_requests * selection_rows * max(decode_width, keep_count)
+        if max(score_rect, selection_rect) >= 2**31:
+            raise ValueError(
+                f"per-head score rectangles overflow 32-bit indexing: "
+                f"scores {score_rect}, selection {selection_rect}"
+            )
         bufs.selection_rows_per_request = selection_rows
         bufs.row_prompt_offsets = torch.zeros(
             (max_requests * selection_rows,), dtype=torch.int32, device=device

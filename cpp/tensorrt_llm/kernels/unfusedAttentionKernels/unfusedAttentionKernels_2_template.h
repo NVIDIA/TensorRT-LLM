@@ -1758,23 +1758,24 @@ void invokeUpdateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
 
 #ifdef ENABLE_BF16
 
-// Optimized bf16 compaction fast path, ported from Fanrong Li's optimized
+// Pipelined bf16 compaction kernels, ported from Fanrong Li's optimized
 // compact kernels (snapshot 2026-07-19). The port keeps the double-buffered
-// cp.async pipeline intact and adapts only the addressing to this tree's ABI:
+// cp.async pipeline intact and adapts only the addressing to this
+// repository's KVCacheManagerV2 ABI:
 //  (a) the per-layer page-table pointer array became one flat int32 V2
 //      K-plane block-offset table shared by all layers (entries encode
 //      2 * page + plane with plane == 0, so >> 1 recovers the page), strided
 //      per request;
 //  (b) the host-scalar destination base became per-request device bases, read
 //      once per CTA (one launch covers a cohort with mixed prompt lengths);
-//  (c) the head-plane stride of the move-source indices is an explicit
+//  (c) the head-row stride of the move-source indices is an explicit
 //      parameter instead of being derived from sourceOffsets[batchSize] on
 //      device: the move buffers are allocation-wide, so a device-derived
 //      stride would silently read the wrong plane for every KV head above
 //      head 0.
 // The original kernels were written for 128-token pages and Dh = 64; the port
 // additionally parameterizes the page and head-vector math so 32-token pages
-// and Dh = 128 (this tree's production geometry) take the same pipeline.
+// and Dh = 128 (the production geometry here) take the same pipeline.
 
 namespace compact_detail
 {
@@ -1813,10 +1814,10 @@ __device__ __forceinline__ void waitGroup()
 } // namespace compact_detail
 
 // One pipeline stage moves a 32-token tile regardless of the page geometry.
-constexpr int32_t kSparseKvCompactFastTokensPerTile = 32;
+constexpr int32_t kSparseKvCompactTokensPerTile = 32;
 
 //! Launch parameters for the pipelined bf16 fast-path compaction kernels.
-struct SparseKvCacheCompactV2Bf16Params
+struct SparseKvCacheCompactBf16Params
 {
     int64_t const* poolPointers;
     int32_t const* pageTable;
@@ -1841,7 +1842,7 @@ struct SparseKvCacheCompactV2Bf16Params
 //! threadIdx.y walks the tokens of a tile.
 template <typename T, int32_t HeadDim, int32_t TokensPerBlock>
 __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
-    * kSparseKvCompactFastTokensPerTile) void sparseKvCacheCompactV2Bf16PipelineKernel(SparseKvCacheCompactV2Bf16Params
+    * kSparseKvCompactTokensPerTile) void sparseKvCacheCompactV2Bf16PipelineKernel(SparseKvCacheCompactBf16Params
         params)
 {
     static_assert(std::is_same_v<T, __nv_bfloat16>);
@@ -1852,7 +1853,7 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
     // 16B vectors per head: Dh64 -> 8 lanes (block 8x32 = 256 threads),
     // Dh128 -> 16 lanes (block 16x32 = 512 threads).
     constexpr int32_t kVectorsPerHead = HeadDim * sizeof(T) / sizeof(uint4);
-    constexpr int32_t kTokensPerTile = kSparseKvCompactFastTokensPerTile;
+    constexpr int32_t kTokensPerTile = kSparseKvCompactTokensPerTile;
     constexpr int32_t kVectorsPerTile = kTokensPerTile * kVectorsPerHead;
     // A buffer holds one K tile plus one V tile; two buffers ping-pong.
     constexpr int32_t kVectorsPerBuffer = 2 * kVectorsPerTile;
@@ -1872,15 +1873,16 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
     // without an explicit map, launch layer i reads source plane i (the flat
     // layout passes sourceLayerStride == 0, which collapses the term).
     int32_t const sourceLayer = params.sourceLayerIndices == nullptr ? layerIdx : params.sourceLayerIndices[layerIdx];
-    // Tip-ABI adaptation (c): head planes are strided by the allocation width
+    // ABI adaptation (c) -- see the port note above the compact_detail
+    // namespace: head rows are strided by the allocation width
     // of the move buffers; this request's range within a plane starts at
     // moveBegin.
     int64_t const sourceMoveBase = static_cast<int64_t>(sourceLayer) * params.sourceLayerStride
         + static_cast<int64_t>(kvHeadIdx) * params.sourceHeadStride + moveBegin;
-    // Tip-ABI adaptation (b): per-request landing position.
+    // ABI adaptation (b) -- see the port note above the compact_detail namespace: per-request landing position.
     int32_t const destinationBase = params.destinationBases[batchIdx];
     auto* const pool = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params.poolPointers[layerIdx]));
-    // Tip-ABI adaptation (a): flat V2 K-plane block-offset table; each lookup
+    // ABI adaptation (a) -- see the port note above the compact_detail namespace: flat V2 K-plane block-offset table; each lookup
     // below decodes an entry to a page with >> 1. TokensPerBlock is a
     // compile-time power of two, so / and % lower to shifts and masks.
     int32_t const* const pageTable = params.pageTable + static_cast<int64_t>(batchIdx) * params.pageTableRequestStride;
@@ -1996,7 +1998,7 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
 //! helper below).
 template <typename T, int32_t HeadDim, int32_t TokensPerBlock>
 __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
-    * kSparseKvCompactFastTokensPerTile) void sparseKvCacheCompactV2Bf16DestinationPagePipelineKernel(SparseKvCacheCompactV2Bf16Params
+    * kSparseKvCompactTokensPerTile) void sparseKvCacheCompactV2Bf16DestinationPagePipelineKernel(SparseKvCacheCompactBf16Params
         params)
 {
     static_assert(std::is_same_v<T, __nv_bfloat16>);
@@ -2004,7 +2006,7 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
     static_assert(TokensPerBlock == 32 || TokensPerBlock == 128);
     constexpr int32_t kBufferCount = 2;
     constexpr int32_t kVectorsPerHead = HeadDim * sizeof(T) / sizeof(uint4);
-    constexpr int32_t kTokensPerTile = kSparseKvCompactFastTokensPerTile;
+    constexpr int32_t kTokensPerTile = kSparseKvCompactTokensPerTile;
     constexpr int32_t kVectorsPerTile = kTokensPerTile * kVectorsPerHead;
     constexpr int32_t kVectorsPerBuffer = 2 * kVectorsPerTile;
 
@@ -2143,10 +2145,10 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
 }
 
 template <typename T, int32_t HeadDim, int32_t TokensPerBlock>
-void launchSparseKvCacheCompactV2Bf16Pipeline(SparseKvCacheCompactV2Bf16Params const& params, cudaStream_t stream)
+void launchSparseKvCacheCompactV2Bf16Pipeline(SparseKvCacheCompactBf16Params const& params, cudaStream_t stream)
 {
     constexpr int32_t kVectorsPerHead = HeadDim * sizeof(T) / sizeof(uint4);
-    dim3 const block(kVectorsPerHead, kSparseKvCompactFastTokensPerTile);
+    dim3 const block(kVectorsPerHead, kSparseKvCompactTokensPerTile);
     dim3 const grid(params.numLayers, params.numKvHeads, params.batchSize);
     // Two ping-pong buffers x (K tile + V tile) of 32 tokens x kVectorsPerHead
     // 16B vectors:
@@ -2154,28 +2156,28 @@ void launchSparseKvCacheCompactV2Bf16Pipeline(SparseKvCacheCompactV2Bf16Params c
     //   Dh128: 4 * 32 * 16 * 16 B = 32 KiB
     // Both fit the 48 KiB per-CTA dynamic shared memory default, so no
     // cudaFuncSetAttribute opt-in is required.
-    size_t const sharedBytes = 4 * kSparseKvCompactFastTokensPerTile * kVectorsPerHead * sizeof(uint4);
+    size_t const sharedBytes = 4 * kSparseKvCompactTokensPerTile * kVectorsPerHead * sizeof(uint4);
     sparseKvCacheCompactV2Bf16PipelineKernel<T, HeadDim, TokensPerBlock><<<grid, block, sharedBytes, stream>>>(params);
 }
 
 template <typename T, int32_t HeadDim, int32_t TokensPerBlock>
 void launchSparseKvCacheCompactV2Bf16DestinationPagePipeline(
-    SparseKvCacheCompactV2Bf16Params const& params, cudaStream_t stream)
+    SparseKvCacheCompactBf16Params const& params, cudaStream_t stream)
 {
     constexpr int32_t kDestinationPageBuffers = 2;
     constexpr int32_t kVectorsPerHead = HeadDim * sizeof(T) / sizeof(uint4);
-    dim3 const block(kVectorsPerHead, kSparseKvCompactFastTokensPerTile);
+    dim3 const block(kVectorsPerHead, kSparseKvCompactTokensPerTile);
     dim3 const grid(params.numLayers, params.numKvHeads, params.batchSize);
     // Same 16/32 KiB tile buffers as the plain pipeline plus two staged
     // destination page indices; still far below the 48 KiB default.
-    size_t const sharedBytes = 4 * kSparseKvCompactFastTokensPerTile * kVectorsPerHead * sizeof(uint4)
+    size_t const sharedBytes = 4 * kSparseKvCompactTokensPerTile * kVectorsPerHead * sizeof(uint4)
         + kDestinationPageBuffers * sizeof(int32_t);
     sparseKvCacheCompactV2Bf16DestinationPagePipelineKernel<T, HeadDim, TokensPerBlock>
         <<<grid, block, sharedBytes, stream>>>(params);
 }
 
 template <typename T, int32_t HeadDim, int32_t TokensPerBlock>
-void dispatchSparseKvCacheCompactV2FastGeometry(SparseKvCacheCompactV2Bf16Params const& params, cudaStream_t stream)
+void dispatchSparseKvCacheCompactGeometry(SparseKvCacheCompactBf16Params const& params, cudaStream_t stream)
 {
     // The destination-page variant requires every request's destination base
     // to be 32-token tile aligned so each tile lands in one page, but the
@@ -2369,7 +2371,7 @@ void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
 }
 
 template <typename T>
-void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t const* pageTable, int32_t numLayers,
+void invokeSparseKvCacheCompactLayers(int64_t const* poolPointers, int32_t const* pageTable, int32_t numLayers,
     int64_t pageTableRequestStride, int32_t const* sparseKvIndices, int32_t const* sourceLayerIndices,
     int64_t sourceLayerStride, int64_t sourceHeadStride, int32_t const* sparseKvOffsets,
     int32_t const* destinationBases, int32_t batchSize, int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim,
@@ -2385,7 +2387,7 @@ void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t con
         // dtypes and geometries fail the check below instead of falling back.
         if ((headDim == 64 || headDim == 128) && (tokensPerBlock == 32 || tokensPerBlock == 128))
         {
-            SparseKvCacheCompactV2Bf16Params fastParams{};
+            SparseKvCacheCompactBf16Params fastParams{};
             fastParams.poolPointers = poolPointers;
             fastParams.pageTable = pageTable;
             fastParams.sourceIndices = sparseKvIndices;
@@ -2402,19 +2404,19 @@ void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t con
             fastParams.bytesPerPage = 2 * fastParams.bytesPerKvHalf;
             if (headDim == 64 && tokensPerBlock == 32)
             {
-                dispatchSparseKvCacheCompactV2FastGeometry<T, 64, 32>(fastParams, stream);
+                dispatchSparseKvCacheCompactGeometry<T, 64, 32>(fastParams, stream);
             }
             else if (headDim == 64 && tokensPerBlock == 128)
             {
-                dispatchSparseKvCacheCompactV2FastGeometry<T, 64, 128>(fastParams, stream);
+                dispatchSparseKvCacheCompactGeometry<T, 64, 128>(fastParams, stream);
             }
             else if (headDim == 128 && tokensPerBlock == 32)
             {
-                dispatchSparseKvCacheCompactV2FastGeometry<T, 128, 32>(fastParams, stream);
+                dispatchSparseKvCacheCompactGeometry<T, 128, 32>(fastParams, stream);
             }
             else
             {
-                dispatchSparseKvCacheCompactV2FastGeometry<T, 128, 128>(fastParams, stream);
+                dispatchSparseKvCacheCompactGeometry<T, 128, 128>(fastParams, stream);
             }
             return;
         }
@@ -2442,8 +2444,8 @@ void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t con
         QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);                                         \
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#define INSTANTIATE_SPARSE_KV_CACHE_COMPACT_V2_LAYERS(T)                                                               \
-    template void invokeSparseKvCacheCompactV2Layers<T>(int64_t const*, int32_t const*, int32_t, int64_t,              \
+#define INSTANTIATE_SPARSE_KV_CACHE_COMPACT_LAYERS(T)                                                               \
+    template void invokeSparseKvCacheCompactLayers<T>(int64_t const*, int32_t const*, int32_t, int64_t,              \
         int32_t const*, int32_t const*, int64_t, int64_t, int32_t const*, int32_t const*, int32_t, int32_t, int32_t,   \
         int32_t, cudaStream_t);
 

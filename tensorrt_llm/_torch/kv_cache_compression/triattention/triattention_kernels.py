@@ -376,6 +376,12 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     half away, packing pre-settled ordinals read from ``output_indices`` --
     the draft co-compaction flow, whose keep set is the target's and needs
     no settling.
+
+    The increasing-ordinal emission and the tail placement are LOAD-BEARING
+    for the consumer: sparseKvCacheCompactOp.cpp's forward tiled in-place
+    copy requires increasing source ordinals with
+    ``destinationBases[request] + move <= source[move]`` (the SWA window
+    inequality is the SWA-family instance of the same invariant).
     """
     request = tl.program_id(0)
     selection_domain = tl.program_id(1)

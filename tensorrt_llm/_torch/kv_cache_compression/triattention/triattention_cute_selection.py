@@ -46,7 +46,13 @@ def _select_normalize_union_config(
     width: int,
     sm_count: int,
 ) -> tuple[int, int, int]:
-    """Return tokens per lane, token subtiles, and row-cluster CTAs."""
+    """Return tokens per lane, token subtiles, and row-cluster CTAs.
+
+    Heuristic: prefer the small token tile (more CTAs, cluster-widened per
+    row) while the whole grid still fits the residency bound below; past it,
+    fall back to the large tile with no clustering so each CTA carries more
+    tokens instead of oversubscribing the SMs.
+    """
     row_cluster_ctas = max(1, _MAX_ROW_CLUSTER_CTAS // request_count)
     small_token_tile = _WARP_SIZE * _SMALL_TOKENS_PER_LANE * _SMALL_TOKEN_SUBTILES
     token_tiles = (width + small_token_tile - 1) // small_token_tile
@@ -127,8 +133,8 @@ class _TriAttentionNormalizeUnionKernel:
         token_subtiles: int,
         row_cluster_ctas: int,
     ) -> None:
-        # The score scratch pads each KV head's group of head planes up to
-        # the MMA tile: real head row ``q_head`` lives in scratch plane
+        # The score scratch pads each KV head's group of score planes up to
+        # the MMA tile: real head row ``q_head`` lives in score plane
         # ``kv * 8 + qg``. The partial-stats rows are always compact.
         self.score_group_size = num_q_heads // num_kv_heads
         self.score_head_pad = _PADDED_HEAD_COLUMNS - self.score_group_size
@@ -178,6 +184,10 @@ class _TriAttentionNormalizeUnionKernel:
                 stream=stream,
             )
         else:
+            # 1D-flattened cluster grid: the X extent is divisible by the
+            # cluster size and cluster peers are consecutive CTAs, so the
+            # kernel's (request, token-tile, rank) decode must keep exactly
+            # this factor order.
             kernel.launch(
                 grid=(
                     request_count * self.num_token_tiles * self.row_cluster_ctas,
@@ -452,7 +462,11 @@ class _TriAttentionNormalizeUnionKernel:
                     subtile_first_token = first_token + token_subtile * self.subtile_token_tile
                     # The output row covers this request's own window,
                     # [0, valid - start); the straddling subtile falls back
-                    # to the per-token stores.
+                    # to the per-token stores. union_scores spans
+                    # request_count * width < 2^31 by the host score-plane
+                    # audit (triattention.init_eviction_buffers), so the i32
+                    # union_index cannot wrap here -- unlike the scratch,
+                    # whose offsets fold through Int64.
                     if cutlass.const_expr(
                         self.width % self.tokens_per_lane == 0
                     ) and cutlass.dynamic_expr(
@@ -517,7 +531,8 @@ class _TriAttentionNormalizeUnionKernel:
                             )
                         reduced_values[token_slot] = union_value
                     subtile_first_token = first_token + token_subtile * self.subtile_token_tile
-                    # Same per-request output domain as the single-CTA path.
+                    # Same per-request output domain (and the same host-audit
+                    # bound on the i32 union_index) as the single-CTA path.
                     if cutlass.const_expr(
                         self.width % self.tokens_per_lane == 0
                     ) and cutlass.dynamic_expr(
