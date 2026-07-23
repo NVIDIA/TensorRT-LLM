@@ -83,6 +83,145 @@ TIE_MARGIN = float(os.environ.get("INKLING_GP_TIE_MARGIN", "0.75"))
 REPEAT_THRESH = int(os.environ.get("INKLING_GP_REPEAT_THRESH", "8"))
 MIN_UNIQUE = int(os.environ.get("INKLING_GP_MIN_UNIQUE", "3"))
 
+# ---- DETERMINISTIC measurement config (human feedback #3 / #4) ----------------
+# INKLING_DETERMINISTIC=1 makes batch=1 + autotuner-off the PRIMARY deterministic
+# baseline so run-to-run noise stops contaminating every parity number. Two named
+# non-determinism sources are removed:
+#   (1) the CROSS-ROW atomic reduction in the BATCHED fused-MoE combine (float add
+#       is non-associative; atomicAdd order is unfixed at batch>1) -- gone at
+#       max_batch_size=1 (a single row has no cross-row reduction);
+#   (2) the AUTOTUNER, which times candidate kernel tactics at warmup and can pick a
+#       different tactic across runs on timing noise -> different accumulation order
+#       -- disabled by enable_autotuner=False (every tunable op takes its fixed
+#       fallback tactic, no warmup timing at all).
+# The driving sbatch additionally exports TLLM_DISABLE_ALLREDUCE_AUTOTUNE=1 so the
+# TP=4 all-reduce also uses a fixed strategy instead of an AUTO-tuned one.
+# Default 0 preserves the official crit7 gate config (max_batch_size=8, autotuner
+# on) byte-for-byte -- this is a measurement-hygiene switch, NOT a gate relaxation.
+DETERMINISTIC = os.environ.get("INKLING_DETERMINISTIC", "0") == "1"
+MAX_BS = 1 if DETERMINISTIC else int(os.environ.get("INKLING_GP_MAX_BS", "8"))
+ENABLE_AUTOTUNER = not DETERMINISTIC
+# Optional fingerprint artifact for the two-run byte-identical determinism proof.
+FINGERPRINT_OUT = os.environ.get("INKLING_GP_FINGERPRINT_OUT", "")
+# Documented rounding for the stable per-step logit checksum (acceptance crit12:
+# "byte-identical ... final logits or stable logit checksums"). TRT's top-K
+# log-probs are rounded to LOGIT_ROUND decimals before hashing so bit-noise in
+# float repr cannot create a false determinism MISMATCH, while any real change in
+# TRT's output distribution (top-K membership or a value beyond ~1e-5) flips the
+# checksum. Default 5 decimals; override via INKLING_GP_LOGIT_ROUND.
+LOGIT_ROUND = int(os.environ.get("INKLING_GP_LOGIT_ROUND", "5"))
+
+
+def _repo_provenance():
+    """Repo-SHA + dirty-source identity for the deterministic run (acceptance
+    crit12: each artifact must carry "job id/config/repo SHA provenance").
+
+    Prefer the values the driving sbatch captured from the mounted TensorRT-LLM
+    checkout and exported (INKLING_DET_REPO_SHA / _DIRTY / _DIFF_SHA) -- that is
+    the authoritative same-path mount the run actually executed on. Fall back to
+    computing them here from this test file's own git repo (via subprocess) so the
+    provenance field is never empty even when the test is run directly without the
+    sbatch wrapper. Returns (repo_sha, dirty_file_count, diff_sha) all as strings;
+    diff_sha is a short sha256 over `git diff HEAD` so two runs of the SAME working
+    tree share one dirty-source identity while any uncommitted edit changes it.
+    """
+    sha = os.environ.get("INKLING_DET_REPO_SHA", "").strip()
+    dirty = os.environ.get("INKLING_DET_REPO_DIRTY", "").strip()
+    diff_sha = os.environ.get("INKLING_DET_REPO_DIFF_SHA", "").strip()
+    if sha and dirty and diff_sha:
+        return sha, dirty, diff_sha
+    import subprocess
+    import hashlib
+    repo = os.path.dirname(os.path.abspath(__file__))
+
+    def _git(args):
+        try:
+            r = subprocess.run(["git", "-C", repo, *args],
+                               capture_output=True, text=True, timeout=30)
+            return r.stdout
+        except Exception:  # noqa: BLE001
+            return ""
+
+    if not sha:
+        sha = _git(["rev-parse", "HEAD"]).strip() or "unknown"
+    if not dirty:
+        porcelain = _git(["status", "--porcelain"])
+        dirty = str(len([ln for ln in porcelain.splitlines() if ln.strip()]))
+    if not diff_sha:
+        diff = _git(["diff", "HEAD"])
+        diff_sha = hashlib.sha256(diff.encode()).hexdigest()[:16]
+    return sha, dirty, diff_sha
+
+
+def _canon_blob(fr_records, tf_records, counts):
+    """Canonical byte blob over the determinism-relevant discrete state AND the
+    stable per-step logit checksum.
+
+    Acceptance crit12 requires two deterministic runs to be byte-identical for
+    greedy token ids, the tf_mismatch / near-tie / confident counts, AND
+    "final logits or stable logit checksums". The blob hashes exactly those:
+    every free-run greedy token id sequence, every teacher-forced per-step
+    (t, trt, sg, match, lp_ck) tuple -- where lp_ck is the stable logit checksum
+    of TRT's top-K log-probs at that step (see _lp_checksum) -- and the summary
+    counts. The raw cos/max_abs floats stay OUT of the hash (they are the
+    TRT-vs-SGLang gap, reported separately via tf_min_cos); the determinism of
+    TRT's own logits is carried by lp_ck, which is rounded to LOGIT_ROUND decimals
+    so float-repr noise cannot create a false MISMATCH.
+    """
+    canon = {
+        "freerun": [[rec["prompt"], list(rec["token_ids"])]
+                    for rec in fr_records],
+        "teacher": [[rec["prompt"],
+                     [[s["t"], s["trt"], s["sg"], int(s["match"]),
+                       s.get("lp_ck", "")]
+                      for s in rec["steps"]]]
+                    for rec in tf_records],
+        "counts": list(counts),
+    }
+    return json.dumps(canon, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _fingerprint_sha(fr_records, tf_records, counts):
+    """sha256 of the canonical determinism blob (see _canon_blob)."""
+    import hashlib
+    return hashlib.sha256(_canon_blob(fr_records, tf_records, counts)).hexdigest()
+
+
+def _logit_checksum(tf_records):
+    """Aggregate stable logit checksum over every teacher-forced step (acceptance
+    crit12 "stable logit checksums"). Deterministic function of the per-step lp_ck
+    values (TRT top-K log-probs rounded to LOGIT_ROUND decimals, see _lp_checksum),
+    keyed by (prompt, step) so ordering is fixed. A separate, directly-comparable
+    field from sha256 so cmd_det can assert the logit values -- not just the greedy
+    decisions -- are byte-identical run-to-run. Steps with no TRT log-probs
+    contribute an empty lp_ck, so a run where TRT emits nothing is still captured.
+    """
+    import hashlib
+    parts = []
+    for rec in tf_records:
+        for s in rec["steps"]:
+            parts.append(f"{rec['prompt']}|{s['t']}|{s.get('lp_ck', '')}")
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def _worst_step(tf_records):
+    """Feedback #4 Stage A: the teacher-forced step with MAX TRT-vs-SGLang logit
+    divergence (lowest cosine over the shared vocab support). Returns the
+    (prompt, t, cos, max_abs, sg, trt) of that step, or None if no step carried a
+    finite cosine. This is the (sample_id, token_position) Stage A must output.
+    """
+    worst = None
+    for rec in tf_records:
+        for s in rec["steps"]:
+            c = s.get("cos")
+            if c is None:
+                continue
+            if worst is None or c < worst["cos"]:
+                worst = {"prompt": rec["prompt"], "t": s["t"], "cos": c,
+                         "max_abs": s.get("max_abs"), "sg": s["sg"],
+                         "trt": s["trt"]}
+    return worst
+
 
 def _sg_margin(sg_top):
     """SGLang top1-top2 log-prob margin (nats); large if only one entry."""
@@ -123,6 +262,29 @@ def _lp_dict(lp_entry):
     return {int(k): float(getattr(v, "logprob", v)) for k, v in lp_entry.items()}
 
 
+def _lp_checksum(trt_lp_dict):
+    """Stable per-step logit checksum: sha over TRT's top-K (token_id, rounded
+    log-prob) pairs (acceptance crit12 "stable logit checksums ... with documented
+    rounding"). Values are rounded to LOGIT_ROUND decimals (default 5) and -0.0 is
+    normalized to 0.0 so identical float64 outputs hash identically and sub-1e-5
+    repr noise cannot create a false determinism MISMATCH, while any real change in
+    TRT's output distribution (top-K membership or a value) flips the checksum.
+    Returns "" when the step carried no TRT log-probs (e.g. TRT emitted nothing),
+    which is itself a determinism-relevant, comparable state.
+    """
+    if not trt_lp_dict:
+        return ""
+    import hashlib
+
+    def _q(x):
+        v = round(float(x), LOGIT_ROUND)
+        return 0.0 if v == 0.0 else v  # normalize -0.0 -> 0.0
+
+    items = sorted((int(tid), _q(lp)) for tid, lp in trt_lp_dict.items())
+    blob = json.dumps(items, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
 def teacher_force(llm, SamplingParams, TokensPrompt, input_ids, sg_ids, sg_top):
     """Restart-on-fork teacher-forced greedy decode against the SGLang tokens.
 
@@ -149,7 +311,8 @@ def teacher_force(llm, SamplingParams, TokensPrompt, input_ids, sg_ids, sg_top):
             margin = _sg_margin(sg_top[t])
             per_step.append(dict(t=t, trt=-1, sg=int(sg_ids[t]), match=False,
                                  margin=margin, neartie=(margin < TIE_MARGIN),
-                                 cos=float("nan"), max_abs=float("nan")))
+                                 cos=float("nan"), max_abs=float("nan"),
+                                 lp_ck=""))
             forced = list(input_ids) + list(sg_ids[:t + 1])
             t += 1
             continue
@@ -162,11 +325,12 @@ def teacher_force(llm, SamplingParams, TokensPrompt, input_ids, sg_ids, sg_top):
             sg = int(sg_ids[tt_t])
             margin = _sg_margin(sg_top[tt_t])
             match = (int(tt) == sg)
-            mx, cos, _ = _lp_stats(_lp_dict(trt_lps[i]) if i < len(trt_lps)
-                                   else {}, sg_top[tt_t])
+            trt_lp = _lp_dict(trt_lps[i]) if i < len(trt_lps) else {}
+            mx, cos, _ = _lp_stats(trt_lp, sg_top[tt_t])
             per_step.append(dict(t=tt_t, trt=int(tt), sg=sg, match=match,
                                  margin=margin, neartie=(margin < TIE_MARGIN),
-                                 cos=cos, max_abs=mx))
+                                 cos=cos, max_abs=mx,
+                                 lp_ck=_lp_checksum(trt_lp)))
             consumed += 1
             if not match:
                 forced = list(input_ids) + list(sg_ids[:tt_t + 1])
@@ -182,7 +346,8 @@ def teacher_force(llm, SamplingParams, TokensPrompt, input_ids, sg_ids, sg_top):
                 per_step.append(dict(t=next_t, trt=-1, sg=int(sg_ids[next_t]),
                                      match=False, margin=margin,
                                      neartie=(margin < TIE_MARGIN),
-                                     cos=float("nan"), max_abs=float("nan")))
+                                     cos=float("nan"), max_abs=float("nan"),
+                                     lp_ck=""))
                 forced = list(input_ids) + list(sg_ids[:next_t + 1])
                 t = next_t + 1
     return per_step, n_calls
@@ -208,7 +373,11 @@ def main() -> int:
     assert len(ref) >= 5, f"need >=5 prompts with >={NSTEP} ref tokens, got {len(ref)}"
     tok = AutoTokenizer.from_pretrained(CKPT, trust_remote_code=True)
     print(f"[gp] tp={TP} cuda_graph={CUDA_GRAPH} overlap={OVERLAP} n_prompts={len(ref)} "
-          f"steps={NSTEP} topk={TOPK} tie_margin={TIE_MARGIN} ref={REF}", flush=True)
+          f"steps={NSTEP} topk={TOPK} tie_margin={TIE_MARGIN} "
+          f"deterministic={DETERMINISTIC} max_batch_size={MAX_BS} "
+          f"enable_autotuner={ENABLE_AUTOTUNER} "
+          f"allreduce_autotune_disabled={os.environ.get('TLLM_DISABLE_ALLREDUCE_AUTOTUNE', '0')} "
+          f"ref={REF}", flush=True)
 
     moe_backend = os.environ.get("INKLING_MOE_BACKEND", "CUTLASS")
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
@@ -222,13 +391,15 @@ def main() -> int:
         kv_cache_config=kv_cache_config,
         cuda_graph_config=CudaGraphConfig() if CUDA_GRAPH else None,
         disable_overlap_scheduler=not OVERLAP,
+        enable_autotuner=ENABLE_AUTOTUNER,
         max_seq_len=2048,
-        max_batch_size=8,
+        max_batch_size=MAX_BS,
         max_num_tokens=2048,
     )
     hard_path = "CudaGraphConfig()" if CUDA_GRAPH else "eager(no-graph)"
-    print(f"[gp] moe_backend={moe_backend} cuda_graph_hard_path={hard_path}",
-          flush=True)
+    print(f"[gp] moe_backend={moe_backend} cuda_graph_hard_path={hard_path} "
+          f"deterministic={DETERMINISTIC} max_batch_size={MAX_BS} "
+          f"enable_autotuner={ENABLE_AUTOTUNER}", flush=True)
 
     def decode(ids):
         try:
@@ -243,9 +414,12 @@ def main() -> int:
             prompts, SamplingParams(max_tokens=NSTEP, temperature=0.0))
         collapse = []
         fr_matchlens = []
+        fr_records = []  # per-prompt free-run greedy token ids (determinism proof)
         for r, out in zip(ref, fr_out):
             trt_ids = list(out.outputs[0].token_ids)
             sg_ids = r["greedy_token_ids"]
+            fr_records.append({"prompt": r["prompt"],
+                               "token_ids": [int(x) for x in trt_ids]})
             # leading per-step match length (diagnostic only)
             ml = 0
             for a, b in zip(trt_ids, sg_ids[:NSTEP]):
@@ -279,10 +453,19 @@ def main() -> int:
         tf_neartie = 0       # subset of tf_bad at a tiny SGLang margin (diagnostic)
         tf_total = 0
         tf_min_cos = float("inf")
+        tf_records = []      # per-prompt per-step records (determinism proof + Stage A)
         for r in ref:
             per_step, n_calls = teacher_force(
                 llm, SamplingParams, TokensPrompt,
                 r["input_ids"], r["greedy_token_ids"], r["pos_top"])
+            tf_records.append({"prompt": r["prompt"], "steps": [
+                {"t": s["t"], "trt": int(s["trt"]), "sg": int(s["sg"]),
+                 "match": bool(s["match"]), "neartie": bool(s["neartie"]),
+                 "cos": (None if math.isnan(s["cos"]) else round(s["cos"], 6)),
+                 "max_abs": (None if math.isnan(s["max_abs"])
+                             else round(s["max_abs"], 6)),
+                 "lp_ck": s.get("lp_ck", "")}
+                for s in per_step]})
             mism = [s for s in per_step if not s["match"]]
             near = [s for s in mism if s["neartie"]]
             tf_neartie += len(near)
@@ -333,6 +516,73 @@ def main() -> int:
           f"freerun_min_matchlen={fr_min_ml}/{NSTEP} "
           f"min_cos={tf_min_cos:.5f} cuda_graph={CUDA_GRAPH} "
           f"overlap={OVERLAP} cuda_graph_hard_path={hard_path}", flush=True)
+
+    # ---- DETERMINISM FINGERPRINT + Stage-A worst step (feedback #3 / #4) ------
+    # sha256 over greedy token ids + teacher per-step decisions + counts. Two
+    # deterministic runs of the SAME code must print the SAME sha (byte-identical).
+    tf_confident = n_bad - tf_neartie
+    counts = [n_bad, tf_neartie, tf_confident, n_collapse, fr_min_ml]
+    sha = _fingerprint_sha(fr_records, tf_records, counts)
+    logit_ck = _logit_checksum(tf_records)
+    worst = _worst_step(tf_records)
+    # Provenance (acceptance crit12): job id + repo SHA + dirty-source identity.
+    # job_id prefers the sbatch-exported INKLING_DET_JOB_ID because SLURM_JOB_ID is
+    # not reliably propagated into the pyxis --container-name login shell (it landed
+    # empty in the iter-25/26 artifacts); SLURM_JOB_ID stays as a fallback.
+    prov_sha, prov_dirty, prov_diff_sha = _repo_provenance()
+    fp = {
+        "config": {"tp": TP, "cuda_graph": CUDA_GRAPH, "overlap": OVERLAP,
+                   "moe_backend": moe_backend, "max_batch_size": MAX_BS,
+                   "enable_autotuner": ENABLE_AUTOTUNER,
+                   "deterministic": DETERMINISTIC,
+                   "allreduce_autotune_disabled":
+                   os.environ.get("TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0"),
+                   "cublas_workspace_config":
+                   os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
+                   "logit_round": LOGIT_ROUND,
+                   "job_id": (os.environ.get("INKLING_DET_JOB_ID")
+                              or os.environ.get("SLURM_JOB_ID", "")),
+                   "repo_sha": prov_sha,
+                   "repo_dirty_files": prov_dirty,
+                   "repo_diff_sha": prov_diff_sha,
+                   "tag": os.environ.get("INKLING_DET_TAG", ""),
+                   "ref": REF, "steps": NSTEP, "tie_margin": TIE_MARGIN,
+                   "n_prompts": len(ref)},
+        "summary": {"tf_mismatch_steps": n_bad, "tf_neartie_flips": tf_neartie,
+                    "tf_confident": tf_confident, "freerun_collapse": n_collapse,
+                    "freerun_min_matchlen": fr_min_ml,
+                    "tf_min_cos": (None if math.isnan(tf_min_cos)
+                                   else round(tf_min_cos, 6))},
+        "worst_step": worst,
+        "freerun": fr_records,
+        "teacher": tf_records,
+        "sha256": sha,
+        "logit_checksum": logit_ck,
+    }
+    if FINGERPRINT_OUT:
+        try:
+            with open(FINGERPRINT_OUT, "w") as f:
+                json.dump(fp, f, sort_keys=True)
+            print(f"[gp] fingerprint written: {FINGERPRINT_OUT}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[gp] WARN fingerprint write failed: {e}", flush=True)
+    print(f"INKLING_GP_FINGERPRINT sha256={sha} logit_checksum={logit_ck} "
+          f"logit_round={LOGIT_ROUND} deterministic={DETERMINISTIC} "
+          f"max_batch_size={MAX_BS} enable_autotuner={ENABLE_AUTOTUNER} "
+          f"job_id={fp['config']['job_id']} repo_sha={prov_sha} "
+          f"repo_dirty_files={prov_dirty} repo_diff_sha={prov_diff_sha} "
+          f"tf_mismatch_steps={n_bad} tf_neartie={tf_neartie} "
+          f"tf_confident={tf_confident} freerun_collapse={n_collapse}/{len(ref)}",
+          flush=True)
+    if worst is not None:
+        wtxt_sg = decode([worst["sg"]])
+        wtxt_trt = decode([worst["trt"]])
+        print(f"INKLING_GP_WORSTSTEP prompt={worst['prompt']!r} t={worst['t']} "
+              f"cos={worst['cos']} max_abs={worst['max_abs']} "
+              f"sg={worst['sg']}({wtxt_sg!r}) trt={worst['trt']}({wtxt_trt!r})",
+              flush=True)
+    else:
+        print("INKLING_GP_WORSTSTEP none (no finite-cosine step)", flush=True)
     return 0 if ok else 1
 
 

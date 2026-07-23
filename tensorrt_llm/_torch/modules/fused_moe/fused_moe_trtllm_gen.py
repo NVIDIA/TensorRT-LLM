@@ -255,6 +255,20 @@ class TRTLLMGenFusedMoE(MoE):
         backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
         self.op_backend: MoEOpBackend = get_op_backend(backend_name)
 
+        # Env-gated (default off) positive dispatch evidence: which routed-expert
+        # fp4 op backend actually got selected. Used to prove that the FlashInfer
+        # fp4 path (flashinfer::trtllm_fp4_block_scale_moe -- SGLang's kernel) was
+        # really chosen vs a silent fall-through to the trtllm-gen blockScaleMoe
+        # runner. Zero cost when INKLING_LOG_MOE_OPBACKEND is unset.
+        if os.environ.get("INKLING_LOG_MOE_OPBACKEND") == "1":
+            print(
+                f"[inkling-moe-opbackend] TRTLLMGenFusedMoE selected op_backend="
+                f"{backend_name} use_flashinfer={self.use_flashinfer} "
+                f"routing={type(self.routing_method).__name__} "
+                f"TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER="
+                f"{os.environ.get('TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER', '0')}",
+                flush=True)
+
         # Note: Load balancer initialization is handled by base class _init_load_balancer()
         # If no load balancer is available, the base class will set:
         # - self.num_slots = self.num_experts

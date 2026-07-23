@@ -44,6 +44,13 @@ from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
+# NVFP4 two-level-scale maxima: E2M1 element max (6.0) and E4M3 block-scale max
+# (448.0). ModelOpt stores the per-tensor activation ``input_scale`` as
+# ``amax / (E2M1_MAX * E4M3_MAX)``; Inkling's checkpoint instead ships the raw
+# ``.input_amax``, so the mapper must apply this conversion (see ``_map_expert``).
+_NVFP4_E2M1_MAX = 6.0
+_NVFP4_E4M3_MAX = 448.0
+
 # Prefixes intentionally unused for the text-only GSM8K/MMLU bring-up.
 INKLING_DEFERRED_PREFIXES: Tuple[str, ...] = (
     "model.audio.",
@@ -329,6 +336,25 @@ class InklingHfWeightMapper(HfWeightMapper):
         }.get(sidecar)
         if scale_name is None:  # .original_shape -> drop (layout metadata)
             return
+
+        if sidecar == ".input_amax":
+            # Inkling's NVFP4 checkpoint stores the routed-expert activation
+            # calibration as a RAW amax (``.input_amax``). The fused-MoE loader
+            # (``NVFP4FusedMoEMethod.process_weights_after_loading`` ->
+            # ``fc31_input_scale = 1 / max_e(input_scale)``) and
+            # ``torch.ops.trtllm.fp4_quantize`` expect the ModelOpt per-tensor
+            # activation ``input_scale = amax / (E2M1_MAX * E4M3_MAX)``, so the
+            # activation global scale ``1 / max_e(input_scale)`` lands the e4m3
+            # activation block scales in range. Without this conversion the global
+            # scale is (E2M1_MAX*E4M3_MAX)=2688x too small, the activation fp4 block
+            # scales underflow e4m3, and every routed expert loses ~0.62 rel_rms vs
+            # the bf16 ground truth (7.6x SGLang) -- the baseline GSM8K gap.
+            # Mirrors sglang inkling.py:1222 / inkling_common/dense_mlp.py:497
+            # (``input_scale = input_amax / (6.0 * 448.0)``). Weight/block-scale/
+            # scale2 layout is already correct (positional bisection: 24/24 L3
+            # experts element-wise identical), so ONLY the activation input scale
+            # needs this fix.
+            tensor = tensor.to(torch.float32) / (_NVFP4_E2M1_MAX * _NVFP4_E4M3_MAX)
 
         n_experts = int(getattr(self.config.pretrained_config,
                                 "n_routed_experts", tensor.shape[0]))

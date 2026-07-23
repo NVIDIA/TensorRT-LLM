@@ -1845,9 +1845,54 @@ class InklingDecoderLayer(nn.Module):
                 # the attention TP transform; the pure MLP/MoE transform output
                 # (pre-sconv, pre-residual) isolates the routed/shared expert TP
                 # transform when the reference replays it on this SAME h_attn.
-                dump_sink["h_attn"] = h.detach().float().cpu()
-                dump_sink["moe_out"] = hmlp.detach().float().cpu()
+                # ``_answer_pos_only`` (feedback #4 all-66-layer module dump) slices
+                # the last (answer) token on-device before the host copy so the dump
+                # stays O(2*H)/layer instead of O(2*T*H); default path unchanged.
+                _ap = bool(dump_sink.get("_answer_pos_only"))
+
+                def _pick(_t):
+                    return (_t[-1] if _ap else _t).detach().float().cpu()
+
+                dump_sink["h_attn"] = _pick(h)
+                dump_sink["moe_out"] = _pick(hmlp)
+                # feedback #7 finer-grain L0-L4 split: capture the intra-layer
+                # module boundaries so an L3 divergence can be attributed to the
+                # router vs attention-core vs the short-convs. The DECISIVE point is
+                # the MoE gate -- router logits + top-k expert ids + post-renorm
+                # routing weights -- which separates "router top-k chaos" from an
+                # "expert GEMM/quant" bug. Recomputed from this layer's gate on the
+                # SAME ``hn`` (mlp_norm output) the fused MoE consumed: ``self.mlp.
+                # gate`` + ``inkling_joint_renorm`` ARE the exact routing math the
+                # CUTLASS path runs, and the trtllm-gen kernel consumes the SAME
+                # ``router_logits``, so this recompute is a faithful,
+                # backend-independent readout of the intended top-k. Zero cost when
+                # ``_finegrain`` is unset.
+                if dump_sink.get("_finegrain"):
+                    dump_sink["attn_core"] = _pick(h_core)
+                    dump_sink["attn_sconv"] = _pick(h_asc)
+                    dump_sink["mlp_norm"] = _pick(hn)
+                    if isinstance(self.mlp, InklingMoE):
+                        _rl = self.mlp.gate(hn)  # [T, num_routed+n_shared] fp32
+                        _rw, _ti, _ = inkling_joint_renorm(
+                            _rl,
+                            gate_bias=self.mlp.gate.bias,
+                            global_scale=self.mlp.gate.global_scale,
+                            route_scale=self.mlp.route_scale,
+                            top_k=self.mlp.top_k,
+                            num_routed=self.mlp.num_routed,
+                            n_shared=self.mlp.n_shared,
+                        )
+                        dump_sink["router_logits"] = _pick(_rl)
+                        dump_sink["topk_idx"] = (
+                            _ti[-1] if _ap else _ti).detach().to(
+                                torch.int32).cpu()
+                        dump_sink["routed_w"] = _pick(_rw)
             hm = _apply_sconv(self.mlp_sconv, hmlp, conv_state.mlp, conv_rt)
+            if dump_sink is not None and dump_sink.get("_finegrain"):
+                # point 6: mlp short-conv output (computed after the dump block).
+                dump_sink["mlp_sconv"] = (
+                    hm[-1] if dump_sink.get("_answer_pos_only") else hm
+                ).detach().float().cpu()
             out = residual + hm
             if diverge_sink is not None:
                 # Per-sub-op row divergence (identical requests -> must be 0.0).
@@ -2012,6 +2057,22 @@ class InklingModel(DecoderModel):
         _dump_min = int(_os.environ.get("INKLING_DUMP_MINTOK", "1"))
         _dump_max = int(_os.environ.get("INKLING_DUMP_MAXTOK", "64"))
         _dump_all = _os.environ.get("INKLING_DUMP_ALLLAYERS") == "1"
+        # feedback #4 Stage B: in all-layers mode ALSO capture the per-layer module
+        # split -- the post-attention residual ``h_attn`` (attention kernel) and the
+        # pure MLP/MoE transform ``moe_out`` (routed/shared-expert kernel) -- for
+        # EVERY one of the 66 layers, answer-position only. This is what cleanly
+        # separates an "attention kernel" divergence from a "MoE kernel" divergence
+        # against the SGLang-triton reference (the raw residual stream carries the
+        # pre/post-sconv convention offset that fakes a sharp drop). Zero cost unless
+        # both INKLING_DUMP_ALLLAYERS=1 and INKLING_DUMP_MODULES=1 are set.
+        _dump_modules = _os.environ.get("INKLING_DUMP_MODULES") == "1"
+        # feedback #7 finer-grain L0-L4 mode: on top of the feedback-#4 module dump,
+        # capture the intra-layer boundaries (attn_core, attn_sconv, mlp_norm,
+        # moe_out, mlp_sconv) plus the MoE gate (router_logits, top-k ids, routing
+        # weights) for layers 0..INKLING_DUMP_MAXLAYER only, to split the L3 MoE
+        # jump into router-chaos vs expert-GEMM. Zero cost unless _finegrain is set.
+        _dump_finegrain = _os.environ.get("INKLING_DUMP_FINEGRAIN") == "1"
+        _dump_maxlayer = int(_os.environ.get("INKLING_DUMP_MAXLAYER", "999"))
         _ctx_tok = (int(attn_metadata.seq_lens[:attn_metadata.num_contexts].sum())
                     if attn_metadata.num_contexts > 0 else 0)
         _do_dump = bool(_dump_path) and _dump_min <= _ctx_tok <= _dump_max
@@ -2077,10 +2138,22 @@ class InklingModel(DecoderModel):
         for i, layer in enumerate(self.layers):
             layer_state = (conv_cache.layer_state(i)
                            if conv_cache is not None else None)
-            # Sublayer detail (h_attn/moe_out, full-position) only in the original
-            # short-prompt mode; the all-layers residual localizer keeps just the
-            # answer-position residual to bound the dump to ~66*H floats/prompt.
-            _sink = {} if (_do_dump and not _dump_all and i < 8) else None
+            # Sublayer detail (h_attn/moe_out): full-position for the original
+            # short-prompt mode (i<8), OR answer-position-only for EVERY layer in the
+            # feedback #4 all-layers module-split mode. Plain all-layers mode keeps
+            # just the answer-position residual to bound the dump to ~66*H floats.
+            if _do_dump and _dump_all and _dump_modules:
+                if _dump_finegrain:
+                    # feedback #7: intra-layer boundaries + gate for L0..maxlayer
+                    # only; layers beyond maxlayer keep just the residual stream.
+                    _sink = ({"_answer_pos_only": True, "_finegrain": True}
+                             if i <= _dump_maxlayer else None)
+                else:
+                    _sink = {"_answer_pos_only": True}
+            elif _do_dump and not _dump_all and i < 8:
+                _sink = {}
+            else:
+                _sink = None
             hidden_states = layer(position_ids,
                                   hidden_states,
                                   attn_metadata,
@@ -2101,6 +2174,15 @@ class InklingModel(DecoderModel):
                 if _sink:
                     _rec.setdefault("h_attn", {})[i] = _sink.get("h_attn")
                     _rec.setdefault("moe_out", {})[i] = _sink.get("moe_out")
+                    if _sink.get("_finegrain"):
+                        # feedback #7 fine-grain points (present only for L0..
+                        # maxlayer; router_* only on MoE layers >= dense_mlp_idx).
+                        for _k in ("attn_core", "attn_sconv", "mlp_norm",
+                                   "mlp_sconv", "router_logits", "topk_idx",
+                                   "routed_w"):
+                            _v = _sink.get(_k)
+                            if _v is not None:
+                                _rec.setdefault(_k, {})[i] = _v
         out = self.norm(hidden_states)
         if _fp_on:
             self._ink_fp[len(self.layers)].copy_(out[-1].to(torch.float32))
