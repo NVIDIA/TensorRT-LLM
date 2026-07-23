@@ -296,34 +296,9 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
     pipeline.stage('Submit Test Result') {
         sh "ls -al ${stageName}/ || true"
 
-        // Check whether the progress watcher ever succeeded in uploading a tar.
-        // progress_upload_snapshot.sh writes this sentinel on each successful PUT.
-        def progressOkFile = "${WORKSPACE}/results-${stageName}${postTag}-progress.tar.gz.upload_ok"
-        def progressEverUploaded = fileExists(progressOkFile)
-
-        if (progressEverUploaded) {
-            // Move the progress tar to the final test-results location via Artifactory server-side
-            // move (no data re-transfer). Virtual repo sw-tensorrt-generic does not support move;
-            // rewrite to the backing local repo as we do for DELETE in deleteProgressArtifact().
-            def localUploadPath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
-            def srcArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}-progress.tar.gz"
-            def dstArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}.tar.gz"
-            withCredentials([usernamePassword(
-                    credentialsId: 'urm-artifactory-creds',
-                    usernameVariable: 'ART_USER',
-                    passwordVariable: 'ART_PASS')]) {
-                def rc = sh(
-                    script: """curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" -X POST \
-                        'https://urm.nvidia.com/artifactory/api/move/${srcArtPath}?to=/${dstArtPath}'""",
-                    returnStatus: true
-                )
-                if (rc == 0) {
-                    echo "[PROGRESS-UPLOAD] ${stageName}: progress tar moved to test-results/ as results-${stageName}${postTag}.tar.gz"
-                } else {
-                    echo "[PROGRESS-UPLOAD] ${stageName}: move failed (rc=${rc}); results may already be at destination or progress tar was deleted"
-                }
-            }
-        } else {
+        // Promote progress tar to final path, or fall back to direct upload.
+        // progress_upload_snapshot.sh writes the sentinel on each successful PUT.
+        if (!promoteProgressTar(stageName, postTag)) {
             // Progress upload never succeeded (Artifactory unreachable, watcher not started, etc.).
             // Fall back to original approach: tar local XML files and upload directly.
             // Use --transform so tar contents carry the postTag filename without touching disk files.
@@ -2676,27 +2651,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             }
             sh "STAGE_NAME=${stageName} && env | sort > ${stageName}/debug_env.txt"
             echo "Upload test results."
-            def progressOkFile = "${WORKSPACE}/results-${stageName}${postTag}-progress.tar.gz.upload_ok"
-            if (fileExists(progressOkFile)) {
-                def localUploadPath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
-                def srcArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}-progress.tar.gz"
-                def dstArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}.tar.gz"
-                withCredentials([usernamePassword(
-                        credentialsId: 'urm-artifactory-creds',
-                        usernameVariable: 'ART_USER',
-                        passwordVariable: 'ART_PASS')]) {
-                    def rc = sh(
-                        script: """curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" -X POST \
-                            'https://urm.nvidia.com/artifactory/api/move/${srcArtPath}?to=/${dstArtPath}'""",
-                        returnStatus: true
-                    )
-                    if (rc == 0) {
-                        echo "[PROGRESS-UPLOAD] ${stageName}: progress tar moved to test-results/ as results-${stageName}${postTag}.tar.gz"
-                    } else {
-                        echo "[PROGRESS-UPLOAD] ${stageName}: move failed (rc=${rc}); results may already be at destination or progress tar was deleted"
-                    }
-                }
-            } else {
+            if (!promoteProgressTar(stageName, postTag)) {
                 echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
                 def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
                 sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
@@ -3530,6 +3485,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
                     PROGRESS_DONE_FILE='${rerunDoneFile}' \\
                     PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
                     LABEL_PREFIX='rerun${times} checkpoint' \\
+                    XML_PATH='${xmlFile}' \\
                     bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
                     WATCHER_PID=\$!
 
@@ -3842,6 +3798,37 @@ REUSED_TESTS_EOF
     }
 }
 
+// Promotes the progress tar to the final results path via an Artifactory
+// server-side move (no data re-transfer). Returns true when a progress
+// snapshot existed and was promoted; false when no snapshot was ever uploaded.
+// Virtual repo sw-tensorrt-generic does not support move; rewrite to the
+// backing local repo as we do for DELETE in deleteProgressArtifact().
+def promoteProgressTar(stageName, postTag="") {
+    def progressOkFile = "${WORKSPACE}/results-${stageName}${postTag}-progress.tar.gz.upload_ok"
+    if (!fileExists(progressOkFile)) {
+        return false
+    }
+    def localUploadPath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
+    def srcArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}-progress.tar.gz"
+    def dstArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}.tar.gz"
+    withCredentials([usernamePassword(
+            credentialsId: 'urm-artifactory-creds',
+            usernameVariable: 'ART_USER',
+            passwordVariable: 'ART_PASS')]) {
+        def rc = sh(
+            script: """curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" -X POST \
+                'https://urm.nvidia.com/artifactory/api/move/${srcArtPath}?to=/${dstArtPath}'""",
+            returnStatus: true
+        )
+        if (rc == 0) {
+            echo "[PROGRESS-UPLOAD] ${stageName}: progress tar moved to test-results/ as results-${stageName}${postTag}.tar.gz"
+        } else {
+            echo "[PROGRESS-UPLOAD] ${stageName}: move failed (rc=${rc}); results may already be at destination or progress tar was deleted"
+        }
+    }
+    return true
+}
+
 // Removes the in-progress checkpoint tarball uploaded by the inline
 // shell watcher in runLLMTestlistOnPlatformImpl / runLLMTestlistWithSbatch.
 // Called only when the pytest+rerun execution
@@ -3862,16 +3849,17 @@ def deleteProgressArtifact(stageName, postTag="") {
                 usernameVariable: 'ART_USER',
                 passwordVariable: 'ART_PASS')]) {
             def httpStatus = sh(
-                script: "curl -sSo /dev/null -w '%{http_code}' --retry 2 -u \"\$ART_USER:\$ART_PASS\" '${targetUrl}'",
+                script: "curl -sSo /dev/null -w '%{http_code}' --retry 2 -X DELETE -u \"\$ART_USER:\$ART_PASS\" '${targetUrl}'",
                 returnStdout: true
             ).trim()
-            if (httpStatus == '404') {
+            if (httpStatus == '204' || httpStatus == '200') {
+                echo "[PROGRESS-UPLOAD] ${stageName}: deleted progress tar ${targetUrl}"
+            } else if (httpStatus == '404') {
                 echo "[PROGRESS-UPLOAD] ${stageName}: progress tar not found, skipping delete"
-                return
+            } else {
+                echo "[PROGRESS-UPLOAD] ${stageName}: delete returned HTTP ${httpStatus} (non-fatal)"
             }
-            sh "curl -fsSL --retry 2 -X DELETE -u \"\$ART_USER:\$ART_PASS\" '${targetUrl}'"
         }
-        echo "[PROGRESS-UPLOAD] ${stageName}: deleted progress tar ${targetUrl}"
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
