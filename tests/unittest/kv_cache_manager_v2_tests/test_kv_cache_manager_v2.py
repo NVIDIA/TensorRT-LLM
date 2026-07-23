@@ -697,6 +697,61 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(kv2.num_committed_tokens, len(prompt))
         kv2.close()
 
+    def test_commit_min_snapshot_preserves_partial_endpoint(self) -> None:
+        """A covering block without every lifecycle page must keep the partial endpoint."""
+        tokens_per_block = 32
+        base_prompt = [TokenId(i) for i in range(80)]
+        extended_prompt = base_prompt + [TokenId(i) for i in range(1000, 1080)]
+        cfg = KVCacheManagerConfig(
+            tokens_per_block=tokens_per_block,
+            cache_tiers=[GpuCacheTierConfig(quota=16 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(role=Role.KEY, size=8192),
+                        BufferConfig(role=Role.VALUE, size=8192),
+                    ],
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[
+                        BufferConfig(role=Role.KEY, size=8192),
+                        BufferConfig(role=Role.VALUE, size=8192),
+                    ],
+                    sliding_window_size=16,
+                ),
+            ],
+            enable_partial_reuse=True,
+            commit_min_snapshot=True,
+        )
+        self.manager = KVCacheManager(cfg)
+
+        def commit_prompt(prompt: list[TokenIdExt]) -> int:
+            kv_cache = self.manager.create_kv_cache(input_tokens=prompt)
+            num_reused_tokens = kv_cache.num_committed_tokens
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(kv_cache.resume(stream))
+                self.assertTrue(kv_cache.resize(len(prompt), len(prompt)))
+                kv_cache.commit(prompt[num_reused_tokens:])
+                kv_cache.close()
+            stream_holder.take_finish_event().synchronize()
+            return num_reused_tokens
+
+        self.assertEqual(commit_prompt(base_prompt), 0)
+        self.assertEqual(commit_prompt(extended_prompt), len(base_prompt))
+
+        rewind_prompt = base_prompt + [TokenId(2000)]
+        self.assertEqual(self.manager.probe_reuse(input_tokens=rewind_prompt), len(base_prompt))
+
+        # The covering block lacks early SWA pages, so the shorter prompt starts
+        # from scratch and recreates the partial endpoint after the covering block.
+        self.manager.clear_reusable_blocks()
+        self.assertEqual(commit_prompt(extended_prompt), 0)
+        self.assertEqual(commit_prompt(base_prompt), 0)
+        self.assertEqual(self.manager.probe_reuse(input_tokens=rewind_prompt), len(base_prompt))
+
     def test_planned_drop_handle(self) -> None:
         window_size = 8
         self.prepare(16 << 20, 0, 0, 2, window_size, 0, tokens_per_block=8)

@@ -222,26 +222,22 @@ def traverse_post_order(root: "Block") -> Iterator["Block"]:
                 break
 
 
-def find_best_partial_match_in_next_nodes(
+def find_partial_matches_in_next_nodes(
     block: "Block | RootBlock", tokens: TokenBlock
-) -> tuple["Block | None", int]:
+) -> list[tuple["Block", int]]:
     """
-    Among all child nodes (self.next), finds the one whose tokens have the longest leading match with the given tokens.
-    Returns a tuple of (best_block, num_matched_tokens).
-    If no child matches any tokens, returns (None, 0).
+    Return child nodes with a non-empty leading token match.
     """
     if len(block.next) >= 32:
         # TODO: build a database to accelerate partial matching. (TRTLLM-7784)
         # For now, it might be too slow to iterate over all children, so let's just skip.
-        return None, 0
-    best_block = None
-    best_match_len = 0
+        return []
+    matches = list[tuple[Block, int]]()
     for b in block.next.values():
         match_len = b._partial_match_this_node(tokens)
-        if match_len > best_match_len:
-            best_match_len = match_len
-            best_block = b
-    return best_block, best_match_len
+        if match_len > 0:
+            matches.append((b, match_len))
+    return matches
 
 
 class DuplicateKeyError(Exception):
@@ -345,30 +341,50 @@ class Block:
         self.next = {}
         self.storage = filled_list(None, prev.num_life_cycles)
         self.__rawref__ = rawref.NULL
-        # a Block is useless if all its tokens are covered by a sibling block. Raise UselessBlockError if so.
+        # An exact sibling already represents this token endpoint.
         if self.key in prev.next:
             raise UselessBlockError(prev.next[self.key])
         if len(tokens) < self.tokens_per_block:
-            # @TODO: when we have the database for find_best_partial_match_in_next_nodes, we may use
-            # that for faster check.
-            for b in prev.next.values():
-                if b.tokens[: len(tokens)] == tokens:
-                    raise UselessBlockError(b)
-        # If there are sibling blocks fully covered by this block, remove them.
-        to_remove = []
-        for k, b in prev.next.items():
-            if len(b.tokens) < len(tokens) and tokens[: len(b.tokens)] == b.tokens:
-                assert NDEBUG or (not b.is_full and b is not self and b.key == k and not b.next)
-                to_remove.append(k)
-        event_manager = get_tree(prev).event_manager if to_remove else None
-        for k in to_remove:
-            b = detach_next(prev, k)
-            assert isinstance(b, Block)
-            if event_manager is not None:
-                event_manager.add_removed_event(b.key)
-            assert b.is_orphan  # _KVCache may still hold it.
+            for sibling in prev.next.values():
+                if sibling.tokens[: len(tokens)] == tokens and sibling._can_replace_token_span(
+                    len(tokens)
+                ):
+                    raise UselessBlockError(sibling)
         # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
         prev.next[self.key] = self
+
+    def _can_replace_token_span(self, num_tokens: int) -> bool:
+        pages = [ref() if ref is not None else None for ref in self.storage]
+        if any(page is None for page in pages):
+            return False
+
+        ssm_lc_id = get_tree(self).life_cycles.ssm_life_cycle_id
+        if ssm_lc_id is not None:
+            from ._page import SsmCommittedPage
+
+            ssm_page = expect_type(SsmCommittedPage, pages[ssm_lc_id])
+            if ssm_page.num_tokens_in_block != num_tokens:
+                return False
+        return True
+
+    def remove_redundant_covered_siblings(self) -> None:
+        """Remove shorter siblings only when this block preserves their reusable state."""
+        prev = self.prev
+        to_remove = [
+            key
+            for key, sibling in prev.next.items()
+            if len(sibling.tokens) < len(self.tokens)
+            and self.tokens[: len(sibling.tokens)] == sibling.tokens
+            and self._can_replace_token_span(len(sibling.tokens))
+        ]
+        event_manager = get_tree(prev).event_manager if to_remove else None
+        for key in to_remove:
+            sibling = detach_next(prev, key)
+            assert isinstance(sibling, Block)
+            assert NDEBUG or (not sibling.is_full and sibling is not self and not sibling.next)
+            if event_manager is not None:
+                event_manager.add_removed_event(sibling.key)
+            assert sibling.is_orphan  # _KVCache may still hold it.
 
     def _release_pages(self) -> None:
         """Reclaim every page held by this block.
@@ -550,34 +566,61 @@ class BlockRadixTree:
     def _has_page(block: Block, lc: LifeCycleId) -> bool:
         return block.storage[lc] is not None
 
-    # yields tuples of (block, num_matched_tokens). num_matched_tokens should be equal to
+    # Returns tuples of (block, num_matched_tokens). num_matched_tokens should be equal to
     # tokens_per_block except the last one.
     def _match_token_path(
         self,
         reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
-    ) -> Iterator[tuple[Block, int]]:
+    ) -> tuple[
+        list[tuple[Block, int]],
+        list[tuple[int, tuple[Block, int]]],
+    ]:
         block: Block | RootBlock | BlockRadixTree = self
         mismatched_token_block: TokenBlock = []
+        matched = list[tuple[Block, int]]()
+        fallback_candidates = list[tuple[int, tuple[Block, int]]]()
         for token_block, key in sequence_to_blockchain_keys(
             self._tokens_per_block, reuse_scope, tokens
         ):
             if key in block.next:
-                block = block.next[key]
+                next_block = block.next[key]
                 if token_block:
-                    assert isinstance(block, Block)
-                    yield block, len(token_block)
+                    assert isinstance(block, Block | RootBlock)
+                    assert isinstance(next_block, Block)
+                    if enable_partial_match and len(block.next) > 1:
+                        fallback_candidates.extend(
+                            (len(matched), candidate)
+                            for candidate in find_partial_matches_in_next_nodes(block, token_block)
+                            if candidate[0] is not next_block
+                        )
+                    matched.append((next_block, len(token_block)))
+                block = next_block
             else:
                 mismatched_token_block = token_block
                 break
         if mismatched_token_block and enable_partial_match:
-            partial_block, match_len = find_best_partial_match_in_next_nodes(
+            candidates = find_partial_matches_in_next_nodes(
                 cast(Block | RootBlock, block), mismatched_token_block
             )
-            if partial_block is not None:
-                block = partial_block
-                yield block, match_len
+            if candidates:
+                best_candidate: tuple[Block, int] | None = None
+                best_reusable_tokens = -1
+                for candidate in sorted(candidates, key=lambda item: item[1], reverse=True):
+                    max_reusable_tokens = self._tokens_per_block * len(matched) + candidate[1]
+                    if max_reusable_tokens <= best_reusable_tokens:
+                        break
+                    candidate_path = self._prune_match([*matched, candidate])
+                    reusable_tokens = self._num_matched_tokens(candidate_path)
+                    if reusable_tokens > best_reusable_tokens:
+                        best_candidate = candidate
+                        best_reusable_tokens = reusable_tokens
+                    if reusable_tokens == max_reusable_tokens:
+                        break
+                assert best_candidate is not None
+                matched.append(best_candidate)
+        return matched, fallback_candidates
 
     def _prune_match(self, matched: list[tuple[Block, int]]) -> list[tuple[Block, int]]:
         tokens_per_block = self._tokens_per_block
@@ -672,10 +715,25 @@ class BlockRadixTree:
         The result is volatile: callers that need to reuse the returned blocks must
         acquire ownership of the pages before depending on them.
         """
-        matched = self._prune_match(
-            list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        token_path, fallback_candidates = self._match_token_path(
+            reuse_scope, tokens, enable_partial_match
         )
-        return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
+        matched = self._prune_match(token_path.copy())
+        num_matched_tokens = self._num_matched_tokens(matched)
+        for prefix_len, candidate in sorted(
+            fallback_candidates,
+            key=lambda item: self._tokens_per_block * item[0] + item[1][1],
+            reverse=True,
+        ):
+            max_reusable_tokens = self._tokens_per_block * prefix_len + candidate[1]
+            if max_reusable_tokens <= num_matched_tokens:
+                break
+            fallback_path = self._prune_match([*token_path[:prefix_len], candidate])
+            fallback_tokens = self._num_matched_tokens(fallback_path)
+            if fallback_tokens > num_matched_tokens:
+                matched = fallback_path
+                num_matched_tokens = fallback_tokens
+        return ReuseMatch([block for block, _ in matched], num_matched_tokens)
 
     def _check_sanity(self) -> bool:
         raise NotImplementedError(
