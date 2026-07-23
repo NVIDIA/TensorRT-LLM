@@ -2044,7 +2044,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     else
                         echo "Pytest failed in Slurm job \$jobId"
                         echo "Full test output (logs not shown above) is uploaded after stage teardown to:"
-                        echo "  https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/results-${stageName}*.tar.gz"
+                        echo "  https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/results-${stageName}${postTag}.tar.gz"
                     fi
                     echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
                     exit 0
