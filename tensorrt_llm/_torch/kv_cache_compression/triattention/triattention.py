@@ -523,12 +523,12 @@ def init_eviction_buffers(
             draft_move_offsets=bufs.draft_move_offsets,
         )
     compaction = init_compaction_buffers(
-        eviction_mode=eviction_mode,
+        union=union,
+        per_layer=eviction_mode == "per_layer_perhead",
         layer_pools=layer_pools,
         dense_layers=list(dense_layers),
         swa_layers=list(swa_layers),
         layer_group_representative=layer_group_representative,
-        kept_token_ordinals=bufs.keep,
         valid_sequence_lengths=bufs.valid_seq_lens_device,
         kv_block_offsets=bufs.block_offsets_device,
         page_table_slots=bufs.representative_slots,

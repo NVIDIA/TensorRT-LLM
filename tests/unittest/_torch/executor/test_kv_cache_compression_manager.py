@@ -149,7 +149,7 @@ class TestBaseABC:
 
         assert manager.kv_cache_manager is target
         assert manager.draft_kv_cache_manager is draft
-        assert manager.has_independent_draft_kv_cache
+        assert manager.draft_kv_cache_manager is not None
         assert target.kv_compression_manages_history is True
         assert draft.kv_compression_manages_history is True
 

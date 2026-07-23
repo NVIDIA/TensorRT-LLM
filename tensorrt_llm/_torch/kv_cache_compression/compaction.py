@@ -15,63 +15,40 @@
 
 """Batched physical KV-cache compaction for eviction-based compression.
 
-A general post-eviction component: given each request's kept-token ordinals,
-its valid sequence length, and the staged V2 block offsets, the surviving KV
-moves in place through batched C++ compact launches, fed by per-request move
-indices packed on device. Everything is plain tensors and dicts:
-``init_compaction_buffers`` allocates the launch data once per geometry
-(called by ``triattention.init_eviction_buffers``) and returns one bundle
-whose fields the eviction driver fires directly each round -- the target's
-dense/SWA packing rides the driver's fused settle launch (described by the
-bundle's ``settle_pack_tensors``/``settle_pack_shape``), the co-compressed
-draft's own pack launch and every family's C++ moves are inlined in
-``triattention.run_eviction_round``.
+Contract: the caller supplies increasing kept decode ordinals per selection
+row (absolute positions), each request's valid length and pinned prompt
+length, and the staged V2 block offsets; the surviving KV then moves in
+place through batched C++ compact launches, fed by per-request move indices
+packed on device. Everything is plain tensors and dicts:
+``init_compaction_buffers`` allocates the launch data once per geometry and
+returns one bundle whose fields the eviction driver fires directly each
+round -- the target's dense/SWA packing rides the driver's fused settle
+launch (described by the bundle's ``settle_pack_tensors``/
+``settle_pack_shape``); the driver also fires the co-compressed draft's own
+pack launch (``draft_pack``) and every family's C++ moves.
 """
 
 from collections import OrderedDict
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
 
-def _make_move_buffers(
+def _make_move_indices(
     index_prefix: Tuple[int, ...],
-    moves_per_request: List[int],
-    device: torch.device,
-    external_offsets: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Allocate the packed source-index buffer and its per-request offsets.
-
-    ``external_offsets`` shares a caller-owned device row (refreshed together
-    with the round metadata in one copy) instead of allocating one here; the
-    index buffer is always sized for the widest per-request move counts.
-    """
-    offsets = [0]
-    for count in moves_per_request:
-        offsets.append(offsets[-1] + count)
-    indices = torch.empty((*index_prefix, offsets[-1]), dtype=torch.int32, device=device)
-    if external_offsets is not None:
-        return indices, external_offsets
-    return indices, torch.tensor(offsets, dtype=torch.int32, device=device)
-
-
-def _page_table_provider(
-    page_table_slots: Dict[int, int],
-    kv_block_offsets: torch.Tensor,
-    device: torch.device,
+    moves_per_request: int,
     request_count: int,
-    what: str,
-) -> Callable[[int], torch.Tensor]:
-    """Return per-slot K block-offset views, cached per slot."""
-    tables: Dict[int, torch.Tensor] = {}
+    device: torch.device,
+) -> torch.Tensor:
+    """Packed source-index buffer sized for the widest per-request moves.
 
-    def page_table_for(representative: int) -> torch.Tensor:
-        slot = page_table_slots[representative]
-        if slot not in tables:
-            tables[slot] = kv_block_offsets[slot, :request_count, 0]
-        return tables[slot]
-
-    return page_table_for
+    The per-request move offsets are always caller-owned rows (refreshed
+    together with the round metadata in one copy), so only the index
+    rectangle is allocated here.
+    """
+    return torch.empty(
+        (*index_prefix, moves_per_request * request_count), dtype=torch.int32, device=device
+    )
 
 
 def _compact_groups(
@@ -127,12 +104,12 @@ def _compact_groups(
 
 def init_compaction_buffers(
     *,
-    eviction_mode: str,
+    union: bool,
+    per_layer: bool,
     layer_pools: List[torch.Tensor],
     dense_layers: List[int],
     swa_layers: List[int],
     layer_group_representative: Dict[int, int],
-    kept_token_ordinals: torch.Tensor,
     valid_sequence_lengths: torch.Tensor,
     kv_block_offsets: torch.Tensor,
     page_table_slots: Dict[int, int],
@@ -149,40 +126,45 @@ def init_compaction_buffers(
     draft_protected_tail_capacity: Optional[int] = None,
     draft_kv_block_offsets: Optional[torch.Tensor] = None,
     draft_page_table_slots: Optional[Dict[int, int]] = None,
-    dense_move_offsets: Optional[torch.Tensor] = None,
+    dense_move_offsets: torch.Tensor,
     swa_move_offsets: Optional[torch.Tensor] = None,
     draft_move_offsets: Optional[torch.Tensor] = None,
 ) -> Dict[str, object]:
     """Allocate the per-geometry compaction launch data as one plain dict.
 
-    Dense layers keep the prompt in place and compact the selected decode
-    tokens plus any target KV reserved for the next overlapped forward;
-    kernel-masked SWA layers keep the latest window plus the same protected
-    tail. A co-compressed draft cache reuses the target's kept token ordinals
-    (broadcast over the draft's own KV-head count, union mode only) plus the
-    draft's own protected tail, landing at the same destination base.
+    ``union``/``per_layer`` are the two selection-geometry facts consumed
+    here: one shared selection row per request (union), or one per
+    (layer, KV head) (per_layer), else one per KV head. Dense layers keep
+    the prompt in place and compact the selected decode tokens plus any
+    target KV reserved for the next overlapped forward; kernel-masked SWA
+    layers keep the latest window plus the same protected tail. A
+    co-compressed draft cache reuses the target's single-row kept ordinals
+    (broadcast over the draft's own KV-head count) plus the draft's own
+    protected tail, landing at the same destination base.
 
-    ``kept_token_ordinals`` carries increasing kept decode ordinals (absolute
-    positions) per request; prompt tokens never move, so the rectangle is
-    prompt-length independent and ``prompt_offsets`` carries each request's
-    pinned prompt length. The increasing order is LOAD-BEARING:
-    sparseKvCacheCompactOp.cpp's forward tiled in-place copy requires
-    increasing source ordinals with ``destinationBases[request] + move <=
-    source[move]``. ``kv_block_offsets`` is the staged V2 snapshot
+    The driver's settle launch packs increasing kept decode ordinals
+    (absolute positions) per selection row into the index buffers here;
+    prompt tokens never move, so the rectangle is prompt-length independent
+    and ``prompt_offsets`` carries each request's pinned prompt length. The
+    increasing order is LOAD-BEARING: sparseKvCacheCompactOp.cpp's forward
+    tiled in-place copy requires increasing source ordinals with
+    ``destinationBases[request] + move <= source[move]``. ``kv_block_offsets`` is the staged V2 snapshot
     ``[slot, request, K/V, block]`` (offset = ``2*page + plane``);
     ``protected_tail_capacity`` is the widest per-request tail this geometry
     must support -- actual per-round lengths arrive through the staged
-    move-offset rows. Nothing launches here: the target's dense/SWA packing
-    rides the driver's fused settle launch (``settle_pack_tensors`` +
-    ``settle_pack_shape`` describe it) and the driver's round function fires
-    the draft pack (``draft_pack``) and every family's C++ moves directly.
+    move-offset rows, which are caller-owned. Nothing launches here: the
+    target's dense/SWA packing rides the driver's fused settle launch
+    (``settle_pack_tensors`` + ``settle_pack_shape`` describe it) and the
+    driver's round function fires the draft pack (``draft_pack``) and every
+    family's C++ moves directly.
 
-    Returns one plain bundle dict: ``families`` (each ``{"name", "groups",
-    "source", "offsets", "destination_bases"}``), the settle/pack launch data
-    above, ``draft_pack`` (``None`` or ``{"indices", "offsets",
-    "dense_total", "move_capacity", "num_kv_heads"}``), ``swa_rebase_delta``
-    (per-round SWA destination rebase), and the geometry scalars
-    (``selection_rows``, ``request_count``, ``decode_keep_count``, ...).
+    Returns EXACTLY the launch data the driver fires: ``families`` (each
+    ``{"name", "groups", "source", "offsets", "destination_bases"}``),
+    ``settle_pack_tensors``/``settle_pack_shape``, ``draft_pack`` (``None``
+    or ``{"indices", "offsets", "dense_total", "move_capacity",
+    "num_kv_heads"}``), ``swa_destination_bases``, and ``swa_rebase_delta``
+    (per-round SWA destination rebase). The bundle is launch data, not an
+    input mirror.
     """
     device = layer_pools[dense_layers[0]].device
     request_count = int(request_count)
@@ -192,22 +174,24 @@ def init_compaction_buffers(
     swa_layers = tuple(int(layer) for layer in swa_layers)
     layer_pool_keys = tuple(layer_pool_keys)
 
-    per_layer = eviction_mode == "per_layer_perhead"
     # The C++ compact op takes the KV-head count from each launch's pool
     # shape [pages, K/V, heads, tokens, dim].
     num_kv_heads = int(layer_pools[dense_layers[0]].shape[2])
     dense_index_prefix = (len(dense_layers), num_kv_heads) if per_layer else (num_kv_heads,)
-    dense_move_indices, dense_move_offsets = _make_move_buffers(
+    dense_move_indices = _make_move_indices(
         dense_index_prefix,
-        [decode_keep_count + protected_tail_capacity] * request_count,
+        decode_keep_count + protected_tail_capacity,
+        request_count,
         device,
-        external_offsets=dense_move_offsets,
-    )
-    page_table_for = _page_table_provider(
-        page_table_slots, kv_block_offsets, device, request_count, "compaction"
     )
     dense_entries = [
-        (layer, layer_pools[layer], page_table_for(layer_group_representative[layer]))
+        (
+            layer,
+            layer_pools[layer],
+            kv_block_offsets[
+                page_table_slots[layer_group_representative[layer]], :request_count, 0
+            ],
+        )
         for layer in dense_layers
     ]
 
@@ -225,23 +209,23 @@ def init_compaction_buffers(
         # prompt-dependent and checked by the caller each round.
         swa_window = int(swa_window)
         swa_destination_bases = torch.empty_like(prompt_offsets)
-        swa_move_indices, swa_move_offsets = _make_move_buffers(
+        swa_move_indices = _make_move_indices(
             (num_kv_heads,),
-            [swa_window + protected_tail_capacity] * request_count,
+            swa_window + protected_tail_capacity,
+            request_count,
             device,
-            external_offsets=swa_move_offsets,
         )
         # SWA layers are staged as their own page-table representatives.
-        swa_entries = [(layer, layer_pools[layer], page_table_for(layer)) for layer in swa_layers]
+        swa_entries = [
+            (
+                layer,
+                layer_pools[layer],
+                kv_block_offsets[page_table_slots[layer], :request_count, 0],
+            )
+            for layer in swa_layers
+        ]
 
     dense_slots = {layer: slot for slot, layer in enumerate(dense_layers)} if per_layer else None
-    union = eviction_mode == "union"
-    if union:
-        selection_rows = 1
-    elif per_layer:
-        selection_rows = len(dense_layers) * num_kv_heads
-    else:
-        selection_rows = num_kv_heads
     # Selection rows carry decode-only kept ordinals (already absolute), so
     # the rectangle is prompt-length independent. HAS_SWA specializes the SWA
     # loads and stores away, so without SWA layers the SWA pointer arguments
@@ -300,20 +284,21 @@ def init_compaction_buffers(
         # The draft forms its own launch groups so it may use a different
         # KV-head count than the target.
         draft_num_kv_heads = int(draft_layer_pools[draft_layers[0]].shape[2])
-        draft_move_indices, draft_move_offsets = _make_move_buffers(
+        draft_move_indices = _make_move_indices(
             (draft_num_kv_heads,),
-            [decode_keep_count + draft_tail] * request_count,
+            decode_keep_count + draft_tail,
+            request_count,
             device,
-            external_offsets=draft_move_offsets,
-        )
-        draft_page_table_for = _page_table_provider(
-            draft_page_table_slots, draft_kv_block_offsets, device, request_count, "draft"
         )
         draft_entries = [
             (
                 layer,
                 draft_layer_pools[layer],
-                draft_page_table_for(draft_layer_group_representative[layer]),
+                draft_kv_block_offsets[
+                    draft_page_table_slots[draft_layer_group_representative[layer]],
+                    :request_count,
+                    0,
+                ],
             )
             for layer in draft_layers
         ]
@@ -342,23 +327,11 @@ def init_compaction_buffers(
 
     return dict(
         families=families,
-        kept_token_ordinals=kept_token_ordinals,
-        valid_sequence_lengths=valid_sequence_lengths,
-        selection_rows=selection_rows,
         settle_pack_tensors=settle_pack_tensors,
         settle_pack_shape=settle_pack_shape,
         draft_pack=draft_pack,
-        num_kv_heads=num_kv_heads,
-        swa_window=swa_window,
         swa_destination_bases=swa_destination_bases,
         # The prompt offsets may be re-staged each round; the driver rebases
         # the SWA landing positions with this delta before the moves.
         swa_rebase_delta=decode_keep_count - swa_window,
-        prompt_offsets=prompt_offsets,
-        decode_keep_count=decode_keep_count,
-        request_count=request_count,
-        protected_tail_capacity=protected_tail_capacity,
-        draft_protected_tail_capacity=(
-            int(draft_protected_tail_capacity or 0) if draft_layers else 0
-        ),
     )

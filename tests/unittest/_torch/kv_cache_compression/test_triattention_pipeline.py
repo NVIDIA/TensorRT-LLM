@@ -147,6 +147,15 @@ class TestConfigAndFactory:
             )
         with pytest.raises(ValidationError):
             TriAttentionKvCacheCompressionConfig(eviction_mode="made_up_mode")
+        # Cross-field contract surfaces at config validation (the manager
+        # re-raises at construction as the op-boundary backstop).
+        with pytest.raises(ValidationError, match="normalize"):
+            TriAttentionKvCacheCompressionConfig(
+                model_path="/models/test",
+                calibration_path="/calib/test.pt",
+                eviction_mode="union",
+                normalize_scores=False,
+            )
 
     def test_factory_returns_triattention_and_propagates_config_fields(self):
         # Calibration is deferred to the first request, so construction needs

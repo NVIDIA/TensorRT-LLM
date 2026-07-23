@@ -3450,8 +3450,9 @@ class TriAttentionKvCacheCompressionConfig(BaseKvCacheCompressionConfig):
     normalize_scores: bool = Field(
         default=True,
         description="Z-normalize each head's scores over the decode region "
-        "before selection (upstream default). `union` eviction requires True: "
-        "its fused score+stats+union pipeline always normalizes.")
+        "before selection (upstream default). `union` eviction always "
+        "normalizes; False is only valid with `per_head`/`per_layer_perhead`."
+    )
     pin_prefill: bool = Field(
         default=True,
         description="Always preserve the prompt (prefill) tokens; only decode "
@@ -3494,6 +3495,12 @@ class TriAttentionKvCacheCompressionConfig(BaseKvCacheCompressionConfig):
                 "TriAttention requires both model_path and calibration_path; "
                 "TRT-LLM consumes an official calibration file and does not "
                 "compute one.")
+        # Same config-validation-time surfacing for the cross-field contract
+        # (the manager re-raises at construction as the op-boundary backstop).
+        if self.eviction_mode == "union" and not self.normalize_scores:
+            raise ValueError(
+                "union eviction always normalizes scores; normalize_scores="
+                "False is only valid with per_head/per_layer_perhead.")
         return self
 
     def to_manager_kwargs(self) -> dict:

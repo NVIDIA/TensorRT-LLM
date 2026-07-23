@@ -2462,10 +2462,6 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
             draft_kv_cache_manager.kv_compression_manages_history = (
                 self.adjusts_generation_kv_length)
 
-    @property
-    def has_independent_draft_kv_cache(self) -> bool:
-        return self.draft_kv_cache_manager is not None
-
     # ================================================================== #
     # KV-cache lifecycle hooks (5, in temporal order).                   #
     # Subclasses override what they need; all default to no-op.          #
@@ -2490,15 +2486,23 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         scheduled_batch: "ScheduledRequests",
         **kwargs,
     ) -> None:
-        """Fired once per generation step before this step's forward."""
+        """Fired once per executor iteration, before this step's forward.
+
+        The batch may contain only context requests and
+        ``scheduled_batch.generation_requests`` may be empty. ``**kwargs``
+        is reserved for forward compatibility (never populated today).
+        """
 
     def on_generation_step_end(
         self,
         scheduled_batch: "ScheduledRequests",
         **kwargs,
     ) -> None:
-        """Fired once per generation step, after every layer's forward
-        completes. Override for periodic or budget-triggered eviction.
+        """Fired once per executor iteration, after every layer's forward
+        completes. The batch may contain only context requests and
+        ``scheduled_batch.generation_requests`` may be empty; ``**kwargs``
+        is reserved for forward compatibility. Override for periodic or
+        budget-triggered eviction.
         """
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:

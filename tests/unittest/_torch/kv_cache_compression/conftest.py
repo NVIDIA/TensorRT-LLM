@@ -136,7 +136,14 @@ def make_ramp_pools(
 
 
 def build_compaction(**overrides):
-    """``init_compaction_buffers`` with the suite's default 2-layer geometry."""
+    """``init_compaction_buffers`` with the suite's default 2-layer geometry.
+
+    Accepts ``eviction_mode`` for test ergonomics (translated to the
+    builder's derived selection facts), allocates the caller-owned move
+    offset rows the production driver would stage (capacity cumsum), and
+    mirrors the geometry inputs onto the bundle for the standalone helpers
+    here -- production reads only the launch fields.
+    """
     from tensorrt_llm._torch.kv_cache_compression.compaction import init_compaction_buffers
 
     args = dict(
@@ -151,7 +158,45 @@ def build_compaction(**overrides):
         swa_window=None,
     )
     args.update(overrides)
-    return init_compaction_buffers(**args)
+    mode = args.pop("eviction_mode")
+    union = mode == "union"
+    per_layer = mode == "per_layer_perhead"
+    kept = args.pop("kept_token_ordinals")
+    request_count = args["request_count"]
+    keep_count = args["decode_keep_count"]
+    tail = int(args.get("protected_tail_capacity", 0))
+    draft_tail = int(args.get("draft_protected_tail_capacity") or 0)
+    device = args["layer_pools"][args["dense_layers"][0]].device
+    swa_window = int(args["swa_window"] or 0) if args["swa_layers"] else 0
+
+    def capacity_offsets(count):
+        return torch.arange(0, (request_count + 1) * count, count, dtype=torch.int32, device=device)
+
+    args.setdefault("dense_move_offsets", capacity_offsets(keep_count + tail))
+    if args["swa_layers"]:
+        args.setdefault("swa_move_offsets", capacity_offsets(swa_window + tail))
+    if args.get("draft_layers"):
+        args.setdefault("draft_move_offsets", capacity_offsets(keep_count + draft_tail))
+    num_kv_heads = int(args["layer_pools"][args["dense_layers"][0]].shape[2])
+    compaction = init_compaction_buffers(union=union, per_layer=per_layer, **args)
+    # Test-side mirror of the construction inputs: production reads only the
+    # launch fields; the standalone helpers here need the geometry back.
+    compaction.update(
+        kept_token_ordinals=kept,
+        valid_sequence_lengths=args["valid_sequence_lengths"],
+        prompt_offsets=args["prompt_offsets"],
+        request_count=request_count,
+        decode_keep_count=keep_count,
+        protected_tail_capacity=tail,
+        draft_protected_tail_capacity=draft_tail if args.get("draft_layers") else 0,
+        swa_window=swa_window,
+        selection_rows=(
+            1
+            if union
+            else (len(args["dense_layers"]) * num_kv_heads if per_layer else num_kv_heads)
+        ),
+    )
+    return compaction
 
 
 def launch_family_pack(compaction, name):
