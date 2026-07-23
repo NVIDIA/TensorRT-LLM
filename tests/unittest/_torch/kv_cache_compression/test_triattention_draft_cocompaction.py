@@ -392,15 +392,15 @@ def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
         # and thread through unchanged (no longer build arguments).
         assert manager.eviction_mode == "union"
         assert manager._phase is phase
-        assert kwargs["capacities"]["max_requests"] == 8
-        assert kwargs["capacities"]["decode_width"] == 4 + 2 * 128
-        assert kwargs["capacities"]["bucket_seq_len"] == 1024
-        assert kwargs["capacities"]["page_table_token_capacity"] == 1024 + 1
+        assert kwargs["max_requests"] == 8
+        assert kwargs["decode_width"] == 4 + 2 * 128
+        assert kwargs["bucket_seq_len"] == 1024
+        assert kwargs["page_table_token_capacity"] == 1024 + 1
         assert kwargs["draft"]["page_table_token_capacity"] == 1024 + 1
         assert kwargs["draft"]["layout"] is manager._runtime_kv_layout.return_value
         # Migrated from the pipeline buffer-kwargs test: the budget and the
         # pool keys thread through unchanged.
-        assert kwargs["capacities"]["keep_count"] == manager.budget
+        assert kwargs["keep_count"] == manager.budget
         assert kwargs["layout"] is layout
         assert list(kwargs["layout"]["layer_pool_ids"]) == list(layout["layer_pool_ids"])
 

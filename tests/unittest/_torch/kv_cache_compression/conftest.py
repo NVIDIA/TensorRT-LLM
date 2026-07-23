@@ -561,22 +561,18 @@ def make_cute_buffers(
     manager._phase = make_phase_table(offsets, omega, seq_len)
     manager._build_buffers(
         layout=layout,
-        calibration=dict(
-            q_real=q_real,
-            q_imag=q_imag,
-            mlr_coef=mlr_coef,
-            freq_scale_sq=freq_scale_sq,
+        q_real=q_real,
+        q_imag=q_imag,
+        mlr_coef=mlr_coef,
+        freq_scale_sq=freq_scale_sq,
+        max_requests=max_requests,
+        bucket_seq_len=seq_len,
+        decode_width=decode_width,
+        page_table_token_capacity=(
+            seq_len if page_table_token_capacity is None else page_table_token_capacity
         ),
-        capacities=dict(
-            max_requests=max_requests,
-            bucket_seq_len=seq_len,
-            decode_width=decode_width,
-            page_table_token_capacity=(
-                seq_len if page_table_token_capacity is None else page_table_token_capacity
-            ),
-            keep_count=keep_count,
-            protected_tail_capacity=protected_tail_capacity,
-        ),
+        keep_count=keep_count,
+        protected_tail_capacity=protected_tail_capacity,
     )
     return manager
 

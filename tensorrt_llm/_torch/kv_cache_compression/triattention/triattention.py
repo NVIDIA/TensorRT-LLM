@@ -560,8 +560,13 @@ class TriAttention(KVCacheCompressionManager):
             ]
             raise RuntimeError(f"Missing {what}KV pools for attention layers {missing}")
         layer_pools = [pool for pool in maybe_layer_pools if pool is not None]
-        # Canonical pool IDs, resolved once; every grouping derives from them.
-        layer_pool_ids = self._page_table_pool_ids(manager, global_layers)
+        # Canonical pool IDs, resolved once; every grouping derives from them
+        # (V2 owns the mapping; its own lookup errors are the precise ones).
+        layer_offsets = manager.layer_offsets
+        layer_to_pool = manager.layer_to_pool_mapping_dict
+        layer_pool_ids = tuple(
+            int(layer_to_pool[layer_offsets[global_layer]]) for global_layer in global_layers
+        )
         all_storage_groups: Dict[int, List[int]] = {}
         for layer, pool_id in enumerate(layer_pool_ids):
             all_storage_groups.setdefault(pool_id, []).append(layer)
@@ -673,20 +678,16 @@ class TriAttention(KVCacheCompressionManager):
         q_real, q_imag, mlr_coef = self._local_score_calibration(layout["global_layers"])
         self._build_buffers(
             layout=layout,
-            calibration=dict(
-                q_real=q_real,
-                q_imag=q_imag,
-                mlr_coef=mlr_coef,
-                freq_scale_sq=self._freq_scale_sq,
-            ),
-            capacities=dict(
-                max_requests=request_capacity,
-                bucket_seq_len=seq_capacity,
-                decode_width=decode_width,
-                page_table_token_capacity=page_table_token_capacity,
-                keep_count=self.budget,
-                protected_tail_capacity=tail_capacity,
-            ),
+            q_real=q_real,
+            q_imag=q_imag,
+            mlr_coef=mlr_coef,
+            freq_scale_sq=self._freq_scale_sq,
+            max_requests=request_capacity,
+            bucket_seq_len=seq_capacity,
+            decode_width=decode_width,
+            page_table_token_capacity=page_table_token_capacity,
+            keep_count=self.budget,
+            protected_tail_capacity=tail_capacity,
             draft=draft,
         )
         self._buffers_built = True
@@ -695,8 +696,16 @@ class TriAttention(KVCacheCompressionManager):
         self,
         *,
         layout: Dict[str, object],
-        calibration: Dict[str, torch.Tensor],
-        capacities: Dict[str, int],
+        q_real: torch.Tensor,
+        q_imag: torch.Tensor,
+        mlr_coef: torch.Tensor,
+        freq_scale_sq: torch.Tensor,
+        max_requests: int,
+        bucket_seq_len: int,
+        decode_width: int,
+        page_table_token_capacity: int,
+        keep_count: int,
+        protected_tail_capacity: int,
         draft: Optional[Dict[str, object]] = None,
     ) -> None:
         """Build the round's buffers, compiled score launches, and compaction data
@@ -725,24 +734,21 @@ class TriAttention(KVCacheCompressionManager):
         layer_group_representative = layout["layer_group_representative"]
         # Canonical layer -> V2 pool id tuple; it IS the staged plane slot map.
         layer_pool_ids = tuple(layout["layer_pool_ids"])
-        dense_groups = list(layout["storage_groups"].values())
-        page_representatives = [group[0] for group in dense_groups]
-        page_representatives.extend(
-            layer for layer in swa_layers if layer not in page_representatives
-        )
         num_page_table_slots = int(layout["manager"].num_pools)
 
-        device = layer_pools[page_representatives[0]].device
-        max_requests = int(capacities["max_requests"])
-        seq_len = int(capacities["bucket_seq_len"])
-        page_table_token_capacity = int(capacities["page_table_token_capacity"])
-        decode_width = int(capacities["decode_width"])
-        keep_count = int(capacities["keep_count"])
-        protected_tail_capacity = int(capacities["protected_tail_capacity"])
+        # The first dense layer anchors device and staging geometry.
+        p0 = layer_pools[dense_layers[0]]
+        device = p0.device
+        max_requests = int(max_requests)
+        seq_len = int(bucket_seq_len)
+        page_table_token_capacity = int(page_table_token_capacity)
+        decode_width = int(decode_width)
+        keep_count = int(keep_count)
+        protected_tail_capacity = int(protected_tail_capacity)
 
         q_real, q_imag, mlr_coef, freq_scale_sq = (
-            calibration[key].to(device=device, dtype=torch.float32).contiguous()
-            for key in ("q_real", "q_imag", "mlr_coef", "freq_scale_sq")
+            tensor.to(device=device, dtype=torch.float32).contiguous()
+            for tensor in (q_real, q_imag, mlr_coef, freq_scale_sq)
         )
         num_q_heads = int(q_real.shape[1])
         num_freqs = int(q_real.shape[2])
@@ -755,7 +761,7 @@ class TriAttention(KVCacheCompressionManager):
 
         # ---- block-offset staging (target, plus the co-compressed draft) -------
         self._block_offsets_host, self._block_offsets_device = _allocate_block_offset_staging(
-            layer_pools[page_representatives[0]],
+            p0,
             num_pools=num_page_table_slots,
             max_requests=max_requests,
             token_capacity=page_table_token_capacity,
@@ -815,15 +821,15 @@ class TriAttention(KVCacheCompressionManager):
         self._phase_f_block = triton.next_power_of_2(self._phase_num_freqs)
 
         # ---- score state: one fused group across all dense layers --------------
-        p0 = layer_pools[dense_layers[0]]
-        _, kv_factor, num_kv_heads, tokens_per_block, head_dim = p0.shape
+        _, _, num_kv_heads, tokens_per_block, _ = p0.shape
         self._num_layers = len(dense_layers)
         self._num_q_heads = int(num_q_heads)
         self._num_kv_heads = int(num_kv_heads)
         self._num_freqs = int(num_freqs)
         self._tokens_per_block = int(tokens_per_block)
-        _rep_of = {layer: layers[0] for layers in dense_groups for layer in layers}
-        dense_layer_slots = [layer_pool_ids[_rep_of[layer]] for layer in dense_layers]
+        dense_layer_slots = [
+            layer_pool_ids[layer_group_representative[layer]] for layer in dense_layers
+        ]
         seg_req_id = torch.arange(max_requests, dtype=torch.int32, device=device).repeat_interleave(
             self._num_layers
         )
@@ -1209,20 +1215,6 @@ class TriAttention(KVCacheCompressionManager):
         self._block_offsets_ready_event = torch.cuda.Event()
         # This cohort's compact is done: manager may resize/reuse pages.
         self._compaction_done_event = torch.cuda.Event()
-
-    @staticmethod
-    def _page_table_pool_ids(
-        manager: KVCacheManagerV2,
-        global_layers: List[int],
-    ) -> Tuple[int, ...]:
-        """Canonical local layer -> V2 pool id tuple (the staged plane slots).
-
-        V2 owns the mapping; its own lookup errors are the precise ones."""
-        layer_offsets = manager.layer_offsets
-        layer_to_pool = manager.layer_to_pool_mapping_dict
-        return tuple(
-            int(layer_to_pool[layer_offsets[global_layer]]) for global_layer in global_layers
-        )
 
     def _evict_requests(
         self,
