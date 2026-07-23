@@ -53,6 +53,7 @@ def _bare_proxy():
     proxy._results = {}
     # Set so the __del__ -> shutdown() path is a clean no-op at GC time.
     proxy.workers_started = False
+    proxy._multi_frontend_ipc_dir = None
     return proxy
 
 
@@ -528,6 +529,14 @@ def test_pool_session_shutdown_never_blocks_after_release():
     pool = _Mock()
     pool._pool.thread = None  # no real manager thread to deregister
     session.mpi_pool = pool
+    # __init__ is bypassed above; seed the attributes that shutdown() reads
+    # so the test exercises the release/shutdown contract, not attribute
+    # lookup on a raw-constructed session. Keep them minimal:
+    #   * n_workers is only used by shutdown()'s log line.
+    #   * _wait_shutdown gates the post-shutdown worker-exit barrier;
+    #     the test targets the blocking-join guard, so leave it off.
+    session.n_workers = 1
+    session._wait_shutdown = False
 
     session.release_exit_joins()
     session.shutdown()  # owner asks for the default blocking shutdown
