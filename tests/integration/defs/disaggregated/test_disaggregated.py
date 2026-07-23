@@ -1547,10 +1547,16 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
+    # This test validates the legacy C++ DataTransceiver CSV format. Force
+    # DEFAULT to UCX so Llama's Python preference falls back to C++.
+    env = llm_venv._new_env | {
+        "TRTLLM_KVCACHE_TIME_OUTPUT_PATH": output_path,
+        "TRTLLM_USE_NIXL_KVCACHE": "0",
+        "TRTLLM_USE_UCX_KVCACHE": "1",
+    }
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
-                           env=llm_venv._new_env
-                           | {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": output_path},
+                           env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
     assert os.path.isdir(output_path)
