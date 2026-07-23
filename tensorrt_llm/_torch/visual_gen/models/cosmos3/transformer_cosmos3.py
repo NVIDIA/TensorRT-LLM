@@ -930,7 +930,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         pretrained_config = apply_pretrained_config_compat_defaults(model_config.pretrained_config)
         self.recipe = resolve_arch_recipe(pretrained_config)
         self.audio_gen = getattr(pretrained_config, "sound_gen", False)
-        self.action_gen = getattr(pretrained_config, "action_gen", False)
+        # Config fact only: the transformer never constructs action modules.
+        self.has_action_weights = getattr(pretrained_config, "action_gen", False)
 
         self.hidden_size = pretrained_config.hidden_size
         self.num_hidden_layers = pretrained_config.num_hidden_layers

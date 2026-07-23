@@ -549,7 +549,7 @@ class TestI2V4StepConfigShape:
         model = Cosmos3VFMTransformer(model_config)
 
         assert model.audio_gen is False
-        assert model.action_gen is False
+        assert model.has_action_weights is False
         assert not hasattr(model, "audio2llm")
         assert not hasattr(model, "audio_modality_embed")
         assert model.base_fps == 16

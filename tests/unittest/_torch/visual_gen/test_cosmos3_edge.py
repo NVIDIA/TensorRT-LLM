@@ -352,7 +352,7 @@ class TestEdgeTransformerStructure:
     def test_recipe_and_flags(self, model):
         assert model.recipe is NEMOTRON_DENSE_RECIPE
         assert model.audio_gen is False
-        assert model.action_gen is True
+        assert model.has_action_weights is True
         assert model.temporal_compression_factor == 4
         assert model.temporal_compression_factor_declared is True
 
@@ -728,7 +728,8 @@ def _bare_pipeline(family: str) -> Cosmos3OmniMoTPipeline:
     pipeline.family = family
     pipeline.sampling = Cosmos3SamplingPolicy()
     pipeline.audio_gen = False
-    pipeline.action_gen = family == NEMOTRON_DENSE_RECIPE.name
+    pipeline.action_gen = False
+    pipeline.has_action_weights = family == NEMOTRON_DENSE_RECIPE.name
     pipeline.use_native_flow_schedule = family == NEMOTRON_DENSE_RECIPE.name
     return pipeline
 

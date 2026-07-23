@@ -109,6 +109,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def __init__(self, pipeline_config):
         primary_pretrained_config = pipeline_config.primary_pretrained_config
         self.audio_gen = False
+        # Checkpoint fact vs runtime capability: the checkpoint may ship
+        # action weights, but action generation is not implemented here.
+        self.has_action_weights = False
         self.action_gen = False
         self.sampling = Cosmos3SamplingPolicy()
         self.use_native_flow_schedule = False
@@ -127,7 +130,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 "Checkpoint declares action weights; action generation is not supported "
                 "by this pipeline (weights are skipped)."
             )
-            self.action_gen = True
+            self.has_action_weights = True
 
         super().__init__(pipeline_config)
 

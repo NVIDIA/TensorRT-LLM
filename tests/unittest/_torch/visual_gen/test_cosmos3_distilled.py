@@ -18,12 +18,12 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_T2I_PARAMS,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
-from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
     DISTILLED_GUIDANCE_SCALE,
     Cosmos3SamplingPolicy,
     load_scheduler,
 )
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
@@ -83,6 +83,7 @@ def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
     defaults = dict(
         audio_gen=False,
         action_gen=False,
+        has_action_weights=False,
         sampling=Cosmos3SamplingPolicy(),
         default_use_system_prompt=False,
         family=QWEN3_RECIPE.name,
