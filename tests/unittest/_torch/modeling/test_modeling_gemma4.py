@@ -22,6 +22,7 @@ import math
 import unittest
 import unittest.mock
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
@@ -369,6 +370,91 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
 
 class TestGemma4HfWeightMapper(unittest.TestCase):
     """Tests for Gemma4-specific checkpoint key transformations."""
+
+    def test_duplicate_full_attention_kv_projection_tensors(self):
+        """Full K=V layers should duplicate all missing k_proj tensors to v_proj."""
+        fields = ("weight", "weight_scale", "input_scale", "weight_scale_2", "pre_quant_scale")
+        for is_vlm in (False, True):
+            with self.subTest(is_vlm=is_vlm):
+                mapper = Gemma4HfWeightMapper()
+                config = SimpleNamespace(
+                    attention_k_eq_v=True,
+                    layer_types=["sliding_attention", "full_attention"],
+                )
+                layer_scalar_buffers = [unittest.mock.Mock(), unittest.mock.Mock()]
+                layers = [
+                    SimpleNamespace(layer_scalar=layer_scalar_buffer)
+                    for layer_scalar_buffer in layer_scalar_buffers
+                ]
+                if is_vlm:
+                    mapper._model = SimpleNamespace(
+                        config=config,
+                        vision_tower=object(),
+                        llm=SimpleNamespace(model=SimpleNamespace(layers=layers)),
+                    )
+                    model_prefix = "language_model.model"
+                else:
+                    mapper._model = SimpleNamespace(
+                        config=config,
+                        model=SimpleNamespace(layers=layers),
+                    )
+                    model_prefix = "model"
+
+                weights = {}
+                if is_vlm:
+                    weights["model.vision_tower.marker"] = object()
+                raw_prefix = "model.language_model"
+                full_k_prefix = f"{model_prefix}.layers.1.self_attn.k_proj."
+                full_v_prefix = f"{model_prefix}.layers.1.self_attn.v_proj."
+                sliding_v_prefix = f"{model_prefix}.layers.0.self_attn.v_proj."
+                for field in fields:
+                    weights[f"{raw_prefix}.layers.1.self_attn.k_proj.{field}"] = object()
+                    weights[f"{raw_prefix}.layers.0.self_attn.k_proj.{field}"] = object()
+
+                explicit_v_input_scale = object()
+                weights[f"{raw_prefix}.layers.1.self_attn.v_proj.input_scale"] = (
+                    explicit_v_input_scale
+                )
+                explicit_v_scale = object()
+                weights[f"{raw_prefix}.layers.1.self_attn.k_proj.k_scale"] = object()
+                weights[f"{raw_prefix}.layers.1.self_attn.k_proj.k_bias"] = object()
+                weights[f"{raw_prefix}.layers.1.self_attn.v_proj.v_scale"] = explicit_v_scale
+                weights[f"{raw_prefix}.layers.1.self_attn.k_norm.weight"] = object()
+                layer_scalar_value = object()
+                weights[f"{raw_prefix}.layers.1.layer_scalar"] = layer_scalar_value
+
+                result = mapper.preprocess_weights(weights)
+
+                self.assertIs(
+                    result[f"{full_v_prefix}input_scale"],
+                    explicit_v_input_scale,
+                )
+                for field in fields:
+                    if field == "input_scale":
+                        continue
+                    self.assertIs(
+                        result[f"{full_v_prefix}{field}"],
+                        result[f"{full_k_prefix}{field}"],
+                    )
+                self.assertIs(result[f"{full_v_prefix}v_scale"], explicit_v_scale)
+                self.assertIs(
+                    result[f"{full_v_prefix}v_bias"],
+                    result[f"{full_k_prefix}k_bias"],
+                )
+                self.assertNotIn(f"{full_v_prefix}k_scale", result)
+                self.assertNotIn(f"{full_v_prefix}k_bias", result)
+                for field in fields:
+                    self.assertNotIn(f"{sliding_v_prefix}{field}", result)
+                self.assertNotIn(
+                    f"{model_prefix}.layers.1.self_attn.v_norm.weight",
+                    result,
+                )
+                layer_scalar_buffers[1].copy_.assert_called_once_with(layer_scalar_value)
+                self.assertNotIn(f"{model_prefix}.layers.1.layer_scalar", result)
+
+                second_result = mapper.preprocess_weights(result)
+                for key, value in result.items():
+                    self.assertIs(second_result[key], value)
 
     def test_remap_modelopt_nvfp4_per_expert_weights(self):
         """ModelOpt's split expert tensors should map to the VANILLA MoE layout."""
