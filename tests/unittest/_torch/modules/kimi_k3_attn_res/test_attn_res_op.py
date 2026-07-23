@@ -38,7 +38,18 @@ def _similarity(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, fl
 
 @pytest.mark.parametrize(
     ("num_tokens", "num_snapshots"),
-    [(64, 0), (128, 3), (1024, 11), (300, 5), (16384, 11)],
+    [
+        (1, 0),
+        (1, 1),
+        (1, 3),
+        (1, 7),
+        (1, 11),
+        (64, 0),
+        (128, 3),
+        (1024, 11),
+        (300, 5),
+        (16384, 11),
+    ],
 )
 @torch.no_grad()
 def test_fused_attn_res_matches_torch_reference(num_tokens: int, num_snapshots: int) -> None:
