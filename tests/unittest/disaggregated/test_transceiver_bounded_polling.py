@@ -1364,6 +1364,7 @@ def test_consensus_outcome_uses_single_batched_allgather() -> None:
     assert reclaimable_failed == [2]  # 99 lacks this rank's quiescence ACK
     assert new_completed == [7]  # intersection only (8 is completed on the peer only)
 
+
 @pytest.mark.skip(
     reason="ctx idle fast-path was dropped from this branch. TODO: when the "
     "fast-path is reintroduced, its terminal-count reduction must mirror "
