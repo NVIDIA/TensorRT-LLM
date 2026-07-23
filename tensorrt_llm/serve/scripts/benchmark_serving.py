@@ -28,6 +28,7 @@ from argparse import ArgumentParser as FlexibleArgumentParser
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -45,6 +46,7 @@ from tensorrt_llm.serve.scripts.benchmark_dataset import (
     SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset)
 from tensorrt_llm.serve.scripts.benchmark_utils import (
     convert_to_pytorch_benchmark_format, write_to_json)
+from tensorrt_llm.serve.scripts.time_breakdown import RequestTimeBreakdown
 # isort: on
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
@@ -735,6 +737,61 @@ async def fetch_energy_metrics(base_url: str) -> Optional[dict]:
             return None
 
 
+def _snapshot_perf_metrics(output_dir: str) -> dict[Path, int]:
+    directory = Path(output_dir)
+    if not directory.exists():
+        return {}
+    if not directory.is_dir():
+        raise ValueError(
+            f"Performance metrics output path is not a directory: {output_dir}")
+    return {
+        path: path.stat().st_size
+        for path in directory.glob("perf_metrics-*.jsonl")
+    }
+
+
+def _perf_metrics_files(output_dir: str, offsets: dict[Path,
+                                                       int]) -> list[Path]:
+    paths = sorted(Path(output_dir).glob("perf_metrics-*.jsonl"))
+    by_kind = {}
+    for path in paths:
+        if path.stat().st_size <= offsets.get(path, 0):
+            continue
+        kind = path.name.removeprefix("perf_metrics-").split("-", 1)[0]
+        by_kind.setdefault(kind, []).append(path)
+    if "disagg" in by_kind:
+        return by_kind["disagg"]
+    if "server" in by_kind:
+        return by_kind["server"]
+    return []
+
+
+def _read_new_perf_metrics(
+    output_dir: str,
+    offsets: dict[Path, int],
+    expected_count: int,
+    timeout: float = 10,
+) -> list[dict]:
+    deadline = time.monotonic() + timeout
+    records = []
+    while time.monotonic() < deadline:
+        records = []
+        for path in _perf_metrics_files(output_dir, offsets):
+            with path.open("r", encoding="utf-8") as metrics_file:
+                metrics_file.seek(offsets.get(path, 0))
+                for line in metrics_file:
+                    if not line.strip():
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        if len(records) >= expected_count:
+            return records
+        time.sleep(0.1)
+    return records
+
+
 def main(args: argparse.Namespace):
     print(args)
     random.seed(args.seed)
@@ -936,6 +993,10 @@ def main(args: argparse.Namespace):
     # Avoid GC - reduce pause times.
     gc.disable()
 
+    perf_metrics_output_dir = getattr(args, 'save_request_time_breakdown', None)
+    perf_metrics_offsets = (_snapshot_perf_metrics(perf_metrics_output_dir)
+                            if perf_metrics_output_dir else {})
+
     benchmark_result = asyncio.run(
         benchmark(
             backend=backend,
@@ -1015,6 +1076,43 @@ def main(args: argparse.Namespace):
         with open(file_name, "w", encoding='utf-8') as outfile:
             json.dump(result_json, outfile)
         save_to_pytorch_benchmark_format(args, result_json, file_name)
+
+    if perf_metrics_output_dir:
+        expected_count = benchmark_result["completed"] + int(
+            not args.no_test_input)
+        perf_metrics = _read_new_perf_metrics(perf_metrics_output_dir,
+                                              perf_metrics_offsets,
+                                              expected_count)
+        if not perf_metrics:
+            print("No new public-server performance metrics found; "
+                  "skipping time breakdown report.")
+            return
+        if len(perf_metrics) < expected_count:
+            print(f"Warning: found {len(perf_metrics)} of "
+                  f"{expected_count} expected performance metrics records.")
+
+        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base_model_id = model_id.split("/")[-1]
+        max_concurrency_str = (f"-concurrency{args.max_concurrency}"
+                               if args.max_concurrency is not None else "")
+        output_stem = (f"{backend}-{args.request_rate}qps{max_concurrency_str}-"
+                       f"{base_model_id}-{current_dt}-perf_metrics")
+        if args.result_dir:
+            output_stem = os.path.join(args.result_dir, output_stem)
+        perf_filename = f"{output_stem}.jsonl"
+        with open(perf_filename, "w", encoding="utf-8") as outfile:
+            for record in perf_metrics:
+                outfile.write(json.dumps(record, separators=(",", ":")) + "\n")
+        print(f"Request performance metrics saved to: {perf_filename}")
+
+        analyzer = RequestTimeBreakdown()
+        timing_data = analyzer.parse_json_file(perf_filename)
+        if timing_data:
+            diagram_filename = f"{output_stem}-time_diagram.html"
+            analyzer.create_timing_diagram(timing_data, diagram_filename)
+            print(f"Time diagram saved to: {diagram_filename}")
+        else:
+            print("No time data found; skipping time breakdown diagram.")
 
 
 if __name__ == "__main__":
@@ -1405,6 +1503,18 @@ if __name__ == "__main__":
         "--no-test-input",
         action="store_true",
         help="Skip initial test run with a single prompt.",
+    )
+
+    parser.add_argument(
+        "--save-request-time-breakdown",
+        nargs="?",
+        const=".",
+        default=None,
+        metavar="PERF_METRICS_OUTPUT_DIR",
+        help=("Read JSONL records dumped by the server's "
+              "perf_metrics_output_dir, save the benchmark records, and "
+              "create an interactive time breakdown diagram. If no directory "
+              "is provided, use the current directory."),
     )
 
     args = parser.parse_args()
