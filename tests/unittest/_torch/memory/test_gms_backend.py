@@ -29,6 +29,7 @@ here. Tracked as a follow-up PR; see PR #13926 review thread
 
 import sys
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -200,6 +201,119 @@ class TestRwOnlyMethodsGated:
     def test_method_raises_when_granted_ro(self, method_name, invoke):
         with pytest.raises(RuntimeError, match="only valid in RW mode"):
             invoke(self._ro_backend())
+
+
+# ---------------------------------------------------------------------------
+# finalize_write() return contract and state transition
+# ---------------------------------------------------------------------------
+
+
+class TestFinalizeWrite:
+    """GMS finalization consumes supported byte-count return contracts."""
+
+    @staticmethod
+    def _rw_backend():
+        backend = GMSBackend(socket_path="/tmp/gms.sock", mapping=MagicMock())
+        backend._client = MagicMock()
+        backend._is_rw = True
+        return backend
+
+    @staticmethod
+    def _install_finalize_result(monkeypatch, result):
+        finalize_gms_write = MagicMock(return_value=result)
+        fake_utils = SimpleNamespace(finalize_gms_write=finalize_gms_write)
+        monkeypatch.setitem(
+            sys.modules,
+            "gpu_memory_service.integrations.common.utils",
+            fake_utils,
+        )
+        return finalize_gms_write
+
+    @staticmethod
+    def _install_fake_cleanup(monkeypatch):
+        evict_gms_client_memory_manager = MagicMock()
+        fake_allocator = SimpleNamespace(
+            evict_gms_client_memory_manager=evict_gms_client_memory_manager
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "gpu_memory_service.client.torch.allocator",
+            fake_allocator,
+        )
+        return evict_gms_client_memory_manager
+
+    @pytest.mark.parametrize(
+        "result, expected_bytes",
+        [
+            pytest.param(
+                SimpleNamespace(committed_bytes=0, pruned_bytes=1024),
+                0,
+                id="current-stats-zero",
+            ),
+            pytest.param(
+                SimpleNamespace(committed_bytes=4096, pruned_bytes=1024),
+                4096,
+                id="current-stats-nonzero",
+            ),
+            pytest.param(4096, 4096, id="legacy-integer"),
+        ],
+    )
+    def test_consumes_supported_result(self, monkeypatch, result, expected_bytes):
+        backend = self._rw_backend()
+        model = MagicMock()
+        finalize_gms_write = self._install_finalize_result(monkeypatch, result)
+
+        assert backend.finalize_write(model) == expected_bytes
+        finalize_gms_write.assert_called_once_with(backend._client, model)
+        assert backend.is_rw is False
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            pytest.param(None, id="none"),
+            pytest.param(True, id="boolean"),
+            pytest.param(
+                SimpleNamespace(committed_bytes="4096", pruned_bytes=0),
+                id="non-integer-committed-bytes",
+            ),
+            pytest.param(
+                SimpleNamespace(committed_bytes=True, pruned_bytes=0),
+                id="boolean-committed-bytes",
+            ),
+        ],
+    )
+    def test_rejects_unsupported_result_and_cleans_up(self, monkeypatch, result):
+        backend = self._rw_backend()
+        client = backend._client
+        self._install_finalize_result(monkeypatch, result)
+        evict_gms_client_memory_manager = self._install_fake_cleanup(monkeypatch)
+
+        with pytest.raises(TypeError, match="Unsupported gpu_memory_service"):
+            backend.finalize_write(MagicMock())
+
+        client.close.assert_called_once_with()
+        evict_gms_client_memory_manager.assert_called_once_with(client)
+        assert backend._client is None
+        assert backend.is_rw is None
+
+    def test_finalizer_failure_cleans_up_and_preserves_exception(self, monkeypatch):
+        backend = self._rw_backend()
+        client = backend._client
+        finalize_gms_write = MagicMock(side_effect=RuntimeError("remap failed"))
+        monkeypatch.setitem(
+            sys.modules,
+            "gpu_memory_service.integrations.common.utils",
+            SimpleNamespace(finalize_gms_write=finalize_gms_write),
+        )
+        evict_gms_client_memory_manager = self._install_fake_cleanup(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="remap failed"):
+            backend.finalize_write(MagicMock())
+
+        client.close.assert_called_once_with()
+        evict_gms_client_memory_manager.assert_called_once_with(client)
+        assert backend._client is None
+        assert backend.is_rw is None
 
 
 # ---------------------------------------------------------------------------
