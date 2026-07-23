@@ -2308,16 +2308,27 @@ class Indexer(nn.Module):
 
         return k_fp8, k_scale
 
-    def _call_mqa_logits(self, q_fp8: torch.Tensor, k_fp8: torch.Tensor,
-                         k_scale: torch.Tensor, weights: torch.Tensor,
-                         cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor,
-                         q_scale: Optional[torch.Tensor]) -> torch.Tensor:
+    def _call_mqa_logits(self,
+                         q_fp8: torch.Tensor,
+                         k_fp8: torch.Tensor,
+                         k_scale: torch.Tensor,
+                         weights: torch.Tensor,
+                         cu_seqlen_ks: torch.Tensor,
+                         cu_seqlen_ke: torch.Tensor,
+                         q_scale: Optional[torch.Tensor],
+                         clean_logits: bool = True) -> torch.Tensor:
         """Dispatch fp8_mqa_logits vs fp8_fp4_mqa_logits based on use_fp4.
 
         For FP4 the gather output keeps the legacy float8_e4m3fn dtype for
         API compatibility; reinterpret the bytes as the int8 / int32 layout
         the DeepGEMM kernel expects. The scale tensor is collapsed to 1D for
         the kv side and 2D for the q side per the kernel's asserts.
+
+        clean_logits=False skips DeepGEMM's smxx_clean_logits pass that fills
+        everything outside each row's [ks, ke) window with -inf. Safe only
+        when the consumer never reads outside that window (the custom
+        indexer_topk_prefill kernel); the torch topk fallback scans the full
+        padded row and needs the fill.
         """
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
@@ -2331,9 +2342,13 @@ class Indexer(nn.Module):
                 weights,
                 cu_seqlen_ks,
                 cu_seqlen_ke,
+                clean_logits=clean_logits,
             )
-        return fp8_mqa_logits(q_fp8, (k_fp8, k_scale.reshape(-1)), weights,
-                              cu_seqlen_ks, cu_seqlen_ke)
+        return fp8_mqa_logits(q_fp8, (k_fp8, k_scale.reshape(-1)),
+                              weights,
+                              cu_seqlen_ks,
+                              cu_seqlen_ke,
+                              clean_logits=clean_logits)
 
     def _call_paged_mqa_logits(self, q_decode: torch.Tensor,
                                k_cache: torch.Tensor,
@@ -2478,6 +2493,7 @@ class Indexer(nn.Module):
                             chunk.cu_seqlen_ks[c0:c1],
                             chunk.cu_seqlen_ke[c0:c1],
                             tile_q_scale,
+                            clean_logits=not use_custom_topk,
                         )
                         if use_custom_topk:
                             torch.ops.trtllm.indexer_topk_prefill(
@@ -2533,6 +2549,7 @@ class Indexer(nn.Module):
                     cu_seqlen_ks,
                     cu_seqlen_ke,
                     ctx_q_scale,
+                    clean_logits=not use_custom_topk,
                 )
                 if use_custom_topk:
                     torch.ops.trtllm.indexer_topk_prefill(
