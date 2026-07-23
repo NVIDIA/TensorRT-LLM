@@ -350,6 +350,12 @@ class MultimodalModelMixin:
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
 
+    supports_mm_encoder_item_scheduling: ClassVar[bool] = False
+    """Whether the model supports item-level MM encoder scheduling: it implements
+    the item-encode forward and pairs with a processor that overrides
+    `BaseMultimodalInputProcessor.get_mm_encoder_item_metadata`. This is the
+    executor-layer gate for item scheduling."""
+
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
 
@@ -994,26 +1000,15 @@ class MultimodalModelMixin:
         The cache stores per-item embeddings for params that can be represented by one modality.
         See `_encoder_cache_keys` for the mixed-modality skip path and its technical limitation.
 
-        Scope: this serves only the full-request consumers (side-stream
-        prefetch, `mm_encoder_only`/disagg encoding, cache-enabled models
-        without item scheduling). Item-scheduling models store encoder
-        outputs in the engine-owned `MultimodalEncoderCacheManager` instead;
-        for them this cache stays empty in the executor loop (their requests
-        arrive here with embeddings already attached). The key format is
-        shared (`_encoder_cache_item_key`) so the two stores can unify later.
-
-        TODO(TRTLLM-14477): unify the full-request consumers onto the
-        `MultimodalEncoderCacheManager` and retire this clone cache:
-        (1) inject the manager into the model and switch
-        `_attach_encoder_cache_hit` to `get_and_hold` and
-        `_write_encoder_cache_entries` to a clone-adopt `put` (batch-tensor
-        slices must not retain the whole batch allocation) — this also puts
-        side-stream prefetch under the byte budget; (2) assemble partial
-        hits by encoding only the misses through
-        `prepare_multimodal_encoder_inputs` (resolves TRTLLM-13996 for all
-        consumers); (3) delete this getter, `_encoder_cache_keys`,
-        `supports_encoder_cache`, and the legacy reservation branch in
-        `_reserve_multimodal_encoder_cache_memory`.
+        Scope: the single encoder cache instance for a cache-enabled model
+        (`supports_encoder_cache`). The full-request (legacy inline-encode)
+        consumers — side-stream prefetch, `mm_encoder_only`/disagg encoding —
+        populate and read it inline; the item-scheduling path consumes the
+        same instance read-through at encode time
+        (`ModelEngine.forward_multimodal_encoder_items`). The key format is
+        shared (`_encoder_cache_item_key`) so hits cross between paths. The
+        item path's recorded outputs are cloned, so cache eviction never
+        invalidates an in-flight request.
         """
         if not self.encoder_cache_active:
             logger.debug_once(
@@ -1153,8 +1148,8 @@ class MultimodalModelMixin:
 
         The single source of the key format: the full-request path
         (`_encoder_cache_keys`) and the item-scheduling path
-        (`build_encoder_cache_item_keys`) must produce identical keys so
-        entries written by either path hit from the other.
+        (`build_encoder_cache_item_keys`) produce identical keys so entries
+        written by either path hit from the other.
         """
         return (modality, tuple(item_hash), int(embedding_length), kwargs_hash)
 

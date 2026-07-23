@@ -1200,6 +1200,8 @@ class Qwen3VisionModelBase(nn.Module):
 
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
+    supports_mm_encoder_item_scheduling = True
+
     def encode_multimodal_inputs(
         self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
     ) -> torch.Tensor:

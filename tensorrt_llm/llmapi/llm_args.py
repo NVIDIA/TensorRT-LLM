@@ -570,18 +570,14 @@ class MultimodalConfig(StrictBaseModel):
         default=134_217_728,  # 128 MiB.
         description=
         ("Maximum bytes for the per-model multimodal encoder embedding cache. "
-         "String values such as '512MB' and '1GiB' use binary units. "
-         "For models with item-level encoder scheduling this cache is the "
-         "exclusive storage for encoder outputs: its budget bounds encoder-"
-         "output GPU residency (reserved during memory profiling), entries "
-         "are reused per item across requests, and values below one prefill "
-         "iteration's embeddings (including 0) are raised to that minimum "
-         "with a warning. For other multimodal models it is a cross-request "
-         "cache with all-or-nothing per-request reuse (every item must hit "
-         "before cached embeddings are used); 0 disables it, and only "
-         "single-modality requests are cacheable for the time being. "
-         "For the time being, this is incompatible with "
-         "encoder_side_stream_max_ahead > 0. "
+         "String values such as '512MB' and '1GiB' use binary units. This is "
+         "a cross-request cache with all-or-nothing per-request reuse (every "
+         "item must hit before cached embeddings are used); 0 disables it, "
+         "and only single-modality requests are cacheable for the time being. "
+         "The item-level encoder scheduler does not use this cache; its "
+         "resident encoder outputs are bounded by an internally derived budget "
+         "(one prefill iteration's embeddings). For the time being, this is "
+         "incompatible with encoder_side_stream_max_ahead > 0. "
          "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
          ),
         status="prototype",

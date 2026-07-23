@@ -26,7 +26,6 @@ pytestmark = pytest.mark.cpu_only
 
 class _ItemMetadataFakeProcessor:
     multimodal_hashing_supported = False
-    supports_mm_encoder_item_scheduling = True
 
     def __init__(self, existing_embedding_lengths):
         self.existing_embedding_lengths = existing_embedding_lengths
@@ -82,14 +81,30 @@ def test_mm_item_metadata_rejects_mismatched_embedding_lengths():
         input_processor({"prompt": "unused"}, sampling_params=None)
 
 
-def test_mm_item_scheduling_contract_requires_metadata_for_raw_payload():
-    class MissingMetadataProcessor(_ItemMetadataFakeProcessor):
+def test_mm_item_metadata_none_falls_back_to_non_item_path():
+    # A processor whose get_mm_encoder_item_metadata returns None does not
+    # participate in item scheduling; routing falls through with no item
+    # metadata attached (no capability flag drives this).
+    class NoMetadataProcessor(_ItemMetadataFakeProcessor):
         def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
             return None
 
-    input_processor = create_input_processor_with_hash(MissingMetadataProcessor([2]))
+    input_processor = create_input_processor_with_hash(NoMetadataProcessor([2]))
 
-    with pytest.raises(TypeError, match="must return item metadata"):
+    _, extra = input_processor({"prompt": "unused"}, sampling_params=None)
+
+    assert MULTIMODAL_ENCODER_ITEM_METADATA_KEY not in extra["multimodal_data"]
+
+
+def test_mm_item_metadata_rejects_wrong_return_type():
+    # A non-None, non-metadata return is a genuine contract violation.
+    class BadMetadataProcessor(_ItemMetadataFakeProcessor):
+        def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
+            return ("image", 0)
+
+    input_processor = create_input_processor_with_hash(BadMetadataProcessor([2]))
+
+    with pytest.raises(TypeError, match="must return a"):
         input_processor({"prompt": "unused"}, sampling_params=None)
 
 

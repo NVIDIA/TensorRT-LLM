@@ -55,7 +55,12 @@ ATTENTION_DP_DUMMY_REQUEST_ID = 0
 
 
 class MultimodalEncoderProgress(Enum):
-    """Python-only progress derived from request-local MM item outputs."""
+    """Python-only progress derived from request-local MM item outputs.
+
+    Only `READY` gates control flow today (`is_multimodal_encoder_ready`);
+    `PENDING`/`PARTIAL` are the intermediate states the item-level chunked
+    MM prefill follow-up will consume (per-chunk readiness) and document the
+    FCFS priority in the meantime."""
 
     PENDING = auto()
     """No MM item of the request has an encoder output yet."""
@@ -76,15 +81,16 @@ class MultimodalEncoderRequestState:
     Created at admission by `initialize_multimodal_encoder_request` for
     requests whose raw MM payloads run through the item scheduler; the
     request's `py_mm_encoder_state` is `None` otherwise. Item slots are
-    recorded from two sources — fresh encoder outputs adopted into the
-    `MultimodalEncoderCacheManager` and manager hits — through the single
-    `record()` writer, so validation cannot diverge between them.
+    filled by the single `record()` writer from two sources — fresh encoder
+    outputs and read-through encoder-cache hits — so validation cannot
+    diverge between them.
 
-    The state holds no storage of its own: every slot aliases a
-    manager-owned entry that the request holds until its prefill consumes
-    the embedding. Holds are released through the executor's teardown
-    funnel (`release_holds`), never by this object; held entries cannot
-    be evicted, so a recorded slot cannot regress.
+    The state owns its storage: `record()` clones every incoming tensor, so
+    a slot never aliases the encoder's batch output or a cache entry (cache
+    eviction is therefore harmless). The slot bytes are exactly the
+    request's own residency — the scheduler derives its byte budget from
+    live states each tick, so clearing the state *is* the release; there is
+    no release call to forget or replay.
 
     The state is rank-local and never crosses a serialization boundary:
     schedule distribution carries request/item IDs only, and every rank
@@ -93,12 +99,11 @@ class MultimodalEncoderRequestState:
 
     embedding_lengths: List[int]
     """Declared embedding row count of each atomic item, in prompt order.
-    `record()` validates incoming views against these."""
+    `record()` validates incoming tensors against these."""
 
     outputs: List[Optional[torch.Tensor]]
     """One slot per atomic item, in prompt order. ``None`` until the item is
-    recorded; then an alias of a held ``MultimodalEncoderCacheManager``
-    entry."""
+    recorded; then a clone owned by this request."""
 
     @classmethod
     def from_embedding_lengths(
@@ -131,45 +136,58 @@ class MultimodalEncoderRequestState:
             if output is None
         ]
 
-    def record(self, item_idx: int, output_view: torch.Tensor) -> None:
-        """Record one item's manager-owned output view into its slot.
+    def record(self, item_idx: int, output: torch.Tensor) -> None:
+        """Record one item's encoder output into its slot, taking a clone.
 
-        ``output_view`` must come from the `MultimodalEncoderCacheManager`
-        (`adopt()` for fresh encoder outputs, `get_and_hold()` for hits) so
-        it is already held on this request's behalf; no copy happens
-        here. Raises when the view does not match the item's declared row
-        count, when the item was already recorded, or when it disagrees
-        with previously recorded items on trailing shape/dtype/device
-        (items of one request must concatenate cleanly at fuse time).
+        ``output`` may be a view of a batched encoder output or a
+        read-through cache entry; the clone is the single choke point that
+        guarantees a recorded slot neither retains the whole batch
+        allocation through a view nor aliases a cache entry that can be
+        evicted under it. Raises when the tensor does not match the item's
+        declared row count, when the item was already recorded, or when it
+        disagrees with previously recorded items on trailing
+        shape/dtype/device (items of one request must concatenate cleanly at
+        fuse time).
         """
         expected_rows = self.embedding_lengths[item_idx]
-        if output_view.shape[0] != expected_rows:
-            raise ValueError(
-                f"MM item {item_idx} produced {output_view.shape[0]} "
-                f"embeddings; expected {expected_rows}")
+        if output.shape[0] != expected_rows:
+            raise ValueError(f"MM item {item_idx} produced {output.shape[0]} "
+                             f"embeddings; expected {expected_rows}")
         if self.outputs[item_idx] is not None:
             raise ValueError(
                 f"MM item {item_idx} was already recorded; items are "
                 "encoded at most once per request")
         reference = next((o for o in self.outputs if o is not None), None)
-        if reference is not None and (
-                reference.shape[1:] != output_view.shape[1:] or reference.dtype
-                != output_view.dtype or reference.device != output_view.device):
+        if reference is not None and (reference.shape[1:] != output.shape[1:]
+                                      or reference.dtype != output.dtype
+                                      or reference.device != output.device):
             raise ValueError(
                 "MM encoder items for one request must have matching "
                 "output shape, dtype, and device")
-        self.outputs[item_idx] = output_view
+        self.outputs[item_idx] = output.detach().clone()
+
+    def resident_output_bytes(self, embedding_row_bytes: int) -> int:
+        """Bytes of recorded, not-yet-consumed outputs held by this request.
+
+        The scheduler sums this over live states every tick to derive the
+        occupied share of the encoder output byte budget; there is no
+        separate accounting to keep in sync.
+        """
+        return sum(
+            length
+            for length, output in zip(self.embedding_lengths, self.outputs)
+            if output is not None) * embedding_row_bytes
 
     def finalize_into(self, multimodal_data: Dict[str, Any]) -> bool:
-        """Publish the item views once every slot is recorded.
+        """Publish the item outputs once every slot is recorded.
 
-        Attaches the prompt-ordered list of held item views as
+        Attaches the prompt-ordered list of owned item tensors as
         ``multimodal_embedding`` and drops the raw pre-encoder inputs. The
-        views stay manager-owned; the per-request contiguous embedding is
-        materialized lazily inside the prefill forward
-        (`get_multimodal_embeddings`), so between encode and prefill the
-        only GPU residency is the manager's accounted entries. No-op
-        returning ``False`` while any slot is still pending.
+        per-request contiguous embedding is materialized lazily inside the
+        prefill forward (`get_multimodal_embeddings`), so between encode
+        and prefill the only GPU residency is the slots this state owns —
+        exactly what the scheduler's derived byte accounting counts.
+        No-op returning ``False`` while any slot is still pending.
         """
         if not self.outputs or any(output is None for output in self.outputs):
             return False
@@ -1304,11 +1322,11 @@ def initialize_multimodal_encoder_request(
     Raises `ValueError` (failing only this request) when the request can
     never execute under the startup guarantees: an atomic item larger than
     the effective encoder token budget, or — when the encoder-output
-    storage budget is supplied — a total embedding footprint that could
-    never fit `multimodal_config.encoder_cache_max_bytes`. The latter is
-    ordinarily unreachable because prompts are bounded by `max_num_tokens`,
-    but LLM chunked prefill admits longer prompts whose full embedding must
-    stay resident across chunks.
+    budget is supplied — a total embedding footprint that could never fit
+    the encoder output budget (one prefill iteration's embeddings). The
+    latter is ordinarily unreachable because prompts are bounded by
+    `max_num_tokens`, but LLM chunked prefill admits longer prompts whose
+    full embedding must stay resident across chunks.
     """
     mm_data = request.py_multimodal_data
     has_raw_payload = isinstance(mm_data, dict) and any(
@@ -1336,9 +1354,10 @@ def initialize_multimodal_encoder_request(
             if total_bytes > max_output_bytes:
                 raise ValueError(
                     f"Multimodal request needs {total_bytes} bytes of "
-                    "encoder output storage but multimodal_config."
-                    f"encoder_cache_max_bytes only allows {max_output_bytes}; "
-                    "raise the cache budget to serve inputs of this size")
+                    "resident encoder output but the encoder output budget "
+                    f"is only {max_output_bytes} bytes (one prefill "
+                    "iteration); raise max_num_tokens to serve inputs of "
+                    "this size")
         request.py_mm_encoder_state = (
             MultimodalEncoderRequestState.from_embedding_lengths(
                 embedding_lengths))

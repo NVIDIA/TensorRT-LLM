@@ -202,7 +202,6 @@ _MAX_PIXELS_TOKEN_PROBE = 1 << 31
 
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
-    supports_mm_encoder_item_scheduling = True
 
     def __init__(self,
                  model_path: str,
@@ -2002,6 +2001,7 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
+    supports_mm_encoder_item_scheduling = True
 
     def __init__(
         self,
