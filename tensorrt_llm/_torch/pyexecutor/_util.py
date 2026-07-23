@@ -2140,9 +2140,7 @@ def validate_kv_cache_compression_with_spec(
         if spec_config.draft_len_schedule is not None:
             raise ValueError("TriAttention does not yet support dynamic "
                              "speculative draft lengths")
-        # Rejection sampling (and MTP's relaxed thinking acceptance, an
-        # MTP-only field) makes the per-step accepted-token count stochastic;
-        # compression eviction is only validated with greedy acceptance.
+        # Compression eviction is only validated with greedy acceptance.
         if spec_config.use_rejection_sampling or getattr(
                 spec_config, "use_relaxed_acceptance_for_thinking", False):
             raise ValueError("TriAttention does not support speculative "

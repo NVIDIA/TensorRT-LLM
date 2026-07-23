@@ -639,12 +639,7 @@ class Attention(nn.Module):
         if (config.kv_cache_compression_config is not None
                 and config.kv_cache_compression_config.
                 kv_cache_compression_mode.is_eviction_method()):
-            # The configured method physically evicts cached tokens, so the
-            # KV length no longer equals the logical sequence length. The
-            # fused path derives each new token's rotary position from the KV
-            # length inside the kernel; the unfused path consumes the engine's
-            # logical position_ids, so surviving keys retain their original
-            # phases.
+            # Fused RoPE derives positions from the KV length, which eviction shortens; stay unfused.
             logger.warning_once(
                 "disable rope_fusion for KV-cache compression "
                 f"({config.kv_cache_compression_config.algorithm}): "
