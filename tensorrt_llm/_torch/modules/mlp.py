@@ -268,11 +268,15 @@ class MLP(nn.Module):
     ) -> torch.Tensor:
         assert lora_params is not None
 
-        x_up = self.up_proj(x)
-
         assert self.layer_idx is not None, "layer_idx is required for lora"
-        x_up_lora = self.up_lora(x, lora_params, self.layer_idx)
-        x_up = add_lora_result(x_up, x_up_lora)
+        x_up, x_up_lora = self.up_lora.execute_with_base(
+            lambda: self.up_proj(x),
+            lambda: self.up_lora(x, lora_params, self.layer_idx),
+            lora_params,
+            self.layer_idx,
+        )
+        if x_up_lora is not None:
+            x_up = x_up + x_up_lora
 
         x_act = self.activation(x_up)
         x_down = self.down_proj(x_act,
