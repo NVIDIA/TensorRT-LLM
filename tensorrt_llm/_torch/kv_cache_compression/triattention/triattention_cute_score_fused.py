@@ -221,6 +221,46 @@ class _TriAttentionScoreKernel:
         return copy_atom, register_output, thread_output
 
     @cute.jit
+    def _stage_raw_band_copies(
+        self,
+        raw_tma_pipeline,
+        raw_tma_producer_state,
+        band,
+        first_page,
+        page_fragments,
+        shared_partition,
+        stage_args,
+    ):
+        """One raw-K band's fragment copies into an acquired pipeline stage.
+
+        The CALLER owns the pipeline handshake (producer_acquire before,
+        state.advance after): the double-buffered prefetch shares ONE
+        acquire/advance across its dynamic destination arms, so the
+        handshake cannot live here. ``band`` is the trace-time real/imag
+        plane index; ``page_fragments`` is only read for the multi-fragment
+        specialization (None otherwise).
+        """
+        raw_tma_atom, raw_tma_global_partition, kv_head, raw_tma_descriptor_ptr = stage_args
+        for fragment in cutlass.range_constexpr(self.fragments_per_phase):
+            fragment_page = first_page
+            if cutlass.const_expr(fragment > 0):
+                fragment_page = page_fragments[fragment]
+            cute.copy(
+                raw_tma_atom,
+                raw_tma_global_partition[
+                    (
+                        None,
+                        band,
+                        0,
+                        (kv_head, fragment_page),
+                    )
+                ],
+                shared_partition[fragment],
+                tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(raw_tma_producer_state),
+                tma_desc_ptr=raw_tma_descriptor_ptr,
+            )
+
+    @cute.jit
     def __call__(
         self,
         page_ids: cute.Tensor,
@@ -584,6 +624,9 @@ class _TriAttentionScoreKernel:
             (raw_tma_descriptors.iterator + layer_id * TMA_DESCRIPTOR_QWORDS).align(128),
             cute.AddressSpace.generic,
         )
+        # Trace-time invariants of every raw-band stage copy (see
+        # _stage_raw_band_copies); bound once, unpacked in the helper.
+        raw_stage_args = (raw_tma_atom, raw_tma_global_partition, kv_head, raw_tma_descriptor_ptr)
         sRawBf16B0 = storage.sRawBf16B0.get_tensor(
             raw_bf16_b_smem_layout.outer,
             swizzle=raw_bf16_b_smem_layout.inner,
@@ -606,6 +649,8 @@ class _TriAttentionScoreKernel:
                 stats_sums_m128[stats_head] = cutlass.Float32(0.0)
                 stats_square_sums_m128[stats_head] = cutlass.Float32(0.0)
         producer_prefetched_page_id_lane0 = cutlass.Int32(0)
+        physical_fragments_arg = None
+        prefetched_fragments_arg = None
         if cutlass.const_expr(self.fragments_per_phase > 1):
             # Per-fragment page-id registers for multi-page compute tiles.
             # Slot 0 is unused: fragment 0 keeps the scalar broadcast
@@ -615,6 +660,8 @@ class _TriAttentionScoreKernel:
             )
             physical_page_fragments = cute.make_rmem_tensor((self.pages_per_tile,), cutlass.Int32)
             prefetched_page_fragments = cute.make_rmem_tensor((self.pages_per_tile,), cutlass.Int32)
+            physical_fragments_arg = physical_page_fragments
+            prefetched_fragments_arg = prefetched_page_fragments
         shard_has_page = valid_seq_len > score_start and tile_start_token < valid_seq_len
         empty_shard = valid_seq_len <= score_start or tile_start_token >= valid_seq_len
         if cutlass.dynamic_expr(shard_has_page):
@@ -787,48 +834,26 @@ class _TriAttentionScoreKernel:
                                 0,
                             )
                     raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
-                    for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                        fragment_page = prefetched_physical_page
-                        if cutlass.const_expr(fragment > 0):
-                            fragment_page = prefetched_page_fragments[fragment]
-                        cute.copy(
-                            raw_tma_atom,
-                            raw_tma_global_partition[
-                                (
-                                    None,
-                                    0,
-                                    0,
-                                    (kv_head, fragment_page),
-                                )
-                            ],
-                            raw_tma_shared_partition_real[fragment],
-                            tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                raw_tma_producer_state
-                            ),
-                            tma_desc_ptr=raw_tma_descriptor_ptr,
-                        )
+                    self._stage_raw_band_copies(
+                        raw_tma_pipeline,
+                        raw_tma_producer_state,
+                        0,
+                        prefetched_physical_page,
+                        prefetched_fragments_arg,
+                        raw_tma_shared_partition_real,
+                        raw_stage_args,
+                    )
                     raw_tma_producer_state.advance()
                     raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
-                    for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                        fragment_page = prefetched_physical_page
-                        if cutlass.const_expr(fragment > 0):
-                            fragment_page = prefetched_page_fragments[fragment]
-                        cute.copy(
-                            raw_tma_atom,
-                            raw_tma_global_partition[
-                                (
-                                    None,
-                                    1,
-                                    0,
-                                    (kv_head, fragment_page),
-                                )
-                            ],
-                            raw_tma_shared_partition_imag[fragment],
-                            tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                raw_tma_producer_state
-                            ),
-                            tma_desc_ptr=raw_tma_descriptor_ptr,
-                        )
+                    self._stage_raw_band_copies(
+                        raw_tma_pipeline,
+                        raw_tma_producer_state,
+                        1,
+                        prefetched_physical_page,
+                        prefetched_fragments_arg,
+                        raw_tma_shared_partition_imag,
+                        raw_stage_args,
+                    )
                     raw_tma_producer_state.advance()
         while (
             valid_seq_len > score_start
@@ -859,26 +884,15 @@ class _TriAttentionScoreKernel:
                     # Every producer-warp lane participates in the
                     # PipelineTmaAsync barrier election.
                     raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
-                    for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                        fragment_page = physical_page
-                        if cutlass.const_expr(fragment > 0):
-                            fragment_page = physical_page_fragments[fragment]
-                        cute.copy(
-                            raw_tma_atom,
-                            raw_tma_global_partition[
-                                (
-                                    None,
-                                    0,
-                                    0,
-                                    (kv_head, fragment_page),
-                                )
-                            ],
-                            raw_tma_shared_partition_real[fragment],
-                            tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                raw_tma_producer_state
-                            ),
-                            tma_desc_ptr=raw_tma_descriptor_ptr,
-                        )
+                    self._stage_raw_band_copies(
+                        raw_tma_pipeline,
+                        raw_tma_producer_state,
+                        0,
+                        physical_page,
+                        physical_fragments_arg,
+                        raw_tma_shared_partition_real,
+                        raw_stage_args,
+                    )
                     raw_tma_producer_state.advance()
             raw_tma_pipeline.consumer_wait(raw_tma_consumer_state)
             raw_tma_pipeline.consumer_release(raw_tma_consumer_state)
@@ -886,26 +900,15 @@ class _TriAttentionScoreKernel:
             if cutlass.const_expr(not self.write_partial_stats):
                 if warp_idx == self.producer_warp_id:
                     raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
-                    for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                        fragment_page = physical_page
-                        if cutlass.const_expr(fragment > 0):
-                            fragment_page = physical_page_fragments[fragment]
-                        cute.copy(
-                            raw_tma_atom,
-                            raw_tma_global_partition[
-                                (
-                                    None,
-                                    1,
-                                    0,
-                                    (kv_head, fragment_page),
-                                )
-                            ],
-                            raw_tma_shared_partition_imag[fragment],
-                            tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                raw_tma_producer_state
-                            ),
-                            tma_desc_ptr=raw_tma_descriptor_ptr,
-                        )
+                    self._stage_raw_band_copies(
+                        raw_tma_pipeline,
+                        raw_tma_producer_state,
+                        1,
+                        physical_page,
+                        physical_fragments_arg,
+                        raw_tma_shared_partition_imag,
+                        raw_stage_args,
+                    )
                     raw_tma_producer_state.advance()
 
             next_page_id_lane0 = cutlass.Int32(0)
@@ -989,94 +992,53 @@ class _TriAttentionScoreKernel:
                                 0,
                             )
                     if cutlass.dynamic_expr(prefetch_next_raw):
+                        # ONE acquire/advance per band is SHARED across the
+                        # dynamic destination arms (current vs next buffer);
+                        # only the smem destination differs per arm.
                         next_raw_page_buffer = (raw_page_buffer + 1) % RAW_PAGE_BUFFERS
                         raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
                         if cutlass.dynamic_expr(next_raw_page_buffer == 0):
-                            for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                                fragment_page = prefetched_physical_page
-                                if cutlass.const_expr(fragment > 0):
-                                    fragment_page = prefetched_page_fragments[fragment]
-                                cute.copy(
-                                    raw_tma_atom,
-                                    raw_tma_global_partition[
-                                        (
-                                            None,
-                                            0,
-                                            0,
-                                            (kv_head, fragment_page),
-                                        )
-                                    ],
-                                    raw_tma_shared_partition_real[fragment],
-                                    tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                        raw_tma_producer_state
-                                    ),
-                                    tma_desc_ptr=raw_tma_descriptor_ptr,
-                                )
+                            self._stage_raw_band_copies(
+                                raw_tma_pipeline,
+                                raw_tma_producer_state,
+                                0,
+                                prefetched_physical_page,
+                                prefetched_fragments_arg,
+                                raw_tma_shared_partition_real,
+                                raw_stage_args,
+                            )
                         else:
-                            for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                                fragment_page = prefetched_physical_page
-                                if cutlass.const_expr(fragment > 0):
-                                    fragment_page = prefetched_page_fragments[fragment]
-                                cute.copy(
-                                    raw_tma_atom,
-                                    raw_tma_global_partition[
-                                        (
-                                            None,
-                                            0,
-                                            0,
-                                            (kv_head, fragment_page),
-                                        )
-                                    ],
-                                    raw_tma_shared_partition_real_next[fragment],
-                                    tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                        raw_tma_producer_state
-                                    ),
-                                    tma_desc_ptr=raw_tma_descriptor_ptr,
-                                )
+                            self._stage_raw_band_copies(
+                                raw_tma_pipeline,
+                                raw_tma_producer_state,
+                                0,
+                                prefetched_physical_page,
+                                prefetched_fragments_arg,
+                                raw_tma_shared_partition_real_next,
+                                raw_stage_args,
+                            )
                         raw_tma_producer_state.advance()
                         raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
                         if cutlass.dynamic_expr(next_raw_page_buffer == 0):
-                            for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                                fragment_page = prefetched_physical_page
-                                if cutlass.const_expr(fragment > 0):
-                                    fragment_page = prefetched_page_fragments[fragment]
-                                cute.copy(
-                                    raw_tma_atom,
-                                    raw_tma_global_partition[
-                                        (
-                                            None,
-                                            1,
-                                            0,
-                                            (kv_head, fragment_page),
-                                        )
-                                    ],
-                                    raw_tma_shared_partition_imag[fragment],
-                                    tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                        raw_tma_producer_state
-                                    ),
-                                    tma_desc_ptr=raw_tma_descriptor_ptr,
-                                )
+                            self._stage_raw_band_copies(
+                                raw_tma_pipeline,
+                                raw_tma_producer_state,
+                                1,
+                                prefetched_physical_page,
+                                prefetched_fragments_arg,
+                                raw_tma_shared_partition_imag,
+                                raw_stage_args,
+                            )
                         else:
-                            for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                                fragment_page = prefetched_physical_page
-                                if cutlass.const_expr(fragment > 0):
-                                    fragment_page = prefetched_page_fragments[fragment]
-                                cute.copy(
-                                    raw_tma_atom,
-                                    raw_tma_global_partition[
-                                        (
-                                            None,
-                                            1,
-                                            0,
-                                            (kv_head, fragment_page),
-                                        )
-                                    ],
-                                    raw_tma_shared_partition_imag_next[fragment],
-                                    tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                        raw_tma_producer_state
-                                    ),
-                                    tma_desc_ptr=raw_tma_descriptor_ptr,
-                                )
+                            self._stage_raw_band_copies(
+                                raw_tma_pipeline,
+                                raw_tma_producer_state,
+                                1,
+                                prefetched_physical_page,
+                                prefetched_fragments_arg,
+                                raw_tma_shared_partition_imag_next,
+                                raw_stage_args,
+                            )
                         raw_tma_producer_state.advance()
             # Each of the 32 lanes stages one frequency per pass; 64-
             # frequency heads take two passes.
