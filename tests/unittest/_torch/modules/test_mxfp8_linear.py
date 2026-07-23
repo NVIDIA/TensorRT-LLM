@@ -21,6 +21,12 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.modules.linear as linear_module
+from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    MXFP8GemmRunner,
+    _get_mxfp8_large_m_tuning_buckets,
+    _map_to_mxfp8_large_m_bucket,
+)
 from tensorrt_llm._torch.modules.linear import (
     Linear,
     MXFP8LinearMethod,
@@ -62,6 +68,7 @@ def test_mxfp8_dispatch_returns_mxfp8_method(monkeypatch):
     method = get_quant_method(qc)
     assert isinstance(method, MXFP8LinearMethod)
     assert method.backend == "trtllm"
+    assert method.use_native_autotuner
 
 
 def _mock_mxfp8_ops(monkeypatch):
@@ -70,9 +77,23 @@ def _mock_mxfp8_ops(monkeypatch):
     quantize = Mock(return_value=(quantized, activation_scale))
     native_output = torch.empty((2, 3), dtype=torch.bfloat16)
     native_gemm = Mock(return_value=native_output)
-    fake_trtllm_ops = SimpleNamespace(mxfp8_quantize=quantize, mxfp8_mxfp8_gemm=native_gemm)
+    autotuned_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    autotuned_gemm = Mock(return_value=autotuned_output)
+    fake_trtllm_ops = SimpleNamespace(
+        mxfp8_quantize=quantize,
+        mxfp8_mxfp8_gemm=native_gemm,
+        mxfp8_mxfp8_gemm_autotuned=autotuned_gemm,
+    )
     monkeypatch.setattr(linear_module.torch, "ops", SimpleNamespace(trtllm=fake_trtllm_ops))
-    return quantized, activation_scale, quantize, native_gemm, native_output
+    return (
+        quantized,
+        activation_scale,
+        quantize,
+        native_gemm,
+        native_output,
+        autotuned_gemm,
+        autotuned_output,
+    )
 
 
 def test_mxfp8_flashinfer_call_contract(monkeypatch):
@@ -83,7 +104,7 @@ def test_mxfp8_flashinfer_call_contract(monkeypatch):
     expected = torch.empty((2, 3), dtype=torch.bfloat16)
     mm_mxfp8 = Mock(return_value=expected)
     monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8))
-    quantized, activation_scale, quantize, _, _ = _mock_mxfp8_ops(monkeypatch)
+    quantized, activation_scale, quantize, _, _, _, _ = _mock_mxfp8_ops(monkeypatch)
 
     weight = torch.empty((3, 4), dtype=torch.float8_e4m3fn)
     weight_scale = torch.empty(512, dtype=torch.uint8)
@@ -116,7 +137,7 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     flashinfer_output = torch.empty((2, 3), dtype=torch.bfloat16)
     mm_mxfp8 = Mock(return_value=flashinfer_output)
     monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8))
-    _, _, _, native_gemm, native_output = _mock_mxfp8_ops(monkeypatch)
+    _, _, _, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
 
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
@@ -139,6 +160,117 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     # Leaving the decode-capture scope restores the eager/native path.
     assert method.apply(module, activation, bias=None) is native_output
     assert native_gemm.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "num_tokens,expected",
+    [
+        (1, 1),
+        (6552, 6552),
+        (6553, 8192),
+        (8192, 8192),
+        (8193, 8193),
+        (13105, 13105),
+        (13106, 16384),
+        (16384, 16384),
+        (16385, 16385),
+        (19658, 19658),
+        (19659, 32768),
+        (32768, 32768),
+        (32769, 32769),
+    ],
+)
+def test_mxfp8_large_m_bucket_mapping(num_tokens, expected):
+    assert _map_to_mxfp8_large_m_bucket(num_tokens) == expected
+
+
+@pytest.mark.parametrize(
+    "max_num_tokens,expected",
+    [
+        (4096, ()),
+        (6599, (8192,)),
+        (14906, (8192, 16384)),
+        (29765, (8192, 16384, 32768)),
+    ],
+)
+def test_mxfp8_large_m_tuning_buckets(max_num_tokens, expected):
+    assert _get_mxfp8_large_m_tuning_buckets(max_num_tokens) == expected
+
+
+def test_mxfp8_large_m_cache_profile_maps_act_and_constrains_scale():
+    AutoTuner._find_nearest_profile.cache_clear()
+    input_shapes = (
+        torch.Size((6599, 6144)),
+        torch.Size((1277952,)),
+        torch.Size((9216, 6144)),
+        torch.Size((1769472,)),
+        torch.Size((1,)),
+    )
+    profile = AutoTuner._find_nearest_profile(
+        input_shapes,
+        MXFP8GemmRunner.tuning_config.dynamic_tensor_specs,
+        MXFP8GemmRunner.tuning_config.constraint_specs,
+    )
+    assert profile == (
+        (8192, 6144),
+        (-1,),
+        (9216, 6144),
+        (1769472,),
+        (1,),
+    )
+
+
+def test_mxfp8_native_autotuner_dispatch(monkeypatch):
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    _, _, _, native_gemm, native_output, autotuned_gemm, autotuned_output = _mock_mxfp8_ops(
+        monkeypatch
+    )
+
+    module = SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    activation = torch.randn((2, 4), dtype=torch.bfloat16)
+
+    method = MXFP8LinearMethod()
+    assert method.use_native_autotuner
+    assert method.needs_native_autotune
+    assert method.apply(module, activation, bias=None) is autotuned_output
+    autotuned_gemm.assert_called_once()
+    native_gemm.assert_not_called()
+
+    method.mark_native_autotuned()
+    assert not method.needs_native_autotune
+    assert method.apply(module, activation, bias=None) is native_output
+    autotuned_gemm.assert_called_once()
+    native_gemm.assert_called_once()
+
+
+def test_mxfp8_native_autotuner_syncs_profiles():
+    runner = object.__new__(MXFP8GemmRunner)
+    runner.output_dtype = torch.bfloat16
+    runner.sm_version = 100
+    runner.mxfp8_gemm_runner = Mock()
+    profile = (
+        (8192, 6144),
+        (-1,),
+        (9216, 6144),
+        (1769472,),
+        (1,),
+    )
+    cache_key = (
+        "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+        "MXFP8GemmRunner",
+        str(runner.unique_id()),
+        profile,
+    )
+    profiling_cache = Mock()
+    profiling_cache.get_specific_custom_op.return_value = {cache_key: (0, 17, 0.25)}
+
+    runner.sync_tactic_cache(SimpleNamespace(profiling_cache=profiling_cache))
+
+    runner.mxfp8_gemm_runner.register_tactic.assert_called_once_with(8192, 9216, 6144, 17)
 
 
 def test_mxfp8_rejects_unknown_backend(monkeypatch):

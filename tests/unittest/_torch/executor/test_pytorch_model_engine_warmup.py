@@ -291,6 +291,113 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertTrue(method._flashinfer_autotuned)
         flashinfer_autotuner_module.autotune.assert_called_once_with()
 
+    def test_native_mxfp8_retries_after_missing_warmup_batch(self):
+        """MXFP8 tuning remains pending until a warmup forward can run."""
+        calls = []
+
+        @contextlib.contextmanager
+        def trtllm_autotune(**kwargs):
+            self.assertIsNone(kwargs["cache_path"])
+            calls.append("autotune_enter")
+            yield
+            calls.append("autotune_exit")
+
+        tuner = SimpleNamespace(
+            setup_distributed_state=Mock(),
+            cache_pp_recv=Mock(),
+            cache_pp_send=Mock(),
+            clean_pp_flag=Mock(),
+            profiling_cache={},
+            print_profiling_cache=Mock(),
+        )
+
+        with patch(
+            "tensorrt_llm._torch.modules.linear._mxfp8_cutlass_op_available",
+            return_value=True,
+        ):
+            method = MXFP8LinearMethod()
+            self.assertTrue(method.needs_native_autotune)
+
+            engine = SimpleNamespace(
+                llm_args=SimpleNamespace(enable_autotuner=True),
+                cuda_graph_runner=SimpleNamespace(enabled=False),
+                model=SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)]),
+                kv_cache_manager_key="kv_cache",
+                max_num_tokens=16,
+                batch_size=16,
+                max_seq_len=2,
+                original_max_draft_len=0,
+                mapping=SimpleNamespace(tp_size=1),
+                dist=object(),
+                is_draft_model=False,
+                no_cuda_graph=lambda: contextlib.nullcontext(),
+                _create_warmup_request=Mock(return_value=object()),
+                _release_batch_context=Mock(
+                    side_effect=[
+                        contextlib.nullcontext(None),
+                        contextlib.nullcontext(object()),
+                    ]
+                ),
+                _assert_all_tp_ranks_have_warmup_batch=Mock(),
+                forward=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
+            )
+            kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+            resource_manager = SimpleNamespace(
+                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
+            )
+
+            with (
+                patch(
+                    "tensorrt_llm._torch.pyexecutor.model_engine.AutoTuner.get",
+                    return_value=tuner,
+                ),
+                patch(
+                    "tensorrt_llm._torch.pyexecutor.model_engine.autotune",
+                    side_effect=trtllm_autotune,
+                ),
+                patch("torch.cuda.synchronize"),
+                patch("torch.cuda.empty_cache"),
+                patch("tensorrt_llm._torch.pyexecutor.model_engine.clear_memory_buffers"),
+            ):
+                PyTorchModelEngine._run_autotuner_warmup(engine, resource_manager)
+                self.assertEqual(calls, ["autotune_enter", "autotune_exit"])
+                self.assertFalse(method._native_autotuned)
+                self.assertTrue(method.needs_native_autotune)
+
+                PyTorchModelEngine._run_autotuner_warmup(engine, resource_manager)
+
+        self.assertEqual(
+            calls,
+            [
+                "autotune_enter",
+                "autotune_exit",
+                "autotune_enter",
+                "forward",
+                "autotune_exit",
+            ],
+        )
+        self.assertTrue(method._native_autotuned)
+        self.assertFalse(method.needs_native_autotune)
+        self.assertEqual(tuner.setup_distributed_state.call_count, 2)
+        tuner.setup_distributed_state.assert_called_with(engine.mapping, engine.dist)
+
+    def test_native_mxfp8_respects_disabled_global_autotuner(self):
+        with patch(
+            "tensorrt_llm._torch.modules.linear._mxfp8_cutlass_op_available",
+            return_value=True,
+        ):
+            method = MXFP8LinearMethod()
+            engine = SimpleNamespace(
+                llm_args=SimpleNamespace(enable_autotuner=False),
+                cuda_graph_runner=SimpleNamespace(enabled=False),
+                model=SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)]),
+            )
+
+            PyTorchModelEngine._run_autotuner_warmup(engine, Mock())
+
+        self.assertFalse(method.use_native_autotuner)
+        self.assertFalse(method.needs_native_autotune)
+
 
 if __name__ == "__main__":
     unittest.main()

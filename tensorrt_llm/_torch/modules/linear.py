@@ -3004,6 +3004,10 @@ class MXFP8LinearMethod(LinearMethodBase):
     ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
     ``flashinfer``, or ``auto``. The reference layout is 2D [O,K/32]; both
     compiled backends consume the same 1D padded swizzled scale layout.
+    When the TensorRT-LLM autotuner is enabled, the native backend profiles
+    its compiled tactics during startup. Learned tactics are registered in
+    the native op so serving avoids the Python autotuner lookup; the generic
+    CUTLASS configuration remains the cache-miss fallback.
     """
     BLOCK_SIZE = 32
     # Swizzled-SF layout padding (matches W4A8MXFP4FP8: rows->128, cols/SFblock->4).
@@ -3014,6 +3018,8 @@ class MXFP8LinearMethod(LinearMethodBase):
         super().__init__()
         self.use_cutlass = _mxfp8_cutlass_op_available()
         self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
+        self.use_native_autotuner = True
+        self._native_autotuned = False
         if self.backend not in ("trtllm", "flashinfer", "auto"):
             raise ValueError("TRTLLM_MXFP8_GEMM_BACKEND must be 'trtllm', "
                              f"'flashinfer', or 'auto', got {self.backend!r}")
@@ -3032,6 +3038,11 @@ class MXFP8LinearMethod(LinearMethodBase):
     @property
     def needs_flashinfer_autotune(self) -> bool:
         return self.uses_flashinfer and self._flashinfer_mxfp8 is not None
+
+    @property
+    def needs_native_autotune(self) -> bool:
+        return (self.use_native_autotuner and not self._native_autotuned
+                and self.use_cutlass and self.backend == "trtllm")
 
     def _load_flashinfer(self, *, required: bool) -> bool:
         if not self.use_cutlass:
@@ -3066,6 +3077,13 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def mark_flashinfer_autotuned(self) -> None:
         self._flashinfer_autotuned = True
+
+    def mark_native_autotuned(self) -> None:
+        self._native_autotuned = True
+
+    def disable_native_autotune(self) -> None:
+        self.use_native_autotuner = False
+        self._native_autotuned = False
 
     def disable_flashinfer_auto(self) -> None:
         if self.backend == "auto":
@@ -3138,7 +3156,10 @@ class MXFP8LinearMethod(LinearMethodBase):
                 global_scale = torch.ones([1],
                                           dtype=torch.float32,
                                           device=input.device)
-                output = torch.ops.trtllm.mxfp8_mxfp8_gemm(
+                gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
+                        if self.needs_native_autotune else
+                        torch.ops.trtllm.mxfp8_mxfp8_gemm)
+                output = gemm(
                     act_e4m3,
                     act_sf,
                     module.weight,
