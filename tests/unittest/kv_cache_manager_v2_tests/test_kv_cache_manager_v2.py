@@ -46,6 +46,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        PlannedDropHandle,
         ReuseScope,
         SsmLayerConfig,
         SwaScratchReuseConfig,
@@ -99,6 +100,7 @@ else:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        PlannedDropHandle,
         ReuseScope,
         SsmLayerConfig,
         SwaScratchReuseConfig,
@@ -694,6 +696,46 @@ class TestNoBatching(TestKVCacheManagerV2):
         kv2 = self.manager.create_kv_cache(input_tokens=prompt)
         self.assertEqual(kv2.num_committed_tokens, len(prompt))
         kv2.close()
+
+    def test_planned_drop_handle(self) -> None:
+        window_size = 8
+        self.prepare(16 << 20, 0, 0, 2, window_size, 0, tokens_per_block=8)
+        long_tokens = [self.next_token() for _ in range(24)]
+        short_tokens = long_tokens[:8]
+
+        def plan_drop(tokens: list[TokenIdExt]) -> PlannedDropHandle:
+            kv_cache = self.manager.create_kv_cache(None, tokens)
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(kv_cache.resume(stream))
+                self.assertTrue(kv_cache.resize(len(tokens)))
+                uncommitted = tokens[kv_cache.num_committed_tokens :]
+                if uncommitted:
+                    kv_cache.commit(uncommitted)
+                kv_cache.stop_committing()
+                drop_handle = kv_cache.plan_committed_block_drop()
+                self.assertIsNotNone(drop_handle)
+                self.assertIsInstance(drop_handle, PlannedDropHandle)
+            _ = stream_holder.take_finish_event()
+            kv_cache.close()
+            assert drop_handle is not None
+            return drop_handle
+
+        long_handle = plan_drop(long_tokens)
+        short_handle = plan_drop(short_tokens)
+        self.assertEqual(self.manager.probe_reuse(None, short_tokens), len(short_tokens))
+
+        short_handle.drop()
+        self.assertEqual(self.manager.probe_reuse(None, short_tokens), 0)
+        self.assertEqual(self.manager.probe_reuse(None, long_tokens), len(long_tokens))
+
+        long_handle.drop()
+        # The SWA window is dropped, while older full-attention blocks remain reusable.
+        self.assertEqual(
+            self.manager.probe_reuse(None, long_tokens), len(long_tokens) - window_size
+        )
+        with self.assertRaisesRegex(ValueError, "already been dropped"):
+            long_handle.drop()
 
     def test_reuse_scope_isolates_reuse(self) -> None:
         self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=8)

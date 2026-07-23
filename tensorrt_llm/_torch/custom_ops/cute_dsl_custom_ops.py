@@ -5252,7 +5252,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Args:
             input_values: Input logits tensor [batch_size * next_n, vocab_size]
             seq_lens: Sequence lengths for each batch [batch_size]
-            top_k: Number of top elements to select (max 2048)
+            top_k: Number of top elements to select (max 16384)
             next_n: Number of candidates per sequence (for speculative decoding)
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
             load_balance: Enable persistent dynamic scheduling for load balancing
@@ -5262,7 +5262,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         Note:
             This function requires Blackwell architecture (SM100+) and CuTE DSL support.
-            Maximum supported top_k is 2048.
+            Maximum supported top_k is 16384.
         """
         # Validate SM version
         sm_version = get_sm_version()
@@ -5272,10 +5272,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 "Use standard top-k implementation for older architectures.")
 
         # Validate inputs
-        if top_k <= 0 or top_k > 2048:
+        if top_k <= 0 or top_k > 16384:
             raise ValueError(
-                f"top_k must be in range [1, 2048], got {top_k}. "
-                "Maximum supported top_k is 2048 for Blackwell architecture.")
+                f"top_k must be in range [1, 16384], got {top_k}. "
+                "Maximum supported top_k is 16384 for Blackwell architecture.")
 
         if next_n <= 0:
             raise ValueError(f"next_n must be positive, got {next_n}")
@@ -5987,7 +5987,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Args:
             input_values: Input logits tensor [batch_size * next_n, vocab_size]
             seq_lens: Sequence lengths for each batch [batch_size]
-            top_k: Number of top elements to select (max 2048)
+            top_k: Number of top elements to select (max 16384)
             next_n: Number of candidates per sequence (for speculative decoding)
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
             chunk_size_per_cta: Number of columns each CTA processes
@@ -6007,10 +6007,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 "Use standard top-k implementation for older architectures.")
 
         # Validate inputs
-        if top_k <= 0 or top_k > 2048:
+        if top_k <= 0 or top_k > 16384:
             raise ValueError(
-                f"top_k must be in range [1, 2048], got {top_k}. "
-                "Maximum supported top_k is 2048 for Blackwell architecture.")
+                f"top_k must be in range [1, 16384], got {top_k}. "
+                "Maximum supported top_k is 16384 for Blackwell architecture.")
 
         if next_n <= 0:
             raise ValueError(f"next_n must be positive, got {next_n}")
@@ -6118,7 +6118,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             input_values: Input logits tensor [batch_size * next_n, vocab_size]
             seq_lens: Sequence lengths for each batch [batch_size]
             output_indices: Pre-allocated output buffer [batch_size * next_n, top_k]
-            top_k: Number of top elements to select (max 2048)
+            top_k: Number of top elements to select (max 16384)
             next_n: Number of candidates per sequence (for speculative decoding)
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
             dynamic: Use dynamic multi-CTA scheduling (for 2-pass multi-CTA)
@@ -6126,6 +6126,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             single_pass_multi_cta_cluster: Force cluster-accelerated variant
                 (only effective when single_pass_multi_cta=True)
         """
+        # Validate inputs
+        if top_k <= 0 or top_k > 16384:
+            raise ValueError(
+                f"top_k must be in range [1, 16384], got {top_k}. "
+                "Maximum supported top_k is 16384 for Blackwell architecture.")
+
         num_rows = input_values.shape[0]
         num_tokens = input_values.shape[1]
 

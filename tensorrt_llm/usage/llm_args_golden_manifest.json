@@ -561,9 +561,10 @@
     {
       "allowed_values": [
         "all_reusable",
-        "per_request"
+        "per_request",
+        "per_conversation"
       ],
-      "annotation": "Literal['all_reusable', 'per_request']",
+      "annotation": "Literal['all_reusable', 'per_request', 'per_conversation']",
       "converter": "",
       "kind": "categorical",
       "path": "kv_cache_config.block_reuse_policy"
@@ -1017,6 +1018,13 @@
       "path": "num_postprocess_workers"
     },
     {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "num_serve_frontends"
+    },
+    {
       "allowed_values": [
         "cutlass",
         "cublaslt",
@@ -1390,6 +1398,16 @@
       "path": "sparse_attention_config.enable_heuristic_topk"
     },
     {
+      "allowed_values": [
+        "triton",
+        "msa"
+      ],
+      "annotation": "Literal['triton', 'msa']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.implementation"
+    },
+    {
       "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
@@ -1450,6 +1468,20 @@
       "converter": "allowlist",
       "kind": "categorical",
       "path": "sparse_attention_config.kt_cache_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.num_attention_heads"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.num_key_value_heads"
     },
     {
       "allowed_values": [],
