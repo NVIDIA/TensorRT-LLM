@@ -194,7 +194,7 @@ def build_compaction(**overrides):
         draft=draft,
     )
     # Opaque plans plus a test-side mirror of the caller-owned construction
-    # inputs (production binds the same values on its buffer namespace); the
+    # inputs (production binds the same values as manager attributes); the
     # standalone helpers here need the move-offset rows and SWA staging back.
     return dict(
         plans=plans,
@@ -229,23 +229,28 @@ def run_compaction(compaction):
 
 
 def make_bare_staging(device, *, max_requests, staged_blocks_per_seq):
-    """A bare buffer namespace for the bulk page-table copy tests."""
-    staging = SimpleNamespace()
-    staging.max_requests = max_requests
-    staging.keep_count = 4
-    staging.swa_window = None
-    staging.draft_protected_tail_capacity = None
-    staging.block_offsets_ready_event = torch.cuda.Event()
-    staging.compaction_done_event = torch.cuda.Event()
-    staging.staging_reuse_event = torch.cuda.Event()
-    staging.copy_pending = False
-    staging.block_offsets_host = torch.empty(
+    """A bare manager carrying only the staging attributes, for the bulk
+    page-table copy tests (mirrors the product's ``_build_buffers`` names)."""
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
+
+    staging = TriAttention.__new__(TriAttention)
+    staging.kv_cache_manager = None
+    staging.draft_kv_cache_manager = None
+    staging._max_requests = max_requests
+    staging._keep_count = 4
+    staging._swa_window = None
+    staging._draft_protected_tail_capacity = None
+    staging._block_offsets_ready_event = torch.cuda.Event()
+    staging._compaction_done_event = torch.cuda.Event()
+    staging._staging_reuse_event = torch.cuda.Event()
+    staging._copy_pending = False
+    staging._block_offsets_host = torch.empty(
         1, max_requests, 2, staged_blocks_per_seq, dtype=torch.int32, device="cpu", pin_memory=True
     )
-    staging.identity_copy_indices_host = torch.arange(
+    staging._identity_copy_indices_host = torch.arange(
         max_requests, dtype=torch.int32, device="cpu", pin_memory=True
     )
-    staging.block_offsets_device = torch.empty(
+    staging._block_offsets_device = torch.empty(
         1, max_requests, 2, staged_blocks_per_seq, dtype=torch.int32, device=device
     )
     return staging
@@ -264,7 +269,10 @@ def make_staging_manager(host_table, gather, manager_stream, *, num_slots=1):
 
 
 def make_buffer_stubs(manager, *, decode_width=260):
-    """Stub the calibration/layout surfaces around ``_buffers_for``."""
+    """Stub the calibration/layout surfaces around ``_ensure_buffers``.
+
+    Returns the layout dict plus the manager attributes a stubbed
+    ``_build_buffers`` should set (production sets them in place)."""
     manager._freq_scale_sq = torch.ones(2)
     manager._phase = {"rows": 8}
     manager.calibration = {"omega": torch.ones(2)}
@@ -281,14 +289,14 @@ def make_buffer_stubs(manager, *, decode_width=260):
         layer_group_representative={0: 0, 1: 0},
         layer_pool_ids=(0, 0),
     )
-    buffers = SimpleNamespace(
-        decode_width=decode_width,
-        page_table_token_capacity=65537,
-        max_requests=8,
-        token_starts_device=torch.zeros(8, dtype=torch.int32),
-        valid_widths=torch.empty(8, dtype=torch.int32),
+    built_attributes = dict(
+        _decode_width=decode_width,
+        _page_table_token_capacity=65537,
+        _max_requests=8,
+        _token_starts_device=torch.zeros(8, dtype=torch.int32),
+        _valid_widths=torch.empty(8, dtype=torch.int32),
     )
-    return layout, buffers
+    return layout, built_attributes
 
 
 def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
@@ -392,15 +400,12 @@ def make_request(request_id, **overrides):
 @contextmanager
 def mocked_eviction_internals(manager):
     """Run the real ``_evict_requests`` body around a mocked round executor."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
-
-    buffers = SimpleNamespace(max_requests=8)
     with (
         mock.patch.object(manager, "_runtime_kv_layout", return_value={}),
-        mock.patch.object(manager, "_buffers_for", return_value=buffers),
-        mock.patch.object(module, "execute_eviction_round") as execute,
+        mock.patch.object(manager, "_ensure_buffers"),
+        mock.patch.object(manager, "_execute_eviction_round") as execute,
     ):
-        yield SimpleNamespace(buffers=buffers, execute=execute)
+        yield SimpleNamespace(execute=execute)
 
 
 def torch_tri_score_oracle(
@@ -497,18 +502,17 @@ def make_cute_buffers(
     layer_pool_ids=None,
     normalize_scores=True,
 ):
-    """Real eviction buffers over the one-shared-slot default layout; split
-    reference legs use ``eviction_mode="per_head"`` over the same pools.
-    ``storage_groups``/``layer_pool_ids`` override the page-table grouping
-    (``layer_pool_ids`` is the canonical per-layer V2 pool id list)."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        init_eviction_buffers,
-    )
+    """A bare manager with real eviction buffers built over the one-shared-slot
+    default layout; split reference legs use ``eviction_mode="per_head"`` over
+    the same pools. ``storage_groups``/``layer_pool_ids`` override the
+    page-table grouping (``layer_pool_ids`` is the canonical per-layer V2 pool
+    id list)."""
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
     num_layers = len(layer_pools)
     assert int(q_real.shape[1]) == num_q_heads
-    # The constructor takes every capacity explicitly (no test-only
-    # None-derive path); the widest window defaults keep old call sites.
+    # The build takes every capacity explicitly (no test-only None-derive
+    # path); the widest window defaults keep old call sites.
     if decode_width is None:
         decode_width = seq_len
     if storage_groups is None:
@@ -527,8 +531,14 @@ def make_cute_buffers(
         },
         layer_pool_ids=layer_pool_ids,
     )
-    return init_eviction_buffers(
-        eviction_mode=eviction_mode,
+    manager = TriAttention.__new__(TriAttention)
+    manager.kv_cache_manager = None
+    manager.draft_kv_cache_manager = None
+    manager._draft_protected_tail_capacity = None
+    manager.eviction_mode = eviction_mode
+    manager.normalize_scores = normalize_scores
+    manager._phase = make_phase_table(offsets, omega, seq_len)
+    manager._build_buffers(
         layout=layout,
         calibration=dict(
             q_real=q_real,
@@ -536,7 +546,6 @@ def make_cute_buffers(
             mlr_coef=mlr_coef,
             freq_scale_sq=freq_scale_sq,
         ),
-        phase=make_phase_table(offsets, omega, seq_len),
         capacities=dict(
             max_requests=max_requests,
             bucket_seq_len=seq_len,
@@ -547,67 +556,87 @@ def make_cute_buffers(
             keep_count=keep_count,
             protected_tail_capacity=protected_tail_capacity,
         ),
-        normalize_scores=normalize_scores,
     )
+    return manager
 
 
-def write_block_offsets(bufs, encoded):
+def write_block_offsets(manager, encoded):
     """Load a test page table into the staged block-offset plane."""
-    bufs.block_offsets_device.zero_()
-    bufs.block_offsets_device[:, : encoded.shape[1], :, : encoded.shape[-1]].copy_(encoded)
+    manager._block_offsets_device.zero_()
+    manager._block_offsets_device[:, : encoded.shape[1], :, : encoded.shape[-1]].copy_(encoded)
 
 
-def stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts):
+def stage_score_metadata(manager, request_count, valid_seq_lens, valid_widths, token_starts):
     """Stage the per-round score metadata exactly like production (the
-    compiled runner reads the staged rows via pointer capture)."""
+    compiled score launches read the staged rows via pointer capture)."""
     torch.sub(
         valid_seq_lens[:request_count],
         token_starts[:request_count],
         out=valid_widths[:request_count],
     )
-    bufs.valid_seq_lens_device[:request_count].copy_(valid_seq_lens[:request_count])
-    bufs.token_starts_device[:request_count].copy_(token_starts[:request_count])
+    manager._valid_seq_lens_device[:request_count].copy_(valid_seq_lens[:request_count])
+    manager._token_starts_device[:request_count].copy_(token_starts[:request_count])
 
 
 def launch_split_scores(
-    bufs, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
+    manager, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
 ):
-    """The production score-only leg plus the decode-window gather
-    (``execute_eviction_round``'s per-head sequence, parameterized by count).
-    Test mean phases load into the runner's ctor-bound buffers, exactly like
-    the production in-place gather refresh."""
-    stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts)
-    bufs.mean_cos[:request_count].copy_(mean_cos[:request_count])
-    bufs.mean_sin[:request_count].copy_(mean_sin[:request_count])
-    assert request_count in bufs.runner._compiled
-    bufs.runner.launch(request_count)
-    num_segments = request_count * bufs.num_layers
-    group_size = bufs.num_q_heads // bufs.num_kv_heads
+    """The production score-only leg plus the decode-window gather (the round
+    executor's per-head sequence, parameterized by count). Test mean phases
+    load into the build-bound buffers, exactly like the production in-place
+    gather refresh; the compiled entry fires directly, like the round does."""
+    import cuda.bindings.driver as cuda_driver
+
+    stage_score_metadata(manager, request_count, valid_seq_lens, valid_widths, token_starts)
+    manager._mean_cos[:request_count].copy_(mean_cos[:request_count])
+    manager._mean_sin[:request_count].copy_(mean_sin[:request_count])
+    assert request_count in manager._compiled_score
+    stream = cuda_driver.CUstream(
+        torch.cuda.current_stream(manager._score_scratch.device).cuda_stream
+    )
+    manager._compiled_score[request_count](
+        *manager._cute_score_prefix,
+        manager._cute_mean_cos,
+        manager._cute_mean_sin,
+        *manager._cute_score_tail,
+        request_count,
+        stream,
+    )
+    num_segments = request_count * manager._num_layers
+    group_size = manager._num_q_heads // manager._num_kv_heads
     source = (
-        bufs.score_scratch[: bufs.num_kv_heads * 8 * num_segments * bufs.bucket_seq_len]
-        .view(bufs.num_kv_heads, 8, request_count, bufs.num_layers, bufs.bucket_seq_len)[
-            :, :group_size
-        ]
+        manager._score_scratch[: manager._num_kv_heads * 8 * num_segments * manager._bucket_seq_len]
+        .view(
+            manager._num_kv_heads, 8, request_count, manager._num_layers, manager._bucket_seq_len
+        )[:, :group_size]
         .permute(2, 3, 0, 1, 4)
     )
     columns = (
-        token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + bufs.gather_columns
+        token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + manager._gather_columns
     )
-    columns = columns.clamp_(max=bufs.bucket_seq_len - 1).expand(
-        request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
+    columns = columns.clamp_(max=manager._bucket_seq_len - 1).expand(
+        request_count,
+        manager._num_layers,
+        manager._num_kv_heads,
+        group_size,
+        manager._decode_width,
     )
     output = torch.full(
-        (request_count, bufs.num_layers, bufs.num_q_heads, bufs.decode_width),
+        (request_count, manager._num_layers, manager._num_q_heads, manager._decode_width),
         float("nan"),
         dtype=torch.float32,
-        device=bufs.score_scratch.device,
+        device=manager._score_scratch.device,
     )
     torch.gather(
         source,
         4,
         columns,
         out=output.view(
-            request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
+            request_count,
+            manager._num_layers,
+            manager._num_kv_heads,
+            group_size,
+            manager._decode_width,
         ),
     )
     return output

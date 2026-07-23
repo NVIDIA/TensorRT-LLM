@@ -58,7 +58,7 @@ def _build_case(
     omega = torch.rand(num_freqs, device=device) * 0.05
     offsets_t = torch.tensor(offsets, dtype=torch.float32, device=device)
     capacity = page_count * tokens_per_block
-    bufs = _make_cute_buffers(
+    tri = _make_cute_buffers(
         eviction_mode="per_head",
         layer_pools=pools,
         max_requests=max_requests,
@@ -72,7 +72,7 @@ def _build_case(
         offsets=offsets_t,
         decode_width=capacity - prompt_len,
     )
-    _write_block_offsets(bufs, _encode_block_offsets(page_ids))
+    _write_block_offsets(tri, _encode_block_offsets(page_ids))
     round_starts = (torch.arange(max_requests, dtype=torch.int32, device=device) + 9).contiguous()
     token_starts = torch.full((max_requests,), prompt_len, dtype=torch.int32, device=device)
     # Mid-page/mid-tile tails; 58 leaves a fully-invalid trailing fragment.
@@ -92,7 +92,7 @@ def _build_case(
         offsets=offsets_t,
     )
     return (
-        bufs,
+        tri,
         pools,
         token_starts,
         valid_seq_lens,
@@ -132,7 +132,7 @@ def test_cute_kernel_matches_torch_oracle(case):
     max_requests = case["max_requests"]
     num_layers = case["num_layers"]
     (
-        bufs,
+        tri,
         pools,
         token_starts,
         valid_seq_lens,
@@ -141,7 +141,7 @@ def test_cute_kernel_matches_torch_oracle(case):
         mean_sin,
         oracle_inputs,
     ) = _build_case(prompt_len=prompt_len, seed=20260719, **case)
-    device = bufs.score_scratch.device
+    device = tri._score_scratch.device
 
     oracle = _torch_tri_score_oracle(
         pools,
@@ -158,11 +158,11 @@ def test_cute_kernel_matches_torch_oracle(case):
     )
 
     # Every count up to capacity is served, nothing beyond.
-    assert max_requests + 1 not in bufs.runner._compiled
+    assert max_requests + 1 not in tri._compiled_score
     for request_count in dict.fromkeys((1, max_requests - 1, max_requests)):
         valid_widths = torch.full((max_requests,), -1, dtype=torch.int32, device=device)
         scores = _launch_split_scores(
-            bufs,
+            tri,
             request_count,
             valid_seq_lens,
             valid_widths,
@@ -174,7 +174,7 @@ def test_cute_kernel_matches_torch_oracle(case):
             request_count,
             num_layers,
             case["num_q_heads"],
-            bufs.decode_width,
+            tri._decode_width,
         )
         # The score leg owns the per-request decode widths the selection
         # reduce kernels consume.

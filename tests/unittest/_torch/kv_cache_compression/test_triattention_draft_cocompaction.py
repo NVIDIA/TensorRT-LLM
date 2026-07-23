@@ -172,41 +172,42 @@ def test_execute_eviction_round_orders_both_manager_streams():
 
     event = mock.Mock()
     host = torch.zeros(6, 9, dtype=torch.int32)
-    buffers = SimpleNamespace(
-        max_requests=8,
-        keep_count=4,
-        eviction_mode="union",
-        swa_window=None,
-        compaction_plan=(),
-        draft_protected_tail_capacity=1,
-        copy_pending=False,
-        staging_reuse_event=mock.Mock(),
-        compaction_done_event=event,
-        request_metadata_host=host,
-        request_metadata_host_np=host.numpy(),
-        request_metadata_device=torch.zeros_like(host),
-        phase={"cos": None, "sin": None, "rows": 8},
-        phase_num_freqs=1,
-        phase_f_block=1,
-        round_starts_device=None,
-        valid_seq_lens_device=None,
-        token_starts_device=None,
-        valid_widths=None,
-        mean_cos=None,
-        mean_sin=None,
-        swa_destination_bases=None,
-        swa_rebase_delta=0,
-        block_offsets_host=None,
-        block_offsets_device=torch.zeros(1, dtype=torch.int32),
-        draft_block_offsets_host=None,
-        draft_block_offsets_device=None,
-    )
+    tri = TriAttention.__new__(TriAttention)
+    tri._max_requests = 8
+    tri._keep_count = 4
+    tri.eviction_mode = "union"
+    tri._swa_window = None
+    tri.compaction_plan = ()
+    tri._draft_protected_tail_capacity = 1
+    tri._copy_pending = False
+    tri._staging_reuse_event = mock.Mock()
+    tri._compaction_done_event = event
+    tri._request_metadata_host = host
+    tri._request_metadata_host_np = host.numpy()
+    tri._request_metadata_device = torch.zeros_like(host)
+    tri._phase = {"cos": None, "sin": None, "rows": 8}
+    tri._phase_num_freqs = 1
+    tri._phase_f_block = 1
+    tri._round_starts_device = None
+    tri._valid_seq_lens_device = None
+    tri._token_starts_device = None
+    tri._valid_widths = None
+    tri._mean_cos = None
+    tri._mean_sin = None
+    tri._swa_destination_bases = None
+    tri._swa_rebase_delta = 0
+    tri._block_offsets_host = None
+    tri._block_offsets_device = torch.zeros(1, dtype=torch.int32)
+    tri._draft_block_offsets_host = None
+    tri._draft_block_offsets_device = None
     target_stream = mock.Mock()
     draft_stream = mock.Mock()
     manager = SimpleNamespace(_stream=target_stream)
     draft_manager = SimpleNamespace(
         _stream=draft_stream, num_extra_kv_tokens=0, _kv_reserve_draft_tokens=0
     )
+    tri.kv_cache_manager = manager
+    tri.draft_kv_cache_manager = draft_manager
     compute_stream = SimpleNamespace()
     prepared = [_make_prepared_item(request_id=7, seq_len=8)]
 
@@ -218,12 +219,12 @@ def test_execute_eviction_round_orders_both_manager_streams():
     with (
         mock.patch.object(torch.cuda, "current_stream", return_value=compute_stream),
         mock.patch.object(module, "grow_mean_phase_table"),
-        mock.patch.object(module, "_stage_block_offsets") as stage,
+        mock.patch.object(tri, "_stage_block_offsets") as stage,
         mock.patch.object(module, "_gather_mean_phase_kernel", score_kernel),
         mock.patch.object(module, "compact") as compact,
     ):
         with pytest.raises(Boom):
-            module.execute_eviction_round(buffers, manager, prepared, draft_manager)
+            tri._execute_eviction_round(prepared)
 
     # Both page-table planes were snapshotted before the round body fired.
     assert stage.call_count == 2
@@ -349,7 +350,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
                 # The staged logical position restores the uncompressed
                 # length: physical confirmed plus everything evicted so far
                 # (the prepared item's round_start).
-                prepared = internals.execute.call_args.args[2]
+                prepared = internals.execute.call_args.args[0]
                 assert prepared[0]["round_start"] == uncompressed
             # The published count equals the uncompressed confirmed logical
             # length minus the physical confirmed length, and never decreases.
@@ -360,22 +361,20 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     assert eviction_rounds == 3
     assert previous_published == 12
     # Each round the draft cache shrinks with the target, and the one
-    # executor call carries both managers, whose streams it orders after the
-    # compact launches.
+    # executor call runs on the manager itself, which carries both cache
+    # managers whose streams it orders after the compact launches.
     assert draft_cache.resize.call_args_list == [mock.call(7, None)] * eviction_rounds
     assert len(internals.execute.call_args_list) == eviction_rounds
+    assert manager.kv_cache_manager is target
+    assert manager.draft_kv_cache_manager is draft_manager
     for call in internals.execute.call_args_list:
-        assert call.args[0] is internals.buffers
-        assert call.args[1] is target
-        assert call.args[3] is draft_manager
+        assert len(call.args) == 1
         assert call.kwargs == {}
 
 
 def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
-    from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
-
     manager = _make_triattention(budget=4)
-    layout, buffers = _make_buffer_stubs(manager)
+    layout, built_attributes = _make_buffer_stubs(manager)
     # The one-time host block-offset table shape gate reads the real manager
     # tables (int32 [pools, slots, K/V, blocks]).
     manager.kv_cache_manager.host_kv_cache_block_offsets = torch.zeros(
@@ -401,55 +400,59 @@ def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
         _make_prepared_item(_make_request(7), request_id=7, seq_len=8, expected_keep_count=4)
     ]
 
-    with mock.patch.object(
-        module,
-        "init_eviction_buffers",
-        return_value=buffers,
-    ) as prepare:
-        resources = manager._buffers_for(layout, prepared)
+    def apply_built(**kwargs):
+        for name, value in built_attributes.items():
+            setattr(manager, name, value)
+
+    phase = manager._phase
+    with mock.patch.object(manager, "_build_buffers", side_effect=apply_built) as prepare:
+        manager._ensure_buffers(layout, prepared)
 
         # Request capacity follows the executor limits, while the score
         # bucket follows what the cohort actually presents (power-of-two,
         # 1024 floor) instead of pinning tens-of-GiB scratch to max_seq_len.
-        assert resources is buffers
+        # The stubbed build's capacities became the resident manager state.
+        assert manager._buffers_built
+        assert manager._decode_width == built_attributes["_decode_width"]
         kwargs = prepare.call_args.kwargs
-        assert kwargs["eviction_mode"] == "union"
+        # The mode and the shared phase-table dict live on the manager itself
+        # and thread through unchanged (no longer build arguments).
+        assert manager.eviction_mode == "union"
+        assert manager._phase is phase
         assert kwargs["capacities"]["max_requests"] == 8
         assert kwargs["capacities"]["decode_width"] == 4 + 2 * 128
         assert kwargs["capacities"]["bucket_seq_len"] == 1024
         assert kwargs["capacities"]["page_table_token_capacity"] == 1024 + 1
         assert kwargs["draft"]["page_table_token_capacity"] == 1024 + 1
         assert kwargs["draft"]["layout"] is manager._draft_runtime_kv_layout.return_value
-        # Migrated from the pipeline buffer-kwargs test: the budget, the
-        # shared phase-table dict, and the pool keys thread through unchanged.
+        # Migrated from the pipeline buffer-kwargs test: the budget and the
+        # pool keys thread through unchanged.
         assert kwargs["capacities"]["keep_count"] == manager.budget
-        assert kwargs["phase"] is manager._phase
         assert kwargs["layout"] is layout
         assert list(kwargs["layout"]["layer_pool_ids"]) == list(layout["layer_pool_ids"])
 
         # A second round within the resident capacities reuses the buffers
         # (and with them the compaction launch data they carry).
-        assert manager._buffers_for(layout, prepared) is resources
+        manager._ensure_buffers(layout, prepared)
         assert prepare.call_count == 1
 
         # A cohort that outgrows the resident capacities rebuilds the whole
-        # buffer namespace, compaction included.
+        # buffer state, compaction included.
         grown = [
             _make_prepared_item(
                 _make_request(7),
                 request_id=7,
-                seq_len=8 + buffers.decode_width,
+                seq_len=8 + built_attributes["_decode_width"],
                 expected_keep_count=4,
             )
         ]
-        rebuilt_buffers = SimpleNamespace(
-            decode_width=buffers.decode_width + 8,
-            page_table_token_capacity=buffers.page_table_token_capacity,
-            max_requests=buffers.max_requests,
-        )
-        prepare.return_value = rebuilt_buffers
-        rebuilt = manager._buffers_for(layout, grown)
-        assert rebuilt is not resources
-        assert rebuilt is rebuilt_buffers
+
+        def apply_rebuilt(**kwargs):
+            apply_built()
+            manager._decode_width = built_attributes["_decode_width"] + 8
+
+        prepare.side_effect = apply_rebuilt
+        manager._ensure_buffers(layout, grown)
         assert prepare.call_count == 2
-        assert manager._buffers is rebuilt_buffers
+        assert manager._buffers_built
+        assert manager._decode_width == built_attributes["_decode_width"] + 8

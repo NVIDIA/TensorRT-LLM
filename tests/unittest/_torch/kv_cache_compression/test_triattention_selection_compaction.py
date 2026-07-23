@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 from conftest import build_compaction as _build_compaction
@@ -15,7 +13,7 @@ from conftest import make_staging_manager as _make_staging_manager
 from conftest import run_compaction as _run_compaction
 from conftest import set_protected_tails as _set_protected_tails
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import settle_top_tokens
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     prepare_per_head_scores,
 )
@@ -47,83 +45,69 @@ def _make_selection_buffers(
     num_query_heads=1,
     num_kv_heads=1,
 ):
-    """Selection-only buffers for the mode, without CuTe score state or
-    compaction (the settle launch writes only the kept-ordinal rows).
-    Mirrors the product's canonical row-major selection allocation."""
-    bufs = SimpleNamespace(
-        eviction_mode=eviction_mode,
-        max_requests=max_requests,
-        decode_width=width,
-        keep_count=keep_count,
-        num_layers=num_layers,
-        num_q_heads=num_query_heads,
-        num_kv_heads=num_kv_heads,
-    )
-    bufs.valid_widths = torch.full((max_requests,), width, dtype=torch.int32, device=device)
-    bufs.token_starts_device = torch.zeros(max_requests, dtype=torch.int32, device=device)
+    """A bare manager with selection-only attributes for the mode, without
+    CuTe score state or compaction (the settle launch writes only the
+    kept-ordinal rows). Mirrors the product's canonical row-major selection
+    allocation; ``_settle_top_tokens`` reads exactly these attributes."""
+    tri = TriAttention.__new__(TriAttention)
+    tri.eviction_mode = eviction_mode
+    tri._max_requests = max_requests
+    tri._decode_width = width
+    tri._keep_count = keep_count
+    tri._num_layers = num_layers
+    tri._num_q_heads = num_query_heads
+    tri._num_kv_heads = num_kv_heads
+    tri._valid_widths = torch.full((max_requests,), width, dtype=torch.int32, device=device)
+    tri._token_starts_device = torch.zeros(max_requests, dtype=torch.int32, device=device)
     if eviction_mode == "union":
-        bufs.selection_rows_per_request = 1
-        bufs.selection_scores_rows = torch.empty(
+        tri._selection_rows_per_request = 1
+        tri._selection_scores_rows = torch.empty(
             (max_requests, width), dtype=torch.float32, device=device
         )
-        bufs.selection_row_lengths = bufs.valid_widths
+        tri._selection_row_lengths = tri._valid_widths
         # Padded rows carry zero valid width; their provisional TopK entries
         # must still be in-range ordinals for the finalizer's score gather.
-        bufs.provisional_rows = torch.zeros(
+        tri._provisional_rows = torch.zeros(
             (max_requests, keep_count), dtype=torch.int32, device=device
         )
-        bufs.kept_ordinal_rows = torch.empty(
+        tri._kept_ordinal_rows = torch.empty(
             (max_requests, keep_count), dtype=torch.int32, device=device
         )
     else:
         selection_rows = num_kv_heads if eviction_mode == "per_head" else num_layers * num_kv_heads
-        bufs.selection_rows_per_request = selection_rows
-        bufs.row_mean = torch.empty(
+        tri._selection_rows_per_request = selection_rows
+        tri._row_mean = torch.empty(
             max_requests, num_layers, num_query_heads, 1, dtype=torch.float32, device=device
         )
-        bufs.row_inv_std = torch.empty_like(bufs.row_mean)
-        bufs.selection_scores_rows = torch.empty(
+        tri._row_inv_std = torch.empty_like(tri._row_mean)
+        tri._selection_scores_rows = torch.empty(
             (max_requests * selection_rows, width), dtype=torch.float32, device=device
         )
-        bufs.selection_row_lengths = torch.full(
+        tri._selection_row_lengths = torch.full(
             (max_requests * selection_rows,), width, dtype=torch.int32, device=device
         )
-        bufs.provisional_rows = torch.zeros(
+        tri._provisional_rows = torch.zeros(
             (max_requests * selection_rows, keep_count), dtype=torch.int32, device=device
         )
-        bufs.kept_ordinal_rows = torch.empty(
+        tri._kept_ordinal_rows = torch.empty(
             (max_requests * selection_rows, keep_count), dtype=torch.int32, device=device
         )
-    # The launch args mirror the product's ``bufs.settle_args``/
-    # ``bufs.settle_kwargs`` order and keys exactly.
-    bufs.settle_args = (
-        bufs.selection_scores_rows,
-        bufs.selection_row_lengths,
-        bufs.token_starts_device,
-        bufs.provisional_rows,
-        bufs.kept_ordinal_rows,
-    )
-    bufs.settle_kwargs = dict(
-        WIDTH=width,
-        KEEP_COUNT=keep_count,
-        SELECTION_ROWS=bufs.selection_rows_per_request,
-    )
-    return bufs
+    return tri
 
 
-def _select_per_head(bufs, scores, *, normalize_scores):
+def _select_per_head(tri, scores, *, normalize_scores):
     """The per-head selection flow: reduce kernels, then top-k settle."""
     prepare_per_head_scores(
         scores,
-        bufs.valid_widths,
-        bufs.row_mean,
-        bufs.row_inv_std,
-        bufs.selection_scores_rows,
-        bufs.selection_row_lengths,
-        per_layer=bufs.eviction_mode == "per_layer_perhead",
+        tri._valid_widths,
+        tri._row_mean,
+        tri._row_inv_std,
+        tri._selection_scores_rows,
+        tri._selection_row_lengths,
+        per_layer=tri.eviction_mode == "per_layer_perhead",
         normalize_scores=normalize_scores,
     )
-    settle_top_tokens(bufs, bufs.max_requests)
+    tri._settle_top_tokens(tri._max_requests)
 
 
 def _stable_topk(row: torch.Tensor, width: int, keep_count: int) -> torch.Tensor:
@@ -193,7 +177,7 @@ def test_per_head_selection_matches_torch_oracle_on_selector_stream(
     device = torch.device("cuda", torch.cuda.current_device())
     stream = torch.cuda.Stream(device=device)
     with torch.cuda.stream(stream):
-        bufs = _make_selection_buffers(
+        tri = _make_selection_buffers(
             eviction_mode=eviction_mode,
             width=width,
             keep_count=keep_count,
@@ -203,13 +187,13 @@ def test_per_head_selection_matches_torch_oracle_on_selector_stream(
             num_query_heads=query_heads,
             num_kv_heads=kv_heads,
         )
-        bufs.valid_widths.copy_(valid_widths.to(device))
+        tri._valid_widths.copy_(valid_widths.to(device))
         scores = scores_cpu.to(device)
-        keep_shape = (request_count, bufs.selection_rows_per_request, keep_count)
-        _select_per_head(bufs, scores, normalize_scores=normalize_scores)
-        first = bufs.kept_ordinal_rows.view(keep_shape).cpu()
-        _select_per_head(bufs, scores, normalize_scores=normalize_scores)
-        second = bufs.kept_ordinal_rows.view(keep_shape).cpu()
+        keep_shape = (request_count, tri._selection_rows_per_request, keep_count)
+        _select_per_head(tri, scores, normalize_scores=normalize_scores)
+        first = tri._kept_ordinal_rows.view(keep_shape).cpu()
+        _select_per_head(tri, scores, normalize_scores=normalize_scores)
+        second = tri._kept_ordinal_rows.view(keep_shape).cpu()
     stream.synchronize()
 
     assert torch.equal(first, expected)
@@ -234,20 +218,20 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         device=device,
     ).to(torch.float32)
     valid_widths = (width, width - 32)
-    bufs = _make_selection_buffers(
+    tri = _make_selection_buffers(
         eviction_mode="union",
         width=width,
         keep_count=keep_count,
         device=device,
         max_requests=request_count,
     )
-    bufs.valid_widths.copy_(torch.tensor(valid_widths, dtype=torch.int32, device=device))
-    bufs.token_starts_device[:request_count].copy_(
+    tri._valid_widths.copy_(torch.tensor(valid_widths, dtype=torch.int32, device=device))
+    tri._token_starts_device[:request_count].copy_(
         torch.tensor([prompt_len] * request_count, dtype=torch.int32, device=device)
     )
-    bufs.selection_scores_rows.copy_(scores.amax(dim=1))
-    settle_top_tokens(bufs, bufs.max_requests)
-    actual = bufs.kept_ordinal_rows.cpu()
+    tri._selection_scores_rows.copy_(scores.amax(dim=1))
+    tri._settle_top_tokens(tri._max_requests)
+    actual = tri._kept_ordinal_rows.cpu()
 
     combined = scores.amax(dim=1).cpu()
     for request, valid_width in enumerate(valid_widths):
@@ -429,9 +413,6 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
 def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     """Keep score and compaction layer axes aligned across interleaved V2 pools."""
     pytest.importorskip("cutlass")
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        execute_eviction_round,
-    )
 
     device = torch.device("cuda", torch.cuda.current_device())
     num_layers = 3
@@ -475,7 +456,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     mlr_coef[:, :, 0] = 1
     freq_scale_sq = torch.zeros(num_freqs, dtype=torch.float32, device=device)
     freq_scale_sq[0] = 1
-    bufs = _make_cute_buffers(
+    tri = _make_cute_buffers(
         eviction_mode="per_layer_perhead",
         layer_pools=pools,
         max_requests=1,
@@ -497,16 +478,16 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         normalize_scores=False,
     )
     # No SWA in this layout: no window, no rebase row for the phase gather.
-    assert bufs.swa_window is None
-    assert bufs.swa_destination_bases is None
+    assert tri._swa_window is None
+    assert tri._swa_destination_bases is None
     # Native V2 staging contract: [pool, request, K/V, block] int32 pair with
     # a 4-aligned block width (PackedInt copy ABI) and a pinned host snapshot.
-    assert bufs.block_offsets_host.shape == bufs.block_offsets_device.shape
-    assert bufs.block_offsets_host.shape[:3] == (2, 1, 2)
-    assert bufs.block_offsets_host.shape[-1] % 4 == 0
-    assert bufs.block_offsets_host.dtype == bufs.block_offsets_device.dtype == torch.int32
-    assert bufs.block_offsets_host.is_contiguous() and bufs.block_offsets_device.is_contiguous()
-    assert bufs.block_offsets_host.is_pinned()
+    assert tri._block_offsets_host.shape == tri._block_offsets_device.shape
+    assert tri._block_offsets_host.shape[:3] == (2, 1, 2)
+    assert tri._block_offsets_host.shape[-1] % 4 == 0
+    assert tri._block_offsets_host.dtype == tri._block_offsets_device.dtype == torch.int32
+    assert tri._block_offsets_host.is_contiguous() and tri._block_offsets_device.is_contiguous()
+    assert tri._block_offsets_host.is_pinned()
 
     # Stage through the round executor: the gather double writes both
     # page-table slots' K page ids and the bulk copy encodes the K/V rows;
@@ -525,8 +506,9 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         num_slots=2,
     )
     prepared = [_make_prepared_item(request_id=7, seq_len=seq_len, round_start=0)]
-    execute_eviction_round(bufs, manager, prepared)
-    assert torch.equal(bufs.kept_ordinal_rows.view_as(expected_keep), expected_keep)
+    tri.kv_cache_manager = manager
+    tri._execute_eviction_round(prepared)
+    assert torch.equal(tri._kept_ordinal_rows.view_as(expected_keep), expected_keep)
     torch.cuda.synchronize(device)
 
     for before_pool, after_pool, table, layer in zip(
@@ -549,9 +531,6 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
     pytest.importorskip("cutlass")
     import tensorrt_llm
     import tensorrt_llm.bindings
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        execute_eviction_round,
-    )
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
@@ -653,7 +632,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
         mlr_coef[..., 0] = 1
         freq_scale_sq = torch.zeros(num_freqs, dtype=torch.float32, device=device)
         freq_scale_sq[0] = 1
-        bufs = _make_cute_buffers(
+        tri = _make_cute_buffers(
             eviction_mode="union",
             layer_pools=[pool],
             max_requests=1,
@@ -670,6 +649,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             page_table_token_capacity=seq_len + protected_tail,
             protected_tail_capacity=protected_tail,
         )
+        tri.kv_cache_manager = manager
 
         def evict_once() -> tuple[torch.Tensor, torch.Tensor]:
             before = snapshot(seq_len + protected_tail)
@@ -686,8 +666,8 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             # the derived move offsets stage keep_count + protected_tail
             # moves. Z-normalization is monotonic per row, so the raw-score
             # keep set is unchanged.
-            execute_eviction_round(bufs, manager, prepared)
-            selected = bufs.kept_ordinal_rows[0].clone().to(torch.long)
+            tri._execute_eviction_round(prepared)
+            selected = tri._kept_ordinal_rows[0].clone().to(torch.long)
             torch.cuda.synchronize(device)
             assert cache.resize(compacted_capacity, None)
             after = snapshot(compacted_capacity)

@@ -19,21 +19,39 @@ _SM100_ONLY = pytest.mark.skipif(
 )
 
 
-def _launch_union_fusion(
-    bufs, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin, union_out
+def _run_fused_union(
+    tri, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin, union_out
 ):
-    """The fused score+stats+normalized-union pipeline (THE union path).
-    Test mean phases load into the runner's ctor-bound buffers; the fused
-    rows land in the ctor-bound ``bufs.union_scores`` and copy out."""
-    _stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts)
-    bufs.mean_cos[:request_count].copy_(mean_cos[:request_count])
-    bufs.mean_sin[:request_count].copy_(mean_sin[:request_count])
+    """The fused score+stats+normalized-union pipeline (THE union path), fired
+    directly off the compiled entries exactly like the round. Test mean phases
+    load into the build-bound buffers; the fused rows land in the build-bound
+    ``tri._union_scores`` and copy out."""
+    import cuda.bindings.driver as cuda_driver
+
+    _stage_score_metadata(tri, request_count, valid_seq_lens, valid_widths, token_starts)
+    tri._mean_cos[:request_count].copy_(mean_cos[:request_count])
+    tri._mean_sin[:request_count].copy_(mean_sin[:request_count])
     assert (
-        request_count in bufs.runner._compiled_stats
-        and request_count in bufs.runner._compiled_normalize_union
+        request_count in tri._compiled_score_stats
+        and request_count in tri._compiled_normalize_union
     )
-    bufs.runner.launch_union_fusion(request_count)
-    union_out[:request_count].copy_(bufs.union_scores[:request_count])
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(tri._score_scratch.device).cuda_stream)
+    tri._compiled_score_stats[request_count](
+        *tri._cute_score_prefix,
+        tri._cute_mean_cos,
+        tri._cute_mean_sin,
+        *tri._cute_score_tail,
+        request_count,
+        stream,
+    )
+    tri._compiled_normalize_union[request_count](
+        tri._cute_partial_stats,
+        *tri._cute_selection_prefix,
+        tri._cute_union_scores,
+        request_count,
+        stream,
+    )
+    union_out[:request_count].copy_(tri._union_scores[:request_count])
 
 
 def _reference_union_scores(scores_rows: torch.Tensor, valid_widths: torch.Tensor) -> torch.Tensor:
@@ -123,16 +141,16 @@ def test_union_fusion_matches_split_pipeline(
         omega=omega,
         offsets=offsets,
     )
-    bufs = _make_cute_buffers(eviction_mode="union", **common)
+    tri = _make_cute_buffers(eviction_mode="union", **common)
     # The split reference leg runs on its own score-only buffers.
-    ref_bufs = _make_cute_buffers(eviction_mode="per_head", **common)
+    ref_tri = _make_cute_buffers(eviction_mode="per_head", **common)
     k_plane = [2 * page for page in page_permutation]
     v_plane = [2 * page + 1 for page in page_permutation]
     encoded = torch.tensor(
         [[[k_plane, v_plane], [k_plane, v_plane]]], dtype=torch.int32, device=device
     )
-    _write_block_offsets(bufs, encoded)
-    _write_block_offsets(ref_bufs, encoded)
+    _write_block_offsets(tri, encoded)
+    _write_block_offsets(ref_tri, encoded)
     if valid_lens is None:
         valid_lens = [seq_len, seq_len]
     valid_seq_lens = torch.tensor(valid_lens, dtype=torch.int32, device=device)
@@ -146,7 +164,7 @@ def test_union_fusion_matches_split_pipeline(
     split_widths = torch.empty(request_count, dtype=torch.int32, device=device)
     token_starts = torch.tensor(score_starts, dtype=torch.int32, device=device)
     per_head = _launch_split_scores(
-        ref_bufs,
+        ref_tri,
         request_count,
         valid_seq_lens,
         split_widths,
@@ -162,8 +180,8 @@ def test_union_fusion_matches_split_pipeline(
     fused_out = torch.full(
         (request_count, seq_len), float("nan"), dtype=torch.float32, device=device
     )
-    _launch_union_fusion(
-        bufs,
+    _run_fused_union(
+        tri,
         request_count,
         valid_seq_lens,
         fused_widths,
@@ -286,16 +304,16 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
         offsets=offsets,
         decode_width=decode_window,
     )
-    bufs = _make_cute_buffers(eviction_mode="union", max_requests=max_requests, **common)
-    assert (bufs.score_scratch.numel() > 2**31) == (max_requests == 64)
+    tri = _make_cute_buffers(eviction_mode="union", max_requests=max_requests, **common)
+    assert (tri._score_scratch.numel() > 2**31) == (max_requests == 64)
     # The split reference leg only scores the two live requests; its own
     # small per_head buffers keep the giant scratch on the union side.
-    ref_bufs = _make_cute_buffers(eviction_mode="per_head", max_requests=request_count, **common)
+    ref_tri = _make_cute_buffers(eviction_mode="per_head", max_requests=request_count, **common)
     page_ids = torch.arange(num_pages, dtype=torch.int32, device=device)
-    for staged in (bufs, ref_bufs):
-        staged.block_offsets_device.zero_()
-        staged.block_offsets_device[0, :request_count, 0, :num_pages] = 2 * page_ids
-        staged.block_offsets_device[0, :request_count, 1, :num_pages] = 2 * page_ids + 1
+    for staged in (tri, ref_tri):
+        staged._block_offsets_device.zero_()
+        staged._block_offsets_device[0, :request_count, 0, :num_pages] = 2 * page_ids
+        staged._block_offsets_device[0, :request_count, 1, :num_pages] = 2 * page_ids + 1
 
     valid_seq_lens = torch.zeros(max_requests, dtype=torch.int32, device=device)
     token_starts = torch.zeros(max_requests, dtype=torch.int32, device=device)
@@ -306,7 +324,7 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     # the pure-torch union oracle.
     split_widths = torch.zeros(max_requests, dtype=torch.int32, device=device)
     per_head = _launch_split_scores(
-        ref_bufs,
+        ref_tri,
         request_count,
         valid_seq_lens,
         split_widths,
@@ -323,8 +341,8 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     fused_out = torch.full(
         (max_requests, seq_len), float("nan"), dtype=torch.float32, device=device
     )
-    _launch_union_fusion(
-        bufs,
+    _run_fused_union(
+        tri,
         max_requests,
         valid_seq_lens,
         fused_widths,

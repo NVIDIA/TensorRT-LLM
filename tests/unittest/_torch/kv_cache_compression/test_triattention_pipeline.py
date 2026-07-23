@@ -195,14 +195,15 @@ class TestTriAttentionClass:
         assert set(triattention._request_states) == {11, 12}
 
         buffers = object()
-        triattention._buffers = buffers
+        triattention._buffers_built = True
+        triattention._score_scratch = buffers
         batch = SimpleNamespace()
         triattention._prepared_generation_batch = batch
         triattention.on_request_finish(_make_request(11))
         triattention.on_request_finish(_make_request(12))
         assert triattention._request_states == {}
         assert triattention._prepared_generation_batch is batch
-        assert triattention._buffers is buffers
+        assert triattention._buffers_built and triattention._score_scratch is buffers
 
     def test_resolve_accepts_flat_pt(self, flat_calibration_pt):
         mgr = _make_triattention()
@@ -562,20 +563,17 @@ class TestFixedScoreMetadata:
     def test_execute_rejects_int32_overflowing_round_starts(self):
         # Round starts past the int32 metadata range fail loudly (in the host
         # metadata build) before any GPU work is enqueued.
-        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-            execute_eviction_round,
-        )
-
         device = torch.device("cuda", torch.cuda.current_device())
         staging = _make_bare_staging(device, max_requests=1, staged_blocks_per_seq=8)
         gather = mock.Mock()
         manager = _make_staging_manager(
             torch.zeros(1, 2, 2, 12, dtype=torch.int32), gather, torch.cuda.Stream(device=device)
         )
+        staging.kv_cache_manager = manager
         prepared = [_make_prepared_item(request_id=7, seq_len=64, round_start=2**31)]
 
         with pytest.raises((RuntimeError, OverflowError, ValueError)):
-            execute_eviction_round(staging, manager, prepared)
+            staging._execute_eviction_round(prepared)
         assert gather.call_count == 0
 
     def test_bulk_page_table_copy_snapshots_and_orders_consumers(self):
@@ -586,13 +584,8 @@ class TestFixedScoreMetadata:
         index-mapper slot assignment) may mutate as soon as staging returns;
         the staged device tables must reflect the values at staging time. A
         subsequent bulk copy must also wait until the previous round's
-        consumers (ordered by ``execute_eviction_round``'s completion event)
-        are done.
+        consumers (ordered by the round executor's completion event) are done.
         """
-        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-            _stage_block_offsets,
-        )
-
         device = torch.device("cuda", torch.cuda.current_device())
         current_stream = torch.cuda.current_stream(device)
         manager_stream = torch.cuda.Stream(device=device)
@@ -617,17 +610,16 @@ class TestFixedScoreMetadata:
 
         gather = mock.Mock(side_effect=gather_k_block_offsets)
         staging = _make_bare_staging(device, max_requests=1, staged_blocks_per_seq=8)
-        staging.staging_reuse_event.record(current_stream)
+        staging._staging_reuse_event.record(current_stream)
         manager = _make_staging_manager(host_table, gather, manager_stream)
 
         def stage_once():
             # Raises on any staging failure; success returns None.
-            _stage_block_offsets(
-                staging,
+            staging._stage_block_offsets(
                 manager,
                 [7],
-                staging.block_offsets_host,
-                staging.block_offsets_device,
+                staging._block_offsets_host,
+                staging._block_offsets_device,
             )
 
         # Round 1: mutate the host table and the slot assignment right after
@@ -641,13 +633,13 @@ class TestFixedScoreMetadata:
             side_effect=AssertionError("page-table staging used torch.index_select"),
         ):
             stage_once()
-        assert staging.block_offsets_host.shape == (1, 1, 2, 8)
+        assert staging._block_offsets_host.shape == (1, 1, 2, 8)
         host_table[0, 0, 0, :5] = torch.tensor([13, 14, 15, 16, 17], dtype=torch.int32)
         selected_slot[0] = 1
         current_stream.synchronize()
 
-        assert staging.block_offsets_device[0, 0, 0, :5].tolist() == [6, 8, 10, 12, 14]
-        assert staging.block_offsets_device[0, 0, 1, :5].tolist() == [7, 9, 11, 13, 15]
+        assert staging._block_offsets_device[0, 0, 0, :5].tolist() == [6, 8, 10, 12, 14]
+        assert staging._block_offsets_device[0, 0, 1, :5].tolist() == [7, 9, 11, 13, 15]
 
         # Round 2: same contract on a re-staged cohort.
         host_table[0, 0, 0, :5] = torch.tensor([18, 19, 20, 21, 22], dtype=torch.int32)
@@ -659,48 +651,43 @@ class TestFixedScoreMetadata:
         selected_slot[0] = 1
         current_stream.synchronize()
 
-        assert staging.block_offsets_device[0, 0, 0, :5].tolist() == [36, 38, 40, 42, 44]
-        assert staging.block_offsets_device[0, 0, 1, :5].tolist() == [37, 39, 41, 43, 45]
+        assert staging._block_offsets_device[0, 0, 0, :5].tolist() == [36, 38, 40, 42, 44]
+        assert staging._block_offsets_device[0, 0, 1, :5].tolist() == [37, 39, 41, 43, 45]
 
         # Round 3: a delayed consumer read (snapshot) queued before the
         # round's completion ordering must complete before the next bulk
         # copy overwrites the device tables.
         selected_slot[0] = 0
         manager_stream.synchronize()
-        snapshot = torch.empty_like(staging.block_offsets_device)
+        snapshot = torch.empty_like(staging._block_offsets_device)
         torch.cuda._sleep(20_000_000)
-        snapshot.copy_(staging.block_offsets_device)
-        # ``execute_eviction_round``'s completion ordering: one event records
-        # the consumers and the manager stream waits on it.
-        staging.compaction_done_event.record(torch.cuda.current_stream(device))
-        manager_stream.wait_event(staging.compaction_done_event)
+        snapshot.copy_(staging._block_offsets_device)
+        # The round executor's completion ordering: one event records the
+        # consumers and the manager stream waits on it.
+        staging._compaction_done_event.record(torch.cuda.current_stream(device))
+        manager_stream.wait_event(staging._compaction_done_event)
 
         stage_once()
         current_stream.synchronize()
 
         assert snapshot[0, 0, 0, :5].tolist() == [36, 38, 40, 42, 44]
-        assert staging.block_offsets_device[0, 0, 0, :5].tolist() == [46, 48, 50, 52, 54]
+        assert staging._block_offsets_device[0, 0, 0, :5].tolist() == [46, 48, 50, 52, 54]
 
     def test_cohort_move_offsets_stage_keep_plus_tail_and_pad_rows(self):
         # The derived move offsets stage keep + tail moves per request
         # (keep_count=4 -> [6, 7]); padded rows past the cohort repeat the
         # final offset and contribute no moves. (The executor-call contract
         # itself is pinned by the overlap-tail and draft publication tests.)
-        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-            _cohort_move_offsets,
-        )
-
-        offsets_buffers = SimpleNamespace(
-            max_requests=8,
-            keep_count=4,
-            swa_window=None,
-            draft_protected_tail_capacity=None,
-        )
+        offsets_manager = TriAttention.__new__(TriAttention)
+        offsets_manager._max_requests = 8
+        offsets_manager._keep_count = 4
+        offsets_manager._swa_window = None
+        offsets_manager._draft_protected_tail_capacity = None
         prepared = [
             _make_prepared_item(request_id=7, seq_len=8, protected_tail=2),
             _make_prepared_item(request_id=8, seq_len=10, protected_tail=3),
         ]
-        dense, swa, draft = _cohort_move_offsets(offsets_buffers, prepared)
+        dense, swa, draft = offsets_manager._cohort_move_offsets(prepared)
         assert dense == [0, 6, 13, 13, 13, 13, 13, 13, 13]
         assert swa is None
         assert draft is None
@@ -758,7 +745,7 @@ class TestFixedScoreMetadata:
         round_starts = round_device[:request_count].tolist()
         seq_lens = [seq_len - request % 2 for request in range(request_count)]
         layer_order = list(range(num_layers))
-        bufs = _make_cute_buffers(
+        tri = _make_cute_buffers(
             eviction_mode="per_head",
             layer_pools=pools,
             max_requests=max_requests,
@@ -794,6 +781,7 @@ class TestFixedScoreMetadata:
             torch.cuda.Stream(device=device),
             num_slots=num_layers,
         )
+        tri.kv_cache_manager = manager
 
         def prepared_cohort():
             return [
@@ -807,13 +795,13 @@ class TestFixedScoreMetadata:
             ]
 
         score_sentinel = -12345.0
-        bufs.score_output.fill_(score_sentinel)
+        tri._score_output.fill_(score_sentinel)
         # The compact stage is stubbed to a no-op: this test owns the score
         # buffers only, never a staged move decision.
         with mock.patch.object(module, "compact"):
-            module.execute_eviction_round(bufs, manager, prepared_cohort())
-        fixed = bufs.score_output.clone()
-        assert bufs.valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
+            tri._execute_eviction_round(prepared_cohort())
+        fixed = tri._score_output.clone()
+        assert tri._valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
 
         oracle = _torch_tri_score_oracle(
             pools,
@@ -847,12 +835,12 @@ class TestFixedScoreMetadata:
             )
         )
         expected_second_widths = valid_seq_lens - prompt_len
-        bufs.score_output.fill_(score_sentinel)
-        bufs.valid_widths.fill_(-1)
+        tri._score_output.fill_(score_sentinel)
+        tri._valid_widths.fill_(-1)
         with mock.patch.object(module, "compact"):
-            module.execute_eviction_round(bufs, manager, prepared_cohort())
-        second_launch = bufs.score_output.clone()
-        assert torch.equal(bufs.valid_widths, expected_second_widths)
+            tri._execute_eviction_round(prepared_cohort())
+        second_launch = tri._score_output.clone()
+        assert torch.equal(tri._valid_widths, expected_second_widths)
         assert not torch.equal(second_launch, fixed)
 
 

@@ -129,10 +129,10 @@ def _make_compact_launches(
     move_offsets: torch.Tensor,
     destination_bases: torch.Tensor,
     per_layer_slots: Optional[Dict[int, int]] = None,
-) -> Tuple[tuple, ...]:
-    """Batch layers into one prepacked ``sparse_kv_cache_compact_layers``
-    argument tuple per uniform V2 pool (grouped by canonical pool id plus
-    pool/page-table geometry; native ABI order)."""
+) -> Tuple[Dict[str, object], ...]:
+    """Batch layers into one launch record per uniform V2 pool (grouped by
+    canonical pool id plus pool/page-table geometry), carrying the native
+    ``sparse_kv_cache_compact_layers`` operands as plain named fields."""
     device = entries[0][1].device
     grouped = OrderedDict()
     for layer, pool, page_table in entries:
@@ -158,67 +158,21 @@ def _make_compact_launches(
                 device=device,
             )
         launches.append(
-            (
-                pools,
-                torch.tensor(
+            dict(
+                pools=pools,
+                pool_pointers=torch.tensor(
                     [pool.data_ptr() for pool in pools],
                     dtype=torch.int64,
                     device=device,
                 ),
-                page_tables[0],
-                move_indices,
-                move_offsets,
-                destination_bases,
-                source_layer_indices,
+                page_table=page_tables[0],
+                move_indices=move_indices,
+                move_offsets=move_offsets,
+                destination_bases=destination_bases,
+                source_layer_indices=source_layer_indices,
             )
         )
     return tuple(launches)
-
-
-def _make_pack_launch(
-    *,
-    # Decision inputs, packed each round.
-    kept_ordinal_rows: torch.Tensor,
-    valid_seq_lens: torch.Tensor,
-    decision_rows: int,
-    per_layer_sources: bool,
-    # Dense move family.
-    dense_move_offsets: torch.Tensor,
-    dense_move_indices: torch.Tensor,
-    # SWA move family (all-or-none).
-    swa_move_offsets: Optional[torch.Tensor] = None,
-    swa_move_indices: Optional[torch.Tensor] = None,
-    swa_window: int = 0,
-    # Launch geometry.
-    keep_count: int,
-    move_capacity: int,
-    num_kv_heads: int,
-) -> Tuple[int, tuple, dict]:
-    """Assemble one family's prepacked pack launch ``(grid_rows, args,
-    kwargs)``: stable tensor references plus constexpr dispatch (the frozen
-    ``_pack_move_sources_kernel`` ABI), built once per geometry so the round
-    path constructs no Python containers."""
-    return (
-        decision_rows,
-        (
-            kept_ordinal_rows,
-            valid_seq_lens,
-            dense_move_offsets,
-            dense_move_indices,
-            swa_move_offsets,
-            swa_move_indices,
-        ),
-        dict(
-            KEEP_COUNT=keep_count,
-            DECISION_ROWS=decision_rows,
-            MOVE_CAPACITY=move_capacity,
-            NUM_KV_HEADS=num_kv_heads,
-            PER_LAYER=per_layer_sources,
-            DENSE_TOTAL=int(dense_move_indices.shape[-1]),
-            SWA_TOTAL=int(swa_move_indices.shape[-1]) if swa_move_indices is not None else 0,
-            SWA_WINDOW=swa_window,
-        ),
-    )
 
 
 def init_compaction_buffers(
@@ -226,7 +180,7 @@ def init_compaction_buffers(
     target: Dict[str, object],
     capacities: Dict[str, int],
     draft: Optional[Dict[str, object]] = None,
-) -> Tuple[Tuple[Tuple[int, tuple, dict], Tuple[tuple, ...]], ...]:
+) -> Tuple[Dict[str, object], ...]:
     """Agree on the decision rows and return opaque launch plans per geometry.
 
     Move sources must be increasing kept ordinals with
@@ -245,9 +199,10 @@ def init_compaction_buffers(
     draft's own KV heads); ``capacities`` the request/keep/tail capacity
     numbers.
 
-    Returns one ``(pack_launch, native_launches)`` plan per compacted cache
-    family (target, then the optional draft); the plans hold their own
-    move-index buffers and only :func:`compact` interprets them.
+    Returns one plan per compacted cache family (target, then the optional
+    draft): plain contract fields -- decision inputs, move-index buffers,
+    pack geometry ints, and the grouped native launch records -- that only
+    :func:`compact` interprets.
     """
     layer_pools = target["layer_pools"]
     dense_layers = tuple(int(layer) for layer in target["dense_layers"])
@@ -338,7 +293,7 @@ def init_compaction_buffers(
             )
         )
 
-    target_pack_launch = _make_pack_launch(
+    target_plan = dict(
         kept_ordinal_rows=kept_ordinal_rows,
         valid_seq_lens=valid_seq_lens,
         decision_rows=decision_rows,
@@ -351,9 +306,12 @@ def init_compaction_buffers(
         keep_count=keep_count,
         move_capacity=move_capacity,
         num_kv_heads=num_kv_heads,
+        dense_total=int(dense_move_indices.shape[-1]),
+        swa_total=int(swa_move_indices.shape[-1]) if swa_move_indices is not None else 0,
+        launches=tuple(target_launches),
     )
 
-    plans = [(target_pack_launch, tuple(target_launches))]
+    plans = [target_plan]
     if draft is not None:
         if decision_rows != 1:
             raise ValueError(
@@ -391,32 +349,63 @@ def init_compaction_buffers(
             move_offsets=draft["dense_move_offsets"],
             destination_bases=token_starts,
         )
-        draft_pack_launch = _make_pack_launch(
+        draft_plan = dict(
             kept_ordinal_rows=kept_ordinal_rows,
             valid_seq_lens=valid_seq_lens,
             decision_rows=1,
             per_layer_sources=False,
             dense_move_offsets=draft["dense_move_offsets"],
             dense_move_indices=draft_move_indices,
+            swa_move_offsets=None,
+            swa_move_indices=None,
+            swa_window=0,
             keep_count=keep_count,
             move_capacity=keep_count + draft_tail,
             num_kv_heads=draft_num_kv_heads,
+            dense_total=int(draft_move_indices.shape[-1]),
+            swa_total=0,
+            launches=draft_launches,
         )
-        plans.append((draft_pack_launch, draft_launches))
+        plans.append(draft_plan)
     return tuple(plans)
 
 
 def compact(
-    plans: Tuple[Tuple[Tuple[int, tuple, dict], Tuple[tuple, ...]], ...],
+    plans: Tuple[Dict[str, object], ...],
     request_count: int,
 ) -> None:
     """Pack each plan's move sources and fire its native compacts, in plan order.
 
     Pure mover: the caller has already materialized its kept ordinals into the
     agreed decision rows for the active ``request_count`` cohort, and the
-    caller owns the completion ordering of the whole round.
+    caller owns the completion ordering of the whole round. Every launch
+    argument comes straight off the plan's init-built contract fields; the
+    round constructs no containers and runs no torch ops of its own.
     """
-    for (rows, pack_args, pack_kwargs), native_launches in plans:
-        _pack_move_sources_kernel[(request_count, rows)](*pack_args, **pack_kwargs)
-        for launch in native_launches:
-            torch.ops.trtllm.sparse_kv_cache_compact_layers(*launch)
+    for plan in plans:
+        _pack_move_sources_kernel[(request_count, plan["decision_rows"])](
+            plan["kept_ordinal_rows"],
+            plan["valid_seq_lens"],
+            plan["dense_move_offsets"],
+            plan["dense_move_indices"],
+            plan["swa_move_offsets"],
+            plan["swa_move_indices"],
+            KEEP_COUNT=plan["keep_count"],
+            DECISION_ROWS=plan["decision_rows"],
+            MOVE_CAPACITY=plan["move_capacity"],
+            NUM_KV_HEADS=plan["num_kv_heads"],
+            PER_LAYER=plan["per_layer_sources"],
+            DENSE_TOTAL=plan["dense_total"],
+            SWA_TOTAL=plan["swa_total"],
+            SWA_WINDOW=plan["swa_window"],
+        )
+        for launch in plan["launches"]:
+            torch.ops.trtllm.sparse_kv_cache_compact_layers(
+                launch["pools"],
+                launch["pool_pointers"],
+                launch["page_table"],
+                launch["move_indices"],
+                launch["move_offsets"],
+                launch["destination_bases"],
+                launch["source_layer_indices"],
+            )
