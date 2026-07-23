@@ -97,15 +97,12 @@ class DSATrtllmAttention(TrtllmAttention):
         """Run the DSA indexer and convert its local TopK to paged indices."""
         is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
         sparse_backend_args = forward_args.sparse_backend_args
+        phase_start = metadata.num_ctx_tokens if is_generation else 0
+        phase_end = (metadata.num_tokens
+                     if is_generation else metadata.num_ctx_tokens)
+        shared_topk_indices = metadata.shared_topk_indices
         if self.indexer is None:
-            shared_topk_indices = metadata.shared_topk_indices
-            assert shared_topk_indices is not None, (
-                "DSA shared layer has no top-k from a preceding full "
-                "indexer layer; check the index_topk_pattern/freq schedule.")
-            if is_generation:
-                topk_indices = shared_topk_indices[metadata.num_ctx_tokens:]
-            else:
-                topk_indices = shared_topk_indices[:metadata.num_ctx_tokens]
+            topk_indices = shared_topk_indices[phase_start:phase_end]
         else:
             indexer_intermediates = sparse_backend_args.indexer_intermediates
             topk_indices = self.indexer.forward_from_projected(
@@ -114,14 +111,11 @@ class DSATrtllmAttention(TrtllmAttention):
                 indexer_intermediates,
                 is_generation=is_generation,
             )
-            buffer = metadata.shared_topk_indices_buffer
-            if buffer is not None:
-                shared_topk_indices = buffer[:metadata.
-                                             num_tokens, :topk_indices.shape[1]]
-                metadata.shared_topk_indices = shared_topk_indices
-                start = metadata.num_ctx_tokens if is_generation else 0
-                shared_topk_indices[start:start +
-                                    topk_indices.shape[0]].copy_(topk_indices)
+            if shared_topk_indices is not None:
+                shared_topk_indices[
+                    phase_start:phase_start + topk_indices.shape[0],
+                    :topk_indices.shape[1],
+                ].copy_(topk_indices)
 
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
             topk_indices, metadata, self.get_local_layer_idx(metadata),
