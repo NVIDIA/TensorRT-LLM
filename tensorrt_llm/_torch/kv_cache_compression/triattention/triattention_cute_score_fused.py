@@ -123,6 +123,9 @@ class _TriAttentionScoreKernel:
         # Barrier tx bytes per phase: the full 128-token tile of one coefficient plane.
         self.raw_tma_copy_bytes = CTA_M * num_freqs * (cutlass.BFloat16.width // 8)
         self.raw_tma_pipeline_stages = 2 * RAW_PAGE_BUFFERS if write_partial_stats else 1
+        # Raw-K page buffers each specialization addresses: the fused union pipeline
+        # double-buffers across tiles; score-only reuses one buffer (stages 0/1) per tile.
+        self.raw_page_buffers = RAW_PAGE_BUFFERS if write_partial_stats else 1
         self.accumulator_pipeline_stages = 1
         self.producer_warp_id = 0
         self.physical_threads = THREADS
@@ -279,7 +282,7 @@ class _TriAttentionScoreKernel:
             raw_bf16_tiled_mma,
             (CTA_M, N, self.num_freqs),
             cutlass.BFloat16,
-            2 * RAW_PAGE_BUFFERS,
+            2 * self.raw_page_buffers,
         )
         raw_tma_smem_layout = cute.make_composed_layout(
             raw_bf16_direct_a_smem_layout.inner,
@@ -343,8 +346,8 @@ class _TriAttentionScoreKernel:
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_accumulator_slots))
         self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
 
-        # Two double-buffered raw-K stages (real+imag halves per page buffer).
-        raw_k_elements = CTA_M * 2 * self.num_freqs * RAW_PAGE_BUFFERS
+        # Real+imag bf16 stage pair per raw-page buffer (union double-buffers, score-only single).
+        raw_k_elements = CTA_M * 2 * self.num_freqs * self.raw_page_buffers
         raw_bf16_b_elements = cute.cosize(raw_bf16_b_smem_layout.outer)
         magnitude_fp16_a_elements = cute.cosize(magnitude_fp16_a_smem_layout.outer)
         magnitude_fp16_b_elements = cute.cosize(magnitude_fp16_b_smem_layout.outer)
@@ -504,8 +507,10 @@ class _TriAttentionScoreKernel:
         )
         cpasync_raw_k_real = cpasync_raw_k_0[(None, None, None, 0)]
         cpasync_raw_k_imag = cpasync_raw_k_0[(None, None, None, 1)]
-        cpasync_raw_k_real_next = cpasync_raw_k_0[(None, None, None, 2)]
-        cpasync_raw_k_imag_next = cpasync_raw_k_0[(None, None, None, 3)]
+        if cutlass.const_expr(self.write_partial_stats):
+            # The second raw-page buffer exists only in the fused union specialization.
+            cpasync_raw_k_real_next = cpasync_raw_k_0[(None, None, None, 2)]
+            cpasync_raw_k_imag_next = cpasync_raw_k_0[(None, None, None, 3)]
         # Use only the outer mapping for the TMA destination so the swizzle is not applied twice.
         raw_tma_source_tiles = cute.local_tile(
             raw_tma_source,
@@ -528,14 +533,15 @@ class _TriAttentionScoreKernel:
                 cpasync_raw_k_imag.iterator + fragment_offset,
                 raw_tma_smem_layout.outer,
             )
-            fragment_real_next = cute.make_tensor(
-                cpasync_raw_k_real_next.iterator + fragment_offset,
-                raw_tma_smem_layout.outer,
-            )
-            fragment_imag_next = cute.make_tensor(
-                cpasync_raw_k_imag_next.iterator + fragment_offset,
-                raw_tma_smem_layout.outer,
-            )
+            if cutlass.const_expr(self.write_partial_stats):
+                fragment_real_next = cute.make_tensor(
+                    cpasync_raw_k_real_next.iterator + fragment_offset,
+                    raw_tma_smem_layout.outer,
+                )
+                fragment_imag_next = cute.make_tensor(
+                    cpasync_raw_k_imag_next.iterator + fragment_offset,
+                    raw_tma_smem_layout.outer,
+                )
             partition_real, global_partition = cpasync.tma_partition(
                 raw_tma_atom,
                 0,
@@ -550,24 +556,26 @@ class _TriAttentionScoreKernel:
                 cute.group_modes(fragment_imag, 0, 2),
                 cute.group_modes(raw_tma_source_tiles, 0, 2),
             )
-            partition_real_next, _ = cpasync.tma_partition(
-                raw_tma_atom,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(fragment_real_next, 0, 2),
-                cute.group_modes(raw_tma_source_tiles, 0, 2),
-            )
-            partition_imag_next, _ = cpasync.tma_partition(
-                raw_tma_atom,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(fragment_imag_next, 0, 2),
-                cute.group_modes(raw_tma_source_tiles, 0, 2),
-            )
+            if cutlass.const_expr(self.write_partial_stats):
+                partition_real_next, _ = cpasync.tma_partition(
+                    raw_tma_atom,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(fragment_real_next, 0, 2),
+                    cute.group_modes(raw_tma_source_tiles, 0, 2),
+                )
+                partition_imag_next, _ = cpasync.tma_partition(
+                    raw_tma_atom,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(fragment_imag_next, 0, 2),
+                    cute.group_modes(raw_tma_source_tiles, 0, 2),
+                )
             raw_tma_shared_partition_real.append(partition_real)
             raw_tma_shared_partition_imag.append(partition_imag)
-            raw_tma_shared_partition_real_next.append(partition_real_next)
-            raw_tma_shared_partition_imag_next.append(partition_imag_next)
+            if cutlass.const_expr(self.write_partial_stats):
+                raw_tma_shared_partition_real_next.append(partition_real_next)
+                raw_tma_shared_partition_imag_next.append(partition_imag_next)
             raw_tma_global_partition = global_partition
         raw_tensormap_manager = utils.TensorMapManager(
             utils.TensorMapUpdateMode.GMEM,
