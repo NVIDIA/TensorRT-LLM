@@ -136,7 +136,7 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, FP4GemmType fp4GemmType,
     std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind,
     tkc::CutlassGemmConfig const* maybe_config = nullptr, c10::optional<torch::List<int64_t>> group = c10::nullopt,
-    std::optional<at::Tensor> const& bias = std::nullopt)
+    std::optional<at::Tensor> const& bias = std::nullopt, std::optional<at::Tensor> const& output = std::nullopt)
 {
     if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
     {
@@ -198,9 +198,33 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
     TORCH_CHECK(out_dtype == torch::kFloat || out_dtype == torch::kHalf || out_dtype == torch::kBFloat16,
         "out_dtype must be one of fp16/bf16/fp32. It defaults to fp16.");
 
-    std::vector<int64_t> out_shape = mat1.dim() == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
-    auto [out, _] = torch_ext::allocate_output(
-        out_shape, out_dtype.value(), mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
+    std::vector<int64_t> const outShape
+        = mat1.dim() == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
+    at::Tensor out;
+    if (output.has_value())
+    {
+        out = *output;
+        CHECK_TH_CUDA(out);
+        TORCH_CHECK(out.device() == mat1.device(), "output must reside on the same CUDA device as mat1");
+        TORCH_CHECK(out.is_contiguous(), "output must be contiguous");
+        if (mat1.dim() == 2)
+        {
+            TORCH_CHECK(out.dim() == 2 && out.size(0) >= m && out.size(1) == n, "output has shape ", out.sizes(),
+                "; expected at least [", m, ", ", n, "]");
+        }
+        else
+        {
+            TORCH_CHECK(out.sizes() == at::IntArrayRef(outShape), "output has shape ", out.sizes(), "; expected ",
+                outShape);
+        }
+        TORCH_CHECK(out.scalar_type() == out_dtype.value(), "output dtype must match out_dtype");
+    }
+    else
+    {
+        auto const allocated = torch_ext::allocate_output(
+            outShape, out_dtype.value(), mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
+        out = allocated.first;
+    }
 
     void const* bias_ptr = nullptr;
     if (bias.has_value())
@@ -309,6 +333,21 @@ public:
             output_buffer_kind, config, group, bias);
     }
 
+    // Run GEMM into caller-owned output storage.
+    void runGemmOut(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
+        at::Tensor const& mat2Scale, at::Tensor const& globalScale, at::Tensor const& output, int64_t configIdx,
+        std::optional<at::Tensor> const& bias = std::nullopt) const
+    {
+        tkc::CutlassGemmConfig const* config = nullptr;
+        if (configIdx != -1)
+        {
+            TORCH_CHECK(configIdx >= 0 && configIdx < getNumConfigs());
+            config = &mConfigs.at(configIdx);
+        }
+        fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, mfp4GemmType, mOutputDtype,
+            static_cast<int>(torch_ext::BufferKind::Default), config, c10::nullopt, bias, output);
+    }
+
     at::ScalarType getOutputDtype() const
     {
         return mOutputDtype;
@@ -334,6 +373,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<tensorrt_llm::torch_ext::FP4GemmRunner>("FP4GemmRunner")
         .def(torch::init<at::ScalarType, int64_t>())
         .def("run_gemm", &tensorrt_llm::torch_ext::FP4GemmRunner::runGemm)
+        .def("run_gemm_out", &tensorrt_llm::torch_ext::FP4GemmRunner::runGemmOut)
         .def("get_num_configs", &tensorrt_llm::torch_ext::FP4GemmRunner::getNumConfigs);
 
     m.def(
