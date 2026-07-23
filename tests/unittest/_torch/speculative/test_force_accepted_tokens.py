@@ -103,7 +103,7 @@ def test_get_force_num_accepted_tokens_float(env_value, expected):
     ],
 )
 def test_get_force_num_accepted_tokens_int_unchanged(env_value, expected):
-    """The int helper must keep its original behavior (used by 2-model)."""
+    """The int helper must keep its original integer-only behavior."""
     with patch.dict(os.environ, {FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR: env_value}):
         assert get_force_num_accepted_tokens() == expected
 
