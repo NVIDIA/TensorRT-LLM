@@ -476,7 +476,7 @@ def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch
         method.post_load_weights(DummyModule())
 
 
-def _make_megamoe_cutedsl_for_ctor_test():
+def _make_megamoe_cutedsl_for_ctor_test() -> MegaMoECuteDsl:
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
         moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
@@ -493,7 +493,9 @@ def _make_megamoe_cutedsl_for_ctor_test():
     )
 
 
-def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(monkeypatch):
+def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Profiling scratch is sized for the largest adaptive bucket.
     monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
     moe = _make_megamoe_cutedsl_for_ctor_test()
@@ -505,14 +507,16 @@ def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(monkeypatch):
     assert moe._select_launch_max_tokens(small_hint) == buckets[-1]
 
 
-def test_megamoe_cutedsl_tactic_autotune_defaults_off(monkeypatch):
+def test_megamoe_cutedsl_tactic_autotune_defaults_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Standard serving must not pay for the 36-tactic sweep by default.
     monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
     moe = _make_megamoe_cutedsl_for_ctor_test()
     assert moe.tactic_autotune is False
 
 
-def test_enumerate_megamoe_candidate_tactics_curated_space():
+def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
     from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)

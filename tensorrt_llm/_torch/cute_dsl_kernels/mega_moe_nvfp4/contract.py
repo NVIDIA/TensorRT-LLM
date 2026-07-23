@@ -398,7 +398,7 @@ class TensorWithContract:
     contract: Contract
 
 
-def eval_function_mapping(contract: Contract, **domain_coord):
+def eval_function_mapping(contract: Contract, **domain_coord) -> dict:
     """Evaluate a FunctionMapping contract at runtime."""
     if not isinstance(contract.mapping, FunctionMapping):
         raise TypeError("runtime contract eval requires a FunctionMapping")
