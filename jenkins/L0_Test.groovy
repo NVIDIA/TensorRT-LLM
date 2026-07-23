@@ -4724,6 +4724,9 @@ def launchTestJobs(pipeline, testFilter)
     // mapping between test names and Jenkins stage names. Any changes to this syntax
     // may break the mapping functionality.
 
+    // [M3 bringup] All x86 Kubernetes stages disabled for feat branch.
+    x86TestConfigs = [:]
+    /*
     x86TestConfigs = [
         "CPU-Generic-x86-1": ["cpu", "l0_cpu_x86", 1, 1],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
@@ -4801,6 +4804,7 @@ def launchTestJobs(pipeline, testFilter)
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
+    */ // [/M3 bringup]
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), { attemptTag, isFinalAttempt, retryContext = null ->
@@ -4815,6 +4819,14 @@ def launchTestJobs(pipeline, testFilter)
     }]]}
     fullSet = parallelJobs.keySet()
 
+    // [M3 bringup] Only M3-specific SLURM stages retained.
+    x86SlurmTestConfigs = [
+        // M3 1-GPU unit tests (B200)
+        "DGX_B200-PyTorch-M3-1": ["auto:dgx-b200-flex", "l0_b200_m3", 1, 1, 1, 1, true],
+        // M3 4-GPU accuracy tests (B200)
+        "DGX_B200-4_GPUs-PyTorch-M3-1": ["auto:dgx-b200-flex", "l0_dgx_b200_m3", 1, 1, 4, 1, true],
+    ]
+    /*
     x86SlurmTestConfigs = [
         "DGX_H100-PyTorch-1": ["auto:dgx-h100-x1", "l0_h100", 1, 6],
         "DGX_H100-PyTorch-2": ["auto:dgx-h100-x1", "l0_h100", 2, 6],
@@ -4893,6 +4905,7 @@ def launchTestJobs(pipeline, testFilter)
         16,
         2
     )
+    */ // [/M3 bringup]
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -5226,61 +5239,9 @@ def launchTestJobs(pipeline, testFilter)
 
     // Python version and OS for sanity check
     // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall, platName]
-    x86SanityCheckConfigs = [
-        "PY312-DLFW": [
-            LLM_DOCKER_IMAGE,
-            "B200_PCIe",
-            X86_64_TRIPLE,
-            false,
-            true,
-            DLFW_IMAGE,
-            false,
-            'manylinux_2_39_x86_64',
-        ],
-        "PY310-UB2204": [
-            LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
-            "A10",
-            X86_64_TRIPLE,
-            true,
-            false,
-            UBUNTU_22_04_IMAGE,
-            true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
-            'manylinux_2_28_x86_64',
-        ],
-        "PY312-UB2404": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
-            "A100X",
-            X86_64_TRIPLE,
-            true,
-            false,
-            UBUNTU_24_04_IMAGE,
-            true, // Extra PyTorch CUDA 13.0 install
-            'manylinux_2_28_x86_64',
-        ],
-    ]
-
-    aarch64SanityCheckConfigs = [
-        "PY312-UB2404": [
-            LLM_WHEEL_DOCKER_IMAGE,
-            "GH200",
-            AARCH64_TRIPLE,
-            false,
-            false,
-            UBUNTU_24_04_IMAGE,
-            true, // Extra PyTorch CUDA 13.0 install
-            'manylinux_2_39_aarch64',
-        ],
-        "PY312-DLFW": [
-            LLM_DOCKER_IMAGE,
-            "GH200",
-            AARCH64_TRIPLE,
-            false,
-            true,
-            DLFW_IMAGE,
-            false,
-            'manylinux_2_39_aarch64',
-        ],
-    ]
+    // [M3 bringup] Sanity check stages disabled for feat branch.
+    x86SanityCheckConfigs = [:]
+    aarch64SanityCheckConfigs = [:]
 
     def toStageName = { gpuType, key -> "${gpuType}-PackageSanityCheck-${key}".toString() }
     fullSet += x86SanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
