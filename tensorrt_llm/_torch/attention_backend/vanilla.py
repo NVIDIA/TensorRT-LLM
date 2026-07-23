@@ -146,7 +146,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         Invalid block IDs produce zeros without changing logical positions.
         """
         if num_tokens <= 0:
-            return kv_cache_tensor[block_ids[0], kv_idx, :0]
+            # Empty slice: content is irrelevant, but block_ids[0] may be
+            # BAD_PAGE_INDEX, so index the always-valid block 0.
+            return kv_cache_tensor[0, kv_idx, :0]
         chunks = []
         read = 0
         while read < num_tokens:
@@ -209,6 +211,11 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 blk = block_ids[pos // tokens_per_block]
                 off = pos % tokens_per_block
                 n = min(tokens_per_block - off, kv_len - written)
+                # New tokens must land in a live page; fail loudly rather than
+                # writing into the last page via negative indexing.
+                assert blk != BAD_PAGE_INDEX, (
+                    f"Writing new KV into an evicted/invalid page (pos {pos}); "
+                    "block_ids/metadata are inconsistent.")
                 dst = torch.arange(off, off + n, device=kv_cache_tensor.device)
                 kv_cache_tensor[blk, 0].view(dtype=access_type).index_copy_(
                     0, dst,
