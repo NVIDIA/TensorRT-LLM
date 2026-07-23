@@ -13,7 +13,6 @@ from unittest import mock
 import pytest
 import torch
 from conftest import build_compaction as _build_compaction
-from conftest import compaction_family as _compaction_family
 from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_buffer_stubs as _make_buffer_stubs
 from conftest import make_fake_v2 as _make_fake_v2
@@ -160,11 +159,11 @@ def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle(draft_protect
         expected_moves.append(draft_source.to(torch.int32))
         expected_offsets.append(expected_offsets[-1] + int(draft_source.numel()))
 
-    # Packed indices must match the same broadcast-plus-tail oracle.
-    draft_family = _compaction_family(built.compaction, "draft")
+    # Packed indices must match the same broadcast-plus-tail oracle: the
+    # test-owned draft offsets row and the contract's draft move sources.
     expected_row = torch.cat(expected_moves)
-    assert draft_family["offsets"].cpu().tolist() == expected_offsets
-    draft_indices = draft_family["source"]
+    assert built.compaction["draft_move_offsets"].cpu().tolist() == expected_offsets
+    draft_indices = built.compaction["draft_move_indices"]
     # Capacity-sized buffer; this round's moves pack at the front.
     capacity_total = built.request_count * (
         int(built.keep.shape[1]) + max(built.draft_protected_tails)
@@ -370,17 +369,20 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
         # bucket follows what the cohort actually presents (power-of-two,
         # 1024 floor) instead of pinning tens-of-GiB scratch to max_seq_len.
         assert resources is buffers
-        assert prepare.call_args.kwargs["eviction_mode"] == "union"
-        assert prepare.call_args.kwargs["max_requests"] == 8
-        assert prepare.call_args.kwargs["decode_width"] == 4 + 2 * 128
-        assert prepare.call_args.kwargs["seq_len"] == 1024
-        assert prepare.call_args.kwargs["page_table_token_capacity"] == 1024 + 1
-        assert prepare.call_args.kwargs["draft_page_table_token_capacity"] == 1024 + 1
+        kwargs = prepare.call_args.kwargs
+        assert kwargs["eviction_mode"] == "union"
+        assert kwargs["capacities"]["max_requests"] == 8
+        assert kwargs["capacities"]["decode_width"] == 4 + 2 * 128
+        assert kwargs["capacities"]["bucket_seq_len"] == 1024
+        assert kwargs["capacities"]["page_table_token_capacity"] == 1024 + 1
+        assert kwargs["draft"]["page_table_token_capacity"] == 1024 + 1
+        assert kwargs["draft"]["layout"] is manager._draft_runtime_kv_layout.return_value
         # Migrated from the pipeline buffer-kwargs test: the budget, the
         # shared phase-table dict, and the pool keys thread through unchanged.
-        assert prepare.call_args.kwargs["keep_count"] == manager.budget
-        assert prepare.call_args.kwargs["phase"] is manager._phase
-        assert prepare.call_args.kwargs["layer_pool_keys"] == list(layout["layer_pool_keys"])
+        assert kwargs["capacities"]["keep_count"] == manager.budget
+        assert kwargs["phase"] is manager._phase
+        assert kwargs["layout"] is layout
+        assert list(kwargs["layout"]["layer_pool_keys"]) == list(layout["layer_pool_keys"])
 
         # A second round with unchanged pools reuses the resident buffers
         # (and with them the compaction launch data they carry).

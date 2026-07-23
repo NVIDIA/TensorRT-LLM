@@ -27,6 +27,7 @@ import pytest
 import torch
 from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_bare_staging as _make_bare_staging
+from conftest import make_cute_buffers as _make_cute_buffers
 from conftest import make_fake_v2 as _make_fake_v2
 from conftest import make_request as _make_request
 from conftest import make_staging_manager as _make_staging_manager
@@ -814,28 +815,22 @@ class TestFixedScoreMetadata:
         round_starts = round_device[:request_count].tolist()
         seq_lens = [seq_len - request % 2 for request in range(request_count)]
         layer_order = list(range(num_layers))
-        bufs = module.init_eviction_buffers(
+        bufs = _make_cute_buffers(
             eviction_mode="per_head",
             layer_pools=pools,
-            dense_groups=[[layer] for layer in layer_order],
-            dense_layers=layer_order,
-            page_representatives=layer_order,
             max_requests=max_requests,
             seq_len=seq_len,
             num_q_heads=num_q_heads,
-            num_freqs=num_freqs,
-            keep_count=4,
             q_real=q_real,
             q_imag=q_imag,
             mlr_coef=mlr,
             freq_scale_sq=freq,
-            offsets=offsets,
             omega=omega,
+            offsets=offsets,
             decode_width=seq_len - prompt_len,
-            page_table_keys=[("pool", layer) for layer in layer_order],
-            num_page_table_slots=num_layers,
-            page_table_token_capacity=seq_len,
-            layer_group_representative={layer: layer for layer in layer_order},
+            keep_count=4,
+            # One storage group and page-table slot per layer (distinct pools).
+            storage_groups={("pool", layer): [layer] for layer in layer_order},
             layer_pool_keys=[("pool", layer) for layer in layer_order],
         )
         valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
@@ -849,11 +844,12 @@ class TestFixedScoreMetadata:
             )
 
         score_sentinel = -12345.0
-        # Empty prebound launch args: the compact stage is a no-op.
-        bufs.compact_launch_args = ()
         stage_round()
         bufs.score_output.fill_(score_sentinel)
-        module.run_eviction_round(bufs, normalize_scores=False)
+        # The compact stage is stubbed to a no-op: this test owns the score
+        # buffers only, never a staged move decision.
+        with mock.patch.object(module, "compact"):
+            module.run_eviction_round(bufs, normalize_scores=False)
         fixed = bufs.score_output.clone()
         assert bufs.valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
 
@@ -892,7 +888,8 @@ class TestFixedScoreMetadata:
         stage_round()
         bufs.score_output.fill_(score_sentinel)
         bufs.valid_widths.fill_(-1)
-        module.run_eviction_round(bufs, normalize_scores=False)
+        with mock.patch.object(module, "compact"):
+            module.run_eviction_round(bufs, normalize_scores=False)
         second_launch = bufs.score_output.clone()
         assert torch.equal(bufs.valid_widths, expected_second_widths)
         assert not torch.equal(second_launch, fixed)

@@ -37,14 +37,6 @@ def encode_block_offsets(page_ids: torch.Tensor) -> torch.Tensor:
     return encoded
 
 
-def compaction_family(compaction, name):
-    """Return one cache family dict ("dense", "swa", or "draft") or None."""
-    for family in compaction["families"]:
-        if family["name"] == name:
-            return family
-    return None
-
-
 def _write_move_offsets(compaction, offsets, moves_per_request):
     cumulative = [0]
     for count in moves_per_request:
@@ -55,25 +47,23 @@ def _write_move_offsets(compaction, offsets, moves_per_request):
 
 
 def set_protected_tails(compaction, tail_lengths, draft_tail_lengths=None):
-    """Load per-request protected tails into the staged move offsets."""
+    """Load per-request protected tails into the caller-owned move offsets."""
     if len(tail_lengths) > compaction["request_count"]:
         raise ValueError("the cohort exceeds the compaction request capacity")
     if any(tail < 0 or tail > compaction["protected_tail_capacity"] for tail in tail_lengths):
         raise ValueError("a protected tail exceeds the configured capacity")
     _write_move_offsets(
         compaction,
-        compaction_family(compaction, "dense")["offsets"],
+        compaction["dense_move_offsets"],
         [compaction["decode_keep_count"] + int(tail) for tail in tail_lengths],
     )
-    swa_family = compaction_family(compaction, "swa")
-    if swa_family is not None:
+    if compaction["has_swa"]:
         _write_move_offsets(
             compaction,
-            swa_family["offsets"],
+            compaction["swa_move_offsets"],
             [compaction["swa_window"] + int(tail) for tail in tail_lengths],
         )
-    draft_family = compaction_family(compaction, "draft")
-    if draft_family is not None:
+    if compaction["has_draft"]:
         if draft_tail_lengths is None:
             draft_tail_lengths = [0] * len(tail_lengths)
         if len(draft_tail_lengths) != len(tail_lengths):
@@ -85,7 +75,7 @@ def set_protected_tails(compaction, tail_lengths, draft_tail_lengths=None):
             raise ValueError("a draft protected tail exceeds the configured capacity")
         _write_move_offsets(
             compaction,
-            draft_family["offsets"],
+            compaction["draft_move_offsets"],
             [compaction["decode_keep_count"] + int(tail) for tail in draft_tail_lengths],
         )
 
@@ -124,8 +114,9 @@ def make_ramp_pools(
 
 def build_compaction(**overrides):
     """``init_compaction_buffers`` with the suite's 2-layer defaults:
-    translates ``eviction_mode``, allocates the caller-owned offset rows
-    (capacity cumsum), and mirrors geometry inputs onto the bundle."""
+    translates ``eviction_mode`` into ``per_layer_sources``, allocates the
+    caller-owned move-offset rows (capacity cumsum), and mirrors the
+    decision inputs onto the returned contract."""
     from tensorrt_llm._torch.kv_cache_compression.compaction import init_compaction_buffers
 
     args = dict(
@@ -148,6 +139,7 @@ def build_compaction(**overrides):
     keep_count = args["decode_keep_count"]
     tail = int(args.get("protected_tail_capacity", 0))
     draft_tail = int(args.get("draft_protected_tail_capacity") or 0)
+    has_draft = bool(args.get("draft_layers"))
     device = args["layer_pools"][args["dense_layers"][0]].device
     swa_window = int(args["swa_window"] or 0) if args["swa_layers"] else 0
 
@@ -155,23 +147,62 @@ def build_compaction(**overrides):
         return torch.arange(0, (request_count + 1) * count, count, dtype=torch.int32, device=device)
 
     args.setdefault("dense_move_offsets", capacity_offsets(keep_count + tail))
-    if args["swa_layers"]:
-        args.setdefault("swa_move_offsets", capacity_offsets(swa_window + tail))
-    if args.get("draft_layers"):
+    args.setdefault(
+        "swa_move_offsets", capacity_offsets(swa_window + tail) if args["swa_layers"] else None
+    )
+    if has_draft:
         args.setdefault("draft_move_offsets", capacity_offsets(keep_count + draft_tail))
     num_kv_heads = int(args["layer_pools"][args["dense_layers"][0]].shape[2])
-    compaction = init_compaction_buffers(union=union, per_layer=per_layer, **args)
+    draft = None
+    if has_draft:
+        draft = dict(
+            layer_pools=args["draft_layer_pools"],
+            layers=args["draft_layers"],
+            layer_group_representative=args["draft_layer_group_representative"],
+            layer_pool_keys=args["draft_layer_pool_keys"],
+            kv_block_offsets=args["draft_kv_block_offsets"],
+            page_table_slots=args["draft_page_table_slots"],
+            move_offsets=args["draft_move_offsets"],
+            protected_tail_capacity=draft_tail,
+        )
+    compaction = init_compaction_buffers(
+        target=dict(
+            layer_pools=args["layer_pools"],
+            dense_layers=args["dense_layers"],
+            swa_layers=args["swa_layers"],
+            swa_window=args["swa_window"],
+            layer_group_representative=args["layer_group_representative"],
+            layer_pool_keys=args["layer_pool_keys"],
+            kv_block_offsets=args["kv_block_offsets"],
+            page_table_slots=args["page_table_slots"],
+            prompt_offsets=args["prompt_offsets"],
+            dense_move_offsets=args["dense_move_offsets"],
+            swa_move_offsets=args["swa_move_offsets"],
+            per_layer_sources=per_layer,
+        ),
+        capacities=dict(
+            request_capacity=request_count,
+            decode_keep_count=keep_count,
+            protected_tail_capacity=tail,
+        ),
+        draft=draft,
+    )
     # Test-side mirror of the construction inputs: production reads only the
-    # launch fields; the standalone helpers here need the geometry back.
+    # contract's public keys; the standalone helpers here need the decision
+    # inputs and the caller-owned move-offset rows back.
     compaction.update(
+        union=union,
+        per_layer=per_layer,
         kept_token_ordinals=kept,
         valid_sequence_lengths=args["valid_sequence_lengths"],
         prompt_offsets=args["prompt_offsets"],
         request_count=request_count,
         decode_keep_count=keep_count,
         protected_tail_capacity=tail,
-        draft_protected_tail_capacity=draft_tail if args.get("draft_layers") else 0,
-        swa_window=swa_window,
+        draft_protected_tail_capacity=draft_tail if has_draft else 0,
+        dense_move_offsets=args["dense_move_offsets"],
+        swa_move_offsets=args["swa_move_offsets"],
+        draft_move_offsets=args["draft_move_offsets"] if has_draft else None,
         selection_rows=(
             1
             if union
@@ -182,26 +213,27 @@ def build_compaction(**overrides):
 
 
 def launch_family_pack(compaction, name):
-    """Standalone HAS_SETTLE=False pack for one family so the C++ moves
-    read initialized indices (settle-side pointers are compiled away)."""
+    """Standalone HAS_SETTLE=False pack for one family ("dense" or "draft")
+    so the C++ moves read initialized indices (settle-side pointers are
+    compiled away); the dense launch also packs the SWA rows when present."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
         SETTLE_PACK_BLOCK,
         SETTLE_PACK_NUM_WARPS,
         _settle_ties_and_pack_compaction_sources_kernel,
     )
 
-    family = compaction_family(compaction, name)
     kept = compaction["kept_token_ordinals"]
     valid = compaction["valid_sequence_lengths"]
     keep_count = compaction["decode_keep_count"]
     if name == "draft":
-        draft = compaction["draft_pack"]
+        indices = compaction["draft_move_indices"]
+        offsets = compaction["draft_move_offsets"]
         rows = 1
         shape = dict(
-            DENSE_TOTAL=draft["dense_total"],
+            DENSE_TOTAL=int(indices.shape[-1]),
             SWA_TOTAL=0,
-            MOVE_CAPACITY=draft["move_capacity"],
-            NUM_KV_HEADS=draft["num_kv_heads"],
+            MOVE_CAPACITY=int(indices.shape[-1]) // compaction["request_count"],
+            NUM_KV_HEADS=int(indices.shape[0]),
             SWA_WINDOW=0,
             UNION=True,
             PER_LAYER=False,
@@ -209,11 +241,21 @@ def launch_family_pack(compaction, name):
         )
         swa_offsets, swa_indices = None, None
     else:
+        indices = compaction["dense_move_indices"]
+        offsets = compaction["dense_move_offsets"]
         rows = compaction["selection_rows"]
-        shape = compaction["settle_pack_shape"]
-        swa_family = compaction_family(compaction, "swa")
-        swa_offsets = swa_family["offsets"] if swa_family else None
-        swa_indices = swa_family["source"] if swa_family else None
+        shape = dict(
+            DENSE_TOTAL=compaction["dense_total"],
+            SWA_TOTAL=compaction["swa_total"],
+            MOVE_CAPACITY=compaction["move_capacity"],
+            NUM_KV_HEADS=compaction["num_kv_heads"],
+            SWA_WINDOW=compaction["swa_window"],
+            UNION=compaction["union"],
+            PER_LAYER=compaction["per_layer"],
+            HAS_SWA=compaction["has_swa"],
+        )
+        swa_offsets = compaction["swa_move_offsets"] if compaction["has_swa"] else None
+        swa_indices = compaction["swa_move_indices"]
     _settle_ties_and_pack_compaction_sources_kernel[(compaction["request_count"], rows)](
         None,
         None,
@@ -221,8 +263,8 @@ def launch_family_pack(compaction, name):
         None,
         kept,
         valid,
-        family["offsets"],
-        family["source"],
+        offsets,
+        indices,
         swa_offsets,
         swa_indices,
         WIDTH=keep_count,
@@ -236,26 +278,22 @@ def launch_family_pack(compaction, name):
 
 
 def run_compaction(compaction, pack=("dense", "draft")):
-    """Replica of the round's compact stage: packs, SWA rebase, C++ moves."""
+    """Replica of the round's decision-plus-move stage in production order:
+    target pack, draft broadcast pack, SWA destination rebase, then
+    ``compact`` fires the native target and draft moves."""
+    from tensorrt_llm._torch.kv_cache_compression.compaction import compact
+
+    if "dense" in pack:
+        launch_family_pack(compaction, "dense")
+    if "draft" in pack and compaction["has_draft"]:
+        launch_family_pack(compaction, "draft")
     if compaction["swa_destination_bases"] is not None:
         torch.add(
             compaction["prompt_offsets"],
             compaction["swa_rebase_delta"],
             out=compaction["swa_destination_bases"],
         )
-    for family in compaction["families"]:
-        if family["name"] in pack and family["name"] != "swa":
-            launch_family_pack(compaction, family["name"])
-        for group in family["groups"]:
-            torch.ops.trtllm.sparse_kv_cache_compact_layers(
-                group["pools"],
-                group["pool_pointers"],
-                group["page_table"],
-                family["source"],
-                family["offsets"],
-                family["destination_bases"],
-                group["source_layer_indices"],
-            )
+    compact(compaction, compaction["request_count"])
 
 
 def make_bare_staging(device, *, max_requests, copy_block_count, page_count=None):
@@ -466,6 +504,25 @@ def torch_tri_score_oracle(
     return scores
 
 
+def make_phase_table(offsets, omega, initial_rows):
+    """Build the mean-phase table dict exactly like the product's inlined
+    form and grow it to cover positions ``[0, initial_rows)``."""
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+        grow_mean_phase_table,
+    )
+
+    phase = {
+        "offsets": offsets.contiguous(),
+        "omega": omega.to(dtype=torch.float32).contiguous(),
+        "offset_values": offsets.tolist(),
+        "cos": None,
+        "sin": None,
+        "rows": 0,
+    }
+    grow_mean_phase_table(phase, max(int(initial_rows), 1))
+    return phase
+
+
 def make_cute_buffers(
     *,
     eviction_mode,
@@ -480,41 +537,62 @@ def make_cute_buffers(
     omega,
     offsets,
     decode_width=None,
+    keep_count=1,
+    page_table_token_capacity=None,
+    protected_tail_capacity=0,
+    storage_groups=None,
+    layer_pool_keys=None,
 ):
-    """Real eviction buffers over one shared page-table slot; split
-    reference legs use ``eviction_mode="per_head"`` over the same pools."""
+    """Real eviction buffers over the one-shared-slot default layout; split
+    reference legs use ``eviction_mode="per_head"`` over the same pools.
+    ``storage_groups``/``layer_pool_keys`` override the page-table grouping
+    (keys are ``(name, slot)`` tuples; the slot is ``key[1]``)."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
         init_eviction_buffers,
     )
 
     num_layers = len(layer_pools)
+    assert int(q_real.shape[1]) == num_q_heads
     # The constructor takes every capacity explicitly (no test-only
     # None-derive path); the widest window defaults keep old call sites.
     if decode_width is None:
         decode_width = seq_len
+    if storage_groups is None:
+        storage_groups = {("pool", 0): list(range(num_layers))}
+    if layer_pool_keys is None:
+        layer_pool_keys = [("pool", 0)] * num_layers
+    layout = dict(
+        manager=SimpleNamespace(num_pools=max(key[1] for key in layer_pool_keys) + 1),
+        layer_pools=layer_pools,
+        dense_layers=list(range(num_layers)),
+        swa_layers=[],
+        swa_window=None,
+        storage_groups=storage_groups,
+        layer_group_representative={
+            layer: layers[0] for layers in storage_groups.values() for layer in layers
+        },
+        layer_pool_keys=layer_pool_keys,
+    )
     return init_eviction_buffers(
         eviction_mode=eviction_mode,
-        layer_pools=layer_pools,
-        dense_groups=[list(range(num_layers))],
-        dense_layers=list(range(num_layers)),
-        page_representatives=[0],
-        max_requests=max_requests,
-        seq_len=seq_len,
-        num_q_heads=num_q_heads,
-        num_freqs=int(q_real.shape[-1]),
-        keep_count=1,
-        q_real=q_real,
-        q_imag=q_imag,
-        mlr_coef=mlr_coef,
-        freq_scale_sq=freq_scale_sq,
-        offsets=offsets,
-        omega=omega,
-        decode_width=decode_width,
-        page_table_keys=[("pool", 0)],
-        num_page_table_slots=1,
-        page_table_token_capacity=seq_len,
-        layer_group_representative={layer: 0 for layer in range(num_layers)},
-        layer_pool_keys=[("pool", 0)] * num_layers,
+        layout=layout,
+        calibration=dict(
+            q_real=q_real,
+            q_imag=q_imag,
+            mlr_coef=mlr_coef,
+            freq_scale_sq=freq_scale_sq,
+        ),
+        phase=make_phase_table(offsets, omega, seq_len),
+        capacities=dict(
+            max_requests=max_requests,
+            bucket_seq_len=seq_len,
+            decode_width=decode_width,
+            page_table_token_capacity=(
+                seq_len if page_table_token_capacity is None else page_table_token_capacity
+            ),
+            keep_count=keep_count,
+            protected_tail_capacity=protected_tail_capacity,
+        ),
     )
 
 

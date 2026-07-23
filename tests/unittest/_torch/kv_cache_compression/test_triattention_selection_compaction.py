@@ -8,12 +8,15 @@ import pytest
 import torch
 from conftest import build_compaction as _build_compaction
 from conftest import encode_block_offsets as _encode_block_offsets
+from conftest import make_cute_buffers as _make_cute_buffers
 from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import run_compaction as _run_compaction
 from conftest import set_protected_tails as _set_protected_tails
 
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import settle_top_tokens
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+    SETTLE_PACK_BLOCK,
+    SETTLE_PACK_NUM_WARPS,
     prepare_per_head_scores,
 )
 
@@ -103,27 +106,41 @@ def _make_selection_buffers(
         bufs.keep_rows = bufs.keep.view(-1, keep_count)
     bufs.settle_grid = (max_requests, bufs.selection_rows_per_request)
     # The settle launch always packs now; zero per-request move counts mask
-    # every pack store off, so these buffers stay selection-only.
+    # every pack store off, so these buffers stay selection-only. The launch
+    # args mirror the product's ``bufs.settle_args``/``bufs.settle_kwargs``
+    # order and keys exactly (swa pointers are None without SWA layers).
     zero_offsets = torch.zeros(max_requests + 1, dtype=torch.int32, device=device)
     zero_lengths = torch.zeros(max_requests, dtype=torch.int32, device=device)
     zero_indices = torch.zeros(1, dtype=torch.int32, device=device)
-    bufs.settle_pack_tensors = (
+    bufs.settle_args = (
+        bufs.selection_scores_rows,
+        bufs.selection_row_lengths,
+        bufs.row_prompt_offsets,
+        bufs.provisional_rows,
+        bufs.keep_rows,
         zero_lengths,
         zero_offsets,
         zero_indices,
-        zero_offsets,
-        zero_indices,
+        None,
+        None,
     )
-    bufs.settle_pack_shape = dict(
+    bufs.settle_kwargs = dict(
+        WIDTH=width,
+        KEEP_COUNT=keep_count,
+        SELECTION_ROWS=bufs.selection_rows_per_request,
         DENSE_TOTAL=0,
         SWA_TOTAL=0,
         MOVE_CAPACITY=keep_count,
         NUM_KV_HEADS=1,
         SWA_WINDOW=0,
-        UNION=False,
-        PER_LAYER=False,
+        UNION=eviction_mode == "union",
+        PER_LAYER=eviction_mode == "per_layer_perhead",
         HAS_SWA=False,
+        HAS_SETTLE=True,
+        BLOCK=SETTLE_PACK_BLOCK,
+        num_warps=SETTLE_PACK_NUM_WARPS,
     )
+    bufs.draft_pack_launch = None
     return bufs
 
 
@@ -449,8 +466,6 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     """Keep score and compaction layer axes aligned across interleaved V2 pools."""
     pytest.importorskip("cutlass")
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        attach_compaction_bundle,
-        init_eviction_buffers,
         run_eviction_round,
     )
 
@@ -468,9 +483,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     tokens_per_block = 32
     head_dim = 64
     num_freqs = head_dim // 2
-    dense_layers = [0, 1, 2]
     dense_groups = [[0, 2], [1]]
-    layer_group_representative = {0: 0, 1: 1, 2: 0}
     page_tables = (
         torch.tensor([[1, 0]], dtype=torch.int32, device=device),
         torch.tensor([[0, 1]], dtype=torch.int32, device=device),
@@ -498,55 +511,38 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     mlr_coef[:, :, 0] = 1
     freq_scale_sq = torch.zeros(num_freqs, dtype=torch.float32, device=device)
     freq_scale_sq[0] = 1
-    bufs = init_eviction_buffers(
+    bufs = _make_cute_buffers(
         eviction_mode="per_layer_perhead",
         layer_pools=pools,
-        dense_groups=dense_groups,
-        dense_layers=dense_layers,
-        page_representatives=[0, 1],
         max_requests=1,
         seq_len=bucket_capacity,
         num_q_heads=num_q_heads,
-        num_freqs=num_freqs,
-        keep_count=keep_count,
         q_real=q_real,
         q_imag=q_imag,
         mlr_coef=mlr_coef,
         freq_scale_sq=freq_scale_sq,
-        offsets=torch.zeros(1, dtype=torch.float32, device=device),
         omega=torch.zeros(num_freqs, dtype=torch.float32, device=device),
+        offsets=torch.zeros(1, dtype=torch.float32, device=device),
         decode_width=bucket_capacity,
-        page_table_keys=[("pool", 0), ("pool", 1)],
-        num_page_table_slots=2,
-        page_table_token_capacity=bucket_capacity,
-        layer_group_representative=layer_group_representative,
+        keep_count=keep_count,
+        storage_groups={
+            ("pool", 0): dense_groups[0],
+            ("pool", 1): dense_groups[1],
+        },
         layer_pool_keys=[("pool", 0), ("pool", 1), ("pool", 0)],
     )
+    assert bufs.compaction["has_swa"] is False
     bufs.block_offsets_device.zero_()
     bufs.block_offsets_device[..., :2].copy_(_encode_block_offsets(torch.stack(page_tables)))
     bufs.round_starts_device.fill_(0)
     bufs.valid_seq_lens_device.fill_(seq_len)
     bufs.token_starts_device.fill_(0)
-
-    # Replace the constructor-built bundle wholesale; the settle launch
-    # packs this bundle's construction-time move offsets.
-    compaction = _build_compaction(
-        eviction_mode="per_layer_perhead",
-        layer_pools=pools,
-        dense_layers=dense_layers,
-        layer_group_representative=layer_group_representative,
-        layer_pool_keys=[("pool", 0), ("pool", 1), ("pool", 0)],
-        kept_token_ordinals=bufs.keep[:1],
-        valid_sequence_lengths=bufs.valid_seq_lens_device[:1],
-        kv_block_offsets=bufs.block_offsets_device,
-        page_table_slots=bufs.representative_slots,
-        request_count=1,
-        prompt_offsets=torch.zeros(1, dtype=torch.int32, device=device),
-        decode_keep_count=keep_count,
-        protected_tail_capacity=0,
+    # Stage this round's move offsets into the buffers' OWN metadata row:
+    # the fused settle launch and the native moves consume the buffers'
+    # own contract (keep_count moves per request, no protected tail).
+    bufs.request_metadata_device[3, :2].copy_(
+        torch.tensor([0, keep_count], dtype=torch.int32, device=device)
     )
-    _set_protected_tails(compaction, [0])
-    attach_compaction_bundle(bufs, compaction)
     run_eviction_round(bufs, normalize_scores=False)
     assert torch.equal(bufs.keep, expected_keep)
     torch.cuda.synchronize(device)
@@ -572,7 +568,6 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
     import tensorrt_llm
     import tensorrt_llm.bindings
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        init_eviction_buffers,
         mark_page_tables_consumed,
         run_eviction_round,
         stage_eviction_cohort,
@@ -678,28 +673,20 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
         mlr_coef[..., 0] = 1
         freq_scale_sq = torch.zeros(num_freqs, dtype=torch.float32, device=device)
         freq_scale_sq[0] = 1
-        bufs = init_eviction_buffers(
+        bufs = _make_cute_buffers(
             eviction_mode="union",
             layer_pools=[pool],
-            dense_groups=[[0]],
-            dense_layers=[0],
-            layer_group_representative={0: 0},
-            layer_pool_keys=[("pool", 0)],
-            page_representatives=[0],
             max_requests=1,
             seq_len=seq_len,
             num_q_heads=num_q_heads,
-            num_freqs=num_freqs,
-            keep_count=keep_count,
             q_real=q_real,
             q_imag=q_imag,
             mlr_coef=mlr_coef,
             freq_scale_sq=freq_scale_sq,
-            offsets=torch.zeros(1, dtype=torch.float32, device=device),
             omega=torch.zeros(num_freqs, dtype=torch.float32, device=device),
-            page_table_keys=[("pool", 0)],
-            num_page_table_slots=1,
+            offsets=torch.zeros(1, dtype=torch.float32, device=device),
             decode_width=seq_len - prompt_len,
+            keep_count=keep_count,
             page_table_token_capacity=seq_len + protected_tail,
             protected_tail_capacity=protected_tail,
         )

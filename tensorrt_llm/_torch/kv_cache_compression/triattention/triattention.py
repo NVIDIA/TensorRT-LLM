@@ -39,7 +39,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
-from ..compaction import init_compaction_buffers
+from ..compaction import compact, init_compaction_buffers
 from .triattention_kernels import (
     SETTLE_PACK_BLOCK,
     SETTLE_PACK_NUM_WARPS,
@@ -96,129 +96,52 @@ def _allocate_page_table_plane(
     return representative_slots, copy_block_count, host, dev
 
 
-def attach_compaction_bundle(bufs: SimpleNamespace, compaction: Dict[str, object]) -> None:
-    """Flatten one compaction bundle into the prebound launch fields the round fires."""
-    bufs.compaction_families = compaction["families"]
-    bufs.settle_pack_tensors = compaction["settle_pack_tensors"]
-    bufs.settle_pack_shape = compaction["settle_pack_shape"]
-    bufs.draft_pack = compaction["draft_pack"]
-    bufs.swa_destination_bases = compaction["swa_destination_bases"]
-    bufs.swa_rebase_delta = compaction["swa_rebase_delta"]
-
-    def group_args(family):
-        return tuple(
-            (
-                group["pools"],
-                group["pool_pointers"],
-                group["page_table"],
-                family["source"],
-                family["offsets"],
-                family["destination_bases"],
-                group["source_layer_indices"],
-            )
-            for group in family["groups"]
-        )
-
-    target_args: List[tuple] = []
-    draft_args: Tuple[tuple, ...] = ()
-    for family in compaction["families"]:
-        if family["name"] == "draft":
-            # Kept separate: the draft pack launch must precede the draft moves.
-            draft_args = group_args(family)
-        else:
-            target_args.extend(group_args(family))
-    bufs.compact_launch_args = tuple(target_args)
-    bufs.draft_compact_launch_args = draft_args
-    draft_pack = compaction["draft_pack"]
-    if draft_pack is None:
-        bufs.draft_pack_args = None
-        bufs.draft_pack_kwargs = None
-        return
-    # Pack-only launch (HAS_SETTLE=False): settle-side pointers are None.
-    bufs.draft_pack_args = (
-        None,
-        None,
-        None,
-        None,
-        bufs.keep,
-        bufs.valid_seq_lens_device,
-        draft_pack["offsets"],
-        draft_pack["indices"],
-        None,
-        None,
-    )
-    bufs.draft_pack_kwargs = dict(
-        WIDTH=bufs.keep_count,
-        KEEP_COUNT=bufs.keep_count,
-        SELECTION_ROWS=1,
-        DENSE_TOTAL=draft_pack["dense_total"],
-        SWA_TOTAL=0,
-        MOVE_CAPACITY=draft_pack["move_capacity"],
-        NUM_KV_HEADS=draft_pack["num_kv_heads"],
-        SWA_WINDOW=0,
-        UNION=True,
-        PER_LAYER=False,
-        HAS_SWA=False,
-        HAS_SETTLE=False,
-        BLOCK=SETTLE_PACK_BLOCK,
-        num_warps=SETTLE_PACK_NUM_WARPS,
-    )
-
-
 def init_eviction_buffers(
     *,
     eviction_mode: str,
-    layer_pools: List[torch.Tensor],
-    dense_groups: List[List[int]],
-    dense_layers: List[int],
-    swa_layers: Sequence[int] = (),
-    swa_window: Optional[int] = None,
-    layer_group_representative: Optional[Dict[int, int]] = None,
-    layer_pool_keys: Optional[List[object]] = None,
-    page_representatives: List[int],
-    max_requests: int,
-    seq_len: int,
-    num_q_heads: int,
-    num_freqs: int,
-    keep_count: int,
-    q_real: torch.Tensor,
-    q_imag: torch.Tensor,
-    mlr_coef: torch.Tensor,
-    freq_scale_sq: torch.Tensor,
-    offsets: torch.Tensor,
-    omega: torch.Tensor,
-    phase: Optional[Dict[str, object]] = None,
-    page_table_keys: List[object],
-    num_page_table_slots: int,
-    decode_width: int,
-    page_table_token_capacity: int,
-    protected_tail_capacity: int = 0,
-    draft_layer_pools: Optional[List[torch.Tensor]] = None,
-    draft_layers: Optional[List[int]] = None,
-    draft_layer_group_representative: Optional[Dict[int, int]] = None,
-    draft_layer_pool_keys: Optional[List[object]] = None,
-    draft_page_representatives: Optional[List[int]] = None,
-    draft_page_table_keys: Optional[List[object]] = None,
-    draft_num_page_table_slots: Optional[int] = None,
-    draft_page_table_token_capacity: Optional[int] = None,
-    draft_protected_tail_capacity: int = 0,
+    layout: Dict[str, object],
+    calibration: Dict[str, torch.Tensor],
+    phase: Dict[str, object],
+    capacities: Dict[str, int],
+    draft: Optional[Dict[str, object]] = None,
 ) -> SimpleNamespace:
     """Build the one namespace of buffers, compiled launches, and compaction data
-    (the compiled kernels capture raw pool addresses: scored pools must stay alive and stay put)."""
+    (the compiled kernels capture raw pool addresses: scored pools must stay alive and stay put).
+
+    ``layout`` is the runtime KV layout dict, passed whole; ``calibration``
+    carries the local q_real/q_imag/mlr_coef [L, H, F] slices and
+    freq_scale_sq; ``draft`` is one all-or-none resolved branch (its layout
+    dict plus tail/page-table capacities); ``capacities`` the capacity numbers.
+    """
     from .triattention_cute_score_fused import N as PADDED_HEAD_COLUMNS
     from .triattention_cute_score_fused import TriAttentionCuteScoreRunner
 
-    device = layer_pools[page_representatives[0]].device
-    max_requests = int(max_requests)
-    seq_len = int(seq_len)
-    page_table_token_capacity = int(page_table_token_capacity)
-    decode_width = int(decode_width)
-    keep_count = int(keep_count)
+    layer_pools = layout["layer_pools"]
+    dense_layers = list(layout["dense_layers"])
+    swa_layers = list(layout["swa_layers"])
+    swa_window = layout["swa_window"]
+    layer_group_representative = layout["layer_group_representative"]
+    layer_pool_keys = list(layout["layer_pool_keys"])
+    dense_groups = list(layout["storage_groups"].values())
+    page_representatives = [group[0] for group in dense_groups]
+    page_representatives.extend(layer for layer in swa_layers if layer not in page_representatives)
+    page_table_keys = [layer_pool_keys[layer] for layer in page_representatives]
+    num_page_table_slots = int(layout["manager"].num_pools)
 
-    q_real, q_imag, mlr_coef, freq_scale_sq, offsets, omega = (
-        tensor.to(device=device, dtype=torch.float32).contiguous()
-        for tensor in (q_real, q_imag, mlr_coef, freq_scale_sq, offsets, omega)
+    device = layer_pools[page_representatives[0]].device
+    max_requests = int(capacities["max_requests"])
+    seq_len = int(capacities["bucket_seq_len"])
+    page_table_token_capacity = int(capacities["page_table_token_capacity"])
+    decode_width = int(capacities["decode_width"])
+    keep_count = int(capacities["keep_count"])
+    protected_tail_capacity = int(capacities["protected_tail_capacity"])
+
+    q_real, q_imag, mlr_coef, freq_scale_sq = (
+        calibration[key].to(device=device, dtype=torch.float32).contiguous()
+        for key in ("q_real", "q_imag", "mlr_coef", "freq_scale_sq")
     )
+    num_q_heads = int(q_real.shape[1])
+    num_freqs = int(q_real.shape[2])
 
     bufs = SimpleNamespace()
     bufs.eviction_mode = eviction_mode
@@ -249,18 +172,20 @@ def init_eviction_buffers(
     bufs._draft_bulk_offsets_src = None
     bufs.draft_copy_block_count = 0
     draft_page_slots: Dict[int, int] = {}
-    if draft_layer_pools is not None:
+    if draft is not None:
+        draft_layout = draft["layout"]
+        draft_representatives = list(draft_layout["pool_representatives"])
         (
             draft_page_slots,
             bufs.draft_copy_block_count,
             bufs._draft_bulk_offsets_src,
             bufs.draft_block_offsets_device,
         ) = _allocate_page_table_plane(
-            draft_layer_pools,
-            draft_page_representatives,
-            draft_page_table_keys,
-            int(draft_num_page_table_slots),
-            int(draft_page_table_token_capacity),
+            draft_layout["layer_pools"],
+            draft_representatives,
+            [draft_layout["layer_pool_keys"][layer] for layer in draft_representatives],
+            int(draft_layout["manager"].num_pools),
+            int(draft["page_table_token_capacity"]),
             max_requests,
             device,
         )
@@ -287,17 +212,6 @@ def init_eviction_buffers(
     draft_move_offsets_row = bufs.request_metadata_device[5]
     bufs.mean_cos = torch.empty((max_requests, num_freqs), dtype=torch.float32, device=device)
     bufs.mean_sin = torch.empty_like(bufs.mean_cos)
-    # ``phase=None`` is the one documented test seam (private table built here).
-    if phase is None:
-        phase = {
-            "offsets": offsets.contiguous(),
-            "omega": omega.contiguous(),
-            "offset_values": offsets.tolist(),
-            "cos": None,
-            "sin": None,
-            "rows": 0,
-        }
-        grow_mean_phase_table(phase, max(int(seq_len), 1))
     bufs.phase = phase
     bufs.phase_num_freqs = int(phase["omega"].numel())
     bufs.phase_f_block = triton.next_power_of_2(bufs.phase_num_freqs)
@@ -461,42 +375,110 @@ def init_eviction_buffers(
         bufs.keep_rows = bufs.keep.view(-1, keep_count)
         bufs.top_indices_i32.zero_()
 
-    # ---- compaction launch data + settle/pack fusion ------------------------
+    # ---- compaction contract + decision-materialization prebinds ------------
     bufs.settle_grid = (max_requests, bufs.selection_rows_per_request)
-    draft_kwargs = {}
-    if draft_layers:
-        draft_kwargs = dict(
-            draft_layer_pools=draft_layer_pools,
-            draft_layers=list(draft_layers),
-            draft_layer_group_representative=draft_layer_group_representative,
-            draft_layer_pool_keys=draft_layer_pool_keys,
-            draft_protected_tail_capacity=int(draft_protected_tail_capacity),
-            draft_kv_block_offsets=bufs.draft_block_offsets_device,
-            draft_page_table_slots=draft_page_slots,
-            draft_move_offsets=draft_move_offsets_row,
+    per_layer = eviction_mode == "per_layer_perhead"
+    draft_contract = None
+    if draft is not None:
+        draft_layout = draft["layout"]
+        draft_contract = dict(
+            layer_pools=draft_layout["layer_pools"],
+            layers=list(draft_layout["dense_layers"]),
+            layer_group_representative=draft_layout["layer_group_representative"],
+            layer_pool_keys=list(draft_layout["layer_pool_keys"]),
+            kv_block_offsets=bufs.draft_block_offsets_device,
+            page_table_slots=draft_page_slots,
+            move_offsets=draft_move_offsets_row,
+            protected_tail_capacity=int(draft["protected_tail_capacity"]),
         )
-    compaction = init_compaction_buffers(
-        union=union,
-        per_layer=eviction_mode == "per_layer_perhead",
-        layer_pools=layer_pools,
-        dense_layers=list(dense_layers),
-        swa_layers=list(swa_layers),
-        layer_group_representative=layer_group_representative,
-        valid_sequence_lengths=bufs.valid_seq_lens_device,
-        kv_block_offsets=bufs.block_offsets_device,
-        page_table_slots=bufs.representative_slots,
-        request_count=max_requests,
-        prompt_offsets=bufs.token_starts_device,
-        decode_keep_count=keep_count,
-        swa_window=swa_window,
-        layer_pool_keys=list(layer_pool_keys),
-        protected_tail_capacity=int(protected_tail_capacity),
-        # Per-round tails: the move offsets ride the staged metadata rows.
-        dense_move_offsets=dense_move_offsets_row,
-        swa_move_offsets=swa_move_offsets_row,
-        **draft_kwargs,
+    contract = init_compaction_buffers(
+        target=dict(
+            layer_pools=layer_pools,
+            dense_layers=list(dense_layers),
+            swa_layers=list(swa_layers),
+            swa_window=swa_window,
+            layer_group_representative=layer_group_representative,
+            layer_pool_keys=list(layer_pool_keys),
+            kv_block_offsets=bufs.block_offsets_device,
+            page_table_slots=bufs.representative_slots,
+            prompt_offsets=bufs.token_starts_device,
+            # Per-round tails: the move offsets ride the staged metadata rows.
+            dense_move_offsets=dense_move_offsets_row,
+            swa_move_offsets=swa_move_offsets_row,
+            per_layer_sources=per_layer,
+        ),
+        capacities=dict(
+            request_capacity=max_requests,
+            decode_keep_count=keep_count,
+            protected_tail_capacity=int(protected_tail_capacity),
+        ),
+        draft=draft_contract,
     )
-    attach_compaction_bundle(bufs, compaction)
+    bufs.compaction = contract
+    bufs.swa_destination_bases = contract["swa_destination_bases"]
+    bufs.swa_rebase_delta = contract["swa_rebase_delta"]
+    # The decision side: settle+pack launch args against the agreed buffers.
+    bufs.settle_args = (
+        bufs.selection_scores_rows,
+        bufs.selection_row_lengths,
+        bufs.row_prompt_offsets,
+        bufs.provisional_rows,
+        bufs.keep_rows,
+        bufs.valid_seq_lens_device,
+        dense_move_offsets_row,
+        contract["dense_move_indices"],
+        swa_move_offsets_row if contract["has_swa"] else None,
+        contract["swa_move_indices"],
+    )
+    bufs.settle_kwargs = dict(
+        WIDTH=decode_width,
+        KEEP_COUNT=keep_count,
+        SELECTION_ROWS=bufs.selection_rows_per_request,
+        DENSE_TOTAL=contract["dense_total"],
+        SWA_TOTAL=contract["swa_total"],
+        MOVE_CAPACITY=contract["move_capacity"],
+        NUM_KV_HEADS=contract["num_kv_heads"],
+        SWA_WINDOW=contract["swa_window"],
+        UNION=union,
+        PER_LAYER=per_layer,
+        HAS_SWA=contract["has_swa"],
+        HAS_SETTLE=True,
+        BLOCK=SETTLE_PACK_BLOCK,
+        num_warps=SETTLE_PACK_NUM_WARPS,
+    )
+    bufs.draft_pack_launch = None
+    if draft is not None:
+        draft_move_indices = contract["draft_move_indices"]
+        # Pack-only decision broadcast (HAS_SETTLE=False): settle pointers are None.
+        broadcast_pack_args = (
+            None,
+            None,
+            None,
+            None,
+            bufs.keep,
+            bufs.valid_seq_lens_device,
+            draft_move_offsets_row,
+            draft_move_indices,
+            None,
+            None,
+        )
+        broadcast_pack_kwargs = dict(
+            WIDTH=keep_count,
+            KEEP_COUNT=keep_count,
+            SELECTION_ROWS=1,
+            DENSE_TOTAL=int(draft_move_indices.shape[-1]),
+            SWA_TOTAL=0,
+            MOVE_CAPACITY=int(draft_move_indices.shape[-1]) // max_requests,
+            NUM_KV_HEADS=int(draft_move_indices.shape[0]),
+            SWA_WINDOW=0,
+            UNION=True,
+            PER_LAYER=False,
+            HAS_SWA=False,
+            HAS_SETTLE=False,
+            BLOCK=SETTLE_PACK_BLOCK,
+            num_warps=SETTLE_PACK_NUM_WARPS,
+        )
+        bufs.draft_pack_launch = (broadcast_pack_args, broadcast_pack_kwargs)
 
     # ---- round-ordering events ----------------------------------------------
     bufs.copy_done = torch.cuda.Event()
@@ -623,7 +605,8 @@ def mark_page_tables_consumed(bufs: SimpleNamespace, *manager_streams: torch.cud
 
 
 def settle_top_tokens(bufs: SimpleNamespace) -> None:
-    """Pick the top-k, settle ties to sorted ordinals, and pack the move sources."""
+    """Pick the top-k, settle ties, and materialize the move-source decision
+    (target settle+pack, then the draft broadcast pack)."""
     # The trailing 1 is next_n: decode scores one query token per request.
     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
         bufs.selection_scores_rows,
@@ -633,20 +616,13 @@ def settle_top_tokens(bufs: SimpleNamespace) -> None:
         1,
     )
     _settle_ties_and_pack_compaction_sources_kernel[bufs.settle_grid](
-        bufs.selection_scores_rows,
-        bufs.selection_row_lengths,
-        bufs.row_prompt_offsets,
-        bufs.provisional_rows,
-        bufs.keep_rows,
-        *bufs.settle_pack_tensors,
-        WIDTH=bufs.decode_width,
-        KEEP_COUNT=bufs.keep_count,
-        SELECTION_ROWS=bufs.selection_rows_per_request,
-        **bufs.settle_pack_shape,
-        HAS_SETTLE=True,
-        BLOCK=SETTLE_PACK_BLOCK,
-        num_warps=SETTLE_PACK_NUM_WARPS,
+        *bufs.settle_args, **bufs.settle_kwargs
     )
+    if bufs.draft_pack_launch is not None:
+        broadcast_pack_args, broadcast_pack_kwargs = bufs.draft_pack_launch
+        _settle_ties_and_pack_compaction_sources_kernel[(bufs.max_requests, 1)](
+            *broadcast_pack_args, **broadcast_pack_kwargs
+        )
 
 
 def run_eviction_round(bufs: SimpleNamespace, normalize_scores: bool) -> None:
@@ -723,15 +699,7 @@ def run_eviction_round(bufs: SimpleNamespace, normalize_scores: bool) -> None:
             )
         settle_top_tokens(bufs)
     with nvtx_range("triattention.compact", color="purple"):
-        # Prebound calls; the draft pack launch precedes the draft moves.
-        for args in bufs.compact_launch_args:
-            torch.ops.trtllm.sparse_kv_cache_compact_layers(*args)
-        if bufs.draft_pack_args is not None:
-            _settle_ties_and_pack_compaction_sources_kernel[(bufs.max_requests, 1)](
-                *bufs.draft_pack_args, **bufs.draft_pack_kwargs
-            )
-            for args in bufs.draft_compact_launch_args:
-                torch.ops.trtllm.sparse_kv_cache_compact_layers(*args)
+        compact(bufs.compaction, request_count)
 
 
 class TriAttention(BaseKVCacheCompressionManager):
@@ -1486,28 +1454,13 @@ class TriAttention(BaseKVCacheCompressionManager):
         assert seq_capacity % score_tile_tokens == 0
         page_table_token_capacity = max(needed_page_tokens, seq_capacity + tail_capacity)
 
-        dense_groups = list(layout["storage_groups"].values())
-        representatives = [group[0] for group in dense_groups]
-        representatives.extend(
-            layer for layer in layout["swa_layers"] if layer not in representatives
-        )
-        draft_kwargs = {}
+        draft = None
         if self.draft_kv_cache_manager is not None:
-            draft_layout = self._draft_runtime_kv_layout()
             draft_tail_capacity = self._draft_protected_tail_capacity()
-            draft_representatives = list(draft_layout["pool_representatives"])
-            draft_kwargs = dict(
-                draft_layer_pools=draft_layout["layer_pools"],
-                draft_layers=draft_layout["dense_layers"],
-                draft_layer_group_representative=draft_layout["layer_group_representative"],
-                draft_layer_pool_keys=list(draft_layout["layer_pool_keys"]),
-                draft_page_representatives=draft_representatives,
-                draft_page_table_keys=[
-                    draft_layout["layer_pool_keys"][layer] for layer in draft_representatives
-                ],
-                draft_num_page_table_slots=self.draft_kv_cache_manager.num_pools,
-                draft_page_table_token_capacity=seq_capacity + draft_tail_capacity,
-                draft_protected_tail_capacity=draft_tail_capacity,
+            draft = dict(
+                layout=self._draft_runtime_kv_layout(),
+                protected_tail_capacity=draft_tail_capacity,
+                page_table_token_capacity=seq_capacity + draft_tail_capacity,
             )
 
         first_pool = layout["layer_pools"][layout["dense_layers"][0]]
@@ -1535,32 +1488,23 @@ class TriAttention(BaseKVCacheCompressionManager):
         )
         bufs = init_eviction_buffers(
             eviction_mode=self.eviction_mode,
-            layer_pools=layout["layer_pools"],
-            dense_groups=dense_groups,
-            dense_layers=layout["dense_layers"],
-            swa_layers=layout["swa_layers"],
-            swa_window=layout["swa_window"],
-            layer_group_representative=layout["layer_group_representative"],
-            layer_pool_keys=list(layout["layer_pool_keys"]),
-            page_representatives=representatives,
-            max_requests=request_capacity,
-            seq_len=seq_capacity,
-            num_q_heads=int(self._H),
-            num_freqs=int(self._F),
-            keep_count=self.budget,
-            q_real=q_real,
-            q_imag=q_imag,
-            mlr_coef=mlr_coef,
-            freq_scale_sq=self._freq_scale_sq,
-            offsets=self._offsets,
-            omega=self.calibration["omega"],
+            layout=layout,
+            calibration=dict(
+                q_real=q_real,
+                q_imag=q_imag,
+                mlr_coef=mlr_coef,
+                freq_scale_sq=self._freq_scale_sq,
+            ),
             phase=self._phase,
-            page_table_keys=self._page_table_pool_keys(representatives, layout["global_layers"]),
-            num_page_table_slots=layout["manager"].num_pools,
-            decode_width=decode_width,
-            page_table_token_capacity=page_table_token_capacity,
-            protected_tail_capacity=tail_capacity,
-            **draft_kwargs,
+            capacities=dict(
+                max_requests=request_capacity,
+                bucket_seq_len=seq_capacity,
+                decode_width=decode_width,
+                page_table_token_capacity=page_table_token_capacity,
+                keep_count=self.budget,
+                protected_tail_capacity=tail_capacity,
+            ),
+            draft=draft,
         )
         self._buffers = bufs
         self._buffers_fingerprint = fingerprint
