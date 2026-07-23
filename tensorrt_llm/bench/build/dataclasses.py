@@ -16,6 +16,24 @@ import struct
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     load_pretrained_config, get_qwen3_hybrid_layer_types)
 
+# Model types that use Multi-Head Latent Attention (MLA). The runtime KV-cache
+# formula for these is a single compressed head with
+# head_dim = kv_lora_rank + qk_rope_head_dim, kv_factor = 1 — matching
+# tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py::mla branch.
+_MLA_MODEL_TYPES = frozenset({
+    "deepseek_v2",
+    "deepseek_v3",
+    "deepseek_v32",
+    "kimi_k2",
+    "glm_moe_dsa",
+})
+
+# Standard DeepSeek-family MLA head geometry (see
+# tensorrt_llm/_torch/configs/deepseek_v3.py). Used only when a known-MLA
+# model_type is set but the HF config we parsed did not surface these fields.
+_MLA_DEFAULT_KV_LORA_RANK = 512
+_MLA_DEFAULT_QK_ROPE_HEAD_DIM = 64
+
 # Mapping from safetensors dtype strings to bytes per element.
 # Used to compute checkpoint size from per-dtype element counts.
 SAFETENSORS_DTYPE_BYTES = {
@@ -183,6 +201,26 @@ class ModelConfig(BaseModel):
                    None] = Field(default="float16",
                                  validation_alias=AliasChoices(
                                      "dtype", "torch_dtype"))
+    # MLA-specific attention geometry. Present on DeepSeek V2/V3/V3.2, Kimi-K2,
+    # and other MLA checkpoints; None for standard MHA / GQA models. When set,
+    # KV bytes/token uses a single compressed head:
+    # head_dim = kv_lora_rank + qk_rope_head_dim, kv_factor = 1.
+    kv_lora_rank: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "kv_lora_rank",
+            AliasPath("text_config", "kv_lora_rank"),
+            AliasPath("language_config", "kv_lora_rank"),
+        ),
+    )
+    qk_rope_head_dim: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "qk_rope_head_dim",
+            AliasPath("text_config", "qk_rope_head_dim"),
+            AliasPath("language_config", "qk_rope_head_dim"),
+        ),
+    )
 
     @model_validator(mode="after")
     def set_values_if_none(self):
@@ -195,7 +233,24 @@ class ModelConfig(BaseModel):
             self.head_size = self.hidden_size // self.num_attention_heads
         if self.num_attention_layers is None:
             self.num_attention_layers = self.num_hidden_layers
+        # For known MLA model_types whose HF configs didn't surface
+        # kv_lora_rank / qk_rope_head_dim, backfill the standard
+        # DeepSeek-family geometry so the bench heuristic can still use
+        # the MLA formula instead of falling back to MHA.
+        if self.model_type in _MLA_MODEL_TYPES:
+            if self.kv_lora_rank is None:
+                self.kv_lora_rank = _MLA_DEFAULT_KV_LORA_RANK
+            if self.qk_rope_head_dim is None:
+                self.qk_rope_head_dim = _MLA_DEFAULT_QK_ROPE_HEAD_DIM
         return self
+
+    def is_mla(self) -> bool:
+        """True when this model uses Multi-Head Latent Attention.
+
+        `set_values_if_none` backfills the MLA head geometry for known
+        MLA `model_type`s, so checking the parsed fields alone is sufficient.
+        """
+        return bool(self.kv_lora_rank and self.qk_rope_head_dim)
 
     @classmethod
     def get_param_count_and_checkpoint_size(cls, model_hf_name, hf_model_path):
