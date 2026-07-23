@@ -4,6 +4,8 @@ import os
 import shutil
 from typing import Any, Dict, List, Optional
 
+from tensorrt_llm.inputs.media_io import decode_video_frames, is_image_file, is_video_file
+from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
 from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
@@ -156,14 +158,46 @@ def parse_visual_gen_params(
         if request.input_reference is not None:
             if media_storage_path is None:
                 raise ValueError("media_storage_path is required when input_reference is provided")
-            ref_path = os.path.join(media_storage_path, f"{id}_reference.png")
-            if isinstance(request.input_reference, str):
-                with open(ref_path, "wb") as f:
-                    f.write(base64.b64decode(request.input_reference))
+            tmp_path = os.path.join(media_storage_path, f"{id}_reference.part")
+            try:
+                if isinstance(request.input_reference, str):
+                    try:
+                        payload = base64.b64decode(request.input_reference)
+                    except ValueError as exc:
+                        raise ValueError("input_reference is not valid base64 data.") from exc
+                    with open(tmp_path, "wb") as f:
+                        f.write(payload)
+                else:
+                    with open(tmp_path, "wb") as f:
+                        shutil.copyfileobj(request.input_reference.file, f)
+
+                if is_image_file(tmp_path):
+                    is_video = False
+                elif is_video_file(tmp_path):
+                    is_video = True
+                else:
+                    raise ValueError(
+                        "input_reference content is neither a decodable image nor a decodable video."
+                    )
+                ref_path = os.path.join(media_storage_path, f"{id}_reference")
+                os.replace(tmp_path, ref_path)
+            except Exception:
+                # Cleanup-and-reraise, not handling: every failure path —
+                # validation errors (400) and I/O or dependency errors (500)
+                # alike — must not leak the temporary materialization.
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+            if is_video:
+                # V2V reference: decode into ``VideoData`` under
+                # ``multi_modal_data["video"]`` — the one intake video-capable
+                # pipelines read. The decode is model-agnostic (all frames, no
+                # crop); each pipeline picks its own conditioning window.
+                params.multi_modal_data = {
+                    "video": VideoData(frames=decode_video_frames(ref_path), metadata={})
+                }
             else:
-                with open(ref_path, "wb") as f:
-                    shutil.copyfileobj(request.input_reference.file, f)
-            params.image = ref_path
+                params.image = ref_path
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _merge_extra_params(params, request.extra_params, generator.extra_param_specs)

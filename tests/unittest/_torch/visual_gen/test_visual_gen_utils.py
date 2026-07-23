@@ -12,10 +12,14 @@ table plus the field-by-field overlay contract.
 from __future__ import annotations
 
 import base64
+import os
+import tempfile
 from io import BytesIO
 from typing import Any, Dict, Optional
 
+import numpy as np
 import pytest
+from fastapi import UploadFile
 from PIL import Image
 
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
@@ -273,7 +277,7 @@ class TestInputReferenceMaterialization:
             request, "vid-1", generator, media_storage_path=str(tmp_path)
         )
         assert params.image is not None
-        assert str(params.image).endswith("vid-1_reference.png")
+        assert str(params.image).endswith("vid-1_reference")
         # The decoded image is identical to what we passed in.
         with open(params.image, "rb") as f:
             decoded = Image.open(f).convert("RGB")
@@ -288,6 +292,108 @@ class TestInputReferenceMaterialization:
         request = VideoGenerationRequest(prompt="x", input_reference=b64)
         with pytest.raises(ValueError, match="media_storage_path"):
             parse_visual_gen_params(request, "vid-2", generator, media_storage_path=None)
+
+    @staticmethod
+    def _mp4_bytes() -> bytes:
+        """Encode a 2-frame 16x16 mp4v-in-mp4 clip and return its bytes.
+
+        ``mp4v`` is a built-in FFmpeg mpeg4 encoder present in the opencv wheel.
+        OpenCV writes only to a path, so encode to a tempfile and read it back.
+        """
+        cv2 = pytest.importorskip("cv2")
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            path = tmp.name
+        try:
+            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
+            for _ in range(2):
+                writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
+            writer.release()
+            with open(path, "rb") as f:
+                return f.read()
+        finally:
+            os.remove(path)
+
+    def test_multipart_video_reference_routes_to_multimodal(self, tmp_path):
+        from tensorrt_llm.inputs.multimodal_data import VideoData
+
+        generator = _StubVisualGen()
+        upload = UploadFile(file=BytesIO(self._mp4_bytes()), filename="clip.mp4")
+        request = VideoGenerationRequest(prompt="x", input_reference=upload)
+        params = parse_visual_gen_params(
+            request, "vid-3", generator, media_storage_path=str(tmp_path)
+        )
+        # Video content is decoded into VideoData under multi_modal_data["video"]
+        # (framework convention), not params.image. The worker crops + VAE-encodes.
+        assert params.image is None
+        assert params.multi_modal_data is not None
+        video_data = params.multi_modal_data["video"]
+        assert isinstance(video_data, VideoData)
+        assert len(video_data.frames) >= 1
+
+    def test_base64_video_reference_routes_to_multimodal(self, tmp_path):
+        # Classification is content-based, so the JSON/base64 path can
+        # carry video even though it has no content-type or filename.
+        from tensorrt_llm.inputs.multimodal_data import VideoData
+
+        generator = _StubVisualGen()
+        b64 = base64.b64encode(self._mp4_bytes()).decode()
+        request = VideoGenerationRequest(prompt="x", input_reference=b64)
+        params = parse_visual_gen_params(
+            request, "vid-4", generator, media_storage_path=str(tmp_path)
+        )
+        assert params.image is None
+        assert isinstance(params.multi_modal_data["video"], VideoData)
+
+    def test_multipart_image_reference_routes_to_image(self, tmp_path):
+        # JPEG upload: content sniffing classifies it as an image and routes
+        # to params.image. The stored file has no type-suffix (PIL identifies
+        # by content, not name).
+        generator = _StubVisualGen()
+        img = Image.new("RGB", (4, 4), (10, 20, 30))
+        buf = BytesIO()
+        img.save(buf, format="JPEG")
+        buf.seek(0)
+        upload = UploadFile(file=buf, filename="ref.jpg")
+        request = VideoGenerationRequest(prompt="x", input_reference=upload)
+        params = parse_visual_gen_params(
+            request, "vid-5", generator, media_storage_path=str(tmp_path)
+        )
+        assert params.extra_params is None
+        assert str(params.image).endswith("vid-5_reference")
+
+    def test_undecodable_reference_raises_and_cleans_up(self, tmp_path):
+        pytest.importorskip("cv2")
+        generator = _StubVisualGen()
+        b64 = base64.b64encode(b"neither an image nor a video").decode()
+        request = VideoGenerationRequest(prompt="x", input_reference=b64)
+        with pytest.raises(ValueError, match="neither a decodable image"):
+            parse_visual_gen_params(request, "vid-6", generator, media_storage_path=str(tmp_path))
+        # The temporary materialization is removed on rejection.
+        assert list(tmp_path.iterdir()) == []
+
+    def test_malformed_base64_reference_raises_and_cleans_up(self, tmp_path):
+        generator = _StubVisualGen()
+        # "ABC" survives the lenient alphabet filter but has an invalid
+        # length, so b64decode raises.
+        request = VideoGenerationRequest(prompt="x", input_reference="ABC")
+        with pytest.raises(ValueError, match="not valid base64"):
+            parse_visual_gen_params(request, "vid-7", generator, media_storage_path=str(tmp_path))
+        assert list(tmp_path.iterdir()) == []
+
+    def test_upload_stream_failure_cleans_up_tmp(self, tmp_path):
+        generator = _StubVisualGen()
+
+        class _BrokenStream:
+            def read(self, *args, **kwargs):
+                raise OSError("client went away")
+
+        upload = UploadFile(file=_BrokenStream(), filename="clip.mp4")
+        request = VideoGenerationRequest(prompt="x", input_reference=upload)
+        # I/O failures keep their server-error semantics (no 400 masking) …
+        with pytest.raises(OSError, match="client went away"):
+            parse_visual_gen_params(request, "vid-8", generator, media_storage_path=str(tmp_path))
+        # … but the partial materialization must not leak.
+        assert list(tmp_path.iterdir()) == []
 
 
 # =============================================================================

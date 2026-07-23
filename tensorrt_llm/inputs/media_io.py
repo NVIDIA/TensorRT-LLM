@@ -38,7 +38,7 @@ import soundfile
 import torch
 from blake3 import blake3
 from packaging.version import Version
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.logger import logger
@@ -343,6 +343,64 @@ def _get_cv2():
             "Install it with `pip install opencv-python-headless`."
         ) from exc
     return cv2
+
+
+def is_image_file(path) -> bool:
+    """True when ``path`` holds still-image content (anything PIL opens).
+
+    Header-only probe: identifies the container without decoding pixels.
+    Lets callers classify a reference by content instead of by file suffix.
+    """
+    try:
+        with Image.open(path):
+            return True
+    except UnidentifiedImageError:
+        return False
+
+
+def is_video_file(path) -> bool:
+    """True when ``path`` holds a decodable video stream (OpenCV-openable).
+
+    Total predicate over content: False for images, audio, and undecodable
+    data alike. Stills are excluded explicitly — FFmpeg demuxes a single
+    image as a one-frame video stream, so a bare video probe would accept
+    every PNG/JPEG. ``_get_cv2`` raises a clear install hint if cv2 is absent.
+    """
+    if is_image_file(path):
+        return False
+    cv2 = _get_cv2()
+    capture = cv2.VideoCapture(str(path))
+    try:
+        return bool(capture.isOpened() and capture.read()[0])
+    finally:
+        capture.release()
+
+
+def decode_video_frames(path, max_frames: Optional[int] = None) -> List["Image.Image"]:
+    """Decode a video file into its frames as PIL images, in order, no sampling.
+
+    Unlike :func:`load_video` — which samples ``num_frames`` evenly for
+    VLM-style inputs — this preserves every frame sequentially from the start;
+    ``max_frames`` bounds the decode when only a prefix is needed.
+    Reference-conditioning consumers (e.g. video-to-video pipelines) pick
+    their own frame window downstream.
+    """
+    cv2 = _get_cv2()
+    capture = cv2.VideoCapture(str(path))
+    try:
+        if not capture.isOpened():
+            raise ValueError(f"Could not open video file: {path}")
+        frames = []
+        while max_frames is None or len(frames) < max_frames:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+    finally:
+        capture.release()
+    if not frames:
+        raise ValueError(f"Video file contains no frames: {path}")
+    return frames
 
 
 def _select_cv2_stream_buffered_backend() -> Optional[int]:

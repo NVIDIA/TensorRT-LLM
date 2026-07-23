@@ -60,6 +60,17 @@ def _assert_llm_envelope(
         assert message_contains in body["message"], body["message"]
 
 
+def _require_opencv():
+    """Skip unless OpenCV is installed (the shared optional video decoder).
+
+    These tests drive ``is_video_file``, which decodes references via
+    OpenCV (the same optional dep the multimodal video path uses). ``cv2`` ships
+    in no CI image, so this ``importorskip``-s it and returns the module for
+    tests that synthesize a clip with ``cv2.VideoWriter``.
+    """
+    return pytest.importorskip("cv2")
+
+
 def _make_dummy_image_tensor(height: int = 64, width: int = 64) -> torch.Tensor:
     """Create a small dummy uint8 image tensor (H, W, C)."""
     return torch.randint(0, 256, (height, width, 3), dtype=torch.uint8)
@@ -839,8 +850,63 @@ class TestVideoGenerationSync:
         # through as params.image (a filesystem path).
         params = video_client.mock_gen.last_params
         assert isinstance(params.image, str)
-        assert params.image.endswith("_reference.png")
+        assert params.image.endswith("_reference")
         assert os.path.exists(params.image)
+
+    def test_sync_video_generation_multipart_with_video_reference(self, video_client, tmp_path):
+        """A video ``input_reference`` is decoded into ``VideoData`` under
+        ``multi_modal_data["video"]`` (V2V).
+
+        The reference is classified by decoding its content, so the clip is
+        synthesized in-test with OpenCV — no video asset ships with the repo.
+        """
+        cv2 = _require_opencv()
+        np = pytest.importorskip("numpy")
+        ref_path = tmp_path / "ref.mp4"
+        # mp4v is a built-in FFmpeg mpeg4 encoder present in the opencv wheel.
+        writer = cv2.VideoWriter(str(ref_path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
+        try:
+            for _ in range(2):
+                writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
+        finally:
+            writer.release()
+        assert ref_path.exists() and ref_path.stat().st_size > 0
+
+        with open(ref_path, "rb") as f:
+            resp = video_client.post(
+                "/v1/videos/generations",
+                data={
+                    "prompt": "Continue the same scene",
+                    "size": "64x64",
+                    "seconds": "1.0",
+                    "fps": "8",
+                },
+                files={"input_reference": ("ref.mp4", f, "video/mp4")},
+            )
+        assert resp.status_code == 200
+        assert len(resp.content) > 0
+
+        # Video content must NOT land on params.image; it's decoded into
+        # VideoData under multi_modal_data["video"] (framework convention; the
+        # same pipeline entry the offline example's --video_path uses).
+        from tensorrt_llm.inputs.multimodal_data import VideoData
+
+        params = video_client.mock_gen.last_params
+        assert params.image is None
+        video_data = params.multi_modal_data["video"]
+        assert isinstance(video_data, VideoData)
+        assert len(video_data.frames) >= 1
+
+    def test_sync_video_generation_undecodable_reference_400(self, video_client):
+        """Content neither PIL nor OpenCV can decode is rejected at the boundary."""
+        _require_opencv()
+        resp = video_client.post(
+            "/v1/videos/generations",
+            data={"prompt": "x"},
+            files={"input_reference": ("doc.txt", BytesIO(b"not media"), "text/plain")},
+        )
+        assert resp.status_code == 400
+        assert "neither a decodable image" in resp.text
 
     def test_sync_video_failure(self, failing_client):
         resp = failing_client.post(

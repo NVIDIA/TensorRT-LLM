@@ -13,6 +13,106 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+r"""Cosmos3 Text(+Image)-to-Video(+Audio) generation.
+
+Cosmos3 supports the following generation modes from a single checkpoint:
+
+- **T2V** — text-to-video (``prompts/t2v.json``).
+- **T2I** — text-to-image (``prompts/t2i.json``);
+  emits a still frame (use ``--output_type image`` / a non-video ``--output_path``).
+- **I2V / TI2V** — image-conditioned video (``prompts/i2v.json``). Condition on a reference frame via the prompt
+  file's ``vision_path`` or ``--image_path``. The image may be a local path, a
+  ``file://`` / ``http(s)://`` URL, or a ``data:`` URI.
+- **V2V** — video-conditioned video (``prompts/v2v.json``). Condition on the
+  first (or last, per ``condition_video_keep``) frames of a reference video
+  via ``--video_path`` (a local frame directory, ``.mp4``/``.avi`` file, or
+  single image; ``.mp4``/``.avi`` decode requires OpenCV).
+- **Transfer** — control-video conditioning via ``--extra_params`` hints
+  (``edge``/``blur``/``depth``/``seg``/``wsm``): the control constrains
+  structure, the prompt supplies appearance. ``edge``/``blur`` are computed
+  from ``--video_path``; any hint accepts ``{"control_path": ...}`` (a local
+  video file). See the README's transfer examples (incl. the synthetic
+  bouncing-ball control from ``generate_bouncing_ball_control.py``).
+- **T2AV** — text-to-video with synchronized audio (``prompts/t2av.json`` with
+  ``enable_audio: true``, or pass ``--enable_audio``). Combine with a
+  ``vision_path`` for image-conditioned audio-video (TI2AV).
+
+Checkpoints (pass the Hub ID or local path via ``--model``):
+
+- `nvidia/Cosmos3-Nano <https://huggingface.co/nvidia/Cosmos3-Nano>`_
+- `nvidia/Cosmos3-Super <https://huggingface.co/nvidia/Cosmos3-Super>`_
+
+Guardrails are enabled by default (required by the
+`NVIDIA Open Model License Agreement
+<https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license>`_).
+Install and authenticate as follows::
+
+    pip install cosmos_guardrail==0.3.0 && pip uninstall opencv-python
+
+Accept the terms for the guardrail checkpoint at
+https://huggingface.co/nvidia/Cosmos-1.0-Guardrail and set a valid ``HF_TOKEN``
+(the checkpoint is downloaded automatically on first run).
+
+To run without guardrails (you are responsible for safe deployment)::
+
+    export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
+
+Deployment configs (``examples/visual_gen/configs/``):
+
+- ``cosmos3-nano-1gpu.yaml`` — 1 GPU
+- ``cosmos3-super-4gpu.yaml`` — 4 GPU, CFG + Ulysses + parallel VAE
+
+Example prompts live under ``prompts/`` (mirroring ``cosmos3-internal/inputs/omni``).
+
+Usage::
+
+    # T2V: text-to-video
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
+        --prompt_file prompts/t2v.json \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+    # I2V/TI2V: image-conditioned video (vision_path is read from the prompt file;
+    # local path, file://, http(s):// URL, or data: URI are all accepted)
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
+        --prompt_file prompts/i2v.json \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+    # I2V with an explicit conditioning image (overrides the prompt file)
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
+        --prompt_file prompts/i2v.json \
+        --image_path https://example.com/frame.jpg \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+    # V2V: video-conditioned video (continues the first frames of --video_path)
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
+        --prompt_file prompts/v2v.json \
+        --video_path /path/to/reference.mp4 \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+    # Transfer: control-video conditioning (structure from the control,
+    # appearance from the prompt)
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
+        --prompt "The same scene rendered photorealistically, sharp detail." \
+        --video_path /path/to/reference.mp4 \
+        --extra_params '{"edge": true}' \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+    # T2AV: text-to-video with synchronized audio
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
+        --prompt_file prompts/t2av.json \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+    # T2I: text-to-image
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
+        --prompt_file prompts/t2i.json \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+        --output_path output.png
+
+    # Inline prompt (``--prompt`` or a JSON file path)
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
+        --prompt "A cute puppy playing with a ball in a park" \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+"""
 
 import argparse
 import json
@@ -21,6 +121,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import TRANSFER_HINT_KEYS
+from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -140,7 +242,25 @@ def main():
     )
     parser.add_argument("--enable_audio", action="store_true", help="Enable audio generation")
     parser.add_argument(
+        "--video_path",
+        type=str,
+        default=None,
+        help="Reference video for V2V: a local frame directory or .mp4/.avi file",
+    )
+    parser.add_argument(
         "--output_type", type=str, default="video", help="Output type (video, image)"
+    )
+    parser.add_argument(
+        "--extra_params",
+        type=json.loads,
+        default=None,
+        help=(
+            "Model-specific extra params as a JSON object, merged last (overrides "
+            "flag-derived values). Keys are validated against the pipeline's "
+            "extra_param_specs. Transfer example: "
+            '\'{"edge": true, "blur": true, "control_guidance": 1.5}\' with --video_path, '
+            'or \'{"edge": {"control_path": "/path/control.mp4"}}\' for a precomputed control.'
+        ),
     )
 
     # Guardrails
@@ -186,6 +306,29 @@ def main():
     params.extra_params["use_guardrails"] = not args.disable_guardrails
     params.extra_params["output_type"] = output_type
 
+    if args.video_path is not None:
+        params.multi_modal_data = {"video": load_reference_video(args.video_path)}
+    if args.extra_params:
+        # Merged last: explicit JSON wins over flag-derived values.
+        params.extra_params.update(args.extra_params)
+
+    # Precomputed transfer controls: a hint's client-local ``control_path`` (or a
+    # bare path string) is decoded here into multi_modal_data["control"] — media
+    # rides multi_modal_data, extra_params keeps only the knob; the worker never
+    # reads paths.
+    control_media = {}
+    for key in TRANSFER_HINT_KEYS:
+        hint = params.extra_params.get(key)
+        if isinstance(hint, str):
+            control_media[key] = load_reference_video(hint)
+            params.extra_params[key] = True
+        elif isinstance(hint, dict) and hint.get("control_path") is not None:
+            control_media[key] = load_reference_video(hint.pop("control_path"))
+            if not hint:
+                params.extra_params[key] = True
+    if control_media:
+        params.multi_modal_data = {**(params.multi_modal_data or {}), "control": control_media}
+
     if negative_prompt is None:
         params.negative_prompt = None
     elif isinstance(negative_prompt, str):
@@ -200,6 +343,7 @@ def main():
 
     output.save(args.output_path)
     print(f"Saved: {args.output_path}")
+
     print(output.metrics)
 
 

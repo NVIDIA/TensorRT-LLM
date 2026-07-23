@@ -72,9 +72,6 @@ class TransformerOutput:
     audio: Optional[torch.Tensor] = None
     """[B, audio_dim, T_audio] audio velocity prediction, or None."""
 
-    action: Optional[torch.Tensor] = None
-    """[B, T_action, action_dim] action velocity prediction, or None."""
-
 
 def compute_mrope_position_ids_text(
     num_tokens: int,
@@ -102,6 +99,7 @@ def compute_mrope_position_ids_vision(
     base_fps: float = 24.0,
     temporal_compression_factor: int = 4,
     enable_fps_modulation: bool = False,
+    start_frame_offset: int = 0,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate 3D mRoPE position IDs for vision tokens.
 
@@ -121,15 +119,17 @@ def compute_mrope_position_ids_vision(
         base_tps = base_fps / temporal_compression_factor
         frame_indices = torch.arange(grid_t, dtype=torch.float32)
         t_index = (
-            (frame_indices / tps * base_tps + temporal_offset)
+            ((frame_indices + start_frame_offset) / tps * base_tps + temporal_offset)
             .view(-1, 1)
             .expand(-1, grid_h * grid_w)
             .flatten()
         )
     else:
-        t_index = torch.arange(grid_t, dtype=torch.long).view(-1, 1).expand(
-            -1, grid_h * grid_w
-        ).flatten() + int(temporal_offset)
+        t_index = (
+            torch.arange(grid_t, dtype=torch.long).view(-1, 1).expand(-1, grid_h * grid_w).flatten()
+            + int(temporal_offset)
+            + start_frame_offset
+        )
 
     h_index = (
         torch.arange(grid_h, dtype=torch.long).view(1, -1, 1).expand(grid_t, -1, grid_w).flatten()
@@ -704,7 +704,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         super().__init__(model_config)
         pretrained_config = model_config.pretrained_config
         self.audio_gen = getattr(pretrained_config, "sound_gen", False)
-        self.action_gen = getattr(pretrained_config, "action_gen", False)
 
         self.hidden_size = pretrained_config.hidden_size
         self.num_hidden_layers = pretrained_config.num_hidden_layers
@@ -870,6 +869,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         fps: float | None,
         device: torch.device,
         dtype: torch.dtype,
+        num_vision_items: int = 1,
+        share_vision_temporal_positions: bool = False,
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """Compute mRoPE cos/sin for UND (text) and GEN (visual) pathways."""
         B = text_mask.shape[0]
@@ -882,16 +883,39 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         for b in range(B):
             real_len = int(text_lengths[b].item())
             t_pos, t_offset = compute_mrope_position_ids_text(real_len, temporal_offset=0)
-            v_pos, _ = compute_mrope_position_ids_vision(
-                T,
-                Hp,
-                Wp,
-                temporal_offset=t_offset + self.unified_3d_mrope_temporal_modality_margin,
-                fps=effective_fps,
-                base_fps=self.base_fps,
-                temporal_compression_factor=self.temporal_compression_factor,
-                enable_fps_modulation=self.enable_fps_modulation,
-            )
+            media_temporal_offset = t_offset + self.unified_3d_mrope_temporal_modality_margin
+            gen_positions = []
+            if num_vision_items == 1 or share_vision_temporal_positions:
+                v_pos, _ = compute_mrope_position_ids_vision(
+                    T,
+                    Hp,
+                    Wp,
+                    temporal_offset=media_temporal_offset,
+                    fps=effective_fps,
+                    base_fps=self.base_fps,
+                    temporal_compression_factor=self.temporal_compression_factor,
+                    enable_fps_modulation=self.enable_fps_modulation,
+                )
+                gen_positions.extend([v_pos] * num_vision_items)
+            else:
+                vision_offset: int | float = media_temporal_offset
+                for _ in range(num_vision_items):
+                    v_pos, vision_offset = compute_mrope_position_ids_vision(
+                        T,
+                        Hp,
+                        Wp,
+                        temporal_offset=vision_offset,
+                        fps=effective_fps,
+                        base_fps=self.base_fps,
+                        temporal_compression_factor=self.temporal_compression_factor,
+                        enable_fps_modulation=self.enable_fps_modulation,
+                    )
+                    gen_positions.append(v_pos)
+
+            pos_dtype = gen_positions[0].dtype
+            for pos in gen_positions[1:]:
+                pos_dtype = torch.promote_types(pos_dtype, pos.dtype)
+            v_pos = torch.cat([pos.to(pos_dtype) for pos in gen_positions], dim=1)
             if real_len < S_text:
                 t_pos = torch.cat(
                     [t_pos, torch.zeros(3, S_text - real_len, dtype=t_pos.dtype)], dim=1
@@ -979,6 +1003,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         fps: float | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         audio_latents: Optional[torch.Tensor] = None,
+        control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        transfer_share_vision_temporal_positions: bool = True,
         **kwargs,
     ) -> "TransformerOutput":
         """
@@ -1002,17 +1028,20 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 When provided, audio tokens are appended to the generation
                 sequence and an audio velocity is returned alongside the video
                 velocity.  Requires ``audio_gen=True`` in the pretrained config.
+            control_latents: Optional transfer-control latents. Controls are #TODO
+                clean vision context and are packed before the noisy target.
 
         Returns:
             TransformerOutput with video (and image alias) always set.
             audio is set to the predicted audio velocity when audio_latents is
-            provided; otherwise None.  action is always None for now.
+            provided; otherwise None.
         """
         del kwargs  # Kept for diffusers API compatibility.
         if timestep is None:
             raise ValueError("Cosmos3VFMTransformer.forward requires normalized timestep.")
         if raw_timestep is None:
             raise ValueError("Cosmos3VFMTransformer.forward requires raw_timestep.")
+
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
         max_real_len = text_mask.sum(dim=1).max().item()
@@ -1023,6 +1052,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         with torch.autocast("cuda", enabled=True, dtype=torch.float32):
             time_embed = self.time_embedder((raw_timestep * self.timestep_scale))
         time_embed = time_embed.to(hidden_states.dtype)
+
+        if control_latents is None:
+            control_lantent_list: list[torch.Tensor] = []
+        elif isinstance(control_latents, torch.Tensor):
+            control_lantent_list = [control_latents]
+        else:
+            control_lantent_list = list(control_latents)
 
         if noisy_frame_mask is not None:
             # Build per-token mask from per-frame mask.
@@ -1047,6 +1083,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 fps,
                 hidden_states.device,
                 hidden_states.dtype,
+                num_vision_items=len(control_lantent_list) + 1,
+                share_vision_temporal_positions=transfer_share_vision_temporal_positions,
             )
             cached_kv_full = self.language_model(
                 text_ids,
@@ -1075,9 +1113,18 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             else:
                 self.cached_kv = cached_kv_full
 
-        # --- Audio token injection -------------------------------------------------
+        # --- Extra modality token injection (audio) ---
         T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp
         T_audio = 0
+        T_control = 0
+        hidden_controls: list[torch.Tensor] = []
+        has_control = len(control_lantent_list) > 0
+
+        if has_control and audio_latents is not None:
+            raise ValueError(
+                "Cosmos3 transfer control latents cannot be combined with sound latents"
+            )
+
         if audio_latents is not None and self.audio_gen:
             T_audio = audio_latents.shape[2]
             hidden_audio = self.pack_audio_latents(audio_latents).to(hidden_gen.dtype)
@@ -1090,13 +1137,28 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 hidden_states.device,
                 hidden_gen.dtype,
             )
-            # [B, T_vid+T_audio, hidden_size]
             hidden_gen = torch.cat([hidden_gen, hidden_audio], dim=1)
             cos_v, sin_v = self.cached_freqs_gen
             freqs_gen_combined = (
                 torch.cat([cos_v, cos_a], dim=1),
                 torch.cat([sin_v, sin_a], dim=1),
             )
+        elif has_control:
+            for idx, control in enumerate(control_lantent_list):
+                if control.shape != hidden_states.shape:
+                    raise ValueError(
+                        "Cosmos3 transfer control latent shape must match target latent shape: "
+                        f"control[{idx}]={tuple(control.shape)}, target={tuple(hidden_states.shape)}."
+                    )
+                hidden_control = self.vae2llm(
+                    self.patchify(
+                        control.to(device=hidden_gen.device, dtype=hidden_gen.dtype), T, H, W
+                    )
+                )
+                hidden_controls.append(hidden_control)
+                T_control += hidden_control.shape[1]
+            hidden_gen = torch.cat([*hidden_controls, hidden_gen], dim=1)
+            freqs_gen_combined = self.cached_freqs_gen
         else:
             freqs_gen_combined = self.cached_freqs_gen
         # --------------------------------------------------------------------------
@@ -1135,15 +1197,16 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         hidden_gen = self.norm_moe_gen(hidden_gen)
 
         # --- Decode video velocity ------------------------------------------------
-        video_vel = self.unpatchify(self.llm2vae(hidden_gen[:, :T_vid_tokens]), T, H, W)
+        video_vel = self.unpatchify(
+            self.llm2vae(hidden_gen[:, T_control : T_control + T_vid_tokens]), T, H, W
+        )
 
-        # --- Decode audio velocity (if requested) ---------------------------------
+        # --- Decode extra-modality velocity (audio; follows video + control) ---
+        extra_start = T_control + T_vid_tokens
         audio_vel = None
         if T_audio > 0 and audio_latents is not None and self.audio_gen:
-            # hidden_gen[:, T_vid_tokens:] → [B, T_audio, hidden_size]
-            # → llm2audio → [B, T_audio, audio_dim] → unpack → [B, audio_dim, T_audio]
             audio_vel = self.unpack_audio_latents(
-                self.llm2audio(hidden_gen[:, T_vid_tokens : T_vid_tokens + T_audio])
+                self.llm2audio(hidden_gen[:, extra_start : extra_start + T_audio])
             )
 
         return TransformerOutput(video=video_vel, image=video_vel, audio=audio_vel)
@@ -1156,10 +1219,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         Maps UND vs GEN blocks into this module's layout (causal self-attn vs cross-attn + MLPs).
         """
         remapped = {}
+        # The Cosmos3 checkpoint ships action modules (action_gen=true), but this
+        # transformer no longer builds them — skip their weights explicitly so the
+        # load stays quiet instead of warning on each as an unknown key.
         skip_prefixes = (
             "lm_head.",
-            "action_modality_embed",
-            "action_proj_",
+            "action_",
         )
 
         for key, value in weights.items():
