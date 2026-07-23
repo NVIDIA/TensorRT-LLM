@@ -642,6 +642,20 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     """Configuration for sparse attention."""
     algorithm: str
 
+    @property
+    def sparse_topk(self) -> int:
+        """Per-token selection budget (top-k).
+
+        The field name is not yet unified across algorithms (DSA / DeepSeek-V4
+        use ``index_topk``, RocketKV uses ``topk``), so resolve it here.
+        """
+        for name in ("index_topk", "topk"):
+            value = getattr(self, name, None)
+            if value is not None:
+                return value
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose a selection top-k.")
+
     def supports_backend(self, backend: str) -> bool:
         """Override if the sparse attention algorithm does not support
         a subset of the possible backends.

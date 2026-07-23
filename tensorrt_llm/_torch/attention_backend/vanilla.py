@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from dataclasses import replace
 from typing import Optional
 
 import torch
@@ -117,6 +118,26 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
     @classmethod
     def support_mla(cls) -> bool:
         return True
+
+    def sparse_kv_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: VanillaAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Lower backend-neutral sparse KV selection for Vanilla attention."""
+        return None, None
+
+    def sparse_attn_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: VanillaAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Use request-local caller-provided selections in the Vanilla backend."""
+        return forward_args.topk_indices, None
 
     def _single_request_sparse_attn_predict(
             self, q: torch.Tensor, k: Optional[torch.Tensor],
@@ -571,6 +592,174 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         return torch.cat(outputs, dim=0)
 
+    @staticmethod
+    def _load_mla_latent_cache(kv_cache: torch.Tensor, block_ids: list[int],
+                               kv_len: int, kv_layout: str) -> torch.Tensor:
+        """Materialize one request's logical MLA cache from its pages."""
+        if kv_len <= 0:
+            raise ValueError(f"MLA KV length must be positive, got {kv_len}")
+        if kv_layout == "NHD":
+            tokens_per_block = kv_cache.shape[2]
+        elif kv_layout == "HND":
+            tokens_per_block = kv_cache.shape[3]
+        else:
+            raise ValueError(f"Unsupported KV cache layout: {kv_layout}")
+
+        valid_block_ids = [block_id for block_id in block_ids if block_id != -1]
+        num_required_blocks = math.ceil(kv_len / tokens_per_block)
+        if len(valid_block_ids) < num_required_blocks:
+            raise ValueError(
+                f"MLA cache has {len(valid_block_ids)} blocks, but "
+                f"{num_required_blocks} are required for {kv_len} tokens")
+
+        chunks = []
+        remaining = kv_len
+        for block_id in valid_block_ids[:num_required_blocks]:
+            num_tokens = min(tokens_per_block, remaining)
+            if kv_layout == "NHD":
+                chunk = kv_cache[block_id, 0, :num_tokens, 0, :]
+            else:
+                chunk = kv_cache[block_id, 0, 0, :num_tokens, :]
+            chunks.append(chunk)
+            remaining -= num_tokens
+        return torch.cat(chunks, dim=0)
+
+    def _mla_forward_sparse(
+        self,
+        fused_q: torch.Tensor,
+        metadata: VanillaAttentionMetadata,
+        latent_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attention_input_type: AttentionInputType,
+    ) -> torch.Tensor:
+        """Run selected sparse MLA from caller-provided local top-k rows.
+
+        The sparse algorithm owns selection. This golden consumes its
+        request-local per-token selections, gathers the selected latent K/V, and
+        performs the absorbed MLA attention directly in PyTorch. The MLA sparse
+        algorithms (DSA / DeepSeek-V4) select individual tokens.
+
+        ``fused_q`` and ``latent_cache`` arrive with RoPE already applied (like
+        every other Vanilla attention path); the caller owns positional embedding.
+        """
+        if attention_input_type == AttentionInputType.context_only:
+            seq_start, seq_end = 0, metadata.num_contexts
+        elif attention_input_type == AttentionInputType.generation_only:
+            seq_start, seq_end = metadata.num_contexts, metadata.num_seqs
+        else:
+            raise ValueError(
+                "Vanilla DSA requires a context-only or generation-only input")
+
+        seq_lens = metadata.seq_lens.tolist()
+        phase_seq_lens = seq_lens[seq_start:seq_end]
+        num_phase_tokens = sum(phase_seq_lens)
+        fused_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        if fused_q.shape[0] != num_phase_tokens:
+            raise ValueError(
+                f"DSA query has {fused_q.shape[0]} tokens, but metadata "
+                f"describes {num_phase_tokens} tokens for this phase")
+        if fused_q.ndim != 2 or fused_q.shape[
+                1] != self.num_heads * fused_head_dim:
+            raise ValueError(
+                "DSA query must have shape "
+                f"[{num_phase_tokens}, {self.num_heads * fused_head_dim}]; "
+                f"got {tuple(fused_q.shape)}")
+        if (latent_cache.ndim != 2
+                or latent_cache.shape != (num_phase_tokens, fused_head_dim)):
+            raise ValueError("DSA latent cache must have shape "
+                             f"[{num_phase_tokens}, {fused_head_dim}]; "
+                             f"got {tuple(latent_cache.shape)}")
+        if topk_indices.ndim != 2 or topk_indices.shape[0] != num_phase_tokens:
+            raise ValueError(
+                "DSA top-k indices must have shape [num_phase_tokens, top_k]; "
+                f"got {tuple(topk_indices.shape)}")
+        if topk_indices.dtype != torch.int32:
+            raise ValueError(
+                f"DSA top-k indices must have dtype int32, got {topk_indices.dtype}"
+            )
+
+        request_ids = metadata.request_ids[seq_start:seq_end]
+        past_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
+        phase_past_tokens = past_tokens[seq_start:seq_end]
+        valid_mask = topk_indices >= 0
+        if torch.any(topk_indices < -1):
+            raise ValueError("DSA top-k indices may only use -1 as padding")
+        if torch.any(~valid_mask.any(dim=1)):
+            raise ValueError(
+                "Every DSA query token must select at least one KV token")
+
+        kv_lengths = torch.cat([
+            torch.full(
+                (q_len, ),
+                int(past) + q_len,
+                dtype=topk_indices.dtype,
+                device=topk_indices.device,
+            ) for past, q_len in zip(
+                phase_past_tokens, phase_seq_lens, strict=True)
+        ])
+        if torch.any(valid_mask & (topk_indices >= kv_lengths.unsqueeze(1))):
+            raise ValueError(
+                "DSA top-k index is out of bounds for its request-local KV length"
+            )
+
+        causal_limits = torch.cat([
+            torch.arange(
+                int(past),
+                int(past) + q_len,
+                dtype=topk_indices.dtype,
+                device=topk_indices.device,
+            ) for past, q_len in zip(
+                phase_past_tokens, phase_seq_lens, strict=True)
+        ])
+        if torch.any(valid_mask & (topk_indices > causal_limits.unsqueeze(1))):
+            raise ValueError("DSA top-k index selects a future token")
+        del valid_mask, kv_lengths, causal_limits
+
+        from .utils import append_mla_latent_cache
+        kv_cache = append_mla_latent_cache(
+            metadata.kv_cache_manager,
+            self.layer_idx,
+            request_ids,
+            phase_seq_lens,
+            phase_past_tokens,
+            latent_cache,
+            kv_layout=metadata.kv_layout,
+        )
+
+        q = fused_q.view(num_phase_tokens, self.num_heads, fused_head_dim)
+        qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        scale = 1.0 / (math.sqrt(qk_head_dim) *
+                       (self.q_scaling if self.q_scaling is not None else 1.0))
+
+        outputs = []
+        token_offset = 0
+        for phase_idx, q_len in enumerate(phase_seq_lens):
+            seq_idx = seq_start + phase_idx
+            kv_len = int(phase_past_tokens[phase_idx]) + q_len
+            latent = self._load_mla_latent_cache(
+                kv_cache, metadata.block_ids_per_seq[seq_idx], kv_len,
+                metadata.kv_layout).to(q.dtype)
+
+            per_token_outputs = []
+            for token_idx in range(q_len):
+                row = topk_indices[token_offset + token_idx]
+                selected = row[row >= 0].to(device=q.device, dtype=torch.long)
+                selected_latent = latent.index_select(0, selected)
+                query = q[token_offset + token_idx]
+                scores = torch.matmul(query, selected_latent.transpose(
+                    0, 1)) * scale
+                probabilities = F.softmax(scores, dim=-1,
+                                          dtype=torch.float32).to(q.dtype)
+                values = selected_latent[:, :self.kv_lora_rank]
+                per_token_outputs.append(torch.matmul(probabilities, values))
+
+            outputs.append(
+                torch.stack(per_token_outputs).reshape(
+                    q_len, self.num_heads * self.kv_lora_rank))
+            token_offset += q_len
+
+        return torch.cat(outputs, dim=0)
+
     def _mla_forward_context(self, q: torch.Tensor, k: torch.Tensor,
                              v: torch.Tensor,
                              metadata: VanillaAttentionMetadata,
@@ -635,6 +824,41 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 raise ValueError("Vanilla MLA requires a KV cache manager.")
             if forward_args.latent_cache is None:
                 raise ValueError("Vanilla MLA requires latent_cache.")
+            if self.sparse_params is not None:
+                sparse_algorithm = self.sparse_params.algorithm
+                if sparse_algorithm != "dsa":
+                    raise ValueError(
+                        "Vanilla selected MLA currently supports only DSA")
+                sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
+                    q, k, metadata, forward_args)
+                sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
+                    q, k, metadata, forward_args)
+                forward_args.sparse_prediction = replace(
+                    forward_args.sparse_prediction,
+                    sparse_kv_indices=sparse_kv_indices,
+                    sparse_kv_offsets=sparse_kv_offsets,
+                    sparse_attn_indices=sparse_attn_indices,
+                    sparse_attn_offsets=sparse_attn_offsets,
+                    sparse_attn_indices_block_size=getattr(
+                        self.sparse_params, "indices_block_size"),
+                )
+            sparse_attn_indices = (
+                forward_args.sparse_prediction.sparse_attn_indices)
+            if sparse_attn_indices is not None:
+                if k is not None or v is not None:
+                    raise ValueError(
+                        "Vanilla sparse MLA expects absorbed queries and latent cache, "
+                        "not explicit K/V tensors")
+                return self._mla_forward_sparse(
+                    q,
+                    metadata,
+                    forward_args.latent_cache,
+                    sparse_attn_indices,
+                    forward_args.attention_input_type,
+                )
+            if self.sparse_params is not None:
+                raise ValueError(
+                    "Vanilla sparse MLA requires sparse attention indices")
             if forward_args.attention_input_type == AttentionInputType.context_only:
                 assert k is not None and v is not None
                 return self._mla_forward_context(q, k, v, metadata,

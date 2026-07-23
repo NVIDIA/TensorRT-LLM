@@ -64,6 +64,9 @@ def get_vanilla_sparse_attn_attention_backend(
     from .rocket import RocketVanillaAttention
     if sparse_params.algorithm == "rocket":
         return RocketVanillaAttention
+    elif sparse_params.algorithm == "dsa":
+        from ..vanilla import VanillaAttention
+        return VanillaAttention
     elif sparse_params.algorithm == "minimax_m3":
         return _resolve_minimax_m3_backend_cls(sparse_params)
     else:
