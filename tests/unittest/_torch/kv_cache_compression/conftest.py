@@ -496,3 +496,115 @@ def torch_tri_score_oracle(
                 head_scores.append(position + mlr)
             scores.append(torch.stack(head_scores))
     return scores
+
+
+def make_cute_buffers(
+    *,
+    eviction_mode,
+    layer_pools,
+    max_requests,
+    seq_len,
+    num_q_heads,
+    q_real,
+    q_imag,
+    mlr_coef,
+    freq_scale_sq,
+    omega,
+    offsets,
+    decode_width=None,
+):
+    """Real eviction buffers over one shared page-table slot.
+
+    Shared by the CuTe score and union-fusion tests. Union runners compile
+    only the fused pipeline, so split-reference legs build their own
+    score-only buffers with ``eviction_mode="per_head"`` over the same pools.
+    """
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+        init_eviction_buffers,
+    )
+
+    num_layers = len(layer_pools)
+    return init_eviction_buffers(
+        eviction_mode=eviction_mode,
+        layer_pools=layer_pools,
+        dense_groups=[list(range(num_layers))],
+        dense_layers=list(range(num_layers)),
+        page_representatives=[0],
+        max_requests=max_requests,
+        seq_len=seq_len,
+        num_q_heads=num_q_heads,
+        num_freqs=int(q_real.shape[-1]),
+        keep_count=1,
+        q_real=q_real,
+        q_imag=q_imag,
+        mlr_coef=mlr_coef,
+        freq_scale_sq=freq_scale_sq,
+        offsets=offsets,
+        omega=omega,
+        decode_width=decode_width,
+        layer_group_representative={layer: 0 for layer in range(num_layers)},
+        layer_pool_keys=[("pool", 0)] * num_layers,
+    )
+
+
+def write_block_offsets(bufs, encoded):
+    """Load a test page table into the staged block-offset plane."""
+    bufs.block_offsets_device.zero_()
+    bufs.block_offsets_device[:, : encoded.shape[1], :, : encoded.shape[-1]].copy_(encoded)
+
+
+def stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts):
+    """Stage the per-round score metadata exactly like production.
+
+    The compiled runner reads valid lengths and window starts straight from
+    the staged metadata rows (pointer capture), so stage them like
+    ``stage_eviction_cohort`` does; the width subtraction mirrors what the
+    production phase-gather launch derives on device.
+    """
+    torch.sub(
+        valid_seq_lens[:request_count],
+        token_starts[:request_count],
+        out=valid_widths[:request_count],
+    )
+    bufs.valid_seq_lens_device[:request_count].copy_(valid_seq_lens[:request_count])
+    bufs.token_starts_device[:request_count].copy_(token_starts[:request_count])
+
+
+def launch_split_scores(
+    bufs, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
+):
+    """The production score-only leg plus the decode-window gather
+    (``run_eviction_round``'s per-head sequence, parameterized by count)."""
+    stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts)
+    assert request_count in bufs.runner._compiled
+    bufs.runner.launch(request_count, mean_cos, mean_sin)
+    num_segments = request_count * bufs.num_layers
+    group_size = bufs.num_q_heads // bufs.num_kv_heads
+    source = (
+        bufs.cute_scratch[: bufs.num_kv_heads * 8 * num_segments * bufs.bucket_seq_len]
+        .view(bufs.num_kv_heads, 8, request_count, bufs.num_layers, bufs.bucket_seq_len)[
+            :, :group_size
+        ]
+        .permute(2, 3, 0, 1, 4)
+    )
+    columns = (
+        token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + bufs.gather_columns
+    )
+    columns = columns.clamp_(max=bufs.bucket_seq_len - 1).expand(
+        request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
+    )
+    output = torch.full(
+        (request_count, bufs.num_layers, bufs.num_q_heads, bufs.decode_width),
+        float("nan"),
+        dtype=torch.float32,
+        device=bufs.device,
+    )
+    torch.gather(
+        source,
+        4,
+        columns,
+        out=output.view(
+            request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
+        ),
+    )
+    return output

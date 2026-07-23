@@ -223,6 +223,8 @@ def test_mark_page_tables_consumed_orders_both_manager_streams():
         # variants raise through the same checks).
         ("union_only_per_head", "union"),
         ("draft_kv_factor", "standard key/value cache"),
+        # Same check family on the TARGET cache (MLA SELFKONLY, kv_factor 1).
+        ("target_kv_factor", "standard key/value KV cache"),
         ("full_attention_draft", "full-attention draft"),
         ("callsite_dflash", "standard paged cache compacted together"),
     ],
@@ -256,12 +258,14 @@ def test_draft_admission_gates_raise(gate, match):
         budget=8,
         model_path="/models/test",
         eviction_mode="per_head" if gate == "union_only_per_head" else "union",
-        draft_kv_cache_manager=draft_manager,
+        draft_kv_cache_manager=None if gate == "target_kv_factor" else draft_manager,
     )
     if gate == "draft_kv_factor":
         # Flipping kv_factor after construction exercises TriAttention's own
         # runtime gate.
         draft_manager.kv_factor = 1
+    if gate == "target_kv_factor":
+        manager.kv_cache_manager.kv_factor = 1
 
     with pytest.raises(ValueError, match=match):
         manager._validate_v2_compatibility()

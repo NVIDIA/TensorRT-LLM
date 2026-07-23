@@ -2,15 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """The SM100 TriAttention CuTe scorer (the only score path) vs PyTorch oracles.
 
-Two layers of coverage over the production score leg (buffer metadata
-staging, the compiled runner launch, and the decode-window gather -- the same
-sequence ``run_eviction_round`` fires). The kernel-numerics matrix drives a
-single-layer buffers across the supported page geometries (permuted
-physical pages, ragged valid lengths, GQA group 4 riding the padded MMA tile)
-against inline oracle math. The launch-path matrix drives multi-layer
-buffers across the named production geometries (Qwen3, GPT-OSS, the
-originally validated 128-token-page shape) against the shared pure-PyTorch
-oracle, sweeps request counts up to the buffer capacity, and checks the
+The launch-path matrix drives multi-layer buffers across the named
+production geometries (Qwen3, GPT-OSS, the originally validated
+128-token-page shape) against the shared pure-PyTorch oracle -- permuted
+physical pages, ragged valid lengths, GQA group 4 riding the padded MMA
+tile -- sweeps request counts up to the buffer capacity, and checks the
 per-request decode-width metadata the selection reduce kernels consume. The
 contract test pins the loud-failure behavior: unsupported geometry raises
 from the CuTe runner's own validation at buffer construction -- there is
@@ -20,112 +16,15 @@ no fallback score kernel.
 import pytest
 import torch
 from conftest import encode_block_offsets as _encode_block_offsets
+from conftest import launch_split_scores as _launch_split_scores
+from conftest import make_cute_buffers as _make_cute_buffers
 from conftest import torch_tri_score_oracle as _torch_tri_score_oracle
+from conftest import write_block_offsets as _write_block_offsets
 
 requires_sm100 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
     reason="TriAttention score requires SM100",
 )
-
-
-def _make_score_buffers(
-    *,
-    layer_pools,
-    max_requests,
-    seq_len,
-    num_q_heads,
-    q_real,
-    q_imag,
-    mlr_coef,
-    freq_scale_sq,
-    omega,
-    offsets,
-    decode_width=None,
-    eviction_mode="per_head",
-):
-    """Score-only buffers over one shared page-table slot."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        init_eviction_buffers,
-    )
-
-    num_layers = len(layer_pools)
-    return init_eviction_buffers(
-        eviction_mode=eviction_mode,
-        layer_pools=layer_pools,
-        dense_groups=[list(range(num_layers))],
-        dense_layers=list(range(num_layers)),
-        page_representatives=[0],
-        max_requests=max_requests,
-        seq_len=seq_len,
-        num_q_heads=num_q_heads,
-        num_freqs=int(q_real.shape[-1]),
-        keep_count=1,
-        q_real=q_real,
-        q_imag=q_imag,
-        mlr_coef=mlr_coef,
-        freq_scale_sq=freq_scale_sq,
-        offsets=offsets,
-        omega=omega,
-        decode_width=decode_width,
-        layer_group_representative={layer: 0 for layer in range(num_layers)},
-        layer_pool_keys=[("pool", 0)] * num_layers,
-    )
-
-
-def _write_block_offsets(bufs, encoded):
-    """Load a test page table into the staged block-offset plane."""
-    bufs.block_offsets_device.zero_()
-    bufs.block_offsets_device[:, : encoded.shape[1], :, : encoded.shape[-1]].copy_(encoded)
-
-
-def _launch_split_scores(
-    bufs, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
-):
-    """The production score-only leg: stage metadata, fire the compiled
-    runner, gather each request's decode window (``run_eviction_round``'s
-    per-head sequence, parameterized by the request count)."""
-    num_segments = request_count * bufs.num_layers
-    torch.sub(
-        valid_seq_lens[:request_count],
-        token_starts[:request_count],
-        out=valid_widths[:request_count],
-    )
-    # The compiled runner reads valid lengths and window starts straight from
-    # the staged metadata rows (pointer capture), so stage them exactly like
-    # ``stage_eviction_cohort`` does.
-    bufs.valid_seq_lens_device[:request_count].copy_(valid_seq_lens[:request_count])
-    bufs.token_starts_device[:request_count].copy_(token_starts[:request_count])
-    assert request_count in bufs.runner._compiled
-    bufs.runner.launch(request_count, mean_cos, mean_sin)
-    group_size = bufs.num_q_heads // bufs.num_kv_heads
-    source = (
-        bufs.cute_scratch[: bufs.num_kv_heads * 8 * num_segments * bufs.bucket_seq_len]
-        .view(bufs.num_kv_heads, 8, request_count, bufs.num_layers, bufs.bucket_seq_len)[
-            :, :group_size
-        ]
-        .permute(2, 3, 0, 1, 4)
-    )
-    columns = (
-        token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + bufs.gather_columns
-    )
-    columns = columns.clamp_(max=bufs.bucket_seq_len - 1).expand(
-        request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
-    )
-    output = torch.full(
-        (request_count, bufs.num_layers, bufs.num_q_heads, bufs.decode_width),
-        float("nan"),
-        dtype=torch.float32,
-        device=bufs.device,
-    )
-    torch.gather(
-        source,
-        4,
-        columns,
-        out=output.view(
-            request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
-        ),
-    )
-    return output
 
 
 def _build_case(
@@ -168,7 +67,8 @@ def _build_case(
     omega = torch.rand(num_freqs, device=device) * 0.05
     offsets_t = torch.tensor(offsets, dtype=torch.float32, device=device)
     capacity = page_count * tokens_per_block
-    bufs = _make_score_buffers(
+    bufs = _make_cute_buffers(
+        eviction_mode="per_head",
         layer_pools=pools,
         max_requests=max_requests,
         seq_len=capacity,
@@ -327,7 +227,8 @@ def test_unsupported_geometry_raises_at_buffer_construction():
     ]
     calib = torch.randn(num_layers, 2, num_freqs, device=device)
     with pytest.raises(RuntimeError, match="no other score path exists"):
-        _make_score_buffers(
+        _make_cute_buffers(
+            eviction_mode="per_head",
             layer_pools=pools,
             max_requests=max_requests,
             seq_len=page_count * tokens_per_block,

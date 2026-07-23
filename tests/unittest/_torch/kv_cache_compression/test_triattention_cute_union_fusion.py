@@ -12,122 +12,15 @@ Triton reference copies.
 
 import pytest
 import torch
+from conftest import launch_split_scores as _launch_split_scores
+from conftest import make_cute_buffers as _make_cute_buffers
+from conftest import stage_score_metadata as _stage_score_metadata
+from conftest import write_block_offsets as _write_block_offsets
 
 _SM100_ONLY = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
     reason="TriAttention CuTe kernels require SM100",
 )
-
-
-def _make_union_buffers(
-    *,
-    layer_pools,
-    max_requests,
-    seq_len,
-    num_q_heads,
-    q_real,
-    q_imag,
-    mlr_coef,
-    freq_scale_sq,
-    omega,
-    offsets,
-    decode_width=None,
-    eviction_mode="union",
-):
-    """Buffers over one shared page-table slot (union mode by default).
-
-    Union runners compile only the fused pipeline, so the split reference
-    leg builds its own score-only buffers with ``eviction_mode="per_head"``
-    over the same pools.
-    """
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        init_eviction_buffers,
-    )
-
-    num_layers = len(layer_pools)
-    return init_eviction_buffers(
-        eviction_mode=eviction_mode,
-        layer_pools=layer_pools,
-        dense_groups=[list(range(num_layers))],
-        dense_layers=list(range(num_layers)),
-        page_representatives=[0],
-        max_requests=max_requests,
-        seq_len=seq_len,
-        num_q_heads=num_q_heads,
-        num_freqs=int(q_real.shape[-1]),
-        keep_count=1,
-        q_real=q_real,
-        q_imag=q_imag,
-        mlr_coef=mlr_coef,
-        freq_scale_sq=freq_scale_sq,
-        offsets=offsets,
-        omega=omega,
-        decode_width=decode_width,
-        layer_group_representative={layer: 0 for layer in range(num_layers)},
-        layer_pool_keys=[("pool", 0)] * num_layers,
-    )
-
-
-def _write_block_offsets(bufs, encoded):
-    """Load a test page table into the staged block-offset plane."""
-    bufs.block_offsets_device.zero_()
-    bufs.block_offsets_device[:, : encoded.shape[1], :, : encoded.shape[-1]].copy_(encoded)
-
-
-def _stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts):
-    """Stage the per-round score metadata exactly like production.
-
-    The compiled runner reads valid lengths and window starts straight from
-    the staged metadata rows (pointer capture), so stage them like
-    ``stage_eviction_cohort`` does; the width subtraction mirrors what the
-    production phase-gather launch derives on device.
-    """
-    torch.sub(
-        valid_seq_lens[:request_count],
-        token_starts[:request_count],
-        out=valid_widths[:request_count],
-    )
-    bufs.valid_seq_lens_device[:request_count].copy_(valid_seq_lens[:request_count])
-    bufs.token_starts_device[:request_count].copy_(token_starts[:request_count])
-
-
-def _launch_split_scores(
-    bufs, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
-):
-    """The production score-only leg plus the decode-window gather."""
-    _stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts)
-    assert request_count in bufs.runner._compiled
-    bufs.runner.launch(request_count, mean_cos, mean_sin)
-    num_segments = request_count * bufs.num_layers
-    group_size = bufs.num_q_heads // bufs.num_kv_heads
-    source = (
-        bufs.cute_scratch[: bufs.num_kv_heads * 8 * num_segments * bufs.bucket_seq_len]
-        .view(bufs.num_kv_heads, 8, request_count, bufs.num_layers, bufs.bucket_seq_len)[
-            :, :group_size
-        ]
-        .permute(2, 3, 0, 1, 4)
-    )
-    columns = (
-        token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + bufs.gather_columns
-    )
-    columns = columns.clamp_(max=bufs.bucket_seq_len - 1).expand(
-        request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
-    )
-    output = torch.full(
-        (request_count, bufs.num_layers, bufs.num_q_heads, bufs.decode_width),
-        float("nan"),
-        dtype=torch.float32,
-        device=bufs.device,
-    )
-    torch.gather(
-        source,
-        4,
-        columns,
-        out=output.view(
-            request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
-        ),
-    )
-    return output
 
 
 def _launch_union_fusion(
@@ -164,7 +57,33 @@ def _reference_union_scores(scores_rows: torch.Tensor, valid_widths: torch.Tenso
     return combined
 
 
-def _check_union_fusion_matches_split_pipeline(
+@_SM100_ONLY
+@pytest.mark.parametrize(
+    "tokens_per_block,num_freqs,num_q_heads,score_starts,valid_lens",
+    [
+        # Representative rows per axis: the originally validated geometry
+        # (32 freqs, GQA group 8) at both page sizes with full-range and
+        # ragged page-aligned starts.
+        (32, 32, 8, 0, None),
+        (128, 32, 8, 128, [250, 230]),
+        # Qwen3 geometry: 128-element K rows (64 frequencies) and GQA group
+        # 4, which rides the MMA tile N=8 with zeroed padding columns.
+        (32, 64, 4, 37, [250, 198]),
+        (128, 64, 4, 128, [250, 230]),
+        # GQA group 4 with 32 frequencies: head columns pad up to the MMA
+        # tile N=8 with zeroed weights, the partial-stats epilogue writes
+        # only the real heads' rows, and the union finalizer maps head rows
+        # onto the padded score planes.
+        (128, 32, 4, 0, None),
+        # Mixed-prompt cohorts: each request scores its own window (one
+        # start mid-tile, one page-aligned) — the case the fused pipeline
+        # previously declined.
+        (32, 32, 8, [37, 128], [250, 198]),
+        (32, 64, 4, [37, 128], None),
+        (128, 64, 4, [37, 128], [250, 230]),
+    ],
+)
+def test_union_fusion_matches_split_pipeline(
     tokens_per_block: int,
     num_freqs: int,
     num_q_heads: int,
@@ -204,7 +123,7 @@ def _check_union_fusion_matches_split_pipeline(
     mean_cos = torch.cos(phase).mean(dim=1).contiguous()
     mean_sin = torch.sin(phase).mean(dim=1).contiguous()
 
-    bufs = _make_union_buffers(
+    common = dict(
         layer_pools=[pool],
         max_requests=2,
         seq_len=seq_len,
@@ -216,19 +135,9 @@ def _check_union_fusion_matches_split_pipeline(
         omega=omega,
         offsets=offsets,
     )
-    ref_bufs = _make_union_buffers(
-        layer_pools=[pool],
-        max_requests=2,
-        seq_len=seq_len,
-        num_q_heads=num_q_heads,
-        q_real=q_real,
-        q_imag=q_imag,
-        mlr_coef=mlr_coef,
-        freq_scale_sq=freq_scale_sq,
-        omega=omega,
-        offsets=offsets,
-        eviction_mode="per_head",
-    )
+    bufs = _make_cute_buffers(eviction_mode="union", **common)
+    # The split reference leg runs on its own score-only buffers.
+    ref_bufs = _make_cute_buffers(eviction_mode="per_head", **common)
     k_plane = [2 * page for page in page_permutation]
     v_plane = [2 * page + 1 for page in page_permutation]
     encoded = torch.tensor(
@@ -284,44 +193,6 @@ def _check_union_fusion_matches_split_pipeline(
             rtol=5.0e-3,
             atol=5.0e-3,
         )
-
-
-@_SM100_ONLY
-@pytest.mark.parametrize(
-    "tokens_per_block,num_freqs,num_q_heads,score_starts,valid_lens",
-    [
-        # Representative rows per axis: the originally validated geometry
-        # (32 freqs, GQA group 8) at both page sizes with full-range and
-        # ragged page-aligned starts.
-        (32, 32, 8, 0, None),
-        (128, 32, 8, 128, [250, 230]),
-        # Qwen3 geometry: 128-element K rows (64 frequencies) and GQA group
-        # 4, which rides the MMA tile N=8 with zeroed padding columns.
-        (32, 64, 4, 37, [250, 198]),
-        (128, 64, 4, 128, [250, 230]),
-        # GQA group 4 with 32 frequencies: head columns pad up to the MMA
-        # tile N=8 with zeroed weights, the partial-stats epilogue writes
-        # only the real heads' rows, and the union finalizer maps head rows
-        # onto the padded score planes.
-        (128, 32, 4, 0, None),
-        # Mixed-prompt cohorts: each request scores its own window (one
-        # start mid-tile, one page-aligned) — the case the fused pipeline
-        # previously declined.
-        (32, 32, 8, [37, 128], [250, 198]),
-        (32, 64, 4, [37, 128], None),
-        (128, 64, 4, [37, 128], [250, 230]),
-    ],
-)
-def test_union_fusion_matches_split_pipeline(
-    tokens_per_block: int,
-    num_freqs: int,
-    num_q_heads: int,
-    score_starts: "int | list",
-    valid_lens: "list | None",
-) -> None:
-    _check_union_fusion_matches_split_pipeline(
-        tokens_per_block, num_freqs, num_q_heads, score_starts, valid_lens
-    )
 
 
 @_SM100_ONLY
@@ -418,9 +289,8 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     mean_cos = torch.cos(phase).mean(dim=1).contiguous()
     mean_sin = torch.sin(phase).mean(dim=1).contiguous()
 
-    bufs = _make_union_buffers(
+    common = dict(
         layer_pools=layer_pools,
-        max_requests=max_requests,
         seq_len=seq_len,
         num_q_heads=num_q_heads,
         q_real=q_real,
@@ -431,23 +301,11 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
         offsets=offsets,
         decode_width=decode_window,
     )
+    bufs = _make_cute_buffers(eviction_mode="union", max_requests=max_requests, **common)
     assert (bufs.cute_scratch.numel() > 2**31) == (max_requests == 64)
     # The split reference leg only scores the two live requests; its own
     # small per_head buffers keep the giant scratch on the union side.
-    ref_bufs = _make_union_buffers(
-        layer_pools=layer_pools,
-        max_requests=request_count,
-        seq_len=seq_len,
-        num_q_heads=num_q_heads,
-        q_real=q_real,
-        q_imag=q_imag,
-        mlr_coef=mlr_coef,
-        freq_scale_sq=freq_scale_sq,
-        omega=omega,
-        offsets=offsets,
-        decode_width=decode_window,
-        eviction_mode="per_head",
-    )
+    ref_bufs = _make_cute_buffers(eviction_mode="per_head", max_requests=request_count, **common)
     page_ids = torch.arange(num_pages, dtype=torch.int32, device=device)
     for staged in (bufs, ref_bufs):
         staged.block_offsets_device.zero_()

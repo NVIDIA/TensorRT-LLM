@@ -33,7 +33,6 @@ import pytest
 import torch
 from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_bare_staging as _make_bare_staging
-from conftest import make_buffer_stubs as _make_buffer_stubs
 from conftest import make_fake_v2 as _make_fake_v2
 from conftest import make_request as _make_request
 from conftest import make_staging_manager as _make_staging_manager
@@ -533,13 +532,6 @@ class TestEvictionLifecycle:
         assert manager._request_states[7]["confirmed_kv_length"] == physical_confirmed
         cache.resize.assert_not_called()
 
-    def test_mla_selfkonly_cache_is_rejected(self):
-        manager = _make_triattention()
-        manager.kv_cache_manager.kv_factor = 1
-
-        with pytest.raises(ValueError, match="standard key/value KV cache"):
-            manager._validate_v2_compatibility()
-
     def test_one_model_draft_co_compression_contract_is_accepted(self):
         # Co-compression keeps the draft's physical length equal to the
         # target's, so a draft with a smaller max_seq_len than the target's
@@ -605,38 +597,6 @@ class TestFixedScoreMetadata:
         # normalize_scores=False is rejected loudly at construction.
         with pytest.raises(ValueError, match="normalize_scores=True"):
             _make_triattention(budget=4, eviction_mode="union", normalize_scores=False)
-
-    def test_buffer_build_receives_mode_and_capacity_kwargs(self):
-        # Mode/phase/pool-key threading and cached reuse are covered by the
-        # buffer-rebuild superset test in
-        # test_triattention_draft_cocompaction.py.
-        from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
-
-        manager = _make_triattention(budget=4)
-        # The buffers follow the executor limits: eight requests (max batch
-        # size) by 260 decode tokens (budget plus two eviction periods).
-        layout, buffers = _make_buffer_stubs(manager)
-        prepared = [
-            _prepared_eviction(
-                _make_request(7),
-                request_id=7,
-                seq_len=8,
-                expected_keep_count=4,
-            )
-        ]
-
-        with mock.patch.object(
-            module,
-            "init_eviction_buffers",
-            return_value=buffers,
-        ) as build_buffers:
-            resources = manager._buffers_for(layout, prepared)
-
-        assert resources is buffers
-        kwargs = build_buffers.call_args.kwargs
-        assert kwargs["eviction_mode"] == "union"
-        assert kwargs["max_requests"] == 8
-        assert kwargs["decode_width"] == 260
 
     def test_stage_rejects_int32_overflowing_round_starts(self):
         # Round starts past the int32 metadata range fail loudly (in the host
