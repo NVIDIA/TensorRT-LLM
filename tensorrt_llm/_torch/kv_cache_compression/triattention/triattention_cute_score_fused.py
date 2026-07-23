@@ -1,13 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SM100 CuTe-DSL scorer for the TriAttention mean-score path.
-
-This is the ONLY score implementation: the per-head modes launch its score-only
-entry and union eviction launches its fused score+stats+union pipeline. It
-uses split real/imag TMA loads, BF16 and FP16 compensated UMMA, sqrt FTZ,
-and producer-only page-ID lookahead. Geometry outside the exact contract
-raises loudly at kernel construction; there is no fallback path.
-"""
+"""SM100 CuTe-DSL scorer for the TriAttention mean-score path (score-only and fused
+score+stats+union entries); geometry outside the exact contract raises at construction."""
 
 from __future__ import annotations
 
@@ -28,12 +22,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 @dsl_user_op
 def _sqrt_approx_ftz(value: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
-    """Emit the approximate FTZ square root as inline PTX.
-
-    ``cute.math.sqrt``'s fast-sqrt keyword spelling varies across CuTe DSL
-    releases; the inline-asm form is release-independent and matches the
-    ``sqrt.approx.ftz.f32`` the fused score path has always used.
-    """
+    """Inline-PTX sqrt.approx.ftz.f32 (cute.math.sqrt's fast-sqrt kwarg varies across releases)."""
     return cutlass.Float32(
         llvm.inline_asm(
             T.f32(),
@@ -50,24 +39,19 @@ def _sqrt_approx_ftz(value: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Fl
 
 
 CTA_M = 128
-# Minimum tcgen05 MMA tile N: GQA groups below 8 ride zero-padded head
-# columns (see the weight-builder loop and the partial-stats epilogue).
+# Minimum tcgen05 MMA tile N; GQA groups below 8 ride zero-padded head columns.
 N = 8
 THREADS = 256
 EPILOGUE_THREADS = 128
 RAW_PAGE_BUFFERS = 2
-# partial_stats is a flat [stats_row, page_shard, {count, mean, m2}] record
-# array (stats_row = segment * num_q_heads + q_head); the selection finalizer
-# imports these field constants.
+# partial_stats: flat [stats_row, page_shard, {count, mean, m2}]; stats_row=segment*num_q_heads+q_head.
 STATS_FIELDS = 3
 STATS_MEAN = 1
 STATS_M2 = 2
-# Stats smem scratch: N first-tile score origins, then one (sum, square-sum)
-# pair per (epilogue warp, padded head column).
+# Stats smem scratch: N score origins + one (sum, square-sum) pair per (warp, head column).
 STATS_ORIGIN_SLOTS = N
 STATS_SCRATCH_ELEMENTS = STATS_ORIGIN_SLOTS + (EPILOGUE_THREADS // 32) * N * 2
-# HND K pools interleave K/V planes: staged block-offset entries encode
-# physical_page * K_PLANES_PER_POOL_PAGE + plane.
+# Staged block-offset entries encode physical_page * K_PLANES_PER_POOL_PAGE + plane.
 K_PLANES_PER_POOL_PAGE = 2
 
 RAW_K_VECTOR_ELEMENTS = 8
@@ -108,9 +92,7 @@ class _TriAttentionScoreKernel:
         if tokens_per_block not in (32, 128):
             raise ValueError("TriAttention CuTe score requires 32- or 128-token pages")
         if tokens_per_block > CTA_M:
-            # The schedule assumes one page never spans multiple compute
-            # tiles (the retired page_half loop generalized this; both
-            # supported page sizes make it a single iteration).
+            # One page never spans multiple compute tiles.
             raise ValueError("TriAttention CuTe score requires pages within one compute tile")
         if num_q_heads % num_kv_heads or num_q_heads // num_kv_heads not in (4, 8):
             raise ValueError("TriAttention CuTe score requires GQA group 4 or 8")
@@ -128,8 +110,7 @@ class _TriAttentionScoreKernel:
         # cos/sin/mlr coefficient planes per frequency.
         self.k_coeff = 3 * num_freqs
         self.tokens_per_block = tokens_per_block
-        # One compute tile = one page (128-token pages) or four page
-        # fragments (32-token pages), one TMA box each.
+        # One tile = one page (128-token) or four page fragments (32-token), one TMA box each.
         self.box_tokens = min(CTA_M, tokens_per_block)
         self.fragments_per_phase = CTA_M // self.box_tokens
         self.pages_per_tile = self.fragments_per_phase
@@ -139,9 +120,7 @@ class _TriAttentionScoreKernel:
         # Producer staging constants baked into the generated code.
         self.prefetch_depth = 4
         self.raw_tma_feature_extent = num_freqs
-        # Barrier transaction bytes for one phase: the full 128-token tile
-        # of one coefficient plane, regardless of how many page fragments
-        # deliver it.
+        # Barrier tx bytes per phase: the full 128-token tile of one coefficient plane.
         self.raw_tma_copy_bytes = CTA_M * num_freqs * (cutlass.BFloat16.width // 8)
         self.raw_tma_pipeline_stages = 2 * RAW_PAGE_BUFFERS if write_partial_stats else 1
         self.accumulator_pipeline_stages = 1
@@ -229,10 +208,7 @@ class _TriAttentionScoreKernel:
         shared_partition,
         stage_args,
     ):
-        """One raw-K band's fragment copies into an acquired pipeline stage.
-
-        The caller owns the pipeline handshake (acquire before, advance after).
-        """
+        """Stage one raw-K band's fragment copies (caller owns the pipeline acquire/advance)."""
         raw_tma_atom, raw_tma_global_partition, kv_head, raw_tma_descriptor_ptr = stage_args
         for fragment in cutlass.range_constexpr(self.fragments_per_phase):
             fragment_page = first_page
@@ -298,8 +274,7 @@ class _TriAttentionScoreKernel:
             tcgen05.CtaGroup.ONE,
             self.mma_tiler[:2],
         )
-        # One real + one imaginary CTA_M x num_freqs bf16 stage per
-        # raw-page buffer; swizzle follows the num_freqs row width.
+        # Real + imag bf16 stages per raw-page buffer; swizzle follows the num_freqs row width.
         raw_bf16_direct_a_smem_layout = sm100_utils.make_smem_layout_a(
             raw_bf16_tiled_mma,
             (CTA_M, N, self.num_freqs),
@@ -363,8 +338,7 @@ class _TriAttentionScoreKernel:
             1,
         )
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
-        # One accumulator slot; the explicit slot mode keeps the shared
-        # producer/consumer slicing protocol and folds away in codegen.
+        # One accumulator slot; explicit slot mode keeps the producer/consumer slicing protocol.
         self.num_accumulator_slots = self.accumulator_pipeline_stages
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_accumulator_slots))
         self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
@@ -419,9 +393,7 @@ class _TriAttentionScoreKernel:
             ]
 
         self.shared_storage = SharedStorage
-        # 64-bit: at large request counts this product exceeds 2^31 (the
-        # score scratch spans request*layer segments of seq_len columns), so
-        # the score-plane stride must reach the kernel as Int64.
+        # The score-plane stride product can exceed 2^31, so it must reach the kernel as Int64.
         sum_seq = cutlass.Int64(request_count * self.num_layers * self.seq_len)
         num_ctas = request_count * self.num_layers * self.num_kv_heads * self.page_shards
         self.kernel(
@@ -534,16 +506,13 @@ class _TriAttentionScoreKernel:
         cpasync_raw_k_imag = cpasync_raw_k_0[(None, None, None, 1)]
         cpasync_raw_k_real_next = cpasync_raw_k_0[(None, None, None, 2)]
         cpasync_raw_k_imag_next = cpasync_raw_k_0[(None, None, None, 3)]
-        # Each stage slice retains the swizzled smem pointer flags.  Reuse
-        # only the feature-first outer mapping for the corresponding TMA
-        # destination so the swizzle is not applied twice.
+        # Use only the outer mapping for the TMA destination so the swizzle is not applied twice.
         raw_tma_source_tiles = cute.local_tile(
             raw_tma_source,
             (self.raw_tma_feature_extent, self.box_tokens),
             coord=(None, None, None),
         )
-        # One smem view/TMA partition per page fragment; fragment offsets
-        # are whole swizzle periods.
+        # One smem view/TMA partition per fragment; fragment offsets are whole swizzle periods.
         raw_tma_shared_partition_real = []
         raw_tma_shared_partition_imag = []
         raw_tma_shared_partition_real_next = []
@@ -608,8 +577,7 @@ class _TriAttentionScoreKernel:
             (raw_tma_descriptors.iterator + layer_id * TMA_DESCRIPTOR_QWORDS).align(128),
             cute.AddressSpace.generic,
         )
-        # Trace-time invariants of every raw-band stage copy (see
-        # _stage_raw_band_copies); bound once, unpacked in the helper.
+        # Trace-time invariants of every raw-band stage copy; bound once, unpacked in the helper.
         raw_stage_args = (raw_tma_atom, raw_tma_global_partition, kv_head, raw_tma_descriptor_ptr)
         sRawBf16B0 = storage.sRawBf16B0.get_tensor(
             raw_bf16_b_smem_layout.outer,
@@ -636,9 +604,7 @@ class _TriAttentionScoreKernel:
         physical_fragments_arg = None
         prefetched_fragments_arg = None
         if cutlass.const_expr(self.fragments_per_phase > 1):
-            # Per-fragment page-id registers for multi-page compute tiles.
-            # Slot 0 is unused: fragment 0 keeps the scalar broadcast
-            # registers of the validated single-fragment schedule.
+            # Per-fragment page-id registers; slot 0 unused (fragment 0 uses the scalar registers).
             producer_prefetched_page_ids_lane0 = cute.make_rmem_tensor(
                 (self.pages_per_tile,), cutlass.Int32
             )
@@ -651,16 +617,14 @@ class _TriAttentionScoreKernel:
         if cutlass.dynamic_expr(shard_has_page):
             if warp_idx == self.producer_warp_id:
                 if lane_idx == 0:
-                    # The staged K-plane entries encode physical_page *
-                    # kv_factor (2); decode to the pool page index here.
+                    # Staged entries encode physical_page * kv_factor; decode to the pool page.
                     producer_prefetched_page_id_lane0 = (
                         cutlass.Int32(page_ids[page_off + tile_index * self.pages_per_tile])
                         // K_PLANES_PER_POOL_PAGE
                     )
                     if cutlass.const_expr(self.fragments_per_phase > 1):
                         for fragment in cutlass.range_constexpr(1, self.pages_per_tile):
-                            # Clamp the tail fragment's page so the TMA never
-                            # dereferences an unstaged block entry.
+                            # Clamp tail-fragment pages so the TMA never reads an unstaged entry.
                             fragment_page_id = producer_prefetched_page_id_lane0
                             if tile_start_token + fragment * self.box_tokens < valid_seq_len:
                                 fragment_page_id = (
@@ -716,8 +680,7 @@ class _TriAttentionScoreKernel:
             num_threads=EPILOGUE_THREADS,
         )
         cute.arch.mbarrier_init_fence()
-        # Per-(head, frequency) score coefficients, split into bf16/fp16
-        # value+residual pairs.
+        # Per-(head, frequency) score coefficients, split into bf16/fp16 value+residual pairs.
         for weight_round in cutlass.range_constexpr(N * self.k_coeff // THREADS):
             linear_index = tidx + weight_round * THREADS
             qg = linear_index // self.k_coeff
@@ -725,8 +688,7 @@ class _TriAttentionScoreKernel:
             coefficient_kind = feature // self.num_freqs
             frequency = feature % self.num_freqs
             mean_offset = req_id * self.num_freqs + frequency
-            # Padded GQA columns read the group's first head and force
-            # zero coefficients.
+            # Padded GQA columns read the group's first head and force zero coefficients.
             qg_read = qg
             if cutlass.const_expr(self.group_size < N):
                 if qg_read >= self.group_size:
@@ -903,9 +865,7 @@ class _TriAttentionScoreKernel:
                         )
                         if cutlass.const_expr(self.fragments_per_phase > 1):
                             for fragment in cutlass.range_constexpr(1, self.pages_per_tile):
-                                # Same tail-tile clamp as the initial
-                                # prefetch: fall back to the first
-                                # fragment's page.
+                                # Tail-tile clamp: fall back to the first fragment's page.
                                 next_fragment_page_id = next_page_id_lane0
                                 if (
                                     next_tile_start_token + fragment * self.box_tokens
@@ -965,9 +925,7 @@ class _TriAttentionScoreKernel:
                                 0,
                             )
                     if cutlass.dynamic_expr(prefetch_next_raw):
-                        # ONE acquire/advance per band is SHARED across the
-                        # dynamic destination arms (current vs next buffer);
-                        # only the smem destination differs per arm.
+                        # ONE acquire/advance per band, shared across the dynamic destination arms.
                         next_raw_page_buffer = (raw_page_buffer + 1) % RAW_PAGE_BUFFERS
                         raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
                         if cutlass.dynamic_expr(next_raw_page_buffer == 0):
@@ -1013,12 +971,10 @@ class _TriAttentionScoreKernel:
                                 raw_stage_args,
                             )
                         raw_tma_producer_state.advance()
-            # Each of the 32 lanes stages one frequency per pass; 64-
-            # frequency heads take two passes.
+            # Each lane stages one frequency per pass; 64-frequency heads take two passes.
             for freq_rep in cutlass.range_constexpr(self.num_freqs // 32):
                 frequency = lane_idx + 32 * freq_rep
-                # Stage prefetch_depth independent token loads from the
-                # raw-K shared buffer before consuming any of them.
+                # Stage prefetch_depth independent token loads before consuming any of them.
                 for token_base in cutlass.range(
                     0,
                     CTA_M // (THREADS // 32),
@@ -1109,9 +1065,7 @@ class _TriAttentionScoreKernel:
                         tCrRawBf16B1[(None, None, imag_b_block, 0)],
                         tCtAcc,
                     )
-                # Compensated FP16 magnitude accumulation:
-                # |K|*coeff = A0*B0 + A0*B1 + A1*B0 (the A1*B1 term is
-                # below fp32 accumulation resolution and dropped).
+                # Compensated FP16 magnitude: |K|*coeff = A0*B0 + A0*B1 + A1*B0 (A1*B1 dropped).
                 magnitude_lo_tiled_mma.set(
                     tcgen05.Field.ACCUMULATE,
                     True,
@@ -1146,13 +1100,10 @@ class _TriAttentionScoreKernel:
                     cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
             acc_pipeline.consumer_wait(acc_consumer_state)
             if cutlass.const_expr(self.write_partial_stats):
-                # The alternate raw-page buffer was filled while this
-                # page's UMMA completed. Release only the current imag
-                # phase after all of its asynchronous consumers finish.
+                # Release only the current imag phase after all of its async consumers finish.
                 raw_tma_pipeline.consumer_release(raw_tma_consumer_state)
                 raw_tma_consumer_state.advance()
-            # Every term multiplying sum_seq must stay 64-bit (the plane
-            # stride can exceed 2^31; the host audit bounds the head fold).
+            # Every term multiplying sum_seq must stay 64-bit; the plane stride can exceed 2^31.
             output_offset = cutlass.Int64(kv_head * N) * sum_seq + out_base + tile_start_token
             page_output = cute.make_tensor(
                 output.iterator + output_offset,
@@ -1265,8 +1216,7 @@ class _TriAttentionScoreKernel:
                     sStats[stats_scratch_base + 1] = stats_square_sum
             cute.arch.barrier()
             if warp_idx == 0:
-                # Only real heads' statistics merge into the compact row
-                # layout (row = segment * num_q_heads + q_head).
+                # Only real heads merge into the compact rows (row = segment*num_q_heads + q_head).
                 if lane_idx < self.group_size:
                     stats_sum = cutlass.Float32(0.0)
                     stats_square_sum = cutlass.Float32(0.0)
@@ -1318,7 +1268,6 @@ def _encode_tma_descriptors(
     num_freqs: int,
     tokens_per_block: int,
 ) -> torch.Tensor:
-    """Encode one immutable feature-first TensorMap per layer index."""
     anchor = layer_pools[layer_indices[0]]
     active_layers = set(layer_indices)
     uint32 = cuda.cuuint32_t
@@ -1353,8 +1302,7 @@ def _encode_tma_descriptors(
             global_dims.append(int(pool.shape[0]))
             global_strides_bytes.append(s_page * pool.element_size())
         tensor_rank = len(global_dims)
-        # One TMA box covers one coefficient plane of one page fragment
-        # (the whole page for the validated 128-token geometry).
+        # One TMA box covers one coefficient plane of one page fragment.
         box_dims = [num_freqs, min(CTA_M, tokens_per_block)] + [1] * (tensor_rank - 2)
         status, tensor_map = cuda.cuTensorMapEncodeTiled(
             cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
@@ -1365,9 +1313,7 @@ def _encode_tma_descriptors(
             [uint32(value) for value in box_dims],
             [uint32(1) for _ in range(tensor_rank)],
             cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
-            # The swizzle must match the smem layout the TMA lands in; the
-            # sm100 helpers pick it from the inner-row byte count (one
-            # coefficient plane: num_freqs bf16 elements).
+            # The swizzle must match the destination smem layout (inner row = num_freqs bf16).
             (
                 cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_64B
                 if num_freqs * 2 == 64
@@ -1444,16 +1390,13 @@ class TriAttentionCuteScoreRunner:
     ) -> None:
         self.max_requests = int(max_requests)
         self.num_layers = int(num_layers)
-        # The score window start is a per-request runtime input
-        # (``token_starts``), so the widest window — the whole bucket —
-        # sizes every start-dependent buffer.
+        # The widest score window (the whole bucket) sizes every start-dependent buffer.
         self.width = int(seq_len)
         self.num_q_heads = int(num_q_heads)
         self.num_kv_heads = int(num_kv_heads)
         self.sm_count = int(torch.cuda.get_device_properties(output.device).multi_processor_count)
         self.enable_partial_stats = bool(enable_partial_stats)
-        # One [stats_row, page_shard, {count, mean, m2}] record array (see the
-        # STATS_FIELDS constants above).
+        # One [stats_row, page_shard, {count, mean, m2}] record array.
         partial_stats_elements = (
             max_requests * num_layers * num_q_heads * SMALL_WORKLOAD_PAGE_SHARDS * STATS_FIELDS
             if self.enable_partial_stats
@@ -1486,9 +1429,7 @@ class TriAttentionCuteScoreRunner:
             layer_pools[layer_indices[0]],
             self.descriptors,
         )
-        # valid_seq_lens/token_starts are row views into the staged metadata
-        # table (byte offset 4*(max_requests+1)*row): only 4-byte aligned,
-        # and only ever read as per-CTA scalars.
+        # valid_seq_lens/token_starts are only 4-byte-aligned row views, read as per-CTA scalars.
         prefix_aligns = (16, 16, 16, 16, 4, 16, 4, 16, 16, 16)
         self._cute_prefix = tuple(
             _to_cute(tensor, assumed_align=align)
@@ -1543,8 +1484,7 @@ class TriAttentionCuteScoreRunner:
         variants = [(1, SMALL_WORKLOAD_PAGE_SHARDS)]
         if max_requests > 1:
             variants.append((max_requests, 2))
-        # Per-head runners compile the score-only entry; the union runner
-        # only its fused stats+union pipeline.
+        # Per-head runners compile the score-only entry; the union runner the fused pipeline.
         kernel_kwargs = dict(
             num_layers=num_layers,
             seq_len=seq_len,
@@ -1596,9 +1536,7 @@ class TriAttentionCuteScoreRunner:
             small = compiled_entries.get(1)
             large = compiled_entries.get(max_requests)
             for request_count in range(1, max_requests + 1):
-                # Shard-pick heuristic: give small cohorts the extra page
-                # shard while the 2-shard grid stays under two waves
-                # (2 * sm_count CTAs); larger cohorts already fill the GPU.
+                # Give small cohorts the extra shard while the 2-shard grid stays under two waves.
                 two_shard_ctas = request_count * num_layers * num_kv_heads * 2
                 use_extra_score_shard = two_shard_ctas < 2 * self.sm_count
                 compiled_entries[request_count] = small if use_extra_score_shard else large
@@ -1639,8 +1577,7 @@ class TriAttentionCuteScoreRunner:
                                 num_layers=num_layers,
                                 seq_len=seq_len,
                                 num_q_heads=num_q_heads,
-                                # The finalizer maps real head rows onto the
-                                # N=8-padded score planes.
+                                # The finalizer maps real head rows onto N=8-padded planes.
                                 num_kv_heads=num_kv_heads,
                                 page_shards=page_shards,
                                 tokens_per_lane=tokens_per_lane,

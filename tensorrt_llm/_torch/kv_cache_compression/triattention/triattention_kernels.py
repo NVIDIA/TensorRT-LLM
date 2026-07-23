@@ -1,11 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Triton kernels, launch helpers, and mean-phase table builders for TriAttention.
-
-Scoring itself runs through the SM100 CuTe pack in
-``triattention_cute_score_fused.py``. House rules: fp32 math, int64 for any
-flat offset that can exceed 2^31, mask every ragged tail, kernels vendored here.
-"""
+"""Triton kernels, launch helpers, and mean-phase table builders for TriAttention
+(fp32 math; int64 past-2^31 flat offsets; masked ragged tails; scoring in the CuTe pack)."""
 
 from __future__ import annotations
 
@@ -15,16 +11,13 @@ import torch
 import triton
 import triton.language as tl
 
-# --------------------------------------------------------------------------- #
-# Mean-phase table: RoPE-style position table of mean trig phases.            #
-# --------------------------------------------------------------------------- #
+# ---- Mean-phase table: RoPE-style position table of mean trig phases ----
 
 
 # Positions past this row count are not exactly representable in fp32.
 _MEAN_PHASE_MAX_ROWS = 1 << 24
 
-# Score z-normalization epsilon, shared with the CuTe union pipeline. Plain
-# float: the CuTe DSL traces it; the Triton kernel takes it as a constexpr arg.
+# Score z-normalization epsilon; must stay a plain float (the CuTe DSL traces it).
 STD_EPSILON = 1e-6
 
 
@@ -45,8 +38,7 @@ def _gather_mean_phase_kernel(
     F_BLOCK: tl.constexpr,
     HAS_SWA: tl.constexpr,
 ):
-    """Copy each request's phase-table row; derive valid widths and, with
-    SWA layers, the rebased SWA landing positions in the same launch."""
+    """Copy each request's phase-table row; derive valid widths and SWA landing bases."""
     request = tl.program_id(0)
     frequency = tl.arange(0, F_BLOCK)
     frequency_mask = frequency < NUM_FREQS
@@ -91,9 +83,7 @@ def grow_mean_phase_table(phase: Dict[str, object], rows: int) -> None:
     phase["rows"] = target
 
 
-# --------------------------------------------------------------------------- #
-# Selection: combine scores per mode, then finalize the top-k set.            #
-# --------------------------------------------------------------------------- #
+# ---- Selection: combine scores per mode, then finalize the top-k set ----
 
 
 @triton.jit
@@ -150,11 +140,7 @@ def _score_per_head_reduce_kernel(
     NORMALIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Reduce query-head score rows into one selector row per KV-head domain.
-
-    per_layer: row (layer, kv_head) = max over the KV head's query group;
-    otherwise row kv_head = mean over layers of that per-layer group max.
-    """
+    """Reduce query-head score rows into one selector row per KV-head domain."""
     request = tl.program_id(0)
     selection_row = tl.program_id(1)
     token_block = tl.program_id(2)
@@ -265,9 +251,7 @@ def prepare_per_head_scores(
     )
 
 
-# --------------------------------------------------------------------------- #
-# Compaction: pack the kept ordinals into per-request move indices.           #
-# --------------------------------------------------------------------------- #
+# ---- Compaction: pack the kept ordinals into per-request move indices ----
 
 
 # Settle/pack launch shape, shared by every launch site.
@@ -301,15 +285,8 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     HAS_SETTLE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Settle one selection row's ties, then pack its compaction move sources.
-
-    One program per (request, selection row): settle emits the kept ordinals
-    (lowest-index-wins ties, prompt-rebased), pack writes the move sources
-    (kept ordinals + protected tail + SWA rows). ``HAS_SETTLE=False`` packs
-    pre-settled ordinals from ``output_indices`` (draft co-compaction).
-    Emission order is load-bearing: the C++ compact requires increasing
-    ordinals with ``destination_bases[request] + move <= source[move]``.
-    """
+    """Settle one selection row's ties and pack its move sources (increasing
+    kept ordinals; C++ in-place copy contract)."""
     request = tl.program_id(0)
     selection_domain = tl.program_id(1)
     row = request * SELECTION_ROWS + selection_domain
@@ -329,8 +306,7 @@ def _settle_ties_and_pack_compaction_sources_kernel(
                 mask=selected_mask,
                 other=0,
             )
-            # Short rows arrive padded with -1 sentinels from the top-k;
-            # masked out so no lane dereferences ``row_scores - 1``.
+            # Mask the top-k's -1 pad sentinels so no lane dereferences ``row_scores - 1``.
             selected_valid = selected_mask & (token_index >= 0)
             selected_score = tl.load(
                 row_scores + token_index,

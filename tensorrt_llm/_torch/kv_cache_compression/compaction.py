@@ -31,8 +31,6 @@ def _make_move_indices(
     request_count: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Packed source-index buffer sized for the widest per-request moves
-    (the move offsets are caller-owned rows)."""
     return torch.empty(
         (*index_prefix, moves_per_request * request_count), dtype=torch.int32, device=device
     )
@@ -44,9 +42,7 @@ def _compact_groups(
     device: torch.device,
     per_layer_slots: Optional[Dict[int, int]] = None,
 ) -> Tuple[Dict[str, object], ...]:
-    """Batch layers into one ``sparse_kv_cache_compact_layers`` launch per
-    uniform V2 pool. ``per_layer_slots`` maps layers to selection rows
-    (per-layer eviction only)."""
+    """Batch layers into one ``sparse_kv_cache_compact_layers`` launch per uniform V2 pool."""
     grouped = OrderedDict()
     for layer, pool, page_table in entries:
         key = (

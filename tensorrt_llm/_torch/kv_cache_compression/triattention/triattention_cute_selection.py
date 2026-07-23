@@ -28,9 +28,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from .triattention_cute_score_fused import STATS_FIELDS as _STATS_FIELDS
 from .triattention_cute_score_fused import STATS_M2, STATS_MEAN
 
-# Single-sourced constants: the fused score file owns the padded-head tile
-# (N) and the partial-stats record layout it writes; the Triton kernels
-# module owns the z-normalization epsilon shared by both selection paths.
+# Single-sourced constants: the score file owns N and the stats layout; Triton owns the epsilon.
 from .triattention_cute_score_fused import N as _PADDED_HEAD_COLUMNS
 from .triattention_kernels import STD_EPSILON as _STD_EPSILON
 
@@ -50,8 +48,7 @@ def _select_normalize_union_config(
     width: int,
     sm_count: int,
 ) -> tuple[int, int, int]:
-    """Return tokens per lane, token subtiles, and row-cluster CTAs
-    (small clustered tile while the grid fits residency, else the large tile)."""
+    """Return (tokens_per_lane, token_subtiles, row_cluster_ctas)."""
     row_cluster_ctas = max(1, _MAX_ROW_CLUSTER_CTAS // request_count)
     small_token_tile = _WARP_SIZE * _SMALL_TOKENS_PER_LANE * _SMALL_TOKEN_SUBTILES
     token_tiles = (width + small_token_tile - 1) // small_token_tile
@@ -118,11 +115,7 @@ def _ld_cluster_f32(mapped_addr):
 
 
 def _gmem_lane_tile(iterator, flat_index, tokens_per_lane, assumed_align):
-    """One lane's gmem tile of ``tokens_per_lane`` fp32 values.
-
-    Folds the 64-bit flat index into the pointer BEFORE element access, so
-    nothing routes through the DSL's 32-bit dynamic coordinate.
-    """
+    """One lane's fp32 gmem tile; folds the 64-bit index into the pointer before access."""
     return cute.make_tensor(
         cute.make_ptr(
             cutlass.Float32,
@@ -149,16 +142,12 @@ class _TriAttentionNormalizeUnionKernel:
         token_subtiles: int,
         row_cluster_ctas: int,
     ) -> None:
-        # The score scratch pads each KV head's group of score planes up to
-        # the MMA tile: real head row ``q_head`` lives in score plane
-        # ``kv * 8 + qg``. The partial-stats rows are always compact.
+        # Real head row q_head lives in score plane kv*8 + qg; partial-stats rows stay compact.
         self.score_group_size = num_q_heads // num_kv_heads
         self.score_head_pad = _PADDED_HEAD_COLUMNS - self.score_group_size
         self.num_layers = num_layers
         self.seq_len = seq_len
-        # The score window start is per-request runtime metadata
-        # (``token_starts``); the widest window — the whole bucket —
-        # sizes the output rows and the token-tile grid.
+        # The widest score window (the whole bucket) sizes the output rows and token-tile grid.
         self.width = seq_len
         self.num_q_heads = num_q_heads
         self.num_rows = num_layers * num_q_heads
@@ -200,8 +189,7 @@ class _TriAttentionNormalizeUnionKernel:
                 stream=stream,
             )
         else:
-            # Cluster peers are consecutive CTAs: the kernel's (request,
-            # token-tile, rank) decode must keep this factor order.
+            # Cluster peers are consecutive CTAs; the kernel decode must keep this factor order.
             kernel.launch(
                 grid=(
                     request_count * self.num_token_tiles * self.row_cluster_ctas,
@@ -227,15 +215,13 @@ class _TriAttentionNormalizeUnionKernel:
         lane_idx: cutlass.Int32,
         from_cluster_peers: cutlass.Constexpr,
     ):
-        """Final peer reduce + union-row store, shared by both arms
-        (the peer source is the only difference, picked at trace time)."""
+        """Final peer reduce and union-row store (the peer source is picked at trace time)."""
         for token_subtile in cutlass.range_constexpr(self.token_subtiles):
             reduced_values = cute.make_rmem_tensor((self.tokens_per_lane,), cutlass.Float32)
             for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
                 if cutlass.const_expr(from_cluster_peers):
                     union_value = warp_max[(0, token_subtile, token_slot, lane_idx)]
-                    # Offset derived from the SAME layout object the smem
-                    # tensor was built with (no hand-derived strides).
+                    # Offset derived from the same layout the smem tensor was built with.
                     shared_offset = cute.crd2idx(
                         (0, token_subtile, token_slot, lane_idx), warp_max.layout
                     )
@@ -256,8 +242,7 @@ class _TriAttentionNormalizeUnionKernel:
                         )
                 reduced_values[token_slot] = union_value
             subtile_first_token = first_token + token_subtile * self.subtile_token_tile
-            # Straddling subtiles fall back to per-token stores; union_scores
-            # stays < 2^31 by the host audit, so the i32 index cannot wrap.
+            # Straddling subtiles store per token; union_scores stays < 2^31 so i32 cannot wrap.
             if cutlass.const_expr(self.width % self.tokens_per_lane == 0) and cutlass.dynamic_expr(
                 subtile_first_token + self.tokens_per_lane <= valid_width
             ):
@@ -305,8 +290,7 @@ class _TriAttentionNormalizeUnionKernel:
         lane_idx = tidx % _WARP_SIZE
         first_token = token_tile_idx * self.token_tile + lane_idx * self.tokens_per_lane
         first_segment = request_idx * self.num_layers
-        # Per-request score window start: the normalization domain and the
-        # union output row both cover [0, valid - start) for this request.
+        # The normalization domain and the union output row both cover [0, valid - start).
         score_start = cutlass.Int32(token_starts[request_idx])
         valid_width = valid_seq_lens[request_idx] - score_start
         warp_max_ptr = cute.arch.alloc_smem(
@@ -388,8 +372,7 @@ class _TriAttentionNormalizeUnionKernel:
             q_head = logical_row - layer_slot * self.num_q_heads
             segment = first_segment + layer_slot
             stats_row = segment * self.num_q_heads + q_head
-            # Map the real head row onto its (possibly padded) score plane;
-            # the padded planes carry zero scores and are never visited.
+            # Map the real head row onto its padded score plane; padded planes are never visited.
             score_plane = q_head
             if cutlass.const_expr(self.score_head_pad > 0):
                 score_plane = q_head + (q_head // self.score_group_size) * self.score_head_pad
@@ -433,9 +416,7 @@ class _TriAttentionNormalizeUnionKernel:
                     + score_start
                     + subtile_first_token
                 )
-                # The vectorized load also needs the runtime start aligned to
-                # the lane width (subtile_first_token and the segment stride
-                # are aligned whenever seq_len is).
+                # The vectorized load needs the runtime start aligned to the lane width.
                 if cutlass.const_expr(
                     self.seq_len % self.tokens_per_lane == 0
                 ) and cutlass.dynamic_expr(
@@ -454,10 +435,7 @@ class _TriAttentionNormalizeUnionKernel:
                         cute.coalesce(score_value_tiles[token_subtile]),
                     )
                 else:
-                    # Fold the 64-bit index into the pointer BEFORE the loads:
-                    # the scratch exceeds 2^31 elements and the DSL's 32-bit
-                    # dynamic coordinate wraps. Unaligned window starts hit
-                    # this arm on every real serve round.
+                    # Fold the 64-bit index into the pointer; the scratch exceeds 2^31 elements.
                     score_tail = _gmem_lane_tile(
                         scores.iterator, score_index, self.tokens_per_lane, 4
                     )
@@ -528,8 +506,7 @@ class _TriAttentionNormalizeUnionKernel:
                     False,
                 )
         else:
-            # Warp 0 reduces its CTA's row partition, then CTA 0 combines the
-            # cluster's partial maxima through distributed shared memory.
+            # Warp 0 reduces its CTA's rows; CTA 0 combines cluster maxima via distributed smem.
             if warp_idx == 0:
                 for token_subtile in cutlass.range_constexpr(self.token_subtiles):
                     for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
