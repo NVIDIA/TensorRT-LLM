@@ -18,9 +18,13 @@ from tensorrt_llm._torch.models.checkpoints.hf import (
 )
 from tensorrt_llm._torch.models.checkpoints.hf.shared_host_stream import (
     HostMemoryRegistration,
+    SharedHostProducerMode,
     SharedHostStreamError,
     SharedHostStreamUnavailableError,
     _allocate_mpi_shared_window,
+    _assigned_extents,
+    _plan_batches,
+    _producer_worker_counts,
     open_shared_host_weight_stream,
     prepare_shared_host_weight_stream,
 )
@@ -302,12 +306,14 @@ class _RecordingReader:
         self._failing_offsets = set(failing_offsets)
         self._lock = threading.Lock()
         self.thread_ids = set()
+        self.calls = []
         self.watched = threading.Event()
         self.closed = False
 
     def read_into(self, source_path, source_offset, destination, cancel_event):
         with self._lock:
             self.thread_ids.add(threading.get_ident())
+            self.calls.append((source_path, source_offset, len(destination)))
         if source_offset in self._watched_offsets:
             self.watched.set()
         if source_offset in self._failing_offsets:
@@ -325,6 +331,21 @@ class _RecordingReader:
 
     def close(self):
         self.closed = True
+
+
+class _BlockingReader(_RecordingReader):
+    def __init__(self, blocked_offset):
+        super().__init__()
+        self._blocked_offset = blocked_offset
+        self.blocked = threading.Event()
+        self.release = threading.Event()
+
+    def read_into(self, source_path, source_offset, destination, cancel_event):
+        if source_offset == self._blocked_offset:
+            self.blocked.set()
+            if not self.release.wait(timeout=10):
+                raise TimeoutError("Timed out waiting to release blocked checkpoint read")
+        super().read_into(source_path, source_offset, destination, cancel_event)
 
 
 class _CloseFailingReader(_RecordingReader):
@@ -385,6 +406,7 @@ def _open_test_stream(
     reader=None,
     world_communicator=None,
     window_factory=None,
+    producer_mode=SharedHostProducerMode.SINGLE_PRODUCER,
     start=True,
 ):
     node_communicator = _FakeCommunicator()
@@ -395,6 +417,7 @@ def _open_test_stream(
         preflight,
         node_communicator,
         world_communicator,
+        producer_mode=producer_mode,
         group_manifest=groups,
         slot_bytes=slot_bytes,
         buffer_budget_bytes=(
@@ -697,6 +720,482 @@ def test_two_local_ranks_share_producer_bytes_without_consumer_io(tmp_path):
     assert telemetry[0].is_node_producer
     assert not telemetry[1].is_node_producer
     assert len(window_factory.windows) == 2
+    assert all(window.freed for window in window_factory.windows)
+    assert all(registration.closed for registration in registrations)
+
+
+def test_rank_cooperative_assignment_is_disjoint_complete_and_rotating(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    _u8_checkpoint(checkpoint, {"a": bytes(range(24))})
+    preflight = prepare_shared_host_weight_stream([checkpoint])
+    groups = (WeightGroup("a", ("a",)),)
+    plans = _plan_batches(preflight, groups, slot_bytes=8, read_chunk_bytes=2)
+
+    for plan in plans:
+        assignments = [
+            _assigned_extents(plan, producer_count=3, producer_rank=rank) for rank in range(3)
+        ]
+        assigned_extents = [extent for assignment in assignments for extent in assignment]
+        assert sorted(assigned_extents, key=lambda extent: extent.payload_offset) == list(
+            plan.extents
+        )
+        assert len({id(extent) for extent in assigned_extents}) == len(plan.extents)
+        first_owner = next(
+            rank for rank, assignment in enumerate(assignments) if plan.extents[0] in assignment
+        )
+        assert first_owner == plan.batch.sequence % 3
+
+
+@pytest.mark.parametrize(
+    ("mode", "node_size", "io_workers", "expected"),
+    [
+        (SharedHostProducerMode.SINGLE_PRODUCER, 4, 7, (7, 0, 0, 0)),
+        (SharedHostProducerMode.RANK_COOPERATIVE, 4, 10, (3, 3, 2, 2)),
+        (SharedHostProducerMode.RANK_COOPERATIVE, 4, 4, (1, 1, 1, 1)),
+        (SharedHostProducerMode.RANK_COOPERATIVE, 4, 2, (1, 1, 0, 0)),
+        (SharedHostProducerMode.RANK_COOPERATIVE, 1, 8, (8,)),
+    ],
+)
+def test_producer_worker_budget_is_node_scoped(mode, node_size, io_workers, expected):
+    assert _producer_worker_counts(mode, node_size, io_workers) == expected
+
+
+def test_rank_cooperative_single_rank_degenerates_to_local_stream(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    expected = b"abcdefgh"
+    _u8_checkpoint(checkpoint, {"a": expected})
+    preflight = prepare_shared_host_weight_stream([checkpoint])
+    groups = (WeightGroup("a", ("a",)),)
+    stream, _, _, _, _ = _open_test_stream(
+        preflight,
+        groups,
+        slot_bytes=4,
+        producer_mode=SharedHostProducerMode.RANK_COOPERATIVE,
+    )
+
+    reconstructed = bytearray(len(expected))
+    while True:
+        lease = stream.begin_next()
+        if lease is None:
+            break
+        for segment in lease.batch.segments:
+            view = lease.view(segment)
+            try:
+                start = segment.tensor_offset
+                reconstructed[start : start + segment.nbytes] = view
+            finally:
+                view.release()
+        stream.complete(lease)
+    telemetry = stream.telemetry
+    stream.finalize()
+
+    assert bytes(reconstructed) == expected
+    assert telemetry.producer_mode == SharedHostProducerMode.RANK_COOPERATIVE.value
+    assert telemetry.producer_count == 1
+    assert telemetry.local_io_workers == 2
+    assert telemetry.producer_ordinal == 0
+
+
+def test_source_backing_agreement_is_cooperative_only(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "model.safetensors"
+    _u8_checkpoint(checkpoint, {"a": b"abcd"})
+    preflight = prepare_shared_host_weight_stream([checkpoint])
+    groups = (WeightGroup("a", ("a",)),)
+
+    def fail_source_identity(*args):
+        del args
+        raise OSError("injected source identity failure")
+
+    monkeypatch.setattr(
+        shared_host_stream_module,
+        "_source_backing_fingerprint",
+        fail_source_identity,
+    )
+    stream, _, _, _, _ = _open_test_stream(
+        preflight,
+        groups,
+        slot_bytes=4,
+        producer_mode=SharedHostProducerMode.SINGLE_PRODUCER,
+    )
+    lease = stream.begin_next()
+    assert lease is not None
+    stream.complete(lease)
+    assert stream.begin_next() is None
+    stream.finalize()
+
+    with pytest.raises(SharedHostStreamUnavailableError, match="injected source identity failure"):
+        _open_test_stream(
+            preflight,
+            groups,
+            slot_bytes=4,
+            producer_mode=SharedHostProducerMode.RANK_COOPERATIVE,
+        )
+
+
+def test_rank_cooperative_source_disagreement_fails_before_allocation(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "model.safetensors"
+    _u8_checkpoint(checkpoint, {"a": b"abcd"})
+    preflight = prepare_shared_host_weight_stream([checkpoint])
+    groups = (WeightGroup("a", ("a",)),)
+    node_group = _ThreadedCollectiveGroup(2)
+    world_group = _ThreadedCollectiveGroup(2)
+    window_factory = _ThreadedWindowFactory()
+    rank_context = threading.local()
+    readers = (_ForbiddenReader(), _ForbiddenReader())
+    errors = [None, None]
+
+    def rank_dependent_source_identity(*args):
+        del args
+        return f"source-backing-rank-{rank_context.rank}"
+
+    monkeypatch.setattr(
+        shared_host_stream_module,
+        "_source_backing_fingerprint",
+        rank_dependent_source_identity,
+    )
+
+    def run_rank(rank):
+        rank_context.rank = rank
+        try:
+            open_shared_host_weight_stream(
+                preflight,
+                _ThreadedCommunicator(node_group, rank, 2),
+                _ThreadedCommunicator(world_group, rank, 2),
+                producer_mode=SharedHostProducerMode.RANK_COOPERATIVE,
+                group_manifest=groups,
+                slot_bytes=4,
+                buffer_budget_bytes=8,
+                read_chunk_bytes=2,
+                io_workers=2,
+                strict=True,
+                window_factory=window_factory,
+                reader=readers[rank],
+            )
+        except BaseException as error:
+            errors[rank] = error
+
+    threads = [threading.Thread(target=run_rank, args=(rank,), daemon=True) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert all(isinstance(error, SharedHostStreamUnavailableError) for error in errors)
+    assert str(errors[0]) == str(errors[1])
+    assert "source backing differs" in str(errors[0])
+    assert not window_factory.windows
+    assert all(reader.calls == 0 for reader in readers)
+
+
+def test_rank_cooperative_producers_collectively_fill_shared_batches(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    expected = bytes(range(24))
+    _u8_checkpoint(checkpoint, {"a": expected})
+    preflight = prepare_shared_host_weight_stream([checkpoint])
+    groups = (WeightGroup("a", ("a",)),)
+    node_group = _ThreadedCollectiveGroup(4)
+    world_group = _ThreadedCollectiveGroup(4)
+    window_factory = _ThreadedWindowFactory()
+    readers = [_RecordingReader() for _ in range(3)] + [_ForbiddenReader()]
+    registrations = [_RegistrationFactory() for _ in range(4)]
+    reconstructed = [None] * 4
+    telemetry = [None] * 4
+    owner_threads = [None] * 4
+    errors = [None] * 4
+
+    def run_rank(rank):
+        owner_threads[rank] = threading.get_ident()
+        try:
+            stream = open_shared_host_weight_stream(
+                preflight,
+                _ThreadedCommunicator(node_group, rank, 4),
+                _ThreadedCommunicator(world_group, rank, 4),
+                producer_mode=SharedHostProducerMode.RANK_COOPERATIVE,
+                group_manifest=groups,
+                slot_bytes=24,
+                buffer_budget_bytes=48,
+                read_chunk_bytes=2,
+                io_workers=3,
+                strict=True,
+                strict_host_registration=True,
+                window_factory=window_factory,
+                reader=readers[rank],
+                host_registrar=registrations[rank],
+            )
+            assert stream is not None
+            stream.start()
+            lease = stream.begin_next()
+            assert lease is not None
+            view = lease.view(lease.batch.segments[0])
+            try:
+                reconstructed[rank] = bytes(view)
+            finally:
+                view.release()
+            stream.complete(lease)
+            assert stream.begin_next() is None
+            telemetry[rank] = stream.telemetry
+            stream.finalize()
+        except BaseException as error:
+            errors[rank] = error
+
+    threads = [threading.Thread(target=run_rank, args=(rank,), daemon=True) for rank in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == [None] * 4
+    assert reconstructed == [expected] * 4
+    assert [item.producer_count for item in telemetry] == [3] * 4
+    assert [item.local_io_workers for item in telemetry] == [1, 1, 1, 0]
+    assert [item.is_storage_producer for item in telemetry] == [True, True, True, False]
+    assert telemetry[0].is_node_producer
+    assert all(not item.is_node_producer for item in telemetry[1:])
+    assert readers[3].calls == 0
+
+    calls = [call for reader in readers[:3] for call in reader.calls]
+    plan = _plan_batches(preflight, groups, slot_bytes=24, read_chunk_bytes=2)[0]
+    expected_calls = [
+        (extent.source_path, extent.source_offset, extent.nbytes) for extent in plan.extents
+    ]
+    assert sorted(calls) == sorted(expected_calls)
+    assert len(calls) == len(set(calls))
+    assert sum(item.assigned_extent_count for item in telemetry) == len(expected_calls)
+    assert sum(item.completed_extent_count for item in telemetry) == len(expected_calls)
+    assert sum(item.assigned_extent_bytes for item in telemetry) == len(expected)
+    assert sum(item.completed_extent_bytes for item in telemetry) == len(expected)
+    worker_threads = set().union(*(reader.thread_ids for reader in readers[:3]))
+    assert worker_threads
+    assert worker_threads.isdisjoint(owner_threads)
+    assert all(len(set(window.call_threads)) == 1 for window in window_factory.windows)
+    assert all(
+        set(window.call_threads).issubset(owner_threads) for window in window_factory.windows
+    )
+    assert all(window.freed for window in window_factory.windows)
+    assert all(registration.closed for registration in registrations)
+
+
+def test_rank_cooperative_publish_waits_for_slowest_producer(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    expected = b"abcdefgh"
+    _u8_checkpoint(checkpoint, {"a": expected})
+    preflight = prepare_shared_host_weight_stream([checkpoint])
+    tensor = preflight.tensors[0]
+    groups = (WeightGroup("a", ("a",)),)
+    node_group = _ThreadedCollectiveGroup(2)
+    world_group = _ThreadedCollectiveGroup(2)
+    window_factory = _ThreadedWindowFactory()
+    blocking_reader = _BlockingReader(tensor.source_offset + 2)
+    readers = (_RecordingReader(), blocking_reader)
+    registrations = (_RegistrationFactory(), _RegistrationFactory())
+    published = [threading.Event(), threading.Event()]
+    errors = [None, None]
+
+    def run_rank(rank):
+        stream = None
+        try:
+            stream = open_shared_host_weight_stream(
+                preflight,
+                _ThreadedCommunicator(node_group, rank, 2),
+                _ThreadedCommunicator(world_group, rank, 2),
+                producer_mode=SharedHostProducerMode.RANK_COOPERATIVE,
+                group_manifest=groups,
+                slot_bytes=8,
+                buffer_budget_bytes=16,
+                read_chunk_bytes=2,
+                io_workers=2,
+                strict=True,
+                strict_host_registration=True,
+                window_factory=window_factory,
+                reader=readers[rank],
+                host_registrar=registrations[rank],
+            )
+            assert stream is not None
+            stream.start()
+            lease = stream.begin_next()
+            assert lease is not None
+            published[rank].set()
+            stream.complete(lease)
+            assert stream.begin_next() is None
+            stream.finalize()
+        except BaseException as error:
+            errors[rank] = error
+            if stream is not None:
+                stream.finalize(error)
+
+    threads = [threading.Thread(target=run_rank, args=(rank,), daemon=True) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+
+    assert blocking_reader.blocked.wait(timeout=5)
+    assert not any(event.is_set() for event in published)
+    blocking_reader.release.set()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == [None, None]
+    assert all(event.is_set() for event in published)
+
+
+def test_rank_cooperative_overlaps_next_fill_and_gates_slot_reuse(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    expected = b"abcdefghijkl"
+    _u8_checkpoint(checkpoint, {"a": expected})
+    preflight = prepare_shared_host_weight_stream([checkpoint])
+    tensor = preflight.tensors[0]
+    groups = (WeightGroup("a", ("a",)),)
+    node_group = _ThreadedCollectiveGroup(2)
+    world_group = _ThreadedCollectiveGroup(2)
+    window_factory = _ThreadedWindowFactory()
+    # Batch 0 occupies slot 0, batch 1 slot 1, and batch 2 reuses slot 0.
+    # With rotating two-producer assignment, rank 1 owns the first extent of
+    # batch 1, while rank 0 owns the first extent of batch 2.
+    blocking_reader = _BlockingReader(tensor.source_offset + 4)
+    slot_reuse_reader = _RecordingReader(watched_offsets=(tensor.source_offset + 8,))
+    readers = (slot_reuse_reader, blocking_reader)
+    registrations = (_RegistrationFactory(), _RegistrationFactory())
+    first_batch_ready = [threading.Event(), threading.Event()]
+    allow_first_batch_completion = [threading.Event(), threading.Event()]
+    rank_zero_entered_completion = threading.Event()
+    reconstructed = [None, None]
+    errors = [None, None]
+
+    class _CompletionSignalingCommunicator(_ThreadedCommunicator):
+        def allgather(self, value):
+            if self.Get_rank() == 0 and getattr(value, "phase", None) == "complete:0":
+                rank_zero_entered_completion.set()
+            return super().allgather(value)
+
+    def run_rank(rank):
+        stream = None
+        try:
+            stream = open_shared_host_weight_stream(
+                preflight,
+                _ThreadedCommunicator(node_group, rank, 2),
+                _CompletionSignalingCommunicator(world_group, rank, 2),
+                producer_mode=SharedHostProducerMode.RANK_COOPERATIVE,
+                group_manifest=groups,
+                slot_bytes=4,
+                buffer_budget_bytes=8,
+                read_chunk_bytes=2,
+                io_workers=2,
+                strict=True,
+                strict_host_registration=True,
+                window_factory=window_factory,
+                reader=readers[rank],
+                host_registrar=registrations[rank],
+            )
+            assert stream is not None
+            stream.start()
+            result = bytearray(len(expected))
+            lease = stream.begin_next()
+            assert lease is not None
+            first_batch_ready[rank].set()
+            while lease is not None:
+                for segment in lease.batch.segments:
+                    view = lease.view(segment)
+                    try:
+                        start = segment.tensor_offset
+                        result[start : start + segment.nbytes] = view
+                    finally:
+                        view.release()
+                if lease.batch.sequence == 0:
+                    assert allow_first_batch_completion[rank].wait(timeout=10)
+                stream.complete(lease)
+                lease = stream.begin_next()
+            reconstructed[rank] = bytes(result)
+            stream.finalize()
+        except BaseException as error:
+            errors[rank] = error
+            if stream is not None:
+                stream.finalize(error)
+
+    threads = [threading.Thread(target=run_rank, args=(rank,), daemon=True) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+
+    next_batch_read_started = blocking_reader.blocked.wait(timeout=5)
+    consumers_received_first_batch = all(event.wait(timeout=5) for event in first_batch_ready)
+    blocking_reader.release.set()
+    allow_first_batch_completion[0].set()
+    rank_zero_waiting_for_peer = rank_zero_entered_completion.wait(timeout=5)
+    slot_reused_before_consensus = slot_reuse_reader.watched.is_set()
+    allow_first_batch_completion[1].set()
+    slot_reused_after_consensus = slot_reuse_reader.watched.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert next_batch_read_started
+    assert consumers_received_first_batch
+    assert rank_zero_waiting_for_peer
+    assert not slot_reused_before_consensus
+    assert slot_reused_after_consensus
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == [None, None]
+    assert reconstructed == [expected, expected]
+
+
+def test_rank_cooperative_nonroot_read_failure_is_collective(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    _u8_checkpoint(checkpoint, {"a": b"abcdefgh"})
+    preflight = prepare_shared_host_weight_stream([checkpoint])
+    tensor = preflight.tensors[0]
+    groups = (WeightGroup("a", ("a",)),)
+    node_group = _ThreadedCollectiveGroup(2)
+    world_group = _ThreadedCollectiveGroup(2)
+    window_factory = _ThreadedWindowFactory()
+    readers = (
+        _RecordingReader(),
+        _RecordingReader(failing_offsets=(tensor.source_offset + 2,)),
+    )
+    registrations = (_RegistrationFactory(), _RegistrationFactory())
+    errors = [None, None]
+    finalize_errors = [None, None]
+
+    def run_rank(rank):
+        stream = None
+        try:
+            stream = open_shared_host_weight_stream(
+                preflight,
+                _ThreadedCommunicator(node_group, rank, 2),
+                _ThreadedCommunicator(world_group, rank, 2),
+                producer_mode=SharedHostProducerMode.RANK_COOPERATIVE,
+                group_manifest=groups,
+                slot_bytes=8,
+                buffer_budget_bytes=16,
+                read_chunk_bytes=2,
+                io_workers=2,
+                strict=True,
+                strict_host_registration=True,
+                window_factory=window_factory,
+                reader=readers[rank],
+                host_registrar=registrations[rank],
+            )
+            assert stream is not None
+            stream.start()
+            stream.begin_next()
+        except BaseException as error:
+            errors[rank] = error
+        finally:
+            if stream is not None:
+                try:
+                    stream.finalize()
+                except BaseException as error:
+                    finalize_errors[rank] = error
+
+    threads = [threading.Thread(target=run_rank, args=(rank,), daemon=True) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert all(isinstance(error, SharedHostStreamError) for error in errors)
+    assert all("failed on world rank 1" in str(error) for error in errors)
+    assert finalize_errors == [None, None]
     assert all(window.freed for window in window_factory.windows)
     assert all(registration.closed for registration in registrations)
 

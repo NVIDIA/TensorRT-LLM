@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded node-local streaming for SafeTensors checkpoint payloads.
 
-The node-local rank-zero process is the only storage producer. It fills an
-MPI-3 shared-memory double buffer with a bounded host-I/O worker pool while all
-local ranks materialize the previously published batch. MPI calls are confined
-to the caller thread so the transport does not require ``MPI_THREAD_MULTIPLE``.
+The stream supports either one node-local storage producer or cooperative
+producers that fill disjoint extents of the same MPI-3 shared-memory double
+buffer. All MPI calls are confined to caller threads, so the transport does
+not require ``MPI_THREAD_MULTIPLE``.
 """
 
 from __future__ import annotations
@@ -16,10 +16,12 @@ import json
 import math
 import os
 import threading
+import time
 import traceback
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_EXCEPTION, CancelledError, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -66,6 +68,13 @@ class SharedHostStreamError(RuntimeError):
 
 class SharedHostStreamUnavailableError(RuntimeError):
     """Raised when strict mode requests an ineligible shared-host stream."""
+
+
+class SharedHostProducerMode(str, Enum):
+    """Select which node-local ranks read checkpoint extents."""
+
+    SINGLE_PRODUCER = "single_producer"
+    RANK_COOPERATIVE = "rank_cooperative"
 
 
 @dataclass(frozen=True)
@@ -124,6 +133,16 @@ class SharedHostStreamTelemetry:
     direct_view_bytes: int
     staged_groups: int
     staged_bytes: int
+    producer_mode: str
+    producer_count: int
+    is_storage_producer: bool
+    local_io_workers: int
+    producer_ordinal: int | None
+    assigned_extent_count: int
+    assigned_extent_bytes: int
+    completed_extent_count: int
+    completed_extent_bytes: int
+    local_fill_seconds: float
 
 
 @dataclass
@@ -219,6 +238,59 @@ class _ReadExtent:
 class _PlannedBatch:
     batch: WeightBatch
     extents: tuple[_ReadExtent, ...]
+
+
+def _normalize_producer_mode(
+    producer_mode: SharedHostProducerMode | str,
+) -> SharedHostProducerMode:
+    if isinstance(producer_mode, SharedHostProducerMode):
+        return producer_mode
+    return SharedHostProducerMode(producer_mode)
+
+
+def _producer_worker_counts(
+    producer_mode: SharedHostProducerMode,
+    node_size: int,
+    io_workers: int,
+) -> tuple[int, ...]:
+    """Distribute a worker budget without starving an active producer."""
+    if node_size <= 0:
+        raise ValueError("Node size must be positive")
+    if io_workers <= 0:
+        raise ValueError("I/O worker count must be positive")
+    if producer_mode is SharedHostProducerMode.SINGLE_PRODUCER:
+        return (io_workers,) + (0,) * (node_size - 1)
+
+    producer_count = min(node_size, io_workers)
+    workers_per_producer, extra_workers = divmod(io_workers, producer_count)
+    return tuple(
+        workers_per_producer + (rank < extra_workers) if rank < producer_count else 0
+        for rank in range(node_size)
+    )
+
+
+def _assigned_extents(
+    plan: _PlannedBatch,
+    producer_count: int,
+    producer_rank: int,
+) -> tuple[_ReadExtent, ...]:
+    """Return one producer's deterministic, disjoint share of a batch."""
+    if producer_count <= 0:
+        raise ValueError("Producer count must be positive")
+    if producer_rank < 0 or producer_rank >= producer_count:
+        return ()
+    return tuple(
+        extent
+        for extent_index, extent in enumerate(plan.extents)
+        if (plan.batch.sequence + extent_index) % producer_count == producer_rank
+    )
+
+
+def _producer_ordinal(worker_counts: Sequence[int], node_rank: int) -> int | None:
+    """Map a node rank to its dense producer ordinal."""
+    if node_rank < 0 or node_rank >= len(worker_counts) or worker_counts[node_rank] == 0:
+        return None
+    return sum(worker_count > 0 for worker_count in worker_counts[:node_rank])
 
 
 @dataclass(frozen=True)
@@ -376,6 +448,10 @@ class SharedHostWeightStream(WeightBatchStream):
         slot_layout: _SlotLayout,
         all_ranks_host_registered: bool,
         io_workers: int,
+        local_io_workers: int,
+        producer_ordinal: int | None,
+        producer_count: int,
+        producer_mode: SharedHostProducerMode,
         read_chunk_bytes: int,
         reader: RangeReader,
         executor: ThreadPoolExecutor | None,
@@ -392,6 +468,10 @@ class SharedHostWeightStream(WeightBatchStream):
         self._slot_bytes = slot_layout.slot_bytes
         self._all_ranks_host_registered = all_ranks_host_registered
         self._io_workers = io_workers
+        self._local_io_workers = local_io_workers
+        self._producer_ordinal = producer_ordinal
+        self._producer_count = producer_count
+        self._producer_mode = producer_mode
         self._read_chunk_bytes = read_chunk_bytes
         self._reader = reader
         self._node_rank = node_communicator.Get_rank()
@@ -403,6 +483,9 @@ class SharedHostWeightStream(WeightBatchStream):
         self._cancel_event = threading.Event()
         self._pending_index: int | None = None
         self._pending_futures: tuple[Future[None], ...] = ()
+        self._pending_extents: tuple[_ReadExtent, ...] = ()
+        self._pending_started_at: float | None = None
+        self._pending_completion_times: list[float | None] = []
         self._next_index = 0
         self._current: _SharedHostBatchLease | None = None
         self._state = "created"
@@ -416,6 +499,11 @@ class SharedHostWeightStream(WeightBatchStream):
         self._direct_view_bytes = 0
         self._staged_groups = 0
         self._staged_bytes = 0
+        self._assigned_extent_count = 0
+        self._assigned_extent_bytes = 0
+        self._completed_extent_count = 0
+        self._completed_extent_bytes = 0
+        self._local_fill_seconds = 0.0
 
     @property
     def groups(self) -> tuple[WeightGroup, ...]:
@@ -471,6 +559,16 @@ class SharedHostWeightStream(WeightBatchStream):
             direct_view_bytes=self._direct_view_bytes,
             staged_groups=self._staged_groups,
             staged_bytes=self._staged_bytes,
+            producer_mode=self._producer_mode.value,
+            producer_count=self._producer_count,
+            is_storage_producer=self._local_io_workers > 0,
+            local_io_workers=self._local_io_workers,
+            producer_ordinal=self._producer_ordinal,
+            assigned_extent_count=self._assigned_extent_count,
+            assigned_extent_bytes=self._assigned_extent_bytes,
+            completed_extent_count=self._completed_extent_count,
+            completed_extent_bytes=self._completed_extent_bytes,
+            local_fill_seconds=self._local_fill_seconds,
         )
 
     def _assert_owner_thread(self) -> None:
@@ -478,32 +576,52 @@ class SharedHostWeightStream(WeightBatchStream):
             raise RuntimeError("SharedHostWeightStream coordination must run on its creator thread")
 
     def _schedule(self, index: int) -> None:
-        if self._node_rank != 0:
+        if self._local_io_workers == 0:
             return
         assert self._executor is not None
         assert self._arena is not None
         if self._pending_index is not None:
             raise RuntimeError("A shared-host fill is already pending")
         plan = self._plans[index]
+        assert self._producer_ordinal is not None
+        assigned_extents = _assigned_extents(plan, self._producer_count, self._producer_ordinal)
         slot_start = plan.batch.slot * self._slot_bytes
         futures = []
         destinations = []
+        completion_times: list[float | None] = []
         submit_failure = None
+        fill_started_at = time.perf_counter()
+
+        def read_extent(
+            extent: _ReadExtent,
+            destination: memoryview,
+            completion_index: int,
+        ) -> None:
+            try:
+                self._reader.read_into(
+                    extent.source_path,
+                    extent.source_offset,
+                    destination,
+                    self._cancel_event,
+                )
+            finally:
+                completion_times[completion_index] = time.perf_counter()
+
         try:
-            for extent in plan.extents:
+            for extent in assigned_extents:
                 destination = self._arena[
                     slot_start + extent.payload_offset : slot_start
                     + extent.payload_offset
                     + extent.nbytes
                 ]
                 destinations.append(destination)
+                completion_times.append(None)
                 futures.append(
                     self._executor.submit(
-                        self._reader.read_into,
-                        extent.source_path,
-                        extent.source_offset,
+                        read_extent,
+                        extent,
                         destination,
-                        self._cancel_event,
+                        len(completion_times) - 1,
                     )
                 )
         except BaseException as error:
@@ -536,13 +654,20 @@ class SharedHostWeightStream(WeightBatchStream):
             )
         self._pending_index = index
         self._pending_futures = tuple(futures)
+        self._pending_extents = assigned_extents
+        self._pending_started_at = fill_started_at
+        self._pending_completion_times = completion_times
+        self._assigned_extent_count += len(assigned_extents)
+        self._assigned_extent_bytes += sum(extent.nbytes for extent in assigned_extents)
 
     def _wait_for_pending(self, index: int) -> BaseException | None:
-        if self._node_rank != 0:
+        if self._local_io_workers == 0:
             return None
         if self._pending_index != index:
             raise RuntimeError(f"Expected pending batch {index}, got {self._pending_index}")
         futures = self._pending_futures
+        extents = self._pending_extents
+        completion_times = self._pending_completion_times
         if futures:
             done, _ = wait(futures, return_when=FIRST_EXCEPTION)
             if any(future.exception() is not None for future in done if not future.cancelled()):
@@ -553,7 +678,7 @@ class SharedHostWeightStream(WeightBatchStream):
 
         first_error = None
         first_cancel = None
-        for future in futures:
+        for future, extent in zip(futures, extents):
             try:
                 error = future.exception()
             except CancelledError as error:
@@ -565,6 +690,9 @@ class SharedHostWeightStream(WeightBatchStream):
                         first_cancel = error
                 elif error is not None and first_error is None:
                     first_error = error
+                if error is None:
+                    self._completed_extent_count += 1
+                    self._completed_extent_bytes += extent.nbytes
 
         # A completed Future retains its worker exception and traceback. The
         # reader frame owns the destination memoryview into the MPI arena, so
@@ -573,8 +701,15 @@ class SharedHostWeightStream(WeightBatchStream):
         # here would append this still-executing frame to the traceback and make
         # traceback.clear_frames() unsafe until after this method returns.
         self._clear_future_traceback_references(futures)
+        successful_fill = first_error is None and first_cancel is None
+        completed_at = [value for value in completion_times if value is not None]
+        if successful_fill and self._pending_started_at is not None and completed_at:
+            self._local_fill_seconds += max(completed_at) - self._pending_started_at
         self._pending_index = None
         self._pending_futures = ()
+        self._pending_extents = ()
+        self._pending_started_at = None
+        self._pending_completion_times = []
         return first_error or first_cancel
 
     @staticmethod
@@ -695,7 +830,7 @@ class SharedHostWeightStream(WeightBatchStream):
 
         index = self._next_index
         local_control = None
-        if self._node_rank == 0:
+        if self._producer_mode is SharedHostProducerMode.SINGLE_PRODUCER and self._node_rank == 0:
             try:
                 if index < len(self._plans):
                     if self._pending_index is None:
@@ -730,6 +865,45 @@ class SharedHostWeightStream(WeightBatchStream):
                     error_message=error_message,
                 )
 
+        if self._producer_mode is SharedHostProducerMode.RANK_COOPERATIVE:
+            fill_error = None
+            if index < len(self._plans):
+                try:
+                    if self._local_io_workers > 0 and self._pending_index is None:
+                        self._schedule(index)
+                    fill_error = self._wait_for_pending(index)
+                    if fill_error is None and self._local_io_workers > 0:
+                        assert self._window is not None
+                        self._window.Sync()
+                except BaseException as producer_error:
+                    fill_error = producer_error
+
+            error_rank, error_type, error_message = self._error_fields(fill_error, self._world_rank)
+            fill_outcomes = self._node_communicator.allgather(
+                (
+                    self._node_rank,
+                    error_rank,
+                    error_type,
+                    error_message,
+                )
+            )
+            if self._node_rank == 0:
+                failures = [outcome for outcome in fill_outcomes if outcome[1] is not None]
+                if failures:
+                    _, error_rank, error_type, error_message = min(
+                        failures, key=lambda outcome: (outcome[1], outcome[0])
+                    )
+                    local_control = _ControlMessage(
+                        kind="error",
+                        error_rank=error_rank,
+                        error_type=error_type,
+                        error_message=error_message,
+                    )
+                elif index < len(self._plans):
+                    local_control = _ControlMessage(kind="batch", batch=self._plans[index].batch)
+                else:
+                    local_control = _ControlMessage(kind="eof")
+
         control = self._node_communicator.bcast(local_control, root=0)
         local_error = None
         try:
@@ -745,7 +919,7 @@ class SharedHostWeightStream(WeightBatchStream):
             local_error is None
             and isinstance(control, _ControlMessage)
             and control.kind == "batch"
-            and self._node_rank == 0
+            and self._local_io_workers > 0
             and index + 1 < len(self._plans)
         ):
             try:
@@ -883,6 +1057,9 @@ class SharedHostWeightStream(WeightBatchStream):
         cleanup_error = None
         pending_futures = self._pending_futures
         self._pending_futures = ()
+        self._pending_extents = ()
+        self._pending_started_at = None
+        self._pending_completion_times = []
         self._pending_index = None
         if self._executor is not None:
             try:
@@ -1166,6 +1343,7 @@ def _resolve_slot_layout(
 def get_shared_host_stream_ineligibility_reason(
     preflight: SharedHostStreamPreflight,
     *,
+    producer_mode: SharedHostProducerMode | str = SharedHostProducerMode.SINGLE_PRODUCER,
     group_manifest: Sequence[WeightGroup] | None = None,
     single_tensor_groups_safe: bool = False,
     node_communicator: Any | None = None,
@@ -1176,6 +1354,10 @@ def get_shared_host_stream_ineligibility_reason(
     read_chunk_bytes: int = _DEFAULT_READ_CHUNK_BYTES,
 ) -> str | None:
     """Return a precise, pre-mutation shared-host eligibility reason."""
+    try:
+        _normalize_producer_mode(producer_mode)
+    except (TypeError, ValueError):
+        return f"shared_host_producer has invalid producer_mode {producer_mode!r}"
     if not preflight.tensors:
         return "shared_host_producer requires non-empty SafeTensors metadata"
     if node_communicator is None:
@@ -1319,6 +1501,11 @@ def _allocate_mpi_shared_window(
     buffer = None
     setup_error = None
     try:
+        memory_model = window.Get_attr(MPI.WIN_MODEL)
+        if memory_model != MPI.WIN_UNIFIED:
+            raise RuntimeError(
+                f"MPI shared window requires MPI_WIN_UNIFIED memory model, got {memory_model!r}"
+            )
         buffer, _ = window.Shared_query(0)
         raw_arena = memoryview(buffer).cast("B")
         try:
@@ -1392,14 +1579,50 @@ def _preopen_fingerprint(
     groups: tuple[WeightGroup, ...],
     plans: tuple[_PlannedBatch, ...],
     slot_layout: _SlotLayout,
+    producer_mode: SharedHostProducerMode,
+    io_workers: int,
+    read_chunk_bytes: int,
 ) -> str:
     descriptor = (
         tuple(
             (tensor.key, tensor.dtype, tensor.shape, tensor.nbytes) for tensor in preflight.tensors
         ),
         groups,
-        tuple(plan.batch for plan in plans),
+        tuple(
+            (
+                plan.batch,
+                tuple((extent.payload_offset, extent.nbytes) for extent in plan.extents),
+            )
+            for plan in plans
+        ),
         slot_layout,
+        producer_mode,
+        io_workers,
+        read_chunk_bytes,
+    )
+    return hashlib.sha256(repr(descriptor).encode("utf-8")).hexdigest()
+
+
+def _source_backing_fingerprint(
+    preflight: SharedHostStreamPreflight,
+    plans: Sequence[_PlannedBatch],
+) -> str:
+    """Identify source files strongly enough for node-local assignment safety."""
+    descriptors = []
+    for source_path in sorted({tensor.source_path for tensor in preflight.tensors}):
+        stat = os.stat(source_path)
+        descriptors.append(
+            (
+                source_path,
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+            )
+        )
+    descriptor = (
+        tuple(descriptors),
+        tuple(plan.extents for plan in plans),
     )
     return hashlib.sha256(repr(descriptor).encode("utf-8")).hexdigest()
 
@@ -1620,6 +1843,7 @@ def open_shared_host_weight_stream(
     node_communicator: Any,
     world_communicator: Any,
     *,
+    producer_mode: SharedHostProducerMode | str = SharedHostProducerMode.SINGLE_PRODUCER,
     group_manifest: Sequence[WeightGroup] | None = None,
     single_tensor_groups_safe: bool = False,
     slot_bytes: int = _DEFAULT_SLOT_BYTES,
@@ -1641,6 +1865,7 @@ def open_shared_host_weight_stream(
     try:
         reason = get_shared_host_stream_ineligibility_reason(
             preflight,
+            producer_mode=producer_mode,
             group_manifest=group_manifest,
             single_tensor_groups_safe=single_tensor_groups_safe,
             node_communicator=node_communicator,
@@ -1666,19 +1891,63 @@ def open_shared_host_weight_stream(
         if strict:
             raise SharedHostStreamUnavailableError(reason)
         return None
+    normalized_producer_mode = _normalize_producer_mode(producer_mode)
     groups = None
     plans = None
     slot_layout = None
     fingerprint = None
     planning_error = None
+    producer_mode_states = node_communicator.allgather(
+        (node_communicator.Get_rank(), normalized_producer_mode.value)
+    )
+    node_producer_modes = {state[1] for state in producer_mode_states}
+    if len(node_producer_modes) != 1:
+        planning_error = RuntimeError("Shared-host producer mode differs across node-local ranks")
     try:
         groups, _ = _validate_groups(preflight, group_manifest, single_tensor_groups_safe)
         assert groups is not None
         slot_layout = _resolve_slot_layout(preflight, groups, slot_bytes, buffer_budget_bytes)
         plans = _plan_batches(preflight, groups, slot_layout.slot_bytes, read_chunk_bytes)
-        fingerprint = _preopen_fingerprint(preflight, groups, plans, slot_layout)
+        fingerprint = _preopen_fingerprint(
+            preflight,
+            groups,
+            plans,
+            slot_layout,
+            normalized_producer_mode,
+            io_workers,
+            read_chunk_bytes,
+        )
     except BaseException as error:
-        planning_error = error
+        if planning_error is None:
+            planning_error = error
+    cooperative_node = node_producer_modes == {SharedHostProducerMode.RANK_COOPERATIVE.value}
+    if cooperative_node:
+        source_backing_fingerprint = None
+        source_backing_error = None
+        try:
+            if plans is None:
+                raise RuntimeError("Batch planning did not produce cooperative assignments")
+            source_backing_fingerprint = _source_backing_fingerprint(preflight, plans)
+        except BaseException as error:
+            source_backing_error = error
+        source_backing_state = (
+            node_communicator.Get_rank(),
+            (None if source_backing_error is None else type(source_backing_error).__name__),
+            None if source_backing_error is None else str(source_backing_error),
+            source_backing_fingerprint,
+        )
+        source_backing_states = node_communicator.allgather(source_backing_state)
+        source_backing_failures = [state for state in source_backing_states if state[1] is not None]
+        if planning_error is None and source_backing_failures:
+            rank, error_type, error_message, _ = min(source_backing_failures)
+            planning_error = RuntimeError(
+                "Checkpoint source identity failed on node-local rank "
+                f"{rank}: {error_type}: {error_message}"
+            )
+        elif planning_error is None and len({state[3] for state in source_backing_states}) != 1:
+            planning_error = RuntimeError(
+                "Checkpoint source backing differs across node-local producer candidates"
+            )
     planning_state = (
         world_communicator.Get_rank(),
         (None if planning_error is None else type(planning_error).__name__),
@@ -1804,10 +2073,19 @@ def open_shared_host_weight_stream(
     stream = None
     construction_error = None
     try:
-        if node_communicator.Get_rank() == 0:
+        worker_counts = _producer_worker_counts(
+            normalized_producer_mode,
+            node_communicator.Get_size(),
+            io_workers,
+        )
+        node_rank = node_communicator.Get_rank()
+        local_io_workers = worker_counts[node_rank]
+        producer_ordinal = _producer_ordinal(worker_counts, node_rank)
+        producer_count = sum(worker_count > 0 for worker_count in worker_counts)
+        if local_io_workers > 0:
             executor = ThreadPoolExecutor(
-                max_workers=io_workers,
-                thread_name_prefix="trtllm-shared-host-reader",
+                max_workers=local_io_workers,
+                thread_name_prefix=f"trtllm-shared-host-reader-{node_rank}",
             )
         stream = SharedHostWeightStream(
             plans,
@@ -1825,6 +2103,10 @@ def open_shared_host_weight_stream(
             # on independently registered peers elsewhere in the world.
             all_ranks_host_registered=not local_registration_failures,
             io_workers=io_workers,
+            local_io_workers=local_io_workers,
+            producer_ordinal=producer_ordinal,
+            producer_count=producer_count,
+            producer_mode=normalized_producer_mode,
             read_chunk_bytes=read_chunk_bytes,
             reader=range_reader,
             executor=executor,

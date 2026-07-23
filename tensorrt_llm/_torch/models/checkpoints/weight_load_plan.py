@@ -21,6 +21,7 @@ class WeightLoadPolicy(str, Enum):
 
     DIRECT_RANK_READ = "direct_rank_read"
     SHARED_HOST_PRODUCER = "shared_host_producer"
+    RANK_COOPERATIVE_STREAM = "rank_cooperative_stream"
     SINGLE_PRODUCER_PAGE_CACHE_PREFETCH = "single_producer_page_cache_prefetch"
     GPU_BROADCAST = "gpu_broadcast"
     LEGACY_FALLBACK = "legacy_fallback"

@@ -110,10 +110,13 @@ fallback happen before checkpoint payload I/O or shared-window allocation; the
 loader does not switch policies after a collective read or transfer has
 started. The implicit plan selects `direct_rank_read` for HF/AUTO SafeTensors
 and otherwise reaches `legacy_fallback`; select `shared_host_producer`
-explicitly to compare the producer/consumer design. An explicitly selected
+explicitly to benchmark one node-local producer, or select
+`rank_cooperative_stream` to benchmark multiple rank-local producers filling
+the same shared stream. The new rank-cooperative mode is intentionally not in
+the default plan until it has broader qualification. An explicitly selected
 single policy is strict. Shared-host preflight parses only SafeTensors headers
 and requires both partial model loading and a mapper-provided atomic dependency
-manifest before it can be selected.
+manifest before either streaming mode can be selected.
 The ordered plan is an eligibility/fallback mechanism, not a runtime
 performance-adaptive selector: one policy handles the whole checkpoint, and
 policies are not mixed per tensor.
@@ -125,8 +128,11 @@ plan when fallback is desired:
 # Strict: fail if this policy is not eligible.
 export TRTLLM_HF_WEIGHT_LOAD_PLAN=shared_host_producer
 
+# Strict multi-producer comparison.
+export TRTLLM_HF_WEIGHT_LOAD_PLAN=rank_cooperative_stream
+
 # Ordered fallback.
-export TRTLLM_HF_WEIGHT_LOAD_PLAN=direct_rank_read,legacy_fallback
+export TRTLLM_HF_WEIGHT_LOAD_PLAN=rank_cooperative_stream,shared_host_producer,legacy_fallback
 trtllm-serve <model>
 ```
 
@@ -138,7 +144,11 @@ from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoad
 
 checkpoint_loader = HfCheckpointLoader(
     weight_loader=HfWeightLoader(
-        weight_load_plan=("shared_host_producer", "legacy_fallback")
+        weight_load_plan=(
+            "rank_cooperative_stream",
+            "shared_host_producer",
+            "legacy_fallback",
+        )
     )
 )
 ```
@@ -147,6 +157,7 @@ checkpoint_loader = HfCheckpointLoader(
 | --- | --- | --- |
 | `direct_rank_read` | Implemented; default primary policy | Node-local ranks own disjoint file extents and issue parallel background reads into the shared OS page cache while ModelLoader materializes tensors. |
 | `shared_host_producer` | Implemented for qualified model mappers | One producer per node fills an adaptively sized, bounded shared-memory double buffer and attempts CUDA host registration. All local ranks incrementally materialize complete dependency groups while the producer fills the next slot. |
+| `rank_cooperative_stream` | Implemented as an explicit benchmark policy for qualified model mappers | Multiple producer ranks on each node cooperatively fill disjoint extents of the same bounded shared-memory slots. Consumers use the same ordered leases and incremental materialization path as `shared_host_producer`. |
 | `single_producer_page_cache_prefetch` | Implemented comparison policy | Node-local rank 0 reads all extents into the Linux page cache; peers wait at a node barrier and then use the unchanged mmap path. This preserves the earlier policy that was temporarily named `shared_host_producer`. |
 | `gpu_broadcast` | Recognized future policy | Preflight reports it unavailable until rank-aware final tensor placement and a topology-aware GPU transport exist. |
 | `legacy_fallback` | Implemented compatibility policy | Uses the pre-existing whole-file prefetch and SafeTensors loading path. |
@@ -186,22 +197,43 @@ not partition storage traffic across nodes. "Direct" means that ranks own
 regular buffered `pread` responsibilities; it does not mean Linux `O_DIRECT`,
 GPUDirect Storage, or direct placement into final GPU tensors.
 
-`shared_host_producer` is the producer/consumer implementation. SafeTensors
-headers and an atomic mapper manifest are validated first. Each node then
-allocates an MPI shared-memory double buffer, and node-local rank 0 reads the
-next ordered batch with a bounded worker pool while all local ranks consume the
-current batch. The configured 256 MiB slot size is a baseline: planning grows
-each slot to the packed size of the largest atomic group, subject to a 64 GiB
-total two-slot budget. This keeps the allocation bounded by one dependency
-group rather than the full checkpoint while allowing groups larger than 256
-MiB to remain in one published lease.
+`shared_host_producer` and `rank_cooperative_stream` share one bounded
+producer/consumer transport. SafeTensors headers and an atomic mapper manifest
+are validated first. Each node then allocates an MPI shared-memory double
+buffer. While every local rank consumes batch N, storage producers fill batch
+N+1 in the inactive slot. The configured 256 MiB slot size is a baseline:
+planning grows each slot to the packed size of the largest atomic group,
+subject to a 64 GiB total two-slot budget. This keeps the allocation bounded
+by one dependency group rather than the full checkpoint while allowing groups
+larger than 256 MiB to remain in one published lease.
 
-The producer uses ordinary buffered `pread` operations. Source data therefore
-still traverses the Linux page cache before the kernel copies it into the
-shared arena; this policy is bounded streaming, not `O_DIRECT` or GDS. The
-initial protocol publishes one atomic dependency group per batch (or multiple
-batches when one group exceeds a slot) and does not yet pack independent small
-groups together, so benchmark group/batch counts and acknowledgement overhead.
+The modes differ only in how they fill each unpublished slot:
+
+- `shared_host_producer` assigns all storage reads to node-local rank 0 and
+  gives that producer the complete node I/O worker budget. This is the
+  single-producer design used to compare against Yijin's proposal.
+- `rank_cooperative_stream` deterministically stripes each batch's read
+  extents across active node-local producer ranks. The configured worker count
+  is one node-level budget, divided as evenly as possible among those
+  producers; it is not multiplied by the number of ranks. Producers write
+  non-overlapping offsets in the same inactive slot, and the coordinator
+  publishes the batch only after every producer reports completion.
+
+Both modes preserve the same ordered batches, two-slot backpressure, all-rank
+completion consensus, direct-versus-staged materialization rules, and final
+model weights. Switching the policy therefore isolates producer topology for
+benchmarking without changing the model-specific mapper path.
+The production transport requires an MPI shared window with the unified memory
+model and rejects a separate-model window before payload I/O, because producer
+and consumer processes directly load and store the shared slot bytes.
+
+Storage producers use ordinary buffered `pread` operations. Source data
+therefore still traverses the Linux page cache before the kernel copies it into
+the shared arena; these policies are bounded streaming, not `O_DIRECT` or GDS.
+The initial protocol publishes one atomic dependency group per batch (or
+multiple batches when one group exceeds a slot) and does not yet pack
+independent small groups together, so benchmark group/batch counts and
+acknowledgement overhead.
 
 After collective shared-window allocation, every node-local rank opens one
 MPI passive-target epoch with `Win.Lock_all`; all producer/consumer
@@ -230,10 +262,13 @@ views until final checkpoint processing; integrated-GPU profiles stage as well
 to keep node-shared bytes outside mmap page-eviction hooks. Unquantized,
 static-loading Qwen 3.5 and Llama 4 profiles on discrete GPUs may use direct
 views. An all-rank completion or error consensus gates slot reuse in both
-cases. Telemetry reports the configured and effective slot sizes, largest
-group, single-slot coverage, node-local all-ranks registration result, and
-direct-versus-staged group and byte counts; benchmark runs should retain these
-fields with their timing results.
+cases. Telemetry reports the policy's producer mode, active producer count,
+node-level worker budget, each rank's local worker quota and producer status,
+assigned and completed extent counts and bytes, cumulative local fill time,
+the configured and effective slot sizes, largest group, single-slot coverage,
+node-local all-ranks registration result, and direct-versus-staged group and
+byte counts. Benchmark runs should retain these fields with their timing
+results so a mislabeled producer topology or imbalanced producer is detectable.
 
 Direct views have a strict lifetime contract: model loading must neither mutate
 nor retain source storage after the incremental load call returns. If a loader
@@ -255,19 +290,21 @@ all ranks before the final slot can be reused. The ordinary
 `post_load_weights` walk still runs afterward through the common model-loader
 lifecycle.
 
-For this policy, `HfWeightLoader.prefetch_chunk_size` sets the baseline slot
-size, `shared_host_buffer_budget` caps the total double buffer, and
-`prefetch_workers_per_rank` sets the single node producer's I/O worker count.
-The producer defaults to the existing 64-worker node budget. The buffer budget
-can also be set in bytes with
+For both streaming policies, `HfWeightLoader.prefetch_chunk_size` sets the
+baseline slot size, `shared_host_buffer_budget` caps the total double buffer,
+and `prefetch_workers_per_rank` sets the node-level I/O worker budget. The
+option retains its historical name, but `rank_cooperative_stream` distributes
+that budget across its active producers instead of allocating that many
+workers to every rank. The stream defaults to the existing 64-worker node
+budget. The buffer budget can also be set in bytes with
 `TRTLLM_HF_SHARED_HOST_BUFFER_BUDGET_BYTES`; the constructor value takes
 precedence. Increase the default only after confirming host-memory headroom.
 
 This shared window contains immutable raw checkpoint bytes. It is not a
-transformed-weight cache, does not require the producer to retain a full model,
+transformed-weight cache, does not require any producer to retain a full model,
 and provides no restart reuse after the load session closes. On a multi-node
-job, every node has its own producer and shared window; checkpoint payload I/O
-is deduplicated within a node, not across nodes. The stream and placement
+job, every node has its own producer set and shared window; checkpoint payload
+I/O is deduplicated within a node, not across nodes. The stream and placement
 interfaces remain source-neutral so a future MX, GMS, snapshot, or Model
 Streamer source can reuse the incremental materialization lifecycle without
 being implemented as another policy mode.
@@ -284,8 +321,8 @@ requires a new rank-aware materialization interface.
 
 The two page-cache policies return the same complete raw tensor dictionary as
 the legacy mmap path, so their eligibility is not tied to a model class,
-mapper, quantization mode, or TP/PP/CP/EP layout. Shared-host streaming is more
-selective: `model.load_weights` must explicitly accept
+mapper, quantization mode, or TP/PP/CP/EP layout. Both shared-host streaming
+modes are more selective: `model.load_weights` must explicitly accept
 `allow_partial_loading`, and the initialized mapper must partition every
 checkpoint source key exactly once into dependency-safe groups. This prevents
 half of a fused QKV projection, quantization scale family, MoE layer, vision
@@ -329,11 +366,12 @@ remains eligible when its selected backend passes the nested capability check.
 The initial model-specific manifests cover Qwen 3.5 text/VLM and Llama 4.
 Architectures that use the unmodified generic HF mapper remain ineligible until
 their model class explicitly opts into the audited contract above. DeepSeek V4
-is deliberately not enabled for `shared_host_producer` yet: its bespoke loader
-performs whole-checkpoint remapping, synthesized defaults, direct key lookups,
-and MTP/shared-layer finalization without a partial-load contract. It continues
-to use `direct_rank_read` or an explicit fallback until that loader is
-refactored and qualified across BF16/FP8/NVFP4, TP/EP, and MTP configurations.
+is deliberately not enabled for either shared-host streaming mode yet: its
+bespoke loader performs whole-checkpoint remapping, synthesized defaults,
+direct key lookups, and MTP/shared-layer finalization without a partial-load
+contract. It continues to use `direct_rank_read` or an explicit fallback until
+that loader is refactored and qualified across BF16/FP8/NVFP4, TP/EP, and MTP
+configurations.
 
 Flagship qualification should exercise the real downstream loaders rather
 than add model-name checks to the byte reader:
@@ -345,10 +383,11 @@ than add model-name checks to the byte reader:
 | Llama 4 | Scout and Maverick; text and multimodal construction; FP8; TP/EP and a PP configuration that verifies layer ownership. |
 
 For each configuration, run strict `direct_rank_read`, strict
-`shared_host_producer`, the default ordered plan, and `legacy_fallback`. The
-single-producer page-cache policy can be retained as an additional diagnostic,
-but it is not the shared-memory producer/consumer result. A strict optimized
-run fails qualification if it falls back. Validate
+`shared_host_producer`, strict `rank_cooperative_stream`, the default ordered
+plan, and `legacy_fallback`. The single-producer page-cache policy can be
+retained as an additional diagnostic, but it is not the shared-memory
+producer/consumer result. A strict optimized run fails qualification if it
+falls back. Validate
 deterministic inference parity, clean worker and communicator teardown, and
 peak host memory, then measure cold-cache model initialization and first-
 inference latency. Performance claims require a system trace showing storage

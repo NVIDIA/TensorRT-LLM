@@ -917,6 +917,32 @@ def test_strict_shared_host_requires_mpi_before_header_preflight(tmp_path):
     prepare_stream.assert_not_called()
 
 
+@pytest.mark.parametrize("policy", ("shared_host_producer", "rank_cooperative_stream"))
+def test_strict_stream_policy_rejects_synchronous_load_weights(tmp_path, monkeypatch, policy):
+    _enable_single_rank_mpi(monkeypatch)
+    save_file(
+        {"model.norm.weight": torch.arange(4)},
+        str(tmp_path / "model.safetensors"),
+    )
+    loader = HfWeightLoader(weight_load_plan=policy)
+
+    with (
+        mock.patch.object(
+            shared_host_stream_module, "prepare_shared_host_weight_stream"
+        ) as prepare_stream,
+        pytest.raises(RuntimeError, match="requires an open weight session"),
+    ):
+        loader.load_weights(
+            str(tmp_path),
+            Mapping(),
+            model=_model(),
+            _weight_mapper=mock.Mock(),
+            _model_supports_partial_loading=True,
+        )
+
+    prepare_stream.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "model, expected_reason",
     [
@@ -1063,7 +1089,16 @@ def test_ordered_shared_host_plan_falls_back_before_transport_allocation(tmp_pat
     legacy_load.assert_called_once()
 
 
-def test_shared_host_session_returns_preflighted_stream(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "policy,producer_mode_name",
+    [
+        ("shared_host_producer", "SINGLE_PRODUCER"),
+        ("rank_cooperative_stream", "RANK_COOPERATIVE"),
+    ],
+)
+def test_shared_host_session_routes_selected_producer_mode(
+    tmp_path, monkeypatch, policy, producer_mode_name
+):
     _enable_single_rank_mpi(monkeypatch)
     checkpoint = tmp_path / "model.safetensors"
     save_file({"model.norm.weight": torch.arange(4)}, str(checkpoint))
@@ -1077,7 +1112,7 @@ def test_shared_host_session_returns_preflighted_stream(tmp_path, monkeypatch):
             return [WeightGroup("model.norm", ("model.norm.weight",))]
 
     expected_stream = _TestWeightStream([WeightGroup("model.norm", ("model.norm.weight",))], [])
-    loader = HfWeightLoader(weight_load_plan="shared_host_producer")
+    loader = HfWeightLoader(weight_load_plan=policy)
     with mock.patch.object(
         shared_host_stream_module,
         "open_shared_host_weight_stream",
@@ -1095,6 +1130,48 @@ def test_shared_host_session_returns_preflighted_stream(tmp_path, monkeypatch):
     assert expected_stream.finalized
     assert open_stream.call_args.kwargs["group_manifest"] == expected_stream.groups
     assert open_stream.call_args.kwargs["buffer_budget_bytes"] == 64 * 1024 * 1024 * 1024
+    assert open_stream.call_args.kwargs["producer_mode"] is getattr(
+        shared_host_stream_module.SharedHostProducerMode, producer_mode_name
+    )
+
+
+def test_rank_cooperative_stream_can_fallback_to_single_producer_stream(tmp_path, monkeypatch):
+    _enable_single_rank_mpi(monkeypatch)
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({"model.norm.weight": torch.arange(4)}, str(checkpoint))
+
+    class ManifestMapper:
+        @staticmethod
+        def get_weight_groups(keys):
+            return [WeightGroup("model.norm", tuple(keys))]
+
+    expected_stream = _TestWeightStream([WeightGroup("model.norm", ("model.norm.weight",))], [])
+    loader = HfWeightLoader(
+        weight_load_plan=(
+            "rank_cooperative_stream",
+            "shared_host_producer",
+            "legacy_fallback",
+        )
+    )
+    with mock.patch.object(
+        shared_host_stream_module,
+        "open_shared_host_weight_stream",
+        side_effect=(None, expected_stream),
+    ) as open_stream:
+        with loader.open_weight_session(
+            str(tmp_path),
+            Mapping(),
+            model=_model(),
+            _weight_mapper=ManifestMapper(),
+            _model_supports_partial_loading=True,
+        ) as weights:
+            assert weights is expected_stream
+
+    producer_modes = [call.kwargs["producer_mode"] for call in open_stream.call_args_list]
+    assert producer_modes == [
+        shared_host_stream_module.SharedHostProducerMode.RANK_COOPERATIVE,
+        shared_host_stream_module.SharedHostProducerMode.SINGLE_PRODUCER,
+    ]
 
 
 def test_direct_session_yields_before_read_ahead_finishes_and_exit_joins(tmp_path):
@@ -1359,6 +1436,13 @@ def test_direct_start_failure_is_coordinated_before_mmap(tmp_path):
 def test_default_weight_load_plan_matches_policy_order(monkeypatch):
     monkeypatch.delenv("TRTLLM_HF_WEIGHT_LOAD_PLAN", raising=False)
 
+    assert DEFAULT_WEIGHT_LOAD_PLAN == (
+        WeightLoadPolicy.DIRECT_RANK_READ,
+        WeightLoadPolicy.SHARED_HOST_PRODUCER,
+        WeightLoadPolicy.GPU_BROADCAST,
+        WeightLoadPolicy.LEGACY_FALLBACK,
+    )
+    assert WeightLoadPolicy.RANK_COOPERATIVE_STREAM not in DEFAULT_WEIGHT_LOAD_PLAN
     assert HfWeightLoader()._get_weight_load_plan() == DEFAULT_WEIGHT_LOAD_PLAN
 
 
@@ -1368,7 +1452,9 @@ def test_default_weight_load_plan_matches_policy_order(monkeypatch):
         ("direct_rank_read", False),
         ("legacy_fallback", False),
         ("shared_host_producer", True),
+        ("rank_cooperative_stream", True),
         (("gpu_broadcast", "shared_host_producer", "legacy_fallback"), True),
+        (("gpu_broadcast", "rank_cooperative_stream", "legacy_fallback"), True),
     ],
 )
 def test_only_shared_first_plan_requires_mapper_before_session(plan, expected):
@@ -1408,13 +1494,25 @@ def test_default_plan_selects_direct_rank_read_for_qualified_model(tmp_path, mon
 def test_weight_load_plan_can_be_selected_from_environment(monkeypatch):
     monkeypatch.setenv(
         "TRTLLM_HF_WEIGHT_LOAD_PLAN",
-        "shared_host_producer,legacy_fallback",
+        "rank_cooperative_stream,shared_host_producer,legacy_fallback",
     )
 
     assert HfWeightLoader()._get_weight_load_plan() == (
+        WeightLoadPolicy.RANK_COOPERATIVE_STREAM,
         WeightLoadPolicy.SHARED_HOST_PRODUCER,
         WeightLoadPolicy.LEGACY_FALLBACK,
     )
+
+
+def test_rank_cooperative_stream_cannot_be_repeated_in_ordered_plan():
+    with pytest.raises(ValueError, match="must not contain duplicate policies"):
+        HfWeightLoader(
+            weight_load_plan=(
+                "rank_cooperative_stream",
+                "shared_host_producer",
+                "rank_cooperative_stream",
+            )
+        )
 
 
 def test_shared_host_buffer_budget_can_be_selected_from_environment(monkeypatch):
@@ -1915,6 +2013,13 @@ def test_hf_session_preserves_hf_weight_loader_subclass_override():
         (
             {
                 "weight_load_plan": "shared_host_producer",
+                "shared_host_buffer_budget": 256 * 1024 * 1024,
+            },
+            "must hold two prefetch chunks",
+        ),
+        (
+            {
+                "weight_load_plan": "rank_cooperative_stream",
                 "shared_host_buffer_budget": 256 * 1024 * 1024,
             },
             "must hold two prefetch chunks",

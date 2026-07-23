@@ -50,6 +50,10 @@ _DEFAULT_SHARED_HOST_BUFFER_BUDGET = 64 * 1024 * 1024 * 1024
 _PREFETCH_READ_SIZE = 8 * 1024 * 1024
 _DEFAULT_PREFETCH_WORKERS_PER_RANK = 16
 _DEFAULT_PREFETCH_WORKERS_PER_NODE = 64
+_SHARED_HOST_STREAM_POLICIES = frozenset({
+    WeightLoadPolicy.SHARED_HOST_PRODUCER,
+    WeightLoadPolicy.RANK_COOPERATIVE_STREAM,
+})
 _GPU_BROADCAST_UNAVAILABLE_REASON = (
     "gpu_broadcast is not implemented: efficient GPU fan-out requires "
     "rank-aware final tensor placement and a topology-aware NCCL/P2P transport")
@@ -194,9 +198,11 @@ class _DirectReadAheadSession:
 class _SharedHostStreamSession:
     """Own transport cleanup and the caller-created node communicator."""
 
-    def __init__(self, stream: WeightBatchStream, node_communicator) -> None:
+    def __init__(self, stream: WeightBatchStream, node_communicator,
+                 policy: WeightLoadPolicy) -> None:
         self._stream = stream
         self._node_communicator = node_communicator
+        self._policy = policy
         self._finished = False
         self._started_at = time.perf_counter()
 
@@ -213,13 +219,13 @@ class _SharedHostStreamSession:
                     self._stream.abort(body_error)
                 except Exception:
                     logger.exception(
-                        "Suppressing shared_host_producer abort failure to "
+                        f"Suppressing {self._policy.value} abort failure to "
                         "preserve the model-load exception.")
             try:
                 telemetry = getattr(self._stream, "telemetry", None)
             except Exception:
                 logger.exception(
-                    "Unable to snapshot shared_host_producer telemetry.")
+                    f"Unable to snapshot {self._policy.value} telemetry.")
             try:
                 self._stream.finalize()
             except Exception as error:
@@ -242,23 +248,38 @@ class _SharedHostStreamSession:
                                   telemetry.staged_bytes)
             direct_fraction = (telemetry.direct_view_bytes / materialized_bytes
                                if materialized_bytes else 0.0)
-            logger.info("shared_host_producer rank materialization: "
-                        f"world_rank={telemetry.world_rank}, "
-                        f"node_rank={telemetry.node_rank}, "
-                        "all_ranks_host_registered="
-                        f"{telemetry.all_ranks_host_registered}, direct_groups="
-                        f"{telemetry.direct_view_groups}, manifest_groups="
-                        f"{telemetry.group_count}, direct_bytes="
-                        f"{telemetry.direct_view_bytes}, staged_groups="
-                        f"{telemetry.staged_groups}, staged_bytes="
-                        f"{telemetry.staged_bytes}, direct_byte_fraction="
-                        f"{direct_fraction:.6f}.")
+            producer_mode = getattr(telemetry.producer_mode, "value",
+                                    telemetry.producer_mode)
+            logger.info(
+                f"{self._policy.value} rank materialization: "
+                f"world_rank={telemetry.world_rank}, "
+                f"node_rank={telemetry.node_rank}, "
+                f"producer_mode={producer_mode}, producer_count="
+                f"{telemetry.producer_count}, is_storage_producer="
+                f"{telemetry.is_storage_producer}, local_io_workers="
+                f"{telemetry.local_io_workers}, producer_ordinal="
+                f"{telemetry.producer_ordinal}, assigned_extents="
+                f"{telemetry.assigned_extent_count}, assigned_bytes="
+                f"{telemetry.assigned_extent_bytes}, completed_extents="
+                f"{telemetry.completed_extent_count}, completed_bytes="
+                f"{telemetry.completed_extent_bytes}, local_fill_seconds="
+                f"{telemetry.local_fill_seconds:.6f}, "
+                "all_ranks_host_registered="
+                f"{telemetry.all_ranks_host_registered}, direct_groups="
+                f"{telemetry.direct_view_groups}, manifest_groups="
+                f"{telemetry.group_count}, direct_bytes="
+                f"{telemetry.direct_view_bytes}, staged_groups="
+                f"{telemetry.staged_groups}, staged_bytes="
+                f"{telemetry.staged_bytes}, direct_byte_fraction="
+                f"{direct_fraction:.6f}.")
         if telemetry is not None and telemetry.is_node_producer:
             elapsed = time.perf_counter() - self._started_at
             throughput = telemetry.bytes_published / max(elapsed, 1e-9) / (1024
                                                                            **3)
+            producer_mode = getattr(telemetry.producer_mode, "value",
+                                    telemetry.producer_mode)
             logger.info(
-                "shared_host_producer node stream published "
+                f"{self._policy.value} node stream published "
                 f"{telemetry.bytes_published / (1024**3):.2f}GB in "
                 f"{telemetry.batches_published} batches over {elapsed:.2f}s "
                 f"({throughput:.2f}GB/s logical rate); shared double buffer="
@@ -269,7 +290,9 @@ class _SharedHostStreamSession:
                 f"largest group={telemetry.largest_group_nbytes / (1024**2):.0f}MiB, "
                 f"single-slot groups={telemetry.groups_fitting_single_slot}/"
                 f"{telemetry.group_count}), "
-                f"I/O workers={telemetry.io_workers}, host registration="
+                f"producer_mode={producer_mode}, producers="
+                f"{telemetry.producer_count}, node I/O worker budget="
+                f"{telemetry.io_workers}, host registration="
                 f"{telemetry.host_registered} "
                 f"({telemetry.host_registration_detail}), all-rank registration="
                 f"{telemetry.all_ranks_host_registered}; direct materialization="
@@ -310,7 +333,8 @@ class HfWeightLoader(BaseWeightLoader):
         if (self._prefetch_workers_per_rank is not None
                 and self._prefetch_workers_per_rank <= 0):
             raise ValueError("prefetch_workers_per_rank must be positive")
-        if (WeightLoadPolicy.SHARED_HOST_PRODUCER in weight_load_plan
+        if (any(policy in _SHARED_HOST_STREAM_POLICIES
+                for policy in weight_load_plan)
                 and self._get_shared_host_buffer_budget()
                 < 2 * self._prefetch_chunk_size):
             raise ValueError(
@@ -346,7 +370,7 @@ class HfWeightLoader(BaseWeightLoader):
         first_non_gpu_policy = next(
             (policy for policy in self._get_weight_load_plan()
              if policy != WeightLoadPolicy.GPU_BROADCAST), None)
-        return first_non_gpu_policy == WeightLoadPolicy.SHARED_HOST_PRODUCER
+        return first_non_gpu_policy in _SHARED_HOST_STREAM_POLICIES
 
     def _get_coordinated_weight_load_plan(
             self,
@@ -473,8 +497,13 @@ class HfWeightLoader(BaseWeightLoader):
         weight_mapper: Any,
         weight_groups: Sequence[Any] | None,
         preflight_error: str | None,
+        policy: WeightLoadPolicy = WeightLoadPolicy.SHARED_HOST_PRODUCER,
     ) -> str | None:
         """Preflight model-side requirements for incremental materialization."""
+        if policy not in _SHARED_HOST_STREAM_POLICIES:
+            raise ValueError(
+                f"Policy {policy.value} is not a shared-host stream")
+        policy_name = policy.value
         reason = cls._cooperative_ineligibility_reason(
             model,
             mapping,
@@ -484,10 +513,10 @@ class HfWeightLoader(BaseWeightLoader):
         if reason is not None:
             return reason
         if not ENABLE_MULTI_DEVICE or mpi_disabled():
-            return ("shared_host_producer requires active MPI world and "
+            return (f"{policy_name} requires active MPI world and "
                     "node-local communicators")
         if not supports_weight_stream:
-            return ("shared_host_producer requires an open weight session; "
+            return (f"{policy_name} requires an open weight session; "
                     "synchronous load_weights callers cannot consume a stream")
         if not model_supports_partial_loading:
             return ("the model load_weights method does not support "
@@ -499,11 +528,11 @@ class HfWeightLoader(BaseWeightLoader):
         load_balancer = getattr(model_config, "moe_load_balancer", None)
         if (load_balancer is not None
                 and getattr(load_balancer, "layer_updates_per_iter", 0) > 0):
-            return ("shared_host_producer does not support dynamic MoE load "
+            return (f"{policy_name} does not support dynamic MoE load "
                     "balancing because it retains raw checkpoint tensors "
                     "beyond a bounded stream batch")
         if getattr(model_config, "enable_min_latency", False):
-            return ("shared_host_producer does not support min-latency model "
+            return (f"{policy_name} does not support min-latency model "
                     "loading because its eager weight derivation is not "
                     "compatible with deferred partial-load finalization")
         if weight_mapper is None:
@@ -548,7 +577,7 @@ class HfWeightLoader(BaseWeightLoader):
                 continue
 
             if policy not in policy_reasons:
-                if policy == WeightLoadPolicy.SHARED_HOST_PRODUCER:
+                if policy in _SHARED_HOST_STREAM_POLICIES:
                     reason = self._shared_host_ineligibility_reason(
                         model,
                         mapping,
@@ -560,7 +589,8 @@ class HfWeightLoader(BaseWeightLoader):
                             model_supports_partial_loading),
                         weight_mapper=weight_mapper,
                         weight_groups=shared_host_weight_groups,
-                        preflight_error=shared_host_preflight_error)
+                        preflight_error=shared_host_preflight_error,
+                        policy=policy)
                 else:
                     reason = self._cooperative_ineligibility_reason(
                         model,
@@ -924,16 +954,16 @@ class HfWeightLoader(BaseWeightLoader):
             shared_host_weight_groups = None
             shared_host_preflight_error = None
 
-            # Avoid even SafeTensors header parsing unless shared-host
-            # streaming is the first potentially executable policy. Direct
-            # read-ahead and page-cache prefetch have the same distributed
-            # eligibility requirements, so a shared policy after either one
-            # cannot become the selected policy on its own.
+            # Avoid even SafeTensors header parsing unless a shared-host
+            # streaming mode is the first potentially executable policy.
+            # Direct read-ahead and page-cache prefetch have the same
+            # distributed eligibility requirements, so a stream after either
+            # one cannot become the selected policy on its own.
             first_non_gpu_policy = next(
                 (candidate for candidate in weight_load_plan
                  if candidate != WeightLoadPolicy.GPU_BROADCAST), None)
-            if (coordination_error is None and first_non_gpu_policy
-                    == WeightLoadPolicy.SHARED_HOST_PRODUCER):
+            if (coordination_error is None
+                    and first_non_gpu_policy in _SHARED_HOST_STREAM_POLICIES):
                 cheap_reason = self._shared_host_ineligibility_reason(
                     model,
                     mapping,
@@ -946,7 +976,8 @@ class HfWeightLoader(BaseWeightLoader):
                         model_supports_partial_loading),
                     weight_mapper=weight_mapper,
                     weight_groups=(),
-                    preflight_error=None)
+                    preflight_error=None,
+                    policy=first_non_gpu_policy)
                 if getattr(load_format, "name", load_format) == "AUTO":
                     cheap_reason = (
                         self._coordinate_cooperative_ineligibility_reason(
@@ -1002,20 +1033,25 @@ class HfWeightLoader(BaseWeightLoader):
                     shared_host_preflight_error=(shared_host_preflight_error))
 
             policy, skipped = resolve_policy(weight_load_plan)
-            if policy == WeightLoadPolicy.SHARED_HOST_PRODUCER:
+            while policy in _SHARED_HOST_STREAM_POLICIES:
                 assert shared_host_preflight is not None
                 assert shared_host_weight_groups is not None
                 node_communicator = self._get_active_node_communicator()
                 try:
-                    from tensorrt_llm._torch.models.checkpoints.hf.shared_host_stream import \
-                        open_shared_host_weight_stream
+                    from tensorrt_llm._torch.models.checkpoints.hf.shared_host_stream import (
+                        SharedHostProducerMode, open_shared_host_weight_stream)
 
                     world_communicator = (mpi_comm() if ENABLE_MULTI_DEVICE
                                           and not mpi_disabled() else None)
+                    producer_mode = (
+                        SharedHostProducerMode.SINGLE_PRODUCER
+                        if policy == WeightLoadPolicy.SHARED_HOST_PRODUCER else
+                        SharedHostProducerMode.RANK_COOPERATIVE)
                     stream = open_shared_host_weight_stream(
                         shared_host_preflight,
                         node_communicator,
                         world_communicator,
+                        producer_mode=producer_mode,
                         group_manifest=shared_host_weight_groups,
                         slot_bytes=self._prefetch_chunk_size,
                         buffer_budget_bytes=(
@@ -1028,36 +1064,39 @@ class HfWeightLoader(BaseWeightLoader):
                         node_communicator.Free()
                     raise
                 if stream is not None:
-                    telemetry = stream.telemetry
+                    telemetry = getattr(stream, "telemetry", None)
                     if self._is_weight_cache_enabled():
                         logger.warning(
                             "The HF raw-weight cache is ignored by "
-                            "shared_host_producer because it cannot mirror "
+                            f"{policy.value} because it cannot mirror "
                             "the incremental collective sequence.")
-                    logger.info(
-                        "Using shared_host_producer bounded SafeTensors "
-                        f"streaming for {type(model).__name__} "
-                        f"(TP={mapping.tp_size}, PP={mapping.pp_size}); slots="
-                        f"{telemetry.slot_count} x "
-                        f"{telemetry.slot_bytes / (1024**2):.0f}MiB "
-                        f"(configured {telemetry.configured_slot_bytes / (1024**2):.0f}MiB), "
-                        f"single-slot atomic groups="
-                        f"{telemetry.groups_fitting_single_slot}/"
-                        f"{telemetry.group_count}, largest group="
-                        f"{telemetry.largest_group_nbytes / (1024**2):.0f}MiB, "
-                        f"all-rank CUDA host registration="
-                        f"{telemetry.all_ranks_host_registered}.")
+                    log_message = (
+                        f"Using {policy.value} bounded SafeTensors streaming "
+                        f"for {type(model).__name__} (TP={mapping.tp_size}, "
+                        f"PP={mapping.pp_size})")
+                    if telemetry is not None:
+                        log_message += (
+                            f"; slots={telemetry.slot_count} x "
+                            f"{telemetry.slot_bytes / (1024**2):.0f}MiB "
+                            f"(configured "
+                            f"{telemetry.configured_slot_bytes / (1024**2):.0f}MiB), "
+                            "single-slot atomic groups="
+                            f"{telemetry.groups_fitting_single_slot}/"
+                            f"{telemetry.group_count}, largest group="
+                            f"{telemetry.largest_group_nbytes / (1024**2):.0f}MiB, "
+                            "all-rank CUDA host registration="
+                            f"{telemetry.all_ranks_host_registered}")
+                    logger.info(log_message + ".")
                     return stream, _SharedHostStreamSession(
-                        stream, node_communicator)
+                        stream, node_communicator, policy)
 
                 if node_communicator is not None:
                     node_communicator.Free()
                 skipped.append(
-                    (WeightLoadPolicy.SHARED_HOST_PRODUCER,
+                    (policy,
                      "the shared-host transport is unavailable on this host"))
-                shared_index = weight_load_plan.index(
-                    WeightLoadPolicy.SHARED_HOST_PRODUCER)
-                remaining_plan = weight_load_plan[shared_index + 1:]
+                stream_index = weight_load_plan.index(policy)
+                remaining_plan = weight_load_plan[stream_index + 1:]
                 policy, additionally_skipped = resolve_policy(remaining_plan)
                 skipped.extend(additionally_skipped)
 
