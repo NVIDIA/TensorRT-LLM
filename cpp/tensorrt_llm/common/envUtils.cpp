@@ -517,10 +517,10 @@ uint16_t getEnvNixlPort()
     return nixlPort;
 }
 
-bool getEnvNixlEnableCoalesce()
+bool getEnvNixlDisableCoalesce()
 {
-    static bool const enableCoalesce = getBoolEnv("TRTLLM_NIXL_ENABLE_COALESCE");
-    return enableCoalesce;
+    static bool const disableCoalesce = getBoolEnv("TRTLLM_NIXL_DISABLE_COALESCE");
+    return disableCoalesce;
 }
 
 bool getEnvDisaggBenchmarkGenOnly()

@@ -102,10 +102,10 @@ class DFlashSpecMetadata(SpecMetadata):
                     worker._ctx_len[slot] = 0
                     worker._free_slots.append(slot)
 
-            # Default to slot 0 for unknown request IDs (e.g. during warmup
-            # where synthetic requests may not have assigned slots).
+            # Route unknown request IDs (cuda graph padding or warmup dummies)
+            # to dummy slot to avoid corrupting real request's context
             mapping = torch.tensor(
-                [worker._req_to_slot.get(rid, 0) for rid in self.request_ids],
+                [worker._req_to_slot.get(rid, worker._dummy_slot) for rid in self.request_ids],
                 dtype=torch.long,
                 device="cpu",
                 pin_memory=prefer_pinned(),
@@ -184,12 +184,13 @@ class DFlashWorker(SpecWorkerBase):
         self._kv_rewind_bs = None
         self._batch_to_slot = None
         self._max_ctx = 0
-        self._ctx_k_buf = None  # [max_batch, L, max_ctx+block, nkv, hd]
+        self._ctx_k_buf = None  # [max_batch+1, L, max_ctx+block, nkv, hd]
         self._ctx_v_buf = None
 
         # Slot management (Python, updated in prepare() and eager mode)
         self._req_to_slot = {}  # request_id -> slot index
         self._free_slots = deque()  # available slot indices
+        self._dummy_slot = None  # for cudagraph padding or warmup dummy requests
 
         logger.info(
             f"DFlashWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
@@ -231,7 +232,13 @@ class DFlashWorker(SpecWorkerBase):
 
         dtype = draft_model.fc.weight.dtype if hasattr(draft_model, "fc") else torch.bfloat16
 
-        self._ctx_len = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+        # Reserve slot index max_batch as a scratch slot for padding/unknown
+        # dummies; real requests only draw slots 0..max_batch-1, so dummy
+        # writes land here and can't corrupt a real request's context.
+        self._dummy_slot = max_batch
+        num_slots = max_batch + 1
+
+        self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
         self._free_slots = deque(range(max_batch))
@@ -250,7 +257,7 @@ class DFlashWorker(SpecWorkerBase):
         L = draft_model._num_attn_layers
         nkv = draft_model._num_kv_heads
         hd = draft_model._head_dim
-        kv_shape = (max_batch, L, self._max_ctx + self._resolved_block_size, nkv, hd)
+        kv_shape = (num_slots, L, self._max_ctx + self._resolved_block_size, nkv, hd)
         self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
         self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
         self._ctx_buf_inited = True
@@ -485,7 +492,10 @@ class DFlashWorker(SpecWorkerBase):
             # Rebuild batch_to_slot after prefill assigns new slots
             if self._ctx_buf_inited and spec_metadata.request_ids:
                 num_seqs = len(spec_metadata.request_ids)
-                mapping = [self._req_to_slot.get(rid, 0) for rid in spec_metadata.request_ids]
+                mapping = [
+                    self._req_to_slot.get(rid, self._dummy_slot)
+                    for rid in spec_metadata.request_ids
+                ]
                 self._batch_to_slot[:num_seqs].copy_(
                     torch.tensor(mapping, dtype=torch.long, device="cuda")
                 )
