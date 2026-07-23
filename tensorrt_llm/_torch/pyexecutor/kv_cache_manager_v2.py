@@ -15,14 +15,16 @@
 import hashlib
 import math
 import os
+import sys
 from collections import OrderedDict, defaultdict
-from dataclasses import fields
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 from strenum import StrEnum
 
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -38,40 +40,41 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
+    BAD_PAGE_INDEX,
+    CACHE_LEVEL1,
     DEFAULT_BEAM_INDEX,
+    GPU_LEVEL,
     AttentionLayerConfig,
+    AttnLifeCycle,
+    BatchDesc,
     BufferConfig,
+    CacheLevel,
     CacheTierConfig,
+    CuError,
+    DataRole,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
+    KVCacheDesc,
+    KVCacheEventManager,
     KVCacheIterationStatsDelta,
     LayerId,
+    LifeCycleId,
     PageIndexMode,
+    PlannedDropHandle,
+    PoolGroupPeakBlockStats,
     ReuseScope,
     SwaScratchReuseConfig,
     TokenIdExt,
     _KVCache,
+    exact_div,
+    gen_multimodal_cache_key_tokens,
+    typed_range,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
-    gen_multimodal_cache_key_tokens,
-)
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
-    BAD_PAGE_INDEX,
-    CACHE_LEVEL1,
-    GPU_LEVEL,
-    CacheLevel,
-)
-from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
-from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEventManager
-from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError
-from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import (
-    OutOfMemoryError as KVCacheOutOfMemoryError,
-)
-from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import AttnLifeCycle, LifeCycleId
-from tensorrt_llm.runtime.kv_cache_manager_v2._utils import exact_div, typed_range
+from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError as KVCacheOutOfMemoryError
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range, str_dtype_to_torch
@@ -101,9 +104,7 @@ from .scheduler import ScheduledRequests
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 
-KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(
-    field.name for field in fields(KVCacheIterationStatsDelta)
-)
+KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
     "iter_reused_blocks",
     "iter_full_reused_blocks",
@@ -125,8 +126,8 @@ class Role:
     # Sparse-attention per-layer index-K cache (MiniMax-M3 and similar
     # sparse-block-selection backends). Registered as a native V2
     # BufferConfig on sparse layers via the extra_buffers_per_layer hook on
-    # _build_cache_config, so allocation, free, slot reuse, and prefix
-    # reuse share the lifecycle of the main K/V buffers for the same layer.
+    # _build_base_config, so allocation, free, slot reuse, and prefix reuse
+    # share the lifecycle of the main K/V buffers for the same layer.
     INDEX_KEY = DataRole("index_key")
     ALL = DataRole("all")
 
@@ -134,6 +135,90 @@ class Role:
 class BlockReusePolicy(StrEnum):
     ALL_REUSABLE = "all_reusable"
     PER_REQUEST = "per_request"
+    PER_CONVERSATION = "per_conversation"
+
+
+def _request_conversation_id(request: LlmRequest) -> Optional[str]:
+    if request.is_dummy_request:
+        return None
+    conversation_params = request.py_conversation_params
+    if conversation_params is None:
+        return None
+    conversation_id = conversation_params.conversation_id.strip()
+    return conversation_id or None
+
+
+@dataclass(slots=True)
+class _ConversationState:
+    current_request_id: Optional[int] = None
+    planned_drop_handle: Optional[PlannedDropHandle] = None
+
+
+class ConversationManager:
+    """Track the current request and drop plan for each conversation."""
+
+    def __init__(self) -> None:
+        self._conversation_states: Dict[str, _ConversationState] = {}
+
+    def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
+        """Save a completed context's drop plan and apply the preceding plan on success."""
+        request_id = request.py_request_id
+        conversation_id = _request_conversation_id(request)
+        if conversation_id is None:
+            return
+
+        state = self._conversation_states[conversation_id]
+        if state.current_request_id != request_id:
+            return
+
+        drop_handle = kv_cache.plan_committed_block_drop()
+        if drop_handle is None:
+            logger.warning(
+                f"Committed blocks for request {request_id} in conversation "
+                f"{conversation_id} have been dropped."
+            )
+        else:
+            previous_handle = state.planned_drop_handle
+            state.planned_drop_handle = drop_handle
+            if previous_handle is not None:
+                previous_handle.drop()
+
+        self.finish_request(request)
+
+    def prepare_request(self, request: LlmRequest) -> None:
+        """Register a context request unless its conversation has another active one."""
+        conversation_id = _request_conversation_id(request)
+        if conversation_id is None:
+            return
+        request_id = request.py_request_id
+        state = self._conversation_states.setdefault(conversation_id, _ConversationState())
+        current_request_id = state.current_request_id
+        if current_request_id is not None and current_request_id != request_id:
+            logger.warning(
+                f"Conversation {conversation_id} already has current request "
+                f"{current_request_id}. Request {request_id} will ignore "
+                "conversation params."
+            )
+            return
+
+        state.current_request_id = request_id
+
+    def finish_request(self, request: LlmRequest) -> None:
+        """Clear a request as active while preserving any saved drop plan."""
+        conversation_id = _request_conversation_id(request)
+        if conversation_id is None:
+            return
+        state = self._conversation_states.get(conversation_id)
+        if state is None or state.current_request_id != request.py_request_id:
+            return
+
+        state.current_request_id = None
+        if state.planned_drop_handle is None:
+            self._conversation_states.pop(conversation_id)
+
+    def clear(self) -> None:
+        """Clear state after reusable KV-cache blocks have been cleared."""
+        self._conversation_states.clear()
 
 
 def _estimate_full_attn_size_per_token(
@@ -144,6 +229,46 @@ def _estimate_full_attn_size_per_token(
         for layer_size, window_size in zip(layer_sizes, attention_windows)
         if window_size is None or window_size <= 0
     )
+
+
+def _compute_auto_host_tier_quota(
+    quota: int,
+    local_ranks: int,
+    mem_available: float,
+    memlock_limit: float,
+) -> int:
+    """Compute the auto-provisioned host cache tier quota for a single rank.
+
+    The host tier backs the MAX_UTILIZATION scheduler's suspend/resume path,
+    so it must be positive. It defaults to the device quota, capped by the
+    per-node available-memory budget shared with co-located ranks and by the
+    pinnable-memory (RLIMIT_MEMLOCK) limit.
+
+    Args:
+        quota: Device (GPU) KV cache quota in bytes; must be positive.
+        local_ranks: Number of ranks co-located on this physical node.
+        mem_available: Available host memory in bytes, or ``float("inf")``
+            if unknown.
+        memlock_limit: RLIMIT_MEMLOCK soft limit in bytes, or
+            ``float("inf")`` if unlimited or unknown.
+
+    Returns:
+        Host cache tier quota in bytes (always positive).
+    """
+    candidates = [quota]
+    if mem_available != float("inf"):
+        candidates.append(int(mem_available / local_ranks * 0.5))
+    if memlock_limit != float("inf"):
+        candidates.append(int(memlock_limit * 0.8))
+    host_quota = min(candidates)
+    if host_quota <= 0:
+        logger.warning(
+            f"KV cache manager v2 auto host tier sizing computed a "
+            f"non-positive quota ({host_quota}); falling back to the "
+            f"device quota {quota / (1 << 30):.2f}GiB"
+        )
+        host_quota = quota
+    return host_quota
 
 
 def _estimate_swa_cache_size(
@@ -281,9 +406,19 @@ def _ensure_int64_cpu_tensor(values: Sequence[int] | torch.Tensor) -> torch.Tens
     return torch.as_tensor(values, dtype=torch.int64)
 
 
+_MM_RUN_METADATA_UNSET = object()
+
+
 def _resolve_multimodal_run_metadata(req: LlmRequest) -> Optional[_MmRunMetadata]:
-    # TODO(perf): cache per request; block-reuse invokes this once per block,
-    # repeatedly rebuilding identical tensors for the same request metadata.
+    # Memoize on the request. Block reuse resolves this on the first context
+    # chunk, again on every commit during chunked prefill, and on prefetch, yet
+    # the result is a pure function of the request's immutable multimodal run
+    # layout. Caching on the request bounds the cache to the request lifetime,
+    # so no separate teardown is needed.
+    cached = getattr(req, "py_mm_run_metadata", _MM_RUN_METADATA_UNSET)
+    if cached is not _MM_RUN_METADATA_UNSET:
+        return cached
+
     # Worked example for one logical multimodal item split by text:
     #
     #   prompt index: 0    1      2      3    4      5
@@ -316,6 +451,7 @@ def _resolve_multimodal_run_metadata(req: LlmRequest) -> Optional[_MmRunMetadata
     run_lengths = req.multimodal_run_lengths
 
     if all(field is None for field in (item_run_cu_offsets, run_positions, run_lengths)):
+        req.py_mm_run_metadata = None
         return None
 
     if item_run_cu_offsets is None or run_positions is None or run_lengths is None:
@@ -350,12 +486,14 @@ def _resolve_multimodal_run_metadata(req: LlmRequest) -> Optional[_MmRunMetadata
     # Shape [num_runs]; one-past-last full-prompt index for each flat run.
     run_ends = run_positions + run_lengths
 
-    return _MmRunMetadata(
+    metadata = _MmRunMetadata(
         run_positions=run_positions,
         run_ends=run_ends,
         run_item_indices=run_item_indices,
         run_item_offsets=run_item_offsets,
     )
+    req.py_mm_run_metadata = metadata
+    return metadata
 
 
 def _augment_tokens_with_mm_run_metadata(
@@ -648,6 +786,8 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+        # Set True by a compression manager; generation-step resize then leaves history untouched.
+        self.kv_compression_manages_history: bool = False
         self.enable_swa_scratch_reuse = (
             kv_cache_config.enable_swa_scratch_reuse and not self.is_draft
         )
@@ -788,7 +928,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.is_vswa = len(set(self.max_attention_window_vec)) > 1
 
-        quota = float("inf")
+        max_util_for_resume = kv_cache_config.max_util_for_resume
+        quota = sys.maxsize
         if (
             kv_cache_config.max_gpu_total_bytes is not None
             and kv_cache_config.max_gpu_total_bytes > 0
@@ -799,7 +940,7 @@ class KVCacheManagerV2(BaseResourceManager):
             quota_from_max_tokens = int(
                 math.ceil(
                     self._get_quota_from_max_tokens(kv_cache_config.max_tokens)
-                    / kv_cache_config.max_util_for_resume
+                    / max_util_for_resume
                 )
             )
             quota = min(quota, quota_from_max_tokens)
@@ -809,17 +950,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"New quota is {quota / (1 << 30)}GiB"
             )
 
-        assert quota != float("inf"), (
+        assert quota < sys.maxsize, (
             "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
         )
 
-        # Sync KV cache token capacity across ranks so all ranks allocate
-        # the same number of tokens and the scheduler produces identical
-        # batches.  Normalize to token count before the allreduce because
-        # bytes_per_token varies across PP ranks (different local layers).
+        # Sync resumable token capacity across ranks so the scheduler produces
+        # identical batches. Normalize to tokens because cache costs vary
+        # across PP ranks, including fixed per-rank costs.
         if mapping.world_size > 1:
             dist = Distributed.get(mapping)
-            max_tokens = self._get_max_tokens_from_quota(quota)
+            resumable_quota = int(quota * max_util_for_resume)
+            max_tokens = self._get_max_tokens_from_quota(resumable_quota)
             max_tokens = dist.allreduce(max_tokens, op=ReduceOp.MIN)
             # inf max_tokens means all layers are SWA and every rank quota can
             # fit all SWA fixed cache.
@@ -828,11 +969,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 # token↔quota round-trip is not identity when SWA layers
                 # dominate (full_attn_size_per_token==0), so clamp to guard
                 # against a bogus inflation (nvbugs/6418103).
-                quota = min(quota, self._get_quota_from_max_tokens(max_tokens))
+                synced_quota = int(
+                    math.ceil(self._get_quota_from_max_tokens(max_tokens) / max_util_for_resume)
+                )
+                quota = min(quota, synced_quota)
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
-        cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=quota)]
+        cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
         if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
         else:
@@ -847,6 +991,14 @@ class KVCacheManagerV2(BaseResourceManager):
             # memory and pinnable memory limit to avoid allocation failures.
             import resource
 
+            # Rank-aware host tier sizing: divide the per-node memory budget
+            # by the number of ranks sharing this physical node.  Each rank
+            # independently provisions a host tier; without this, N
+            # co-located ranks each reserving a device-quota-sized block can
+            # OOM the host (observed on GB300 NVL72 with 4 ranks/node and
+            # ~170GiB device quota each on a 975GiB node).
+            local_ranks = max(1, Distributed.get(mapping).local_world_size)
+
             try:
                 mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
             except (ValueError, OSError):
@@ -856,16 +1008,16 @@ class KVCacheManagerV2(BaseResourceManager):
                 memlock_limit = _soft if _soft != resource.RLIM_INFINITY else float("inf")
             except (ValueError, OSError):
                 memlock_limit = float("inf")
-            candidates = [quota]
-            if mem_available != float("inf"):
-                candidates.append(int(mem_available * 0.5))
-            if memlock_limit != float("inf"):
-                candidates.append(int(memlock_limit * 0.8))
-            host_quota = min(candidates)
-            if host_quota <= 0:
-                host_quota = quota
+            host_quota = _compute_auto_host_tier_quota(
+                quota, local_ranks, mem_available, memlock_limit
+            )
+            logger.info(
+                f"KV cache manager v2 auto host tier sizing: "
+                f"{local_ranks} co-located rank(s) on this node, "
+                f"available host memory {mem_available / (1 << 30):.2f}GiB"
+            )
         if host_quota > 0:
-            cache_tiers.append(HostCacheTierConfig(quota=host_quota))
+            cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
                 f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
             )
@@ -873,19 +1025,21 @@ class KVCacheManagerV2(BaseResourceManager):
         if disk_cache_size is not None and disk_cache_size > 0:
             disk_cache_path = kv_cache_config.disk_cache_path
             assert disk_cache_path is not None
-            cache_tiers.append(DiskCacheTierConfig(quota=disk_cache_size, path=disk_cache_path))
+            cache_tiers.append(
+                DiskCacheTierConfig(quota=int(disk_cache_size), path=disk_cache_path)
+            )
             logger.info(
                 f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
 
         self.vocab_size = vocab_size
 
-        config = self._build_cache_config(
+        config = self._build_base_config(
             kv_cache_config,
             tokens_per_block=tokens_per_block,
-            vocab_size=vocab_size,
             cache_tiers=cache_tiers,
         )
+        config = self._build_cache_config(config)
 
         self.kv_cache_manager_py_config = config
 
@@ -899,12 +1053,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     "Retrying without host cache tier."
                 )
                 cache_tiers_gpu_only = [t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)]
-                config = self._build_cache_config(
-                    kv_cache_config,
-                    tokens_per_block=tokens_per_block,
-                    vocab_size=vocab_size,
-                    cache_tiers=cache_tiers_gpu_only,
-                )
+                config = replace(config, cache_tiers=cache_tiers_gpu_only)
                 cache_tiers = cache_tiers_gpu_only
                 self.kv_cache_manager_py_config = config
                 self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
@@ -979,6 +1128,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
+        enable_conversation_manager = (
+            self.enable_block_reuse
+            and self.block_reuse_policy == BlockReusePolicy.PER_CONVERSATION
+            and not self.is_draft
+        )
+        self.conversation_manager = ConversationManager() if enable_conversation_manager else None
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -1048,23 +1203,11 @@ class KVCacheManagerV2(BaseResourceManager):
 
             for layer_id in typed_range(LayerId(self.num_local_layers)):
                 layer_group_id = self.impl.get_layer_group_id(layer_id)
-                if self.dtype != DataType.NVFP4:
-                    key_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
-                    addr_offset = (
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, Role.KEY, PageIndexMode.SHARED
-                        )
-                        - key_base_addr
-                    )
-                else:
-                    key_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
+                key_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
+                offset = self._kv_pool_mapping_offset(layer_id, layer_group_id, key_base_addr)
+
+                if self.dtype == DataType.NVFP4:
                     block_scale_base_addr = block_scale_pool_pointers_list[layer_group_id][0]
-                    addr_offset = (
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, Role.KEY, PageIndexMode.SHARED
-                        )
-                        - key_base_addr
-                    )
                     block_scale_addr_offset = (
                         self.impl.get_mem_pool_base_address(
                             layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
@@ -1077,14 +1220,6 @@ class KVCacheManagerV2(BaseResourceManager):
                         * self.kv_factor
                         * self.tokens_per_block,
                     )
-                offset = exact_div(
-                    addr_offset,
-                    self.get_layer_bytes_per_token(layer_id, Role.KEY)
-                    * self.kv_factor
-                    * self.tokens_per_block,
-                )
-
-                if self.dtype == DataType.NVFP4:
                     assert block_scale_offset == offset, (
                         "Block scale offset and offset should be the same"
                     )
@@ -1144,6 +1279,29 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         if self.enable_swa_scratch_reuse:
             self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
+
+    def _kv_pool_mapping_offset(
+        self, layer_id: LayerId, layer_group_id: int, key_base_addr: int
+    ) -> int:
+        """Per-layer offset recorded in ``kv_cache_pool_mapping``.
+
+        The default derives the layer's position within its pool from the K
+        base address, assuming every layer contributes exactly K(+V) to the
+        pool slot so the layer stride is uniform. Managers whose pool slots
+        may interleave extra per-layer buffers between layers (non-uniform
+        layer strides — e.g. MiniMax M3 when the index-K buffer coalesces
+        into the K/V pool) must override this with a positional formula.
+        """
+        addr_offset = (
+            self.impl.get_mem_pool_base_address(layer_id, Role.KEY, PageIndexMode.SHARED)
+            - key_base_addr
+        )
+        return exact_div(
+            addr_offset,
+            self.get_layer_bytes_per_token(layer_id, Role.KEY)
+            * self.kv_factor
+            * self.tokens_per_block,
+        )
 
     def _get_runtime_cache_size_layer_components(self) -> tuple[List[int], List[Optional[int]]]:
         layer_sizes = []
@@ -1478,14 +1636,81 @@ class KVCacheManagerV2(BaseResourceManager):
             non_blocking=True,
         )
 
-    def _build_cache_config(
+    def _build_base_config(
         self,
         kv_cache_config: KvCacheConfig,
         *,
         tokens_per_block: int,
-        vocab_size: Optional[int],
         cache_tiers: List[CacheTierConfig],
     ) -> KVCacheManagerConfigPy:
+        """Build the general cache configuration used by most models.
+
+        Models that need a custom configuration should subclass
+        :class:`KVCacheManagerV2` and override :meth:`_build_cache_config` to
+        update the necessary fields.
+        """
+        scratch_reuse_config = None
+        if self.enable_swa_scratch_reuse:
+            # Context requests allocate num_extra_kv_tokens for spec decoding.
+            # They should not count toward the scratch range.
+            scratch_reuse_config = SwaScratchReuseConfig(max_rewind_len=self.num_extra_kv_tokens)
+
+        typical_step = None
+        constraints = []
+        if kv_cache_config.pool_ratio is None:
+            typical_seq_len = (
+                kv_cache_config.avg_seq_len
+                if kv_cache_config.avg_seq_len is not None
+                else self.max_seq_len
+            )
+            if typical_seq_len > self.max_seq_len:
+                raise ValueError(
+                    f"kv_cache_config.avg_seq_len ({typical_seq_len}) must be less than or "
+                    f"equal to max_seq_len ({self.max_seq_len})"
+                )
+
+            # Model one context request and enough generation requests to fill
+            # max_batch_size without over-provisioning windowed cache pools.
+            context_capacity = (
+                self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
+            ) + self.num_extra_kv_tokens
+            generation_history_length = max(0, typical_seq_len - self.max_draft_len - 1)
+            typical_step = BatchDesc(
+                [KVCacheDesc(capacity=context_capacity, history_length=0)]
+                + [
+                    KVCacheDesc(
+                        capacity=typical_seq_len,
+                        history_length=generation_history_length,
+                    )
+                ]
+                * (self.max_batch_size - 1)
+            )
+
+            # CUDA graph generation warmup uses one request at max_seq_len and
+            # enough minimal decode requests to fill max_batch_size.
+            min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
+            constraints.append(
+                BatchDesc(
+                    [KVCacheDesc(capacity=self.max_seq_len, history_length=self.max_seq_len - 1)]
+                    + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
+                    * (self.max_batch_size - 1)
+                )
+            )
+
+            # General and chunked-prefill warmup uses one fresh context request
+            # at the per-iteration token budget.
+            if self.max_num_tokens is not None:
+                constraints.append(
+                    BatchDesc(
+                        [
+                            KVCacheDesc(
+                                capacity=self.max_num_tokens + self.num_extra_kv_tokens,
+                                history_length=0,
+                            )
+                        ]
+                    )
+                )
+
         buffer_type = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             buffer_type.append(Role.VALUE)
@@ -1497,12 +1722,6 @@ class KVCacheManagerV2(BaseResourceManager):
             buffer_type.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
-
-        scratch_reuse_config = None
-        if self.enable_swa_scratch_reuse:
-            # Context requests allocate num_extra_kv_tokens for spec decoding.
-            # They should not count toward the scratch range.
-            scratch_reuse_config = SwaScratchReuseConfig(max_rewind_len=self.num_extra_kv_tokens)
 
         # Subclasses (e.g. MiniMax-M3 sparse cache) can register additional
         # per-layer BufferConfig entries — for example a sparse index-K
@@ -1544,14 +1763,24 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
-            vocab_size=vocab_size,
             cache_tiers=cache_tiers,
+            layers=layer_configs,
+            typical_step=typical_step,
+            constraints=constraints,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
+            enable_partial_reuse=kv_cache_config.enable_partial_reuse,
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
+            commit_min_snapshot=(
+                kv_cache_config.enable_block_reuse
+                and self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
+            ),
             initial_pool_ratio=kv_cache_config.pool_ratio,
-            layers=layer_configs,
         )
+
+    def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        """Customize the general cache config for a specialized cache manager."""
+        return config
 
     def _extra_buffers_per_layer(
         self, *, tokens_per_block: int
@@ -1564,11 +1793,43 @@ class KVCacheManagerV2(BaseResourceManager):
         a sparse index-K buffer for each sparse local layer. Each
         ``BufferConfig.size`` is interpreted as bytes per block (i.e.,
         ``bytes_per_token * tokens_per_block``), matching the standard
-        buffers built in :meth:`_build_cache_config`. The block storage
+        buffers built in :meth:`_build_base_config`. The block storage
         groups buffers by lifecycle and size with an opaque role key, so
         new roles do not require C++ changes.
         """
         return None
+
+    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
+        """Map native cache roles to disaggregation mapper kinds.
+
+        ``Role.ALL`` is the required fallback for roles without an explicit
+        entry. The default is the head-major (HND) ``INDEXED`` layout written
+        by the TRTLLM attention kernels — correct for V1 and standard V2
+        managers. ``Role.INDEX_KEY`` defaults to ``REPLICATED``: every
+        index-key side cache shipped so far (DSA indexer-K on V1, MiniMax M3
+        on V2) computes its projection replicated across TP ranks, so the
+        cache bytes are identical per rank; the entry is inert unless a
+        subclass actually registers ``INDEX_KEY`` buffers via
+        ``_extra_buffers_per_layer``. Model-specific managers may declare
+        logical layouts without requiring the shared extractor to inspect
+        private attributes or role names. MiniMax M3, for example, maps
+        ordinary K/V to ``NHD`` and keeps index-key ``REPLICATED``.
+
+        This declaration does not influence storage pooling: V2 storage
+        coalesces buffers purely by ``(life_cycle, buffer size)``, so roles
+        with different transfer semantics may share a pool slot when their
+        per-block sizes coincide (e.g. MiniMax M3 at TP degrees where
+        K == V == INDEX_KEY bytes per block). The disagg page-table builder
+        splits each physical pool into one logical view per mapper kind, so
+        transfer correctness never depends on the coalescing outcome.
+
+        Pool memory is layout-agnostic; this declaration describes what the
+        manager's paired attention backend actually writes. A static mapping
+        is valid only for a fixed manager/backend pair. A manager whose backend
+        selects the layout at runtime must derive the mapping from that
+        backend's configuration.
+        """
+        return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
 
     @property
     def blocks_in_primary_pool(self) -> int:
@@ -1936,6 +2197,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _prepare_context_impl(self, req: LlmRequest) -> bool:
         if req.is_first_context_chunk:
+            if self.conversation_manager is not None:
+                self.conversation_manager.prepare_request(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if kv_cache is None:
                 all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
@@ -2220,14 +2483,47 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         return self._stats_window_size(life_cycle.window_size)
 
+    def _get_storage_statistics(self, cache_level: CacheLevel):
+        return self.impl._storage.get_statistics(cache_level)
+
+    def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
+        pool_groups_by_life_cycle = [
+            self.impl._storage.get_pool_group_index(LifeCycleId(life_cycle_id))
+            for life_cycle_id in range(len(self.impl.layer_grouping))
+        ]
+
+        metadata: dict[int, tuple[int, Optional[int], str]] = {}
+        for life_cycle_id, layer_ids in enumerate(self.impl.layer_grouping):
+            if not layer_ids:
+                continue
+            layer = self.kv_cache_manager_py_config.layers[int(layer_ids[0])]
+            is_attention = isinstance(layer, AttentionLayerConfig)
+            metadata[life_cycle_id] = (
+                int(pool_groups_by_life_cycle[life_cycle_id]),
+                self._stats_window_size(layer.sliding_window_size) if is_attention else None,
+                "attention" if is_attention else "ssm",
+            )
+        return metadata
+
     def _storage_pool_groups_by_window(self) -> dict[int, set[int]]:
         pool_groups_by_window: dict[int, set[int]] = defaultdict(set)
-        for life_cycle_id, life_cycle in self.impl._life_cycles.attention_life_cycles():
-            pool_group_id = self.impl._storage.get_pool_group_index(life_cycle_id)
-            pool_groups_by_window[self._stats_window_size(life_cycle.window_size)].add(
-                int(pool_group_id)
-            )
+        for pool_group_id, window_size, _ in self._stats_life_cycle_metadata().values():
+            if window_size is not None:
+                pool_groups_by_window[window_size].add(pool_group_id)
         return pool_groups_by_window
+
+    def _get_and_reset_iteration_peak_block_stats(self, cache_level: CacheLevel):
+        get_peak_stats = getattr(self.impl, "get_and_reset_iteration_peak_block_stats", None)
+        if get_peak_stats is not None:
+            return get_peak_stats(cache_level)
+        return [
+            PoolGroupPeakBlockStats(
+                available=stats.available,
+                unavailable=stats.total - stats.available,
+                evictable=stats.evictable,
+            )
+            for stats in self._get_storage_statistics(cache_level)
+        ]
 
     @staticmethod
     def _windows_by_pool_group(
@@ -2345,7 +2641,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return stats
 
     def _collect_iteration_stats_deltas(
-        self, raw_iteration_stats, storage
+        self, raw_iteration_stats, life_cycle_metadata
     ) -> tuple[dict, dict, dict, dict]:
         reuse_deltas_by_window: dict[int, KVCacheIterationStatsDelta] = {}
         reuse_deltas_by_life_cycle: dict[int, KVCacheIterationStatsDelta] = {}
@@ -2353,9 +2649,7 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_group_deltas: dict[int, KVCacheIterationStatsDelta] = {}
 
         for life_cycle_id, delta in raw_iteration_stats.items():
-            life_cycle = self.impl._life_cycles.get_life_cycle(life_cycle_id)
-            pool_group_id = int(storage.get_pool_group_index(life_cycle_id))
-            window_size = self._stats_life_cycle_window_size(life_cycle)
+            pool_group_id, window_size, _ = life_cycle_metadata[int(life_cycle_id)]
 
             pool_group_delta = self._filter_iteration_stats_delta(
                 delta, KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS
@@ -2421,9 +2715,15 @@ class KVCacheManagerV2(BaseResourceManager):
         secondary_peak_stats_by_level,
         pool_group_delta,
     ) -> KVCacheV2PoolGroupIterationStats:
+        primary_pool_group_stats = primary_stats[pool_group_id]
+        slot_size = (
+            primary_pool_group_stats.slot_sizes
+            if hasattr(primary_pool_group_stats, "slot_sizes")
+            else primary_pool_group_stats.slot_size
+        )
         return KVCacheV2PoolGroupIterationStats(
             pool_group_id=pool_group_id,
-            slot_size=tuple(primary_stats[pool_group_id].slot_size),
+            slot_size=tuple(slot_size),
             window_sizes=windows_by_pool_group.get(pool_group_id, ()),
             stats=self._build_iteration_stats(
                 (pool_group_id,),
@@ -2439,21 +2739,19 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_life_cycle_iteration_stats(
         self,
         life_cycle_id: int,
-        storage,
+        life_cycle_metadata,
         primary_stats,
         secondary_stats_by_level,
         primary_peak_stats,
         secondary_peak_stats_by_level,
         reuse_delta,
     ) -> KVCacheV2LifeCycleIterationStats:
-        typed_life_cycle_id = LifeCycleId(life_cycle_id)
-        life_cycle = self.impl._life_cycles.get_life_cycle(typed_life_cycle_id)
-        pool_group_id = int(storage.get_pool_group_index(typed_life_cycle_id))
+        pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
         return KVCacheV2LifeCycleIterationStats(
             life_cycle_id=life_cycle_id,
             pool_group_id=pool_group_id,
-            window_size=self._stats_life_cycle_window_size(life_cycle),
-            kind="attention" if isinstance(life_cycle, AttnLifeCycle) else "ssm",
+            window_size=window_size,
+            kind=kind,
             stats=self._build_iteration_stats(
                 (),
                 primary_stats,
@@ -2467,7 +2765,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
-        pool_group_stats = self.impl._storage.get_statistics(GPU_LEVEL)
+        pool_group_stats = self._get_storage_statistics(GPU_LEVEL)
         max_num_blocks = sum(stat.total for stat in pool_group_stats)
         free_num_blocks = sum(stat.available for stat in pool_group_stats)
         committed_stats = self.impl.get_committed_stats()
@@ -2509,29 +2807,29 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self.enable_stats:
             return None
 
-        storage = self.impl._storage
+        life_cycle_metadata = self._stats_life_cycle_metadata()
         pool_groups_by_window = self._storage_pool_groups_by_window()
         windows_by_pool_group = self._windows_by_pool_group(pool_groups_by_window)
         raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
-        primary_peak_stats = self.impl.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
+        primary_peak_stats = self._get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
+        num_cache_levels = len(self.impl.cache_tier_list)
         secondary_peak_stats_by_level = [
-            self.impl.get_and_reset_iteration_peak_block_stats(CacheLevel(level))
-            for level in range(1, int(storage.num_cache_levels))
+            self._get_and_reset_iteration_peak_block_stats(CacheLevel(level))
+            for level in range(1, num_cache_levels)
         ]
         (
             reuse_deltas_by_window,
             reuse_deltas_by_life_cycle,
             pool_group_deltas_by_window,
             pool_group_deltas,
-        ) = self._collect_iteration_stats_deltas(raw_iteration_stats, storage)
+        ) = self._collect_iteration_stats_deltas(raw_iteration_stats, life_cycle_metadata)
 
         windows = set(pool_groups_by_window)
         windows.update(reuse_deltas_by_window)
         windows.update(pool_group_deltas_by_window)
-        primary_stats = storage.get_statistics(GPU_LEVEL)
+        primary_stats = self._get_storage_statistics(GPU_LEVEL)
         secondary_stats_by_level = [
-            storage.get_statistics(CacheLevel(level))
-            for level in range(1, int(storage.num_cache_levels))
+            self._get_storage_statistics(CacheLevel(level)) for level in range(1, num_cache_levels)
         ]
 
         stats_by_window = {
@@ -2566,7 +2864,7 @@ class KVCacheManagerV2(BaseResourceManager):
         stats_by_life_cycle = {
             life_cycle_id: self._build_life_cycle_iteration_stats(
                 life_cycle_id,
-                storage,
+                life_cycle_metadata,
                 primary_stats,
                 secondary_stats_by_level,
                 primary_peak_stats,
@@ -2749,6 +3047,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 start=kv_cache.num_committed_tokens,
                 end=request.context_current_position,
             )
+            # TODO: On a disaggregated prefill server, pass is_end=True for
+            # the last context chunk to improve performance.
             kv_cache.commit(tokens)
         if request.context_remaining_length == 0:
             kv_cache.stop_committing()
@@ -2770,6 +3070,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        if self.conversation_manager is not None:
+            self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
@@ -2783,6 +3085,12 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             self.index_mapper.remove_sequence(request.py_request_id)
 
+    def get_layer_page_index_scale(self, layer_idx: int) -> int:
+        """Page-index scale of this layer's KV buffer. Layers in one pool can
+        have different scales (e.g. different head_dim), so per-layer callers
+        must not use the pool-level scale."""
+        return int(self.impl.get_page_index_scale(self.layer_offsets[layer_idx], Role.KEY))
+
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
@@ -2791,13 +3099,16 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> List[List[int]]:
         if layer_idx is None:
             pool_id = 0
+            index_scale = None
         else:
             pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
+            index_scale = self.get_layer_page_index_scale(layer_idx)
         return self._get_batch_cache_indices_by_pool_id(
             request_ids,
             pool_id=pool_id,
             is_kv_aggregate=True,
             num_blocks_per_seq=num_blocks_per_seq,
+            index_scale=index_scale,
         )
 
     def _get_batch_cache_indices_by_pool_id(
@@ -2807,6 +3118,7 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_id: int = 0,
         is_kv_aggregate: bool = True,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
+        index_scale: Optional[int] = None,
     ) -> List[List[int]]:
         if is_kv_aggregate:
             # Div by kv_factor to index kv cache with size
@@ -2815,7 +3127,8 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             div_factor = 1
 
-        index_scale = int(self.index_scales[pool_id])
+        if index_scale is None:
+            index_scale = int(self.index_scales[pool_id])
         res = []
 
         for req_idx, req_id in enumerate(request_ids):
@@ -2858,10 +3171,14 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if layer_idx is None:
             pool_id = 0
+            scale = self._index_scale_ints[pool_id]
         else:
             pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
-
-        scale = self._index_scale_ints[pool_id]
+            # Layers sharing a pool can still require different page-index
+            # scales (e.g. Gemma4 sliding/global head_dim). Use the per-layer
+            # scale so this flat block table matches get_batch_cache_indices()
+            # and never feeds out-of-range page ids to FlashInfer.
+            scale = self.get_layer_page_index_scale(layer_idx)
         div_factor = self.kv_factor
 
         out_tensor = torch.empty(sum(num_blocks), dtype=torch.int32, pin_memory=prefer_pinned())
@@ -2995,6 +3312,8 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         self.impl.shutdown()
+        if self.conversation_manager is not None:
+            self.conversation_manager.clear()
 
     def get_max_resource_count(self) -> int:
         # TODO: implement this
@@ -3076,6 +3395,8 @@ class KVCacheManagerV2(BaseResourceManager):
             if should_commit:
                 self.try_commit_blocks(req)
             if req.context_remaining_length == 0:
+                if self.conversation_manager is not None:
+                    self.conversation_manager.save_drop_plan(req, kv_cache)
                 # Scratch blocks are only for prefill chunks. Disable them at
                 # the context/generation boundary so generation uses normal KV
                 # pages before the first generation allocation.
@@ -3109,12 +3430,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - req.py_rewind_len
             )
-            success = kv_cache.resize(new_capacity, req.max_beam_num_tokens - 1)
+            history_length = (
+                None if self.kv_compression_manages_history else req.max_beam_num_tokens - 1
+            )
+            success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(
                     f"Failed to resize KV cache for request {req.py_request_id} "
                     f"to capacity {new_capacity} and history length "
-                    f"{req.max_beam_num_tokens - 1} tokens at generation update"
+                    f"{history_length} tokens at generation update"
                 )
 
     def copy_batch_block_offsets(
@@ -3124,7 +3448,10 @@ class KVCacheManagerV2(BaseResourceManager):
         beam_width: int,
         num_contexts: int,
         num_seqs: int,
+        max_blocks: Optional[int] = None,
     ):
+        # max_blocks is accepted for signature parity with KVCacheManager; the
+        # device-side copy op here already scales with allocated blocks only.
         assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
 
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
@@ -3255,3 +3582,5 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()
+        if self.conversation_manager is not None:
+            self.conversation_manager.clear()

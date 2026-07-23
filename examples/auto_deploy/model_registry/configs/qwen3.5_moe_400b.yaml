@@ -36,8 +36,6 @@ transforms:
   apply_sharding_hints:
     enabled: true
     allreduce_strategy: SYMM_MEM
-    # Shared expert is excluded from sharding for performance purpose
-    shard_layers: ["moe", "delta", "mha"]
     simple_shard_filter: "lm_head"
   multi_stream_moe:
     stage: compile

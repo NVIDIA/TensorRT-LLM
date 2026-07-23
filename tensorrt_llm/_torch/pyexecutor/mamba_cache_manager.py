@@ -33,7 +33,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
     PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import nvtx_range, prefer_pinned
+from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -783,14 +784,20 @@ class PythonMambaCacheManager(BaseResourceManager):
         torch.cuda.empty_cache()
 
     @torch.compile(options={"max-autotune": True})
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor,
-                            state_indices: torch.Tensor):
+    def update_mamba_states(
+            self,
+            attn_metadata: "AttentionMetadata",
+            num_accepted_tokens: torch.Tensor,
+            state_indices: torch.Tensor,
+            accepted_leaf_positions: Optional[torch.Tensor] = None):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
         num_accepted_draft_tokens = num_accepted_tokens[
             num_contexts:num_contexts + num_gens] - 1
+        # Dynamic tree passes tree-node leaf positions; linear MTP uses depth.
+        accepted_positions = (accepted_leaf_positions if accepted_leaf_positions
+                              is not None else num_accepted_draft_tokens)
         state_indices_d = state_indices[num_contexts:num_contexts + num_gens]
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
@@ -827,7 +834,7 @@ class PythonMambaCacheManager(BaseResourceManager):
             ssm_states = self.mamba_cache.temporal
             intermediate_ssm_cache = self.mamba_cache.intermediate_ssm
             accepted_ssm_state = intermediate_ssm_cache[:, src_state_indices,
-                                                        num_accepted_draft_tokens]
+                                                        accepted_positions]
             ssm_states[:, state_indices_d, :] = accepted_ssm_state
 
         # Conv: both paths save all intermediate conv windows, carry over the accepted one.
@@ -835,7 +842,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         intermediate_conv_window_cache = self.mamba_cache.intermediate_conv_window
         accepted_conv_state = intermediate_conv_window_cache[:,
                                                              src_state_indices,
-                                                             num_accepted_draft_tokens]
+                                                             accepted_positions]
         conv_states[:, state_indices_d, :] = accepted_conv_state
 
 
@@ -979,15 +986,18 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     def shutdown(self):
         self._impl.shutdown()
 
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor,
-                            state_indices: torch.Tensor):
+    def update_mamba_states(
+            self,
+            attn_metadata: "AttentionMetadata",
+            num_accepted_tokens: torch.Tensor,
+            state_indices: torch.Tensor,
+            accepted_leaf_positions: Optional[torch.Tensor] = None):
         # Non-speculative configs don't allocate intermediate state; the
         # promotion is a clean no-op.
         if not self._impl.is_speculative():
             return
         self._impl.update_mamba_states(attn_metadata, num_accepted_tokens,
-                                       state_indices)
+                                       state_indices, accepted_leaf_positions)
 
 
 class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
@@ -1133,26 +1143,6 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
                          kv_cache_dtype_byte_size: float = None):
         KVCacheManager.update_resources(self, scheduled_batch, attn_metadata,
                                         kv_cache_dtype_byte_size)
-
-
-def calc_context_stop_positions(prompt_len: int,
-                                tokens_per_block: int,
-                                mamba_state_cache_interval: int,
-                                save_last_snapshot: bool = False) -> list[int]:
-    """Compute token positions at which mamba state snapshots should be saved.
-
-    Returns positions spaced by ``mamba_state_cache_interval`` plus the final
-    prompt length (and optionally the last block-aligned position).
-    """
-    stop_positions = list(
-        range(mamba_state_cache_interval, prompt_len,
-              mamba_state_cache_interval))
-    last_ckpt = prompt_len // tokens_per_block * tokens_per_block
-    if save_last_snapshot and (last_ckpt not in stop_positions):
-        stop_positions.append(last_ckpt)
-    if prompt_len not in stop_positions:
-        stop_positions.append(prompt_len)
-    return stop_positions
 
 
 @triton.jit
@@ -1326,6 +1316,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # accessors (get_mamba_ssm_cache_dtype, use_replay_state_update) work
         # on ranks with no local mamba layers.
         self._use_replay_state_update = use_replay_state_update
+        self._use_gdn_cached_replay_all_layer_commit = (
+            use_replay_state_update and model_type == "qwen3_next"
+            and self.local_num_mamba_layers > 0)
         self.replay_step_width: Optional[int] = (
             spec_config.tokens_per_gen_step
             if spec_config is not None and use_replay_state_update else None)
@@ -1362,6 +1355,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 is_estimating_kv_cache=is_estimating_kv_cache,
                 is_draft=is_draft,
             )
+            # PP ranks replay the same scheduling decisions, so a rank without
+            # local Mamba layers must still publish the configured boundaries.
+            self.kv_cache_config = kv_cache_config
+            self.linear_attention_metadata = LinearAttentionMetadata()
+            self.linear_attention_metadata.states_snapshot_interval = (
+                kv_cache_config.mamba_state_cache_interval
+                if kv_cache_config.enable_block_reuse else 0)
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
@@ -1448,6 +1448,21 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                     LinearCacheType.RECURRENT_STATES.
                     value if mamba_layer_mask[i] else max_seq_len)
 
+        recurrent_states_window = LinearCacheType.RECURRENT_STATES.value
+        local_windows = {
+            recurrent_states_window
+            if mamba_layer_mask[layer_idx] else max_seq_len
+            for layer_idx in self.pp_layers
+        }
+        kwargs["pool_configurations"] = [
+            PoolConfiguration(
+                window_size=window_size,
+                head_dim=head_dim,
+                dtype=torch_dtype_to_binding(self.ssm_state_dtype)
+                if window_size == recurrent_states_window else dtype,
+            ) for window_size in sorted(local_windows)
+        ]
+
         # Normalize num_kv_heads to a per-layer list and zero out mamba
         # layer positions: those layers carry SSM/conv state instead of KV
         # heads, so the parent KV cache should not allocate KV head storage
@@ -1519,6 +1534,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         self._setup_states()
         self._setup_replay_buffers(spec_config)
+        if use_replay_state_update and model_type == "qwen3_next":
+            logger.info_once(
+                "Configured GDN cached replay commit mode: small-batch fused, "
+                "large-batch all-layer",
+                key="gdn_cached_replay_commit_mode_fused",
+            )
 
     @staticmethod
     def get_cache_size_per_token(
@@ -1591,6 +1612,46 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if mamba_slope > 0:
             intercept = 0
         return attention_slope + mamba_slope, intercept
+
+    @property
+    def use_gdn_cached_replay_all_layer_commit(self) -> bool:
+        return self._use_gdn_cached_replay_all_layer_commit
+
+    def _commit_gdn_cached_replay_history_layers(
+        self,
+        attn_metadata: "AttentionMetadata",
+        num_decodes: int,
+    ) -> None:
+        """Synchronously advance every local GDN checkpoint in one launch."""
+        from tensorrt_llm._torch.modules.fla.cached_replay import (
+            CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+            commit_gdn_cached_replay_history_layers)
+
+        if (not self._use_gdn_cached_replay_all_layer_commit
+                or num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE):
+            return
+        if (self.all_ssm_states is None or self.old_x is None
+                or self.old_B is None or self.old_dt is None
+                or self.replay_history_size is None):
+            raise RuntimeError(
+                "GDN cached replay all-layer commit requires replay state buffers."
+            )
+
+        mamba_metadata = attn_metadata.mamba_metadata
+        if mamba_metadata.replay_num_decodes != num_decodes:
+            raise RuntimeError(
+                "GDN replay metadata contains "
+                f"{mamba_metadata.replay_num_decodes} decode requests, "
+                f"but state update received {num_decodes}.")
+        commit_gdn_cached_replay_history_layers(
+            ssm_states=self.all_ssm_states,
+            old_u=self.old_x,
+            old_k=self.old_B,
+            old_G=self.old_dt,
+            replay_work_items=mamba_metadata.replay_work_items[:num_decodes],
+            n_writes=mamba_metadata.replay_n_writes,
+            history_size=self.replay_history_size,
+        )
 
     def shutdown(self):
         # Release tensor views into the pool before the pool memory is freed,
@@ -1739,10 +1800,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         return self.spec_config is not None
 
     @nvtx_range("hybrid_update_mamba_states")
-    def update_mamba_states(self,
-                            attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor,
-                            state_indices: Optional[torch.Tensor] = None):
+    def update_mamba_states(
+            self,
+            attn_metadata: "AttentionMetadata",
+            num_accepted_tokens: torch.Tensor,
+            state_indices: Optional[torch.Tensor] = None,
+            accepted_leaf_positions: Optional[torch.Tensor] = None):
         if self.local_num_mamba_layers == 0:
             return
         batch_size = attn_metadata.num_seqs
@@ -1751,6 +1814,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         num_accepted_draft_tokens = (
             num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
                 torch.int32)
+        # Dynamic tree passes tree-node leaf positions; linear MTP uses depth.
+        accepted_positions = (accepted_leaf_positions.to(torch.int32)
+                              if accepted_leaf_positions is not None else
+                              num_accepted_draft_tokens)
         # Match the API of MambaCacheManager.update_mamba_states: callers
         # may pass per-request state slot indices explicitly (e.g. MTP via
         # attn_metadata.mamba_metadata.state_indices). Fall back to this
@@ -1768,6 +1835,11 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # writes through the view's real strides (~85% of HBM peak, one launch
         # per state).
         if self._use_replay_state_update:
+            # Every GDN layer has finished reading the old checkpoint and
+            # writing its candidate history. Advance all local checkpoints
+            # in one launch before PNAT and the active history buffer change.
+            self._commit_gdn_cached_replay_history_layers(
+                attn_metadata, num_gens)
             # SSM state is handled incrementally by the kernel. Mirror the
             # kernel's checkpoint predicate from the previous PNAT and fixed
             # replay step width: checkpoint steps flip buffers, while no-write
@@ -1798,16 +1870,15 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             # Legacy: copy the accepted SSM state from the intermediate buffer.
             _promote_mamba_state_triton(self.all_ssm_states,
                                         self.intermediate_ssm_states,
-                                        src_state_indices,
-                                        num_accepted_draft_tokens,
+                                        src_state_indices, accepted_positions,
                                         state_indices_d)
 
         # Conv: both paths save all intermediate conv windows, carry over the
         # accepted one.
         _promote_mamba_state_triton(self.all_conv_states,
                                     self.intermediate_conv_states,
-                                    src_state_indices,
-                                    num_accepted_draft_tokens, state_indices_d)
+                                    src_state_indices, accepted_positions,
+                                    state_indices_d)
 
     @torch.inference_mode()
     def _refresh_dummy_request_mask(self, is_dummy: List[bool]) -> None:
@@ -1838,7 +1909,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # request, so no additional capping is required here.
         interval = (self.linear_attention_metadata.states_snapshot_interval
                     if self.linear_attention_metadata is not None else 0)
-        if interval and interval > 0:
+        # Attention-only PP ranks keep the interval so every rank publishes
+        # identical scheduling boundaries, but they have no recurrent-state
+        # pool whose capacity should constrain their attention KV cache.
+        if self.local_num_mamba_layers > 0 and interval and interval > 0:
             stats = self.impl.get_kv_cache_stats()
             rs_free = stats.num_free_blocks_per_window_size.get(
                 LinearCacheType.RECURRENT_STATES.value, 0)
@@ -1968,15 +2042,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
+        is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(
-            [req.is_dummy for req in self.requests])
+            is_dummy if requests is
+            self.requests else [req.is_dummy for req in self.requests])
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
-        for i, req in enumerate(requests):
-            self._request_id_to_state_index[
-                req.py_request_id] = self._host_state_indices[i].item()
-            self._request_id_to_is_dummy[req.py_request_id] = req.is_dummy
+        # Bulk tolist avoids a per-request tensor-index + .item() round-trip.
+        state_values = self._host_state_indices[:n].tolist()
+        for req, value, dummy in zip(requests, state_values, is_dummy):
+            self._request_id_to_state_index[req.py_request_id] = value
+            self._request_id_to_is_dummy[req.py_request_id] = dummy
 
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,
@@ -2000,38 +2077,23 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return indices
         return self.cuda_state_indices
 
-    def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
-        """Compute the next prefill chunk size for a context request when block reuse is enabled.
-
-        When kv_cache_config.enable_block_reuse is True, context prefill must stop exactly at
-        the positions returned by calc_context_stop_positions (mamba_state_cache_interval boundaries
-        and block boundaries). This returns the chunk_size to use for the next prefill step so
-        that the next stop position is not exceeded.
-
-        Args:
-            request: Context request with prompt_len and context_current_position set.
-
-        Returns:
-            Number of tokens to prefill in the next step (0 if context is already complete).
-        """
-        prompt_len = request.prompt_len
-        current = request.context_current_position
-        if current >= prompt_len:
-            return 0
+    def prepare_expect_snapshot_points(self,
+                                       requests: List[LlmRequest]) -> None:
+        """Set reusable Mamba snapshot boundaries before scheduling."""
         if not self.kv_cache_config.enable_block_reuse:
-            assert current == 0, (
-                "Expected context_current_position to be 0 when block reuse is "
-                f"disabled, but got {current}")
-            return prompt_len - current
-        step = self.linear_attention_metadata.states_snapshot_interval
-        stop_positions = calc_context_stop_positions(prompt_len,
-                                                     self.tokens_per_block,
-                                                     step)
-        stop_positions = sorted(set(stop_positions))
-        for pos in stop_positions:
-            if pos > current:
-                return pos - current
-        return prompt_len - current
+            for request in requests:
+                request.expect_snapshot_points = []
+            return
+
+        interval = self.linear_attention_metadata.states_snapshot_interval
+        if interval is None or interval <= 0:
+            for request in requests:
+                request.expect_snapshot_points = []
+            return
+
+        for request in requests:
+            request.expect_snapshot_points = list(
+                range(interval, request.prompt_len + 1, interval))
 
     def _setup_states(self) -> None:
         # Pool layout: {numLocalLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)

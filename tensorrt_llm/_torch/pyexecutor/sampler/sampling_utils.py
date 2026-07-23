@@ -31,54 +31,49 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer, vanilla
 # These op wrappers are safe to import without flashinfer installed; they are
 # only called on the flashinfer sampler / speculative-worker paths.
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    sampling_from_probs_generator_op as sampling_from_probs_generator_op,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import softmax_op as softmax_op
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_k_mask_logits_op as top_k_mask_logits_op,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_k_sampling_from_probs_generator_op as top_k_sampling_from_probs_generator_op,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_k_top_p_sampling_from_logits_with_generator_op as top_k_top_p_sampling_from_logits_with_generator_op,  # noqa: E501
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_p_renorm_probs_op as top_p_renorm_probs_op,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_p_sampling_from_probs_generator_op as top_p_sampling_from_probs_generator_op,
+    sampling_from_probs_op,
+    softmax_op,
+    top_k_mask_logits_op,
+    top_k_sampling_from_probs_op,
+    top_k_top_p_sampling_from_logits_op,
+    top_p_renorm_probs_op,
+    top_p_sampling_from_probs_op,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    BeamSearchMetadata as BeamSearchMetadata,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import StrategyMetadata as StrategyMetadata
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import _Fusions as _Fusions
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    beam_search_sampling_batch as beam_search_sampling_batch,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    get_rejected_indices as get_rejected_indices,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import greedy as _torch_greedy
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    greedy_search_sampling_batch as greedy_search_sampling_batch,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import sample_rejected as sample_rejected
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    temperature_sampling_batch as temperature_sampling_batch,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    top_k_sampling_batch as top_k_sampling_batch,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    top_k_top_p_sampling_batch as top_k_top_p_sampling_batch,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    top_p_sampling_batch as top_p_sampling_batch,
+    GREEDY_TEMPERATURE_THRESHOLD,
+    BeamSearchMetadata,
+    Fusions,
+    StrategyMetadata,
+    beam_search_sampling_batch,
+    get_rejected_indices,
+    greedy_search_sampling_batch,
+    sample_rejected,
+    top_k_top_p_sampling_batch,
 )
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.sampling_params import SamplingParams
+
+# Ops imported above are re-exported for dependent modules (sampler, drafting
+# loops, tests). mypy runs in strict mode (no implicit re-export), so they must
+# be listed here.
+__all__ = [
+    "GREEDY_TEMPERATURE_THRESHOLD",
+    "BeamSearchMetadata",
+    "Fusions",
+    "StrategyMetadata",
+    "beam_search_sampling_batch",
+    "get_rejected_indices",
+    "greedy_search_sampling_batch",
+    "sample_rejected",
+    "sampling_from_probs_op",
+    "softmax_op",
+    "top_k_mask_logits_op",
+    "top_k_sampling_from_probs_op",
+    "top_k_top_p_sampling_batch",
+    "top_k_top_p_sampling_from_logits_op",
+    "top_p_renorm_probs_op",
+    "top_p_sampling_from_probs_op",
+]
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -96,7 +91,8 @@ GREEDY: Greedy = ("greedy", None)
 
 Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSearch
 
-BEAM_SEARCH_PAD_TOKEN = -1
+# Re-exported from the beam-search op implementation (single source of truth).
+BEAM_SEARCH_PAD_TOKEN = vanilla.BEAM_SEARCH_PAD_TOKEN
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -110,6 +106,10 @@ class UtilsSamplingParams:
         use_beam_search: Whether to use beam search.
         beam_width_in: The beam_width of a request before the sampling step.
         beam_width_out: The beam_width of a request after the sampling step.
+        top_p_decay: Per-step multiplicative decay applied to the runtime top-p.
+        top_p_min: Lower bound for the decayed runtime top-p.
+        top_p_reset_ids: Token id which, when sampled, resets the runtime top-p to
+            its initial value. A value < 0 never matches a token.
     """
 
     temperature: Optional[float]
@@ -118,6 +118,38 @@ class UtilsSamplingParams:
     use_beam_search: Optional[bool]
     beam_width_in: Optional[int] = None
     beam_width_out: Optional[int] = None
+    top_p_decay: Optional[float] = None
+    top_p_min: Optional[float] = None
+    top_p_reset_ids: Optional[int] = None
+
+
+@dataclass(kw_only=True)
+class TopPDecayMetadata(StrategyMetadata):
+    """Per-group runtime top-p override for Top-P Decay (attached to top_p /
+    top_k_top_p groups via the ``StrategyMetadata`` mechanism).
+
+    ``slots`` maps each per-step group row to its sequence slot; the decayed
+    per-row top-p is gathered on-device from the per-slot ``runtime_top_p``
+    store, gated by ``is_decay_slot`` (non-decay rows keep their static top-p).
+    Consumed by the TopP*/TopKTopP* strategy impls in ``sample()``. See
+    ``TorchSampler.TopPDecayStore`` for the feature-level semantics.
+    """
+
+    slots: torch.Tensor
+    """Per-step group rows' sequence slots (int64, device)."""
+    runtime_top_p: torch.Tensor
+    """Per-slot runtime (decayed) top-p store (float32, device)."""
+    is_decay_slot: torch.Tensor
+    """Per-slot decay-active gate (bool, device)."""
+
+
+def top_p_decay_active(params: UtilsSamplingParams) -> bool:
+    """Whether dynamic top-p decay is active for a request.
+
+    Delegates to the single-source predicate on SamplingParams; note that
+    ``top_p_min`` / ``top_p_reset_ids`` alone do not activate dynamic behavior.
+    """
+    return SamplingParams.params_imply_top_p_decay_active(params.top_p_decay)
 
 
 def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -> Strategy:
@@ -128,11 +160,15 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     top_p = params.top_p
     top_k = params.top_k
 
+    # The greedy verdict (including the top-p-decay override of the implicit
+    # all-unset greedy default, and explicit greedy controls winning over decay)
+    # is single-sourced in SamplingParams.params_imply_greedy_decoding.
     if SamplingParams.params_imply_greedy_decoding(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
         use_beam_search=use_beam_search,
+        top_p_decay=params.top_p_decay,
     ):
         return GREEDY
 
@@ -156,7 +192,10 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     assert top_k > 1, "non-greedy sampling requires valid top_k"
     need_top_k = top_k < vocab_size
     assert top_p > 0, "non-greedy sampling requires valid top_p"
-    need_top_p = top_p < 1
+    # A decay-active request must go through a top-p-capable path even when its
+    # initial top_p is 1.0, so the runtime top-p (sourced per-row at sample time)
+    # can shrink the nucleus on later steps.
+    need_top_p = top_p < 1 or top_p_decay_active(params)
 
     if need_top_p:
         if need_top_k:
@@ -179,14 +218,14 @@ def sample(
     # 'cast' needed b/c of https://github.com/python/mypy/issues/19081
     match strategy:
         case ("top_k", top_k, temperature):
-            tokens, softmax = top_k_sampling_batch(
+            tokens, softmax = top_k_top_p_sampling_batch(
                 logits,
                 top_k=cast(int, top_k),
                 temperature=cast(float, temperature),
                 generator=generator,
             )
         case ("top_p", top_p, temperature):
-            tokens, softmax = top_p_sampling_batch(
+            tokens, softmax = top_k_top_p_sampling_batch(
                 logits,
                 top_p=cast(float, top_p),
                 generator=generator,
@@ -201,7 +240,7 @@ def sample(
                 generator=generator,
             )
         case ("temperature", temperature):
-            tokens, softmax = temperature_sampling_batch(
+            tokens, softmax = top_k_top_p_sampling_batch(
                 logits,
                 temperature=cast(float, temperature),
                 generator=generator,
@@ -255,8 +294,19 @@ class _StrategyImpls:
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             pass
 
+        # TODO: Revisit this after determining performance impact
+        #
+        # NB: NaN logits can lead to crashes, see
+        #     https://github.com/flashinfer-ai/flashinfer/issues/1575
+        #
         @staticmethod
         def _flashinfer_check_nans(inputs: torch.Tensor) -> bool:
+            # Deliberately returns False to keep FlashInfer's own 'check_nan' path
+            # disabled: that path is a host-side `if torch.any(torch.isnan(...))`,
+            # which forces a device sync on every call. The explicit async
+            # device-side assert below provides the same protection without
+            # stalling the pipeline.
+            # https://github.com/pytorch/pytorch/issues/36853
             torch._assert_async(~torch.any(torch.isnan(inputs)))
             return False
 
@@ -296,8 +346,8 @@ class _StrategyImpls:
             probs: torch.Tensor,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
-            return sampling_from_probs_generator_op(
-                probs, generator, check_nan=cls._flashinfer_check_nans(probs)
+            return sampling_from_probs_op(
+                probs, generator=generator, check_nan=cls._flashinfer_check_nans(probs)
             )
 
         def _sample_greedy_with_probs(
@@ -339,6 +389,34 @@ class _StrategyImpls:
             new_tokens = cls._sample_from_probs(probs, generator=generator)
             return new_tokens, probs
 
+    class TopPDecayMixin:
+        """Mixed into the TopP*/TopKTopP* impls (the owners of a per-row
+        ``_top_p`` tensor) to consume ``TopPDecayMetadata``."""
+
+        _top_p: torch.Tensor
+
+        def _maybe_apply_top_p_decay(self, group_metadata: Optional[StrategyMetadata]) -> None:
+            """Override the per-row static top-p with the decayed runtime top-p.
+
+            Only decay-active rows (per the on-device ``is_decay_slot`` gate) are
+            overridden, so a group mixing top-p-decay and plain top-p requests
+            keeps each row's correct value. The overridden ``self._top_p`` tensor
+            then feeds both sampling and ``top_p_renorm_probs_op`` (so processed
+            logprobs match). Fused via torch.compile (gather + gate + select).
+            """
+            if not isinstance(group_metadata, TopPDecayMetadata):
+                return
+            assert self._top_p.shape == group_metadata.slots.shape, (
+                self._top_p.shape,
+                group_metadata.slots.shape,
+            )
+            self._top_p = Fusions.top_p_decay_gather(
+                runtime_top_p=group_metadata.runtime_top_p,
+                is_decay_slot=group_metadata.is_decay_slot,
+                static_top_p=self._top_p,
+                slots=group_metadata.slots,
+            )
+
     class StrategyImplWithProbs(StrategyImpl):
         @override
         @classmethod
@@ -367,7 +445,7 @@ class _StrategyImpls:
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             return self._sample_greedy_with_probs(logits, group_logit_indices=group_logit_indices)
 
-    class TopKTopPWithProbs(StrategyImplWithProbs):
+    class TopKTopPWithProbs(TopPDecayMixin, StrategyImplWithProbs):
         def __init__(self, top_k: torch.Tensor, top_p: torch.Tensor, temperature: torch.Tensor):
             self._top_k = top_k
             self._top_p = top_p
@@ -393,6 +471,7 @@ class _StrategyImpls:
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            self._maybe_apply_top_p_decay(group_metadata)
             return self._sample_with_probs(
                 logits,
                 group_logit_indices=group_logit_indices,
@@ -435,7 +514,7 @@ class _StrategyImpls:
                 generator=generator,
             )
 
-    class TopPWithProbs(StrategyImplWithProbs):
+    class TopPWithProbs(TopPDecayMixin, StrategyImplWithProbs):
         def __init__(self, top_p: torch.Tensor, temperature: torch.Tensor):
             self._top_p = top_p
             self._temperature = temperature
@@ -459,6 +538,7 @@ class _StrategyImpls:
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            self._maybe_apply_top_p_decay(group_metadata)
             return self._sample_with_probs(
                 logits,
                 group_logit_indices=group_logit_indices,
@@ -527,7 +607,7 @@ class _StrategyImpls:
                 logits = logits[group_logit_indices]
             return torch.argmax(logits, dim=-1), None
 
-    class TopKTopPSampleOnly(StrategyImplSampleOnly):
+    class TopKTopPSampleOnly(TopPDecayMixin, StrategyImplSampleOnly):
         def __init__(self, top_k: torch.Tensor, top_p: torch.Tensor, temperature: torch.Tensor):
             self._top_k = top_k
             self._top_p = top_p
@@ -553,14 +633,15 @@ class _StrategyImpls:
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            self._maybe_apply_top_p_decay(group_metadata)
             logits = self._prepare_logits_with_temperature(
                 logits, group_logit_indices, self._temperature
             )
-            return top_k_top_p_sampling_from_logits_with_generator_op(
+            return top_k_top_p_sampling_from_logits_op(
                 logits,
                 self._top_k,
                 self._top_p,
-                generator,
+                generator=generator,
                 check_nan=self._flashinfer_check_nans(logits),
             ), None
 
@@ -591,11 +672,14 @@ class _StrategyImpls:
             probs = self._prepare_probs_with_temperature(
                 logits, group_logit_indices, self._temperature
             )
-            return top_k_sampling_from_probs_generator_op(
-                probs, self._top_k, generator, check_nan=self._flashinfer_check_nans(probs)
+            return top_k_sampling_from_probs_op(
+                probs,
+                self._top_k,
+                generator=generator,
+                check_nan=self._flashinfer_check_nans(probs),
             ), None
 
-    class TopPSampleOnly(StrategyImplSampleOnly):
+    class TopPSampleOnly(TopPDecayMixin, StrategyImplSampleOnly):
         def __init__(self, top_p: torch.Tensor, temperature: torch.Tensor):
             self._top_p = top_p
             self._temperature = temperature
@@ -619,11 +703,15 @@ class _StrategyImpls:
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            self._maybe_apply_top_p_decay(group_metadata)
             probs = self._prepare_probs_with_temperature(
                 logits, group_logit_indices, self._temperature
             )
-            return top_p_sampling_from_probs_generator_op(
-                probs, self._top_p, generator, check_nan=self._flashinfer_check_nans(probs)
+            return top_p_sampling_from_probs_op(
+                probs,
+                self._top_p,
+                generator=generator,
+                check_nan=self._flashinfer_check_nans(probs),
             ), None
 
     class TemperatureOnlySampleOnly(StrategyImplSampleOnly):
@@ -742,6 +830,8 @@ class FlashInferGroupedStrategySampler:
         match strategy_key:
             case ("beam_search", _, _):
                 return BeamSearchMetadata
+            case "top_p" | "top_k_top_p":
+                return TopPDecayMetadata
             case _:
                 return None
 
@@ -813,9 +903,6 @@ class FlashInferGroupedStrategySampler:
         return next_tokens, softmax, strategy_impl.get_temperature()
 
 
-# Re-export the torch greedy op (used by drafting_loops and speculative/interface).
-greedy = _torch_greedy
-
 # ---------------------------------------------------------------------------
 # Spec-decoding interface: compute_probs_from_logits (per-request tensor params)
 # ---------------------------------------------------------------------------
@@ -825,14 +912,13 @@ def sanitize_top_k(top_k: torch.Tensor, vocab_size: int) -> torch.Tensor:
     """Map ``top_k`` into a backend-safe range before top-k filtering.
 
     Per ``SamplingParams``, ``top_k == 0`` means "all logits" (top-k disabled),
-    but the flashinfer (``top_k_mask_logits``) and PyTorch-native top-k paths
-    break on a literal 0 — they mask the entire row (all-zero probs) or gather
-    out of bounds. Mirror the C++ op (``dynamicTreeKernels.cu``): map any
-    non-positive value (and any oversized disable sentinel such as
-    ``INT32_MAX``) to ``vocab_size`` (== keep all tokens), leaving genuine
-    top_k values untouched.
+    but the flashinfer top-k kernels (``top_k_mask_logits``) break on a literal
+    0 — they mask the entire row (all-zero probs). Map any non-positive value
+    (and any oversized disable sentinel such as ``INT32_MAX``) to
+    ``vocab_size`` (== keep all tokens), leaving genuine top_k values
+    untouched.
     """
-    return torch.where(top_k > 0, top_k, torch.full_like(top_k, vocab_size)).clamp(max=vocab_size)
+    return top_k.clamp(max=vocab_size).masked_fill_(top_k <= 0, vocab_size)
 
 
 @torch.compile(options={"max-autotune": True})
@@ -859,20 +945,20 @@ def sampling_batch_spec_dec_one_model(
     temperatures: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
-    seed: Optional[int] = None,
-    offset: Optional[int] = None,
+    seed: Optional[torch.Tensor] = None,
+    offset: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CUDA-graph compatible sampling; supports mixed sampling params. Returns sampled tokens."""
     top_k = sanitize_top_k(top_k, logits.shape[-1])
     # Greedy rows (temperature <= threshold) must return the argmax token, not a
     # sample from the temperature-scaled distribution. Capture the argmax from the
-    # *original* logits up front; _safely_apply_temperature_inplace then guards the division
+    # *original* logits up front; safely_apply_temperature_inplace then guards the division
     # against the greedy sentinel, and torch.where restores the greedy rows below.
     # All ops are branch-free (no data-dependent control flow), so this stays
     # CUDA-graph safe.
-    is_greedy = temperatures <= vanilla._GREEDY_TEMPERATURE_THRESHOLD
+    is_greedy = temperatures <= vanilla.GREEDY_TEMPERATURE_THRESHOLD
     greedy_tokens = logits.argmax(dim=-1)
-    logits = vanilla._safely_apply_temperature_inplace(logits, temperatures)
+    logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
     sampled = flashinfer.top_k_top_p_sampling_from_logits_op(
         logits, top_k, top_p, seed=seed, offset=offset
     )

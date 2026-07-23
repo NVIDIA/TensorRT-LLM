@@ -777,7 +777,9 @@ class PARDForCausalLM(nn.Module):
             draft_config.pretrained_config)
 
         # Remove spec_config to prevent recursive spec-dec initialization
-        draft_config_no_spec = replace(draft_config, spec_config=None)
+        draft_config_no_spec = replace(draft_config,
+                                       spec_config=None,
+                                       lm_head_gather_output=False)
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
@@ -840,11 +842,11 @@ class DFlashForCausalLM(nn.Module):
     """
 
     def __init__(self, draft_config):
+        """Build the draft model, resolving its architecture from the draft config
+        (falling back to a model_type-derived name when the checkpoint uses a
+        custom DFlash architecture label)."""
         super().__init__()
 
-        # DFlash draft models may use custom architecture names (e.g. "DFlashDraftModel")
-        # that are not registered in MODEL_CLASS_MAPPING. Fall back to model_type-based
-        # architecture name (e.g. "qwen3" -> "Qwen3ForCausalLM").
         pretrained_cfg = draft_config.pretrained_config
         try:
             DraftModelClass, _ = get_model_architecture(pretrained_cfg)
@@ -863,7 +865,9 @@ class DFlashForCausalLM(nn.Module):
                 pretrained_cfg.architectures = original_archs
 
         # Remove spec_config to prevent recursive spec-dec initialization
-        draft_config_no_spec = replace(draft_config, spec_config=None)
+        draft_config_no_spec = replace(draft_config,
+                                       spec_config=None,
+                                       lm_head_gather_output=False)
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
@@ -909,6 +913,11 @@ class DFlashForCausalLM(nn.Module):
         self._num_kv_heads = 0
         self._has_qk_norm = False
         self._use_fused_qk_norm_rope = False
+        # Laguna-specific draft-layer behaviors, disabled by default so generic
+        # DFlash drafters keep the original contract (no context input_layernorm,
+        # non-causal block attention). Subclasses opt in.
+        self._context_input_layernorm = False
+        self._sliding_layers_causal = False
 
     def _init_rope(self):
         """Initialize RoPE from the draft model's attention configuration.
@@ -916,6 +925,14 @@ class DFlashForCausalLM(nn.Module):
         Reuses the existing RotaryEmbedding infrastructure which correctly
         handles all RoPE variants (standard, YaRN, scaled, etc.).
         """
+        # RoPE is read from layer 0; guard that the drafter is single-layer-type
+        # (the target uses per-layer-type RoPE, the drafter does not).
+        layer_types = getattr(self.config, 'layer_types', None)
+        if layer_types is not None and len(set(layer_types)) > 1:
+            raise ValueError(
+                "DFlash _init_rope() reads RoPE from layer 0 only, but the drafter "
+                f"has heterogeneous layer_types {sorted(set(layer_types))}; per-layer "
+                "RoPE resolution is required for this checkpoint.")
         attn0 = self.model.layers[0].self_attn
 
         if attn0.rotary_emb is not None:
@@ -951,6 +968,24 @@ class DFlashForCausalLM(nn.Module):
 
         self._rope_initialized = True
 
+    def project_target_hidden(self,
+                              hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project captured target hidden states into the draft hidden space.
+
+        Generic DFlash: fc then hidden_norm. Subclasses (e.g. Laguna) may
+        normalize the per-aux features first by overriding this method.
+        """
+        hidden_states = hidden_states.to(self.fc.weight.dtype)
+        return self.hidden_norm(self.fc(hidden_states))
+
+    def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads,
+                             head_dim):
+        """Hook applied to the block-attention output before o_proj.
+
+        No-op for generic DFlash; overridden by drafters that gate (e.g. Laguna).
+        """
+        return attn_output
+
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
         """Load weights into the DFlash draft model.
 
@@ -959,6 +994,36 @@ class DFlashForCausalLM(nn.Module):
         - Extra DFlash-specific weights: 'fc.weight', 'hidden_norm.weight'
         - Missing embed_tokens and lm_head (shared with target model)
         """
+        # Laguna DFlash checkpoints may ship a fused self_attn.qkv_proj; the draft
+        # loader expects split q/k/v (a fused key is silently dropped otherwise).
+        if any(k.endswith('self_attn.qkv_proj.weight') for k in weights):
+            for attr in ('num_attention_heads_per_layer',
+                         'num_key_value_heads_per_layer'):
+                per_layer = getattr(self.config, attr, None)
+                if per_layer is not None and len(set(per_layer)) > 1:
+                    raise ValueError(
+                        "DFlash load_weights() splits the fused qkv_proj using "
+                        "the global head count, but the drafter has heterogeneous "
+                        f"{attr} {sorted(set(per_layer))}; per-layer qkv splitting "
+                        "is required for this checkpoint.")
+            head_dim = getattr(
+                self.config, 'head_dim',
+                self.config.hidden_size // self.config.num_attention_heads)
+            num_kv_heads = getattr(self.config, 'num_key_value_heads',
+                                   self.config.num_attention_heads)
+            q = self.config.num_attention_heads * head_dim
+            kv = num_kv_heads * head_dim
+            split = {}
+            for k, v in weights.items():
+                if k.endswith('self_attn.qkv_proj.weight'):
+                    b = k[:-len('qkv_proj.weight')]
+                    split[b + 'q_proj.weight'] = v[:q]
+                    split[b + 'k_proj.weight'] = v[q:q + kv]
+                    split[b + 'v_proj.weight'] = v[q + kv:]
+                else:
+                    split[k] = v
+            weights = split
+
         # Remap: add 'model.' prefix where needed, and extract DFlash-specific weights
         remapped = {}
         for key, value in weights.items():
@@ -1028,7 +1093,12 @@ class DFlashForCausalLM(nn.Module):
         nkv = self._num_kv_heads
         hd = self._head_dim
         weight_dtype = self._fused_kv_weight.dtype
-        if projected_hidden.dtype != weight_dtype:
+        if getattr(self, '_input_ln_eps', None) is not None:
+            ph = projected_hidden.float()
+            ph = ph * torch.rsqrt(
+                ph.pow(2).mean(-1, keepdim=True) + self._input_ln_eps)
+            projected_hidden = ph.to(weight_dtype)
+        elif projected_hidden.dtype != weight_dtype:
             projected_hidden = projected_hidden.to(weight_dtype)
 
         kv_flat = F.linear(projected_hidden, self._fused_kv_weight,
@@ -1123,12 +1193,17 @@ class DFlashForCausalLM(nn.Module):
         q_size = attn0.q_size
         kv_size = attn0.kv_size
         head_dim = attn0.head_dim
+        num_heads = attn0.num_heads
         num_kv_heads = attn0.num_key_value_heads
+        # Head counts are read from layer 0 here and in dflash_forward; assert
+        # uniformity (the target uses per-layer heads, the drafter does not).
         for a in layers_attn[1:]:
-            assert (a.kv_size == kv_size and a.head_dim == head_dim
-                    and a.num_key_value_heads == num_kv_heads), (
-                        "DFlash fused KV requires all drafter layers to share "
-                        "kv_size / head_dim / num_kv_heads.")
+            assert (
+                a.q_size == q_size and a.kv_size == kv_size
+                and a.head_dim == head_dim and a.num_heads == num_heads
+                and a.num_key_value_heads == num_kv_heads), (
+                    "DFlash fused KV requires all drafter layers to share "
+                    "q_size / kv_size / head_dim / num_heads / num_kv_heads.")
 
         has_k_norm = [hasattr(a, 'k_norm') for a in layers_attn]
         assert all(has_k_norm) or not any(has_k_norm), (
@@ -1138,6 +1213,32 @@ class DFlashForCausalLM(nn.Module):
         kv_weights = [
             a.qkv_proj.weight[q_size:q_size + 2 * kv_size] for a in layers_attn
         ]
+        # Fold each drafter layer's input_layernorm weight into its KV projection
+        # so context K/V match the query path. vLLM laguna_dflash applies
+        # layer.input_layernorm to context states before KV; RMSNorm gives
+        # (x_hat * w) @ Wkv.T == x_hat @ (Wkv * w).T, and the shared 1/rms(x) is
+        # applied to projected_hidden in precompute_context_kv.
+        dlayers = self.model.layers
+        if self._context_input_layernorm and all(
+                hasattr(dl, 'input_layernorm') for dl in dlayers):
+            eps_set = {
+                getattr(dl.input_layernorm, 'variance_epsilon',
+                        getattr(self.config, 'rms_norm_eps', 1e-6))
+                for dl in dlayers
+            }
+            assert len(eps_set) == 1, (
+                "DFlash fused context input_layernorm needs all drafter layers "
+                f"to share variance_epsilon; got {sorted(eps_set)}")
+            self._input_ln_eps = eps_set.pop()
+            folded = []
+            for w, dl in zip(kv_weights, dlayers):
+                scale = dl.input_layernorm.weight.data
+                if getattr(dl.input_layernorm, 'use_gemma', False):
+                    scale = scale + 1
+                folded.append(w * scale[None, :].to(w.dtype))
+            kv_weights = folded
+        else:
+            self._input_ln_eps = None
         fused_kv_weight = torch.cat(kv_weights, dim=0).contiguous()
         if attn0.qkv_proj.bias is not None:
             kv_biases = [
@@ -1243,6 +1344,7 @@ class DFlashForCausalLM(nn.Module):
         q_size = attn0.q_size
         kv_size = attn0.kv_size
         head_dim = attn0.head_dim
+        # Uniformity across layers is asserted in _build_fused_kv_buffers (above).
         num_heads_per_rank = attn0.num_heads
         num_kv_heads_per_rank = attn0.num_key_value_heads
 
@@ -1373,6 +1475,13 @@ class DFlashForCausalLM(nn.Module):
 
             # flash_attn appends k_noise/v_noise in-place at
             # cache_seqlens[i]..+block_size for each batch i.
+            # DFlash sliding-attention draft layers use causal block attention;
+            # full-attention layers stay non-causal. Matches the vLLM reference,
+            # which overrides sliding_attention layers to causal metadata (the
+            # window itself is disabled; context K/V sit at absolute slots).
+            layer_types = getattr(self.config, 'layer_types', None)
+            causal = (self._sliding_layers_causal and bool(layer_types)
+                      and layer_types[layer_idx] == 'sliding_attention')
             out = flash_attn_with_kvcache(
                 q=Q_bshd,
                 k_cache=layer_k_cache,
@@ -1381,9 +1490,17 @@ class DFlashForCausalLM(nn.Module):
                 v=v_noise_bshd,
                 cache_seqlens=cache_seqlens_i32,
                 cache_batch_idx=cache_batch_idx_i32,
-                causal=False,
+                causal=causal,
             )
             attn_output = out.reshape(B * block_size, q_size)
+
+            # Per-drafter post-attention gate (no-op for generic DFlash; Laguna
+            # applies per-head softplus g_proj gating). gate input is the
+            # input_layernorm output (the attention input).
+            attn_output = self._post_attention_gate(attn_output, hs_normed_flat,
+                                                    attn_mod,
+                                                    num_heads_per_rank,
+                                                    head_dim)
 
             # o_proj (flat 2D, handles all-reduce internally)
             hidden_out = attn_mod.o_proj(attn_output)
@@ -1414,6 +1531,8 @@ class DFlashForCausalLM(nn.Module):
         hidden_states: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the draft model and return (hidden_states, hidden_states) for the
+        speculative-decoding contract."""
         hidden_states_out = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -1424,6 +1543,91 @@ class DFlashForCausalLM(nn.Module):
         )
 
         return hidden_states_out, hidden_states_out
+
+
+class DFlashLagunaForCausalLM(DFlashForCausalLM):
+    """Laguna DFlash drafter.
+
+    The generic block decode lives in DFlashForCausalLM; this subclass supplies
+    the Laguna draft-layer specifics: per-head g_proj softplus gating and the
+    per-aux fc_norm applied to captured target features before fc.
+    """
+
+    @staticmethod
+    def _normalize_config(config: PretrainedConfig) -> None:
+        """Fill TRT-LLM Laguna defaults missing from dense DFlash drafts."""
+        if getattr(config, "num_experts", None) is None:
+            config.num_experts = 0
+        if getattr(config, "mlp_layer_types", None) is None:
+            config.mlp_layer_types = ["dense"] * config.num_hidden_layers
+        if getattr(config, "block_size", None) is None:
+            dflash_config = getattr(config, "dflash_config", {})
+            if isinstance(dflash_config, dict):
+                config.block_size = dflash_config.get("block_size", None)
+
+    def __init__(self, draft_config):
+        """Pin the Laguna draft-layer class and enable Laguna-specific behaviors
+        (context input_layernorm, causal sliding blocks); reject non-per-head
+        gating."""
+        # The checkpoint labels itself with the vLLM name (model_type "llama");
+        # remap to the Laguna architecture so TRT-LLM builds the Laguna layers.
+        draft_config.pretrained_config.architectures = ["LagunaForCausalLM"]
+        self._normalize_config(draft_config.pretrained_config)
+        super().__init__(draft_config)
+        self._context_input_layernorm = True
+        self._sliding_layers_causal = True
+        gating = getattr(self.config, 'gating', True)
+        if gating not in (True, 'per-head'):
+            raise NotImplementedError(
+                f"Laguna DFlash drafter supports per-head gating only, "
+                f"got gating={gating!r}")
+
+    def load_weights(self, weights, weight_mapper=None, **kwargs):
+        """Build the per-aux ``fc_norm`` from the drafter's ``aux_hidden_norms.*``
+        weights, then defer the remaining weights to the base loader."""
+        aux_keys = sorted(
+            (k for k in weights if k.startswith('aux_hidden_norms.')),
+            key=lambda k: int(k.split('.')[1]))
+        if not aux_keys:
+            raise ValueError(
+                "Laguna DFlash checkpoint is missing aux_hidden_norms.* weights"
+            )
+        weights = dict(weights)
+        eps = getattr(self.config, 'rms_norm_eps', 1e-6)
+        norms = []
+        for k in aux_keys:
+            w = weights.pop(k)
+            norm = nn.RMSNorm(w.shape[0],
+                              eps=eps,
+                              device='cuda',
+                              elementwise_affine=True,
+                              dtype=w.dtype)
+            norm.weight.data.copy_(w)
+            norms.append(norm)
+        self.fc_norm = nn.ModuleList(norms)
+        super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+
+    def project_target_hidden(self, hidden_states):
+        """Project captured target features to the draft width: apply the per-aux
+        ``fc_norm`` to each hidden chunk, then ``fc`` + ``hidden_norm``."""
+        hidden_states = hidden_states.to(self.fc.weight.dtype)
+        fc_norm = getattr(self, 'fc_norm', None)
+        if fc_norm is not None:
+            chunks = hidden_states.chunk(len(fc_norm), dim=-1)
+            hidden_states = torch.cat(
+                [norm(chunk) for norm, chunk in zip(fc_norm, chunks)], dim=-1)
+        return self.hidden_norm(self.fc(hidden_states))
+
+    def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads,
+                             head_dim):
+        """Apply Laguna's per-head softplus output gate (``g_proj``) to the
+        attention output; a no-op when the layer has no ``g_proj``."""
+        g_proj = getattr(attn_mod, 'g_proj', None)
+        if g_proj is None:
+            return attn_output
+        gate = F.softplus(g_proj(gate_input).float()).to(attn_output.dtype)
+        return (attn_output.unflatten(-1, (num_heads, head_dim)) *
+                gate.unsqueeze(-1)).flatten(-2)
 
 
 class MTPForCausalLM(nn.Module):
@@ -1626,6 +1830,9 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
 
 
 def get_draft_model(model_config, draft_config, lm_head, model):
+    """Construct the draft model for the configured speculative-decoding mode
+    (EAGLE3 / MTP / PARD / DFlash). The DFlash branch selects the Laguna drafter
+    by detecting its architecture in the draft checkpoint's own config."""
     assert getattr(model_config, 'spec_config', None) is not None
     spec_dec_mode = model_config.spec_config.spec_dec_mode
     if spec_dec_mode.is_eagle3_one_model():
@@ -1651,8 +1858,32 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     elif spec_dec_mode.is_pard():
         return PARDForCausalLM(draft_config)
     elif spec_dec_mode.is_dflash():
+        draft_arches = getattr(draft_config.pretrained_config, "architectures",
+                               None) or []
+        if any("Laguna" in arch for arch in draft_arches):
+            return DFlashLagunaForCausalLM(draft_config)
         return DFlashForCausalLM(draft_config)
+    elif spec_dec_mode.is_dspark():
+        # Lazy import to avoid a cycle (modeling_dspark -> modeling_deepseekv4 ->
+        # modeling_speculative). The DSpark draft reuses the target's aux streams.
+        # The draft stage count (n_mtp_layers) is not in the HF config, so derive
+        # it from the checkpoint's mtp.* namespace.
+        from .modeling_dspark import DSparkForCausalLM, count_dspark_stages
+        num_stages = count_dspark_stages(
+            model_config.spec_config.speculative_model)
+        return DSparkForCausalLM(
+            draft_config,
+            getattr(model, "aux_stream_dict", None),
+            num_stages=num_stages,
+            block_size=model_config.spec_config.block_size,
+        )
     elif spec_dec_mode.is_draft_target_one_model():
+        # Keep the draft LM head vocab-sharded so greedy draft sampling uses the
+        # lighter TP gather (see SpecWorkerBase.greedy_sample_draft_with_tp_gather).
+        was_frozen = draft_config._frozen
+        draft_config._frozen = False
+        draft_config.lm_head_gather_output = False
+        draft_config._frozen = was_frozen
         return AutoModelForCausalLM.from_config(draft_config)
     else:
         raise NotImplementedError(
@@ -1741,6 +1972,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 model_config.mapping,
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
             if self.spec_worker is not None:
+                # Cache the static draft->target vocab map now that the draft
+                # model is loaded, so workers read self._d2t instead of probing
+                # draft_model.model.d2t on every forward.
+                self.spec_worker.set_draft_model(self.draft_model)
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
 
@@ -1836,7 +2071,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         if self.spec_config and (
                 not self.spec_config.spec_dec_mode.is_external_drafter()
-                or self.spec_config.spec_dec_mode.is_dflash()):
+                or self.spec_config.spec_dec_mode.is_dflash()
+                or self.spec_config.spec_dec_mode.is_dspark()):
             self.draft_model.load_weights_from_target_model(self)
 
     def set_guided_decoder(self,
