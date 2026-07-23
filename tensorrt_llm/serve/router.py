@@ -44,6 +44,9 @@ COORDINATOR_FINISH_TIMEOUT_S = 5.0
 COORDINATOR_FINISH_WORKERS = 16
 COORDINATOR_FINISH_QUEUE_SIZE = 4096
 COORDINATOR_FINISH_DRAIN_TIMEOUT_S = 5.0
+RUNTIME_SERVER_INFO_MAX_ATTEMPTS = 3
+RUNTIME_SERVER_INFO_RETRY_DELAY_S = 0.1
+RUNTIME_SERVER_INFO_REQUEST_TIMEOUT_S = 5.0
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
@@ -344,9 +347,19 @@ class Router(ABC):
         self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else None
         self._server_preparation_func = server_preparation_func
         self._prepared_ready_servers: set[str] = set()
+        self._runtime_server_info_refresh_tasks: dict[tuple[str, bool],
+                                                      asyncio.Task] = {}
+        self._runtime_server_info_logged_generations: dict[str, str] = {}
 
     async def close(self):
         """Close the shared HTTP session."""
+        refresh_tasks = list(self._runtime_server_info_refresh_tasks.values())
+        self._runtime_server_info_refresh_tasks.clear()
+        self._runtime_server_info_logged_generations.clear()
+        for task in refresh_tasks:
+            task.cancel()
+        if refresh_tasks:
+            await asyncio.gather(*refresh_tasks, return_exceptions=True)
         if self._session:
             try:
                 await self._session.close()
@@ -416,6 +429,117 @@ class Router(ABC):
             # swallow the error, if the server becomes ready or is added later, it will be prepared again
             logger.warning(f"Error preparing server {server}: {e}")
 
+    async def _fetch_runtime_server_info(self, server: str,
+                                         require_generation: bool) -> dict:
+        last_error: Optional[Exception] = None
+        for attempt in range(RUNTIME_SERVER_INFO_MAX_ATTEMPTS):
+            try:
+                server_info = await self._fetch_server_info(
+                    server, self._health_check_timeout
+                    or RUNTIME_SERVER_INFO_REQUEST_TIMEOUT_S)
+                disaggregated_params = server_info.get("disaggregated_params",
+                                                       {})
+                endpoint = disaggregated_params.get("ctx_info_endpoint")
+                generation = disaggregated_params.get("ctx_endpoint_generation")
+                if not endpoint or (require_generation and not generation):
+                    raise RuntimeError("server has not published final-runtime "
+                                       "disaggregated endpoint ownership")
+                return server_info
+            except RuntimeError as error:
+                last_error = error
+                if attempt + 1 < RUNTIME_SERVER_INFO_MAX_ATTEMPTS:
+                    await asyncio.sleep(RUNTIME_SERVER_INFO_RETRY_DELAY_S)
+
+        raise RuntimeError(
+            f"Failed to fetch final-runtime server info for {server}"
+        ) from last_error
+
+    async def get_runtime_server_info(
+            self,
+            server: str,
+            require_generation: bool = False,
+            validate_server_membership: bool = True) -> dict:
+        """Return endpoint metadata owned by the final serving executor.
+
+        Startup preparation can overlap remote worker construction.  Coalesce
+        concurrent generation-first refreshes per server and accept a result
+        only when the Python transceiver reports an endpoint and, when the
+        asynchronous-readiness path advertised one, its lifetime UUID.  Every
+        later asynchronous dispatch fetches again, so a same-URL restart
+        cannot leave a retired endpoint cached.  Network waits happen outside
+        the router lock so routing and monitoring remain responsive.
+        """
+        refresh_key = (server, require_generation)
+        async with self._lock:
+            refresh_task = self._runtime_server_info_refresh_tasks.get(
+                refresh_key)
+            if refresh_task is None:
+                refresh_task = asyncio.create_task(
+                    self._fetch_runtime_server_info(server, require_generation))
+                self._runtime_server_info_refresh_tasks[
+                    refresh_key] = refresh_task
+
+                def retire_refresh(completed_task: asyncio.Task) -> None:
+                    # Event-loop callbacks are serialized.  Retire the task
+                    # independently of its waiters so cancellation cannot
+                    # leave a completed, stale refresh cached.
+                    if self._runtime_server_info_refresh_tasks.get(
+                            refresh_key) is completed_task:
+                        self._runtime_server_info_refresh_tasks.pop(
+                            refresh_key, None)
+                    if not completed_task.cancelled():
+                        completed_task.exception()
+
+                refresh_task.add_done_callback(retire_refresh)
+
+        try:
+            server_info = await asyncio.shield(refresh_task)
+        except BaseException:
+            if refresh_task.done():
+                async with self._lock:
+                    if self._runtime_server_info_refresh_tasks.get(
+                            refresh_key) is refresh_task:
+                        self._runtime_server_info_refresh_tasks.pop(
+                            refresh_key, None)
+            raise
+
+        async with self._lock:
+            if validate_server_membership and server not in self._servers:
+                raise RuntimeError(
+                    f"Server {server} was removed while refreshing runtime info"
+                )
+            if not validate_server_membership:
+                # A delegating client receives coordinator-selected workers
+                # without mirroring the coordinator's dynamic server list.
+                # Return their live metadata to this request, but do not retain
+                # churned fleet URLs in the wrapped local router indefinitely.
+                if self._runtime_server_info_refresh_tasks.get(
+                        refresh_key) is refresh_task:
+                    self._runtime_server_info_refresh_tasks.pop(
+                        refresh_key, None)
+                return server_info
+            previous_generation = self._server_info.get(server, {}).get(
+                "disaggregated_params", {}).get("ctx_endpoint_generation")
+            current_generation = server_info["disaggregated_params"].get(
+                "ctx_endpoint_generation")
+            if (previous_generation is not None
+                    and previous_generation != current_generation):
+                logger.info(f"server {server} endpoint generation changed from "
+                            f"{previous_generation} to {current_generation}")
+            if (current_generation is not None
+                    and self._runtime_server_info_logged_generations.get(server)
+                    != current_generation):
+                logger.info("PYTHON_ASYNC_CONSENSUS "
+                            "transition=runtime_endpoint_refresh "
+                            f"server={server} generation={current_generation}")
+                self._runtime_server_info_logged_generations[
+                    server] = current_generation
+            self._server_info[server] = server_info
+            if self._runtime_server_info_refresh_tasks.get(
+                    refresh_key) is refresh_task:
+                self._runtime_server_info_refresh_tasks.pop(refresh_key, None)
+            return server_info
+
     async def prepare_servers(self, servers: Optional[List[str]] = None):
         targets = self._servers if servers is None else servers
         for server in targets:
@@ -468,6 +592,13 @@ class Router(ABC):
             ]
             self._on_servers_updated(old_servers, self._servers)
         self._prepared_ready_servers.discard(server)
+        self._runtime_server_info_logged_generations.pop(server, None)
+        refresh_keys = [
+            key for key in self._runtime_server_info_refresh_tasks
+            if key[0] == server
+        ]
+        for key in refresh_keys:
+            self._runtime_server_info_refresh_tasks.pop(key).cancel()
         self._server_info.pop(server, None)
         logger.debug(
             f"Removed server {server}, current server list: {self._servers}")
@@ -548,6 +679,16 @@ class Router(ABC):
                         for server in old_servers:
                             if server not in final_servers:
                                 self._prepared_ready_servers.discard(server)
+                                self._runtime_server_info_logged_generations.pop(
+                                    server, None)
+                                refresh_keys = [
+                                    key for key in
+                                    self._runtime_server_info_refresh_tasks
+                                    if key[0] == server
+                                ]
+                                for key in refresh_keys:
+                                    self._runtime_server_info_refresh_tasks.pop(
+                                        key).cancel()
                                 self._server_info.pop(server, None)
                                 logger.info(f"Server {server} is removed")
 
@@ -1699,6 +1840,21 @@ class CoordinatorDelegatingRouter(Router):
 
     def _on_servers_updated(self, old_servers, new_servers):
         pass
+
+    async def get_runtime_server_info(
+            self,
+            server: str,
+            require_generation: bool = False,
+            validate_server_membership: bool = True) -> dict:
+        # The proxy session targets the coordinator (and may use a UDS).  The
+        # selected worker's /server_info must be queried through the wrapped
+        # local router and its ordinary HTTP session.
+        del validate_server_membership
+        return await self._local.get_runtime_server_info(
+            server,
+            require_generation=require_generation,
+            validate_server_membership=False,
+        )
 
     def _request_id(self,
                     request: OpenAIRequest,

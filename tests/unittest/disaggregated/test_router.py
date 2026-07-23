@@ -34,6 +34,90 @@ from tensorrt_llm.serve.router import (KV_CACHE_HASH_ALGO_V1,
 # yapf: enable
 
 
+@pytest.mark.asyncio
+async def test_runtime_server_info_refreshes_generation_and_coalesces():
+    server = "ctx:8000"
+    router = RoundRobinRouter(server_role="context", servers=[server])
+    first = asyncio.Event()
+    release = asyncio.Event()
+    responses = [
+        {
+            "disaggregated_params": {
+                "ctx_info_endpoint": ["tcp://ctx:1000"],
+                "ctx_endpoint_generation": "generation-1",
+            }
+        },
+        {
+            "disaggregated_params": {
+                "ctx_info_endpoint": ["tcp://ctx:2000"],
+                "ctx_endpoint_generation": "generation-2",
+            }
+        },
+    ]
+
+    async def fetch(_server, _timeout):
+        first.set()
+        await release.wait()
+        return responses.pop(0)
+
+    router._fetch_server_info = mock.AsyncMock(side_effect=fetch)
+    refresh_1 = asyncio.create_task(
+        router.get_runtime_server_info(server, require_generation=True))
+    await first.wait()
+    refresh_2 = asyncio.create_task(
+        router.get_runtime_server_info(server, require_generation=True))
+    release.set()
+
+    result_1, result_2 = await asyncio.gather(refresh_1, refresh_2)
+    assert result_1 == result_2
+    assert router._fetch_server_info.await_count == 1
+
+    restarted = await router.get_runtime_server_info(server,
+                                                     require_generation=True)
+    assert restarted["disaggregated_params"][
+        "ctx_endpoint_generation"] == "generation-2"
+    assert router._fetch_server_info.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_runtime_server_info_rejects_missing_final_endpoint():
+    server = "ctx:8000"
+    router = RoundRobinRouter(server_role="context", servers=[server])
+    router._fetch_server_info = mock.AsyncMock(
+        return_value={"disaggregated_params": {}})
+
+    with pytest.raises(RuntimeError, match="final-runtime server info"):
+        await router.get_runtime_server_info(server, require_generation=True)
+
+    assert router._fetch_server_info.await_count == 3
+    assert all(call.args[1] == 5.0
+               for call in router._fetch_server_info.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_delegating_router_refresh_uses_local_worker_session():
+    # Stateful delegating clients intentionally do not mirror the
+    # coordinator's dynamic server list locally.
+    local = RoundRobinRouter(server_role="context", servers=[])
+    server_info = {
+        "disaggregated_params": {
+            "ctx_info_endpoint": ["tcp://ctx:1000"],
+            "ctx_endpoint_generation": "generation-1",
+        }
+    }
+    local._fetch_server_info = mock.AsyncMock(return_value=server_info)
+    router = CoordinatorDelegatingRouter("unix:/tmp/coordinator.sock", local,
+                                         "context")
+
+    result = await router.get_runtime_server_info("ctx:8000",
+                                                  require_generation=True)
+
+    assert result == server_info
+    local._fetch_server_info.assert_awaited_once_with("ctx:8000", 5.0)
+    assert local._server_info == {}
+    assert local._runtime_server_info_logged_generations == {}
+
+
 def test_native_block_key_hasher_matches_python_v1():
     """Native C++ BlockKeyHasher must be bit-exact with hash_v1_block_key.
 
