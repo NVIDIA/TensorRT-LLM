@@ -91,6 +91,18 @@ def _translate_mtp_pattern(name, n_hidden_layers):
     return None
 
 
+def _regex_targets_mtp(regex: str) -> bool:
+    """Whether a compressed-tensors re: exclude regex targets the HF
+    mtp.* namespace.  llm-compressor checkpoints mark the whole MTP layer
+    unquantized with a single re:^mtp.* entry; detecting such a regex lets
+    the caller translate it into a TRT-LLM model.layers.<n> subtree
+    exclusion (ModelOpt instead emits explicit mtp.layers.0* globs)."""
+    try:
+        return re.match(regex, "mtp.layers.0.self_attn.o_proj") is not None
+    except re.error:
+        return False
+
+
 # --- Config adapters --------------------------------------------------------
 #
 # These run from `load_pretrained_config` in
@@ -449,6 +461,20 @@ def _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=False):
         # Drop vision tensors (not part of the language model graph)
         if name.startswith("model.visual"):
             continue
+        # compressed-tensors (llm-compressor) checkpoints express excludes as
+        # re: regexes.  RedHatAI Qwen3.5/3.6 NVFP4 checkpoints mark the
+        # whole MTP layer unquantized with a single re:^mtp.* entry.
+        # is_module_excluded_from_quantization matches re: patterns against
+        # TRT-LLM runtime names, but ^mtp.* is HF-namespaced and never
+        # matches model.layers.<n>...; translate it to a subtree exclusion
+        # of the MTP layer (mapped to model.layers.<num_hidden_layers>).
+        if (
+            name.startswith("re:")
+            and n_hidden_layers is not None
+            and _regex_targets_mtp(name[len("re:") :])
+        ):
+            normalized.add(f"model.layers.{n_hidden_layers}*")
+            continue
         # Translate MTP-namespace patterns to TRT-LLM paths so the MTP
         # layer (which the checkpoint stores unquantized) gets correctly
         # excluded from the global NVFP4/FP8 quant_config.
@@ -652,6 +678,48 @@ _QWEN3_5_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 
 
+def _normalize_compressed_tensors_names(
+    weights: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Rename llm-compressor (compressed-tensors) NVFP4 tensors to the ModelOpt
+    names the MoE / Linear NVFP4 loaders expect.
+
+    compressed-tensors stores an NVFP4 Linear as:
+        weight_packed, weight_scale, weight_global_scale, input_global_scale
+    ModelOpt (NVIDIA Qwen3.6-NVFP4) stores it as:
+        weight,        weight_scale, weight_scale_2,      input_scale
+    (weight_scale -- the per-group FP8 scale -- is already identical.)
+
+    Guarded on the presence of a "*.weight_packed" key so ModelOpt checkpoints
+    pass through untouched (they never contain weight_packed).
+    """
+    if not any(k.endswith(".weight_packed") for k in weights):
+        return weights
+    # weight_scale (per-group FP8) is byte-identical between the two formats and
+    # keeps its name. The two *global* FP32 scalars are reciprocals, though:
+    # compressed-tensors stores a *quantization* scale (amax -> FP4*FP8 range),
+    # ModelOpt stores the *dequantization* scale. Invert them on rename.
+    #   weight_global_scale -> weight_scale_2 = 1 / weight_global_scale
+    #   input_global_scale  -> input_scale    = 1 / input_global_scale
+    invert = {
+        ".weight_global_scale": ".weight_scale_2",
+        ".input_global_scale": ".input_scale",
+    }
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in weights.items():
+        renamed = False
+        for old_suffix, new_suffix in invert.items():
+            if k.endswith(old_suffix):
+                k = k[: -len(old_suffix)] + new_suffix
+                v = (1.0 / v.float()).to(v.dtype)
+                renamed = True
+                break
+        if not renamed and k.endswith(".weight_packed"):
+            k = k[: -len(".weight_packed")] + ".weight"
+        out[k] = v
+    return out
+
+
 class _Qwen3_5VLModel(Qwen3VLModelBase):
     """Shared VLM wrapper composing the Qwen3 vision encoder with a Qwen3.5
     (Qwen3Next-based) text decoder.
@@ -705,6 +773,7 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
         # weight_scale=1.0 and quantizes activations dynamically every step.
         weight_mapper.init_model_and_config(self.llm, self.llm.model_config)
         filtered_weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
+        filtered_weights = _normalize_compressed_tensors_names(filtered_weights)
         params_map = {
             r"^model\.language_model\.(.*)$": r"model.\1",
         }
