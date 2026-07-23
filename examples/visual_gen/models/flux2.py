@@ -18,8 +18,8 @@
 Usage:
     python flux2.py
     python flux2.py --visual_gen_args ../configs/flux2-dev-fp4-1gpu.yaml
-    python flux2.py --reference_image subject.png
-    python flux2.py --reference_image subject.png --reference_image style.png
+    python flux2.py --image subject.png
+    python flux2.py --image subject.png --image style.png
 """
 
 import argparse
@@ -66,7 +66,7 @@ def main():
         help="Number of images to generate for the prompt",
     )
     parser.add_argument(
-        "--reference_image",
+        "--image",
         action="append",
         default=None,
         help="Reference image path; repeat for a shared set of up to 10 images",
@@ -118,8 +118,8 @@ def main():
     # Start from per-model defaults and override only user-provided request fields.
     params = visual_gen.default_params
     params.num_images_per_prompt = args.num_images_per_prompt
-    params.image = args.reference_image
-    if args.reference_image:
+    params.image = args.image
+    if args.image:
         # Let FLUX.2 derive omitted dimensions from the first processed reference.
         params.height = args.height
         params.width = args.width

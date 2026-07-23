@@ -1742,7 +1742,7 @@ def test_flux2_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp
             model_path,
             "--visual_gen_args",
             config_path,
-            "--reference_image",
+            "--image",
             str(reference_path),
             "--height",
             "256",
