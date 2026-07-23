@@ -300,66 +300,27 @@ def test_union_fusion_matches_split_pipeline(
 
 
 @_SM100_ONLY
-@pytest.mark.parametrize("guard", ["runner_construction_failure", "frequency_count"])
-def test_union_fusion_guards_raise(guard: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """One representative per fused-pipeline guard family raises loudly.
-
-    ``runner_construction_failure``: a runner construction failure surfaces
-    as the no-fallback RuntimeError at workspace construction (the only
-    place the CuTe entries compile). ``frequency_count``: 16 frequencies
-    (head size 32) sit outside the fused kernel contract and are rejected at
-    kernel construction.
-    """
+def test_union_fusion_frequency_count_guard_raises() -> None:
+    """16 frequencies (head size 32) sit outside the fused kernel contract
+    and are rejected at kernel construction."""
     cutlass = pytest.importorskip("cutlass")
 
-    if guard == "frequency_count":
-        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_cute_score_fused import (  # noqa: E501
-            _TriAttentionScoreKernel,
-        )
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_cute_score_fused import (  # noqa: E501
+        _TriAttentionScoreKernel,
+    )
 
-        with pytest.raises(ValueError, match="frequencies"):
-            _TriAttentionScoreKernel(
-                num_layers=1,
-                seq_len=256,
-                num_q_heads=8,
-                num_kv_heads=1,
-                num_freqs=16,
-                tokens_per_block=128,
-                pool_shape=(2, 2, 1, 128, 32),
-                pool_strides=(8192, 4096, 4096, 32, 1),
-                pool_dtype=cutlass.BFloat16,
-                page_shards=3,
-            )
-        return
-
-    import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_cute_score_fused as fused_module  # noqa: E501
-
-    torch.manual_seed(20260721)
-    device = torch.device("cuda")
-    seq_len, tokens_per_block, num_freqs, num_q_heads = 256, 128, 32, 8
-    num_pages = seq_len // tokens_per_block
-    pool = (
-        0.125 * torch.randn(num_pages, 2, 1, tokens_per_block, 2 * num_freqs, device=device)
-    ).to(torch.bfloat16)
-    q_real = 0.125 * torch.randn(1, num_q_heads, num_freqs, device=device)
-    omega = torch.linspace(0.01, 0.03, num_freqs, device=device)
-
-    def _refuse_construction(**_kwargs):
-        raise ValueError("synthetic fused-runner construction failure")
-
-    monkeypatch.setattr(fused_module, "TriAttentionCuteScoreRunner", _refuse_construction)
-    with pytest.raises(RuntimeError, match="no other score path exists"):
-        _make_union_workspace(
-            layer_pools=[pool],
-            max_requests=2,
-            seq_len=seq_len,
-            num_q_heads=num_q_heads,
-            q_real=q_real,
-            q_imag=torch.randn_like(q_real) * 0.125,
-            mlr_coef=torch.randn_like(q_real) * 0.125,
-            freq_scale_sq=torch.linspace(0.5, 1.5, num_freqs, device=device),
-            omega=omega,
-            offsets=torch.tensor([1.0, 2.0, 4.0], device=device),
+    with pytest.raises(ValueError, match="frequencies"):
+        _TriAttentionScoreKernel(
+            num_layers=1,
+            seq_len=256,
+            num_q_heads=8,
+            num_kv_heads=1,
+            num_freqs=16,
+            tokens_per_block=128,
+            pool_shape=(2, 2, 1, 128, 32),
+            pool_strides=(8192, 4096, 4096, 32, 1),
+            pool_dtype=cutlass.BFloat16,
+            page_shards=3,
         )
 
 

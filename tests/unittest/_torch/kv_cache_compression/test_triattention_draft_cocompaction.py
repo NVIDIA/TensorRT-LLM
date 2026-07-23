@@ -388,6 +388,11 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
         assert prepare.call_args.kwargs["seq_len"] == 1024
         assert prepare.call_args.kwargs["page_table_token_capacity"] == 1024 + 1
         assert prepare.call_args.kwargs["draft_page_table_token_capacity"] == 1024 + 1
+        # Migrated from the pipeline workspace-kwargs test: the budget, the
+        # shared phase-table dict, and the pool keys thread through unchanged.
+        assert prepare.call_args.kwargs["keep_count"] == manager.top_B
+        assert prepare.call_args.kwargs["phase"] is manager._phase
+        assert prepare.call_args.kwargs["layer_pool_keys"] == list(layout["layer_pool_keys"])
 
         # A second round with unchanged pools reuses the resident workspace
         # (and with it the compaction launch data it carries).

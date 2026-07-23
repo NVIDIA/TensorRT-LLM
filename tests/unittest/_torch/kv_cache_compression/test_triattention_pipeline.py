@@ -537,16 +537,19 @@ class TestEvictionLifecycle:
 
 
 class TestFixedScoreMetadata:
-    @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
-    def test_workspace_build_receives_mode_and_capacity_kwargs(self, eviction_mode):
+    def test_union_rejects_unnormalized_scores(self):
+        # The fused pipeline (THE union path) always z-normalizes, so
+        # normalize_scores=False is rejected loudly at construction.
+        with pytest.raises(ValueError, match="normalize_scores=True"):
+            _make_triattention(top_B=4, eviction_mode="union", normalize_scores=False)
+
+    def test_workspace_build_receives_mode_and_capacity_kwargs(self):
+        # Mode/phase/pool-key threading and cached reuse are covered by the
+        # workspace-rebuild superset test in
+        # test_triattention_draft_cocompaction.py.
         from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
-        if eviction_mode == "union":
-            # The fused pipeline (THE union path) always z-normalizes, so
-            # normalize_scores=False is rejected loudly at construction.
-            with pytest.raises(ValueError, match="normalize_scores=True"):
-                _make_triattention(top_B=4, eviction_mode="union", normalize_scores=False)
-        manager = _make_triattention(top_B=4, eviction_mode=eviction_mode)
+        manager = _make_triattention(top_B=4)
         # The workspace follows the executor limits: eight requests (max batch
         # size) by 260 decode tokens (top_B plus two eviction periods).
         layout, workspace = _make_workspace_stubs(manager)
@@ -568,19 +571,9 @@ class TestFixedScoreMetadata:
 
         assert resources is workspace
         kwargs = build_workspace.call_args.kwargs
-        assert kwargs["eviction_mode"] == eviction_mode
-        assert kwargs["keep_count"] == 4
+        assert kwargs["eviction_mode"] == "union"
         assert kwargs["max_requests"] == 8
         assert kwargs["decode_width"] == 260
-        assert kwargs["phase"] is manager._phase
-        assert kwargs["layer_pool_keys"] == list(layout["layer_pool_keys"])
-        # The cached workspace serves later rounds without rebuilding.
-        with mock.patch.object(
-            module,
-            "prepare_eviction_workspace",
-            side_effect=AssertionError("workspace was rebuilt"),
-        ):
-            assert manager._workspace_for(layout, prepared) is workspace
 
     def test_stage_rejects_int32_overflowing_round_starts(self):
         # Round starts past the int32 metadata range fail loudly (in the host

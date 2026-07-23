@@ -348,7 +348,9 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
     request_count = 2
     num_layers = 2
     num_kv_heads = 2
-    prompt_len = 2
+    # Per-request pinned prompts: one cohort mixes prompt lengths, so the
+    # byte-exact oracle also proves per-request destination rebasing.
+    prompt_lens = [2, 5]
     decode_keep_count = 4
     seq_len = 80
     tokens_per_block = 32
@@ -381,7 +383,7 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
                 keep[request, row] = torch.tensor(
                     sorted(
                         {
-                            2 + ((request + row + offset * 2) % 8) * 8
+                            prompt_lens[request] + ((request + row + offset * 2) % 8) * 8
                             for offset in range(decode_keep_count)
                         }
                     ),
@@ -395,7 +397,7 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
         kept_token_ordinals=keep.to(torch.int32),
         valid_sequence_lengths=torch.tensor([seq_len, seq_len], dtype=torch.int32, device=device),
         kv_block_offsets=_encode_block_offsets(page_tables.unsqueeze(0)),
-        prompt_offsets=torch.full((request_count,), prompt_len, dtype=torch.int32, device=device),
+        prompt_offsets=torch.tensor(prompt_lens, dtype=torch.int32, device=device),
         protected_tail_capacity=max(protected_tails),
     )
     _set_protected_tails(compaction, protected_tails)
@@ -407,6 +409,7 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
 
     for layer, (before_pool, after_pool) in enumerate(zip(initial_pools, pools)):
         for request in range(request_count):
+            prompt_len = prompt_lens[request]
             pages = page_tables[request].to(torch.long)
             before = (
                 before_pool[pages]
@@ -439,81 +442,6 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
                     after[:, head].index_select(1, destination),
                     before[:, head].index_select(1, source),
                 )
-
-
-def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
-    """One union cohort mixing prompt lengths compacts byte-identically to
-    running the same two requests as two single-request compactions."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    request_count = 2
-    num_layers = 2
-    # bf16 pools in the compact op's supported geometry; three 32-token pages
-    # per request with a 80-token sequence keep the moves page-crossing.
-    seq_len = 80
-    decode_keep_count = 3
-    prompt_lens = [2, 5]
-    protected_tails = [2, 1]
-    decode_widths = [seq_len - prompt_len for prompt_len in prompt_lens]
-    width = max(decode_widths)
-
-    # Oracle selection: decode-relative scores per request, rebased to
-    # absolute ordinals by each request's own prompt offset.
-    generator = torch.Generator().manual_seed(11)
-    scores = torch.randint(
-        -8,
-        9,
-        (request_count, 1, width),
-        generator=generator,
-        dtype=torch.int32,
-    ).to(torch.float32)
-    keep = torch.stack(
-        [
-            torch.sort(
-                _stable_topk(scores[request, 0], decode_width, decode_keep_count) + prompt_len
-            ).values
-            for request, (prompt_len, decode_width) in enumerate(zip(prompt_lens, decode_widths))
-        ]
-    )
-
-    page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
-    initial_pools = _make_ramp_pools(num_layers, device=device)
-    cohort_pools = [pool.clone() for pool in initial_pools]
-    keep_cuda = keep.to(device)
-    valid_seq_lens = torch.tensor([seq_len, seq_len], dtype=torch.int32, device=device)
-    cohort_compaction = _build_compaction(
-        layer_pools=cohort_pools,
-        kept_token_ordinals=keep_cuda,
-        valid_sequence_lengths=valid_seq_lens,
-        kv_block_offsets=_encode_block_offsets(page_tables.unsqueeze(0)),
-        prompt_offsets=torch.tensor(prompt_lens, dtype=torch.int32, device=device),
-        decode_keep_count=decode_keep_count,
-        protected_tail_capacity=max(protected_tails),
-    )
-    _set_protected_tails(cohort_compaction, protected_tails)
-    launch_move_pack(cohort_compaction["dense_pack"])
-    run_cache_compactions(cohort_compaction)
-
-    expected_pools = [pool.clone() for pool in initial_pools]
-    for request in range(request_count):
-        single_compaction = _build_compaction(
-            layer_pools=expected_pools,
-            kept_token_ordinals=keep_cuda[request : request + 1],
-            valid_sequence_lengths=valid_seq_lens[request : request + 1],
-            kv_block_offsets=_encode_block_offsets(page_tables[request : request + 1].unsqueeze(0)),
-            request_count=1,
-            prompt_offsets=torch.tensor([prompt_lens[request]], dtype=torch.int32, device=device),
-            decode_keep_count=decode_keep_count,
-            protected_tail_capacity=protected_tails[request],
-        )
-        _set_protected_tails(single_compaction, [protected_tails[request]])
-        launch_move_pack(single_compaction["dense_pack"])
-        run_cache_compactions(single_compaction)
-    torch.cuda.synchronize(device)
-
-    # The two requests own disjoint pages, so whole-pool equality proves the
-    # cohort produced exactly the two single-request results.
-    for cohort_pool, expected_pool in zip(cohort_pools, expected_pools):
-        assert torch.equal(cohort_pool, expected_pool)
 
 
 @requires_sm100
