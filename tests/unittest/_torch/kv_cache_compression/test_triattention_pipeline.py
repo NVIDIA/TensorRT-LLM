@@ -89,13 +89,7 @@ class TestConfigAndFactory:
         # Calibration is deferred to the first request, so construction needs
         # no calibration file or CUDA.
         fake_v2 = _make_fake_v2(enable_block_reuse=False)
-        cfg = TriAttentionKvCacheCompressionConfig(
-            budget=32,
-            beta=16,
-            eviction_mode="per_head",
-            model_path="/models/test",
-            calibration_path="/calib/test.pt",
-        )
+        cfg = _make_tri_config(budget=32, beta=16, eviction_mode="per_head")
         mgr = create_kv_cache_compression_manager(cfg, kv_cache_manager=fake_v2)
         assert isinstance(mgr, TriAttention)
         assert mgr.budget == 32
@@ -129,7 +123,7 @@ class TestTriAttentionClass:
             pool_representatives=(0, 1),
             pool_page_counts=(4, 8),
         )
-        triattention._runtime_kv_layout_cache = cached
+        triattention._kv_layout_caches[False] = cached
 
         assert triattention._runtime_kv_layout() is cached
         manager.get_buffers.assert_not_called()
@@ -155,7 +149,6 @@ class TestTriAttentionClass:
         manager.num_extra_kv_tokens = 4
         manager._kv_reserve_draft_tokens = 4
         triattention = TriAttention(manager, _make_tri_config(budget=8))
-        triattention._attention_layer_partition_cache = ([], [], None)
         triattention._calibrated = True
 
         triattention.on_request_init(_make_request(11))
@@ -814,7 +807,7 @@ class TestKernelMaskedSwa:
         mgr = _make_triattention()
         mgr.model_path = "/models/gpt-oss"
         mgr.budget = budget
-        mgr.kv_cache_manager = SimpleNamespace(pp_layers=[0, 1, 2, 3])
+        mgr._global_layers = [0, 1, 2, 3]
         config = _make_hf_config(
             layer_types=[
                 "sliding_attention",

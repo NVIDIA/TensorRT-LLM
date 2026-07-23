@@ -273,7 +273,7 @@ def test_draft_admission_gates_raise(gate, match):
 def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     manager = _make_triattention(budget=4, beta=4)
     manager._calibrated = True
-    manager._attention_layer_partition_cache = ([0, 1], [], None)
+    manager._layer_partition = ([0, 1], [], None)
     target = manager.kv_cache_manager
     target._stream = mock.Mock()
     target.pp_layers = [0, 1]
@@ -358,7 +358,9 @@ def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
     manager.draft_kv_cache_manager = draft_manager
     # Injected post-construction: mirror the ctor-cached manager-lifetime tail.
     manager._draft_protected_tail_capacity = 1
-    manager._draft_runtime_kv_layout = mock.Mock(
+    # The one resolver serves both sides; only its draft arm runs here (the
+    # target layout arrives as the explicit _ensure_buffers argument).
+    manager._runtime_kv_layout = mock.Mock(
         return_value=dict(
             layer_pools=[],
             dense_layers=[],
@@ -396,7 +398,7 @@ def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
         assert kwargs["capacities"]["bucket_seq_len"] == 1024
         assert kwargs["capacities"]["page_table_token_capacity"] == 1024 + 1
         assert kwargs["draft"]["page_table_token_capacity"] == 1024 + 1
-        assert kwargs["draft"]["layout"] is manager._draft_runtime_kv_layout.return_value
+        assert kwargs["draft"]["layout"] is manager._runtime_kv_layout.return_value
         # Migrated from the pipeline buffer-kwargs test: the budget and the
         # pool keys thread through unchanged.
         assert kwargs["capacities"]["keep_count"] == manager.budget

@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+import tempfile
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Optional
 from unittest import mock
 
 import torch
@@ -329,6 +333,27 @@ def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     return fake_v2
 
 
+_TEST_MODEL_DIR: Optional[str] = None
+
+
+def make_test_model_dir() -> str:
+    """A real on-disk dense model config: construction-time layer partition
+    resolves through the production AutoConfig path, no mocks."""
+    global _TEST_MODEL_DIR
+    if _TEST_MODEL_DIR is None:
+        _TEST_MODEL_DIR = tempfile.mkdtemp(prefix="triattention_test_model_")
+        config = {
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "num_hidden_layers": 2,
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+        }
+        with open(os.path.join(_TEST_MODEL_DIR, "config.json"), "w") as handle:
+            json.dump(config, handle)
+    return _TEST_MODEL_DIR
+
+
 def make_tri_config(**overrides):
     """A real TriAttentionKvCacheCompressionConfig with test calibration inputs
     (the config validator requires both ``model_path`` and ``calibration_path``)."""
@@ -336,7 +361,7 @@ def make_tri_config(**overrides):
 
     options = {
         "budget": 8,
-        "model_path": "/models/test",
+        "model_path": make_test_model_dir(),
         "calibration_path": "/calib/test.pt",
     }
     options.update(overrides)

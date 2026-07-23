@@ -171,19 +171,21 @@ class TriAttention(KVCacheCompressionManager):
         # Buffers build once at the first eviction as plain attributes on this
         # manager and stay resident for the manager's lifetime.
         self._buffers_built = False
-        self._local_to_global_layers_cache: Optional[List[int]] = None
-        self._attention_layer_partition_cache: Optional[
-            Tuple[List[int], List[int], Optional[int]]
-        ] = None
-        self._runtime_kv_layout_cache: Optional[Dict[str, object]] = None
-        self._draft_runtime_kv_layout_cache: Optional[Dict[str, object]] = None
+        # Manager-lifetime layer facts, resolved once: V2 fixes pp_layers at
+        # construction and the model config is immutable on disk.
+        self._global_layers = [int(layer) for layer in kv_cache_manager.pp_layers]
+        self._layer_partition = self._attention_layer_partition()
+        # Target/draft runtime KV layouts, cached by the one resolver.
+        self._kv_layout_caches: Dict[bool, Optional[Dict[str, object]]] = {
+            False: None,
+            True: None,
+        }
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
         """Track the request and resolve the official calibration on first use."""
         request_id = request.py_request_id
         if request_id not in self._request_states:
             self._validate_request_capacity(request)
-            self._attention_layer_partition()
             self._request_states[request_id] = {
                 "generation_steps": 0,
                 "evicted_tokens": 0,
@@ -445,43 +447,25 @@ class TriAttention(KVCacheCompressionManager):
 
     # ---- helpers (eviction / scoring / V2 cache access / calibration) ----
 
-    def _local_to_global_layers(self) -> List[int]:
-        cached = self._local_to_global_layers_cache
-        if cached is None:
-            cached = [int(layer) for layer in self.kv_cache_manager.pp_layers]
-            self._local_to_global_layers_cache = cached
-        return cached
-
     @staticmethod
     def _has_sliding_window_signal(config: Dict[str, object]) -> bool:
         use_sliding_window = config.get("use_sliding_window")
         if isinstance(use_sliding_window, bool):
             return use_sliding_window
-        for field in (
-            "sliding_window",
-            "sliding_window_size",
-            "sliding_window_pattern",
-            "max_window_layers",
-        ):
-            value = config.get(field)
-            if isinstance(value, bool):
-                if value:
-                    return True
-            elif isinstance(value, (int, float)):
-                if value > 0:
-                    return True
-            elif value:
-                return True
-        return False
+        return any(
+            config.get(field)
+            for field in (
+                "sliding_window",
+                "sliding_window_size",
+                "sliding_window_pattern",
+                "max_window_layers",
+            )
+        )
 
     def _attention_layer_partition(self) -> Tuple[List[int], List[int], Optional[int]]:
         """SWA layers here are stored at full length; the window applies only in the kernel."""
-        cached = self._attention_layer_partition_cache
-        if cached is not None:
-            return cached
-
         model_path = self.model_path
-        global_layers = self._local_to_global_layers()
+        global_layers = self._global_layers
         num_layers = len(global_layers)
 
         try:
@@ -490,7 +474,7 @@ class TriAttention(KVCacheCompressionManager):
             config = AutoConfig.from_pretrained(
                 model_path, trust_remote_code=True, local_files_only=True
             )
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             raise ValueError(
                 f"TriAttention could not load the local model config from {model_path!r}"
             ) from exc
@@ -502,9 +486,7 @@ class TriAttention(KVCacheCompressionManager):
                     "Model config exposes sliding-window metadata but no layer_types; "
                     "TriAttention cannot classify kernel-masked SWA layers safely"
                 )
-            result = (list(range(num_layers)), [], None)
-            self._attention_layer_partition_cache = result
-            return result
+            return (list(range(num_layers)), [], None)
         if global_layers and max(global_layers) >= len(layer_types):
             raise ValueError(
                 f"Model config has {len(layer_types)} layer_types entries, "
@@ -532,16 +514,15 @@ class TriAttention(KVCacheCompressionManager):
                     f"the kernel-masked SWA window size {raw_window}"
                 )
             window_size = raw_window
-        result = (dense_layers, swa_layers, window_size)
-        self._attention_layer_partition_cache = result
-        return result
+        return (dense_layers, swa_layers, window_size)
 
-    def _runtime_kv_layout(self) -> Dict[str, object]:
+    def _runtime_kv_layout(self, *, draft: bool = False) -> Dict[str, object]:
         # The manager identity and layer count are manager-lifetime owner
         # contracts; only the pool page counts are polled (stale-pointer
-        # safety until V2 exposes a layout epoch).
-        manager = self.kv_cache_manager
-        cached = self._runtime_kv_layout_cache
+        # safety until V2 exposes a layout epoch). Production draft callers
+        # gate on ``draft_kv_cache_manager is not None``.
+        manager = self.draft_kv_cache_manager if draft else self.kv_cache_manager
+        cached = self._kv_layout_caches[draft]
         if cached is not None:
             current_page_counts = self._pool_page_counts(
                 manager,
@@ -550,24 +531,33 @@ class TriAttention(KVCacheCompressionManager):
             )
             if current_page_counts != cached["pool_page_counts"]:
                 raise RuntimeError(
-                    "TriAttention V2 pool layout changed after the layout was built; "
-                    "KV pool rebalance is not supported"
+                    f"TriAttention {'draft ' if draft else ''}V2 pool layout changed "
+                    "after the layout was built; KV pool rebalance is not supported"
                 )
             return cached
 
-        global_layers = self._local_to_global_layers()
-        dense_layers, swa_layers, swa_window = self._attention_layer_partition()
-        if not dense_layers:
-            raise ValueError("TriAttention requires at least one full-attention layer")
+        if draft:
+            global_layers = [int(layer) for layer in manager.pp_layers]
+            if not global_layers:
+                raise RuntimeError("TriAttention draft KV cache manager exposes no layers")
+            # The draft is never scored: all draft layers compact as dense.
+            dense_layers: List[int] = list(range(len(global_layers)))
+            swa_layers: List[int] = []
+            swa_window: Optional[int] = None
+        else:
+            global_layers = self._global_layers
+            dense_layers, swa_layers, swa_window = self._layer_partition
+            if not dense_layers:
+                raise ValueError("TriAttention requires at least one full-attention layer")
         layout = self._build_runtime_kv_layout(
             manager,
             global_layers,
             dense_layers=dense_layers,
             swa_layers=swa_layers,
             swa_window=swa_window,
-            what="",
+            what="draft " if draft else "",
         )
-        self._runtime_kv_layout_cache = layout
+        self._kv_layout_caches[draft] = layout
         return layout
 
     def _build_runtime_kv_layout(
@@ -617,37 +607,6 @@ class TriAttention(KVCacheCompressionManager):
             ),
         )
 
-    def _draft_runtime_kv_layout(self) -> Dict[str, object]:
-        # Production callers gate on ``draft_kv_cache_manager is not None``.
-        manager = self.draft_kv_cache_manager
-        cached = self._draft_runtime_kv_layout_cache
-        if cached is not None:
-            current_page_counts = self._pool_page_counts(
-                manager,
-                cached["global_layers"],
-                cached["pool_representatives"],
-            )
-            if current_page_counts != cached["pool_page_counts"]:
-                raise RuntimeError(
-                    "TriAttention draft V2 pool layout changed after the layout "
-                    "was built; KV pool rebalance is not supported"
-                )
-            return cached
-
-        global_layers = [int(layer) for layer in manager.pp_layers]
-        if not global_layers:
-            raise RuntimeError("TriAttention draft KV cache manager exposes no layers")
-        layout = self._build_runtime_kv_layout(
-            manager,
-            global_layers,
-            dense_layers=list(range(len(global_layers))),
-            swa_layers=[],
-            swa_window=None,
-            what="draft ",
-        )
-        self._draft_runtime_kv_layout_cache = layout
-        return layout
-
     @staticmethod
     def _pool_page_counts(
         manager: KVCacheManagerV2,
@@ -677,7 +636,7 @@ class TriAttention(KVCacheCompressionManager):
         if self.draft_kv_cache_manager is not None:
             # The cached layout lookup enforces draft V2 pool page-count
             # stability every round, exactly like the target's lookup.
-            self._draft_runtime_kv_layout()
+            self._runtime_kv_layout(draft=True)
         if self._buffers_built:
             if (
                 needed_width <= self._decode_width
@@ -709,7 +668,7 @@ class TriAttention(KVCacheCompressionManager):
         if self.draft_kv_cache_manager is not None:
             draft_tail_capacity = self._draft_protected_tail_capacity
             draft = dict(
-                layout=self._draft_runtime_kv_layout(),
+                layout=self._runtime_kv_layout(draft=True),
                 protected_tail_capacity=draft_tail_capacity,
                 page_table_token_capacity=seq_capacity + draft_tail_capacity,
             )
@@ -929,15 +888,14 @@ class TriAttention(KVCacheCompressionManager):
         self._gather_index_base = None
         self._gather_index = None
         if not union:
-            num_kv_heads_early = int(layer_pools[dense_layers[0]].shape[2])
             self._gather_index_base = torch.empty(
                 (max_requests, 1, 1, 1, decode_width), dtype=torch.int64, device=device
             )
             self._gather_index = self._gather_index_base.expand(
                 max_requests,
                 len(dense_layers),
-                num_kv_heads_early,
-                num_q_heads // num_kv_heads_early,
+                self._num_kv_heads,
+                num_q_heads // self._num_kv_heads,
                 decode_width,
             )
         self._union_scores = None
@@ -947,9 +905,7 @@ class TriAttention(KVCacheCompressionManager):
                 (max_requests, seq_len), dtype=torch.float32, device=device
             )
 
-        # ---- THE score path (no fallback): per request-count/page-shard
-        # compiled variants over ctor-bound cute tensor handles; construction
-        # failures raise the kernels' own dtype/shape/TMA errors.
+        # ---- THE score path (no fallback): compiled per request-count/page-shard ----
         anchor_pool = p0
         sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
         # One [stats_row, page_shard, {count, mean, m2}] record array.
@@ -973,19 +929,21 @@ class TriAttention(KVCacheCompressionManager):
             int(num_freqs),
             int(tokens_per_block),
         )
-        torch_prefix = (
-            block_offsets.view(-1),
-            seg_page_off,
-            seg_req_id,
-            seg_layer_id,
-            # Pointer capture of the staged metadata rows.
-            self._valid_seq_lens_device,
-            seg_out_offset,
-            self._token_starts_device,
-            q_real.view(-1),
-            q_imag.view(-1),
-            mlr_coef.view(-1),
+        # Alignment sits with the operand it describes; valid_seq_lens and
+        # token_starts are only 4-byte-aligned row views, read as per-CTA scalars.
+        prefix_operands = (
+            (block_offsets.view(-1), 16),
+            (seg_page_off, 16),
+            (seg_req_id, 16),
+            (seg_layer_id, 16),
+            (self._valid_seq_lens_device, 4),
+            (seg_out_offset, 16),
+            (self._token_starts_device, 4),
+            (q_real.view(-1), 16),
+            (q_imag.view(-1), 16),
+            (mlr_coef.view(-1), 16),
         )
+        torch_prefix = tuple(tensor for tensor, _ in prefix_operands)
         torch_tail = (
             freq_scale_sq,
             self._score_scratch,
@@ -993,14 +951,10 @@ class TriAttention(KVCacheCompressionManager):
             anchor_pool,
             self._tma_descriptors,
         )
-        # Keep-alive twin of the cute handles below: the compiled launches
-        # capture these raw device pointers for the buffers' lifetime.
-        self._score_torch_operands = (*torch_prefix, *torch_tail)
-        # valid_seq_lens/token_starts are only 4-byte-aligned row views, read as per-CTA scalars.
-        prefix_aligns = (16, 16, 16, 16, 4, 16, 4, 16, 16, 16)
+        # No keep-alive twin: each cute handle below owns its operand's DLPack
+        # capsule, which retains the underlying torch storage.
         self._cute_score_prefix = tuple(
-            _to_cute(tensor, assumed_align=align)
-            for tensor, align in zip(torch_prefix, prefix_aligns)
+            _to_cute(tensor, assumed_align=align) for tensor, align in prefix_operands
         )
         self._cute_score_tail = (
             _to_cute(freq_scale_sq),
@@ -1058,6 +1012,16 @@ class TriAttention(KVCacheCompressionManager):
             pool_shape=tuple(int(value) for value in anchor_pool.shape),
             pool_strides=tuple(int(value) for value in anchor_pool.stride()),
         )
+        stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+
+        def _compiled_kernel(cache_key, build):
+            with _COMPILE_LOCK:
+                compiled = _COMPILED_KERNELS.get(cache_key)
+                if compiled is None:
+                    compiled = build()
+                    _COMPILED_KERNELS[cache_key] = compiled
+            return compiled
+
         if union:
             variant_key = "triattention_cute_score_stats"
             compiled_entries = self._compiled_score_stats
@@ -1072,26 +1036,22 @@ class TriAttention(KVCacheCompressionManager):
                 request_count,
                 page_shards,
             )
-            with _COMPILE_LOCK:
-                compiled = _COMPILED_KERNELS.get(cache_key)
-                if compiled is None:
-                    kernel = _TriAttentionScoreKernel(
+            compiled_entries[request_count] = _compiled_kernel(
+                cache_key,
+                lambda page_shards=page_shards: cute.compile(
+                    _TriAttentionScoreKernel(
                         **kernel_kwargs,
                         page_shards=page_shards,
                         write_partial_stats=union,
-                    )
-                    stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
-                    compiled = cute.compile(
-                        kernel,
-                        *self._cute_score_prefix,
-                        self._cute_mean_cos,
-                        self._cute_mean_sin,
-                        *self._cute_score_tail,
-                        cutlass.Int32(1),
-                        stream,
-                    )
-                    _COMPILED_KERNELS[cache_key] = compiled
-            compiled_entries[request_count] = compiled
+                    ),
+                    *self._cute_score_prefix,
+                    self._cute_mean_cos,
+                    self._cute_mean_sin,
+                    *self._cute_score_tail,
+                    cutlass.Int32(1),
+                    stream,
+                ),
+            )
             page_shards_by_count[request_count] = page_shards
 
         if max_requests > 1:
@@ -1131,11 +1091,14 @@ class TriAttention(KVCacheCompressionManager):
                         _tensor_spec(self._union_scores),
                         _tensor_spec(self._partial_stats),
                     )
-                    with _COMPILE_LOCK:
-                        compiled_selection = _COMPILED_KERNELS.get(cache_key)
-                        if compiled_selection is None:
-                            tokens_per_lane, token_subtiles, row_cluster_ctas = config
-                            kernel = _TriAttentionNormalizeUnionKernel(
+                    tokens_per_lane, token_subtiles, row_cluster_ctas = config
+                    compiled_selection = _compiled_kernel(
+                        cache_key,
+                        lambda page_shards=page_shards,
+                        tokens_per_lane=tokens_per_lane,
+                        token_subtiles=token_subtiles,
+                        row_cluster_ctas=row_cluster_ctas: cute.compile(
+                            _TriAttentionNormalizeUnionKernel(
                                 num_layers=self._num_layers,
                                 seq_len=seq_len,
                                 num_q_heads=num_q_heads,
@@ -1145,19 +1108,14 @@ class TriAttention(KVCacheCompressionManager):
                                 tokens_per_lane=tokens_per_lane,
                                 token_subtiles=token_subtiles,
                                 row_cluster_ctas=row_cluster_ctas,
-                            )
-                            stream = cuda_driver.CUstream(
-                                torch.cuda.current_stream(device).cuda_stream
-                            )
-                            compiled_selection = cute.compile(
-                                kernel,
-                                _to_cute(self._partial_stats),
-                                *self._cute_selection_prefix,
-                                self._cute_union_scores,
-                                cutlass.Int32(1),
-                                stream,
-                            )
-                            _COMPILED_KERNELS[cache_key] = compiled_selection
+                            ),
+                            self._cute_partial_stats,
+                            *self._cute_selection_prefix,
+                            self._cute_union_scores,
+                            cutlass.Int32(1),
+                            stream,
+                        ),
+                    )
                     compiled_configs[config_key] = compiled_selection
                 self._compiled_normalize_union[request_count] = compiled_selection
         logger.info(
