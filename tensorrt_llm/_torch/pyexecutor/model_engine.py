@@ -1461,6 +1461,18 @@ class PyTorchModelEngine(ModelEngine):
                                  resource_manager=resource_manager)
                 torch.cuda.synchronize()
 
+    @staticmethod
+    def _release_megamoe_profiling_scratch():
+        # MegaMoE tuning resources are shared across layers, so only the engine
+        # can release them after its full autotune warmup and before graph
+        # capture. Later eviction could invalidate a captured workspace pointer.
+        from ..custom_ops import cute_dsl_megamoe_custom_op as _megamoe_op
+        release_megamoe_scratch = getattr(_megamoe_op,
+                                          "release_megamoe_profiling_scratch",
+                                          None)
+        if release_megamoe_scratch is not None:
+            release_megamoe_scratch()
+
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs a forward pass to populate the autotuner cache."""
         if not self.llm_args.enable_autotuner:
@@ -1513,6 +1525,8 @@ class PyTorchModelEngine(ModelEngine):
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
         )
         AutoTuner.get().print_profiling_cache()
+
+        self._release_megamoe_profiling_scratch()
 
         # Clear workspace buffers allocated during the autotuner forward pass.
         # The autotuner runs a context-only forward with max_num_tokens, which

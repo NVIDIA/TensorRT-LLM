@@ -44,6 +44,7 @@ def _run_autotune(
     The function always restores ``AutoTuner`` singleton state on exit so that
     ``--fast_autotune`` set for one case does not leak into the next.
     """
+    tactic_autotune = bool(getattr(getattr(moe, "backend", moe), "tactic_autotune", False))
     tuner = AutoTuner.get()
     saved_warmup = tuner.warmup
     saved_repeat = tuner.repeat
@@ -63,3 +64,9 @@ def _run_autotune(
         tuner.warmup = saved_warmup
         tuner.repeat = saved_repeat
         tuner.stream_delay_micro_secs = saved_stream_delay
+        if tactic_autotune:
+            from tensorrt_llm._torch.custom_ops.cute_dsl_megamoe_custom_op import (
+                release_megamoe_profiling_scratch,
+            )
+
+            release_megamoe_profiling_scratch()
