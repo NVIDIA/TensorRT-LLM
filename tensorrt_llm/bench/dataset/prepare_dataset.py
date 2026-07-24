@@ -43,7 +43,7 @@ class RootArgs(BaseModel):
                 tokenizer = PreTrainedTokenizerFast.from_pretrained(
                     self.tokenizer, padding_side="left"
                 )
-            except Exception:
+            except (OSError, ValueError):
                 tokenizer = AutoTokenizer.from_pretrained(
                     self.tokenizer, padding_side="left", trust_remote_code=self.trust_remote_code
                 )
