@@ -136,7 +136,7 @@ def test_pool_ratio_overrides_constraints() -> None:
     assert config.constraints == []
 
 
-def test_builds_warmup_constraints() -> None:
+def test_default_uses_allocator_fallback() -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(host_cache_size=0),
         max_batch_size=3,
@@ -146,6 +146,19 @@ def test_builds_warmup_constraints() -> None:
     )
 
     assert config.initial_pool_ratio is None
+    assert config.typical_step is None
+    assert config.constraints == []
+
+
+def test_avg_seq_len_builds_warmup_constraints() -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0, avg_seq_len=1024),
+        max_batch_size=3,
+        max_seq_len=1024,
+        max_num_tokens=2048,
+        max_draft_len=2,
+    )
+
     assert config.typical_step == BatchDesc(
         [KVCacheDesc(capacity=2048, history_length=0)]
         + [KVCacheDesc(capacity=1024, history_length=1021)] * 2
@@ -187,7 +200,7 @@ def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
 
 def test_extra_tokens_are_in_context_capacity() -> None:
     config = _make_cache_config_for_test(
-        KvCacheConfig(),
+        KvCacheConfig(avg_seq_len=264),
         max_batch_size=1,
         max_seq_len=264,
         max_num_tokens=256,
