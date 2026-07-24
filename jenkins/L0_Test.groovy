@@ -5711,6 +5711,11 @@ def launchTestJobs(pipeline, testFilter)
         } else {
             echo "CBTS [${cbts.scope}]: empty stage set after filtering"
         }
+        // coverage tier omits multi-GPU; re-add under baseline gate
+        if (cbts.enable_multi_gpu && testFilter[(MULTI_GPU_FILE_CHANGED)]) {
+            parallelJobsFiltered += multiGpuJobs
+            echo "CBTS [${cbts.scope}]: multi-GPU file changed → running ${multiGpuJobs.size()} multi-GPU stage(s) at baseline"
+        }
     }
 
     echo "Check the passed GitLab bot testFilter parameters."

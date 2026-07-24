@@ -774,8 +774,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
-        // Shadow audit: download the latest merged touch DB and log its health + HEAD coverage gap (diagnostic only).
-        _cbtsCoverageAudit(pipeline)
+        // Download the touch DB for audit + Tier 2 coverage-based narrowing.
+        def coverageDbPath = _cbtsCoverageAudit(pipeline)
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -800,10 +800,11 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def inputPath = "${LLM_ROOT}/cbts_input.json"
         writeFile file: inputPath, text: inputJson
 
-        def output = sh(
-            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json",
-            returnStdout: true,
-        )
+        def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
+        if (coverageDbPath) {
+            mainCmd += " --coverage-db ${coverageDbPath}"
+        }
+        def output = sh(script: mainCmd, returnStdout: true)
 
         def result = _cbtsParseSelectionResult(output)
         if (result.scope == null) {
@@ -845,30 +846,34 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 }
 
-// Download the latest merged touch DB and run coverage_audit.py on it; best-effort, never changes the CBTS decision.
+// Download the touch DB, audit it, and return the sqlite path (or "" on failure).
 def _cbtsCoverageAudit(pipeline)
 {
     try {
-        def covDir = "${LLM_ROOT}/cbts_cov"
+        // All commands run from ${LLM_ROOT}; covDir and the returned path are
+        // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
+        def covDir = "cbts_cov"
         def url = sh(
             script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py --print-url || true",
             returnStdout: true,
         ).trim()
         if (!url) {
-            pipeline.echo("CBTS audit: no coverage DB artifact found — skipping")
-            return
+            pipeline.echo("CBTS audit: no coverage DB artifact found — skipping Tier 2")
+            return ""
         }
-        sh "mkdir -p ${covDir}"
+        sh "cd ${LLM_ROOT} && mkdir -p ${covDir}"
         // wget the tarball (retrying) and extract the sqlite.
         trtllm_utils.llmExecStepWithRetry(pipeline, script:
-            "wget -nv '${url}' -O ${covDir}/cbts_pystart_report.tar.gz && " +
+            "cd ${LLM_ROOT} && wget -nv '${url}' -O ${covDir}/cbts_pystart_report.tar.gz && " +
             "tar xzf ${covDir}/cbts_pystart_report.tar.gz -C ${covDir}")
-        sh "python3 ${LLM_ROOT}/jenkins/scripts/cbts/tools/coverage_audit.py " +
+        sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py " +
            "--db ${covDir}/cbts_touchmap.sqlite"
+        return "${covDir}/cbts_touchmap.sqlite"
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
+        return ""
     }
 }
 

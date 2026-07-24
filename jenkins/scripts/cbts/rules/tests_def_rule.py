@@ -339,4 +339,5 @@ class TestsDefRule(Rule):
                 f"{len(block_filters)} blocks, {len(affected_stages)} stages"
                 f"{nonarrow_note}"
             ),
+            detail={"paths": len(narrowed)},
         )

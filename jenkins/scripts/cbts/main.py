@@ -48,6 +48,12 @@ from blocks import (  # noqa: E402
     parse_stages_from_groovy,
     write_filtered_test_db,
 )
+from coverage_tier import (  # noqa: E402
+    apply_coverage_tier,
+    compute_coverage_stage_counts,
+    open_db,
+    write_coverage_test_db,
+)
 from rules._helpers import strip_noop_diff_lines  # noqa: E402
 from rules.auto_deploy_rule import AutoDeployRule  # noqa: E402
 from rules.base import PRInputs, Rule, RuleResult  # noqa: E402
@@ -100,7 +106,7 @@ class SelectionResult:
     # rolls these up; noop gives way to actionable scopes there).
     scopes: list[str] = field(default_factory=list)
     affected_stages: set[str] = field(default_factory=set)
-    reasons: list[str] = field(default_factory=list)
+    reasons: list[dict] = field(default_factory=list)
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = field(default_factory=dict)
     test_db_dir_override: Optional[str] = None
     # Per-stage kept-entry count (decision telemetry / diagnostics).
@@ -113,6 +119,9 @@ class SelectionResult:
     # Aggregated `any(rule.perfsanity_relevant)`. Groovy Layer 2 keeps
     # *-PerfSanity-* stages only when True.
     perfsanity_required: bool = True
+    # set by coverage tier; Groovy re-adds multiGpuJobs under MULTI_GPU_FILE_CHANGED gate
+    enable_multi_gpu: bool = False
+    coverage_dropped_stages: list[str] = field(default_factory=list)
 
     def to_json(self) -> str:
         data = {
@@ -125,8 +134,29 @@ class SelectionResult:
             "affected_stage_split_counts": dict(self.affected_stage_split_counts),
             "sanity_required": self.sanity_required,
             "perfsanity_required": self.perfsanity_required,
+            "enable_multi_gpu": self.enable_multi_gpu,
+            "coverage_dropped_stages": sorted(self.coverage_dropped_stages),
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+def _rule_reason(rule, r) -> dict:
+    """One rule's structured reason entry: `{source, **detail, blocks, stages}`."""
+    return {
+        "source": rule.name,
+        **r.detail,
+        "blocks": len(r.block_filters),
+        "stages": len(r.affected_stages),
+    }
+
+
+def _fmt_reason(r) -> str:
+    """Render a structured reason dict as one human line: `[source] k=v, ...`."""
+    if not isinstance(r, dict):
+        return str(r)
+    src = r.get("source", "?")
+    rest = ", ".join(f"{k}={v}" for k, v in r.items() if k != "source")
+    return f"[{src}] {rest}" if rest else f"[{src}]"
 
 
 # Scopes that compose: a PR mixing waive + test-def + test-list edits
@@ -178,26 +208,35 @@ class Selector:
         handled: set[str] = set()
         for _, r in pairs:
             handled |= r.handled_files
+        # Expose for the coverage tier (Tier 2), which unions over the residual.
+        self.pairs = pairs
+        self.handled = handled
+        rule_reasons = [_rule_reason(rule, r) for rule, r in pairs]
+
         unhandled = sorted(set(pr.changed_files) - handled)
         if unhandled:
-            preview = unhandled[:5]
-            more = f" (+{len(unhandled) - 5} more)" if len(unhandled) > 5 else ""
-            return SelectionResult(scope=None, reasons=[f"Unhandled files: {preview}{more}"])
+            return SelectionResult(
+                scope=None,
+                reasons=rule_reasons
+                + [{"source": "fallback", "reason": "unhandled_files", "files": unhandled}],
+            )
 
         if not pairs:
-            return SelectionResult(scope=None, reasons=["No rule contributed"])
+            return SelectionResult(
+                scope=None,
+                reasons=[{"source": "fallback", "reason": "no_rule_contributed"}],
+            )
 
-        reasons = [f"[{rule.name}] {r.reason}" for rule, r in pairs]
         scope = _combine_scopes([r.scope for _, r in pairs])
         if scope is None:
             # scope=None is a rule's force-fallback signal; attribute it, not a scope conflict.
             forced = sorted({rule.name for rule, r in pairs if r.scope is None})
             if forced:
-                summary = f"Fallback forced by rule(s): {', '.join(forced)}"
+                fb = {"source": "fallback", "reason": "forced_by_rules", "rules": forced}
             else:
                 actionable = sorted({r.scope for _, r in pairs if r.scope and r.scope != "noop"})
-                summary = f"Scopes cannot be combined: {', '.join(actionable)}"
-            return SelectionResult(scope=None, reasons=reasons + [summary])
+                fb = {"source": "fallback", "reason": "scopes_uncombinable", "scopes": actionable}
+            return SelectionResult(scope=None, reasons=rule_reasons + [fb])
 
         affected_stages: set[str] = set()
         for _, r in pairs:
@@ -212,11 +251,7 @@ class Selector:
         if not affected_stages and scope != "noop":
             return SelectionResult(
                 scope=None,
-                reasons=reasons
-                + [
-                    "Rules fired but no stages resolved (likely YAML/waive "
-                    "granularity mismatch); falling back to baseline."
-                ],
+                reasons=rule_reasons + [{"source": "fallback", "reason": "no_stages_resolved"}],
             )
 
         # Aggregate per-block prefix->{waive_ids} across rules.
@@ -234,7 +269,7 @@ class Selector:
             scope=scope,
             scopes=sorted({r.scope for _, r in pairs if r.scope}),
             affected_stages=affected_stages,
-            reasons=reasons,
+            reasons=rule_reasons,
             block_filters=block_filters,
             sanity_required=sanity_required,
             perfsanity_required=perfsanity_required,
@@ -293,6 +328,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Override path to the Jenkins test Groovy file "
         "(default: <repo-root>/jenkins/L0_Test.groovy).",
     )
+    parser.add_argument(
+        "--coverage-db",
+        default=None,
+        help="Path to cbts_touchmap.sqlite. When set, the coverage tier (Tier 2) "
+        "runs on fallbacks and may drop fully-safe single-GPU stages.",
+    )
     args = parser.parse_args(argv)
 
     if args.list_needed_diffs:
@@ -336,7 +377,55 @@ def main(argv: Optional[list[str]] = None) -> int:
     stages = parse_stages_from_groovy(groovy_path, include_post_merge=True)
     pr = _load_pr_inputs(input_path)
     rules = build_rules(yaml_index, stages, repo_root)
-    result = Selector(stages).run(pr, rules)
+    selector = Selector(stages)
+    result = selector.run(pr, rules)
+
+    if args.coverage_db and result.scope is None:
+        note = ""
+        try:
+            db = open_db(args.coverage_db)
+            tier, note = apply_coverage_tier(
+                pr, selector.pairs, selector.handled, stages, yaml_index, repo_root, db
+            )
+        except Exception as e:  # noqa: BLE001 — CBTS must never break CI
+            note = f"coverage tier errored: {e}"
+            tier = None
+        if tier is not None:
+            result.scope = "coverage"
+            result.scopes = sorted(
+                {r.scope for _, r in selector.pairs if r.scope and r.scope != "noop"} | {"coverage"}
+            )
+            result.affected_stages = tier.affected_stages
+            result.enable_multi_gpu = True
+            result.coverage_dropped_stages = sorted(tier.dropped)
+            if tier.removed:
+                write_coverage_test_db(
+                    src_dir=test_db_dir,
+                    out_dir=repo_root / "cbts_test_db",
+                    removed=tier.removed,
+                )
+                result.test_db_dir_override = "cbts_test_db"
+                durations = load_durations(repo_root / "tests/integration/defs/.test_durations")
+                (
+                    result.affected_stage_test_counts,
+                    result.affected_stage_split_counts,
+                ) = compute_coverage_stage_counts(
+                    affected_stages=set(result.affected_stages),
+                    stages=stages,
+                    yaml_index=yaml_index,
+                    removed=tier.removed,
+                    durations=durations,
+                )
+            cov_reason = dict(tier.detail)
+            cov_reason["narrowed_stages"] = len(result.affected_stage_split_counts)
+            result.reasons = [x for x in result.reasons if x.get("source") != "fallback"] + [
+                cov_reason
+            ]
+        elif note:
+            for x in result.reasons:
+                if isinstance(x, dict) and x.get("source") == "fallback":
+                    x["coverage_declined"] = note
+                    break
 
     # Layer 3: write narrowed test-db when any block was filtered.
     if result.scope is not None and result.block_filters:
@@ -404,7 +493,7 @@ def _log_decision_to_stderr(
     if result.reasons:
         print("  reasons:", file=out)
         for r in result.reasons:
-            print(f"    - {r}", file=out)
+            print(f"    - {_fmt_reason(r)}", file=out)
     print(f"  block_filters ({len(result.block_filters)} blocks):", file=out)
     for (yaml_stem, idx), prefix_to_waives in sorted(result.block_filters.items()):
         print(f"    - {yaml_stem}#{idx}:", file=out)
