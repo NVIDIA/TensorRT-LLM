@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 
 import click
 from pydantic import BaseModel, model_validator
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from tensorrt_llm.bench.dataset.prepare_real_data import real_dataset
 from tensorrt_llm.bench.dataset.prepare_synthetic_data import token_norm_dist, token_unif_dist
@@ -35,9 +35,18 @@ class RootArgs(BaseModel):
     @model_validator(mode="after")
     def validate_tokenizer(self):
         try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                self.tokenizer, padding_side="left", trust_remote_code=self.trust_remote_code
-            )
+            # PreTrainedTokenizerFast loads directly from tokenizer.json without
+            # invoking AutoConfig, avoiding model-config parsing bugs (e.g.
+            # NemotronHConfig._pattern_to_list KeyError for hybrid models).
+            # Fall back to AutoTokenizer for models that lack a fast tokenizer.
+            try:
+                tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                    self.tokenizer, padding_side="left"
+                )
+            except Exception:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self.tokenizer, padding_side="left", trust_remote_code=self.trust_remote_code
+                )
         except EnvironmentError as e:
             raise ValueError(
                 "Cannot find a tokenizer from the given string because of "
