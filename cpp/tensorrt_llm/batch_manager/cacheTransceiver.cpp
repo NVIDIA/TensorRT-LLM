@@ -747,12 +747,20 @@ CacheTransceiver::~CacheTransceiver()
 std::string CacheTransceiver::getStatusDump() const
 {
     auto const backendType = mCacheTransceiverConfig->getBackendType().value();
+    auto const requesterSyncActive = mSyncRequesterActive.load(std::memory_order_relaxed);
     StatusSnapshot snapshot;
     {
-        std::lock_guard<std::mutex> lock(mStatusSnapshotMutex);
+        std::unique_lock<std::mutex> lock(mStatusSnapshotMutex, std::try_to_lock);
+        if (!lock.owns_lock())
+        {
+            std::ostringstream oss;
+            oss << "KV cache transceiver | backend=" << cacheTransceiverBackendName(backendType)
+                << " | snapshot=unavailable | RX(sync_active=" << requesterSyncActive
+                << ") | poisoned=" << (hasPoisonedTransferBuffer() ? "yes" : "no");
+            return oss.str();
+        }
         snapshot = mStatusSnapshot;
     }
-    auto const requesterSyncActive = mSyncRequesterActive.load(std::memory_order_relaxed);
     std::ostringstream oss;
     oss << "KV cache transceiver | backend=" << cacheTransceiverBackendName(backendType)
         << " | TX(async_active=" << snapshot.senderAsyncActive << ", timed_out=" << snapshot.timedOutSenders

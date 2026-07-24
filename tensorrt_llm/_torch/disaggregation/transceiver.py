@@ -171,25 +171,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             sessions: Dict[int, Any],
             include_receiver_ready: bool,
         ) -> str:
-            session_items = list(sessions.items())
+            session_items = list(sessions.copy().items())
             status_counts = Counter()
             receiver_ready = 0
             for _, session in session_items:
-                try:
-                    status = session.status
-                except Exception:
-                    status_counts["unknown"] += 1
+                status = session.status
+                if isinstance(status, SessionStatus):
+                    status_counts[status] += 1
                 else:
-                    if isinstance(status, SessionStatus):
-                        status_counts[status] += 1
-                    else:
-                        status_counts["unknown"] += 1
+                    status_counts["unknown"] += 1
 
                 if include_receiver_ready:
-                    try:
-                        receiver_ready += int(bool(session.receiver_ready))
-                    except Exception:
-                        pass
+                    receiver_ready += int(bool(session.receiver_ready))
 
             fields = [
                 f"sessions={len(session_items)}",
