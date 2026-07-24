@@ -362,6 +362,7 @@ class DiffusionExecutor:
                         "status": "READY",
                         "default_generation_params": self.pipeline.default_generation_params,
                         "extra_param_specs": self.pipeline.extra_param_specs,
+                        "supports_image_edit": getattr(self.pipeline, "supports_image_edit", False),
                     },
                 )
             )
@@ -404,6 +405,12 @@ class DiffusionExecutor:
         # Universal field defaults
         for field_name, default_value in self.pipeline.default_generation_params.items():
             if hasattr(params, field_name) and getattr(params, field_name) is None:
+                if (
+                    params.image is not None
+                    and getattr(self.pipeline, "derive_output_size_from_reference", False) is True
+                    and field_name in ("height", "width")
+                ):
+                    continue
                 setattr(params, field_name, default_value)
 
         # Extra param defaults — fill all declared keys so infer() can use direct access
@@ -653,6 +660,7 @@ class DiffusionRemoteClient:
         # Pipeline metadata — populated by _wait_ready from the READY signal.
         self.default_generation_params: Dict = {}
         self.extra_param_specs: Dict = {}
+        self.supports_image_edit = False
 
         # --- Launch workers ---
         self.worker_processes = []
@@ -1008,6 +1016,7 @@ class DiffusionRemoteClient:
                             "default_generation_params", {}
                         )
                         self.extra_param_specs = payload.get("extra_param_specs", {})
+                        self.supports_image_edit = payload.get("supports_image_edit", False)
                     elapsed = time.time() - start_time
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return

@@ -16,10 +16,12 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
+from io import BytesIO
 from pathlib import Path
 from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
                     Optional, Union)
 
+import PIL.Image
 import uvicorn
 from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -238,6 +240,45 @@ def _normalize_image_output(image) -> list:
     if hasattr(image, "dim") and image.dim() == 4:
         return [image[i] for i in range(image.shape[0])]
     return [image]
+
+
+def _image_output_size(image) -> str:
+    """Return an OpenAI-style size string for one generated image."""
+    if isinstance(image, PIL.Image.Image):
+        width, height = image.size
+    else:
+        height, width = image.shape[-3:-1]
+    return f"{width}x{height}"
+
+
+def _validate_flux2_reference_image(image_bytes: bytes, index: int) -> None:
+    """Validate a FLUX.2 reference upload before dispatching it to a worker."""
+    try:
+        with PIL.Image.open(BytesIO(image_bytes)) as image:
+            width, height = image.size
+            image.verify()
+    except (
+            OSError,
+            PIL.Image.DecompressionBombError,
+            SyntaxError,
+            ValueError,
+    ) as exc:
+        raise ValueError(
+            f"image[{index}] is not a valid encoded image: {exc}") from exc
+
+    min_side_length = 64
+    if width < min_side_length or height < min_side_length:
+        raise ValueError(
+            f"image[{index}] is too small: {width}x{height}. "
+            f"Both dimensions must be at least {min_side_length}px.")
+
+    max_aspect_ratio = 8
+    aspect_ratio = max(width / height, height / width)
+    if aspect_ratio > max_aspect_ratio:
+        raise ValueError(
+            f"image[{index}] has an unsupported aspect ratio: {width}x{height} "
+            f"({aspect_ratio:.1f}:1). Maximum allowed ratio is {max_aspect_ratio}:1."
+        )
 
 
 class OpenAIServer(_VideoRoutesMixin):
@@ -2403,6 +2444,15 @@ class OpenAIServer(_VideoRoutesMixin):
         with ``request.format`` extended to accept tensor payloads
         (``"safetensors"``/``"pt"``) alongside the PNG/WebP/JPEG encoders.
         """
+        return await self._generate_image(request, raw_request)
+
+    async def _generate_image(
+        self,
+        request: ImageGenerationRequest,
+        raw_request: Request,
+        reference_images: Optional[List[bytes]] = None,
+    ) -> Response:
+        """Generate an image from a validated request and optional references."""
         try:
             image_id = f"image_{uuid.uuid4().hex}"
 
@@ -2414,6 +2464,13 @@ class OpenAIServer(_VideoRoutesMixin):
             try:
                 params = parse_visual_gen_params(request, image_id,
                                                  self.generator)
+                if reference_images is not None:
+                    params.image = (reference_images[0] if len(reference_images)
+                                    == 1 else reference_images)
+                    if (request.size == "auto" and request.width is None
+                            and request.height is None):
+                        params.width = None
+                        params.height = None
                 logger.info(
                     f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
@@ -2433,6 +2490,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     err_type="InternalServerError",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
+
+            output_images = _normalize_image_output(output.image)
+            output_size = (_image_output_size(output_images[0])
+                           if params.width is None or params.height is None else
+                           f"{params.width}x{params.height}")
 
             if is_tensor_format(request.format):
                 # Tensor payloads carry every populated modality in a
@@ -2469,10 +2531,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     created=int(time.time()),
                     data=data,
                     output_format=request.format,
-                    size=f"{params.width}x{params.height}",
+                    size=output_size,
                 )
             else:
-                output_images = _normalize_image_output(output.image)
                 # Pillow's format name is the upper-case form of our
                 # request token. The on-disk extension matches the
                 # request token directly; ``.jpeg`` is interchangeable
@@ -2504,7 +2565,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     created=int(time.time()),
                     data=data,
                     output_format=request.format,
-                    size=f"{params.width}x{params.height}",
+                    size=output_size,
                 )
 
             latency = time.perf_counter() - image_gen_start  # seconds
@@ -2565,17 +2626,95 @@ class OpenAIServer(_VideoRoutesMixin):
         return f"{base}/v1/images/{image_id}/content?i={i}"
 
     async def openai_image_edit(self, raw_request: Request) -> Response:
-        """OpenAI-compatible image editing endpoint — returns HTTP 501.
+        """OpenAI-compatible multipart image-conditioned generation endpoint."""
+        if not getattr(self.generator.executor, "supports_image_edit", False):
+            return self._create_not_supported_error(
+                "Image editing is not supported by the loaded pipeline.")
 
-        No in-tree pipeline implements image editing today: Flux/Flux2 are
-        text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
-        video, not edited images. The route is registered so callers get an
-        honest NotImplemented signal instead of a 404. The request body is
-        not parsed because no schema is committed for this endpoint yet —
-        bring a typed request model back when an edit-capable pipeline lands.
-        """
-        return self._create_not_supported_error(
-            "Image editing is not supported by any in-tree pipeline yet.")
+        content_type = raw_request.headers.get("content-type", "")
+        if "multipart/form-data" not in content_type:
+            return self.create_error_response(
+                message=("Unsupported content-type. "
+                         "Use 'multipart/form-data' for image edits."),
+                err_type="BadRequestError",
+                status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+
+        form = await raw_request.form()
+        uploads = [*form.getlist("image"), *form.getlist("image[]")]
+        if not uploads:
+            return self.create_error_response(
+                message="Field 'image' is required.",
+                err_type="BadRequestError",
+                status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+        if len(uploads) > 10:
+            return self.create_error_response(
+                message="At most 10 input images are supported.",
+                err_type="BadRequestError",
+                status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+
+        reference_images = []
+        for index, upload in enumerate(uploads):
+            if not hasattr(upload, "read"):
+                return self.create_error_response(
+                    message=f"image[{index}] must be an uploaded file.",
+                    err_type="BadRequestError",
+                    status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+                )
+            image_bytes = await upload.read()
+            if not image_bytes:
+                return self.create_error_response(
+                    message=f"image[{index}] must not be empty.",
+                    err_type="BadRequestError",
+                    status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+                )
+            try:
+                _validate_flux2_reference_image(image_bytes, index)
+            except ValueError as exc:
+                return self.create_error_response(
+                    message=str(exc),
+                    err_type="BadRequestError",
+                    status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+                )
+            reference_images.append(image_bytes)
+
+        request_data: dict[str, Any] = {
+            "response_format": "b64_json",
+            "format": "png",
+            "size": "auto",
+            "n": 1,
+        }
+        allowed_fields = set(ImageGenerationRequest.model_fields)
+        for key, value in form.multi_items():
+            if key in ("image", "image[]"):
+                continue
+            request_key = "format" if key == "output_format" else key
+            if request_key not in allowed_fields:
+                return self.create_error_response(
+                    message=f"Unknown request field {key!r}.",
+                    err_type="BadRequestError",
+                    status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+                )
+            if request_key == "extra_params":
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError as exc:
+                    return self.create_error_response(
+                        message=("'extra_params' must be a JSON object "
+                                 f"string; {exc}"),
+                        err_type="BadRequestError",
+                        status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+                    )
+            request_data[request_key] = value
+
+        try:
+            request = ImageGenerationRequest(**request_data)
+        except ValidationError as exc:
+            return self._render_pydantic_validation_error(exc)
+        return await self._generate_image(request, raw_request,
+                                          reference_images)
 
     async def __call__(self,
                        host,

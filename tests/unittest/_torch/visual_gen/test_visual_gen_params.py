@@ -375,6 +375,31 @@ class TestDefaultMerging:
         assert req.params.width == 1920
         assert req.params.num_inference_steps == 50  # Default filled
 
+    def test_flux2_reference_dimensions_remain_unset_for_pipeline_resolution(self):
+        from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
+
+        executor = self._make_mock_executor(Flux2Pipeline)
+        executor.pipeline.derive_output_size_from_reference = True
+        req = self._make_request(image=b"encoded image")
+
+        self._merge(executor, req)
+
+        assert req.params.height is None
+        assert req.params.width is None
+        assert req.params.num_inference_steps == 50
+
+    def test_flux2_reference_dimensions_preserve_explicit_values(self):
+        from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
+
+        executor = self._make_mock_executor(Flux2Pipeline)
+        executor.pipeline.derive_output_size_from_reference = True
+        req = self._make_request(image=b"encoded image", height=768, width=512)
+
+        self._merge(executor, req)
+
+        assert req.params.height == 768
+        assert req.params.width == 512
+
     def test_extra_params_defaults_merged(self):
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
@@ -577,6 +602,7 @@ class TestPipelineMetadataBridging:
                 "status": "READY",
                 "default_generation_params": pipeline_cls.default_generation_params.fget(mock_self),
                 "extra_param_specs": pipeline_cls.extra_param_specs.fget(mock_self),
+                "supports_image_edit": getattr(pipeline_cls, "supports_image_edit", False),
             },
         )
 
@@ -604,6 +630,7 @@ class TestPipelineMetadataBridging:
         assert payload["status"] == "READY"
         assert payload["default_generation_params"] == ltx2_defaults
         assert set(payload["extra_param_specs"].keys()) == set(ltx2_specs.keys())
+        assert payload["supports_image_edit"] is False
 
     def test_extra_param_schema_type_preserved(self):
         """ExtraParamSchema instances keep their type through pickle."""
@@ -674,16 +701,27 @@ class TestPipelineMetadataBridging:
         client = MagicMock(spec=DiffusionRemoteClient)
         client.default_generation_params = {}
         client.extra_param_specs = {}
+        client.supports_image_edit = False
 
         payload = restored.output
         if isinstance(payload, dict):
             client.default_generation_params = payload.get("default_generation_params", {})
             client.extra_param_specs = payload.get("extra_param_specs", {})
+            client.supports_image_edit = payload.get("supports_image_edit", False)
 
         assert client.default_generation_params == ltx2_defaults
         assert set(client.extra_param_specs.keys()) == set(ltx2_specs.keys())
         for spec in client.extra_param_specs.values():
             assert isinstance(spec, ExtraParamSchema)
+
+    def test_flux2_image_edit_capability_roundtrip(self):
+        """FLUX.2 advertises image editing through READY metadata."""
+        from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
+
+        resp = self._build_ready_response(Flux2Pipeline)
+        restored = self._roundtrip(resp)
+
+        assert restored.output["supports_image_edit"] is True
 
 
 # =============================================================================

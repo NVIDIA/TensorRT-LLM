@@ -77,10 +77,10 @@ def _make_dummy_audio_tensor(length: int = 16000) -> torch.Tensor:
     return torch.randn(1, length, dtype=torch.float32)
 
 
-def _b64_white_png_1x1() -> str:
-    """Return a base64-encoded 1x1 white PNG for image edit tests."""
+def _b64_white_png(width: int = 64, height: int = 64) -> str:
+    """Return a base64-encoded white PNG for image edit tests."""
     buf = BytesIO()
-    Image.new("RGB", (1, 1), (255, 255, 255)).save(buf, format="PNG")
+    Image.new("RGB", (width, height), (255, 255, 255)).save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
@@ -130,6 +130,7 @@ class MockVisualGen:
         should_fail: bool = False,
         batch_aware: bool = True,
         validation_error: Optional[ValueError] = None,
+        supports_image_edit: bool = True,
     ):
         from types import SimpleNamespace
 
@@ -168,6 +169,7 @@ class MockVisualGen:
             extra_param_specs={
                 "stg_scale": ExtraParamSchema(type="float", default=1.0),
             },
+            supports_image_edit=supports_image_edit,
         )
 
     def _maybe_batch(self, tensor, n):
@@ -452,6 +454,17 @@ class TestImageGeneration:
         assert params.guidance_scale == 7.5
         assert params.negative_prompt == "blurry"
 
+    def test_image_generation_rejects_reference_extension(self, image_client):
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "Reference-conditioned request",
+                "input_reference": _b64_white_png(),
+            },
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="input_reference")
+
     def test_image_generation_url_returns_fetchable_urls(self, image_client):
         """``response_format='url'`` writes each generated image to
         media storage and surfaces a server-relative HTTP URL pointing
@@ -682,38 +695,151 @@ class TestImageGeneration:
 
 
 class TestImageEdit:
-    """``/v1/images/edits`` returns 501 NotImplemented in the current release.
+    """Multipart reference images are forwarded through the edits endpoint."""
 
-    No in-tree pipeline implements image editing: Flux/Flux2 are
-    text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
-    video, not edited images. Restore the full happy-path coverage when an
-    edit-capable pipeline lands.
-    """
-
-    def test_image_edit_returns_not_implemented(self, image_client):
-        """Valid request body short-circuits to 501 NotImplemented."""
-        b64_img = _b64_white_png_1x1()
+    def test_image_edit_forwards_single_image(self, image_client):
+        reference = base64.b64decode(_b64_white_png())
         resp = image_client.post(
             "/v1/images/edits",
-            json={
-                "image": b64_img,
-                "prompt": "Make it blue",
+            files={"image": ("reference.png", reference, "image/png")},
+            data={
+                "prompt": "Turn this into a watercolor painting",
                 "num_inference_steps": 10,
+                "output_format": "png",
             },
         )
-        assert resp.status_code == 501
-        body = resp.json()
-        assert body.get("type") == "NotImplementedError"
-        assert "not supported" in body.get("message", "").lower()
+        assert resp.status_code == 200
+        assert image_client.mock_gen.last_inputs == "Turn this into a watercolor painting"
+        assert image_client.mock_gen.last_params.image == reference
+        assert image_client.mock_gen.last_params.num_inference_steps == 10
 
-    def test_image_edit_no_body_returns_not_implemented(self, image_client):
-        """The route doesn't parse a typed body; any incoming request still
-        gets 501, including ones that would have failed schema validation
-        before. Restore typed-body coverage when an edit pipeline lands."""
-        resp = image_client.post("/v1/images/edits", json={"prompt": "Edit without image"})
-        assert resp.status_code == 501
-        body = resp.json()
-        assert body.get("type") == "NotImplementedError"
+    @pytest.mark.parametrize("field_name", ["image", "image[]"])
+    def test_image_edit_forwards_multiple_images(self, image_client, field_name):
+        references = [
+            base64.b64decode(_b64_white_png()),
+            base64.b64decode(_b64_white_png()),
+        ]
+        resp = image_client.post(
+            "/v1/images/edits",
+            files=[
+                (field_name, (f"reference-{index}.png", reference, "image/png"))
+                for index, reference in enumerate(references)
+            ],
+            data={"prompt": "Combine the subject and style references"},
+        )
+        assert resp.status_code == 200
+        assert image_client.mock_gen.last_params.image == references
+
+    def test_image_edit_requires_multipart(self, image_client):
+        resp = image_client.post(
+            "/v1/images/edits",
+            json={"prompt": "Edit without multipart"},
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="multipart/form-data")
+
+    def test_image_edit_requires_image(self, image_client):
+        resp = image_client.post(
+            "/v1/images/edits",
+            files={"unused": (None, "value")},
+            data={"prompt": "Edit without image"},
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="Field 'image'")
+
+    def test_image_edit_rejects_too_many_images(self, image_client):
+        reference = base64.b64decode(_b64_white_png())
+        resp = image_client.post(
+            "/v1/images/edits",
+            files=[
+                ("image", (f"reference-{index}.png", reference, "image/png")) for index in range(11)
+            ],
+            data={"prompt": "Too many references"},
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="At most 10")
+
+    def test_image_edit_rejects_unsupported_pipeline(self, tmp_path):
+        gen = MockVisualGen(
+            image_output=_make_dummy_image_tensor(),
+            supports_image_edit=False,
+        )
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        try:
+            client = _create_server(gen)
+            resp = client.post(
+                "/v1/images/edits",
+                files={
+                    "image": (
+                        "reference.png",
+                        base64.b64decode(_b64_white_png()),
+                        "image/png",
+                    )
+                },
+                data={"prompt": "Edit this"},
+            )
+            assert resp.status_code == 501
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    @pytest.mark.parametrize(
+        ("reference", "message"),
+        [
+            (b"not an image", "valid encoded image"),
+            (base64.b64decode(_b64_white_png(32, 64)), "too small"),
+            (base64.b64decode(_b64_white_png(576, 64)), "aspect ratio"),
+        ],
+    )
+    def test_image_edit_rejects_invalid_reference(
+        self,
+        image_client,
+        reference,
+        message,
+    ):
+        resp = image_client.post(
+            "/v1/images/edits",
+            files={"image": ("reference.png", reference, "image/png")},
+            data={"prompt": "Edit this"},
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains=message)
+
+    def test_image_edit_rejects_decompression_bomb(self, image_client):
+        with patch(
+            "tensorrt_llm.serve.openai_server.PIL.Image.open",
+            side_effect=Image.DecompressionBombError("too many pixels"),
+        ):
+            resp = image_client.post(
+                "/v1/images/edits",
+                files={
+                    "image": (
+                        "reference.png",
+                        base64.b64decode(_b64_white_png()),
+                        "image/png",
+                    )
+                },
+                data={"prompt": "Edit this"},
+            )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="valid encoded image")
+
+    def test_image_edit_auto_size_uses_reference_dimensions(self, tmp_path):
+        reference = base64.b64decode(_b64_white_png(80, 64))
+        gen = MockVisualGen(image_output=_make_dummy_image_tensor(64, 80))
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        try:
+            client = _create_server(gen)
+            resp = client.post(
+                "/v1/images/edits",
+                files={"image": ("reference.png", reference, "image/png")},
+                data={"prompt": "Edit this"},
+            )
+            assert resp.status_code == 200
+            assert gen.last_params.width is None
+            assert gen.last_params.height is None
+            assert resp.json()["size"] == "80x64"
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
 
 
 # =========================================================================

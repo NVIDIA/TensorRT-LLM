@@ -210,6 +210,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_flux_transformer.py
   - unittest/_torch/visual_gen/test_flux_attention.py
   - unittest/_torch/visual_gen/test_flux_pipeline.py
+  - unittest/_torch/visual_gen/test_flux2_image_conditioning.py
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
@@ -231,6 +232,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_wan_t2v_example
   - examples/visual_gen/test_visual_gen.py::test_flux1_example
   - examples/visual_gen/test_visual_gen.py::test_flux2_example
+  - examples/visual_gen/test_visual_gen.py::test_flux2_reference_image_example
   - examples/visual_gen/test_visual_gen.py::test_ltx2_example
   - examples/visual_gen/test_visual_gen.py::test_wan_i2v_example
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_example
