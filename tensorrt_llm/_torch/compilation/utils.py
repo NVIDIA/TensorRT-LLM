@@ -183,7 +183,9 @@ def inplace_info():
             2: "output_sf"
         },
         "mla_custom_op_inplace": {
-            1: "output"
+            1: "output",
+            2: "dsv4_output",
+            3: "dsv4_output_sf",
         },
         "mla_dsa_attn_inplace": {
             1: "output"
