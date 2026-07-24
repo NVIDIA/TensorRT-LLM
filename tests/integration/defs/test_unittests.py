@@ -14,8 +14,10 @@
 # limitations under the License.
 import os
 import re
+import shlex
 import warnings
 from subprocess import CalledProcessError
+from typing import NoReturn
 
 from defs.conftest import tests_path
 
@@ -61,6 +63,70 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
 
     os.remove(extra_file)
     base.write(output_file, encoding="UTF-8", xml_declaration=True)
+
+
+def _junit_culprits(xml_path: str) -> list[str]:
+    """Names of failed/errored tests in a JUnit report.
+
+    So a whole-case failure still names the specific culprit test(s) for
+    CI/triage attribution.
+    """
+    import xml.etree.ElementTree as ElementTree
+    try:
+        root = ElementTree.parse(xml_path).getroot()
+    except (OSError, ElementTree.ParseError):
+        return []
+    culprits = []
+    for tc in root.iter('testcase'):
+        if not tc.get('name'):
+            continue
+        kind = 'FAILED' if tc.find('failure') is not None else (
+            'ERROR' if tc.find('error') is not None else None)
+        if kind:
+            culprits.append(
+                f"{kind} {tc.get('classname', '')}::{tc.get('name')}")
+    return culprits
+
+
+def _fail_unittests(reason: str, output_xml: str, output_dir: str,
+                    case: str) -> NoReturn:
+    """Raise a unittest failure naming the specific culprit test(s).
+
+    Culprits are failed/errored tests from the JUnit report, plus tests from
+    this case that were still in flight when a fatal OOM/timeout killed the run
+    (nodeids left by --periodic-save-unfinished-test).
+
+    unfinished_test.txt is shared per node and only cleared on teardown, so it
+    may retain stale entries from other cases; it is filtered to this case's
+    test path(s). Reading it is best-effort and never masks the original
+    failure.
+    """
+    culprits = _junit_culprits(output_xml)
+    unfinished = os.path.join(output_dir, "unfinished_test.txt")
+    # Normalize each case selector to its file/path portion (drop a "::test"
+    # suffix) so an exact "file.py::test" case still matches, then compare on
+    # path boundaries so "unittest/foo" does not match "unittest/foo_bar/...".
+    case_paths = []
+    for arg in shlex.split(case):
+        path = arg.split("::", 1)[0].rstrip("/")
+        if "/" in path or path.endswith(".py"):
+            case_paths.append(path)
+    try:
+        with open(unfinished, encoding="utf-8") as f:
+            for line in f:
+                nodeid = line.strip()
+                if not nodeid:
+                    continue
+                node_path = nodeid.split("::", 1)[0]
+                if not case_paths or any(
+                        node_path == p or node_path.startswith(p + "/")
+                        for p in case_paths):
+                    culprits.append("IN-FLIGHT " + nodeid)
+    except (OSError, UnicodeDecodeError):
+        pass
+    if culprits:
+        reason += "; culprit test(s): " + ", ".join(culprits)
+    raise AssertionError(reason)
 
 
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
@@ -297,6 +363,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                              True)
             else:
                 os.rename(parallel_output_xml, output_xml)
-                assert False, "no report generated, fatal failure happened in unittests (retry phase)"
+                _fail_unittests(
+                    "no report generated, fatal failure in unittests (retry phase)",
+                    output_xml, output_dir, case)
 
-    assert passed, "failure reported in unittests"
+    if not passed:
+        _fail_unittests("failure reported in unittests", output_xml, output_dir,
+                        case)

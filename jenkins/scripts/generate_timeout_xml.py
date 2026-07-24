@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,33 +39,31 @@ def parse_xml_classname_name_file_from_testname(testname, stage_name):
     if testname.startswith(stage_name + "/"):
         testname = testname[len(stage_name) + 1 :]
 
-    # Get file name
-    if testname.startswith("unittest/"):
+    # A unittest record is normally the wrapper case (e.g.
+    # "unittest/_torch/thop/parallel"), but if it carries the specific inner test
+    # that was running (".../test_x.py::test_name[...]"), surface that file+test
+    # instead of flattening the timeout to the whole wrapper case.
+    is_unittest_wrapper = testname.startswith("unittest/") and ".py::" not in testname
+
+    if is_unittest_wrapper:
         file = "test_unittests.py"
-    else:
-        file = testname.split("::")[0]
-
-    # Get test name
-    if testname.startswith("unittest/"):
         name = "test_unittests_v2[" + testname + "]"
-    else:
-        name = testname.split("::")[-1]
-
-    # Get class name
-    if testname.startswith("unittest/"):
         classname = stage_name + ".test_unittests"
-    elif len(testname.split("::")) == 3:
-        classname = (
-            stage_name
-            + "."
-            + testname.split("::")[0].replace(".py", "").replace("/", ".")
-            + "."
-            + testname.split("::")[1]
-        )
     else:
-        classname = stage_name + "." + testname.split("::")[0].replace(".py", "").replace("/", ".")
-        if testname.startswith("accuracy/"):
+        # Split the structural node id (file[::class]::test) from the
+        # parametrization suffix ("[...]") before splitting on "::", so a "::"
+        # inside a param id does not corrupt the file/class/name parsing.
+        structural, bracket, params = testname.partition("[")
+        parts = structural.split("::")
+        file = parts[0]
+        name = parts[-1] + bracket + params
+        module = parts[0].replace(".py", "").replace("/", ".")
+        if len(parts) == 3:
+            classname = stage_name + "." + module + "." + parts[1]
+        elif testname.startswith("accuracy/"):
             classname = ""
+        else:
+            classname = stage_name + "." + module
 
     return classname, name, file
 
