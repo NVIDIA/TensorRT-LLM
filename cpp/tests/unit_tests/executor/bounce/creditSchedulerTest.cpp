@@ -306,6 +306,41 @@ TEST(CreditScheduler, CompletedFlowsReclaimedNoTombstoneLeak)
     EXPECT_EQ(freeRegions(s), 4u);
 }
 
+TEST(CreditScheduler, LastFlowLeavingRingResetsCursorAndRingRefills)
+{
+    // Regression: dropFromRing used to run `mCursor %= mRing.size()` AFTER erasing the LAST ring
+    // element -> modulo by zero (UB; a deterministic SIGFPE in -O0 builds). Any normal completion
+    // of the only active flow hits it. Drain a single flow to empty the ring, then refill and
+    // verify scheduling still rotates fairly from a sane cursor.
+    auto s = makeSched(/*nRegions=*/4, /*window=*/16);
+    std::string const k1 = std::string("p\x1f") + "1";
+    auto g = s.onWant(k1, want(1));
+    ASSERT_EQ(g.size(), 1u);
+    (void) s.onScatterDone(k1, g[0].offset); // last held drains -> flow erased -> ring now EMPTY
+    EXPECT_EQ(s.trackedFlows(), 0u);
+    EXPECT_EQ(freeRegions(s), 4u);
+
+    // Ring refills after going empty; grants keep alternating (cursor was reset, not left dangling).
+    std::string const k2 = std::string("p\x1f") + "2";
+    std::string const k3 = std::string("p\x1f") + "3";
+    auto g2 = s.onWant(k2, want(2));
+    auto g3 = s.onWant(k3, want(2));
+    ASSERT_EQ(g2.size() + g3.size(), 4u);
+    Mirror m;
+    m.grant(g2);
+    m.grant(g3); // no double-grant across the empty->refill transition
+    for (auto const& x : g2)
+    {
+        (void) s.onScatterDone(k2, x.offset);
+    }
+    for (auto const& x : g3)
+    {
+        (void) s.onScatterDone(k3, x.offset);
+    }
+    EXPECT_EQ(s.trackedFlows(), 0u); // BOTH flows drain -> ring empties again (erase-behind-cursor path)
+    EXPECT_EQ(freeRegions(s), 4u);
+}
+
 TEST(CreditScheduler, CancelledFlowReclaimed)
 {
     auto s = makeSched(/*nRegions=*/4, /*window=*/16);
