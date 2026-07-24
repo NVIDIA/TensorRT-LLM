@@ -1,16 +1,16 @@
-max_batch_size: 8
+max_batch_size: 512
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 8
+  max_batch_size: 256
 print_iter_log: true
 kv_cache_config:
-  dtype: auto
+  dtype: fp8
   free_gpu_memory_fraction: 0.85
 stream_interval: 20
 moe_config:
-  backend: TRITON
-tensor_parallel_size: 8
-moe_expert_parallel_size: 8
+  backend: TRTLLM
+tensor_parallel_size: 1
+moe_expert_parallel_size: 1
 trust_remote_code: true
 max_num_tokens: 20000
 max_seq_len: 9472
