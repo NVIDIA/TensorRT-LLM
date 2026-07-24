@@ -306,6 +306,19 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
+        # Qwen3.6-35B-A3B NVFP4 GDN-attn MoE: trust_remote_code, TRTLLM-Gen NVFP4 MoE (SM100/103), block reuse off.
+        {
+            'patterns': ['qwen3.6_35b_a3b_fp4'],
+            'config': {
+                'trust_remote_code': True,
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+            }
+        },
         # MiniMax-M2.5 FP8: route MoE through attention DP.
         # TP=8: intermediate_size=1536 is not block-scale divisible (1536/8=192, %128!=0).
         # TP=4: trtllm-gen FP8 block-scale MoE kernel IMAs during CUDA-graph warmup
@@ -328,6 +341,32 @@ def get_model_yaml_config(model_label: str,
             ],
             'config': {
                 'enable_attention_dp': True,
+            }
+        },
+        # MiniMax-M3 MXFP8 block-sparse MoE: sparse backend, no KV reuse, trust_remote_code, capped max_seq_len to avoid the 1M-default CUDA-graph OOM.
+        {
+            'patterns': ['minimax_m3_mxfp8'],
+            'config': {
+                'enable_attention_dp': True,
+                'trust_remote_code': True,
+                'max_seq_len': 4096,
+                'sparse_attention_config': {
+                    'algorithm': 'minimax_m3',
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+            }
+        },
+        # MiniMax-M3 8000,1000 cases need max_seq_len >= ISL+OSL (9000).
+        {
+            'patterns': [
+                'minimax_m3_mxfp8-bench-pytorch-float8-input_output_len:8000,1000-tp:4-gpus:4',
+                'minimax_m3_mxfp8-bench-pytorch-float8-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-tp:4-gpus:4',
+                'minimax_m3_mxfp8-bench-pytorch-float8-maxbs:512-input_output_len:8000,1000-con:256-tp:4-gpus:4',
+            ],
+            'config': {
+                'max_seq_len': 9216,
             }
         },
         {
