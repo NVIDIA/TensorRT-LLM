@@ -14,3 +14,4 @@ l0_cpu_arm:
       orchestrator: mpi
   tests:
   - unittest/executor/test_rpc.py
+  - unittest/_utils/test_anti_zombie.py

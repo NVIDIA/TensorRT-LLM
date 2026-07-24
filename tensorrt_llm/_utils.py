@@ -13,17 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import ctypes
 import gc
 import inspect
 import json
 import linecache
 import math
 import os
+import signal
 import socket
 import struct
 import sys
 import tempfile
 import threading
+import time
 import trace
 import traceback
 import weakref
@@ -35,6 +38,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
 import numpy as np
 import nvtx
+import psutil
 from mpi4py import MPI
 from mpi4py.util import pkl5
 from typing_extensions import ParamSpec
@@ -397,6 +401,79 @@ def get_free_ports(num=1) -> List[int]:
         f"[get_free_ports] pid={os.getpid()} reserved ports={ports} via "
         f"bind-then-close (subject to TOCTOU reuse before rebinding)")
     return ports
+
+
+# Linux prctl option; see <linux/prctl.h>.
+_PR_SET_PDEATHSIG = 1
+
+
+def set_parent_death_signal(sig=None,
+                            expected_parent_pid: Optional[int] = None) -> None:
+    """Ask the kernel to send ``sig`` to this process when its parent dies.
+
+    Linux-only (``prctl(PR_SET_PDEATHSIG)``); a no-op on other platforms. Used
+    by spawned executor workers so that an abruptly-killed parent (proxy / MPI
+    launcher) cannot leave them orphaned, holding their CUDA context and GPU
+    memory until the job's wall-clock pod-kill.
+
+    ``PR_SET_PDEATHSIG`` only takes effect once this syscall runs: a parent
+    that died *before* arming never triggers it (this process was already
+    reparented). Spawners that know the intended direct parent's PID can pass
+    ``expected_parent_pid`` to close that startup race — after arming,
+    ``os.getppid()`` is compared against it and ``sig`` is delivered to this
+    process immediately on mismatch. MPI-launched workers cannot use this
+    (their direct parent is the MPI/Slurm daemon, whose PID the spawner does
+    not know); there the window stays open but is benign — that daemon dying
+    means the resource manager is already tearing the whole job down.
+
+    Caveats: PR_SET_PDEATHSIG keys off the death of the parent *thread*, and
+    only covers the direct parent. Deeper / forked trees are handled by
+    ``kill_process_tree``.
+    """
+    if sig is None:
+        sig = signal.SIGKILL
+    if sys.platform != "linux":
+        return
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    if libc.prctl(_PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, f"prctl(PR_SET_PDEATHSIG, {sig}) failed")
+    if expected_parent_pid is not None and os.getppid() != expected_parent_pid:
+        # The parent died before the signal was armed (we were reparented);
+        # deliver the death signal ourselves rather than lingering orphaned.
+        os.kill(os.getpid(), sig)
+
+
+def kill_process_tree(pid: int,
+                      *,
+                      include_parent: bool = True,
+                      wait_timeout: float = 60.0) -> None:
+    """SIGKILL ``pid`` and all of its descendants, blocking until reaped.
+
+    Uses ``psutil.children(recursive=True)`` so forked grandchildren are covered
+    (raw PR_SET_PDEATHSIG only covers the direct parent-child link). Mirrors the
+    anti-zombie cleanup used by SGLang / vLLM.
+    """
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+    children = parent.children(recursive=True)
+    targets = children + ([parent] if include_parent else [])
+    for p in targets:
+        try:
+            p.kill()
+        except psutil.NoSuchProcess:
+            pass
+    deadline = time.time() + wait_timeout
+    for p in targets:
+        try:
+            p.wait(timeout=max(0.0, deadline - time.time()))
+        except psutil.TimeoutExpired:
+            logger.error(f"kill_process_tree: pid {p.pid} did not exit within "
+                         f"{wait_timeout}s; abandoning.")
+        except psutil.NoSuchProcess:
+            pass
 
 
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here

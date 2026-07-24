@@ -29,7 +29,8 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
-from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
+from .._utils import (customized_gc_thresholds, kill_process_tree, mpi_rank,
+                      nvtx_range_debug)
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient,
                                   validate_session_world_size)
@@ -720,6 +721,22 @@ class GenerationExecutorProxy(GenerationExecutor):
         # case (a); keep both behaviours explicit.
         if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
             self.request_queue.put_noblock(None, retry=4)
+
+        # Anti-zombie: when shutting down after a fatal error, the graceful
+        # sentinel above may never be drained (workers wedged / dead). Reap any
+        # of the proxy's own descendant processes (e.g. postproc workers, local
+        # helpers) so they don't orphan and leak GPU memory. include_parent is
+        # False so we don't kill the proxy mid-cleanup. MPI-spawned workers are
+        # not the proxy's children and are covered by PR_SET_PDEATHSIG instead.
+        if self._fatal_error is not None:
+            try:
+                kill_process_tree(os.getpid(),
+                                  include_parent=False,
+                                  wait_timeout=10.0)
+            except Exception as e:  # noqa: BLE001 - cleanup must not raise
+                logger_debug(
+                    f"kill_process_tree during pre_shutdown failed: "
+                    f"{e}\n", "yellow")
 
     def _get_next_client_id(self) -> int:
         client_id = super()._get_next_client_id()
