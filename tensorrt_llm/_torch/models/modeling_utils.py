@@ -392,6 +392,7 @@ class DecoderModelForCausalLM(nn.Module,
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
+                mapping=config.mapping,
             )
         else:
             if (hasattr(config, 'lora_config')
