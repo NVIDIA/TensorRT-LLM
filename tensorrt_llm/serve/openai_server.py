@@ -77,6 +77,9 @@ from tensorrt_llm.serve.openai_protocol import (
     ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
+from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
+                                             PerfMetricsMiddleware,
+                                             build_request_metrics_record)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
     ResponsesAPIPostprocArgs, chat_harmony_post_processor,
@@ -315,8 +318,21 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self.model = model
         self.metrics_collector = None
-        self.perf_metrics = None
-        self.perf_metrics_lock = None
+        args = getattr(self.generator, "args", None)
+        self._expose_perf_metrics = bool(
+            args and getattr(args, "return_perf_metrics", False))
+        perf_metrics_output_dir = (getattr(args, "perf_metrics_output_dir",
+                                           None) if args else None)
+        self._collect_perf_metrics = (self._expose_perf_metrics
+                                      or perf_metrics_output_dir is not None)
+        # AsyncLLM uses this flag to request engine-level snapshots. Preserve the
+        # original value separately because only it controls public headers.
+        if self._collect_perf_metrics and args is not None:
+            args.return_perf_metrics = True
+        server_kind = server_role.name.lower(
+        ) if server_role is not None else "server"
+        self._perf_metrics_writer = PerfMetricsJsonlWriter(
+            perf_metrics_output_dir, server_kind)
         self._iteration_stats_collector_task = None
         self._iteration_stats_wakeup_event = asyncio.Event()
         # Bounded snapshot of iteration stats for the GET /metrics handler.
@@ -346,6 +362,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
+            await self._perf_metrics_writer.start()
             if self.metadata_server is not None:
                 metadata = {
                     "model": self.model,
@@ -416,6 +433,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
             yield
 
+            await self._perf_metrics_writer.close()
             if self.embedding_batcher is not None:
                 await self.embedding_batcher.shutdown()
                 logger.info("Stopped encode dynamic batcher")
@@ -473,6 +491,10 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self.register_routes()
 
+        if self._collect_perf_metrics:
+            self.app.add_middleware(PerfMetricsMiddleware,
+                                    expose_headers=self._expose_perf_metrics,
+                                    writer=self._perf_metrics_writer)
         self.app.add_middleware(ServerArrivalTimeMiddleware)
 
     def _init_visual_gen(self):
@@ -573,10 +595,6 @@ class OpenAIServer(_VideoRoutesMixin):
                     pmc.request_inference_time_buckets if pmc else None),
             )
             self._log_config_info_metrics()
-            max_perf_metrics = self.generator.args.perf_metrics_max_requests
-            if max_perf_metrics > 0:
-                self.perf_metrics = deque(maxlen=max_perf_metrics)
-                self.perf_metrics_lock = asyncio.Lock()
 
     @staticmethod
     def _ensure_post_processor_hook_supported(
@@ -801,9 +819,6 @@ class OpenAIServer(_VideoRoutesMixin):
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
-                               methods=["GET"])
-        self.app.add_api_route("/perf_metrics",
-                               self.get_perf_metrics,
                                methods=["GET"])
         self.app.add_api_route("/energy_metrics",
                                self.get_energy_metrics,
@@ -1262,79 +1277,6 @@ class OpenAIServer(_VideoRoutesMixin):
             "transmit_ts": transmit_ts
         })
 
-    async def get_perf_metrics(self) -> JSONResponse:
-        if self.perf_metrics is None:
-            return JSONResponse(content=[])
-        async with self.perf_metrics_lock:
-            perf_metrics = self.perf_metrics
-            self.perf_metrics = deque(
-                maxlen=self.generator.args.perf_metrics_max_requests)
-        for metrics_dict in perf_metrics:
-            metrics = metrics_dict["perf_metrics"]
-            timing_metrics = metrics.timing_metrics
-            kv_cache_metrics = metrics.kv_cache_metrics
-            speculative_decoding = metrics.speculative_decoding
-            metrics_json = {
-                "first_iter": metrics.first_iter,
-                "last_iter": metrics.last_iter,
-                # exclude metrics.iter since it is only meaningful when the request is not finished
-            }
-            server_arrival_time = metrics_dict.pop("server_arrival_time", None)
-            if server_arrival_time is not None:
-                server_arrival_time += self.disagg_server_steady_clock_offset
-            server_first_token_time = metrics_dict.pop(
-                "server_first_token_time", None)
-            if server_first_token_time is not None:
-                server_first_token_time += self.disagg_server_steady_clock_offset
-            metrics_json["timing_metrics"] = {
-                "server_arrival_time":
-                server_arrival_time,
-                "arrival_time":
-                timing_metrics.arrival_time.total_seconds() +
-                self.disagg_server_steady_clock_offset,
-                "first_scheduled_time":
-                timing_metrics.first_scheduled_time.total_seconds() +
-                self.disagg_server_steady_clock_offset,
-                "first_token_time":
-                timing_metrics.first_token_time.total_seconds() +
-                self.disagg_server_steady_clock_offset,
-                "server_first_token_time":
-                server_first_token_time,
-                "last_token_time":
-                timing_metrics.last_token_time.total_seconds() +
-                self.disagg_server_steady_clock_offset,
-            }
-            metrics_json["kv_cache_metrics"] = {
-                "num_total_allocated_blocks":
-                kv_cache_metrics.num_total_allocated_blocks,
-                "num_new_allocated_blocks":
-                kv_cache_metrics.num_new_allocated_blocks,
-                "num_reused_blocks": kv_cache_metrics.num_reused_blocks,
-                "num_missed_blocks": kv_cache_metrics.num_missed_blocks,
-            }
-            if timing_metrics.kv_cache_size > 0:
-                metrics_json["timing_metrics"].update({
-                    # TODO: move to kv_cache_metrics
-                    "kv_cache_size":
-                    timing_metrics.kv_cache_size,
-                    "kv_cache_transfer_start":
-                    timing_metrics.kv_cache_transfer_start.total_seconds() +
-                    self.disagg_server_steady_clock_offset,
-                    "kv_cache_transfer_end":
-                    timing_metrics.kv_cache_transfer_end.total_seconds() +
-                    self.disagg_server_steady_clock_offset,
-                })
-            if speculative_decoding.total_draft_tokens > 0:
-                metrics_json["speculative_decoding"] = {
-                    "acceptance_rate": speculative_decoding.acceptance_rate,
-                    "total_accepted_draft_tokens":
-                    speculative_decoding.total_accepted_draft_tokens,
-                    "total_draft_tokens":
-                    speculative_decoding.total_draft_tokens,
-                }
-            metrics_dict["perf_metrics"] = metrics_json
-        return JSONResponse(content=list(perf_metrics))
-
     async def get_kv_cache_events(self) -> JSONResponse:
         events = []
         try:
@@ -1348,6 +1290,17 @@ class OpenAIServer(_VideoRoutesMixin):
     async def _extract_metrics(self, res: RequestOutput, raw_request: Request):
         if not res.finished:
             return
+        if self._collect_perf_metrics:
+            if raw_request and not getattr(raw_request.state,
+                                           "server_first_token_time", None):
+                raw_request.state.server_first_token_time = (
+                    get_steady_clock_now_in_seconds())
+            record = build_request_metrics_record(
+                res,
+                raw_request,
+                steady_clock_offset=self.disagg_server_steady_clock_offset)
+            if record is not None and raw_request is not None:
+                raw_request.state.perf_metrics_records.append(record)
         if self.metrics_collector:
             if res.candidate_metrics:
                 for candidate_m in res.candidate_metrics:
@@ -1361,31 +1314,6 @@ class OpenAIServer(_VideoRoutesMixin):
             # Wake up the stats collector to drain iteration stats
             if getattr(self.generator.args, "enable_iter_perf_stats", True):
                 self._iteration_stats_wakeup_event.set()
-        if self.generator.args.return_perf_metrics:
-            output = res.outputs[0]
-            item = {
-                "request_id": res.request_id,
-                "perf_metrics": res.outputs[0].request_perf_metrics
-            }
-            if raw_request:
-                item["server_arrival_time"] = getattr(raw_request.state,
-                                                      "server_arrival_time",
-                                                      None)
-                if not getattr(raw_request.state, "server_first_token_time",
-                               None):
-                    raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds(
-                    )
-                item[
-                    "server_first_token_time"] = raw_request.state.server_first_token_time
-            if output.disaggregated_params:
-                item[
-                    "ctx_request_id"] = output.disaggregated_params.ctx_request_id
-            # Request-level time breakdown (on GenerationResult/RequestOutput, not CompletionOutput)
-            if getattr(res, 'time_breakdown_metrics', None) is not None:
-                item["time_breakdown_metrics"] = res.time_breakdown_metrics
-            if self.perf_metrics is not None:
-                async with self.perf_metrics_lock:
-                    self.perf_metrics.append(item)
 
     async def _create_chat_response(
         self,
@@ -2020,9 +1948,6 @@ class OpenAIServer(_VideoRoutesMixin):
             try:
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                # Stamp first-token time on the first response, then append a
-                # /perf_metrics entry after [DONE]. The deque is only
-                # populated inside _extract_metrics.
                 first_response = await anext(promise)
                 raw_request.state.server_first_token_time = (
                     get_steady_clock_now_in_seconds())
@@ -2097,8 +2022,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     "thinking_token_budget is not supported by the Harmony "
                     "GPT-OSS serving path; use reasoning_effort instead")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
-            # Enable per-request perf metrics when the env var is set.
-            # Otherwise the /perf_metrics deque stays empty on this path.
+            # The server-level effective flag already enables engine metrics
+            # for header or JSONL output.
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(
@@ -2181,6 +2106,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     tool_parser=args.tool_parser,
                 )
 
+            await self._extract_metrics(promise, raw_request)
             return response
 
         async def create_streaming_generator(promise: RequestOutput,
@@ -2197,6 +2123,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         res, args)
                 for pp_res in pp_results:
                     yield pp_res
+            await self._extract_metrics(res, raw_request)
 
         try:
             if request.background:

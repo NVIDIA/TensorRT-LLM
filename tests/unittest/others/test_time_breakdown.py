@@ -16,6 +16,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tensorrt_llm.serve.scripts.benchmark_serving import (
+    _read_new_perf_metrics, _snapshot_perf_metrics)
 from tensorrt_llm.serve.scripts.time_breakdown import (RequestDataParser,
                                                        RequestTimeBreakdown,
                                                        TimingMetric,
@@ -393,9 +395,50 @@ class TestRequestTimeBreakdown(unittest.TestCase):
         finally:
             os.unlink(temp_file)
 
+    def test_parse_jsonl_file(self):
+        """Test parsing server-produced JSONL records."""
+        with tempfile.NamedTemporaryFile(mode='w',
+                                         suffix='.jsonl',
+                                         delete=False) as f:
+            for record in self.test_data:
+                f.write(json.dumps(record) + '\n')
+            temp_file = f.name
+
+        try:
+            timing_data = self.analyzer.parse_json_file(temp_file)
+            self.assertEqual(len(timing_data), 2)
+            self.assertEqual(timing_data[0]['ctx_server_arrival_time'], 1.0)
+            self.assertEqual(timing_data[1]['ctx_server_arrival_time'], 2.0)
+        finally:
+            os.unlink(temp_file)
+
+    def test_read_new_disagg_metrics_for_benchmark(self):
+        """Test reading only new combined records from a metrics directory."""
+        with tempfile.TemporaryDirectory() as output_dir:
+            disagg_path = os.path.join(
+                output_dir, "perf_metrics-disagg-host-1-start.jsonl")
+            with open(disagg_path, "w", encoding="utf-8") as output:
+                output.write('{"disagg_request_id":0}\n')
+            offsets = _snapshot_perf_metrics(output_dir)
+
+            with open(disagg_path, "a", encoding="utf-8") as output:
+                output.write('{"disagg_request_id":1}\n')
+            for kind in ("context", "generation"):
+                worker_path = os.path.join(
+                    output_dir, f"perf_metrics-{kind}-host-2-start.jsonl")
+                with open(worker_path, "w", encoding="utf-8") as output:
+                    output.write('{"request_id":1}\n')
+
+            records = _read_new_perf_metrics(output_dir,
+                                             offsets,
+                                             expected_count=1,
+                                             timeout=0.1)
+
+            self.assertEqual(records, [{"disagg_request_id": 1}])
+
     def test_parse_json_file_not_found(self):
         """Test parsing a non-existent file."""
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(FileNotFoundError):
             self.analyzer.parse_json_file('non_existent_file.json')
 
     def test_parse_json_file_invalid_json(self):
@@ -406,7 +449,7 @@ class TestRequestTimeBreakdown(unittest.TestCase):
             temp_file = f.name
 
         try:
-            with self.assertRaises(SystemExit):
+            with self.assertRaises(ValueError):
                 self.analyzer.parse_json_file(temp_file)
         finally:
             os.unlink(temp_file)
