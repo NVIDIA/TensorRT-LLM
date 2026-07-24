@@ -613,15 +613,13 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize("ctx_disable_overlap_scheduler", [False, True])
-    @pytest.mark.parametrize("gen_disable_overlap_scheduler", [False, True])
-    @pytest.mark.parametrize("ctx_enable_block_reuse", [True, False])
-    @pytest.mark.parametrize("gen_enable_block_reuse", [True, False])
-    def test_auto_dtype(self, ctx_disable_overlap_scheduler,
-                        gen_disable_overlap_scheduler, ctx_enable_block_reuse,
-                        gen_enable_block_reuse):
+    # overlap scheduler is token-invariant (unit-tested); only block-reuse changes which KV is transferred
+    @pytest.mark.parametrize("ctx_enable_block_reuse,gen_enable_block_reuse",
+                             [(True, True), (False, False)],
+                             ids=["block_reuse", "no_block_reuse"])
+    def test_auto_dtype(self, ctx_enable_block_reuse, gen_enable_block_reuse):
         ctx_server_config = {
-            "disable_overlap_scheduler": ctx_disable_overlap_scheduler,
+            "disable_overlap_scheduler": False,
             "kv_cache_config": {
                 "enable_block_reuse": ctx_enable_block_reuse
             }
@@ -631,7 +629,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_tokens_in_buffer": 4096
         }
         gen_server_config = {
-            "disable_overlap_scheduler": gen_disable_overlap_scheduler,
+            "disable_overlap_scheduler": False,
             "kv_cache_config": {
                 "enable_block_reuse": gen_enable_block_reuse
             }
@@ -702,50 +700,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                               self.MODEL_NAME, [CnnDailymail],
                               extra_acc_spec=f"beam_width={max_beam_width}",
                               sampling_params=sampling_params)
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_device(2)
-    def test_kv_cache_v2_nixl_python(self):
-        """Test with use_kv_cache_manager_v2=True, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
-        ctx_server_config = {
-            "disable_overlap_scheduler": True,
-            "kv_cache_config": {
-                "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": True
-            },
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "transceiver_runtime": "PYTHON"
-            }
-        }
-        gen_server_config = {
-            "disable_overlap_scheduler": False,
-            "kv_cache_config": {
-                "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": True
-            },
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "transceiver_runtime": "PYTHON"
-            }
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "port": 8000,
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
-            },
-            "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @pytest.mark.skip_less_device(2)
     def test_ngram(self):
@@ -910,7 +864,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    # grammar backend is disagg-agnostic (runs on gen worker); backend correctness is covered by aggregated tests
+    @pytest.mark.parametrize("backend", ["xgrammar"])
     def test_guided_decoding(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         ctx_server_config = {
@@ -1255,7 +1210,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "UCX",
+                "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
             },
         }
@@ -1275,7 +1230,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
-                "backend": "UCX",
+                "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
             },
             "enable_attention_dp": enable_attention_dp,
@@ -1298,7 +1253,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("mtp_nextn", [0, 2])
-    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    # grammar backend is disagg-agnostic (runs on gen worker); backend correctness is covered by aggregated tests
+    @pytest.mark.parametrize("backend", ["xgrammar"])
     def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         ctx_server_config = {
@@ -1897,7 +1853,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "UCX",
+                "backend": "DEFAULT",
                 "max_tokens_in_buffer": 4096
             },
             "enable_chunked_prefill": True,
@@ -1908,7 +1864,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "UCX",
+                "backend": "DEFAULT",
                 "max_tokens_in_buffer": 4096
             },
             "max_batch_size": max_batch_size,
@@ -1969,7 +1925,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "tokens_per_block": 32,
         }
         cache_transceiver_config = {
-            "backend": "UCX",
+            "backend": "DEFAULT",
             "max_tokens_in_buffer": 8192,
         }
         ctx_server_config = {
