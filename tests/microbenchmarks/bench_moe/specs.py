@@ -24,7 +24,7 @@ RoutingMethods, etc.).
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from tensorrt_llm._torch.modules.fused_moe.routing import (
     DeepSeekV3MoeRoutingMethod,
@@ -108,9 +108,23 @@ class ModelSpec:
     routing_method: str
     n_group: Optional[int] = None
     topk_group: Optional[int] = None
+    n_shared_experts: int = 0
+    # How shared experts are realized when n_shared_experts > 0:
+    #   "fused"   -> fold them into the routed-expert grouped GEMM (PR #11143).
+    #   "unfused" -> routed MoE (no fusion) + a separate shared GatedMLP, summed
+    #                (the pre-fusion baseline, for measuring fusion's net benefit).
+    shared_expert_mode: Literal["fused", "unfused"] = "fused"
     swiglu_alpha: float = 1.0
     swiglu_beta: float = 0.0
     swiglu_limit: float = float("inf")
+
+    def __post_init__(self) -> None:
+        if self.n_shared_experts < 0:
+            raise ValueError(f"n_shared_experts must be >= 0, got {self.n_shared_experts}.")
+        if self.shared_expert_mode not in ("fused", "unfused"):
+            raise ValueError(
+                f"shared_expert_mode must be 'fused' or 'unfused', got {self.shared_expert_mode!r}."
+            )
 
     @property
     def routing_method_cls(self) -> type:
