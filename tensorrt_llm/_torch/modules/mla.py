@@ -1419,7 +1419,16 @@ class MLA(nn.Module):
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         num_tokens = attn_metadata.num_tokens
 
-        hidden_states = _slice_hidden_states_to_num_tokens(hidden_states, num_tokens)
+        # Hoist the Fp4QuantizedTensor isinstance branch out of the helper so
+        # dynamo emits the plain-tensor path from an inline slice (matching the
+        # pre-501777ac89 FX-node shape). The helper's outlined function-call
+        # boundary otherwise shifts multi-stream sync-event insertion around the
+        # piecewise CUDA graph regions, producing an async CUDA IMA at sampler
+        # event synchronize on SM120 + torch_compile + MTP=2 (nvbugs/6473374).
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            hidden_states = _slice_hidden_states_to_num_tokens(hidden_states, num_tokens)
+        else:
+            hidden_states = hidden_states[:num_tokens, ...]
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
