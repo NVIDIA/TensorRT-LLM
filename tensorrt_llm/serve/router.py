@@ -798,14 +798,19 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  tokens_per_block: Optional[int] = None,
                  custom_tokenizer: Optional[str] = None,
                  tokenizer_dir: Optional[str] = None,
+                 use_harmony: Optional[bool] = None,
+                 model_path: Optional[str] = None,
                  track_routed_blocks: bool = True,
                  load_weight: float = 0.25,
                  load_cap: float = float("inf"),
-                 **kwargs):
+                 **kwargs) -> None:
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._init_block_hashing(tokens_per_block, custom_tokenizer,
-                                 tokenizer_dir)
+        self._init_block_hashing(tokens_per_block,
+                                 custom_tokenizer,
+                                 tokenizer_dir,
+                                 use_harmony=use_harmony,
+                                 model_path=model_path)
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
@@ -1252,11 +1257,12 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  use_token_ids: bool = False,
                  hash_skip_count: int = 0,
                  max_sessions: int = 100000,
+                 use_harmony: Optional[bool] = None,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
         self._init_load_balancing(servers)
-        self._init_block_hashing(tokens_per_block)
+        self._init_block_hashing(tokens_per_block, use_harmony=use_harmony)
 
         self._match_threshold = match_threshold
         self._use_token_ids = use_token_ids
