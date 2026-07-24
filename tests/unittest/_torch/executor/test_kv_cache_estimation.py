@@ -638,6 +638,12 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
         patch.object(torch.cuda, "memory_stats", return_value={"allocated_bytes.all.current": 128}),
         patch.object(torch.cuda, "empty_cache"),
         patch.object(torch.cuda, "reset_peak_memory_stats"),
+        # This test exercises inferred pool sizing, not the fp8 context-MLA workspace reserve; the mock
+        # model_config would otherwise walk into the MLA byte-cost path. Neutralize it so no reserve applies.
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_mla_context_workspace_bytes_per_token",
+            return_value=0,
+        ),
     ):
         assert creator.try_prepare_estimation()
         assert kv_cache_config.max_tokens == estimation_max_tokens

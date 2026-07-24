@@ -220,6 +220,100 @@ class CacheCost:
         return self.slope * tokens + self.intercept
 
 
+def get_mla_context_workspace_bytes_per_token(model_config, mapping) -> int:
+    """Per-token byte cost of the fp8 context-MLA K/V dequant workspace.
+
+    This buffer is shared across attention layers and scales with the summed attended KV length
+    (``total_kv_len``) of the step's context requests, which KV-cache reuse can grow far past the floor the
+    profiling forward measures against an empty cache. The per-token size is the single source of truth in
+    C++ (``AttentionOp::contextMlaWorkspaceBytesPerToken``, exposed via nanobind), so the estimator's
+    reserve cannot drift from the runtime allocation. Returns 0 for non-MLA / non-fp8-KV / sparse MLA (which
+    reads K/V straight from the paged cache). A non-zero result drives both the reserve and the scheduler's
+    admission cap.
+    """
+    from tensorrt_llm.bindings.internal import thop
+    config = model_config.pretrained_config
+    if not is_mla(config):
+        return 0
+    quant_config = model_config.quant_config
+    fp8_context_mla = (quant_config is not None
+                       and quant_config.quant_mode.has_fp8_kv_cache()
+                       and get_sm_version() in (90, 100, 103, 120))
+    if not fp8_context_mla:
+        return 0
+    # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror mNumAttnHeads).
+    attn_tp = 1 if mapping.enable_attention_dp else mapping.tp_size
+    num_attn_heads = config.num_attention_heads // attn_tp
+    # Sparse MLA reads K/V straight from the paged cache and stages no dequant buffer -- EXCEPT when the
+    # short-seq MHA fallback is enabled (TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD > 0), which routes short context
+    # sequences through the dense context path that does stage the fp8 buffer. So the buffer is truly never
+    # staged only for sparse MLA with the fallback off; reserve for it otherwise (conservative -- may
+    # over-reserve for models that never take the fallback, but never under-reserves).
+    sparse_mla = model_config.sparse_attention_config is not None
+    short_seq_mha_enabled = int(
+        os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
+    stages_no_buffer = sparse_mla and not short_seq_mha_enabled
+    return int(
+        thop.get_context_mla_workspace_bytes_per_token(
+            num_attn_heads=num_attn_heads,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            v_head_dim=config.v_head_dim,
+            fp8_context_mla=fp8_context_mla,
+            # Paged context MLA always uses separate Q/KV input; the term is otherwise gated to 0.
+            separate_q_and_kv_input=True,
+            sparse_mla=stages_no_buffer,
+        ))
+
+
+def get_mla_context_workspace_kv_len_cap(kv_cache_config, max_batch_size,
+                                         max_num_tokens, max_seq_len,
+                                         enable_chunked_prefill):
+    """Max summed attended-KV length (tokens) per forward step the fp8 context-MLA workspace is reserved
+    -- and the scheduler admits -- for, or ``None`` when no reservation is needed.
+
+    Returns ``None`` unless KV-cache reuse can grow the workspace past the floor the profiling forward
+    measures: with block reuse off the summed attended KV is bounded by ``max_num_tokens`` (already
+    profiled), and with chunked prefill each attention launch is independently bounded by its chunk buffer.
+    In both cases reserving would only double-count and needlessly shrink the KV pool, so no cap is returned.
+
+    Otherwise the default (no override) is the never-stall worst case ``min(max_batch_size, max_num_tokens)
+    * max_seq_len``: at most that many context requests run in a step, each attending at most ``max_seq_len``
+    KV, so reserving for it never defers a request. An explicit ``fp8_context_mla_kv_len_cap`` override
+    reserves less workspace (freeing KV pool) and lets the scheduler defer over-cap requests; it is floored
+    at ``max_seq_len`` (one request must always fit) and capped at the worst case.
+    """
+    if not kv_cache_config.enable_block_reuse or enable_chunked_prefill:
+        return None
+    worst_case = min(max_batch_size, max_num_tokens) * max_seq_len
+    override = kv_cache_config.fp8_context_mla_kv_len_cap
+    if override is None:
+        return worst_case
+    return min(max(int(override), max_seq_len), worst_case)
+
+
+def get_mla_context_workspace_reserve(budget_bytes, k_bytes_per_token,
+                                      w_bytes_per_token, kv_len_cap):
+    """Bytes to reserve for the fp8 context-MLA workspace, and the token admission cap that reserve covers.
+
+    Reserve ``w * kv_len_cap`` (the worst-case summed attended KV), clamped to the per-token split
+    ``budget * w / (k + w)`` so a memory-constrained node shares the budget at a common token count rather
+    than starving the KV pool. The admission cap is ``reserve / w == min(kv_len_cap, budget / (k + w))``
+    tokens; the scheduler admits at most that much summed attended KV, so the fp8 dequant staging buffer
+    this reserve covers stays within it. This accounts for the fp8 staging term only -- the separate BF16
+    full-gather buffers on the reuse path are not yet charged here (tracked as a follow-up), so this bounds
+    but does not by itself guarantee the reuse-path peak. Returns ``(reserve_bytes, cap_tokens)``, or
+    ``(0, None)`` when any input is non-positive.
+    """
+    if not (budget_bytes > 0 and k_bytes_per_token > 0 and w_bytes_per_token > 0
+            and kv_len_cap and kv_len_cap > 0):
+        return 0, None
+    reserve = min(
+        w_bytes_per_token * kv_len_cap, budget_bytes * w_bytes_per_token /
+        (k_bytes_per_token + w_bytes_per_token))
+    return reserve, int(reserve / w_bytes_per_token)
+
+
 def is_vswa_enabled(kv_cache_config):
     max_attention_window = kv_cache_config.max_attention_window
     return max_attention_window is not None and len(
@@ -342,6 +436,10 @@ class KvCacheCreator:
                                                   KVCacheManagerV2)
         self._draft_config = draft_config
         self._skip_est = skip_est
+        # Admission cap (tokens of summed context attended-KV) that the fp8 context-MLA workspace reservation
+        # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
+        # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
+        self._fp8_ctx_mla_kv_len_cap = None
 
     def _get_model_kv_cache_manager_cls(
         self,
@@ -913,6 +1011,41 @@ class KvCacheCreator:
         # user-provided configuration.
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
+
+        # Reserve headroom for the fp8 context-MLA attention workspace, which the profiling forward
+        # under-measures (fresh-prefill dummies never exercise KV reuse). This is only needed when KV-cache
+        # reuse can push summed attended KV past the profiled floor: get_mla_context_workspace_kv_len_cap
+        # returns None (no reservation) with reuse off -- the workspace is then bounded by max_num_tokens --
+        # or with chunked prefill -- each attention launch is then bounded by its chunk buffer -- since
+        # reserving in those cases would double-count and needlessly shrink the KV pool (up to ~37% for
+        # Kimi-K2 attention-DP). When it does apply,
+        # reserve w * L_cap bytes -- covering the worst-case summed attended KV the scheduler admits
+        # (get_mla_context_workspace_kv_len_cap) -- but clamp it to the per-token split budget * w / (k + w)
+        # so a memory-constrained node shares the budget at a common token count instead of starving the
+        # pool. Equivalently the pool keeps max((budget - w*L_cap)/k, budget/(k+w)) tokens. The reserve
+        # covers exactly reserve/w tokens of summed attended KV; that count is carried to the KV manager as
+        # the scheduler's admission cap so it never re-derives the cap from pool layout (which V2
+        # overstates). No cap or w == 0 -> no-op.
+        w_bytes_per_token = get_mla_context_workspace_bytes_per_token(
+            self._model_engine.model.model_config, self._mapping)
+        kv_len_cap = get_mla_context_workspace_kv_len_cap(
+            self._kv_cache_config, self._max_batch_size, self._max_num_tokens,
+            self._max_seq_len, self._llm_args.enable_chunked_prefill)
+        if w_bytes_per_token > 0 and kv_len_cap:
+            budget_before = kv_cache_max_memory
+            workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
+                get_mla_context_workspace_reserve(
+                    budget_before,
+                    self._get_kv_size_per_token().slope, w_bytes_per_token,
+                    kv_len_cap))
+            if workspace_reserve > 0:
+                kv_cache_max_memory = int(budget_before - workspace_reserve)
+                logger.info(
+                    f"Reserving {workspace_reserve / (GB):.2f} GiB for the fp8 context-MLA attention "
+                    f"workspace (w={w_bytes_per_token} B/token, admitting up to "
+                    f"{self._fp8_ctx_mla_kv_len_cap} tokens of summed attended KV): KV cache budget "
+                    f"{budget_before / (GB):.2f} -> {kv_cache_max_memory / (GB):.2f} GiB."
+                )
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
@@ -1606,6 +1739,13 @@ class KvCacheCreator:
             self._model_engine,
             estimating_kv_cache,
             kv_cache_config_override=self_kv_cache_config)
+
+        # Carry the fp8 context-MLA workspace admission cap (computed in configure_kv_cache_capacity) onto
+        # the real KV manager so the scheduler reads it directly instead of re-deriving from pool layout.
+        # The estimation build reserves nothing and runs throwaway fresh-prefill dummies, so leave the
+        # attribute unset there (PyExecutor._get_ctx_mla_kv_len_cap does not cap during warmup).
+        if not estimating_kv_cache and kv_cache_manager is not None:
+            kv_cache_manager.fp8_ctx_mla_kv_len_cap = self._fp8_ctx_mla_kv_len_cap
 
         if (not estimating_kv_cache and self._kv_connector_manager is not None
                 and self._draft_model_engine is not None):
