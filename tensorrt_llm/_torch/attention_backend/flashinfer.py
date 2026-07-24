@@ -165,6 +165,7 @@ class PlanParams:
     multi_item_params: Optional[FlashInferMultiItemParams] = None
     sm_scale: Optional[float] = None
     window_left: Optional[int] = None
+    kv_pool_id: Optional[int] = None
 
 
 # NB: Some features (multi-item scoring) are only supported with the paged KV-cache wrapper.
@@ -225,6 +226,8 @@ class FlashInferWrappers:
     # and columns before narrowing future updates.
     decode_block_table_active_rows: int = field(default=0, repr=False)
     decode_block_table_active_width: int = field(default=0, repr=False)
+    host_prefill_block_tables: Optional[torch.Tensor] = field(default=None,
+                                                              repr=False)
 
 
 @dataclass(kw_only=True)
@@ -704,15 +707,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     self._vswa_layer_to_pool[layer_idx] = pool_id
                     if pool_id not in self._vswa_pool_to_rep_layer:
                         self._vswa_pool_to_rep_layer[pool_id] = layer_idx
-                # Build head_dim → pool_id mapping using V2 per-layer head_dim
-                self._vswa_head_dim_to_pool: Dict[int, int] = {}
-                if hasattr(mgr, 'head_dim_per_layer'):
-                    for layer_idx, pool_id in self._vswa_layer_to_pool.items():
-                        hd = mgr.head_dim_per_layer[
-                            mgr.layer_offsets[layer_idx]]
-                        if hd not in self._vswa_head_dim_to_pool:
-                            self._vswa_head_dim_to_pool[hd] = pool_id
-
                 # Pre-allocate VSWA pool cache buffers.  These must be
                 # stable (never reallocated) so that CUDA-graph-recorded
                 # copies reference valid addresses across replays.
@@ -1325,13 +1319,54 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._host_paged_kv_indices = \
                 self._host_pool_indices[primary_pool_id]
 
+        # trtllm-gen paged-prefill graphs capture one stable block table per KV
+        # pool. Refresh those tables and KV lengths after request turnover.
+        if (self.is_cuda_graph and self.num_contexts > 0
+                and self._vswa_layer_to_pool is not None):
+            for plan_params, wrappers in self._plan_params_to_wrappers.items():
+                if plan_params.attention_mask_data is not None:
+                    continue
+                prefill_wrapper = wrappers.prefill_wrapper
+                if (prefill_wrapper is None
+                        or prefill_wrapper._backend != "trtllm-gen"):
+                    continue
+                block_tables = prefill_wrapper._block_tables
+                pool_id = plan_params.kv_pool_id
+                if block_tables is None or pool_id is None:
+                    continue
+                host_pool_indices = self._host_pool_indices[pool_id]
+                host_block_tables = wrappers.host_prefill_block_tables
+                if (host_block_tables is None
+                        or host_block_tables.shape != block_tables.shape):
+                    host_block_tables = torch.zeros(
+                        block_tables.shape,
+                        dtype=torch.int32,
+                        pin_memory=prefer_pinned(),
+                    )
+                    wrappers.host_prefill_block_tables = host_block_tables
+                else:
+                    host_block_tables.zero_()
+                source_offset = 0
+                for row, num_blocks_for_row in enumerate(
+                        num_blocks[:self.num_contexts]):
+                    copy_width = min(int(num_blocks_for_row),
+                                     block_tables.size(1))
+                    host_block_tables[row, :copy_width].copy_(
+                        host_pool_indices[source_offset:source_offset +
+                                          copy_width])
+                    source_offset += int(num_blocks_for_row)
+                block_tables.copy_(host_block_tables, non_blocking=True)
+                prefill_wrapper._kv_lens_buffer[:self.num_contexts].copy_(
+                    _to_int32_tensor(kv_lens_host[:self.num_contexts]),
+                    non_blocking=True,
+                )
+
         # CUDA graph + trtllm-gen: update _block_tables and _kv_lens_buffer
         # so the trtllm-gen decode kernel uses current page indices.
         if (self.is_cuda_graph and self._vswa_layer_to_pool is not None
                 and self._vswa_pool_indices_cache is not None
                 and self.num_generations > 0):
             decode_blocks = num_blocks[self.num_contexts:]
-            head_dim_to_pool = getattr(self, '_vswa_head_dim_to_pool', None)
             for plan_params, wrappers in self._plan_params_to_wrappers.items():
                 if plan_params.attention_mask_data is not None:
                     continue
@@ -1339,8 +1374,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 block_tables = getattr(decode_wrapper, '_block_tables', None)
                 if block_tables is None:
                     continue
-                pool_id = (head_dim_to_pool.get(plan_params.head_dim)
-                           if head_dim_to_pool else None)
+                pool_id = plan_params.kv_pool_id
                 if pool_id is None:
                     continue
                 batch_size, table_width = block_tables.shape
@@ -1439,6 +1473,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             attention_mask_type=AttentionMaskType(attention_mask_type),
             attention_mask_data=attention_mask_data,
             multi_item_params=self._multi_item_params,
+            kv_pool_id=getattr(self, "_vswa_active_pool_id", None),
         )
         return self._plan_with_params(plan_params, flashinfer_backend)
 

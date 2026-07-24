@@ -19,19 +19,23 @@ transformers>=5.5.0 Gemma4 support.
 """
 
 import math
+import tempfile
 import unittest
 import unittest.mock
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
 import torch
-from transformers import Gemma4Config, Gemma4TextConfig
+from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig
 
 from tensorrt_llm._torch.attention_backend import FlashInferAttention, FlashInferAttentionMetadata
+from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import Gemma4HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma4 import (
+    Gemma4AssistantForCausalLM,
+    Gemma4AssistantMaskedEmbedder,
     Gemma4Attention,
     Gemma4DecoderLayer,
     Gemma4ForCausalLM,
@@ -104,10 +108,38 @@ GEMMA4_PLE_CONFIG = {
     "use_double_wide_mlp": True,
 }
 
+GEMMA4_ASSISTANT_CONFIG = {
+    "text_config": {
+        **GEMMA4_SMALL_CONFIG,
+        "num_hidden_layers": 4,
+        "layer_types": [
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        "num_kv_shared_layers": 4,
+        "vocab_size_per_layer_input": 0,
+    },
+    "backbone_hidden_size": 256,
+    "use_ordered_embeddings": True,
+    "num_centroids": 16,
+    "centroid_intermediate_top_k": 2,
+    "tie_word_embeddings": True,
+    "dtype": "bfloat16",
+}
+
 
 def _make_model_config(config_dict):
     """Build a ModelConfig from a raw config dict."""
     cfg = Gemma4TextConfig(**config_dict)
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    return ModelConfig(pretrained_config=cfg, mapping=mapping)
+
+
+def _make_assistant_model_config(config_dict=GEMMA4_ASSISTANT_CONFIG):
+    """Build a ModelConfig for a standalone Gemma4 assistant."""
+    cfg = Gemma4AssistantConfig(**deepcopy(config_dict))
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     return ModelConfig(pretrained_config=cfg, mapping=mapping)
 
@@ -445,6 +477,102 @@ class TestGemma4HfWeightMapper(unittest.TestCase):
             Gemma4HfWeightMapper()._remap_moe_keys(weights)
 
 
+class TestGemma4Assistant(unittest.TestCase):
+    """Structural tests for standalone Gemma4 MTP assistants."""
+
+    def test_assistant_config_wraps_text_config(self):
+        config = Gemma4AssistantConfig(**deepcopy(GEMMA4_ASSISTANT_CONFIG))
+
+        self.assertEqual(config.model_type, "gemma4_assistant")
+        self.assertIsInstance(config.text_config, Gemma4TextConfig)
+        self.assertEqual(config.hidden_size, 256)
+        self.assertEqual(config.vocab_size, 1024)
+        self.assertEqual(config.num_hidden_layers, 4)
+
+    def test_assistant_config_default_constructor_is_serializable(self):
+        config = Gemma4AssistantConfig()
+
+        self.assertEqual(config.text_config.num_kv_shared_layers, 4)
+        self.assertIn("text_config", config.to_dict())
+
+    def test_assistant_config_auto_config_round_trip(self):
+        config = Gemma4AssistantConfig(**deepcopy(GEMMA4_ASSISTANT_CONFIG))
+
+        with tempfile.TemporaryDirectory() as directory:
+            config.save_pretrained(directory)
+            restored = AutoConfig.from_pretrained(directory)
+
+        self.assertIsInstance(restored, Gemma4AssistantConfig)
+        self.assertEqual(restored.backbone_hidden_size, 256)
+        self.assertEqual(restored.text_config.num_kv_shared_layers, 4)
+
+    def test_assistant_config_defaults_to_sharing_all_target_kv_layers(self):
+        config_dict = deepcopy(GEMMA4_ASSISTANT_CONFIG)
+        config_dict["text_config"].pop("num_kv_shared_layers")
+
+        config = Gemma4AssistantConfig(**config_dict)
+
+        self.assertEqual(
+            config.text_config.num_kv_shared_layers,
+            config.text_config.num_hidden_layers,
+        )
+
+    def test_assistant_config_rejects_partially_shared_target_kv(self):
+        config_dict = deepcopy(GEMMA4_ASSISTANT_CONFIG)
+        config_dict["text_config"]["num_kv_shared_layers"] = 2
+
+        with self.assertRaisesRegex(ValueError, "must share the target KV cache"):
+            Gemma4AssistantConfig(**config_dict)
+
+    def test_ordered_embedding_combines_vocab_parallel_shards(self):
+        hidden_states = torch.tensor([[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]])
+        lm_head_weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        canonical_positions = torch.tensor([[0, 5, 7], [3, 4, 6]])
+
+        shard_logits = []
+        for vocab_start_index, shard in ((0, lm_head_weight[:4]), (4, lm_head_weight[4:])):
+            shard_logits.append(
+                Gemma4AssistantMaskedEmbedder._selected_logits_for_vocab_shard(
+                    hidden_states,
+                    shard,
+                    canonical_positions,
+                    vocab_start_index,
+                )
+            )
+        actual = sum(shard_logits)
+        selected_weights = lm_head_weight[canonical_positions]
+        expected = torch.bmm(hidden_states.unsqueeze(1), selected_weights.transpose(1, 2)).squeeze(
+            1
+        )
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_assistant_uses_target_kv_sources(self):
+        assistant = Gemma4AssistantForCausalLM(_make_assistant_model_config())
+        self.assertEqual(len(assistant.model.layers), 4)
+        self.assertTrue(all(layer.is_kv_shared_layer for layer in assistant.model.layers))
+
+        target_config = {
+            **GEMMA4_SMALL_CONFIG,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "num_kv_shared_layers": 2,
+        }
+        target = Gemma4ForCausalLM(_make_model_config(target_config))
+        assistant.load_weights_from_target_model(target)
+
+        expected_source_layers = [2, 2, 2, 3]
+        actual_source_layers = [layer.self_attn.attn.layer_idx for layer in assistant.model.layers]
+        self.assertEqual(actual_source_layers, expected_source_layers)
+        self.assertIs(assistant._target_embed_tokens_ref(), target.model.embed_tokens)
+
+
 # ---------------------------------------------------------------------------
 # HF reference comparison tests (sub-module + full model)
 # ---------------------------------------------------------------------------
@@ -672,7 +800,13 @@ GEMMA4_26B_REAL_DIMS_CONFIG = {
 }
 
 
-def _build_gemma4_kv_cache_manager(config, num_blocks=4, tokens_per_block=32, batch_size=1):
+def _build_gemma4_kv_cache_manager(
+    config,
+    num_blocks=4,
+    tokens_per_block=32,
+    batch_size=1,
+    force_vswa=False,
+):
     """Create KVCacheManagerV2 supporting Gemma4 per-layer head_dim / kv_heads.
 
     Mirrors ``Gemma4Attention``'s layout (global kv heads only for K=V layers)
@@ -727,7 +861,7 @@ def _build_gemma4_kv_cache_manager(config, num_blocks=4, tokens_per_block=32, ba
     # exceeds sliding_window.
     sliding_window = getattr(config, "sliding_window", None)
     max_attn_window = None
-    needs_vswa = isinstance(head_dim, list) and len(set(head_dim)) > 1
+    needs_vswa = force_vswa or (isinstance(head_dim, list) and len(set(head_dim)) > 1)
     if not needs_vswa:
         needs_vswa = isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1
     if needs_vswa and sliding_window:
@@ -2238,9 +2372,11 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         self,
         initial_page_counts: list[int],
         *,
+        config_dict: dict | None = None,
         reserved_page_counts: list[int] | None = None,
         max_pages: int = 64,
         manager_batch_size: int | None = None,
+        force_vswa: bool = False,
     ) -> tuple[
         "KVCacheManagerV2",
         list["FlashInferAttention"],
@@ -2256,12 +2392,13 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         if manager_batch_size is None:
             manager_batch_size = batch_size
 
-        config = Gemma4TextConfig(**deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG))
+        config = Gemma4TextConfig(**deepcopy(config_dict or GEMMA4_E2B_REAL_DIMS_CONFIG))
         kv_cache_manager = self._get_kv_cache_manager(
             config,
             num_blocks=max_pages,
             tokens_per_block=_TRTLLM_GEN_TOKENS_PER_BLOCK,
             batch_size=manager_batch_size,
+            force_vswa=force_vswa,
         )
         self.addCleanup(kv_cache_manager.shutdown)
         self.assertTrue(kv_cache_manager.is_vswa, "Expected VSWA manager")
@@ -2380,14 +2517,13 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     def _expected_decode_block_table(
         self,
         metadata: "FlashInferAttentionMetadata",
-        head_dim: int,
+        pool_id: int,
         page_counts: list[int],
         *,
         rows: int,
         width: int,
     ) -> torch.Tensor:
         """Build the expected compact table from one VSWA pool's host indices."""
-        pool_id = metadata._vswa_head_dim_to_pool[head_dim]
         pool_indices = metadata._host_pool_indices[pool_id].numpy()
         expected = torch.zeros((rows, width), dtype=torch.int32)
         source_offset = metadata.num_context_blocks
@@ -2422,7 +2558,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                 block_tables = wrappers.decode_wrapper._block_tables
                 expected = self._expected_decode_block_table(
                     metadata,
-                    plan_params.head_dim,
+                    plan_params.kv_pool_id,
                     new_page_counts,
                     rows=len(initial_page_counts),
                     width=max(initial_page_counts),
@@ -2451,11 +2587,12 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
         initial_state = {}
         for plan_params, wrappers in metadata._plan_params_to_wrappers.items():
+            self.assertIsNotNone(plan_params.kv_pool_id)
             block_tables = wrappers.decode_wrapper._block_tables
             self.assertGreaterEqual(block_tables.size(1), 65)
             self.assertEqual(block_tables.size(1), metadata.kv_cache_manager.max_blocks_per_seq)
             self.assertEqual(wrappers.host_decode_block_tables.size(1), 64)
-            initial_state[plan_params.head_dim] = (
+            initial_state[plan_params.kv_pool_id] = (
                 block_tables.data_ptr(),
                 wrappers.host_decode_block_tables.data_ptr(),
             )
@@ -2467,19 +2604,60 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         for plan_params, wrappers in metadata._plan_params_to_wrappers.items():
             with self.subTest(head_dim=plan_params.head_dim):
                 block_tables = wrappers.decode_wrapper._block_tables
-                old_device_ptr, old_host_ptr = initial_state[plan_params.head_dim]
+                old_device_ptr, old_host_ptr = initial_state[plan_params.kv_pool_id]
                 self.assertEqual(block_tables.data_ptr(), old_device_ptr)
                 self.assertNotEqual(wrappers.host_decode_block_tables.data_ptr(), old_host_ptr)
                 self.assertGreaterEqual(wrappers.host_decode_block_tables.size(1), 65)
                 expected = self._expected_decode_block_table(
                     metadata,
-                    plan_params.head_dim,
+                    plan_params.kv_pool_id,
                     new_page_counts,
                     rows=len(new_page_counts),
                     width=max(new_page_counts),
                 )
                 torch.testing.assert_close(
                     block_tables[: len(new_page_counts), : max(new_page_counts)].cpu(),
+                    expected,
+                    atol=0,
+                    rtol=0,
+                )
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_trtllm_gen_distinguishes_same_head_dim_pools(self) -> None:
+        """Plan keys retain the KV pool when sliding and full head dims match."""
+        config_dict = deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG)
+        config_dict["global_head_dim"] = config_dict["head_dim"]
+        initial_page_counts = [5, 3]
+        _, _, metadata, _, _, _ = self._make_trtllm_gen_decode_case(
+            initial_page_counts,
+            config_dict=config_dict,
+            force_vswa=True,
+        )
+
+        plan_params = list(metadata._plan_params_to_wrappers)
+        self.assertEqual({params.head_dim for params in plan_params}, {256})
+        self.assertEqual(len({params.kv_pool_id for params in plan_params}), 2)
+
+        new_page_counts = [2, 1]
+        self._prepare_decode_page_counts(metadata, [0, 1], new_page_counts)
+        torch.cuda.synchronize()
+
+        for params, wrappers in metadata._plan_params_to_wrappers.items():
+            with self.subTest(pool_id=params.kv_pool_id):
+                expected = self._expected_decode_block_table(
+                    metadata,
+                    params.kv_pool_id,
+                    new_page_counts,
+                    rows=len(new_page_counts),
+                    width=max(new_page_counts),
+                )
+                torch.testing.assert_close(
+                    wrappers.decode_wrapper._block_tables[
+                        : len(new_page_counts), : max(new_page_counts)
+                    ].cpu(),
                     expected,
                     atol=0,
                     rtol=0,
@@ -2736,6 +2914,145 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             )
 
         kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_speculative_verification_hybrid_headdim(self):
+        """Speculative graph refreshes paged-prefill state after request turnover."""
+        config = Gemma4TextConfig(**deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG))
+        kv_cache_manager = self._get_kv_cache_manager(
+            config, num_blocks=32, tokens_per_block=32, batch_size=2
+        )
+        self.addCleanup(kv_cache_manager.shutdown)
+
+        capture_request_ids = [0]
+        replay_request_ids = [1]
+        capture_cached_tokens = [96]
+        replay_cached_tokens = [48]
+        verification_tokens = 6
+        capture_requests = kv_cache_manager.add_dummy_requests(
+            capture_request_ids,
+            [capture_cached_tokens[0] + verification_tokens],
+        )
+        replay_requests = kv_cache_manager.add_dummy_requests(
+            replay_request_ids,
+            [replay_cached_tokens[0] + verification_tokens],
+        )
+        self.assertIsNotNone(capture_requests)
+        self.assertIsNotNone(replay_requests)
+
+        layer_indices = [
+            config.layer_types.index("sliding_attention"),
+            config.layer_types.index("full_attention"),
+        ]
+        layers = []
+        queries = []
+        keys = []
+        values = []
+        for layer_idx in layer_indices:
+            is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+            head_dim = config.head_dim if is_sliding else config.global_head_dim
+            layers.append(
+                FlashInferAttention(
+                    layer_idx=layer_idx,
+                    num_heads=config.num_attention_heads,
+                    head_dim=head_dim,
+                    num_kv_heads=config.num_key_value_heads,
+                    flashinfer_backend="trtllm-gen",
+                )
+            )
+            queries.append(
+                torch.randn(
+                    verification_tokens,
+                    config.num_attention_heads * head_dim,
+                    dtype=config.torch_dtype,
+                    device="cuda",
+                )
+            )
+            keys.append(
+                torch.randn(
+                    verification_tokens,
+                    config.num_key_value_heads * head_dim,
+                    dtype=config.torch_dtype,
+                    device="cuda",
+                )
+            )
+            values.append(torch.randn_like(keys[-1]))
+            torch.nn.init.normal_(kv_cache_manager.get_buffers(layer_idx))
+
+        def make_metadata(
+            *,
+            is_cuda_graph: bool,
+            request_ids: list[int],
+            cached_tokens: list[int],
+        ):
+            return FlashInferAttentionMetadata(
+                seq_lens=torch.tensor([verification_tokens], dtype=torch.int),
+                num_contexts=1,
+                is_cuda_graph=is_cuda_graph,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True, num_cached_tokens_per_seq=cached_tokens
+                ),
+                workspace_buffer=(
+                    torch.empty(_FLASHINFER_WORKSPACE_BYTES, dtype=torch.uint8, device="cuda")
+                    if is_cuda_graph
+                    else None
+                ),
+                max_num_requests=1,
+                max_num_tokens=verification_tokens,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+            )
+
+        graph_metadata = make_metadata(
+            is_cuda_graph=True,
+            request_ids=capture_request_ids,
+            cached_tokens=capture_cached_tokens,
+        )
+        graph_metadata.prepare()
+        for _ in range(2):
+            for layer, query, key, value in zip(layers, queries, keys, values, strict=True):
+                layer.forward(query, key, value, graph_metadata)
+
+        graph_outputs = []
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for layer, query, key, value in zip(layers, queries, keys, values, strict=True):
+                graph_outputs.append(layer.forward(query, key, value, graph_metadata))
+
+        graph_metadata.request_ids = replay_request_ids
+        graph_metadata.kv_cache_params = KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=replay_cached_tokens,
+        )
+        graph_metadata.prepare()
+
+        reference_metadata = make_metadata(
+            is_cuda_graph=False,
+            request_ids=replay_request_ids,
+            cached_tokens=replay_cached_tokens,
+        )
+        reference_metadata.prepare()
+        reference_outputs = [
+            layer.forward(query, key, value, reference_metadata)
+            for layer, query, key, value in zip(layers, queries, keys, values, strict=True)
+        ]
+
+        graph.replay()
+        torch.cuda.synchronize()
+
+        for layer, graph_output, reference_output in zip(
+            layers, graph_outputs, reference_outputs, strict=True
+        ):
+            torch.testing.assert_close(
+                graph_output,
+                reference_output,
+                atol=1e-2,
+                rtol=0,
+                msg=f"Layer {layer.layer_idx}: verification graph output diverges from eager",
+            )
 
     @torch.no_grad()
     @unittest.mock.patch(

@@ -1580,11 +1580,16 @@ class KvCacheCreator:
         # Split combined KV cache budgets before creating managers. Skip during
         # estimation — estimation uses max_tokens-based logic and must not
         # mutate the config.
-        has_draft = (
-            self._draft_model_engine is not None  # two-model
+        draft_shares_target_kv_cache = (
+            self._draft_model_engine is not None
+            and self._draft_model_engine.kv_cache_manager_key
+            == ResourceManagerType.KV_CACHE_MANAGER)
+        has_independent_draft_cache = (
+            (self._draft_model_engine is not None
+             and not draft_shares_target_kv_cache)  # two-model
             or self._should_create_separate_draft_kv_cache())  # one-model
         draft_kv_cache_config = None
-        if not estimating_kv_cache and has_draft:
+        if not estimating_kv_cache and has_independent_draft_cache:
             # Used when each manager sizes pools from max_gpu_total_bytes (V2
             # and V1 VSWA). V1 non-VSWA GPU uses shared max_tokens instead.
             if self._needs_gpu_kv_cache_budget_split(self_kv_cache_config):
@@ -1617,8 +1622,10 @@ class KvCacheCreator:
                                        if draft_kv_cache_config is not None else
                                        self_kv_cache_config)
 
-        # Two-model speculative decoding: draft model has separate engine
-        if self._draft_model_engine is not None:
+        # Two-model speculative decoding with an independent draft KV cache.
+        # Shared-target-KV draft engines use the primary manager instead.
+        if (self._draft_model_engine is not None
+                and not draft_shares_target_kv_cache):
             if self._is_kv_cache_manager_v2:
                 assert draft_kv_cache_config is None, (
                     "KVCacheManagerV2 does not support two-model speculative "

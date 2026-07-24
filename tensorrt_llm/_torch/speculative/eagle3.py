@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
@@ -88,6 +91,10 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.start_indices = {i: 0 for i in range(slot_size)}
         # whether the next draft forward is the first
         self.is_first_draft = True
+        # Gemma4 assistants share the target KV cache and only query the last
+        # validated position. The drafter records that position in the target
+        # model's most recent hidden-state span before preparing draft inputs.
+        self.draft_hidden_state_offsets: Dict[int, int] = {}
         self.spec_tree_manager = None
 
         if isinstance(config,
@@ -122,6 +129,7 @@ class Eagle3ResourceManager(BaseResourceManager):
         slot_id = self.slot_manager.get_slot(request.request_id)
         self.seq_lens[slot_id] = 0
         self.start_indices[slot_id] = 0
+        self.draft_hidden_state_offsets.pop(request.request_id, None)
         if self.use_relaxed_acceptance_for_thinking:
             self.relaxed_delta_pool[slot_id].fill_(0)
         self.slot_manager.remove_slot(request.request_id)
@@ -207,6 +215,7 @@ class Eagle3SpecMetadata(SpecMetadata):
     is_first_draft: bool = False
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
     is_mtp_eagle: bool = False
+    shares_target_kv_cache: bool = False
 
     eagle_choices: Optional[List[List[int]]] = None
     max_total_draft_tokens: int = 0
@@ -274,11 +283,28 @@ class Eagle3SpecMetadata(SpecMetadata):
         for req_id, seq_len in zip(self.request_ids, self.seq_lens):
             slot_id = self.eagle3_resource_manager.slot_manager.get_slot(req_id)
             start_idx = self.eagle3_resource_manager.start_indices[slot_id]
+            # Shared-target-KV drafters issue one query per target iteration.
+            # Read the hidden state for the last validated target token, then
+            # overwrite that location for the remaining draft iterations.
+            if self.is_draft_model and self.shares_target_kv_cache:
+                assert seq_len == 1, (
+                    "Shared-target-KV drafting expects one query token per "
+                    f"request, got {seq_len}")
+                old_seq_len = self.eagle3_resource_manager.seq_lens[slot_id]
+                hidden_state_offset = self.eagle3_resource_manager.draft_hidden_state_offsets.get(
+                    req_id, max(old_seq_len - 1, 0))
+                assert old_seq_len == 0 or 0 <= hidden_state_offset < old_seq_len, (
+                    "Shared-target-KV hidden-state offset is outside the "
+                    f"target span: offset={hidden_state_offset}, "
+                    f"target_seq_len={old_seq_len}")
+                hidden_state_idx = start_idx + hidden_state_offset
+                hidden_states_read_indices.append(hidden_state_idx)
+                hidden_states_write_indices.append(hidden_state_idx)
             # 1) target model or (is_first_draft and is_linear_tree)
             # If this is the first draft or the target model forward, we need to
             # read/write all of the hidden states
-            if not self.is_draft_model or (is_first_draft
-                                           and spec_tree_manager is None):
+            elif not self.is_draft_model or (is_first_draft
+                                             and spec_tree_manager is None):
                 hidden_states_read_indices.extend(
                     list(range(start_idx, start_idx + seq_len)))
                 hidden_states_write_indices.extend(

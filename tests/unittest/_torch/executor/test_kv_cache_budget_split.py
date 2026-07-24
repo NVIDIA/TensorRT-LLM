@@ -14,11 +14,13 @@
 # limitations under the License.
 """Tests for KV cache budget splitting between target and draft managers."""
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 GB = 1 << 30
@@ -65,6 +67,36 @@ def _make_creator(
 
 
 class TestSplitGpuBudgetForDraft:
+    def test_shared_target_cache_skips_draft_manager(self):
+        total_gpu = 10 * GB
+        total_host = 20 * GB
+        c = _make_creator(
+            max_gpu_total_bytes=total_gpu,
+            host_cache_size=total_host,
+        )
+        c._draft_model_engine = SimpleNamespace(
+            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER
+        )
+        c._skip_est = False
+        c._is_encoder_decoder = Mock(return_value=False)
+        c._is_kv_cache_manager_v2 = True
+        c._kv_connector_manager = None
+        c._max_num_tokens = 128
+        c._should_create_separate_draft_kv_cache = Mock(return_value=False)
+        c._split_kv_cache_budget_for_draft = Mock()
+        c._create_kv_cache_manager = Mock(return_value="target")
+
+        resources = {}
+        c.build_managers(resources, estimating_kv_cache=False)
+
+        c._split_kv_cache_budget_for_draft.assert_not_called()
+        c._create_kv_cache_manager.assert_called_once()
+        target_config = c._create_kv_cache_manager.call_args.kwargs["kv_cache_config_override"]
+        assert target_config.max_gpu_total_bytes == total_gpu
+        assert target_config.host_cache_size == total_host
+        assert resources[ResourceManagerType.KV_CACHE_MANAGER] == "target"
+        assert resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER] is None
+
     def test_gpu_budget_split_proportionally(self):
         total_gpu = 10 * GB
         c = _make_creator(

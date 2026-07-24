@@ -130,19 +130,23 @@ def get_spec_metadata(spec_config,
             draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
+        hidden_size = getattr(model_config, "speculative_hidden_size",
+                              model_config.hidden_size)
         return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             num_layers=model_config.num_hidden_layers,
-            hidden_size=model_config.hidden_size,
+            hidden_size=hidden_size,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
             is_draft_model=is_draft_model,
             eagle3_resource_manager=spec_resource_manager,
             layers_to_capture=None,
             is_mtp_eagle=True,
+            shares_target_kv_cache=getattr(model_config,
+                                           "shares_target_kv_cache", False),
         )
     if spec_config.spec_dec_mode.is_eagle3():
         effective_dynamic_tree = _is_effective_dynamic_tree(spec_config)

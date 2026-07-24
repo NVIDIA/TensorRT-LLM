@@ -303,6 +303,9 @@ def setup_llm(args, **kwargs):
     if spec_decode_algo == 'MTP':
         if not args.use_one_model:
             print("Running MTP eagle with two model style.")
+            if args.draft_model_dir is None:
+                raise ValueError(
+                    "--draft_model_dir is required for two-model MTP")
         spec_config = MTPDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             use_relaxed_acceptance_for_thinking=args.
@@ -313,7 +316,8 @@ def setup_llm(args, **kwargs):
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
             max_total_draft_tokens=args.max_total_draft_tokens,
-            speculative_model=args.model_dir)
+            speculative_model=args.model_dir
+            if args.use_one_model else args.draft_model_dir)
     elif spec_decode_algo == "EAGLE3":
         spec_config = Eagle3DecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,

@@ -585,21 +585,43 @@ def create_py_executor(
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
 
-            use_chain_drafter = (
+            capturable_drafter_eligible = (
                 guided_decoding_config is None
-                and draft_spec_config._allow_chain_drafter
                 and draft_spec_config._allow_greedy_draft_tokens
-                and llm_args.attn_backend == "TRTLLM"
                 and draft_spec_config.draft_len_schedule is None)
+            use_chain_drafter = (capturable_drafter_eligible
+                                 and draft_spec_config._allow_chain_drafter
+                                 and llm_args.attn_backend == "TRTLLM")
 
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
-            if use_chain_drafter:
+            if (use_chain_drafter
+                    or draft_spec_config.spec_dec_mode.is_mtp_eagle()):
 
                 def drafting_loop_wrapper(model):
                     from tensorrt_llm._torch.speculative.drafting_loops import (
+                        Gemma4AssistantDraftingLoopWrapper,
                         LinearDraftingLoopWrapper,
                         StaticTreeDraftingLoopWrapper)
                     from tensorrt_llm.llmapi import EagleDecodingConfig
+
+                    shares_target_kv_cache = bool(
+                        getattr(model.config, "shares_target_kv_cache", False))
+                    if shares_target_kv_cache:
+                        if guided_decoding_config is not None:
+                            raise ValueError(
+                                "Guided decoding is not supported with draft "
+                                "models that share the target KV cache")
+                        if not capturable_drafter_eligible:
+                            raise ValueError(
+                                "Draft models that share the target KV cache "
+                                "require the capturable greedy drafting loop "
+                                "without a draft length schedule")
+                        return Gemma4AssistantDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.tokens_per_gen_step - 1, model)
+
+                    if not use_chain_drafter:
+                        return None
 
                     static_tree_drafter = isinstance(
                         draft_spec_config, EagleDecodingConfig
@@ -640,8 +662,11 @@ def create_py_executor(
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
-            # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
-            if spec_config.spec_dec_mode.is_mtp_eagle():
+            # Embedded MTP checkpoints expose a single draft layer. Standalone
+            # Gemma4 assistants keep their full four-layer text backbone.
+            if (spec_config.spec_dec_mode.is_mtp_eagle()
+                    and not getattr(draft_model_engine.model.config,
+                                    "preserve_checkpoint_layer_count", False)):
                 draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)

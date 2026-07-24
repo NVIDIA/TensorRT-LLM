@@ -111,6 +111,7 @@ class CUDAGraphRunnerConfig:
     kv_cache_manager_key: Any
     dynamic_draft_len_mapping: Optional[Dict[int, int]] = None
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
+    draft_model_external_draft_len: Optional[int] = None
 
 
 class CUDAGraphRunner:
@@ -158,6 +159,8 @@ class CUDAGraphRunner:
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
         runtime_draft_token_buffer_width = (
+            self.config.draft_model_external_draft_len
+            if self.config.draft_model_external_draft_len is not None else
             self.config.original_max_total_draft_tokens
             if self.config.spec_config is not None else 0)
         token_per_request = runtime_draft_token_buffer_width + 1
@@ -247,11 +250,18 @@ class CUDAGraphRunner:
 
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
-            # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.
-            # Because we will pad the input to 'max_draft_len' length for the first draft layer.
-            draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
-            key = (batch_size, draft_len, spec_resource_manager.is_first_draft,
-                   short_seq_len_mode, is_all_greedy_sample)
+            if self.config.draft_model_external_draft_len is not None:
+                # Capturable draft models may execute the whole drafting loop
+                # internally while exposing a smaller fixed input shape.
+                draft_len = self.config.draft_model_external_draft_len
+                is_first_draft = False
+            else:
+                # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.
+                # Because we will pad the input to 'max_draft_len' length for the first draft layer.
+                draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
+                is_first_draft = spec_resource_manager.is_first_draft
+            key = (batch_size, draft_len, is_first_draft, short_seq_len_mode,
+                   is_all_greedy_sample)
         else:
             # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
