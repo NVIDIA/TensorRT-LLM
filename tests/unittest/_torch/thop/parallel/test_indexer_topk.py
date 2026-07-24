@@ -150,62 +150,89 @@ def compare_top_k_results(
     Returns:
         True if results match within tolerance, False otherwise
     """
-    num_rows = cuda_indices.shape[0]
+    # --- vectorized implementation (no per-row .item() syncs) ---
+    row_lengths = row_ends - row_starts  # [num_rows]
+    expected_valid = torch.minimum(row_lengths, torch.full_like(row_lengths, top_k))
 
-    # Calculate valid lengths for each row (vectorized)
-    row_lengths = row_ends - row_starts
+    cuda_valid_counts = (cuda_indices != -1).sum(dim=1)
+    torch_valid_counts = (torch_indices != -1).sum(dim=1)
 
-    for row_idx in range(num_rows):
-        row_len = row_lengths[row_idx].item()
-        expected_valid = min(row_len, top_k)
+    # Count mismatch between cuda and torch
+    mismatch = (cuda_valid_counts != torch_valid_counts).nonzero(as_tuple=True)[0]
+    if mismatch.numel() > 0:
+        row_idx = mismatch[0].item()
+        print(
+            f"Row {row_idx}: Different number of valid indices - "
+            f"CUDA: {cuda_valid_counts[row_idx].item()}, "
+            f"PyTorch: {torch_valid_counts[row_idx].item()}"
+        )
+        return False
 
-        cuda_row = cuda_indices[row_idx]
-        torch_row = torch_indices[row_idx]
+    # Count mismatch vs expected
+    wrong = (cuda_valid_counts != expected_valid).nonzero(as_tuple=True)[0]
+    if wrong.numel() > 0:
+        row_idx = wrong[0].item()
+        print(
+            f"Row {row_idx}: Expected {expected_valid[row_idx].item()} valid indices, "
+            f"got {cuda_valid_counts[row_idx].item()}"
+        )
+        return False
 
-        cuda_valid_mask = cuda_row != -1
-        torch_valid_mask = torch_row != -1
+    # Value check: safe gather (-1 → 0), add row_start, gather logits, mask invalid → -inf, sort, compare.
+    # cuda_indices and torch_indices may have different column counts (e.g. decode path where
+    # torch_indices is built with min(top_k, max_row_len) columns), so use separate masks.
+    cuda_invalid = cuda_indices == -1
+    torch_invalid = torch_indices == -1
 
-        cuda_valid = cuda_row[cuda_valid_mask]
-        torch_valid = torch_row[torch_valid_mask]
+    cuda_safe = cuda_indices.clone()
+    torch_safe = torch_indices.clone()
+    cuda_safe[cuda_invalid] = 0
+    torch_safe[torch_invalid] = 0
 
-        if cuda_valid.shape[0] != torch_valid.shape[0]:
-            print(
-                f"Row {row_idx}: Different number of valid indices - "
-                f"CUDA: {cuda_valid.shape[0]}, PyTorch: {torch_valid.shape[0]}"
+    cuda_abs = cuda_safe.long() + row_starts.unsqueeze(1)
+    torch_abs = torch_safe.long() + row_starts.unsqueeze(1)
+
+    cuda_vals = logits.gather(1, cuda_abs)
+    torch_vals = logits.gather(1, torch_abs)
+    cuda_vals[cuda_invalid] = float("-inf")
+    torch_vals[torch_invalid] = float("-inf")
+
+    cuda_sorted = cuda_vals.sort(dim=1, descending=True).values
+    torch_sorted = torch_vals.sort(dim=1, descending=True).values
+
+    # Build per-tensor position masks (first expected_valid[i] positions per row).
+    # Flattening both gives the same element count because counts were verified equal above.
+    cuda_k = cuda_indices.shape[1]
+    torch_k = torch_indices.shape[1]
+    cuda_pos_mask = torch.arange(cuda_k, device=cuda_indices.device).unsqueeze(
+        0
+    ) < expected_valid.unsqueeze(1)
+    torch_pos_mask = torch.arange(torch_k, device=torch_indices.device).unsqueeze(
+        0
+    ) < expected_valid.unsqueeze(1)
+
+    if not torch.allclose(
+        cuda_sorted[cuda_pos_mask], torch_sorted[torch_pos_mask], rtol=tolerance, atol=tolerance
+    ):
+        bad = (cuda_k == torch_k) and (
+            (
+                ~torch.isclose(cuda_sorted, torch_sorted, rtol=tolerance, atol=tolerance)
+                & cuda_pos_mask
             )
-            return False
-
-        if cuda_valid.shape[0] != expected_valid:
-            print(
-                f"Row {row_idx}: Expected {expected_valid} valid indices, got {cuda_valid.shape[0]}"
-            )
-            return False
-
-        if cuda_valid.shape[0] == 0:
-            continue
-
-        row_start = row_starts[row_idx].item()
-        logits_row = logits[row_idx]
-
-        cuda_abs_indices = cuda_valid + row_start
-        torch_abs_indices = torch_valid + row_start
-
-        cuda_values = logits_row[cuda_abs_indices]
-        torch_values = logits_row[torch_abs_indices]
-
-        cuda_values_sorted, _ = torch.sort(cuda_values, descending=True)
-        torch_values_sorted, _ = torch.sort(torch_values, descending=True)
-
-        if not torch.allclose(
-            cuda_values_sorted, torch_values_sorted, rtol=tolerance, atol=tolerance
-        ):
+            .any(dim=1)
+            .nonzero(as_tuple=True)[0]
+        )
+        if bad is not False and bad.numel() > 0:
+            row_idx = bad[0].item()
+            cuda_valid = cuda_indices[row_idx][cuda_indices[row_idx] != -1]
+            torch_valid = torch_indices[row_idx][torch_indices[row_idx] != -1]
             cuda_set = set(cuda_valid.cpu().tolist())
             torch_set = set(torch_valid.cpu().tolist())
             if cuda_set != torch_set:
                 print("  Different indices selected:")
                 print(f"    Only in CUDA: {cuda_set - torch_set}")
                 print(f"    Only in Torch: {torch_set - cuda_set}")
-            return False
+        return False
 
     return True
 
@@ -720,99 +747,6 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 64, 256])
-@pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
-@pytest.mark.parametrize("num_tokens", [4096, 8192])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("load_balance", [False, True])
-def test_cute_dsl_topk_decode_single_cta(
-    batch_size, next_n, index_topk, num_tokens, dtype, load_balance
-):
-    """Correctness test for CuTE DSL single-CTA TopK decode on Blackwell."""
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
-        dtype,
-        lambda logits, seq_lens: torch.ops.trtllm.cute_dsl_topk_decode_blackwell(
-            input_values=logits,
-            seq_lens=seq_lens,
-            top_k=index_topk,
-            next_n=next_n,
-            num_copy_bits=256,
-            load_balance=load_balance,
-        ),
-    )
-
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 64])
-@pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
-@pytest.mark.parametrize("num_tokens", [32768, 65536])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("chunk_size_per_cta", [16384])
-@pytest.mark.parametrize("dynamic", [False, True])
-def test_cute_dsl_topk_decode_multi_cta(
-    batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta, dynamic
-):
-    """Correctness test for CuTE DSL multi-CTA TopK decode on Blackwell."""
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
-        dtype,
-        lambda logits, seq_lens: torch.ops.trtllm.cute_dsl_topk_decode_multi_cta_blackwell(
-            input_values=logits,
-            seq_lens=seq_lens,
-            top_k=index_topk,
-            next_n=next_n,
-            num_copy_bits=256,
-            chunk_size_per_cta=chunk_size_per_cta,
-            dynamic=dynamic,
-        ),
-    )
-
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 64, 128])
-@pytest.mark.parametrize("next_n", [1, 2])
-@pytest.mark.parametrize("index_topk", [2048])
-@pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
-def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
-    """Correctness test for CuTE DSL indexer TopK decode with in-place output."""
-    num_gen_tokens = batch_size * next_n
-
-    def run_fn(logits, seq_lens):
-        """Run CuTE DSL indexer TopK decode and return output indices."""
-        output_indices = torch.empty(num_gen_tokens, index_topk, dtype=torch.int32, device="cuda")
-        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-            input_values=logits,
-            seq_lens=seq_lens,
-            output_indices=output_indices,
-            top_k=index_topk,
-            next_n=next_n,
-            num_copy_bits=256,
-        )
-        return output_indices
-
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
-        torch.float32,
-        run_fn,
-    )
-
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 8])
 @pytest.mark.parametrize("index_topk", [1023, 2047, 4095, 4096, 8192, 16384])
 @pytest.mark.parametrize("num_tokens", [32768, 131072])
@@ -833,7 +767,6 @@ def test_cute_dsl_topk_decode_high_and_odd_k(batch_size, index_topk, num_tokens)
             top_k=index_topk,
             next_n=1,
             num_copy_bits=256,
-            load_balance=False,
         )
 
     def run_multi_cta(logits, seq_lens):
@@ -913,35 +846,6 @@ def test_filtered_topk_varlen_odd_k(top_k, dtype_name):
         top_k=top_k,
         next_n=3,
         do_benchmark=False,
-    )
-
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 256])
-@pytest.mark.parametrize("next_n", [1, 2, 3])
-@pytest.mark.parametrize("index_topk", [2048])
-@pytest.mark.parametrize("num_tokens", [32768, 65536, 131072, 262144])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_single_pass_multi_cta(
-    batch_size, next_n, index_topk, num_tokens, dtype
-):
-    """Correctness test for CuTE DSL single-pass multi-CTA TopK on Blackwell."""
-    _run_cute_dsl_topk_test(
-        batch_size,
-        next_n,
-        index_topk,
-        num_tokens,
-        dtype,
-        lambda logits,
-        seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTARunner.forward(
-            input_values=logits,
-            seq_lens=seq_lens,
-            top_k=index_topk,
-            next_n=next_n,
-            return_val=False,
-            num_copy_bits=256,
-        )[0],
     )
 
 
@@ -1399,17 +1303,15 @@ def generate_pre_idx_v4(
     return pre_idx
 
 
+# radix filter single-cta test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64, 256])
 @pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("load_balance", [False, True])
-def test_cute_dsl_topk_decode_single_cta(  # noqa: F811
-    batch_size, next_n, index_topk, num_tokens, dtype, load_balance
-):
+def test_cute_dsl_radix_topk_decode_single_cta(batch_size, next_n, index_topk, num_tokens, dtype):
     """Correctness test for CuTE DSL single-CTA TopK decode on Blackwell."""
     _run_cute_dsl_topk_test(
         batch_size,
@@ -1423,21 +1325,21 @@ def test_cute_dsl_topk_decode_single_cta(  # noqa: F811
             top_k=index_topk,
             next_n=next_n,
             num_copy_bits=256,
-            load_balance=load_balance,
         ),
     )
 
 
+# radix filter 2-pass multi-cta test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64])
 @pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [32768, 65536])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("chunk_size_per_cta", [16384])
 @pytest.mark.parametrize("dynamic", [False, True])
-def test_cute_dsl_topk_decode_multi_cta(  # noqa: F811
+def test_cute_dsl_radix_topk_decode_multi_cta(
     batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta, dynamic
 ):
     """Correctness test for CuTE DSL multi-CTA TopK decode on Blackwell."""
@@ -1459,13 +1361,14 @@ def test_cute_dsl_topk_decode_multi_cta(  # noqa: F811
     )
 
 
+# cute dsl top-k public interface test, tuned between single-cta and multi-cta.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64, 128])
 @pytest.mark.parametrize("next_n", [1, 2])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
-def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):  # noqa: F811
+def test_cute_dsl_indexer_radix_topk_decode(batch_size, next_n, index_topk, num_tokens):
     """Correctness test for CuTE DSL indexer TopK decode with in-place output."""
     num_gen_tokens = batch_size * next_n
 
@@ -1492,14 +1395,15 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
     )
 
 
+# radix select multi-cta (atomicAdd gmem for cta communication) test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 16, 256])
 @pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [32768, 131072])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_single_pass_multi_cta(  # noqa: F811
+def test_cute_dsl_radix_topk_decode_single_pass_multi_cta(
     batch_size, next_n, index_topk, num_tokens, dtype
 ):
     """Correctness test for CuTE DSL single-pass multi-CTA TopK on Blackwell."""
@@ -1521,14 +1425,15 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta(  # noqa: F811
     )
 
 
+# radix select multi-cta cluster test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 16, 256])
 @pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [32768, 131072])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
+def test_cute_dsl_radix_topk_decode_single_pass_multi_cta_cluster(
     batch_size, next_n, index_topk, num_tokens, dtype
 ):
     """Correctness test for CuTE DSL single-pass multi-CTA cluster TopK on Blackwell."""
@@ -1555,6 +1460,120 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
         dtype,
         run_fn,
     )
+
+
+# radix filter single-pass multi-cta test.
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("num_tokens", [32768, 131072])
+# fp32 (4 refine rounds -> 5 histogram merges) MUST be covered; the
+# merge-placement path only fully exercises on fp32.
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("cluster_size", [2, 4])
+def test_cute_dsl_radix_filter_topk_decode_single_pass_multi_cta(
+    batch_size, next_n, index_topk, num_tokens, dtype, cluster_size
+):
+    """Correctness test for the radix-FILTER single-pass multi-CTA (cluster)
+    decode top-k. num_tokens is large enough that ceil(seq/chunk) >= 2 for the
+    longer rows, exercising the DSMEM histogram-merge + prefix-scan collection.
+    """
+    _run_cute_dsl_topk_test(
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        dtype,
+        lambda logits,
+        seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.forward(
+            input_values=logits,
+            seq_lens=seq_lens,
+            top_k=index_topk,
+            next_n=next_n,
+            cluster_size=cluster_size,
+            return_val=False,
+            num_copy_bits=256,
+        )[0],
+    )
+
+
+def _rf_sp_check(logits, seq_lens, top_k, next_n, cluster_size):
+    """Value-based correctness check for radix-filter SP multi-CTA on custom
+    inputs (controls the value distribution for edge cases).
+    """
+    idx, _ = cute_dsl_custom_ops.CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.forward(
+        input_values=logits,
+        seq_lens=seq_lens,
+        top_k=top_k,
+        next_n=next_n,
+        cluster_size=cluster_size,
+        return_val=False,
+        num_copy_bits=256,
+    )
+    torch.cuda.synchronize()
+    num_rows = logits.shape[0]
+    for r in range(num_rows):
+        b = r // next_n
+        off = r % next_n
+        eff = int(seq_lens[b].item()) - next_n + off + 1
+        k = min(top_k, eff)
+        row = logits[r, :eff]
+        ref = row.topk(k)[0].sort(descending=True)[0].float()
+        gi = idx[r, :k].long()
+        gi = gi[(gi >= 0) & (gi < eff)]
+        got = row[gi].sort(descending=True)[0].float()
+        assert got.numel() == ref.numel() and torch.allclose(got, ref, atol=1e-3), (
+            f"row {r}: mismatch (got {got.numel()} vs ref {ref.numel()})"
+        )
+
+
+# radix filter single-pass multi-cta group-2-heavy test.
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cluster_size", [2, 4])
+@pytest.mark.parametrize("index_topk", [512, 1024])
+def test_cute_dsl_radix_filter_sp_multi_cta_group2_heavy(dtype, cluster_size, index_topk):
+    """Group-2-heavy: quantized logits create many exact ties at the threshold
+    bin, spread across CTAs -> exercises per-CTA s_last_remain, exclusive_offset_2
+    and the pos<top_k truncation in the DSMEM collection.
+    """
+    torch.manual_seed(7)
+    torch.cuda.manual_seed(7)
+    num_tokens = 16384
+    batch = 4
+    seq_lens = torch.full((batch,), num_tokens, dtype=torch.int32, device="cuda")
+    # Few distinct levels -> heavy ties.
+    logits = ((torch.randn(batch, num_tokens, device="cuda") * 4).round() / 4).to(dtype)
+    _rf_sp_check(logits, seq_lens, index_topk, 1, cluster_size)
+
+
+# radix filter single-pass multi-cta solo and degrade test.
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cluster_size", [2, 4])
+def test_cute_dsl_radix_filter_sp_multi_cta_solo_and_degrade(dtype, cluster_size):
+    """Short rows: needed_ctas==1 (solo fast path, extra CTAs exit -> no cluster
+    sync, no deadlock) and 2<=needed<cluster_size (degrade: some CTAs get an
+    empty chunk but must still join every cluster barrier). Also mixes both in
+    one launch (cluster-uniform branch keeps it deadlock-safe).
+    """
+    torch.manual_seed(11)
+    torch.cuda.manual_seed(11)
+    num_tokens = 8192  # bucketed 8192; chunk = ceil(8192/cluster_size)
+    top_k = 512
+    chunk = -(-num_tokens // cluster_size)
+    # solo: seq just under one chunk; degrade: needs 2..cluster_size chunks; full.
+    solo_len = max(top_k + 1, chunk - 1)
+    degrade_len = min(num_tokens, 2 * chunk + chunk // 2)
+    seq_lens = torch.tensor(
+        [solo_len, degrade_len, num_tokens, solo_len], dtype=torch.int32, device="cuda"
+    )
+    logits = torch.randn(4, num_tokens, device="cuda").to(dtype)
+    _rf_sp_check(logits, seq_lens, top_k, 1, cluster_size)
 
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
@@ -1877,4 +1896,92 @@ def test_indexer_topk_decode_dist_v4_cr4(
     dist_cfg = dict(dist="logistic", mean=-0.47, std=1.46, full_range=12.32)
     _run_indexer_topk_decode_v4_gvr_check(
         batch_size, next_n, index_topk, num_tokens, dtype, dist_cfg, success_ratio
+    )
+
+
+# ============================================================================
+# CuTE DSL Prefill Top-K Tests
+# ============================================================================
+
+
+def _run_cute_dsl_topk_prefill_test(batch_size, index_topk, num_tokens, dtype, row_start_offset=0):
+    """Common test logic for CuTE DSL prefill top-k kernel.
+
+    Tests that the DSL kernel outputs LOCAL indices (0-indexed within each
+    row's valid range) matching torch.topk.
+
+    Args:
+        row_start_offset: Fixed offset added to all row_starts. 0 = standard
+            zero-start case; nonzero exercises the subtract_row_start_on_output path.
+    """
+    torch.manual_seed(77)
+    torch.cuda.manual_seed(77)
+
+    seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
+    num_rows = int(seq_lens.sum().item())
+
+    # Build per-row token counts from seq_lens (same logic as CUDA prefill tests).
+    row_indices = torch.arange(1, seq_lens.max() + 1, dtype=torch.int32, device="cuda")
+    row_lengths = row_indices.expand(seq_lens.size(0), -1)[
+        row_indices.expand(seq_lens.size(0), -1) <= seq_lens.unsqueeze(1)
+    ].contiguous()  # shape: (num_rows,)
+
+    # Apply fixed offset: row_start = offset, row_end = offset + row_length.
+    row_starts = torch.full((num_rows,), row_start_offset, dtype=torch.int32, device="cuda")
+    row_ends = (row_starts + row_lengths).contiguous()
+
+    logits = create_random_logits(row_starts, row_ends, dtype, 77)
+
+    # Run DSL kernel — writes LOCAL indices (0-indexed within [row_start, row_end))
+    # into the caller-provided output_indices buffer.
+    output_indices = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
+        logits, row_starts, row_ends, output_indices, index_topk, 256
+    )
+    torch.cuda.synchronize()
+
+    # Reference: torch.topk returns ABSOLUTE indices; convert to LOCAL.
+    # logits has -inf outside [row_start, row_end), so topk selects valid cols.
+    max_row_end = int(row_ends.max().item())
+    torch_abs = logits.topk(min(index_topk, max_row_end), dim=-1)[1].to(torch.int32)
+    torch_local = torch_abs - row_starts.unsqueeze(1)
+    valid = (torch_abs >= row_starts.unsqueeze(1)) & (torch_abs < row_ends.unsqueeze(1))
+    torch_local = torch_local.masked_fill(~valid, -1)
+
+    # compare_top_k_results expects LOCAL indices from both sides; it converts
+    # to absolute internally (+ row_start) for logit-value comparison.
+    assert compare_top_k_results(
+        logits, output_indices, torch_local, row_starts, row_ends, index_topk
+    ), "CuTE DSL prefill top-k results don't match torch.topk"
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 4, 32])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("num_tokens", [4096, 8192])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cute_dsl_radix_topk_prefill_zero_row_starts(batch_size, index_topk, num_tokens, dtype):
+    """Correctness test for CuTE DSL prefill top-k with row_start=0 (all rows).
+
+    Note: batch_size here is the number of sequences; num_rows = sum(seq_lens)
+    can be much larger. Keep batch_size small to avoid OOM on large num_tokens.
+    """
+    _run_cute_dsl_topk_prefill_test(batch_size, index_topk, num_tokens, dtype, row_start_offset=0)
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 4, 32])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("num_tokens", [4096, 8192])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cute_dsl_radix_topk_prefill_nonzero_row_starts(batch_size, index_topk, num_tokens, dtype):
+    """Correctness test for CuTE DSL prefill top-k with nonzero row_starts.
+
+    Uses a fixed offset = index_topk // 4 to verify that output indices are
+    properly localised (subtract_row_start_on_output path).
+    """
+    _run_cute_dsl_topk_prefill_test(
+        batch_size, index_topk, num_tokens, dtype, row_start_offset=index_topk // 4
     )
