@@ -340,7 +340,7 @@ class TRTLLMGenFusedMoE(MoE):
                                         "0") == "1"
         # Only the trtllm op backend implements fused shared experts
         on_trtllm_backend = isinstance(self.op_backend, TRTLLMOpBackend)
-        if fusion_enabled and on_trtllm_backend and model_config.mapping.dp_size == 1 and self.quant_config.layer_quant_mode.has_fp8_block_scales(
+        if fusion_enabled and on_trtllm_backend and model_config.mapping.dp_size == 1 and self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(
         ):
             # Not all models that use this backend define shared experts (e.g. non-DeepSeek
             # MoEs), so fall back to 0 when the config has no `n_shared_experts`.
@@ -550,7 +550,8 @@ class TRTLLMGenFusedMoE(MoE):
             return
 
         self.quant_method = self._get_quant_method()
-        if self.quant_config.layer_quant_mode.has_fp8_block_scales():
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(
+        ):
             self.quant_method.create_weights(self, self.num_fused_shared_expert)
         else:
             self.quant_method.create_weights(self)
