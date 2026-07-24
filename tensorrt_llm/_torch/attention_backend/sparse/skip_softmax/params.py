@@ -12,16 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Skip-softmax calibration helpers shared by the LLM and VisualGen pipelines.
+"""Skip-softmax parameter and calibration types."""
 
-The kernel consumes a scalar ``threshold_scale_factor`` (combined with
-the sequence length at runtime) to decide which KV blocks to skip.
-This module owns the calibration side that produces that scalar from a
-semantic ``target_sparsity`` via a formula shipped with the checkpoint.
-The helpers are shared by the LLM and VisualGen pipelines.
-"""
-
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Literal, Optional, Union
 
 import numexpr
@@ -31,7 +24,7 @@ from pydantic import Field as PydanticField
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
-from .params import SkipSoftmaxKernelParams, SparseParams
+from ..params import SparseParams, SparseRuntimeParams
 
 _RESERVED_FORMULA_KEYS = frozenset({"formula", "target_sparsity"})
 _SKIP_SOFTMAX_ALGORITHMS = frozenset({"skip_softmax", "softmax_skip"})
@@ -63,8 +56,7 @@ def skip_softmax_config_from_ckpt_sparse_attention_config(
 
     config_groups = ckpt_sparse_attention_config.get("config_groups")
     if isinstance(config_groups, dict):
-        # ModelOpt may emit many sparse-attention groups. The shared
-        # skip-softmax helpers operate on the single skip-softmax group.
+        # ModelOpt may emit multiple sparse-attention groups.
         groups = [
             group
             for group in config_groups.values()
@@ -121,18 +113,9 @@ def skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config(
 
 
 class SkipSoftmaxFormula(StrictBaseModel):
-    """Numexpr formula + coefficients that map target_sparsity to threshold_scale_factor.
+    """Formula mapping target sparsity to a threshold scale factor."""
 
-    ``formula`` references ``target_sparsity`` and one or more named
-    coefficients (e.g. ``"a * exp(b * target_sparsity)"``);
-    ``coefficients`` supplies their values.
-    """
-
-    # Frozen: validated once at construction and never mutated, so the
-    # construction-time formula/coefficient checks always hold.
-    # NOTE: ``model_config`` here is the Pydantic model setting (this
-    # class's own validation behavior) — unrelated to the LLM runtime's
-    # ``ModelConfig`` / model config plumbing.
+    # Keep validated formulas immutable.
     model_config = ConfigDict(frozen=True)
 
     formula: str = PydanticField(
@@ -236,8 +219,7 @@ def skip_softmax_ignore_from_ckpt_sparse_attention_config(
                 ignore.append(pattern)
 
     if isinstance(ckpt_sparse_attention_config, dict):
-        # The input may already be the skip-softmax group rather than the
-        # outer sparse_attention_config.
+        # The input may already be the skip-softmax group.
         _extend(ckpt_sparse_attention_config.get("ignore"))
     config = skip_softmax_config_from_ckpt_sparse_attention_config(ckpt_sparse_attention_config)
     if isinstance(config, dict) and config is not ckpt_sparse_attention_config:
@@ -341,8 +323,7 @@ class SkipSoftmaxScheduler:
             if threshold_config is None:
                 phase_formula = None
             else:
-                # Prefer phase-specific coefficients for LLM, then shared
-                # coefficients, then inline coefficients in the threshold dict.
+                # Prefer phase-specific, shared, then inline coefficients.
                 coefficient_config = threshold_config.get(phase)
                 if coefficient_config is None:
                     coefficient_config = threshold_config.get("coefficients")
@@ -385,11 +366,7 @@ class SkipSoftmaxScheduler:
         *,
         disabled_until_timestep: Optional[float],
     ) -> Optional[int]:
-        """Return the graph-key phase for the timestep disablement boundary.
-
-        VisualGen denoising timesteps descend from 1 to 0, so skip-softmax is
-        disabled while ``timestep >= disabled_until_timestep``.
-        """
+        """Return 1 after descending timesteps cross the cutoff, otherwise 0."""
         if disabled_until_timestep is None:
             return None
         timestep_value = cls._as_float(timestep)
@@ -397,8 +374,15 @@ class SkipSoftmaxScheduler:
             return None
         return int(timestep_value < disabled_until_timestep)
 
-    def get_kernel_params(self, *, timestep: Any = None):
-        """Return kernel params, applying timestep-based disablement when provided."""
+    def get_runtime_params(
+        self,
+        *,
+        runtime_params: Optional[SparseRuntimeParams] = None,
+        timestep: Any = None,
+    ) -> SparseRuntimeParams:
+        """Return runtime parameters with skip-softmax thresholds."""
+        if runtime_params is None:
+            runtime_params = SparseRuntimeParams()
         if (
             self.get_graph_phase_for_timestep(
                 timestep,
@@ -406,8 +390,13 @@ class SkipSoftmaxScheduler:
             )
             == 0
         ):
-            return SkipSoftmaxKernelParams()
-        return SkipSoftmaxKernelParams(
+            return replace(
+                runtime_params,
+                threshold_scale_factor_prefill=0.0,
+                threshold_scale_factor_decode=0.0,
+            )
+        return replace(
+            runtime_params,
             threshold_scale_factor_prefill=self.threshold_scale_factor_prefill,
             threshold_scale_factor_decode=self.threshold_scale_factor_decode,
         )

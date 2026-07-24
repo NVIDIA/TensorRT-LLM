@@ -46,6 +46,7 @@ from ..attention_backend.sparse.minimax_m3 import (
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
+from ..attention_backend.sparse.params import SparseBackendForwardArgs
 from ..distributed import AllReduce, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -1132,7 +1133,10 @@ class MiniMaxM3Attention(Attention):
                 assert idx_q is not None and idx_k is not None
                 # Publish the selected blocks so the FMHA runs the sparse path.
                 kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
-                forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
+                forward_args = AttentionForwardArgs(
+                    output=output,
+                    sparse_backend_args=SparseBackendForwardArgs(topk_indices=kv_block_indexes),
+                )
             else:
                 assert idx_q is None and idx_k is None
                 # No top-k selection means the FMHA attends the full page table.

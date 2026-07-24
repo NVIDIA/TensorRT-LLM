@@ -52,7 +52,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
+from ..attention_backend.sparse.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
 from ..distributed import (
     AllReduce,
     AllReduceFusionOp,
@@ -1354,9 +1354,6 @@ class DeepseekV4Attention(MLA):
             mapping_with_cp=mapping_with_cp,
             reduce_output=reduce_output,
         )
-
-        self.indexer = getattr(self.mqa, "indexer", None)
-        self.compressor = getattr(self.mqa, "compressor", None)
 
 
 class DeepseekV4Gate(nn.Module):

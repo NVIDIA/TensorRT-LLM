@@ -17,6 +17,7 @@ from ..attention_backend import (AttentionForwardArgs, AttentionMetadata,
 from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
+from ..attention_backend.sparse.hooks import get_sparse_attn_hooks
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
@@ -602,6 +603,8 @@ class Attention(nn.Module):
         sparse_params = (sparse_attn_cfg.to_sparse_params(
             pretrained_config=config.pretrained_config,
             layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
+        self.sparse_params = sparse_params
+        self.sparse_attn_hooks = get_sparse_attn_hooks(self)
 
         attn_cls = get_attention_backend(self.attn_backend,
                                          sparse_params=sparse_params)
@@ -631,10 +634,21 @@ class Attention(nn.Module):
             logger.info_once(f"Using sparse attention: {algo} {cfg_dump}",
                              key="sparse_attention_config")
 
-            if config.sparse_attention_config.algorithm == "rocket":
-                logger.warning_once("disable rope_fusion for RocketKV.",
-                                    key="disable_rope_fusion_for_rocketkv")
-                self.rope_fusion = False
+        if initialize_sparse_attn := self.sparse_attn_hooks.initialize_sparse_attn:
+            initialize_sparse_attn(
+                self,
+                config=config,
+                mapping=mapping,
+                mapping_o=mapping_o,
+                rms_norm_eps=getattr(config.pretrained_config, "rms_norm_eps",
+                                     1e-6),
+                quant_config=self.quant_config,
+                q_scaling=self.q_scaling,
+                bias=bias,
+                dtype=dtype,
+                reduce_output=reduce_output,
+                aux_stream=None,
+            )
 
         if self.rope_fusion and not attn_cls.support_fused_rope():
             logger.warning_once(
@@ -805,6 +819,7 @@ class Attention(nn.Module):
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
+        **kwargs,
     ):
         num_tokens = attn_metadata.num_tokens
 
@@ -844,6 +859,7 @@ class Attention(nn.Module):
                     relative_attention_bias=relative_attention_bias,
                     relative_attention_max_distance=
                     relative_attention_max_distance,
+                    **kwargs,
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
@@ -893,6 +909,7 @@ class Attention(nn.Module):
                 attention_sinks=attention_sinks,
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
+                **kwargs,
             ))
         if isinstance(attn_output, tuple):
             assert len(
@@ -915,7 +932,26 @@ class Attention(nn.Module):
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
+        **kwargs,
     ):
+        if forward_sparse_attn := self.sparse_attn_hooks.forward_sparse_attn:
+            return forward_sparse_attn(
+                self,
+                q,
+                k,
+                v,
+                attn_metadata,
+                attention_mask,
+                attention_window_size,
+                attention_mask_data,
+                mrope_config,
+                attention_sinks,
+                relative_attention_bias,
+                relative_attention_max_distance,
+                has_lora,
+                **kwargs,
+            )
+
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
         if mrope_config is not None:
@@ -930,7 +966,7 @@ class Attention(nn.Module):
                                  and (self.attn_backend == "TRTLLM"
                                       or self.attn_backend == "FLASHINFER")
                                  and is_torch_compiling()
-                                 and not self.is_marlin_enabled)
+                                 and not self.is_marlin_enabled and not kwargs)
 
         if use_custom_inplace_op:
             outputs = create_attn_outputs(q, attention_mask, self.layer_idx_str)
@@ -968,6 +1004,7 @@ class Attention(nn.Module):
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
                 has_lora=has_lora,
+                **kwargs,
             )
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
@@ -1058,10 +1095,20 @@ class Attention(nn.Module):
             relative_attention_bias=relative_attention_bias,
             relative_attention_max_distance=relative_attention_max_distance,
             has_lora=bool(lora_params),
+            **kwargs,
         )
 
         if self.attn_output_gate:
             attn_output = self.apply_output_gate(attn_output, gate)
+
+        if project_sparse_attn_output := self.sparse_attn_hooks.project_sparse_attn_output:
+            return project_sparse_attn_output(
+                self,
+                attn_output,
+                attn_metadata,
+                all_reduce_params,
+                lora_params,
+            )
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,

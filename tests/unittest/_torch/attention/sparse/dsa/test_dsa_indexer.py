@@ -34,9 +34,16 @@ import torch
 from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    PositionalEmbeddingParams,
+    RopeParams,
+)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+    DSABackendForwardArgs,
     DSACacheManager,
+    DSATrtllmAttention,
     DSAtrtllmAttentionMetadata,
     Indexer,
     _effective_compress_ratio_divisor,
@@ -89,7 +96,7 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     metadata.create_buffers_for_indexer = Mock()
 
     with patch(
-        "tensorrt_llm._torch.attention_backend.sparse.dsa.TrtllmAttentionMetadata.__post_init__"
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
     ):
         DSAtrtllmAttentionMetadata.__post_init__(metadata)
 
@@ -97,6 +104,107 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     assert metadata.compress_ratios == [1, 4, 128]
     assert metadata._indexer_compress_ratio == 4
     assert metadata._tokens_per_block == 64
+
+
+def test_shared_topk_lifecycle():
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_n_heads=1,
+        index_head_dim=8,
+        index_topk=3,
+        skip_indexer_for_short_seqs=False,
+    )
+    pretrained_config = SimpleNamespace(
+        num_hidden_layers=2,
+        index_topk_pattern=["F", "S"],
+    )
+    sparse_metadata_params = sparse_config.to_sparse_metadata_params(
+        pretrained_config=pretrained_config
+    )
+    assert sparse_metadata_params.has_shared_indexer_layers
+
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.sparse_metadata_params = sparse_metadata_params
+    metadata.max_num_sequences = 2
+    metadata.max_num_tokens = 4
+    metadata.num_sparse_topk = 3
+    metadata.num_sms = 1
+    metadata.cuda_graph_buffers = None
+    metadata.kv_cache_manager = SimpleNamespace(max_blocks_per_seq=2)
+    metadata.enable_context_mla_with_cached_kv = False
+    metadata.enable_indexer_skip = False
+    metadata.get_empty = Mock(
+        side_effect=lambda _, shape, **kwargs: torch.empty(tuple(shape), dtype=kwargs["dtype"])
+    )
+    metadata._create_kv_lens_2d_buffer = Mock()
+    metadata._create_radix_aux_buffers = Mock()
+    metadata.create_expanded_buffers = Mock()
+
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.prefer_pinned",
+        return_value=False,
+    ):
+        metadata.create_buffers_for_indexer()
+
+    buffer = metadata.shared_topk_indices
+    assert buffer.shape == (4, 3)
+
+    context_topk = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.int32)
+    generation_topk = torch.tensor([[2, 1, 0], [3, 2, 1]], dtype=torch.int32)
+    full_backend = SimpleNamespace(
+        indexer=SimpleNamespace(
+            forward_from_projected=Mock(side_effect=[context_topk, generation_topk])
+        ),
+        get_local_layer_idx=Mock(return_value=0),
+    )
+    shared_backend = SimpleNamespace(
+        indexer=None,
+        get_local_layer_idx=Mock(return_value=1),
+    )
+    metadata._num_ctx_tokens = context_topk.shape[0]
+    metadata._num_tokens = context_topk.shape[0] + generation_topk.shape[0]
+    backend_args = DSABackendForwardArgs(indexer_intermediates=[])
+
+    def _predict(backend, input_type):
+        return DSATrtllmAttention.sparse_attn_predict(
+            backend,
+            torch.empty((2, 1)),
+            None,
+            metadata,
+            AttentionForwardArgs(
+                attention_input_type=input_type,
+                sparse_backend_args=backend_args,
+            ),
+        )[0]
+
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.backend."
+        "transform_local_topk_and_prepare_pool_view",
+        side_effect=lambda topk, *_: (topk.clone(), None),
+    ):
+        _predict(full_backend, AttentionInputType.context_only)
+        _predict(full_backend, AttentionInputType.generation_only)
+        torch.testing.assert_close(
+            metadata.shared_topk_indices,
+            torch.cat([context_topk, generation_topk]),
+        )
+        torch.testing.assert_close(
+            _predict(shared_backend, AttentionInputType.context_only),
+            context_topk,
+        )
+        torch.testing.assert_close(
+            _predict(shared_backend, AttentionInputType.generation_only),
+            generation_topk,
+        )
+
+    metadata._invalidate_pool_view_cache = Mock()
+    metadata.kv_cache_manager = None
+    metadata._num_tokens = 0
+    metadata._num_generations = 0
+    metadata.kv_lens_cuda = torch.empty(0, dtype=torch.int32)
+    metadata.prepare_dense_topk_indices = Mock()
+    metadata.on_update_kv_lens()
+
+    assert metadata.shared_topk_indices is buffer
 
 
 def test_indexer_post_load_weights_caches_fused_weight():
@@ -3314,7 +3422,6 @@ def test_topk_indices_buffer_cuda_graph():
             k_fp8=dummy,
             k_scale=dummy,
             weights=dummy,
-            update_k_cache=False,
         )
 
     out1 = _run_indexer()

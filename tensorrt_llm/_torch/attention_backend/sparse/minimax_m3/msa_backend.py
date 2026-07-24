@@ -8,7 +8,7 @@
   * The main sparse GQA runs through the registered MsaSparseGqaFmha.
   * The indexer calls fmha_sm100 directly to produce the per-query selected
     block indices, which the model layer threads through
-    forward_args.topk_indices.
+    forward_args.sparse_backend_args.
   * MiniMaxM3MsaSparseAttentionMetadata subclasses TrtllmAttentionMetadata and
     stores its per-forward MSA tensors in CUDA-graph-stable buffers.
     The buffers are allocated once in __post_init__ via
@@ -720,7 +720,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         """Write the index-K cache and return the selected block indices.
 
         The model layer runs this before forward and threads the result through
-        forward_args.topk_indices. Returns [total_q, num_kv_heads, topk].
+        forward_args.sparse_backend_args. Returns [total_q, num_kv_heads, topk].
         Decode uses the prebuilt graph-safe proxy plan; prefill plans
         eagerly.
         """
@@ -768,10 +768,11 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         metadata,
         forward_args: "AttentionForwardArgs",
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # The model layer runs run_indexer and passes the selected block
-        # indices through forward_args.topk_indices. Publish them as the
-        # sparse attention indices MsaSparseGqaFmha reads.
-        return forward_args.topk_indices, None
+        # The model layer runs run_indexer and passes the selected blocks
+        # through the sparse backend payload.
+        sparse_backend_args = forward_args.sparse_backend_args
+        topk_indices = sparse_backend_args.topk_indices if sparse_backend_args is not None else None
+        return topk_indices, None
 
     def sparse_kv_predict(
         self,

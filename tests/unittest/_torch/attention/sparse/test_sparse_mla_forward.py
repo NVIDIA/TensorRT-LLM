@@ -28,10 +28,16 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionBackend, PositionalEmbeddingParams, RopeParams)
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
-    DeepseekV4CacheManager, make_deepseek_v4_sparse_metadata_params)
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+    DeepseekV4CacheManager
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import \
+    forward_context_sparse_attn as forward_context_deepseek_v4_mla
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import \
+    forward_generation_sparse_attn as forward_generation_deepseek_v4_mla
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (HAS_FAST_HADAMARD,
                                                               DSACacheManager)
+from tensorrt_llm._torch.attention_backend.sparse.dsa.module import \
+    _forward_dsa_attn
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -1297,9 +1303,8 @@ def populate_gen_dsa_kv_cache(mla: MLA, AttentionCls: AttentionBackend,
                 offset:offset + cached_len,
                 pretrained_config.kv_lora_rank:].clone()
             offset += cached_len
-            print(
-                f"    - Allocated+populated cache for gen request {req_idx}: {cached_len} cached + 1 new = {cached_len+1} tokens"
-            )
+            print(f"    - Allocated+populated cache for gen request {req_idx}: "
+                  f"{cached_len} cached + 1 new = {cached_len + 1} tokens")
 
     kv_cache_for_ref = {}
     kv_cache_for_ref["compressed_kv"] = all_cached_compressed_kv
@@ -1494,6 +1499,7 @@ def populate_gen_deepseek_v4_kv_cache(
     return kv_cache_for_ref
 
 
+@torch.inference_mode()
 def mla_forward_impl_with_dsa_wo_linear(mla, attn_metadata, q, qr,
                                         compressed_kv, k_pe, latent_cache,
                                         hidden_states, position_ids, dtype,
@@ -1509,44 +1515,25 @@ def mla_forward_impl_with_dsa_wo_linear(mla, attn_metadata, q, qr,
                          dtype=dtype,
                          device=device)
 
-    topk_indices_local = mla.mqa.indexer(
-        qr,
-        hidden_states,
-        attn_metadata,
+    indexer_intermediates = list(
+        mla.mqa.indexer.pre_indexer_proj(qr, hidden_states, position_ids))
+    _forward_dsa_attn(
+        mla,
+        q,
+        compressed_kv,
+        k_pe,
+        latent_cache,
+        indexer_intermediates,
         position_ids,
+        attn_metadata,
+        output,
     )
-
-    # Validate indexer output against expected causal indices (since seq_len < topk=2048)
     if num_contexts > 0:
-        # Transform context indices from local to global
-        ctx_topk_local = topk_indices_local[:num_ctx_tokens]
-
-        mla.forward_context_sparse_mla(
-            q=q[:num_ctx_tokens],
-            compressed_kv=compressed_kv[:num_ctx_tokens],
-            k_pe=k_pe[:num_ctx_tokens],
-            attn_metadata=attn_metadata,
-            output=output[:num_ctx_tokens],
-            latent_cache=latent_cache[:num_ctx_tokens],
-            topk_indices=ctx_topk_local,  # Use global indices
-        )
         print(
             f"  ✓ Context forward: {num_ctx_tokens} tokens from {num_contexts} requests"
         )
 
     if num_generations > 0:
-        # Transform generation indices from local to global
-        gen_topk_local = topk_indices_local[num_ctx_tokens:num_ctx_tokens +
-                                            num_gen_tokens]
-        mla.forward_generation_sparse_mla(
-            q=q[num_ctx_tokens:],
-            compressed_kv=compressed_kv[num_ctx_tokens:],
-            k_pe=k_pe[num_ctx_tokens:],
-            attn_metadata=attn_metadata,
-            output=output[num_ctx_tokens:],
-            latent_cache=latent_cache[num_ctx_tokens:],
-            topk_indices=gen_topk_local,  # Use global indices
-        )
         print(
             f"  ✓ Generation forward: {num_gen_tokens} tokens from {num_generations} requests"
         )
@@ -1615,7 +1602,8 @@ def mla_forward_impl_with_deepseek_v4_wo_linear(mla,
     if num_contexts > 0:
         ctx_topk_local = topk_indices_for_forward[:num_ctx_tokens]
 
-        mla.forward_context_sparse_mla(
+        forward_context_deepseek_v4_mla(
+            mla,
             q=q[:num_ctx_tokens],
             compressed_kv=compressed_kv[:num_ctx_tokens],
             k_pe=k_pe[:num_ctx_tokens],
@@ -1633,7 +1621,8 @@ def mla_forward_impl_with_deepseek_v4_wo_linear(mla,
     if num_generations > 0:
         gen_topk_local = topk_indices_for_forward[num_ctx_tokens:num_tokens]
 
-        mla.forward_generation_sparse_mla(
+        forward_generation_deepseek_v4_mla(
+            mla,
             q=q[num_ctx_tokens:],
             compressed_kv=compressed_kv[num_ctx_tokens:],
             k_pe=k_pe[num_ctx_tokens:],
@@ -1661,8 +1650,8 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                                     sparse_attn_algo: str):
     """Test sparse MLA attention for pure prefill, pure decode, and mixed batches."""
     print(
-        f"\n{'='*80}\nTesting: {batch_name}, sparse_attn_algo: {sparse_attn_algo}, kv_cache_dtype: {kv_cache_dtype}\n{'='*80}"
-    )
+        f"\n{'=' * 80}\nTesting: {batch_name}, sparse_attn_algo: {sparse_attn_algo}, "
+        f"kv_cache_dtype: {kv_cache_dtype}\n{'=' * 80}")
     if sparse_attn_algo == "deepseek_v4" and get_sm_version() < 100:
         pytest.skip(
             "DeepSeek-V4 sparse MLA unittest is not supported on pre-Blackwell architectures"
@@ -1914,7 +1903,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     if num_layers > 1:
         print(f"  Testing layer {layer_idx} of {num_layers} (multi-layer pool)")
     else:
-        print(f"  Testing single layer (baseline)")
+        print("  Testing single layer (baseline)")
 
     # For deepseek_v4: derive freqs_cis from the production RotaryEmbedding to
     # guarantee matching frequencies (the reference precompute_freqs_cis may
@@ -2007,7 +1996,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
 
     # Allocate and pre-populate KV cache in batch order [context...][generation...]
 
-    print(f"  Allocating and pre-populating cache...")
+    print("  Allocating and pre-populating cache...")
 
     # Allocate context requests first
     for req_idx in ctx_indices:
@@ -2028,9 +2017,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
 
     # Allocate and pre-populate generation requests (batched)
     if gen_indices:
-        gen_cached_lens = [
-            cached_lens[i] for i in gen_indices if cached_lens[i] > 0
-        ]
         gen_with_cache = [i for i in gen_indices if cached_lens[i] > 0]
         # Allocate all generation caches
         for req_idx in gen_with_cache:
@@ -2059,7 +2045,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
         raise ValueError(
             f"Invalid sparse attention algorithm: {sparse_attn_algo}")
 
-    print(f"  ✓ KV cache allocated and pre-populated")
+    print("  ✓ KV cache allocated and pre-populated")
 
     # Generate inputs directly in batch order [context...][generation...]
     batch_order = ctx_indices + gen_indices
@@ -2099,11 +2085,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                          num_heads * v_head_dim,
                          dtype=dtype,
                          device=device)
-    if sparse_config.algorithm == "deepseek_v4":
-        sparse_metadata_params = make_deepseek_v4_sparse_metadata_params(
-            sparse_config)
-    else:
-        sparse_metadata_params = sparse_config.to_sparse_metadata_params()
+    sparse_metadata_params = sparse_config.to_sparse_metadata_params()
 
     attn_metadata = AttentionCls.Metadata(
         seq_lens=torch.tensor(batch_query_lens, dtype=torch.int),
@@ -2349,20 +2331,21 @@ _FUSED_Q_FP8_PREFILL_BATCHES = [
 def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name):
     """Regression test for the sparse-MLA context-branch fused FP8 Q-quant
     wiring.  The wo-linear helper bypasses `_q_branch`, so we monkey-patch
-    `forward_context_sparse_mla` to manually populate the fused buffers
-    (mimicking `_deepseek_v4_q_b_layernorm_fused_fp8`) and replace q with
+    `forward_context_sparse_attn` to manually populate the fused buffers
+    (mimicking `_q_b_layernorm_fused_fp8`) and replace q with
     NaN.  Without the C++ wiring fix the legacy standalone quantize runs
     over the NaN placeholder and the output diverges from the reference.
     """
     monkeypatch.setenv("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0")
 
-    from tensorrt_llm._torch.modules.mla import MLA
-    original_fwd = MLA.forward_context_sparse_mla
+    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+        module as deepseek_v4_module
+
+    original_fwd = deepseek_v4_module.forward_context_sparse_attn
 
     def patched_fwd(self, q, compressed_kv, k_pe, attn_metadata, output,
                     **kwargs):
-        if (self.is_deepseek_v4 and self.qk_head_dim == 512
-                and self.kv_lora_rank == 448
+        if (self.qk_head_dim == 512 and self.kv_lora_rank == 448
                 and bool(getattr(self.mqa, "has_fp8_kv_cache", False))):
             num_tokens = q.shape[0]
             num_heads = self.num_heads_tp
@@ -2385,7 +2368,8 @@ def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name):
         return original_fwd(self, q, compressed_kv, k_pe, attn_metadata, output,
                             **kwargs)
 
-    monkeypatch.setattr(MLA, 'forward_context_sparse_mla', patched_fwd)
+    monkeypatch.setattr(deepseek_v4_module, 'forward_context_sparse_attn',
+                        patched_fwd)
     test_forward_sparse_mla_unified(batch_name=batch_name,
                                     kv_cache_dtype="fp8",
                                     sparse_attn_algo="deepseek_v4")

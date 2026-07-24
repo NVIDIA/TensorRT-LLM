@@ -1064,6 +1064,11 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                 return getattr(pretrained_config, name, default)
             return default
 
+        num_layers = getattr(pretrained_config, "num_hidden_layers", None)
+        has_shared_indexer_layers = (num_layers is not None and any(
+            not self._is_full_indexer_layer(pretrained_config, layer_idx)
+            for layer_idx in range(num_layers)))
+
         return DSAMetadataParams(
             indexer_max_chunk_size=self.indexer_max_chunk_size or 32768,
             max_sparse_topk=_value("index_topk"),
@@ -1073,6 +1078,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
+            has_shared_indexer_layers=has_shared_indexer_layers,
         )
 
 

@@ -21,6 +21,7 @@ import math
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import List, Optional
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -33,7 +34,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+from tensorrt_llm._torch.attention_backend.sparse.dsa import DSABackendForwardArgs, DSACacheManager
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -867,6 +868,9 @@ def _run_test_for_backend(
                     topk_indices = _build_sparse_topk_indices_context(
                         context_sequence_lengths, SPARSE_TOPK, device
                     )
+                    ctx_layers[layer_idx].indexer.forward_from_projected = Mock(
+                        return_value=topk_indices
+                    )
                     result = ctx_layers[layer_idx].forward(
                         fused_q.clone(),
                         None,
@@ -875,7 +879,7 @@ def _run_test_for_backend(
                         attention_input_type=AttentionInputType.context_only,
                         latent_cache=latent_cache,
                         q_pe=q_pe,
-                        topk_indices=topk_indices,
+                        sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=[]),
                     )
                     k_pe_ref = _rotate_k_pe_for_ctx(k_pe, rope_cos_sin, context_sequence_lengths)
                     latent_cache_ref = torch.cat([compressed_kv, k_pe_ref], dim=-1)
@@ -958,6 +962,9 @@ def _run_test_for_backend(
                     topk_indices = _build_sparse_topk_indices_generation(
                         cached_lens, generation_seq_len_q, SPARSE_TOPK, device
                     )
+                    gen_layers[layer_idx].indexer.forward_from_projected = Mock(
+                        return_value=topk_indices
+                    )
 
                     result = gen_layers[layer_idx].forward(
                         fused_q,
@@ -973,7 +980,7 @@ def _run_test_for_backend(
                         mla_bmm1_scale=mla_bmm1_scale,
                         mla_bmm2_scale=mla_bmm2_scale,
                         quant_q_buffer=quant_q_buffer,
-                        topk_indices=topk_indices,
+                        sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=[]),
                     )
                     ref_result, latent_cache_ref = calculate_ref_result_gen(
                         fused_q,

@@ -13,22 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .backend import DeepseekV4TrtllmAttention
 from .cache_manager import DeepseekV4CacheManager
-from .deepseek_v4 import (
-    DeepseekV4AttentionType,
-    DeepSeekV4MetadataParams,
-    DeepSeekV4Params,
-    DeepseekV4TrtllmAttention,
-    make_deepseek_v4_sparse_metadata_params,
-    make_deepseek_v4_sparse_params,
-)
+from .indexer import DeepseekV4Indexer
+from .metadata import DeepseekV4TrtllmAttentionMetadata
+from .params import DeepseekV4AttentionType, DeepSeekV4MetadataParams, DeepSeekV4Params
 
 __all__ = [
     "DeepSeekV4MetadataParams",
     "DeepSeekV4Params",
     "DeepseekV4AttentionType",
     "DeepseekV4CacheManager",
+    "DeepseekV4Indexer",
     "DeepseekV4TrtllmAttention",
-    "make_deepseek_v4_sparse_metadata_params",
-    "make_deepseek_v4_sparse_params",
+    "DeepseekV4TrtllmAttentionMetadata",
 ]
