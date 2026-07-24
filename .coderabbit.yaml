@@ -49,6 +49,20 @@ reviews:
     "sufficient" only when the relevant coverage passes; otherwise "insufficient"
     with the failing or missing evidence identified.
     When CBTS artifacts are unavailable, use "needs follow-up".
+    If no test files are touched, write "No test changes."
+
+    For test-list-only changes (only tests/integration/test_lists/ files):
+    - Report which test-db/ or qa/ files were modified and what entries were added or removed.
+    - When CBTS artifacts are available: verdict is "sufficient" if coverage passes,
+      "insufficient" with the failing or missing evidence identified otherwise.
+    - When CBTS artifacts are unavailable: verdict is "needs follow-up".
+
+    For test-code changes (tests/** excluding tests/integration/test_lists/):
+    - List test functions added, modified, or removed.
+    - State whether each is covered in test-db/ (CI) or qa/ (manual QA).
+    - Apply the same CBTS-aware verdict logic above.
+
+    Keep feedback actionable: reference concrete list file names when suggesting additions.
   walkthrough_instructions: |
     For each changed file, include a concise QA perspective:
     - For test-code files (tests/** excluding tests/integration/test_lists/**): note what
@@ -70,6 +84,7 @@ reviews:
     drafts: false
     base_branches: ["main", "release/.+"]
   path_instructions:
+<<<<<<< HEAD
     - path: "tests/**"
       instructions: |
         Act as a QA engineer reviewing test changes and coverage for TensorRT-LLM.
@@ -91,6 +106,8 @@ reviews:
            tests/integration/test_lists/ (test-db/ for CI, qa/ for manual QA).
         3. A coverage verdict: sufficient, insufficient, or needs follow-up.
         Keep feedback actionable: reference concrete list file names when suggesting additions.
+=======
+>>>>>>> 625037290e (update coderabbit prompt)
     - path: "tests/integration/test_lists/qa/**"
       instructions: |
         Files here are manually-triggered QA perf/regression lists, maintained
