@@ -81,9 +81,10 @@ from ..attention_backend import AttentionMetadata, TrtllmAttentionMetadata
 from ..distributed import AllReduce
 from ..metadata import KVCacheParams
 from ..model_config import ModelConfig
-from ..modules.kimi_k3_moe._mlp import KimiK3RMSNorm, SituAndMul
+from ..modules.kimi_k3_moe._mlp import KimiK3MLP, KimiK3RMSNorm, SituAndMul
 from ..modules.kimi_k3_moe.kimi_k3_moe_block import KimiK3RoutedExpertBank
 from ..modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
+from ..modules.rms_norm import RMSNorm
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
 
@@ -192,34 +193,22 @@ def _apply_attn_res(prefix_sum: torch.Tensor, block_residual: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# Dense / shared-expert MLP (HF layout: separate gate/up/down).
+# Dense / shared-expert MLP: fused [gate | up] layout (``KimiK3MLP``).
+#
+# The HF checkpoint stores separate ``gate_proj`` / ``up_proj`` tensors;
+# ``load_weights`` row-concatenates them into ``gate_up_proj`` (see
+# ``_gate_up_ckpt_keys``), replacing two GEMMs + torch.cat with one GEMM.
 # ---------------------------------------------------------------------------
 
 
-class KimiMLP(nn.Module):
-    """HF ``KimiMLP`` with the ``situ`` activation, identity weight names."""
+_GATE_UP_FUSED_SUFFIX = ".gate_up_proj.weight"
 
-    def __init__(self, hidden_size: int, intermediate_size: int,
-                 situ_beta: float, situ_linear_beta: Optional[float],
-                 dtype: torch.dtype):
-        super().__init__()
-        self.gate_proj = nn.Linear(hidden_size,
-                                   intermediate_size,
-                                   bias=False,
-                                   dtype=dtype)
-        self.up_proj = nn.Linear(hidden_size,
-                                 intermediate_size,
-                                 bias=False,
-                                 dtype=dtype)
-        self.down_proj = nn.Linear(intermediate_size,
-                                   hidden_size,
-                                   bias=False,
-                                   dtype=dtype)
-        self.act_fn = SituAndMul(beta=situ_beta, linear_beta=situ_linear_beta)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
-        return self.down_proj(self.act_fn(gate_up))
+def _gate_up_ckpt_keys(fused_key: str) -> Tuple[str, str]:
+    """Checkpoint ``(gate_proj, up_proj)`` keys whose row-concat loads the
+    fused ``gate_up_proj`` parameter named by ``fused_key``."""
+    return (fused_key.replace(_GATE_UP_FUSED_SUFFIX, ".gate_proj.weight"),
+            fused_key.replace(_GATE_UP_FUSED_SUFFIX, ".up_proj.weight"))
 
 
 # ---------------------------------------------------------------------------
@@ -278,12 +267,14 @@ class KimiK3MoERuntime(nn.Module):
                                   linear_beta=situ_linear_beta),
         )
 
-        self.shared_experts = KimiMLP(
-            cfg.hidden_size,
-            cfg.moe_intermediate_size * cfg.num_shared_experts,
-            situ_beta,
-            situ_linear_beta,
-            dtype,
+        self.shared_experts = KimiK3MLP(
+            hidden_size=cfg.hidden_size,
+            intermediate_size=cfg.moe_intermediate_size *
+            cfg.num_shared_experts,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            use_fused_activation=True,
+            dtype=dtype,
         )
         self.routed_expert_down_proj = nn.Linear(cfg.hidden_size,
                                                  self.moe_hidden_size,
@@ -295,9 +286,11 @@ class KimiK3MoERuntime(nn.Module):
                                                dtype=dtype)
         assert getattr(cfg, "latent_moe_use_norm", False), \
             "Kimi K3 runtime expects latent_moe_use_norm=True"
-        self.routed_expert_norm = KimiK3RMSNorm(self.moe_hidden_size,
-                                                eps=cfg.rms_norm_eps,
-                                                dtype=dtype)
+        # Stock fused RMSNorm (flashinfer kernel; the no-flashinfer
+        # fallback is the same fp32-variance eager math as KimiK3RMSNorm).
+        self.routed_expert_norm = RMSNorm(hidden_size=self.moe_hidden_size,
+                                          eps=cfg.rms_norm_eps,
+                                          dtype=dtype)
 
         import os as _os
         self.moe = None
@@ -1178,17 +1171,27 @@ class KimiLinearDecoderLayer(nn.Module):
             situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
             situ_linear_beta = getattr(cfg, "activation_situ_linear_beta",
                                        None)
-            self.mlp = KimiMLP(cfg.hidden_size, cfg.intermediate_size,
-                               situ_beta, situ_linear_beta, dtype)
+            self.mlp = KimiK3MLP(hidden_size=cfg.hidden_size,
+                                 intermediate_size=cfg.intermediate_size,
+                                 situ_beta=situ_beta,
+                                 situ_linear_beta=situ_linear_beta,
+                                 use_fused_activation=True,
+                                 dtype=dtype)
 
-        self.input_layernorm = KimiK3RMSNorm(cfg.hidden_size,
-                                             eps=cfg.rms_norm_eps,
-                                             dtype=dtype)
-        self.post_attention_layernorm = KimiK3RMSNorm(cfg.hidden_size,
-                                                      eps=cfg.rms_norm_eps,
-                                                      dtype=dtype)
+        # Stock fused RMSNorm for the plain (whole-tensor) norms; numerics
+        # are drop-in for KimiK3RMSNorm (fp32 variance, weight applied
+        # after downcast, use_gemma=False).
+        self.input_layernorm = RMSNorm(hidden_size=cfg.hidden_size,
+                                       eps=cfg.rms_norm_eps,
+                                       dtype=dtype)
+        self.post_attention_layernorm = RMSNorm(hidden_size=cfg.hidden_size,
+                                                eps=cfg.rms_norm_eps,
+                                                dtype=dtype)
 
-        # Attention residual scheme (always on for K3).
+        # Attention residual scheme (always on for K3). The res norms stay
+        # KimiK3RMSNorm: they are consumed field-wise (.weight/.eps) by
+        # _apply_attn_res and the fused attn_res op, never called as
+        # modules.
         self.attn_res_block_size = cfg.attn_res_block_size
         assert self.attn_res_block_size is not None, \
             "Kimi K3 runtime expects attn_res_block_size to be set"
@@ -1278,10 +1281,12 @@ class KimiLinearModel(DecoderModel):
             KimiLinearDecoderLayer(model_config, cfg, layer_idx)
             for layer_idx in range(cfg.num_hidden_layers)
         ])
-        self.norm = KimiK3RMSNorm(cfg.hidden_size,
-                                  eps=cfg.rms_norm_eps,
-                                  dtype=dtype)
+        self.norm = RMSNorm(hidden_size=cfg.hidden_size,
+                            eps=cfg.rms_norm_eps,
+                            dtype=dtype)
 
+        # KimiK3RMSNorm (not RMSNorm): consumed field-wise (.weight/.eps)
+        # by _apply_attn_res and the fused attn_res op.
         self.output_attn_res_norm = KimiK3RMSNorm(cfg.hidden_size,
                                                   eps=cfg.rms_norm_eps,
                                                   dtype=dtype)
@@ -1390,7 +1395,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
     def checkpoint_name_plan(self, prefix: str):
         """Return ``(name_map, expected_keys, bank_jobs)``.
 
-        ``name_map`` maps every model parameter name to its checkpoint key;
+        ``name_map`` maps every model parameter name to its checkpoint key
+        (for fused ``gate_up_proj`` parameters the mapped key is virtual;
+        the two real per-half keys come from ``_gate_up_ckpt_keys``);
         ``expected_keys`` additionally covers the rank-local per-expert MXFP4
         tensors; ``bank_jobs`` lists ``(layer_idx, moe_module, key_base)``
         for the expert-bank copies. Exposed separately so the weight-name
@@ -1408,7 +1415,12 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
                 ckpt_key = prefix + name.replace(".self_attn.mixer.",
                                                  ".self_attn.")
             name_map[name] = ckpt_key
-            expected_keys.add(ckpt_key)
+            if name.endswith(_GATE_UP_FUSED_SUFFIX):
+                # Fused [gate | up] MLP layout (dense mlp / shared_experts):
+                # the checkpoint stores two separate tensors.
+                expected_keys.update(_gate_up_ckpt_keys(ckpt_key))
+            else:
+                expected_keys.add(ckpt_key)
 
         # Expert-bank buffers (per-expert checkpoint tensors, EP-sliced).
         bank_jobs = []
@@ -1465,6 +1477,22 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
         def load_param(name: str, param: torch.nn.Parameter):
             if device.type == "cuda":
                 torch.cuda.set_device(device)
+            if name.endswith(_GATE_UP_FUSED_SUFFIX):
+                # Row-concat the checkpoint's separate gate_proj / up_proj
+                # tensors into the fused [gate | up] parameter.
+                gate_key, up_key = _gate_up_ckpt_keys(name_map[name])
+                gate = _materialize(weights[gate_key])
+                up = _materialize(weights[up_key])
+                inter = param.shape[0] // 2
+                if (gate.shape != (inter, param.shape[1])
+                        or up.shape != gate.shape):
+                    raise ValueError(
+                        f"{name}: checkpoint gate/up shapes "
+                        f"{tuple(gate.shape)} / {tuple(up.shape)} do not "
+                        f"concat to param shape {tuple(param.shape)}")
+                param.data[:inter].copy_(gate.to(param.dtype))
+                param.data[inter:].copy_(up.to(param.dtype))
+                return
             src = _materialize(weights[name_map[name]])
             if name == "lm_head.weight":
                 # LMHead is vocab-sharded (TP column) + gathered; its
