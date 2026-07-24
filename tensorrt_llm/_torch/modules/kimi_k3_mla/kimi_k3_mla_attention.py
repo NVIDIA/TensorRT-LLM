@@ -84,10 +84,7 @@ from ...attention_backend.interface import (
     PredefinedAttentionMask,
     RopeParams,
 )
-
-# ---------------------------------------------------------------------------
-# RMSNorm mirror (byte-compatible with HF's ``KimiRMSNorm``).
-# ---------------------------------------------------------------------------
+from ..rms_norm import RMSNorm
 
 
 def _meta_safe_cast_dtype(module, dtype):
@@ -109,28 +106,6 @@ def _meta_safe_cast_dtype(module, dtype):
         return t.to(dtype=dtype)
 
     module._apply(_cast)
-
-
-class _KimiRMSNorm(nn.Module):
-    """RMSNorm with the exact HF ``KimiRMSNorm`` param name and math.
-
-    HF's implementation: ``x_norm = x * rsqrt(mean(x**2) + eps)`` then
-    multiply by ``self.weight``, all in fp32 with a final downcast back
-    to the input dtype. Parameter name is ``weight`` (identity mapping
-    to the K3 module).
-    """
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        x32 = hidden_states.to(torch.float32)
-        variance = x32.pow(2).mean(-1, keepdim=True)
-        x_norm = x32 * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * x_norm.to(input_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -336,12 +311,12 @@ class KimiK3MLAAttention(nn.Module):
         self.omit_output_gate_mutation = omit_output_gate_mutation
 
         self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
-        self.q_a_layernorm = _KimiRMSNorm(q_lora_rank, eps=rms_norm_eps)
+        self.q_a_layernorm = RMSNorm(hidden_size=q_lora_rank, eps=rms_norm_eps, dtype=dtype)
         self.q_b_proj = nn.Linear(q_lora_rank, num_heads * self.q_head_dim, bias=False)
         self.kv_a_proj_with_mqa = nn.Linear(
             hidden_size, kv_lora_rank + qk_rope_head_dim, bias=False
         )
-        self.kv_a_layernorm = _KimiRMSNorm(kv_lora_rank, eps=rms_norm_eps)
+        self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank, eps=rms_norm_eps, dtype=dtype)
         self.kv_b_proj = nn.Linear(
             kv_lora_rank,
             num_heads * (qk_nope_head_dim + v_head_dim),
