@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from pathlib import Path
 
 # isort: off
@@ -55,7 +70,8 @@ def server(model_name: str, backend: str, num_postprocess_workers: int):
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     args.extend(["--kv_cache_free_gpu_memory_fraction", "0.5"])
     remote_server = RemoteOpenAIServer(model_path, args)
-    return remote_server
+    yield remote_server
+    remote_server.terminate()
 
 
 def create_trtoai_worker(model_name, async_client):
@@ -69,13 +85,10 @@ def create_trtoai_worker(model_name, async_client):
 def test_trtoai_worker_generation(default_prompt, model_name, server):
     worker = create_trtoai_worker(model_name, server.get_async_client())
     task = GenerationTask.create_from_prompt(default_prompt)
+    task.max_tokens = 100
     status = asyncio.run(worker.run_task(task))
-    try:
-        assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTOpenaiWorker"
-    except AssertionError as e:
-        worker.shutdown()
-        server.__exit__(None, None, None)
-        raise e
+    assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTOpenaiWorker"
+    worker.shutdown()
 
 
 @pytest.mark.asyncio(loop_scope="module")
