@@ -983,6 +983,12 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
+        # fp8_rowwise_gemm requires a 2D mat1; flatten here and unflatten the output below.
+        orig_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+
         # FP8 tensor inputs are from attention. Directly use ones as scale.
         if input.dtype == torch.float8_e4m3fn:
             qinput = input
@@ -1016,6 +1022,8 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         )
         if bias is not None:
             output = output + bias
+        if len(orig_shape) > 2:
+            output = output.reshape(*orig_shape[:-1], output.shape[-1])
         return output
 
     def _get_scale_name(self, weights: List[Dict]):

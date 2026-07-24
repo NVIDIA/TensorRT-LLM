@@ -272,6 +272,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             algo_map = {
                 "FP8": QuantAlgo.FP8,
                 "FP8_BLOCK_SCALES": QuantAlgo.FP8_BLOCK_SCALES,
+                "FP8_PER_CHANNEL_PER_TOKEN": QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
                 "NVFP4": QuantAlgo.NVFP4,
                 "W4A16_AWQ": QuantAlgo.W4A16_AWQ,
                 "W4A8_AWQ": QuantAlgo.W4A8_AWQ,
