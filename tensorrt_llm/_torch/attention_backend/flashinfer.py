@@ -1319,8 +1319,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._host_paged_kv_indices = \
                 self._host_pool_indices[primary_pool_id]
 
-        # trtllm-gen paged-prefill graphs capture one stable block table per KV
-        # pool. Refresh those tables and KV lengths after request turnover.
+        # Decoder graph batches have no scheduled context requests, but linear
+        # speculative verification reclassifies draft-token extensions as
+        # contexts. Refresh each trtllm-gen paged-prefill graph's stable block
+        # table and KV lengths after request turnover.
         if (self.is_cuda_graph and self.num_contexts > 0
                 and self._vswa_layer_to_pool is not None):
             for plan_params, wrappers in self._plan_params_to_wrappers.items():

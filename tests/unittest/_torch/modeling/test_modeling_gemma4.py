@@ -2724,6 +2724,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         )
 
         plan_params = list(metadata._plan_params_to_wrappers)
+        self.assertEqual(len(plan_params), 2)
         self.assertEqual({params.head_dim for params in plan_params}, {256})
         self.assertEqual(len({params.kv_pool_id for params in plan_params}), 2)
 
