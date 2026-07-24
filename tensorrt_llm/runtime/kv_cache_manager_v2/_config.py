@@ -145,9 +145,11 @@ LayerConfig = AttentionLayerConfig | SsmLayerConfig
 class KVCacheDesc:
     capacity: int
     history_length: int
+    num_ssm_slots: int = 1
 
     def __post_init__(self) -> None:
         assert 0 <= self.history_length <= self.capacity
+        assert self.num_ssm_slots > 0
 
 
 # A batch of requests, working as a use case the KVCacheManager must always support.

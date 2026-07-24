@@ -814,7 +814,20 @@ class TestLogIterationStatsKvCacheIteration:
                     "iterFullReusedBlocks": 4,
                     "iterPartialReusedBlocks": 1,
                     "iterMissedBlocks": 3,
-                }
+                },
+                "1": {
+                    "kind": "ssm",
+                    "snapshotStats": {
+                        "iterSnapshotLookups": 2,
+                        "iterSnapshotHits": 1,
+                        "iterSnapshotMisses": 1,
+                        "iterSnapshotHitRate": 0.5,
+                        "iterReusedTokens": 128,
+                        "iterUnreusedTokens": 64,
+                        "iterAlignedSnapshotHits": 1,
+                        "iterUnalignedSnapshotHits": 0,
+                    },
+                },
             },
             "kvCacheIterationStatsByPoolGroup": {
                 "0": {
@@ -829,6 +842,7 @@ class TestLogIterationStatsKvCacheIteration:
         }
 
         before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
+        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks")
         before_gen_alloc = _get_counter_value(collector, "kv_cache_gen_alloc_blocks_total")
         before_onboard = _get_counter_value(collector, "kv_cache_onboard_bytes_total")
 
@@ -840,11 +854,55 @@ class TestLogIterationStatsKvCacheIteration:
             collector, "kv_cache_iter_reused_blocks"
         ) - before_reused == pytest.approx(5)
         assert _get_counter_value(
+            collector, "kv_cache_iter_missed_blocks"
+        ) - before_missed == pytest.approx(3)
+        assert _get_counter_value(
             collector, "kv_cache_gen_alloc_blocks_total"
         ) - before_gen_alloc == pytest.approx(2)
         assert _get_counter_value(
             collector, "kv_cache_onboard_bytes_total"
         ) - before_onboard == pytest.approx(4096)
+
+    def test_v2_ssm_only_lifecycle_falls_back_to_attention_window_stats(self):
+        """An SSM lifecycle entry must not hide attention's window aggregate."""
+        collector = _make_kv_iter_collector()
+        stats = {
+            "kvCacheIterationStats": {
+                "16": {
+                    "iterReusedBlocks": 2,
+                    "iterFullReusedBlocks": 2,
+                    "iterPartialReusedBlocks": 0,
+                    "iterMissedBlocks": 2,
+                }
+            },
+            "kvCacheIterationStatsByLifecycle": {
+                "1": {
+                    "kind": "ssm",
+                    "snapshotStats": {
+                        "iterSnapshotLookups": 1,
+                        "iterSnapshotHits": 1,
+                        "iterSnapshotMisses": 0,
+                        "iterSnapshotHitRate": 1.0,
+                        "iterReusedTokens": 32,
+                        "iterUnreusedTokens": 0,
+                        "iterAlignedSnapshotHits": 1,
+                        "iterUnalignedSnapshotHits": 0,
+                    },
+                }
+            },
+        }
+        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
+        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks")
+
+        collector.log_iteration_stats(stats)
+
+        assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(0.5)
+        assert _get_counter_value(
+            collector, "kv_cache_iter_reused_blocks"
+        ) - before_reused == pytest.approx(2)
+        assert _get_counter_value(
+            collector, "kv_cache_iter_missed_blocks"
+        ) - before_missed == pytest.approx(2)
 
     def test_multiple_windows_aggregated(self):
         """Stats from multiple window sizes should be summed."""

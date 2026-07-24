@@ -25,7 +25,7 @@ from .page import AttentionLayerGroup, KVCachePageTable, MambaLayerGroup, Physic
 
 
 def get_pool_bytes(pool: PhysicalPool) -> int:
-    """Total bytes across all slots in this pool."""
+    """Total transferable payload bytes across all slots in this pool."""
     return pool.slot_bytes * pool.num_slots
 
 
@@ -33,7 +33,8 @@ def get_slot_address(pool: PhysicalPool, slot_id: int) -> int:
     """Base address of *slot_id*."""
     if slot_id >= pool.num_slots:
         raise ValueError(f"slot_id {slot_id} >= num_slots {pool.num_slots}")
-    return pool.base_address + slot_id * pool.slot_bytes
+    assert pool.slot_stride_bytes is not None
+    return pool.base_address + slot_id * pool.slot_stride_bytes
 
 
 # -------------------------------------------------------------------------
@@ -190,9 +191,22 @@ def get_unique_pool_memory_descs(
     pool_counter = 0
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if isinstance(lg, MambaLayerGroup):
-            num_mamba_layers = len(lg.mamba_layer_offsets)
-            for pool in [lg.conv_states, lg.ssm_states]:
-                pool_size = num_mamba_layers * pool.num_slots * pool.slot_bytes
+            # V2 Mamba layer groups reference manager-owned physical pools.
+            # V1 Mamba state views are standalone and use the first invalid
+            # pool-group index after the attention groups.
+            has_physical_pool_group = 0 <= int(lg.pool_group_idx) < len(page_table.pool_groups)
+            if has_physical_pool_group:
+                pools_and_sizes = [
+                    (pool, get_pool_bytes(pool))
+                    for pool in page_table.pool_groups[int(lg.pool_group_idx)].pools
+                ]
+            else:
+                num_mamba_layers = len(lg.mamba_layer_offsets)
+                pools_and_sizes = [
+                    (pool, num_mamba_layers * pool.num_slots * pool.slot_bytes)
+                    for pool in [lg.conv_states, lg.ssm_states]
+                ]
+            for pool, pool_size in pools_and_sizes:
                 pool_key = (pool.base_address, pool_size)
                 if pool_key not in unique_pools:
                     unique_pools[pool_key] = pool_counter

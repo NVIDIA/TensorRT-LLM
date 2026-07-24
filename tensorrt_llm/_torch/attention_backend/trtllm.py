@@ -1004,6 +1004,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.use_spec_decoding = self.is_spec_decoding_enabled
         self.is_spec_dec_tree = is_spec_dec_tree
         self.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
+        # A hybrid model's first executed attention layer can have a nonzero
+        # cache-local index because recurrent layers precede it.  Do not rely
+        # on the C++ ``layer_idx == 0`` fallback to rebuild the target mask:
+        # the dynamic draft loop clears that mask before the next target step.
+        self.force_prepare_spec_dec_tree_mask = is_spec_dec_dynamic_tree
         # Forward static tree length to FMHA kernel selection.
         self.max_total_draft_tokens = max_total_draft_tokens
 

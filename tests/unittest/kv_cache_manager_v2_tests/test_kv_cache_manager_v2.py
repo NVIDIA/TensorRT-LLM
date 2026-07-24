@@ -1989,6 +1989,89 @@ class TestSSMSupport(unittest.TestCase):
         kv_cache.resume(stream)
         kv_cache.close()
 
+    @parameterized.expand(
+        [
+            ("miss", None, 48, False, (1, 0, 1, 0, 48, 0, 0)),
+            ("aligned_hit", 32, 48, False, (1, 1, 0, 32, 16, 1, 0)),
+            ("unaligned_hit", 48, 64, True, (1, 1, 0, 48, 16, 0, 1)),
+        ]
+    )
+    def test_ssm_snapshot_iteration_stats(
+        self,
+        _name: str,
+        snapshot_length: int | None,
+        lookup_length: int,
+        enable_partial_reuse: bool,
+        expected: tuple[int, int, int, int, int, int, int],
+    ) -> None:
+        tokens_per_block = 32
+        cfg = self._make_ssm_config(
+            tokens_per_block=tokens_per_block,
+            enable_partial_reuse=enable_partial_reuse,
+        )
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(lookup_length)]
+
+        if snapshot_length is not None:
+            seed = self.manager.create_kv_cache()
+            seed.resume(stream)
+            seed.capacity = snapshot_length
+            seed.history_length = snapshot_length
+            seed.commit(prompt[:snapshot_length], is_end=True)
+            seed.close()
+
+        reused = self.manager.create_kv_cache(
+            input_tokens=prompt,
+            id=101,
+            # This is only a sizing hint; lookup telemetry must use the
+            # actual input_tokens length.
+            expected_prompt_length=lookup_length + 17,
+        )
+        self.assertEqual(reused.num_committed_tokens, expected[3])
+        self.assertEqual(self.manager.get_dirty_stats_kv_cache_ids(), {101})
+        reused.commit_pending_stats()
+        self.assertEqual(self.manager.get_dirty_stats_kv_cache_ids(), set())
+
+        assert self.manager._life_cycles.ssm_life_cycle_id is not None
+        ssm_life_cycle_id = self.manager._life_cycles.ssm_life_cycle_id
+        snapshot_stats = self.manager.get_and_reset_ssm_snapshot_iteration_stats()
+        self.assertEqual(set(snapshot_stats), {ssm_life_cycle_id})
+        stats = snapshot_stats[ssm_life_cycle_id]
+        self.assertEqual(
+            (
+                stats.iter_snapshot_lookups,
+                stats.iter_snapshot_hits,
+                stats.iter_snapshot_misses,
+                stats.iter_reused_tokens,
+                stats.iter_unreused_tokens,
+                stats.iter_aligned_snapshot_hits,
+                stats.iter_unaligned_snapshot_hits,
+            ),
+            expected,
+        )
+        self.assertEqual(stats.iter_snapshot_hit_rate, expected[1] / expected[0])
+        self.assertEqual(self.manager.get_and_reset_ssm_snapshot_iteration_stats(), {})
+
+        reused.resume(stream)
+        reused.close()
+
+    def test_discard_ssm_snapshot_stats_clears_dirty_state(self) -> None:
+        cfg = self._make_ssm_config()
+        self.manager = KVCacheManager(cfg)
+        tokens = [self.next_token() for _ in range(16)]
+
+        kv_cache = self.manager.create_kv_cache(input_tokens=tokens, id=101)
+        self.assertEqual(self.manager.get_dirty_stats_kv_cache_ids(), {101})
+        kv_cache.discard_pending_stats()
+
+        self.assertEqual(self.manager.get_dirty_stats_kv_cache_ids(), set())
+        self.assertEqual(self.manager.get_and_reset_ssm_snapshot_iteration_stats(), {})
+        stream_holder = CachedCudaStream()
+        kv_cache.resume(cast(CudaStream, stream_holder.handle))
+        kv_cache.close()
+
     def test_ssm(self) -> None:
         """Inference with SSM layer: prefill 63 tokens, decode 52 tokens."""
         cfg = self._make_ssm_config()
@@ -2139,6 +2222,184 @@ class TestSSMSupport(unittest.TestCase):
         self.assertEqual(kv4.num_committed_tokens, 64)
         kv4.resume(stream)
         kv4.close()
+
+    def test_ssm_planned_drop_targets_latest_snapshot_with_shared_plans(self) -> None:
+        """Shared plans drop only their conversation endpoint snapshot."""
+        cfg = self._make_ssm_config(tokens_per_block=32)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(64)]
+
+        kv_cache = self.manager.create_kv_cache()
+        kv_cache.resume(stream)
+        kv_cache.capacity = 32
+        kv_cache.commit(prompt[:32])
+        kv_cache.capacity = 64
+        kv_cache.commit(prompt[32:])
+        kv_cache.stop_committing()
+        first_handle = kv_cache.plan_committed_block_drop()
+        second_handle = kv_cache.plan_committed_block_drop()
+        self.assertIsNotNone(first_handle)
+        self.assertIsNotNone(second_handle)
+        kv_cache.close()
+
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 64)
+        assert first_handle is not None
+        first_handle.drop()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 64)
+        assert second_handle is not None
+        second_handle.drop()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 32)
+
+        empty_cache = self.manager.create_kv_cache()
+        empty_cache.resume(stream)
+        empty_cache.stop_committing()
+        self.assertIsNone(empty_cache.plan_committed_block_drop())
+        empty_cache.close()
+
+    def test_ssm_planned_drop_includes_partial_swa_window(self) -> None:
+        """Hybrid plans include SSM and every partial SWA-window page."""
+        cfg = self._make_ssm_config(
+            tokens_per_block=32,
+            num_attn_layers=1,
+            num_ssm_layers=1,
+            window_size=32,
+        )
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(48)]
+
+        kv_cache = self.manager.create_kv_cache()
+        kv_cache.resume(stream)
+        kv_cache.capacity = len(prompt)
+        kv_cache.commit(prompt)
+        kv_cache.stop_committing()
+        drop_handle = kv_cache.plan_committed_block_drop()
+        self.assertIsNotNone(drop_handle)
+
+        match = self.manager._radix_tree.match(
+            ReuseScope(), prompt, self.manager.enable_partial_match
+        )
+        self.assertEqual(match.num_tokens, len(prompt))
+        attn_lc_id = next(iter(self.manager._life_cycles.attention_life_cycles()))[0]
+        assert self.manager._life_cycles.ssm_life_cycle_id is not None
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        planned_pages = []
+        for block in match.blocks:
+            page_ref = block.storage[attn_lc_id]
+            assert page_ref is not None
+            planned_pages.append(unwrap_rawref(page_ref))
+        ssm_page_ref = match.blocks[-1].storage[ssm_lc_id]
+        assert ssm_page_ref is not None
+        planned_pages.append(unwrap_rawref(ssm_page_ref))
+        self.assertTrue(all(page.planned_drop_count == 1 for page in planned_pages))
+        planned_pages.clear()
+        del page_ref, ssm_page_ref
+
+        kv_cache.close()
+        assert drop_handle is not None
+        drop_handle.drop()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 0)
+
+    def test_ssm_same_block_snapshots_support_monotonic_multi_turn_reuse(self) -> None:
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(64)]
+
+        for snapshot_length, expected_reuse in ((10, 0), (20, 10), (25, 20)):
+            kv_cache = self.manager.create_kv_cache(input_tokens=prompt[:snapshot_length])
+            self.assertEqual(kv_cache.num_committed_tokens, expected_reuse)
+            kv_cache.resume(stream)
+            kv_cache.capacity = snapshot_length
+            engine.execute(
+                [
+                    Step(
+                        kv_cache,
+                        prompt[expected_reuse:snapshot_length],
+                        prompt[:expected_reuse],
+                    )
+                ],
+                stream,
+            )
+            kv_cache.history_length = snapshot_length
+            kv_cache.commit(prompt[expected_reuse:snapshot_length])
+            kv_cache.close()
+
+        exact = self.manager.create_kv_cache(input_tokens=prompt[:25])
+        self.assertEqual(exact.num_committed_tokens, 25)
+        exact.resume(stream)
+        exact.capacity = 25
+        exact.history_length = 25
+        engine.execute([Step(exact, [], prompt[:25])], stream)
+        exact.close()
+
+    def test_ssm_same_block_forks_only_reuse_safe_snapshots(self) -> None:
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(64)]
+
+        source = self.manager.create_kv_cache()
+        source.resume(stream)
+        commit_start = 0
+        for commit_end in (10, 20):
+            source.capacity = commit_end
+            chunk = prompt[commit_start:commit_end]
+            engine.execute([Step(source, chunk, prompt[:commit_start])], stream)
+            source.history_length = commit_end
+            source.commit(chunk)
+            commit_start = commit_end
+        source.close()
+
+        # The retained 20-token state is in the future of a fork at token 15.
+        # Falling back to zero reuse is safe; reusing that state would corrupt
+        # the fork's SSM history.
+        early_fork = prompt[:15] + [self.next_token() for _ in range(25)]
+        early = self.manager.create_kv_cache(input_tokens=early_fork)
+        self.assertEqual(early.num_committed_tokens, 0)
+        early.resume(stream)
+        early.capacity = len(early_fork)
+        engine.execute([Step(early, early_fork, [])], stream)
+        early.history_length = len(early_fork)
+        engine.execute([Step(early, [], early_fork)], stream)
+        early.close()
+
+        later_fork = prompt[:25] + [self.next_token() for _ in range(15)]
+        later = self.manager.create_kv_cache(input_tokens=later_fork)
+        self.assertEqual(later.num_committed_tokens, 20)
+        later.resume(stream)
+        later.capacity = len(later_fork)
+        engine.execute([Step(later, later_fork[20:], later_fork[:20])], stream)
+        later.history_length = len(later_fork)
+        engine.execute([Step(later, [], later_fork)], stream)
+        later.close()
+
+        aligned = self.manager.create_kv_cache(input_tokens=prompt[:32])
+        self.assertEqual(aligned.num_committed_tokens, 20)
+        aligned.resume(stream)
+        aligned.capacity = 32
+        engine.execute([Step(aligned, prompt[20:32], prompt[:20])], stream)
+        aligned.history_length = 32
+        aligned.commit(prompt[20:32])
+        aligned.close()
+
+        aligned_fork = prompt[:40] + [self.next_token() for _ in range(8)]
+        reused = self.manager.create_kv_cache(input_tokens=aligned_fork)
+        self.assertEqual(reused.num_committed_tokens, 32)
+        reused.resume(stream)
+        reused.capacity = len(aligned_fork)
+        engine.execute([Step(reused, aligned_fork[32:], aligned_fork[:32])], stream)
+        reused.history_length = len(aligned_fork)
+        engine.execute([Step(reused, [], aligned_fork)], stream)
+        reused.close()
 
     def test_ssm_partial_snapshot_respects_partial_reuse_setting(self) -> None:
         """Partial SSM snapshots are created, but partial prompt reuse remains optional."""
@@ -2377,6 +2638,9 @@ class TestInitRatioConfig(unittest.TestCase):
     # Non-power-of-2 sizes so granularity rounding is non-trivial.
     PG0_SLOT_SIZE = 786432  # 768KB (windowed)
     PG1_SLOT_SIZE = 1310720  # 1280KB (non-windowed)
+    SSM_STATE_SLOT_SIZE = 23592960
+    SSM_CONV_SLOT_SIZE = 829440
+    ATTN_SLOT_SIZE = 245760
 
     def _make_config(
         self,
@@ -2431,6 +2695,38 @@ class TestInitRatioConfig(unittest.TestCase):
             swa_scratch_reuse=(SwaScratchReuseConfig() if enable_swa_scratch_reuse else None),
         )
 
+    def _make_hybrid_config(self, gpu_quota: int = 128 << 20) -> KVCacheManagerConfig:
+        return KVCacheManagerConfig(
+            tokens_per_block=self.TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
+            layers=[
+                SsmLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(
+                            role=DataRole("ssm_state"),
+                            size=self.SSM_STATE_SLOT_SIZE,
+                        ),
+                        BufferConfig(
+                            role=DataRole("conv_state"),
+                            size=self.SSM_CONV_SLOT_SIZE,
+                        ),
+                    ],
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[
+                        BufferConfig(
+                            role=DataRole("key"),
+                            size=self.ATTN_SLOT_SIZE,
+                        ),
+                    ],
+                ),
+            ],
+            enable_partial_reuse=False,
+            commit_min_snapshot=True,
+        )
+
     def test_default_init_ratio(self):
         """Without typical_step or constraints, uses hardcoded fallback."""
         cfg = self._make_config()
@@ -2466,6 +2762,96 @@ class TestInitRatioConfig(unittest.TestCase):
         # Windowed layers (window=128) have many stale blocks, non-windowed keep all.
         self.assertLess(ratio[0], ratio[1])
         self.assertLess(ratio[0], 0.15)
+        manager.shutdown()
+
+    def test_num_ssm_slots_controls_ssm_slot_count(self):
+        """SSM sizing uses explicit state-slot count, not token capacity."""
+        manager = KVCacheManager(self._make_hybrid_config())
+        ssm_lc = manager._life_cycles.ssm_life_cycle_id
+        assert ssm_lc is not None
+        ssm_pg = manager._storage.get_pool_group_index(ssm_lc)
+
+        batch = BatchDesc(
+            kv_caches=[
+                KVCacheDesc(
+                    capacity=1024,
+                    history_length=1023,
+                    num_ssm_slots=3,
+                )
+            ]
+            * 2
+        )
+        slots = manager._storage._compute_slots_for_batch(batch, self.TOKENS_PER_BLOCK, None)
+        self.assertEqual(slots[ssm_pg], 6)
+
+        default_batch = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4095)] * 2)
+        default_slots = manager._storage._compute_slots_for_batch(
+            default_batch, self.TOKENS_PER_BLOCK, None
+        )
+        self.assertEqual(default_slots[ssm_pg], 2)
+        manager.shutdown()
+
+    def test_num_ssm_slots_must_be_positive(self):
+        with self.assertRaises(AssertionError):
+            KVCacheDesc(capacity=1, history_length=0, num_ssm_slots=0)
+
+    def test_ssm_slots_bound_additional_attention_capacity(self):
+        manager = KVCacheManager(self._make_hybrid_config())
+        ssm_lc = manager._life_cycles.ssm_life_cycle_id
+        assert ssm_lc is not None
+        ssm_pg = manager._storage.get_pool_group_index(ssm_lc)
+        attn_pg = 1 - ssm_pg
+        batch = BatchDesc([KVCacheDesc(capacity=64, history_length=63, num_ssm_slots=3)])
+
+        slots = manager._storage._compute_slots_for_batch(batch, self.TOKENS_PER_BLOCK, None)
+
+        # Two SSM slots beyond the live state imply at most one retained
+        # partial attention page for this request lineage.
+        self.assertEqual(slots[attn_pg], 3)
+        manager.shutdown()
+
+    def test_ssm_slot_attention_bound_applies_to_each_lifecycle(self):
+        config = self._make_config(enable_swa_scratch_reuse=True)
+        manager = KVCacheManager(config)
+        base_batch = BatchDesc([KVCacheDesc(capacity=512, history_length=32)])
+        snapshot_batch = BatchDesc([KVCacheDesc(capacity=512, history_length=32, num_ssm_slots=3)])
+
+        base_slots = manager._storage._compute_slots_for_batch(
+            base_batch, self.TOKENS_PER_BLOCK, config.swa_scratch_reuse
+        )
+        snapshot_slots = manager._storage._compute_slots_for_batch(
+            snapshot_batch, self.TOKENS_PER_BLOCK, config.swa_scratch_reuse
+        )
+        expected_increase = [0] * manager._storage.num_pool_groups
+        for life_cycle_id, _ in manager._life_cycles.attention_life_cycles():
+            pool_group = manager._storage.get_pool_group_index(life_cycle_id)
+            expected_increase[pool_group] += 1
+
+        self.assertEqual(
+            [actual - base for actual, base in zip(snapshot_slots, base_slots)],
+            expected_increase,
+        )
+        manager.shutdown()
+
+    def test_ssm_slot_attention_bound_reserves_each_lineage(self):
+        manager = KVCacheManager(self._make_hybrid_config())
+        ssm_lc = manager._life_cycles.ssm_life_cycle_id
+        assert ssm_lc is not None
+        ssm_pg = manager._storage.get_pool_group_index(ssm_lc)
+        attn_pg = 1 - ssm_pg
+        batch = BatchDesc(
+            [
+                KVCacheDesc(capacity=64, history_length=63, num_ssm_slots=3),
+                *[KVCacheDesc(capacity=64, history_length=63)] * 3,
+            ]
+        )
+
+        slots = manager._storage._compute_slots_for_batch(batch, self.TOKENS_PER_BLOCK, None)
+
+        self.assertEqual(slots[ssm_pg], 6)
+        # Any extra SSM slot enables the conservative upper bound of one
+        # partial attention page for every request lineage.
+        self.assertEqual(slots[attn_pg], 12)
         manager.shutdown()
 
     def test_constraints_floor_typical_step(self):

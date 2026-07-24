@@ -42,7 +42,8 @@ from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import resolve_hf_torch_dtype, resolve_ssm_cache_dtype
+from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
+                           resolve_ssm_cache_dtype)
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -50,6 +51,36 @@ _KV_CACHE_MAP = {
     "auto": "auto"
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
+
+
+def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
+                                               llm_args: TorchLlmArgs) -> None:
+    """Validate snapshot reuse after the model and V2 setting are resolved."""
+    if not is_hybrid_linear(config.pretrained_config):
+        return
+
+    kv_cache_config = llm_args.kv_cache_config
+    state_config = kv_cache_config.mamba_state_config
+    has_additional_snapshots = bool(
+        state_config.additional_snapshot_offsets_from_start
+        or state_config.additional_snapshot_offsets_from_end)
+    if (has_additional_snapshots
+            and kv_cache_config.use_kv_cache_manager_v2 is not True):
+        raise ValueError(
+            "Mamba additional snapshot offsets require "
+            "kv_cache_config.use_kv_cache_manager_v2=True after resolving "
+            "the model configuration.")
+
+    has_periodic_snapshots = state_config.periodic_snapshot_interval > 0
+    if (kv_cache_config.enable_block_reuse and not has_periodic_snapshots
+            and not has_additional_snapshots):
+        logger.warning(
+            "Disabling KV cache block reuse for the hybrid Mamba model "
+            "because no Mamba state snapshot policy is configured. Set "
+            "kv_cache_config.mamba_state_config.periodic_snapshot_interval "
+            "to a positive value or provide additional snapshot offsets to "
+            "enable block reuse.")
+        kv_cache_config.enable_block_reuse = False
 
 
 def validate_and_set_mamba_ssm_cache_dtype(
@@ -398,6 +429,7 @@ class ModelLoader:
 
         use_kv_cache_manager_v2 = llm_args.kv_cache_config.use_kv_cache_manager_v2
         _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
+        _validate_and_adjust_mamba_snapshot_config(config, llm_args)
         if use_kv_cache_manager_v2 == "auto":
             logger.info(
                 "Resolved use_kv_cache_manager_v2='auto' to %s for %s",

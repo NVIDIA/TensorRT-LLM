@@ -67,6 +67,7 @@ class ReuseMatch(NamedTuple):
 
     blocks: list["Block"]
     num_tokens: int
+    num_lookup_tokens: int
 
 
 # id_offset is usually vocab_size
@@ -361,6 +362,10 @@ class Block:
                 assert NDEBUG or (not b.is_full and b is not self and b.key == k and not b.next)
                 to_remove.append(k)
         event_manager = get_tree(prev).event_manager if to_remove else None
+        # Keep RootBlock attached while covered children are replaced.  Adding
+        # the replacement first prevents detach_next() from pruning an
+        # otherwise-empty root before this block becomes its new child.
+        prev.next[self.key] = self
         for k in to_remove:
             b = detach_next(prev, k)
             assert isinstance(b, Block)
@@ -368,7 +373,6 @@ class Block:
                 event_manager.add_removed_event(b.key)
             assert b.is_orphan  # _KVCache may still hold it.
         # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
-        prev.next[self.key] = self
 
     def _release_pages(self) -> None:
         """Reclaim every page held by this block.
@@ -675,7 +679,11 @@ class BlockRadixTree:
         matched = self._prune_match(
             list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
         )
-        return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
+        return ReuseMatch(
+            [block for block, _ in matched],
+            self._num_matched_tokens(matched),
+            len(tokens),
+        )
 
     def _check_sanity(self) -> bool:
         raise NotImplementedError(

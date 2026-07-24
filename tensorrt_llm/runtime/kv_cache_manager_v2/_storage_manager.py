@@ -956,12 +956,22 @@ class StorageManager:
         """Compute the minimum number of slots per pool group to support a BatchDesc."""
         num_slots = filled_list(0, self.num_pool_groups)
         ssm_lc_idx = self._life_cycles.ssm_life_cycle_id
+        total_ssm_slots = sum(kv.num_ssm_slots for kv in batch.kv_caches)
+        num_request_lineages = len(batch.kv_caches)
+        # An extra SSM slot indicates that this batch can retain snapshots.
+        # Snapshot alignment is unknown while storage is being sized, so once
+        # such capacity exists, reserve one partial attention page per request
+        # lineage. V2 replaces covered partial pages within a lineage, making N
+        # a safe upper bound. This does not require S >= 2N: when N < S < 2N,
+        # the bound merely over-reserves attention pages. The guard keeps the
+        # default num_ssm_slots=1 descriptors used by non-Mamba managers from
+        # paying this Mamba-specific overhead.
+        has_extra_ssm_slot = total_ssm_slots > num_request_lineages
         sys_blocks = batch.system_prompt_length // tokens_per_block
         for lc_idx, lc in typed_enumerate(self._life_cycles.get()):
             pg_idx = self.get_pool_group_index(lc_idx)
             if lc_idx == ssm_lc_idx:
-                # SSM: always 1 dedicated block per request, never shared.
-                num_slots[pg_idx] += len(batch.kv_caches)
+                num_slots[pg_idx] += total_ssm_slots
                 continue
             # Shared sys blocks (counted once): union of non-stale sys blocks across all requests.
             # A sys block needs memory if it's non-stale for ANY request.
@@ -998,6 +1008,11 @@ class StorageManager:
                     )
                 else:
                     num_slots[pg_idx] += unique_non_stale
+            # Retained partial-page copies are additional physical blocks, not
+            # tokens in KVCacheDesc.capacity, so add their safe upper bound
+            # after token staleness and scratch-sharing calculations.
+            if has_extra_ssm_slot:
+                num_slots[pg_idx] += num_request_lineages
         return num_slots
 
     def _slots_to_bytes(

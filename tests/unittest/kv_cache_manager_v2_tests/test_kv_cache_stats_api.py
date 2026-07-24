@@ -26,6 +26,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManager,
     KVCacheManagerConfig,
     KVCacheStatsDelta,
+    SsmSnapshotIterationStatsDelta,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -63,6 +64,20 @@ def test_stats_delta_arithmetic() -> None:
     assert iteration.empty
     assert iteration.iter_cache_hit_rate == 0.0
 
+    snapshot = SsmSnapshotIterationStatsDelta(
+        iter_snapshot_lookups=4,
+        iter_snapshot_hits=3,
+        iter_snapshot_misses=1,
+        iter_reused_tokens=96,
+        iter_unreused_tokens=32,
+        iter_aligned_snapshot_hits=2,
+        iter_unaligned_snapshot_hits=1,
+    )
+    assert snapshot.iter_snapshot_hit_rate == 0.75
+    snapshot.clear()
+    assert snapshot.empty
+    assert snapshot.iter_snapshot_hit_rate == 0.0
+
 
 @pytest.mark.parametrize("enable_stats", [False, True])
 def test_manager_stats_config_and_api(enable_stats: bool) -> None:
@@ -72,6 +87,7 @@ def test_manager_stats_config_and_api(enable_stats: bool) -> None:
         assert manager.init_config.enable_stats is enable_stats
         assert manager.get_committed_stats() == KVCacheStatsDelta()
         assert manager.get_and_reset_iteration_stats() == {}
+        assert manager.get_and_reset_ssm_snapshot_iteration_stats() == {}
         peak_stats = manager.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
         assert len(peak_stats) == 1
         assert peak_stats[0].available >= 0
