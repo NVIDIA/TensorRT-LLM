@@ -311,13 +311,8 @@ def test_row_linear(hidden_size, mpi_pool_executor):
         run_single_rank,
         *zip(*[(tensor_parallel_size, row_linear_forward, x, [l0_weight],
                 hidden_size, dtype)] * 2))
-    if hidden_size % 2 != 0:
-        with pytest.raises(AssertionError):
-            for r in results:
-                assert r is True
-    else:
-        for r in results:
-            assert r is True
+    for r in results:
+        assert r is True
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
