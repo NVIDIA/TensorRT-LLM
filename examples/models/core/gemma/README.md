@@ -49,14 +49,18 @@ The `/v1/chat/completions` endpoint applies the Gemma 4 chat template automatica
 
 ### MTP speculative decoding
 
-Gemma 4 supports two-model Multi-Token Prediction (MTP) speculative decoding on the PyTorch backend. Each target checkpoint must use the matching assistant checkpoint listed above. Create a server configuration for the target/assistant pair:
+Gemma 4 supports Multi-Token Prediction (MTP) speculative decoding through the
+one-model PyTorch execution path. The target and its matching assistant
+checkpoint are loaded into one engine, and the Q-only assistant reads the
+target model's KV cache. Create a server configuration for the
+target/assistant pair:
 
 ```bash
 cat > gemma4_mtp.yaml <<'EOF'
 speculative_config:
   decoding_type: MTP
   max_draft_len: 3
-  mtp_eagle_one_model: false
+  mtp_eagle_one_model: true
   speculative_model: google/gemma-4-E4B-it-assistant
 kv_cache_config:
   enable_block_reuse: false
@@ -68,7 +72,11 @@ trtllm-serve google/gemma-4-E4B-it \
     --config gemma4_mtp.yaml
 ```
 
-The assistant reads the target model's KV cache directly, so TensorRT-LLM does not allocate a second full-size GPU KV cache for it. The current implementation supports the `Gemma4AssistantForCausalLM` assistants for E2B, E4B, 26B-A4B, and 31B. Gemma 4 12B uses the `Gemma4UnifiedForConditionalGeneration` and `Gemma4UnifiedAssistantForCausalLM` architectures, which are not supported. This path uses two-model MTP, which is deprecated and scheduled for removal in release 1.4.
+The assistant shares the target model's KV cache, so TensorRT-LLM does not
+allocate a second full-size GPU KV cache for it. The current implementation
+supports the `Gemma4AssistantForCausalLM` assistants for E2B, E4B, 26B-A4B,
+and 31B. Gemma 4 12B uses the `Gemma4UnifiedForConditionalGeneration` and
+`Gemma4UnifiedAssistantForCausalLM` architectures, which are not supported.
 
 For offline inference, pass both checkpoints to the advanced LLM API example:
 
@@ -78,7 +86,6 @@ python3 examples/llm-api/quickstart_advanced.py \
     --draft_model_dir google/gemma-4-E4B-it-assistant \
     --spec_decode_algo MTP \
     --spec_decode_max_draft_len 3 \
-    --no-use_one_model \
     --disable_kv_cache_reuse \
     --apply_chat_template
 ```

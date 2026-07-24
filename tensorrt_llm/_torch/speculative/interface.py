@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Type
+from typing import TYPE_CHECKING, Any, List, Optional, Type
 
 import torch
 from packaging.version import Version
@@ -107,6 +107,78 @@ _FORCE_ACCEPT_RNG_COUNTER_STRIDE = 6007
 _FORCE_ACCEPT_RNG_SLOT_STRIDE = 1009
 
 
+@dataclass(frozen=True)
+class DraftModelCapabilities:
+    """Runtime ownership contract for an externally loaded draft model."""
+
+    loads_external_weights: bool = False
+    num_draft_modules: int = 0
+    owns_independent_kv_cache: bool = True
+    num_draft_kv_layers: int = 0
+    shares_target_kv_cache: bool = False
+    freezes_draft_attention_state: bool = False
+    requires_external_draft_metadata_view: bool = False
+
+    @classmethod
+    def external_shared_target_kv(cls) -> "DraftModelCapabilities":
+        return cls(
+            loads_external_weights=True,
+            num_draft_modules=1,
+            owns_independent_kv_cache=False,
+            num_draft_kv_layers=0,
+            shares_target_kv_cache=True,
+            freezes_draft_attention_state=True,
+            requires_external_draft_metadata_view=True,
+        )
+
+    @classmethod
+    def from_config(cls, config: Any) -> "DraftModelCapabilities":
+        return cls(
+            loads_external_weights=bool(
+                getattr(config, "loads_external_weights", False)),
+            num_draft_modules=int(getattr(config, "num_draft_modules", 0)),
+            owns_independent_kv_cache=bool(
+                getattr(config, "owns_independent_kv_cache", True)),
+            num_draft_kv_layers=int(getattr(config, "num_draft_kv_layers", 0)),
+            shares_target_kv_cache=bool(
+                getattr(config, "shares_target_kv_cache", False)),
+            freezes_draft_attention_state=bool(
+                getattr(config, "freezes_draft_attention_state", False)),
+            requires_external_draft_metadata_view=bool(
+                getattr(config, "requires_external_draft_metadata_view",
+                        False)),
+        )
+
+
+def get_draft_model_capabilities(
+        spec_config) -> Optional[DraftModelCapabilities]:
+    if spec_config is None:
+        return None
+    return getattr(spec_config, "_draft_model_capabilities", None)
+
+
+def needs_external_draft_weights(spec_config) -> bool:
+    """Whether a one-engine mode loads a separate draft checkpoint."""
+    if spec_config is None:
+        return False
+    capabilities = get_draft_model_capabilities(spec_config)
+    if capabilities is not None and capabilities.loads_external_weights:
+        return True
+    return spec_config.spec_dec_mode.need_load_draft_weights()
+
+
+def should_extend_context(spec_config,
+                          attention_backend: Type[AttentionBackend]) -> bool:
+    """Whether generation verification uses the backend's context kernel."""
+    capabilities = get_draft_model_capabilities(spec_config)
+    if (capabilities is not None and capabilities.shares_target_kv_cache
+            and capabilities.requires_external_draft_metadata_view):
+        from ..attention_backend.flashinfer import FlashInferAttention
+        if issubclass(attention_backend, FlashInferAttention):
+            return True
+    return spec_config.spec_dec_mode.extend_ctx(attention_backend)
+
+
 def should_use_separate_draft_kv_cache(spec_config) -> bool:
     """
     Check if separate draft KV cache should be used for one-engine speculative decoding.
@@ -114,6 +186,9 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
     if spec_config is None:
         return False
     if not spec_config.spec_dec_mode.use_one_engine():
+        return False
+    capabilities = get_draft_model_capabilities(spec_config)
+    if capabilities is not None and not capabilities.owns_independent_kv_cache:
         return False
     # DSpark owns a dedicated rolling-window cache in DSparkWorker. Its draft
     # model does not read the paged draft KV cache managed by attention metadata.

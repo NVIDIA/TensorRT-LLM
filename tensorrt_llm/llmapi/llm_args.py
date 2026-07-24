@@ -2550,6 +2550,9 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     # Internal max batch size for dynamic-tree worker buffers.
     _max_batch_size: Optional[int] = PrivateAttr(default=None)
+    # Runtime-only ownership contract populated after loading an external
+    # assistant config. It is intentionally excluded from serialization.
+    _draft_model_capabilities: Any = PrivateAttr(default=None)
 
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,

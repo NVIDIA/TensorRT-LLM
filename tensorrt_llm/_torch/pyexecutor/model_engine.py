@@ -66,9 +66,9 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
                            prepare_attn_metadata_for_draft_replay,
                            restore_attn_metadata_after_draft_replay,
+                           should_extend_context,
                            update_spec_config_from_loaded_model)
-from ..speculative.drafting_loops import (BaseDraftingLoopWrapper,
-                                          get_draft_model_capability)
+from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..utils import (get_model_extra_attrs,
@@ -312,8 +312,8 @@ class PyTorchModelEngine(ModelEngine):
         dist: Optional[Distributed] = None,
         spec_config: Optional[DecodingBaseConfig] = None,
         is_draft_model: bool = False,
-        drafting_loop_wrapper: Optional[Callable[
-            [torch.nn.Module], Optional[torch.nn.Module]]] = None,
+        drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
+                                                 torch.nn.Module]] = None,
         model: Optional[torch.nn.Module] = None,
         checkpoint_loader: Optional[BaseCheckpointLoader] = None,
         model_weights_memory_tag: Optional[str] = None,
@@ -462,19 +462,10 @@ class PyTorchModelEngine(ModelEngine):
             enable_overlap_headroom=self._enable_dsv4_overlap_headroom,
         )
         if drafting_loop_wrapper is not None:
-            wrapped_model = drafting_loop_wrapper(self.model)
-            if wrapped_model is not None:
-                self.model = wrapped_model
-                self.model_is_wrapped = True
-            else:
-                self.model_is_wrapped = False
+            self.model = drafting_loop_wrapper(self.model)
+            self.model_is_wrapped = True
         else:
             self.model_is_wrapped = False
-        self._shares_target_kv_cache = bool(
-            is_draft_model and get_draft_model_capability(
-                self.model, "shares_target_kv_cache", False))
-        self._cuda_graph_external_draft_len = get_draft_model_capability(
-            self.model, "cuda_graph_external_draft_len", None)
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
@@ -709,13 +700,9 @@ class PyTorchModelEngine(ModelEngine):
 
         self._cuda_graph_padding_enabled = cuda_graph_padding_enabled
 
-        cuda_graph_max_total_draft_tokens = (
-            self._cuda_graph_external_draft_len
-            if self._cuda_graph_external_draft_len is not None else
-            self.original_max_total_draft_tokens)
         self._cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
             cuda_graph_batch_sizes, self.batch_size, self.max_num_tokens,
-            cuda_graph_max_total_draft_tokens,
+            self.original_max_total_draft_tokens,
             self._cuda_graph_padding_enabled) if cuda_graph_batch_sizes else []
 
         self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
@@ -805,10 +792,7 @@ class PyTorchModelEngine(ModelEngine):
         # We look up this key in resource_manager during forward to find the
         # kv cache manager. Can be changed to support multiple model engines
         # with different KV cache managers.
-        self.kv_cache_manager_key = (ResourceManagerType.DRAFT_KV_CACHE_MANAGER
-                                     if is_draft_model
-                                     and not self._shares_target_kv_cache else
-                                     ResourceManagerType.KV_CACHE_MANAGER)
+        self.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER if is_draft_model else ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._trtllm_gen_jit_warmup = False
 
@@ -835,7 +819,6 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             dist=self.dist,
             kv_cache_manager_key=self.kv_cache_manager_key,
-            draft_model_external_draft_len=self._cuda_graph_external_draft_len,
             sparse_attention_config=self.sparse_attention_config,
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
@@ -1568,12 +1551,8 @@ class PyTorchModelEngine(ModelEngine):
         logger.info("Running autotuner warmup...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        if (self.is_draft_model
-                and self._cuda_graph_external_draft_len is not None):
-            token_num_upper_bound = 1
-        else:
-            token_num_upper_bound = min(
-                self.max_num_tokens, self.batch_size * (self.max_seq_len - 1))
+        token_num_upper_bound = min(self.max_num_tokens,
+                                    self.batch_size * (self.max_seq_len - 1))
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
@@ -2535,15 +2514,10 @@ class PyTorchModelEngine(ModelEngine):
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
         if self.is_draft_model and isinstance(spec_resource_manager,
                                               Eagle3ResourceManager):
-            freezes_draft_attention_state = bool(
-                get_draft_model_capability(self.model,
-                                           "freezes_draft_attention_state",
-                                           False))
-            spec_resource_manager.is_first_draft = (
-                is_first_draft and not freezes_draft_attention_state)
+            spec_resource_manager.is_first_draft = is_first_draft
             if is_first_draft:
                 for req in batch.generation_requests:
-                    req.py_is_first_draft = not freezes_draft_attention_state
+                    req.py_is_first_draft = True
                     req.py_draft_tokens = []
 
     def _set_up_attn_metadata(
@@ -3418,8 +3392,9 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.beam_width = 1
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = num_extend_ctx_requests if (
-            enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
-                self.attn_backend) and spec_config.is_linear_tree) else 0
+            enable_spec_decode
+            and should_extend_context(spec_config, self.attn_backend)
+            and spec_config.is_linear_tree) else 0
         attn_metadata.num_chunked_ctx_requests = attn_metadata.num_contexts
 
         # Create KV cache params and prepare metadata
@@ -3698,9 +3673,8 @@ class PyTorchModelEngine(ModelEngine):
         num_extend_dummy_requests = 0
         num_previous_batch = 0
 
-        use_extend_ctx = (self.enable_spec_decode
-                          and spec_config.spec_dec_mode.extend_ctx(
-                              self.attn_backend) and spec_config.is_linear_tree)
+        use_extend_ctx = (self.enable_spec_decode and should_extend_context(
+            spec_config, self.attn_backend) and spec_config.is_linear_tree)
 
         for idx, request in enumerate(extend_requests):
             request_accepted_path[request.py_request_id] = \
@@ -3773,8 +3747,8 @@ class PyTorchModelEngine(ModelEngine):
 
         # Determine if we're using extend_ctx mode for linear tree decoding
         num_extend_ctx_requests = 0
-        if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
-                self.attn_backend) and spec_config.is_linear_tree:
+        if self.enable_spec_decode and should_extend_context(
+                spec_config, self.attn_backend) and spec_config.is_linear_tree:
             num_extend_ctx_requests = num_extend_requests
 
         virtual_num_tokens = num_generation_tokens
@@ -4357,7 +4331,8 @@ class PyTorchModelEngine(ModelEngine):
                                        if is_promoted_context else
                                        request.max_beam_num_tokens - 1)
                 draft_lens.append(num_draft_tokens)
-                if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
+                if self.enable_spec_decode and should_extend_context(
+                        spec_config,
                         self.attn_backend) and spec_config.is_linear_tree:
                     # We're treating the prompt lengths as context requests here, so
                     # the the prompt lens should not include the cached tokens.
@@ -4409,7 +4384,8 @@ class PyTorchModelEngine(ModelEngine):
                     request.py_num_compressed_tokens)
                 request.cached_tokens = (past_seen_token_num +
                                          runtime_tokens_per_gen_step)
-                if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
+                if self.enable_spec_decode and should_extend_context(
+                        spec_config,
                         self.attn_backend) and spec_config.is_linear_tree:
                     prompt_lengths.append(runtime_tokens_per_gen_step)
                 else:
@@ -5007,8 +4983,8 @@ class PyTorchModelEngine(ModelEngine):
         # Use num_chunked_ctx_requests to record the number of extend context requests,
         # so that we can update the kv_lens_cuda correctly in _preprocess_inputs.
         attn_metadata.num_chunked_ctx_requests = 0
-        if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
-                self.attn_backend) and spec_config.is_linear_tree:
+        if self.enable_spec_decode and should_extend_context(
+                spec_config, self.attn_backend) and spec_config.is_linear_tree:
             # For the tree decoding, we want to use XQA to process the draft tokens for the target model.
             # Therefore, we do not treat them as the chunked context requests.
             attn_metadata.num_contexts += len(extend_requests)
@@ -5653,8 +5629,8 @@ class PyTorchModelEngine(ModelEngine):
             tokens_per_seq = 1
             if (self.enable_spec_decode and self.runtime_draft_len > 0
                     and self.spec_config.is_linear_tree
-                    and not self.spec_config.spec_dec_mode.extend_ctx(
-                        self.attn_backend)):
+                    and not should_extend_context(self.spec_config,
+                                                  self.attn_backend)):
                 tokens_per_seq = self.runtime_draft_len + 1
             return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
                 scheduled_requests, attn_metadata, peft_cache_manager,
@@ -5773,8 +5749,9 @@ class PyTorchModelEngine(ModelEngine):
             # count so the kernel correctly expands LoRA weights for all tokens.
             if (self.enable_spec_decode and self.runtime_draft_len > 0
                     and self.spec_config.is_linear_tree
-                    and not self.spec_config.spec_dec_mode.extend_ctx(
-                        self.attn_backend) and num_generations > 0):
+                    and not should_extend_context(self.spec_config,
+                                                  self.attn_backend)
+                    and num_generations > 0):
                 tokens_per_req = self.runtime_draft_len + 1
                 host_request_types = host_request_types.clone()
                 host_request_types[num_contexts:num_seqs].fill_(0)  # kCONTEXT

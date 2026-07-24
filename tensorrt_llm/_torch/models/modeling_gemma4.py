@@ -59,7 +59,7 @@ from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoad
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
-from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_position_ids
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
@@ -1384,6 +1384,8 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         **kwargs,
     ) -> torch.Tensor:
         local_attention_mask_data = None
+        resource_manager = kwargs.pop("resource_manager", None)
+        orig_input_ids = kwargs.pop("orig_input_ids", None)
         # Only build bidirectional masks when use_bidirectional_attention is
         # set to "vision" (26B, 31B).  E2B/E4B have this as None and should
         # use standard causal attention even for multimodal tokens. Gemma4
@@ -1411,6 +1413,38 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, output)
         if attn_metadata.padded_num_tokens is not None:
             output = output[: attn_metadata.num_tokens]
+
+        if self.spec_worker is not None:
+            logits = self.logits_processor.forward(
+                output[spec_metadata.gather_ids],
+                self.lm_head,
+                attn_metadata,
+                True,
+            )
+            if self.config.final_logit_softcapping is not None:
+                cap = self.config.final_logit_softcapping
+                logits = torch.tanh(logits / cap) * cap
+
+            spec_input_ids = input_ids if input_ids is not None else orig_input_ids
+            spec_position_ids = position_ids
+            if attn_metadata.padded_num_tokens is not None:
+                if spec_input_ids is not None:
+                    spec_input_ids = spec_input_ids[: attn_metadata.num_tokens]
+                if position_ids is not None:
+                    spec_position_ids = _slice_spec_position_ids(
+                        position_ids, attn_metadata.num_tokens
+                    )
+
+            return self.spec_worker(
+                input_ids=spec_input_ids,
+                position_ids=spec_position_ids,
+                hidden_states=output,
+                logits=logits,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_model=self.draft_model,
+                resource_manager=resource_manager,
+            )
 
         logits = self.logits_processor.forward(
             output,
@@ -1608,6 +1642,32 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
         )
         return hidden_states[last_tokens]
 
+    def forward_draft_step(
+        self,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
+        recurrent_hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        spec_metadata=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run one Q-only assistant step over a frozen target KV prefix."""
+        target_embeddings = self._get_target_embeddings(input_ids)
+        assistant_inputs = self.pre_projection(
+            torch.cat([target_embeddings, recurrent_hidden_states], dim=-1)
+        )
+        assistant_hidden_states = self.model(
+            attn_metadata=attn_metadata,
+            position_ids=self._constant_position_ids(position_ids, attn_metadata),
+            inputs_embeds=assistant_inputs,
+            spec_metadata=spec_metadata,
+        )
+        projected_hidden_states = self.post_projection(assistant_hidden_states)
+        if self.masked_embedding is not None:
+            logits = self.masked_embedding(assistant_hidden_states, self.lm_head).float()
+        else:
+            logits = self.lm_head(assistant_hidden_states).float()
+        return logits, projected_hidden_states
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1620,31 +1680,22 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
     ) -> torch.Tensor:
         if input_ids is None or spec_metadata is None:
             raise ValueError("Gemma4 assistant requires input_ids and speculative metadata")
-        target_hidden_states = spec_metadata.get_hidden_states()
-        target_embeddings = self._get_target_embeddings(input_ids)
-        assistant_inputs = self.pre_projection(
-            torch.cat([target_embeddings, target_hidden_states], dim=-1)
-        )
-        assistant_hidden_states = self.model(
+        logits, projected_hidden_states = self.forward_draft_step(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            recurrent_hidden_states=spec_metadata.get_hidden_states(),
             attn_metadata=attn_metadata,
-            position_ids=self._constant_position_ids(position_ids, attn_metadata),
-            inputs_embeds=assistant_inputs,
             spec_metadata=spec_metadata,
         )
-
-        projected_hidden_states = self.post_projection(assistant_hidden_states)
         spec_metadata.maybe_capture_hidden_states(
             self.config.num_hidden_layers - 1,
             projected_hidden_states,
         )
 
         if return_context_logits:
-            logits_hidden_states = assistant_hidden_states
-        else:
-            logits_hidden_states = self._last_token_states(assistant_hidden_states, attn_metadata)
-        if self.masked_embedding is not None:
-            return self.masked_embedding(logits_hidden_states, self.lm_head).float()
-        return self.lm_head(logits_hidden_states).float()
+            return logits
+        last_token_indices = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+        return logits[last_token_indices]
 
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
         weights = weight_mapper.preprocess_weights(weights)

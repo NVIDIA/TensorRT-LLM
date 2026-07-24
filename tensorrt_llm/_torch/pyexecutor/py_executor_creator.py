@@ -40,7 +40,8 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_hybrid_linear, is_minimax_m3
+from .config_utils import (is_hybrid_linear, is_minimax_m3,
+                           load_pretrained_config)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -451,8 +452,19 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-        # Check FLASHINFER compatibility with one-engine speculative decoding
-        if llm_args.attn_backend == "FLASHINFER":
+        # External MTP assistants with shared target KV use a dedicated
+        # FlashInfer decode metadata view. Other one-engine modes still rely
+        # on the one-query-per-sequence decode contract.
+        supports_shared_kv_flashinfer = False
+        if (spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                and spec_config.speculative_model is not None
+                and checkpoint_dir is not None):
+            target_config = load_pretrained_config(
+                checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
+            supports_shared_kv_flashinfer = target_config.model_type in (
+                "gemma4", "gemma4_text")
+        if (llm_args.attn_backend == "FLASHINFER"
+                and not supports_shared_kv_flashinfer):
             raise ValueError(
                 f"FLASHINFER attention backend is not supported with one-engine speculative "
                 f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
@@ -585,43 +597,21 @@ def create_py_executor(
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
 
-            capturable_drafter_eligible = (
+            use_chain_drafter = (
                 guided_decoding_config is None
+                and draft_spec_config._allow_chain_drafter
                 and draft_spec_config._allow_greedy_draft_tokens
+                and llm_args.attn_backend == "TRTLLM"
                 and draft_spec_config.draft_len_schedule is None)
-            use_chain_drafter = (capturable_drafter_eligible
-                                 and draft_spec_config._allow_chain_drafter
-                                 and llm_args.attn_backend == "TRTLLM")
 
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
-            if (use_chain_drafter
-                    or draft_spec_config.spec_dec_mode.is_mtp_eagle()):
+            if use_chain_drafter:
 
                 def drafting_loop_wrapper(model):
                     from tensorrt_llm._torch.speculative.drafting_loops import (
-                        Gemma4AssistantDraftingLoopWrapper,
                         LinearDraftingLoopWrapper,
                         StaticTreeDraftingLoopWrapper)
                     from tensorrt_llm.llmapi import EagleDecodingConfig
-
-                    shares_target_kv_cache = bool(
-                        getattr(model.config, "shares_target_kv_cache", False))
-                    if shares_target_kv_cache:
-                        if guided_decoding_config is not None:
-                            raise ValueError(
-                                "Guided decoding is not supported with draft "
-                                "models that share the target KV cache")
-                        if not capturable_drafter_eligible:
-                            raise ValueError(
-                                "Draft models that share the target KV cache "
-                                "require the capturable greedy drafting loop "
-                                "without a draft length schedule")
-                        return Gemma4AssistantDraftingLoopWrapper(
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1, model)
-
-                    if not use_chain_drafter:
-                        return None
 
                     static_tree_drafter = isinstance(
                         draft_spec_config, EagleDecodingConfig
@@ -662,11 +652,8 @@ def create_py_executor(
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
-            # Embedded MTP checkpoints expose a single draft layer. Standalone
-            # Gemma4 assistants keep their full four-layer text backbone.
-            if (spec_config.spec_dec_mode.is_mtp_eagle()
-                    and not getattr(draft_model_engine.model.config,
-                                    "preserve_checkpoint_layer_count", False)):
+            # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
+            if spec_config.spec_dec_mode.is_mtp_eagle():
                 draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)

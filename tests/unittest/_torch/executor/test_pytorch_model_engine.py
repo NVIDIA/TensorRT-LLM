@@ -21,7 +21,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
-    _filter_cuda_graph_batch_sizes, _make_single_token_context_graph_batch)
+    _make_single_token_context_graph_batch)
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchLlmArgs)
@@ -36,7 +36,6 @@ from utils.util import skip_ray
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -1115,56 +1114,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         spec_metadata.write_padding_onehot_draft_probs.assert_called_once_with(
             [generation.py_seq_slot], 0)
         kv_cache_manager.shutdown()
-
-    def test_external_draft_len_graph_key_ignores_first_draft_state(
-            self) -> None:
-        runner = object.__new__(CUDAGraphRunner)
-        runner.config = SimpleNamespace(
-            is_draft_model=True,
-            draft_model_external_draft_len=0,
-            original_max_draft_len=2,
-        )
-        runner.sparse_config = None
-        runner.graphs = {}
-        runner.graph_outputs = {}
-        runner.graph_metadata = {}
-        runner.padding_dummy_requests = {}
-        runner.memory_pool = None
-        batch = SimpleNamespace(batch_size=1)
-        resource_manager = object.__new__(Eagle3ResourceManager)
-
-        resource_manager.is_first_draft = False
-        capture_key = runner.get_graph_key(
-            batch, spec_resource_manager=resource_manager)
-
-        resource_manager.is_first_draft = True
-        runtime_key = runner.get_graph_key(
-            batch, spec_resource_manager=resource_manager)
-
-        self.assertEqual(capture_key, (1, 0, False, False, True))
-        self.assertEqual(runtime_key, capture_key)
-
-    def test_external_draft_len_preserves_cuda_graph_batch_capacity(
-            self) -> None:
-        batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128]
-
-        regular_draft_sizes = _filter_cuda_graph_batch_sizes(
-            batch_sizes,
-            max_batch_size=128,
-            max_num_tokens=128,
-            max_total_draft_tokens=5,
-            enable_padding=False,
-        )
-        external_draft_sizes = _filter_cuda_graph_batch_sizes(
-            batch_sizes,
-            max_batch_size=128,
-            max_num_tokens=128,
-            max_total_draft_tokens=0,
-            enable_padding=False,
-        )
-
-        self.assertEqual(regular_draft_sizes, [1, 2, 4, 8, 16])
-        self.assertEqual(external_draft_sizes, batch_sizes)
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()

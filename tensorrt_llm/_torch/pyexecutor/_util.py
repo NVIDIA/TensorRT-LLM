@@ -44,7 +44,7 @@ from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
-from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
+from ..speculative import (get_num_draft_kv_layers, get_num_extra_kv_tokens,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
@@ -1207,7 +1207,7 @@ class KvCacheCreator:
         """
         if self._speculative_config.spec_dec_mode.is_external_drafter():
             return self._draft_config.pretrained_config.num_hidden_layers
-        return get_num_spec_layers(self._speculative_config)
+        return get_num_draft_kv_layers(self._speculative_config)
 
     def _create_one_model_draft_kv_cache_manager(
         self,
@@ -1699,16 +1699,11 @@ class KvCacheCreator:
         # Split combined KV cache budgets before creating managers. Skip during
         # estimation — estimation uses max_tokens-based logic and must not
         # mutate the config.
-        draft_shares_target_kv_cache = (
-            self._draft_model_engine is not None
-            and self._draft_model_engine.kv_cache_manager_key
-            == ResourceManagerType.KV_CACHE_MANAGER)
-        has_independent_draft_cache = (
-            (self._draft_model_engine is not None
-             and not draft_shares_target_kv_cache)  # two-model
+        has_draft = (
+            self._draft_model_engine is not None  # two-model
             or self._should_create_separate_draft_kv_cache())  # one-model
         draft_kv_cache_config = None
-        if not estimating_kv_cache and has_independent_draft_cache:
+        if not estimating_kv_cache and has_draft:
             # Used when each manager sizes pools from max_gpu_total_bytes (V2
             # and V1 VSWA). V1 non-VSWA GPU uses shared max_tokens instead.
             if self._needs_gpu_kv_cache_budget_split(self_kv_cache_config):
@@ -1741,10 +1736,8 @@ class KvCacheCreator:
                                        if draft_kv_cache_config is not None else
                                        self_kv_cache_config)
 
-        # Two-model speculative decoding with an independent draft KV cache.
-        # Shared-target-KV draft engines use the primary manager instead.
-        if (self._draft_model_engine is not None
-                and not draft_shares_target_kv_cache):
+        # Two-model speculative decoding: draft model has separate engine
+        if self._draft_model_engine is not None:
             if self._is_kv_cache_manager_v2:
                 assert draft_kv_cache_config is None, (
                     "KVCacheManagerV2 does not support two-model speculative "
@@ -1804,7 +1797,7 @@ def _build_per_layer_num_kv_heads(
     if spec_config is None or draft_config is None:
         return num_key_value_heads
 
-    from ..speculative.utils import get_num_spec_layers
+    from ..speculative.utils import get_num_draft_kv_layers
     draft_pretrained = draft_config.pretrained_config
     draft_num_kv_heads = getattr(
         draft_pretrained, 'num_key_value_heads',
@@ -1813,7 +1806,7 @@ def _build_per_layer_num_kv_heads(
     if draft_num_kv_heads is None or draft_num_kv_heads == num_key_value_heads:
         return num_key_value_heads
 
-    num_spec_layers = get_num_spec_layers(spec_config)
+    num_spec_layers = get_num_draft_kv_layers(spec_config)
     logger.info(f"Per-layer KV heads for speculative decoding: "
                 f"target={num_key_value_heads} x {num_hidden_layers} layers, "
                 f"draft={draft_num_kv_heads} x {num_spec_layers} layers, "

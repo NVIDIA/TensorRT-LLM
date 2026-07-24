@@ -13,6 +13,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..attention_backend.flashinfer import FlashInferAttentionMetadata
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
@@ -91,10 +92,6 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.start_indices = {i: 0 for i in range(slot_size)}
         # whether the next draft forward is the first
         self.is_first_draft = True
-        # Gemma4 assistants share the target KV cache and only query the last
-        # validated position. The drafter records that position in the target
-        # model's most recent hidden-state span before preparing draft inputs.
-        self.draft_hidden_state_offsets: Dict[int, int] = {}
         self.spec_tree_manager = None
 
         if isinstance(config,
@@ -129,7 +126,6 @@ class Eagle3ResourceManager(BaseResourceManager):
         slot_id = self.slot_manager.get_slot(request.request_id)
         self.seq_lens[slot_id] = 0
         self.start_indices[slot_id] = 0
-        self.draft_hidden_state_offsets.pop(request.request_id, None)
         if self.use_relaxed_acceptance_for_thinking:
             self.relaxed_delta_pool[slot_id].fill_(0)
         self.slot_manager.remove_slot(request.request_id)
@@ -215,7 +211,6 @@ class Eagle3SpecMetadata(SpecMetadata):
     is_first_draft: bool = False
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
     is_mtp_eagle: bool = False
-    shares_target_kv_cache: bool = False
 
     eagle_choices: Optional[List[List[int]]] = None
     max_total_draft_tokens: int = 0
@@ -283,28 +278,11 @@ class Eagle3SpecMetadata(SpecMetadata):
         for req_id, seq_len in zip(self.request_ids, self.seq_lens):
             slot_id = self.eagle3_resource_manager.slot_manager.get_slot(req_id)
             start_idx = self.eagle3_resource_manager.start_indices[slot_id]
-            # Shared-target-KV drafters issue one query per target iteration.
-            # Read the hidden state for the last validated target token, then
-            # overwrite that location for the remaining draft iterations.
-            if self.is_draft_model and self.shares_target_kv_cache:
-                assert seq_len == 1, (
-                    "Shared-target-KV drafting expects one query token per "
-                    f"request, got {seq_len}")
-                old_seq_len = self.eagle3_resource_manager.seq_lens[slot_id]
-                hidden_state_offset = self.eagle3_resource_manager.draft_hidden_state_offsets.get(
-                    req_id, max(old_seq_len - 1, 0))
-                assert old_seq_len == 0 or 0 <= hidden_state_offset < old_seq_len, (
-                    "Shared-target-KV hidden-state offset is outside the "
-                    f"target span: offset={hidden_state_offset}, "
-                    f"target_seq_len={old_seq_len}")
-                hidden_state_idx = start_idx + hidden_state_offset
-                hidden_states_read_indices.append(hidden_state_idx)
-                hidden_states_write_indices.append(hidden_state_idx)
             # 1) target model or (is_first_draft and is_linear_tree)
             # If this is the first draft or the target model forward, we need to
             # read/write all of the hidden states
-            elif not self.is_draft_model or (is_first_draft
-                                             and spec_tree_manager is None):
+            if not self.is_draft_model or (is_first_draft
+                                           and spec_tree_manager is None):
                 hidden_states_read_indices.extend(
                     list(range(start_idx, start_idx + seq_len)))
                 hidden_states_write_indices.extend(
@@ -679,6 +657,41 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self._saved_position_offsets = None
         self._saved_position_offsets_cpp = None
         self._saved_generation_lengths = None
+        self._uses_external_shared_target_kv = False
+
+    def set_draft_model(self, draft_model) -> None:
+        super().set_draft_model(draft_model)
+        capabilities = getattr(self.spec_config, "_draft_model_capabilities",
+                               None)
+        self._uses_external_shared_target_kv = bool(
+            capabilities is not None and capabilities.loads_external_weights
+            and capabilities.shares_target_kv_cache
+            and not capabilities.owns_independent_kv_cache)
+        if not self._uses_external_shared_target_kv:
+            return
+        if self.use_dynamic_tree:
+            raise ValueError(
+                "Gemma4 shared-target-KV one-model MTP supports only the "
+                "linear draft path.")
+        if self.spec_config.draft_len_schedule is not None:
+            raise ValueError(
+                "Gemma4 shared-target-KV one-model MTP does not support a "
+                "draft length schedule.")
+        if self.sa_enhancer is not None:
+            raise ValueError(
+                "Gemma4 shared-target-KV one-model MTP does not support the "
+                "suffix automaton enhancer.")
+        if self.spec_config.use_rejection_sampling:
+            raise ValueError(
+                "Gemma4 shared-target-KV one-model MTP does not support "
+                "rejection sampling.")
+
+    def set_guided_decoder(self, guided_decoder) -> bool:
+        if self._uses_external_shared_target_kv:
+            raise ValueError(
+                "Gemma4 shared-target-KV one-model MTP does not support "
+                "guided decoding.")
+        return super().set_guided_decoder(guided_decoder)
 
     @property
     def max_draft_len(self) -> int:
@@ -746,6 +759,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                       resource_manager=None):
 
         runtime_draft_len = spec_metadata.runtime_draft_len
+        if self._uses_external_shared_target_kv:
+            return self._forward_external_shared_target_kv(
+                input_ids, position_ids, hidden_states, logits, attn_metadata,
+                spec_metadata, draft_model)
+
         # skip the draft forward if the runtime draft length is 0
         if runtime_draft_len == 0:
             return self.skip_drafting(input_ids, position_ids, hidden_states,
@@ -839,6 +857,134 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             'next_draft_tokens': next_draft_tokens,
             'next_new_tokens': next_new_tokens,
         }
+
+    def _forward_external_shared_target_kv(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        """Draft with an external Q-only assistant over accepted target KV."""
+        if not isinstance(attn_metadata, FlashInferAttentionMetadata):
+            raise TypeError(
+                "Gemma4 shared-target-KV one-model MTP currently requires "
+                "FlashInfer attention metadata.")
+        if self.guided_decoder is not None:
+            raise ValueError(
+                "Gemma4 shared-target-KV one-model MTP does not support "
+                "guided decoding.")
+
+        batch_size = attn_metadata.num_seqs
+        num_contexts = batch_size - spec_metadata.num_generations
+        runtime_draft_len = spec_metadata.runtime_draft_len
+        if runtime_draft_len == 0:
+            target_tokens = self._sample_tokens_for_batch(
+                logits, spec_metadata, num_contexts, batch_size)
+            accepted_tokens = target_tokens.unsqueeze(1)
+            num_accepted_tokens = torch.ones(batch_size,
+                                             dtype=torch.int,
+                                             device=logits.device)
+            next_draft_tokens = torch.empty((batch_size, 0),
+                                            dtype=torch.int32,
+                                            device=logits.device)
+            return {
+                "logits": logits,
+                "new_tokens": accepted_tokens,
+                "new_tokens_lens": num_accepted_tokens,
+                "next_draft_tokens": next_draft_tokens,
+                "next_new_tokens": accepted_tokens,
+            }
+
+        raw_logits = logits
+        accepted_tokens, num_accepted_tokens = (
+            self.sample_and_accept_draft_tokens(input_ids, logits,
+                                                attn_metadata, spec_metadata))
+
+        (
+            draft_input_ids,
+            recurrent_hidden_states,
+            draft_position_ids,
+        ) = self._prepare_external_shared_target_kv_draft_inputs(
+            accepted_tokens=accepted_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            sequence_lengths=attn_metadata.seq_lens_cuda[:batch_size],
+            num_contexts=num_contexts,
+            batch_indices=spec_metadata.batch_indices_cuda[:batch_size],
+        )
+
+        draft_metadata = attn_metadata.get_shared_kv_draft_metadata()
+        draft_metadata.update_shared_kv_draft_lengths(attn_metadata,
+                                                      num_accepted_tokens,
+                                                      num_contexts)
+        draft_metadata.use_spec_decoding = False
+        draft_metadata.padded_num_tokens = None
+        draft_metadata.all_rank_num_tokens = (
+            spec_metadata.subseq_all_rank_num_tokens)
+
+        next_draft_tokens = []
+        for draft_step in range(runtime_draft_len):
+            draft_logits, recurrent_hidden_states = (
+                draft_model.forward_draft_step(
+                    input_ids=draft_input_ids,
+                    position_ids=draft_position_ids,
+                    recurrent_hidden_states=recurrent_hidden_states,
+                    attn_metadata=draft_metadata,
+                    spec_metadata=spec_metadata,
+                ))
+            draft_input_ids = self.sample_draft_tokens(
+                draft_logits,
+                spec_metadata,
+                batch_size,
+                draft_step=draft_step,
+            )
+            next_draft_tokens.append(draft_input_ids)
+
+        next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+        batch_indices = spec_metadata.batch_indices_cuda[:batch_size]
+        next_new_tokens = self._prepare_next_new_tokens(accepted_tokens,
+                                                        next_draft_tokens,
+                                                        batch_indices,
+                                                        batch_size,
+                                                        num_accepted_tokens)
+        attn_metadata.use_spec_decoding = True
+        return {
+            "logits": raw_logits,
+            "new_tokens": accepted_tokens,
+            "new_tokens_lens": num_accepted_tokens,
+            "next_draft_tokens": next_draft_tokens,
+            "next_new_tokens": next_new_tokens,
+        }
+
+    @staticmethod
+    def _prepare_external_shared_target_kv_draft_inputs(
+        *,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        num_contexts: int,
+        batch_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select the accepted token, hidden row, and fixed draft position."""
+        sequence_starts = torch.cumsum(
+            sequence_lengths, dim=0, dtype=torch.long) - sequence_lengths
+        recurrent_indices = sequence_starts + sequence_lengths - 1
+        recurrent_indices[num_contexts:].copy_(
+            sequence_starts[num_contexts:] +
+            num_accepted_tokens[num_contexts:] - 1)
+        draft_input_ids = accepted_tokens[batch_indices,
+                                          num_accepted_tokens - 1]
+        recurrent_hidden_states = hidden_states[recurrent_indices]
+        draft_position_ids = (
+            _select_mtp_position_ids(position_ids, recurrent_indices) + 1)
+        return draft_input_ids, recurrent_hidden_states, draft_position_ids
 
     def _forward_draft_loop(self, inputs, attn_metadata, spec_metadata,
                             draft_model, draft_kv_cache_manager, num_contexts,
@@ -1168,7 +1314,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         acceptance is enabled (both Eagle3 and MTP Eagle); ignored otherwise.
         """
         batch_size = attn_metadata.num_seqs
-        num_contexts = attn_metadata.num_contexts
+        num_contexts = (batch_size - spec_metadata.num_generations
+                        if self._uses_external_shared_target_kv else
+                        attn_metadata.num_contexts)
         num_gens = batch_size - num_contexts
 
         runtime_draft_len = spec_metadata.runtime_draft_len

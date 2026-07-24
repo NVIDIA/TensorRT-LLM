@@ -588,7 +588,7 @@ class TestGemma4Assistant(unittest.TestCase):
             config.save_pretrained(directory)
             restored = AutoConfig.from_pretrained(directory)
 
-        self.assertIsInstance(restored, Gemma4AssistantConfig)
+        self.assertEqual(restored.model_type, "gemma4_assistant")
         self.assertEqual(restored.backbone_hidden_size, 256)
         self.assertEqual(restored.text_config.num_kv_shared_layers, 4)
 
@@ -2620,6 +2620,56 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             )
             source_offset += page_count
         return expected
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_shared_kv_draft_view_uses_accepted_prefix_without_appending_kv(self) -> None:
+        """The assistant gets private decode state over immutable target KV."""
+        page_counts = [3, 2]
+        kv_cache_manager, layers, metadata, queries, _, _ = self._make_trtllm_gen_decode_case(
+            page_counts
+        )
+        target_kv = {
+            layer.layer_idx: kv_cache_manager.get_buffers(layer.layer_idx).clone()
+            for layer in layers
+        }
+
+        accepted_tokens = torch.tensor([1, 3], dtype=torch.int, device="cuda")
+        draft_metadata = metadata.get_shared_kv_draft_metadata()
+        draft_metadata.update_shared_kv_draft_lengths(
+            metadata,
+            accepted_tokens,
+            num_contexts=0,
+        )
+        expected_kv_lens = metadata._cached_token_lens[:2] + accepted_tokens
+
+        for layer, query in zip(layers, queries, strict=True):
+            layer.forward(query, None, None, draft_metadata)
+
+        self.assertIs(draft_metadata.kv_cache_manager, metadata.kv_cache_manager)
+        self.assertIsNot(draft_metadata, metadata)
+        torch.testing.assert_close(
+            draft_metadata._shared_kv_runtime_lens[:2],
+            expected_kv_lens,
+            atol=0,
+            rtol=0,
+        )
+        for wrappers in draft_metadata._plan_params_to_wrappers.values():
+            torch.testing.assert_close(
+                wrappers.decode_wrapper._kv_lens_buffer[:2],
+                expected_kv_lens,
+                atol=0,
+                rtol=0,
+            )
+        for layer in layers:
+            torch.testing.assert_close(
+                kv_cache_manager.get_buffers(layer.layer_idx),
+                target_kv[layer.layer_idx],
+                atol=0,
+                rtol=0,
+            )
 
     @torch.no_grad()
     @unittest.mock.patch(

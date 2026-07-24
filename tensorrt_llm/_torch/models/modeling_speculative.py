@@ -30,8 +30,8 @@ try:
 except ImportError:
     _flashinfer_rope = None
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
-from ..speculative import (SpecMetadata, get_spec_worker,
-                           should_use_separate_draft_kv_cache)
+from ..speculative import (DraftModelCapabilities, SpecMetadata,
+                           get_spec_worker, should_use_separate_draft_kv_cache)
 from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
@@ -1889,6 +1889,11 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
             )
 
+    elif (spec_dec_mode.is_mtp_eagle_one_model() and draft_config is not None
+          and getattr(model_config.spec_config, "_draft_model_capabilities",
+                      None) is not None and model_config.spec_config.
+          _draft_model_capabilities.loads_external_weights):
+        return AutoModelForCausalLM.from_config(draft_config)
     elif spec_dec_mode.is_mtp_one_model():
         return MTPForCausalLM(model_config,
                               model_config.pretrained_config.num_hidden_layers,
@@ -1991,6 +1996,51 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                     model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
+
+                elif (spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                      and spec_config.speculative_model is not None
+                      and model_config.pretrained_config.model_type
+                      in ("gemma4", "gemma4_text")):
+                    self.draft_config = ModelConfig.from_pretrained(
+                        spec_config.speculative_model,
+                        trust_remote_code=True,
+                        attn_backend=model_config.attn_backend,
+                        moe_backend=model_config.moe_backend,
+                        mapping=model_config.mapping,
+                        spec_config=None,
+                        max_num_tokens=model_config.max_num_tokens,
+                        moe_max_num_tokens=model_config.moe_max_num_tokens)
+                    self.draft_config.quant_config.kv_cache_quant_algo = \
+                        model_config.quant_config.kv_cache_quant_algo
+                    self.draft_config.extra_attrs = model_config.extra_attrs
+                    draft_pretrained_config = (
+                        self.draft_config.pretrained_config)
+                    draft_architectures = getattr(draft_pretrained_config,
+                                                  "architectures", None) or []
+                    if "Gemma4AssistantForCausalLM" in draft_architectures:
+                        # Newer Transformers releases provide a native
+                        # Gemma4AssistantConfig without TRT-LLM runtime
+                        # ownership attributes. Its architecture has the same
+                        # all-Q-only, shared-target-KV contract.
+                        capabilities = (
+                            DraftModelCapabilities.external_shared_target_kv())
+                    else:
+                        capabilities = DraftModelCapabilities.from_config(
+                            draft_pretrained_config)
+                    if not (capabilities.loads_external_weights
+                            and capabilities.shares_target_kv_cache
+                            and not capabilities.owns_independent_kv_cache
+                            and capabilities.num_draft_modules == 1
+                            and capabilities.num_draft_kv_layers == 0
+                            and capabilities.freezes_draft_attention_state and
+                            capabilities.requires_external_draft_metadata_view):
+                        raise ValueError(
+                            "External one-model MTP assistants must load "
+                            "external weights, expose one logical draft module, "
+                            "own zero KV layers, share the target KV cache, "
+                            "freeze draft attention state, and require an "
+                            "external draft metadata view.")
+                    spec_config._draft_model_capabilities = capabilities
 
                 elif spec_config.spec_dec_mode.is_external_drafter():
                     self.draft_config = ModelConfig.from_pretrained(

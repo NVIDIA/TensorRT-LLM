@@ -3,127 +3,170 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
-from tensorrt_llm._torch.speculative.drafting_loops import Gemma4AssistantDraftingLoopWrapper
-from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
-from tensorrt_llm._torch.speculative.model_drafter import ModelDrafter
+from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker
+from tensorrt_llm._torch.speculative.interface import (
+    DraftModelCapabilities,
+    needs_external_draft_weights,
+    should_use_separate_draft_kv_cache,
+)
+from tensorrt_llm._torch.speculative.utils import (
+    get_num_draft_kv_layers,
+    get_num_extra_kv_tokens,
+    get_num_spec_layers,
+)
+from tensorrt_llm.llmapi import MTPDecodingConfig
 
 
-class _DummyGemma4Assistant(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.config = SimpleNamespace(
-            model_type="gemma4_assistant",
-            shares_target_kv_cache=True,
-            freezes_draft_attention_state=True,
-        )
-        self.model_config = None
-        self.model = SimpleNamespace()
-        self.calls = []
-
-    def forward(self, input_ids, position_ids, attn_metadata, **kwargs):
-        self.calls.append(
-            {
-                "input_ids": input_ids.clone(),
-                "position_ids": position_ids.clone(),
-                "kv_lens": attn_metadata.kv_lens_cuda.clone(),
-            }
-        )
-        logits = torch.zeros((input_ids.shape[0], 8))
-        logits[:, len(self.calls)] = 1
-        return logits
+def _shared_kv_capabilities() -> DraftModelCapabilities:
+    return DraftModelCapabilities.external_shared_target_kv()
 
 
-def test_gemma4_drafting_loop_keeps_position_and_target_kv_length():
-    draft_model = _DummyGemma4Assistant()
-    wrapper = Gemma4AssistantDraftingLoopWrapper(
-        max_draft_len=3,
-        max_total_draft_tokens=3,
-        draft_model=draft_model,
+def _shared_kv_spec_config(**kwargs) -> MTPDecodingConfig:
+    spec_config = MTPDecodingConfig(
+        max_draft_len=kwargs.pop("max_draft_len", 3),
+        speculative_model="/tmp/gemma4-assistant",
+        mtp_eagle_one_model=True,
+        **kwargs,
     )
-    wrapper.sample = lambda logits: logits.argmax(dim=-1)
+    spec_config._draft_model_capabilities = _shared_kv_capabilities()
+    return spec_config
 
-    attn_metadata = SimpleNamespace(
-        num_seqs=2,
-        kv_lens_cuda=torch.tensor([7, 11]),
+
+def test_external_shared_kv_capability_separates_module_and_kv_counts():
+    spec_config = _shared_kv_spec_config()
+
+    assert needs_external_draft_weights(spec_config)
+    assert get_num_spec_layers(spec_config) == 1
+    assert get_num_draft_kv_layers(spec_config) == 0
+    assert get_num_extra_kv_tokens(spec_config) == 0
+    assert not should_use_separate_draft_kv_cache(spec_config)
+
+
+def test_embedded_one_model_mtp_does_not_load_external_weights():
+    spec_config = _shared_kv_spec_config()
+    spec_config._draft_model_capabilities = None
+
+    assert not needs_external_draft_weights(spec_config)
+
+
+def test_external_shared_kv_worker_rejects_unverified_modes():
+    spec_config = _shared_kv_spec_config(
+        use_dynamic_tree=True,
+        dynamic_tree_max_topK=2,
     )
-    spec_metadata = object.__new__(Eagle3SpecMetadata)
-    spec_metadata.gather_ids = torch.tensor([0, 1])
-    spec_metadata.hidden_states_read_indices = torch.tensor([4, 8])
-    spec_metadata.hidden_states_write_indices = torch.tensor([5, 9])
+    worker = MTPEagleWorker(spec_config)
 
-    outputs = wrapper(
-        input_ids=torch.tensor([2, 3]),
-        position_ids=torch.tensor([[6, 10]]),
+    with pytest.raises(ValueError, match="linear draft path"):
+        worker.set_draft_model(SimpleNamespace(model=SimpleNamespace()))
+
+
+@pytest.mark.parametrize(
+    "num_accepted_tokens, expected_hidden_rows",
+    [
+        ([1, 1, 1], [1, 2, 6]),
+        ([1, 2, 3], [1, 3, 8]),
+        ([1, 4, 4], [1, 5, 9]),
+    ],
+)
+def test_external_shared_kv_selects_last_accepted_target_state(
+    num_accepted_tokens,
+    expected_hidden_rows,
+):
+    accepted_tokens = torch.tensor(
+        [
+            [10, 11, 12, 13],
+            [20, 21, 22, 23],
+            [30, 31, 32, 33],
+        ],
+        dtype=torch.int32,
+    )
+    accepted_counts = torch.tensor(num_accepted_tokens, dtype=torch.long)
+    hidden_states = torch.arange(20, dtype=torch.float32).unsqueeze(1)
+    position_ids = torch.arange(10, dtype=torch.int32).unsqueeze(0)
+
+    draft_ids, recurrent_hidden, draft_positions = (
+        MTPEagleWorker._prepare_external_shared_target_kv_draft_inputs(
+            accepted_tokens=accepted_tokens,
+            num_accepted_tokens=accepted_counts,
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            sequence_lengths=torch.tensor([2, 4, 4]),
+            num_contexts=1,
+            batch_indices=torch.arange(3),
+        )
+    )
+
+    expected_tokens = accepted_tokens[
+        torch.arange(3),
+        accepted_counts - 1,
+    ]
+    assert torch.equal(draft_ids, expected_tokens)
+    assert torch.equal(
+        recurrent_hidden.squeeze(1),
+        torch.tensor(expected_hidden_rows, dtype=torch.float32),
+    )
+    assert torch.equal(
+        draft_positions,
+        torch.tensor(expected_hidden_rows, dtype=torch.int32).unsqueeze(0) + 1,
+    )
+
+
+def test_gemma4_target_forward_dispatches_one_model_worker():
+    hidden_states = torch.tensor(
+        [
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+        ]
+    )
+    worker_calls = []
+
+    def spec_worker(**kwargs):
+        worker_calls.append(kwargs)
+        return {"logits": kwargs["logits"], "new_tokens": torch.tensor([[7]])}
+
+    model = SimpleNamespace(
+        layer_idx=-1,
+        config=SimpleNamespace(final_logit_softcapping=None),
+        model=lambda **kwargs: hidden_states,
+        logits_processor=SimpleNamespace(forward=lambda selected, *args: selected),
+        lm_head=object(),
+        spec_worker=spec_worker,
+        draft_model=object(),
+    )
+    spec_metadata = SimpleNamespace(
+        gather_ids=torch.tensor([2]),
+        is_layer_capture=lambda layer_idx: False,
+    )
+    attn_metadata = SimpleNamespace(padded_num_tokens=None)
+
+    outputs = Gemma4ForCausalLM.forward(
+        model,
         attn_metadata=attn_metadata,
+        input_ids=torch.tensor([1, 2, 3]),
+        position_ids=torch.tensor([[0, 1, 2]]),
         spec_metadata=spec_metadata,
     )
 
-    assert outputs["new_draft_tokens"].tolist() == [[1, 1], [2, 2], [3, 3]]
-    assert len(draft_model.calls) == 3
-    assert all(call["position_ids"].tolist() == [[6, 10]] for call in draft_model.calls)
-    assert all(call["kv_lens"].tolist() == [7, 11] for call in draft_model.calls)
-    assert spec_metadata.hidden_states_read_indices.tolist() == [5, 9]
+    assert torch.equal(outputs["new_tokens"], torch.tensor([[7]]))
+    assert len(worker_calls) == 1
+    assert torch.equal(worker_calls[0]["hidden_states"], hidden_states)
+    assert torch.equal(worker_calls[0]["logits"], hidden_states[[2]])
+    assert worker_calls[0]["draft_model"] is model.draft_model
 
 
-def test_gemma4_drafter_records_target_hidden_state_offset():
-    drafter = object.__new__(ModelDrafter)
-    drafter.spec_resource_manager = SimpleNamespace(
-        draft_hidden_state_offsets={},
-        seq_lens={4: 10},
-        slot_manager=SimpleNamespace(get_slot=lambda request_id: 4),
-    )
-    draft_request = SimpleNamespace()
-    drafter._create_generation_request = lambda request, tokens: draft_request
-    request = SimpleNamespace(
-        py_request_id=17,
-        py_last_context_chunk=(4, 10),
-        py_prompt_len=10,
-        py_num_accepted_draft_tokens=3,
-    )
-
-    assert (
-        drafter._create_shared_target_kv_request(request, [1, 2], is_first_draft=True)
-        is draft_request
-    )
-    assert drafter.spec_resource_manager.draft_hidden_state_offsets[17] == 9
-
-    drafter._create_shared_target_kv_request(request, [1, 2], is_first_draft=False)
-    assert drafter.spec_resource_manager.draft_hidden_state_offsets[17] == 3
-
-
-def test_gemma4_cuda_graph_warmup_uses_one_token_generation_request():
-    engine = object.__new__(PyTorchModelEngine)
-    engine.is_draft_model = True
-    engine.model_is_wrapped = True
-    engine.model = SimpleNamespace(config=SimpleNamespace(freezes_draft_attention_state=True))
-    spec_resource_manager = object.__new__(Eagle3ResourceManager)
-    spec_resource_manager.is_first_draft = True
-    resource_manager = SimpleNamespace(
-        get_resource_manager=lambda resource_type: spec_resource_manager
-    )
-    request = SimpleNamespace(py_is_first_draft=True, py_draft_tokens=[1])
-    batch = SimpleNamespace(generation_requests=[request])
-
-    engine._update_draft_inference_state_for_warmup(
-        batch, is_first_draft=True, resource_manager=resource_manager
-    )
-
-    assert not spec_resource_manager.is_first_draft
-    assert not request.py_is_first_draft
-    assert request.py_draft_tokens == []
-
-
-def test_gemma4_target_forward_captures_speculative_hidden_states():
+def test_gemma4_target_forward_still_captures_hidden_states_without_worker():
     model = SimpleNamespace(
         layer_idx=-1,
         config=SimpleNamespace(final_logit_softcapping=None),
         model=lambda **kwargs: torch.tensor([[1.0, 2.0]]),
         logits_processor=SimpleNamespace(forward=lambda hidden_states, *args: hidden_states),
         lm_head=object(),
+        spec_worker=None,
     )
     captured = []
     spec_metadata = SimpleNamespace(

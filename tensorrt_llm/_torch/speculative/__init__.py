@@ -3,9 +3,12 @@ from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
 from .eagle3 import Eagle3SpecMetadata, MTPEagleWorker
-from .interface import (SpecMetadata, SpecWorkerBase,
+from .interface import (DraftModelCapabilities, SpecMetadata, SpecWorkerBase,
+                        get_draft_model_capabilities,
+                        needs_external_draft_weights,
                         prepare_attn_metadata_for_draft_replay,
                         restore_attn_metadata_after_draft_replay,
+                        should_extend_context,
                         should_use_separate_draft_kv_cache)
 from .mtp import MTPSampler, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
@@ -18,16 +21,18 @@ from .spec_sampler_base import (SampleStateSpec, SampleStateTensorsSpec,
                                 SpecSamplerBase)
 from .spec_tree_manager import SpecTreeManager
 from .suffix_automaton import SuffixAutomatonManager
-from .utils import (get_draft_kv_cache_manager, get_num_extra_kv_tokens,
-                    get_num_spec_layers, get_spec_decoder, get_spec_drafter,
-                    get_spec_metadata, get_spec_resource_manager,
-                    get_spec_worker, update_spec_config_from_draft_model_config,
+from .utils import (get_draft_kv_cache_manager, get_num_draft_kv_layers,
+                    get_num_extra_kv_tokens, get_num_spec_layers,
+                    get_spec_decoder, get_spec_drafter, get_spec_metadata,
+                    get_spec_resource_manager, get_spec_worker,
+                    update_spec_config_from_draft_model_config,
                     update_spec_config_from_loaded_model,
                     update_spec_config_from_model_config)
 
 __all__ = [
     "DFlashSpecMetadata",
     "DFlashWorker",
+    "DraftModelCapabilities",
     "DraftTargetOneModelSpecMetadata",
     "DraftTargetOneModelWorker",
     "Eagle3SpecMetadata",
@@ -52,6 +57,8 @@ __all__ = [
     "SpecSamplerBase",
     "SpecWorkerBase",
     "get_draft_kv_cache_manager",
+    "get_draft_model_capabilities",
+    "get_num_draft_kv_layers",
     "get_num_extra_kv_tokens",
     "get_num_spec_layers",
     "get_spec_decoder",
@@ -60,7 +67,9 @@ __all__ = [
     "get_spec_resource_manager",
     "get_spec_worker",
     "prepare_attn_metadata_for_draft_replay",
+    "needs_external_draft_weights",
     "restore_attn_metadata_after_draft_replay",
+    "should_extend_context",
     "should_use_separate_draft_kv_cache",
     "update_spec_config_from_draft_model_config",
     "update_spec_config_from_loaded_model",

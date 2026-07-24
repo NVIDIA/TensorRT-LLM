@@ -733,6 +733,33 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
 
     @property
+    def model(self):
+        return self.llm.model
+
+    @property
+    def lm_head(self):
+        return self.llm.lm_head
+
+    @property
+    def epilogue(self):
+        return self.llm.epilogue
+
+    @property
+    def spec_worker(self):
+        return self.llm.spec_worker
+
+    @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    def load_draft_weights(self, weights, weight_mapper=None):
+        self.llm.load_draft_weights(weights, weight_mapper)
+
+    @property
     def language_model(self) -> torch.nn.Module:
         return self.llm
 
@@ -743,6 +770,8 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         position_ids: Optional[torch.Tensor],
         mm_inputs: PreparedLlmInputs,
         lora_params=None,
+        spec_metadata=None,
+        resource_manager=None,
         **forward_kwargs,
     ) -> Dict:
         """Build Gemma4-specific language-model forward arguments."""
@@ -770,6 +799,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             "mm_token_type_ids": mm_token_type_ids,
             "ple_input_ids": ple_input_ids,
             "lora_params": lora_params,
+            "spec_metadata": spec_metadata,
+            "resource_manager": resource_manager,
+            "orig_input_ids": raw_input_ids,
         }
 
     @property

@@ -312,9 +312,9 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         total_num_layers = num_hidden_layers
         spec_config = getattr(self.model_config, "spec_config", None)
         if spec_config is not None:
-            from ..speculative.utils import get_num_spec_layers
+            from ..speculative.utils import get_num_draft_kv_layers
 
-            num_spec_layers = get_num_spec_layers(spec_config) or 0
+            num_spec_layers = get_num_draft_kv_layers(spec_config) or 0
             total_num_layers += num_spec_layers
             if num_spec_layers > 0 and mapping.is_last_pp_rank():
                 pp_layer_list.extend(

@@ -146,8 +146,6 @@ def get_spec_metadata(spec_config,
             eagle3_resource_manager=spec_resource_manager,
             layers_to_capture=None,
             is_mtp_eagle=True,
-            shares_target_kv_cache=getattr(model_config,
-                                           "shares_target_kv_cache", False),
         )
     if spec_config.spec_dec_mode.is_eagle3():
         effective_dynamic_tree = _is_effective_dynamic_tree(spec_config)
@@ -447,6 +445,10 @@ def get_spec_drafter(model_engine,
 
 
 def get_num_spec_layers(spec_config):
+    """Return the logical number of draft modules executed by the worker."""
+    capabilities = getattr(spec_config, "_draft_model_capabilities", None)
+    if capabilities is not None and capabilities.num_draft_modules:
+        return capabilities.num_draft_modules
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         return 1
     if spec_config.spec_dec_mode.is_mtp_vanilla():
@@ -455,6 +457,14 @@ def get_num_spec_layers(spec_config):
         num_draft_hidden_layers = spec_config._num_draft_hidden_layers
         return num_draft_hidden_layers if num_draft_hidden_layers is not None else 1
     return 0
+
+
+def get_num_draft_kv_layers(spec_config):
+    """Return the number of draft-owned layers requiring KV cache storage."""
+    capabilities = getattr(spec_config, "_draft_model_capabilities", None)
+    if capabilities is not None:
+        return capabilities.num_draft_kv_layers
+    return get_num_spec_layers(spec_config)
 
 
 def update_spec_config_from_draft_model_config(spec_config,
@@ -522,6 +532,9 @@ def get_num_extra_kv_tokens(spec_config):
     KV cache tokens are required.
     """
     if spec_config is None:
+        return 0
+    capabilities = getattr(spec_config, "_draft_model_capabilities", None)
+    if capabilities is not None and capabilities.shares_target_kv_cache:
         return 0
     if spec_config.spec_dec_mode.use_one_engine():
         return spec_config.max_draft_len - 1

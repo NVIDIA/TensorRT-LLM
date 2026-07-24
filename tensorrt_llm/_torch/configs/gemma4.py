@@ -27,11 +27,14 @@ class Gemma4AssistantConfig(PreTrainedConfig):
     model_type = "gemma4_assistant"
     sub_configs = {"text_config": Gemma4TextConfig}
 
-    # Runtime capabilities consumed by the generic two-model MTP pipeline.
+    # Runtime ownership contract for the one-model speculative pipeline.
+    loads_external_weights = True
+    num_draft_modules = 1
+    owns_independent_kv_cache = False
+    num_draft_kv_layers = 0
     shares_target_kv_cache = True
-    preserve_checkpoint_layer_count = True
     freezes_draft_attention_state = True
-    cuda_graph_external_draft_len = 0
+    requires_external_draft_metadata_view = True
 
     def __init__(
         self,

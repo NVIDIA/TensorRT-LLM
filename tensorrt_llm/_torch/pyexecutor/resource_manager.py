@@ -168,7 +168,7 @@ def get_pp_layers(
     spec_config: Optional["DecodingBaseConfig"] = None,
     layer_mask: Optional[List[bool]] = None,
 ) -> Tuple[List[int], int]:
-    from ..speculative.utils import get_num_spec_layers
+    from ..speculative.utils import get_num_draft_kv_layers
 
     total_num_layers = num_layers
     if layer_mask is not None:
@@ -193,7 +193,7 @@ def get_pp_layers(
     # When layer_mask is provided, the caller explicitly controls which layers
     # to include, so we should not add extra layers automatically.
     if spec_config is not None and layer_mask is None:
-        num_spec_layers = get_num_spec_layers(spec_config)
+        num_spec_layers = get_num_draft_kv_layers(spec_config)
         total_num_layers += num_spec_layers
         if mapping.is_last_pp_rank():
             pp_layers.extend(
