@@ -80,8 +80,14 @@ def get_build_dir(build_dir, build_type):
     return build_dir
 
 
-def stage_msa_package(project_dir: Path, build_dir: Path) -> Path:
-    """Copy pinned MSA sources and apply TensorRT-LLM's downstream patch."""
+def apply_msa_patch(project_dir: Path) -> None:
+    """Apply TensorRT-LLM's downstream MSA patch in place, idempotently.
+
+    The patch is applied directly to the pinned 3rdparty/MSA submodule working
+    tree so every consumer sees the patched fmha_sm100 sources: the runtime
+    importer, editable installs, and wheel packaging. Re-running is a no-op, so
+    it is safe to call on every build.
+    """
     msa_source_dir = project_dir / "3rdparty" / "MSA"
     msa_package_dir = msa_source_dir / "python" / "fmha_sm100"
     msa_patch = project_dir / "3rdparty" / "patches" / "msa_strided_paged_kv.patch"
@@ -90,25 +96,37 @@ def stage_msa_package(project_dir: Path, build_dir: Path) -> Path:
             f"MSA sources are missing at {msa_package_dir}; initialize 3rdparty/MSA"
         )
 
-    staging_dir = build_dir / "msa_patched"
-    if staging_dir.exists():
-        rmtree(staging_dir)
-    copytree(msa_source_dir, staging_dir, ignore=shutil.ignore_patterns(".git"))
     git_env = os.environ.copy()
-    git_env["GIT_CEILING_DIRECTORIES"] = str(staging_dir.parent.resolve())
+    git_env["GIT_CEILING_DIRECTORIES"] = str(msa_source_dir.parent.resolve())
+
+    # A clean reverse-apply means the patch is already present, so a forward
+    # apply would fail. Skip in that case.
+    already_applied = run(
+        ["git", "apply", "--reverse", "--check",
+         str(msa_patch)],
+        cwd=msa_source_dir,
+        env=git_env,
+        stdout=DEVNULL,
+        stderr=DEVNULL,
+    ).returncode == 0
+    if already_applied:
+        print(f"-- MSA patch already applied at {msa_package_dir}; skipping.")
+        return
+
+    # Verify a clean forward apply before mutating the working tree.
     run(
         ["git", "apply", "--check", str(msa_patch)],
-        cwd=staging_dir,
+        cwd=msa_source_dir,
         env=git_env,
         check=True,
     )
     run(
         ["git", "apply", str(msa_patch)],
-        cwd=staging_dir,
+        cwd=msa_source_dir,
         env=git_env,
         check=True,
     )
-    return staging_dir / "python" / "fmha_sm100"
+    print(f"-- Applied MSA patch to {msa_package_dir}.")
 
 
 def clear_folder(folder_path):
@@ -564,6 +582,10 @@ def main(*,
     if any(not (project_dir / submodule / ".git").exists()
            for submodule in submodules):
         build_run('git submodule update --init --recursive')
+
+    # Apply the downstream MSA patch before any packaging so every consumer
+    # loads the patched sources.
+    apply_msa_patch(project_dir)
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
 
@@ -1204,14 +1226,10 @@ def main(*,
                 f"Copied auto-generated attributions to {project_dir / 'ATTRIBUTIONS.md'}"
             )
 
-        msa_package_dir = stage_msa_package(project_dir, build_dir)
-        wheel_env = os.environ.copy()
-        wheel_env["TRTLLM_MSA_PACKAGE_DIR"] = str(msa_package_dir)
-
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"',
-            env=wheel_env)
-        env = wheel_env.copy()
+            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
+        )
+        env = os.environ.copy()
         if mypyc:
             env["TRTLLM_ENABLE_MYPYC"] = "1"
         else:
