@@ -14,9 +14,16 @@
 # limitations under the License.
 
 import os
+import warnings
 
 # Disable UCC to WAR allgather issue before NGC PyTorch 25.12 upgrade.
 os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
+
+# Suppress modelopt version incompatibility warning triggered at import time.
+# The warning is not actionable for TRT-LLM users since the transformers
+# version is pinned by TRT-LLM's own dependency requirements.
+warnings.filterwarnings("ignore",
+                        message=".*incompatible with nvidia-modelopt.*")
 
 
 def _add_trt_llm_dll_directory():
