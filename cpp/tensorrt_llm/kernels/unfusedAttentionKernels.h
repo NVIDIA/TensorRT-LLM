@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -413,10 +413,15 @@ void invokeUpdateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
 template <typename T, typename T_cache, typename KVCacheBuffer>
 void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
 
-// Debug function to test basic parameter access
-template <typename T, typename KVCacheBuffer>
-void invokeDebugSparseKvCacheParams(
-    QKVPreprocessingParams<T, KVCacheBuffer> params, int* debug_output, cudaStream_t stream);
+//! Compact a uniform group of KVCacheManagerV2 layer pools in one batched launch
+//! (per request and head, moves are ascending and never overtake their sources:
+//! the copy runs in place).
+template <typename T>
+void invokeSparseKvCacheCompactLayers(int64_t const* poolPointers, int32_t const* pageTable, int32_t numLayers,
+    int64_t pageTableRequestStride, int32_t const* sparseKvIndices, int32_t const* sourceLayerIndices,
+    int64_t sourceLayerStride, int64_t sourceHeadStride, int32_t const* sparseKvOffsets,
+    int32_t const* destinationBases, int32_t batchSize, int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim,
+    cudaStream_t stream);
 
 template <typename T, typename KVCacheBuffer>
 void invokeKvCachePostprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
