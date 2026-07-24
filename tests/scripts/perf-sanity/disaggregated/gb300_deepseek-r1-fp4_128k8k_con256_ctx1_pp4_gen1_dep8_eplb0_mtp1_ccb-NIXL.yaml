@@ -17,7 +17,7 @@ slurm:
 benchmark:
   mode: e2e
   use_nv_sa_benchmark: false
-  multi_round: 3
+  multi_round: 1
   benchmark_ratio: 0.0
   streaming: true
   concurrency_list: '256'
@@ -28,6 +28,8 @@ hardware:
   gpus_per_node: 4
   num_ctx_servers: 1
   num_gen_servers: 1
+server_config_extra:
+  schedule_style: generation_first
 environment:
   container_mount: <container_mount>
   container_image: <container_image>
@@ -37,6 +39,8 @@ environment:
   work_dir: <full_path_to_work_dir>
   worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1
     TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes
+  ctx_worker_env_var: TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_TERMINAL_CONSENSUS=0 TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_PEER_READY_CONSENSUS=0
+    TRTLLM_PYTHON_TRANSCEIVER_CONTEXT_ACTIVATION_DIGEST=1
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false

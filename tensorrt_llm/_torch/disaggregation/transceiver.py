@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
 import threading
 import time
@@ -71,6 +72,7 @@ from tensorrt_llm.mapping import Mapping
 
 _ASYNC_TERMINAL_ENV = "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_TERMINAL_CONSENSUS"
 _ASYNC_PEER_READY_ENV = "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_PEER_READY_CONSENSUS"
+_CONTEXT_ACTIVATION_DIGEST_ENV = "TRTLLM_PYTHON_TRANSCEIVER_CONTEXT_ACTIVATION_DIGEST"
 _ASYNC_STARTUP_TAG = "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CONSENSUS"
 _ASYNC_READY_CANCELLED_EPOCH_ATTR = "_trtllm_async_ready_cancelled_epoch"
 _MAX_RETIRED_CONSENSUS_REQUESTS = 65536
@@ -197,7 +199,41 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # independent teardown step before surfacing its first error.
             logger.error(f"Python transceiver startup rollback failed: {error}")
 
+    def _init_context_activation_digest(self) -> None:
+        enabled = self._parse_binary_env(
+            _CONTEXT_ACTIVATION_DIGEST_ENV,
+            os.getenv(_CONTEXT_ACTIVATION_DIGEST_ENV, "0"),
+        )
+        self._context_activation_digest = hashlib.sha256() if enabled else None
+        self._context_activation_count = 0
+        self._context_activation_digest_logged = False
+
+    def _record_context_activation_ids(self, request_ids: List[int]) -> None:
+        """Record an order-sensitive digest without logging request IDs."""
+        digest = getattr(self, "_context_activation_digest", None)
+        if digest is None:
+            return
+        for request_id in request_ids:
+            payload = str(int(request_id)).encode("ascii")
+            digest.update(len(payload).to_bytes(4, byteorder="big"))
+            digest.update(payload)
+        self._context_activation_count += len(request_ids)
+
+    def _log_context_activation_digest(self) -> None:
+        digest = getattr(self, "_context_activation_digest", None)
+        if digest is None or getattr(self, "_context_activation_digest_logged", False):
+            return
+        logger.info(
+            "PYTHON_CONTEXT_ACTIVATION_SEQUENCE "
+            f"rank={self._dist.rank} "
+            f"count={self._context_activation_count} "
+            f"digest={digest.hexdigest()} "
+            "algorithm=sha256-length-prefixed-decimal-v1"
+        )
+        self._context_activation_digest_logged = True
+
     def _init_async_consensus(self, cache_transceiver_config: CacheTransceiverConfig) -> None:
+        self._init_context_activation_digest()
         terminal_value = os.getenv(_ASYNC_TERMINAL_ENV, "0")
         peer_ready_value = os.getenv(_ASYNC_PEER_READY_ENV, "0")
         self._async_terminal_flag_value = terminal_value
@@ -432,6 +468,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def shutdown(self):
         if getattr(self, "_shutdown_complete", False):
+            self._log_context_activation_digest()
             return
         worker_event = getattr(self, "_shutdown_worker_event", None)
         if worker_event is not None and not worker_event.is_set():
@@ -542,6 +579,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             and getattr(self, "_shutdown_consensus_complete", False)
             and getattr(self, "_shutdown_worker_complete", False)
         )
+        if self._shutdown_complete:
+            self._log_context_activation_digest()
         worker_event = getattr(self, "_shutdown_worker_event", None)
         if worker_event is not None and not getattr(self, "_shutdown_worker_complete", False):
             deferred_errors = getattr(self, "_shutdown_deferred_errors", [])
@@ -2116,6 +2155,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._async_ready_activated[key] = prepared_req
             coordinator.acknowledge_ready_activation(rid, epoch)
             self._record_async_transition("ready_activate", rid, epoch)
+        self._record_context_activation_ids([rid for rid, _, _, _ in activations])
 
     def supports_pre_active_context_requests(self) -> bool:
         return bool(getattr(self, "_async_peer_ready_consensus_enabled", False))
@@ -2188,9 +2228,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             for rid in self._wait_reqs
             if self._transfer_worker.has_all_peer_req_infos_for_send(rid)
         ]
-        for rid in self._ctx_consensus(local_ready):
+        ready_request_ids = self._ctx_consensus(local_ready)
+        for rid in ready_request_ids:
             self._wait_reqs[rid].state = LlmRequestState.CONTEXT_INIT
             del self._wait_reqs[rid]
+        self._record_context_activation_ids(ready_request_ids)
 
     def _prepare_context_requests_async(self) -> None:
         coordinator = cast(AsyncConsensusCoordinator, self._async_consensus)
