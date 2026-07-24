@@ -158,12 +158,6 @@ Algorithm implementations live under
 - `hooks.py` — module hooks and common backend prediction orchestration.
 - `registry.py` — backend, metadata, and cache-manager dispatch helpers.
 
-Dense and sparse MLA share the same `MLA` module interface. Algorithm-specific
-behavior is selected by backend hooks implemented in each algorithm directory;
-new sparse algorithms should not add a parallel MLA module. The FlashMLA
-adapter remains with DSA because it directly wraps the algorithm-specific
-sparse attention kernel.
-
 ### AttentionOp behavior
 
 <div align="center">
@@ -331,6 +325,3 @@ for the kernel-side specifics.
   eviction as a compromise that keeps KV cache flexibility manageable.
 - **Unified auxiliary memory management** — let custom auxiliary pools
   inherit KV-cache features (reuse, offloading) by default.
-- **Additional shared contracts** — continue moving only genuinely common
-  payload and lifecycle behavior into the sparse framework while keeping
-  algorithm-specific module orchestration inside each algorithm package.

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
+
 from __future__ import annotations
 
 import math
@@ -12,8 +13,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.bindings.internal.batch_manager import \
-    CacheType as CacheTypeCpp
+from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.mapping import Mapping
 
 from .params import DSAParams
@@ -21,8 +21,7 @@ from .params import DSAParams
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
-                                              SparseAttentionConfig)
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, SparseAttentionConfig
 
 
 class DSACacheManager(KVCacheManager):
@@ -58,10 +57,10 @@ class DSACacheManager(KVCacheManager):
         if sparse_attention_config is None and model_config is not None:
             sparse_attention_config = model_config.sparse_attention_config
         if sparse_attention_config is None:
-            raise ValueError(
-                "sparse_attention_config is required for DSA cache")
+            raise ValueError("sparse_attention_config is required for DSA cache")
         sparse_params = sparse_attention_config.to_sparse_params(
-            pretrained_config=pretrained_config)
+            pretrained_config=pretrained_config
+        )
         if not isinstance(sparse_params, DSAParams):
             raise ValueError("DSA cache requires DSA sparse parameters")
         self.quant_block_size = 128
@@ -111,10 +110,10 @@ class DSACacheManager(KVCacheManager):
         per_token_size = data_bytes + self.index_head_dim // self.quant_block_size * 4
         layer_offset = self.layer_offsets[layer_idx]
         return self.indexer_k_cache_pool_per_layer[layer_offset].view(
-            self.num_blocks, block_size, 1, per_token_size)
+            self.num_blocks, block_size, 1, per_token_size
+        )
 
-    def get_batch_indexer_k_cache_indices(
-            self, request_ids: List[int]) -> List[List[int]]:
+    def get_batch_indexer_k_cache_indices(self, request_ids: List[int]) -> List[List[int]]:
         """
         Get the indices for the indexer k cache for a specific batch of requests.
         """
@@ -128,18 +127,17 @@ class DSACacheManager(KVCacheManager):
         super().shutdown()
 
     @staticmethod
-    def get_cache_size_per_token(model_config: ModelConfig,
-                                 mapping: Mapping,
-                                 num_layers: Optional[int] = None,
-                                 **kwargs):
+    def get_cache_size_per_token(
+        model_config: ModelConfig, mapping: Mapping, num_layers: Optional[int] = None, **kwargs
+    ):
         """Estimate total cache bytes per token including indexer K-cache overhead."""
         config = model_config.pretrained_config
         sparse_attention_config = model_config.sparse_attention_config
         if sparse_attention_config is None:
-            raise ValueError(
-                "sparse_attention_config is required for DSA cache")
+            raise ValueError("sparse_attention_config is required for DSA cache")
         sparse_params = sparse_attention_config.to_sparse_params(
-            pretrained_config=model_config.pretrained_config)
+            pretrained_config=model_config.pretrained_config
+        )
         if not isinstance(sparse_params, DSAParams):
             raise ValueError("DSA cache requires DSA sparse parameters")
         index_head_dim = sparse_params.index_head_dim
@@ -154,15 +152,15 @@ class DSACacheManager(KVCacheManager):
         # get kv cache dtype bytes
         mem_per_token = 2
         quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-        ):
+        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
             mem_per_token = 1
 
         # get head dim
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
-            model_config, mapping, num_layers)
+            model_config, mapping, num_layers
+        )
         # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
         mem_per_token *= num_attention_layers * head_dim
 
@@ -172,7 +170,8 @@ class DSACacheManager(KVCacheManager):
         # the latent above). The data-portion byte count already reflects fp8 vs
         # fp4 via indexer_data_dim.
         indexer_bytes_per_token = num_attention_layers * (
-            indexer_data_dim + index_head_dim // quant_block_size * 4)
+            indexer_data_dim + index_head_dim // quant_block_size * 4
+        )
         mem_per_token += indexer_bytes_per_token
         return mem_per_token
 
@@ -181,19 +180,23 @@ class DSACacheManager(KVCacheManager):
         # MLA latent K cache: stored at the KV cache dtype (self.dtype). The
         # indexer K cache is added separately below.
         cache_size_per_token = math.ceil(
-            self.kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
+            self.kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim
+        )
 
-        if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
-                              DataType.FLOAT, DataType.NVFP4):
-            raise ValueError(f'Cannot support {self.dtype} KV cache.')
+        if self.dtype not in (
+            DataType.FP8,
+            DataType.HALF,
+            DataType.BF16,
+            DataType.FLOAT,
+            DataType.NVFP4,
+        ):
+            raise ValueError(f"Cannot support {self.dtype} KV cache.")
 
-        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
-                                                       self.dtype)
+        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token, self.dtype)
         if self.dtype == DataType.NVFP4:
             cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
-                cache_size_per_token,
-                quant_vector_size=16,
-                scaling_factor_dtype=DataType.FP8)
+                cache_size_per_token, quant_vector_size=16, scaling_factor_dtype=DataType.FP8
+            )
 
         # Indexer K cache: physically allocated as raw UINT8 in
         # WindowBlockManager::allocatePools (poolDtype = kUINT8), so we assume
@@ -202,7 +205,8 @@ class DSACacheManager(KVCacheManager):
         # E2M1 codes per byte); the scale bytes are unchanged.
         indexer_data_dim = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
         indexer_bytes_per_token = sum(self.num_kv_heads_per_layer) * (
-            indexer_data_dim + self.index_head_dim // self.quant_block_size * 4)
+            indexer_data_dim + self.index_head_dim // self.quant_block_size * 4
+        )
         cache_size_bytes_per_token += indexer_bytes_per_token
 
         return cache_size_bytes_per_token

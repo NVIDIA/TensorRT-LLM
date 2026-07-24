@@ -5,15 +5,12 @@ from typing import TYPE_CHECKING, Type, Union
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionBackend
-    from tensorrt_llm.llmapi.llm_args import \
-        SparseAttentionConfig as LlmSparseAttentionConfig
-    from tensorrt_llm.visual_gen.args import \
-        SparseAttentionConfig as VisualGenSparseAttentionConfig
+    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig as LlmSparseAttentionConfig
+    from tensorrt_llm.visual_gen.args import SparseAttentionConfig as VisualGenSparseAttentionConfig
 
     from .params import SparseParams
 
-    SparseAttentionConfig = Union[LlmSparseAttentionConfig,
-                                  VisualGenSparseAttentionConfig]
+    SparseAttentionConfig = Union[LlmSparseAttentionConfig, VisualGenSparseAttentionConfig]
 
 # Imports of the concrete backends / cache managers are kept local to each
 # function: they pull in ``trtllm`` and ``resource_manager``, which import
@@ -21,14 +18,14 @@ if TYPE_CHECKING:
 # loaded.
 
 
-def get_sparse_attn_kv_cache_manager(
-        sparse_attention_config: "SparseAttentionConfig") -> type:
+def get_sparse_attn_kv_cache_manager(sparse_attention_config: "SparseAttentionConfig") -> type:
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
     from .deepseek_v4 import DeepseekV4CacheManager
     from .dsa import DSACacheManager
     from .minimax_m3 import MiniMaxM3KVCacheManagerV2
     from .rocket import RocketKVCacheManager
+
     if sparse_attention_config.algorithm == "rocket":
         return RocketKVCacheManager
     elif sparse_attention_config.algorithm == "dsa":
@@ -45,8 +42,7 @@ def get_sparse_attn_kv_cache_manager(
         )
 
 
-def _resolve_minimax_m3_backend_cls(
-        sparse_params: "SparseParams") -> Type["AttentionBackend"]:
+def _resolve_minimax_m3_backend_cls(sparse_params: "SparseParams") -> Type["AttentionBackend"]:
     """Select the MiniMax-M3 sparse backend from the lowered params.
 
     The Triton reference is the default. When implementation is 'msa' the MSA
@@ -54,17 +50,21 @@ def _resolve_minimax_m3_backend_cls(
     unsupported system fails early rather than at kernel launch.
     """
     from .minimax_m3 import MiniMaxM3SparseRuntimeBackend
+
     if getattr(sparse_params, "implementation", "triton") == "msa":
         from .minimax_m3 import MiniMaxM3MsaSparseAttention
         from .minimax_m3.msa_availability import ensure_msa_available
+
         ensure_msa_available()
         return MiniMaxM3MsaSparseAttention
     return MiniMaxM3SparseRuntimeBackend
 
 
 def get_vanilla_sparse_attn_attention_backend(
-        sparse_params: "SparseParams") -> Type["AttentionBackend"]:
+    sparse_params: "SparseParams",
+) -> Type["AttentionBackend"]:
     from .rocket import RocketVanillaAttention
+
     if sparse_params.algorithm == "rocket":
         return RocketVanillaAttention
     elif sparse_params.algorithm == "minimax_m3":
@@ -76,12 +76,14 @@ def get_vanilla_sparse_attn_attention_backend(
 
 
 def get_trtllm_sparse_attn_attention_backend(
-        sparse_params: "SparseParams") -> Type["AttentionBackend"]:
+    sparse_params: "SparseParams",
+) -> Type["AttentionBackend"]:
     from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 
     from .deepseek_v4 import DeepseekV4TrtllmAttention
     from .dsa import DSATrtllmAttention
     from .rocket import RocketTrtllmAttention
+
     if sparse_params.algorithm == "rocket":
         return RocketTrtllmAttention
     elif sparse_params.algorithm == "dsa":
@@ -104,7 +106,8 @@ def get_trtllm_sparse_attn_attention_backend(
 
 
 def get_flashinfer_sparse_attn_attention_backend(
-        sparse_params: "SparseParams") -> Type["AttentionBackend"]:
+    sparse_params: "SparseParams",
+) -> Type["AttentionBackend"]:
     if sparse_params.algorithm == "minimax_m3":
         return _resolve_minimax_m3_backend_cls(sparse_params)
     raise ValueError(

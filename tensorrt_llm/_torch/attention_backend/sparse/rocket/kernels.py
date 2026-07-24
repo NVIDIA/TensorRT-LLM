@@ -17,13 +17,24 @@ from triton.language.standard import _log2, sum, zeros_like
 
 
 @triton.jit
-def rocket_qk_split_kernel(input_ptr, q_output_ptr, k_output_ptr,
-                           k_output_offsets_ptr, context_lens_ptr,
-                           context_cumsum_ptr, valid_seq_indices_ptr,
-                           window_size, num_heads, num_kv_heads, head_dim,
-                           q_total_output_tokens, k_total_output_tokens,
-                           valid_batch_size, BLOCK_SIZE: tl.constexpr,
-                           BLOCK_SIZE_M: tl.constexpr):
+def rocket_qk_split_kernel(
+    input_ptr,
+    q_output_ptr,
+    k_output_ptr,
+    k_output_offsets_ptr,
+    context_lens_ptr,
+    context_cumsum_ptr,
+    valid_seq_indices_ptr,
+    window_size,
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    q_total_output_tokens,
+    k_total_output_tokens,
+    valid_batch_size,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+):
     valid_seq_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
     dim_offset = tl.program_id(2) * BLOCK_SIZE
@@ -75,16 +86,17 @@ def rocket_qk_split_kernel(input_ptr, q_output_ptr, k_output_ptr,
 
         # Calculate input indices with proper dimension offset for Q/K separation
         input_dim_indices = input_dim_offset + actual_head_idx * head_dim + dim_indices
-        src_indices = src_token_pos[:, None] * (
-            num_heads * head_dim +
-            2 * num_kv_heads * head_dim) + input_dim_indices[None, :]
+        src_indices = (
+            src_token_pos[:, None] * (num_heads * head_dim + 2 * num_kv_heads * head_dim)
+            + input_dim_indices[None, :]
+        )
 
         # Calculate output indices
-        dst_indices = (actual_head_idx * total_output_tokens +
-                       dst_token_pos[:, None]) * head_dim + dim_indices[None, :]
+        dst_indices = (
+            actual_head_idx * total_output_tokens + dst_token_pos[:, None]
+        ) * head_dim + dim_indices[None, :]
 
-        full_mask = token_mask[:, None] & dim_mask[
-            None, :]  # [BLOCK_SIZE_M, BLOCK_SIZE]
+        full_mask = token_mask[:, None] & dim_mask[None, :]  # [BLOCK_SIZE_M, BLOCK_SIZE]
 
         data = tl.load(input_ptr + src_indices, mask=full_mask, other=0.0)
         tl.store(output_ptr + dst_indices, data, mask=full_mask)
@@ -131,12 +143,16 @@ def triton_rocket_qk_split(
     q_total_output_tokens = window_size * valid_batch_size
     k_total_output_tokens = total_rocket_k_ctx_tokens
 
-    q_window = torch.empty((num_heads, q_total_output_tokens, head_dim),
-                           device=input_tensor.device,
-                           dtype=input_tensor.dtype)
-    k_context = torch.empty((num_kv_heads, k_total_output_tokens, head_dim),
-                            device=input_tensor.device,
-                            dtype=input_tensor.dtype)
+    q_window = torch.empty(
+        (num_heads, q_total_output_tokens, head_dim),
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
+    )
+    k_context = torch.empty(
+        (num_kv_heads, k_total_output_tokens, head_dim),
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
+    )
 
     BLOCK_SIZE = 128  # Dimension block size
     BLOCK_SIZE_M = 128  # Token block size for parallel processing
@@ -145,22 +161,24 @@ def triton_rocket_qk_split(
     total_heads = num_heads + num_kv_heads
     grid = (valid_batch_size, total_heads, triton.cdiv(head_dim, BLOCK_SIZE))
 
-    rocket_qk_split_kernel[grid](input_tensor,
-                                 q_window,
-                                 k_context,
-                                 k_output_offsets,
-                                 input_lens,
-                                 input_lens_cumsum,
-                                 valid_seq_indices,
-                                 window_size,
-                                 num_heads,
-                                 num_kv_heads,
-                                 head_dim,
-                                 q_total_output_tokens,
-                                 k_total_output_tokens,
-                                 valid_batch_size,
-                                 BLOCK_SIZE=BLOCK_SIZE,
-                                 BLOCK_SIZE_M=BLOCK_SIZE_M)
+    rocket_qk_split_kernel[grid](
+        input_tensor,
+        q_window,
+        k_context,
+        k_output_offsets,
+        input_lens,
+        input_lens_cumsum,
+        valid_seq_indices,
+        window_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        q_total_output_tokens,
+        k_total_output_tokens,
+        valid_batch_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+    )
 
     return q_window, k_context
 
@@ -214,15 +232,11 @@ def rocket_batch_to_flatten_kernel(
             # Load from prefix_indices
             flattened_idx = valid_idx_in_selected * num_kv_heads + head_idx
             prefix_indices = flattened_idx * prefix_budget + token_offsets
-            prefix_values = tl.load(prefix_indices_ptr + prefix_indices,
-                                    mask=token_mask,
-                                    other=0)
+            prefix_values = tl.load(prefix_indices_ptr + prefix_indices, mask=token_mask, other=0)
 
             # Store to output
             output_indices = head_idx * total_sparse_tokens + output_offset + token_offsets
-            tl.store(output_indices_ptr + output_indices,
-                     prefix_values,
-                     mask=token_mask)
+            tl.store(output_indices_ptr + output_indices, prefix_values, mask=token_mask)
 
         # Process window tokens
         for token_block_start in tl.range(0, window_size, BLOCK_SIZE):
@@ -233,10 +247,10 @@ def rocket_batch_to_flatten_kernel(
             window_values = context_len - window_size + token_offsets
 
             # Store to output at prefix_budget offset
-            output_indices = head_idx * total_sparse_tokens + output_offset + prefix_budget + token_offsets
-            tl.store(output_indices_ptr + output_indices,
-                     window_values,
-                     mask=token_mask)
+            output_indices = (
+                head_idx * total_sparse_tokens + output_offset + prefix_budget + token_offsets
+            )
+            tl.store(output_indices_ptr + output_indices, window_values, mask=token_mask)
     else:
         # Invalid batch: generate [0, 1, ..., context_len-1]
         num_tokens = context_len
@@ -249,17 +263,20 @@ def rocket_batch_to_flatten_kernel(
 
             # Store to output
             output_indices = head_idx * total_sparse_tokens + output_offset + token_offsets
-            tl.store(output_indices_ptr + output_indices,
-                     sequential_indices,
-                     mask=token_mask)
+            tl.store(output_indices_ptr + output_indices, sequential_indices, mask=token_mask)
 
 
 def triton_rocket_batch_to_flatten(
-        prefix_indices: torch.Tensor, input_lens: torch.Tensor,
-        valid_seq_indices: torch.Tensor, output_offsets: torch.Tensor,
-        batch_size: int, total_output_tokens: int, window_size: int,
-        prompt_budget: int,
-        num_kv_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
+    prefix_indices: torch.Tensor,
+    input_lens: torch.Tensor,
+    valid_seq_indices: torch.Tensor,
+    output_offsets: torch.Tensor,
+    batch_size: int,
+    total_output_tokens: int,
+    window_size: int,
+    prompt_budget: int,
+    num_kv_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Flatten indices considering both valid and invalid batches.
     For valid sequences, combines prefix_indices with dynamically computed window indices.
@@ -283,26 +300,30 @@ def triton_rocket_batch_to_flatten(
     valid_batch_size = total_tasks // num_kv_heads
 
     # Create output tensor
-    sparse_indices = torch.empty((num_kv_heads, total_output_tokens),
-                                 dtype=prefix_indices.dtype,
-                                 device=prefix_indices.device)
+    sparse_indices = torch.empty(
+        (num_kv_heads, total_output_tokens),
+        dtype=prefix_indices.dtype,
+        device=prefix_indices.device,
+    )
 
     # Launch kernel
     BLOCK_SIZE = 512
     grid = (batch_size, num_kv_heads)
 
-    rocket_batch_to_flatten_kernel[grid](prefix_indices,
-                                         sparse_indices,
-                                         input_lens,
-                                         valid_seq_indices,
-                                         output_offsets,
-                                         batch_size,
-                                         valid_batch_size,
-                                         num_kv_heads,
-                                         prefix_budget,
-                                         window_size,
-                                         prompt_budget,
-                                         BLOCK_SIZE=BLOCK_SIZE)
+    rocket_batch_to_flatten_kernel[grid](
+        prefix_indices,
+        sparse_indices,
+        input_lens,
+        valid_seq_indices,
+        output_offsets,
+        batch_size,
+        valid_batch_size,
+        num_kv_heads,
+        prefix_budget,
+        window_size,
+        prompt_budget,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
 
     return sparse_indices
 
@@ -352,24 +373,26 @@ def rocket_update_kt_cache_gen_kernel(
     if block_offset_in_seq >= max_kt_blocks_per_seq:
         return
 
-    block_idx = tl.load(kt_cache_block_offsets_ptr +
-                        batch_idx * max_kt_blocks_per_seq + block_offset_in_seq)
+    block_idx = tl.load(
+        kt_cache_block_offsets_ptr + batch_idx * max_kt_blocks_per_seq + block_offset_in_seq
+    )
     token_idx_in_block = last_kt_token_idx % tokens_per_block
 
-    cache_base = ((block_idx * tokens_per_block + token_idx_in_block) *
-                  num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
+    cache_base = (
+        block_idx * tokens_per_block + token_idx_in_block
+    ) * num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim
 
     cache_min_indices = cache_base + dim_indices
     cache_max_indices = cache_base + head_dim + dim_indices
 
     kt_mask = dim_mask & (kt_token_idx_in_page > 0)
 
-    k_min_existing = tl.load(kt_cache_tensor_ptr + cache_min_indices,
-                             mask=kt_mask,
-                             other=float('inf'))
-    k_max_existing = tl.load(kt_cache_tensor_ptr + cache_max_indices,
-                             mask=kt_mask,
-                             other=float('-inf'))
+    k_min_existing = tl.load(
+        kt_cache_tensor_ptr + cache_min_indices, mask=kt_mask, other=float("inf")
+    )
+    k_max_existing = tl.load(
+        kt_cache_tensor_ptr + cache_max_indices, mask=kt_mask, other=float("-inf")
+    )
 
     k_min_new = tl.minimum(k_min_existing, k_values)
     k_max_new = tl.maximum(k_max_existing, k_values)
@@ -409,19 +432,21 @@ def triton_rocket_update_kt_cache_gen(
 
     DIM_BLOCK_SIZE = triton.next_power_of_2(head_dim)
 
-    rocket_update_kt_cache_gen_kernel[grid](k,
-                                            kt_cache_tensor,
-                                            kt_cache_block_offsets,
-                                            kv_lens,
-                                            num_gen_tokens,
-                                            num_kv_heads,
-                                            head_dim,
-                                            kt_page_size,
-                                            tokens_per_block,
-                                            max_kt_blocks_per_seq,
-                                            k.stride(0),
-                                            k.stride(1),
-                                            DIM_BLOCK_SIZE=DIM_BLOCK_SIZE)
+    rocket_update_kt_cache_gen_kernel[grid](
+        k,
+        kt_cache_tensor,
+        kt_cache_block_offsets,
+        kv_lens,
+        num_gen_tokens,
+        num_kv_heads,
+        head_dim,
+        kt_page_size,
+        tokens_per_block,
+        max_kt_blocks_per_seq,
+        k.stride(0),
+        k.stride(1),
+        DIM_BLOCK_SIZE=DIM_BLOCK_SIZE,
+    )
 
 
 @triton.jit
@@ -479,12 +504,11 @@ def rocket_update_kt_cache_ctx_kernel(
         dim_indices = dim_block_start + dim_offsets
         dim_mask = dim_indices < head_dim
 
-        kv_token_indices = tl.load(sparse_kv_indices_ptr + kv_indices,
-                                   mask=kv_mask,
-                                   other=0)
+        kv_token_indices = tl.load(sparse_kv_indices_ptr + kv_indices, mask=kv_mask, other=0)
         # Calculate indices for loading keys [BLOCK_SIZE_DIM, BLOCK_SIZE_KV]
         k_base_indices = (kv_token_indices[None, :] + context_start) * (
-            q_hidden_size + 2 * kv_hidden_size) + k_dim_base
+            q_hidden_size + 2 * kv_hidden_size
+        ) + k_dim_base
         k_indices = k_base_indices + dim_indices[:, None]
 
         combined_mask = kv_mask[None, :] & dim_mask[:, None]
@@ -492,30 +516,27 @@ def rocket_update_kt_cache_ctx_kernel(
         # Load key values [BLOCK_SIZE_DIM, BLOCK_SIZE_KV]
         k_values = tl.load(k_ptr + k_indices, mask=combined_mask, other=0.0)
 
-        k_values = tl.reshape(k_values,
-                              (BLOCK_SIZE_DIM, BLOCK_SIZE_KT, kt_page_size))
+        k_values = tl.reshape(k_values, (BLOCK_SIZE_DIM, BLOCK_SIZE_KT, kt_page_size))
 
-        k_min = tl.min(k_values,
-                       axis=-1).to(kt_cache_tensor_ptr.dtype.element_ty)
-        k_max = tl.max(k_values,
-                       axis=-1).to(kt_cache_tensor_ptr.dtype.element_ty)
+        k_min = tl.min(k_values, axis=-1).to(kt_cache_tensor_ptr.dtype.element_ty)
+        k_max = tl.max(k_values, axis=-1).to(kt_cache_tensor_ptr.dtype.element_ty)
 
         # Calculate cache locations [BLOCK_SIZE_KT]
         block_offsets_in_seq = kt_offsets // tokens_per_block
-        valid_block_mask = (block_offsets_in_seq
-                            < max_kt_blocks_per_seq) & kt_mask
+        valid_block_mask = (block_offsets_in_seq < max_kt_blocks_per_seq) & kt_mask
 
         # Load block indices [BLOCK_SIZE_KT]
         block_offset_addrs = batch_idx * max_kt_blocks_per_seq + block_offsets_in_seq
-        block_indices = tl.load(kt_cache_block_offsets_ptr + block_offset_addrs,
-                                mask=valid_block_mask,
-                                other=0)
+        block_indices = tl.load(
+            kt_cache_block_offsets_ptr + block_offset_addrs, mask=valid_block_mask, other=0
+        )
 
         tokens_in_block = kt_offsets % tokens_per_block
 
         # Calculate cache base addresses [BLOCK_SIZE_KT]
-        cache_bases = ((block_indices * tokens_per_block + tokens_in_block) *
-                       num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
+        cache_bases = (
+            block_indices * tokens_per_block + tokens_in_block
+        ) * num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim
 
         cache_min_addrs = cache_bases[None, :] + dim_indices[:, None]
         cache_max_addrs = cache_min_addrs + head_dim
@@ -545,7 +566,8 @@ def triton_rocket_update_kt_cache_ctx(
     Update KT cache during context phase using sparse indices.
 
     Args:
-        qkv_input: QKV input tensor [total_sparse_tokens, num_heads*head_dim + num_kv_heads*head_dim + num_kv_heads*head_dim]
+        qkv_input: QKV input tensor [total_sparse_tokens,
+            num_heads*head_dim + num_kv_heads*head_dim + num_kv_heads*head_dim]
         kt_cache_tensor: KT cache [num_blocks, tokens_per_block, num_kv_heads, 2*head_dim]
         kt_cache_block_offsets: Block offsets [batch_size, max_kt_blocks_per_seq]
         sparse_kv_indices: Sparse KV indices [num_kv_heads, total_sparse_tokens]
@@ -566,8 +588,7 @@ def triton_rocket_update_kt_cache_ctx(
     BLOCK_SIZE_KT = 8
     BLOCK_SIZE_DIM = triton.next_power_of_2(head_dim)
 
-    grid = (batch_size, num_kv_heads,
-            (total_kt_tokens + BLOCK_SIZE_KT - 1) // BLOCK_SIZE_KT)
+    grid = (batch_size, num_kv_heads, (total_kt_tokens + BLOCK_SIZE_KT - 1) // BLOCK_SIZE_KT)
 
     rocket_update_kt_cache_ctx_kernel[grid](
         qkv_input,
@@ -632,21 +653,18 @@ def rocket_paged_kt_cache_bmm_kernel(
     dim_indices = tl.arange(0, DIM_BLOCK_SIZE)
     dim_mask = dim_indices < head_dim
 
-    q_indices = q_base + q_head_offsets[:, None] * q_stride_2 + dim_indices[
-        None, :] * q_stride_3
-    q_values = tl.load(q_ptr + q_indices,
-                       mask=q_head_mask[:, None] & dim_mask[None, :])
+    q_indices = q_base + q_head_offsets[:, None] * q_stride_2 + dim_indices[None, :] * q_stride_3
+    q_values = tl.load(q_ptr + q_indices, mask=q_head_mask[:, None] & dim_mask[None, :])
 
     dim_pos_values = tl.sum(q_values, axis=0) > 0
-    dim_pos_values = tl.broadcast_to(dim_pos_values[None, :],
-                                     (KT_BLOCK_SIZE, DIM_BLOCK_SIZE))
+    dim_pos_values = tl.broadcast_to(dim_pos_values[None, :], (KT_BLOCK_SIZE, DIM_BLOCK_SIZE))
 
     q_values = q_values.to(kt_cache_tensor_ptr.dtype.element_ty)
 
     for kt_block_idx_start in tl.range(
-            0,
-            num_kt_tokens,
-            KT_BLOCK_SIZE,
+        0,
+        num_kt_tokens,
+        KT_BLOCK_SIZE,
     ):
         kt_block_idx_start = tl.multiple_of(kt_block_idx_start, KT_BLOCK_SIZE)
 
@@ -655,44 +673,41 @@ def rocket_paged_kt_cache_bmm_kernel(
 
         block_offsets = batch_idx * max_kt_blocks_per_seq + kt_token_indices // tokens_per_block
 
-        block_indices = tl.load(kt_cache_block_offsets_ptr + block_offsets,
-                                mask=kt_token_mask,
-                                other=0)
+        block_indices = tl.load(
+            kt_cache_block_offsets_ptr + block_offsets, mask=kt_token_mask, other=0
+        )
         token_indices_in_block = kt_token_indices % tokens_per_block
 
         cache_bases = (
-            (block_indices * tokens_per_block + token_indices_in_block) *
-            num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
+            block_indices * tokens_per_block + token_indices_in_block
+        ) * num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim
 
-        combined_mask = dim_mask[
-            None, :] & kt_token_mask[:,
-                                     None]  # Shape: [KT_BLOCK_SIZE, DIM_BLOCK_SIZE]
+        combined_mask = (
+            dim_mask[None, :] & kt_token_mask[:, None]
+        )  # Shape: [KT_BLOCK_SIZE, DIM_BLOCK_SIZE]
 
         kt_cache_indices_min = cache_bases[:, None] + dim_indices[None, :]
         kt_cache_indices_max = kt_cache_indices_min + head_dim
-        kt_cache_values_min = tl.load(kt_cache_tensor_ptr +
-                                      kt_cache_indices_min,
-                                      mask=combined_mask,
-                                      other=0.0)
-        kt_cache_values_max = tl.load(kt_cache_tensor_ptr +
-                                      kt_cache_indices_max,
-                                      mask=combined_mask,
-                                      other=0.0)
+        kt_cache_values_min = tl.load(
+            kt_cache_tensor_ptr + kt_cache_indices_min, mask=combined_mask, other=0.0
+        )
+        kt_cache_values_max = tl.load(
+            kt_cache_tensor_ptr + kt_cache_indices_max, mask=combined_mask, other=0.0
+        )
 
-        kt_cache_values = tl.where(dim_pos_values > 0, kt_cache_values_max,
-                                   kt_cache_values_min)
+        kt_cache_values = tl.where(dim_pos_values > 0, kt_cache_values_max, kt_cache_values_min)
 
-        results = tl.dot(q_values,
-                         kt_cache_values.T)  # [Q_BLOCK_SIZE, KT_BLOCK_SIZE]
+        results = tl.dot(q_values, kt_cache_values.T)  # [Q_BLOCK_SIZE, KT_BLOCK_SIZE]
 
         output_mask = q_head_mask[:, None] & kt_token_mask[None, :]
-        output_indices = (kv_head_idx * num_heads_per_kv * total_kt_tokens +
-                          q_head_offsets[:, None] * total_kt_tokens +
-                          output_offset + kt_token_indices[None, :])
+        output_indices = (
+            kv_head_idx * num_heads_per_kv * total_kt_tokens
+            + q_head_offsets[:, None] * total_kt_tokens
+            + output_offset
+            + kt_token_indices[None, :]
+        )
 
-        tl.store(output_ptr + output_indices,
-                 results * sm_scale,
-                 mask=output_mask)
+        tl.store(output_ptr + output_indices, results * sm_scale, mask=output_mask)
 
 
 def triton_rocket_paged_kt_cache_bmm(
@@ -731,9 +746,9 @@ def triton_rocket_paged_kt_cache_bmm(
         sm_scale = 1.0 / math.sqrt(head_dim)
 
     # Create output tensor with shape [num_kv_heads, num_heads_per_kv, total_kt_tokens]
-    output = torch.empty((num_kv_heads, num_heads_per_kv, total_kt_tokens),
-                         dtype=torch.float32,
-                         device=q.device)
+    output = torch.empty(
+        (num_kv_heads, num_heads_per_kv, total_kt_tokens), dtype=torch.float32, device=q.device
+    )
 
     def grid(_meta):
         return num_gen_tokens, num_kv_heads
@@ -843,9 +858,7 @@ def triton_rocket_reduce_scores(
     """
     total_kt_tokens = scores.shape[-1]
 
-    output = torch.empty((num_kv_heads, total_kt_tokens),
-                         dtype=torch.float32,
-                         device=scores.device)
+    output = torch.empty((num_kv_heads, total_kt_tokens), dtype=torch.float32, device=scores.device)
 
     BLOCK_SIZE = 256
     grid = (batch_size, num_kv_heads)
@@ -870,10 +883,19 @@ def triton_rocket_reduce_scores(
 
 
 @triton.jit
-def _index_gather_kernel(output_ptr, input_ptr, index_ptr, in_row_stride,
-                         in_token_stride, in_head_stride, idx_row_stride,
-                         idx_token_stride, idx_head_stride, dim_size,
-                         BLOCK_SIZE: tl.constexpr):
+def _index_gather_kernel(
+    output_ptr,
+    input_ptr,
+    index_ptr,
+    in_row_stride,
+    in_token_stride,
+    in_head_stride,
+    idx_row_stride,
+    idx_token_stride,
+    idx_head_stride,
+    dim_size,
+    BLOCK_SIZE: tl.constexpr,
+):
     # get program id and block offset
     row_pid = tl.program_id(0)
     token_pid = tl.program_id(1)
@@ -882,14 +904,18 @@ def _index_gather_kernel(output_ptr, input_ptr, index_ptr, in_row_stride,
     head_num = tl.num_programs(2)
 
     # get index
-    indices_idx = row_pid * idx_row_stride + token_pid * idx_token_stride + head_pid * idx_head_stride
+    indices_idx = (
+        row_pid * idx_row_stride + token_pid * idx_token_stride + head_pid * idx_head_stride
+    )
     token_idx = tl.load(index_ptr + indices_idx)
 
     # get input and output base address
-    input_base = (row_pid * in_row_stride + token_idx * in_token_stride +
-                  head_pid * in_head_stride)
-    output_base = (row_pid * token_block_num * head_num * dim_size +
-                   token_pid * head_num * dim_size + head_pid * dim_size)
+    input_base = row_pid * in_row_stride + token_idx * in_token_stride + head_pid * in_head_stride
+    output_base = (
+        row_pid * token_block_num * head_num * dim_size
+        + token_pid * head_num * dim_size
+        + head_pid * dim_size
+    )
 
     # process elements in blocks
     for dim_offset in tl.range(0, dim_size, BLOCK_SIZE):
@@ -899,9 +925,7 @@ def _index_gather_kernel(output_ptr, input_ptr, index_ptr, in_row_stride,
         mask = dim_indices < dim_size
 
         # load input and store output
-        input_val = tl.load(input_ptr + input_base + dim_indices,
-                            mask=mask,
-                            other=0.0)
+        input_val = tl.load(input_ptr + input_base + dim_indices, mask=mask, other=0.0)
         tl.store(output_ptr + output_base + dim_indices, input_val, mask=mask)
 
 
@@ -916,23 +940,25 @@ def triton_index_gather(input, indices):
     num_tokens = indices.shape[1]
 
     # create output tensor
-    output = torch.empty((row_size, num_tokens, head_num, dim_size),
-                         device='cuda',
-                         dtype=input.dtype)
+    output = torch.empty(
+        (row_size, num_tokens, head_num, dim_size), device="cuda", dtype=input.dtype
+    )
 
     # launch kernel
     grid = (row_size, num_tokens, head_num)
-    _index_gather_kernel[grid](output,
-                               input,
-                               indices,
-                               input.stride(0),
-                               input.stride(1),
-                               input.stride(2),
-                               indices.stride(0),
-                               indices.stride(1),
-                               indices.stride(2),
-                               dim_size,
-                               BLOCK_SIZE=1024)
+    _index_gather_kernel[grid](
+        output,
+        input,
+        indices,
+        input.stride(0),
+        input.stride(1),
+        input.stride(2),
+        indices.stride(0),
+        indices.stride(1),
+        indices.stride(2),
+        dim_size,
+        BLOCK_SIZE=1024,
+    )
     return output
 
 
@@ -996,18 +1022,24 @@ def bmm_kernel(
                 k_dim_mask = k_dim_offsets < head_dim
 
                 # Load query chunk [BLOCK_M, BLOCK_K]
-                q_indices = head_idx * total_q_tokens * head_dim + q_global_offsets[:, None] * head_dim + k_dim_offsets[
-                    None, :]
-                q_chunk = tl.load(q_ptr + q_indices,
-                                  mask=q_mask[:, None] & k_dim_mask[None, :],
-                                  other=0.0)
+                q_indices = (
+                    head_idx * total_q_tokens * head_dim
+                    + q_global_offsets[:, None] * head_dim
+                    + k_dim_offsets[None, :]
+                )
+                q_chunk = tl.load(
+                    q_ptr + q_indices, mask=q_mask[:, None] & k_dim_mask[None, :], other=0.0
+                )
 
                 # Load key chunk [BLOCK_N, BLOCK_K]
-                k_indices = k_head_idx * total_k_tokens * head_dim + k_global_offsets[:, None] * head_dim + k_dim_offsets[
-                    None, :]
-                k_chunk = tl.load(k_ptr + k_indices,
-                                  mask=k_mask[:, None] & k_dim_mask[None, :],
-                                  other=0.0)
+                k_indices = (
+                    k_head_idx * total_k_tokens * head_dim
+                    + k_global_offsets[:, None] * head_dim
+                    + k_dim_offsets[None, :]
+                )
+                k_chunk = tl.load(
+                    k_ptr + k_indices, mask=k_mask[:, None] & k_dim_mask[None, :], other=0.0
+                )
 
                 # Accumulate QK^T using tl.dot for better performance
                 qk += tl.dot(q_chunk, tl.trans(k_chunk))
@@ -1028,20 +1060,24 @@ def bmm_kernel(
 
             # Store results - note that we store in the global k position space
             # This matches the original bmm_softmax kernel behavior
-            output_indices = (head_idx * q_len_per_seq * total_k_tokens +
-                              q_offsets[:, None] * total_k_tokens +
-                              k_global_offsets[None, :])  # [BLOCK_M, BLOCK_N]
+            output_indices = (
+                head_idx * q_len_per_seq * total_k_tokens
+                + q_offsets[:, None] * total_k_tokens
+                + k_global_offsets[None, :]
+            )  # [BLOCK_M, BLOCK_N]
 
             tl.store(scores_ptr + output_indices, qk, mask=valid_mask)
 
 
-def triton_bmm(q: torch.Tensor,
-               k: torch.Tensor,
-               q_cu_seqlens: torch.Tensor,
-               k_cu_seqlens: torch.Tensor,
-               batch_size: int,
-               sm_scale: float = None,
-               causal: bool = False) -> torch.Tensor:
+def triton_bmm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_cu_seqlens: torch.Tensor,
+    k_cu_seqlens: torch.Tensor,
+    batch_size: int,
+    sm_scale: float = None,
+    causal: bool = False,
+) -> torch.Tensor:
     """
     Compute softmax(QK^T) with flattened input and output.
     In this kernel we assume that each sequence in the batch has the same Q length.
@@ -1065,16 +1101,16 @@ def triton_bmm(q: torch.Tensor,
     q_len_per_seq = total_q_tokens // batch_size
 
     if total_k_tokens == 0:
-        return torch.zeros((num_q_heads, q_len_per_seq, total_k_tokens),
-                           dtype=torch.float32,
-                           device=q.device)
+        return torch.zeros(
+            (num_q_heads, q_len_per_seq, total_k_tokens), dtype=torch.float32, device=q.device
+        )
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
 
-    bmm_results = torch.empty((num_q_heads, q_len_per_seq, total_k_tokens),
-                              dtype=torch.float32,
-                              device=q.device)
+    bmm_results = torch.empty(
+        (num_q_heads, q_len_per_seq, total_k_tokens), dtype=torch.float32, device=q.device
+    )
 
     # BMM kernel configuration
     BLOCK_M = 32
@@ -1144,16 +1180,14 @@ def softmax_kernel(
     output_row_start = input_row_start
 
     # Find max value only within the valid k range for this batch
-    row_max = float('-inf')
+    row_max = float("-inf")
     for k_block_start in tl.range(0, k_seqlen, BLOCK_SIZE):
         k_offsets = k_block_start + tl.arange(0, BLOCK_SIZE)
         k_mask = k_offsets < k_seqlen
         k_global_offsets = k_seq_start + k_offsets
 
         input_indices = input_row_start + k_global_offsets
-        values = tl.load(input_ptr + input_indices,
-                         mask=k_mask,
-                         other=float('-inf'))
+        values = tl.load(input_ptr + input_indices, mask=k_mask, other=float("-inf"))
         block_max = tl.max(values, axis=0)
         row_max = tl.maximum(row_max, block_max)
 
@@ -1165,9 +1199,7 @@ def softmax_kernel(
         k_global_offsets = k_seq_start + k_offsets
 
         input_indices = input_row_start + k_global_offsets
-        values = tl.load(input_ptr + input_indices,
-                         mask=k_mask,
-                         other=float('-inf'))
+        values = tl.load(input_ptr + input_indices, mask=k_mask, other=float("-inf"))
         exp_values = tl.exp(values - row_max)
         masked_exp = tl.where(k_mask, exp_values, 0.0)
         row_sum += tl.sum(masked_exp, axis=0)
@@ -1181,9 +1213,7 @@ def softmax_kernel(
         input_indices = input_row_start + k_global_offsets
         output_indices = output_row_start + k_global_offsets
 
-        values = tl.load(input_ptr + input_indices,
-                         mask=k_mask,
-                         other=float('-inf'))
+        values = tl.load(input_ptr + input_indices, mask=k_mask, other=float("-inf"))
         exp_values = tl.exp(values - row_max)
         masked_exp = tl.where(k_mask, exp_values, 0.0)
         softmax_values = masked_exp / row_sum
@@ -1213,9 +1243,7 @@ def triton_softmax(
     else:
         num_heads, len_per_seq, total_k_tokens = input_tensor.shape
 
-    output = torch.empty_like(input_tensor,
-                              dtype=input_tensor.dtype,
-                              device=input_tensor.device)
+    output = torch.empty_like(input_tensor, dtype=input_tensor.dtype, device=input_tensor.device)
 
     BLOCK_SIZE = 512
 
@@ -1262,22 +1290,26 @@ def flatten_to_batch_kernel(
 
         input_indices = head_idx * total_tokens + k_offset + pos_offsets
 
-        output_indices = batch_idx * num_heads * padding_to_size + head_idx * padding_to_size + pos_offsets
+        output_indices = (
+            batch_idx * num_heads * padding_to_size + head_idx * padding_to_size + pos_offsets
+        )
 
         values = tl.where(
             combined_mask,
-            tl.load(input_ptr + input_indices,
-                    mask=combined_mask,
-                    other=padding_value), padding_value)
+            tl.load(input_ptr + input_indices, mask=combined_mask, other=padding_value),
+            padding_value,
+        )
 
         tl.store(output_ptr + output_indices, values, mask=pos_mask)
 
 
-def triton_flatten_to_batch(input_tensor: torch.Tensor,
-                            input_offsets: torch.Tensor,
-                            batch_size: int,
-                            padding_to_size: int,
-                            padding_value=-1e10) -> torch.Tensor:
+def triton_flatten_to_batch(
+    input_tensor: torch.Tensor,
+    input_offsets: torch.Tensor,
+    batch_size: int,
+    padding_to_size: int,
+    padding_value=-1e10,
+) -> torch.Tensor:
     """
     Reshape input_tensor from [num_heads, total_tokens] to [batch_size, num_heads, padding_to_size]
 
@@ -1293,21 +1325,25 @@ def triton_flatten_to_batch(input_tensor: torch.Tensor,
     """
     num_heads, total_tokens = input_tensor.shape
 
-    batched_tensor = torch.empty((batch_size, num_heads, padding_to_size),
-                                 device=input_tensor.device,
-                                 dtype=input_tensor.dtype)
+    batched_tensor = torch.empty(
+        (batch_size, num_heads, padding_to_size),
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
+    )
 
     def grid(_meta):
         return batch_size, num_heads
 
-    flatten_to_batch_kernel[grid](input_tensor,
-                                  batched_tensor,
-                                  input_offsets,
-                                  num_heads,
-                                  total_tokens,
-                                  padding_to_size,
-                                  padding_value,
-                                  BLOCK_SIZE=1024)
+    flatten_to_batch_kernel[grid](
+        input_tensor,
+        batched_tensor,
+        input_offsets,
+        num_heads,
+        total_tokens,
+        padding_to_size,
+        padding_value,
+        BLOCK_SIZE=1024,
+    )
 
     return batched_tensor
 
@@ -1315,7 +1351,7 @@ def triton_flatten_to_batch(input_tensor: torch.Tensor,
 @triton.jit
 def _compare_and_swap(x, ids, flip, i: core.constexpr, n_dims: core.constexpr):
     n_outer: core.constexpr = x.numel >> n_dims
-    shape: core.constexpr = [n_outer * 2**i, 2, 2**(n_dims - i - 1)]
+    shape: core.constexpr = [n_outer * 2**i, 2, 2 ** (n_dims - i - 1)]
     y = core.reshape(x, shape)
     # slice left/right with 'stride' 2**(n_dims - i - 1)
     mask = core.arange(0, 2)[None, :, None]
@@ -1351,13 +1387,12 @@ def _compare_and_swap(x, ids, flip, i: core.constexpr, n_dims: core.constexpr):
 
 
 @triton.jit
-def _bitonic_merge(x, ids, stage: core.constexpr, order: core.constexpr,
-                   n_dims: core.constexpr):
-    '''
+def _bitonic_merge(x, ids, stage: core.constexpr, order: core.constexpr, n_dims: core.constexpr):
+    """
     order_type 0 == ascending
     order_type 1 == descending
     order_type 2 == alternating
-    '''
+    """
     n_outer: core.constexpr = x.numel >> n_dims
     core.static_assert(stage <= n_dims)
     # flip denotes whether to re-arrange sub-sequences of elements in ascending or
@@ -1366,11 +1401,11 @@ def _bitonic_merge(x, ids, stage: core.constexpr, order: core.constexpr,
     # if flip = 00110011... then all the elements will be re-arranged alternatingly (with
     # a stride of 2) at this stage
     if order == 2:
-        shape: core.constexpr = [n_outer * 2**(n_dims - 1 - stage), 2, 2**stage]
+        shape: core.constexpr = [n_outer * 2 ** (n_dims - 1 - stage), 2, 2**stage]
         # Create boolean flip pattern instead of integer
-        flip = core.reshape(
-            core.broadcast_to(core.arange(0, 2)[None, :, None], shape),
-            x.shape) != 0
+        flip = (
+            core.reshape(core.broadcast_to(core.arange(0, 2)[None, :, None], shape), x.shape) != 0
+        )
     else:
         # Ensure flip is boolean for XOR operations
         flip = order != 0
@@ -1381,20 +1416,15 @@ def _bitonic_merge(x, ids, stage: core.constexpr, order: core.constexpr,
 
 
 @triton.jit
-def argsort(x,
-            ids,
-            dim: core.constexpr = None,
-            descending: core.constexpr = core.CONSTEXPR_0):
+def argsort(x, ids, dim: core.constexpr = None, descending: core.constexpr = core.CONSTEXPR_0):
     # handle default dimension or check that it is the most minor dim
     _dim: core.constexpr = len(x.shape) - 1 if dim is None else dim
-    core.static_assert(_dim == len(x.shape) - 1,
-                       "only minor dimension is currently supported")
+    core.static_assert(_dim == len(x.shape) - 1, "only minor dimension is currently supported")
     # iteratively run bitonic merge-sort steps
     n_dims: core.constexpr = _log2(x.shape[_dim])
 
     for i in core.static_range(1, n_dims + 1):
-        x, ids = _bitonic_merge(x, ids, i, 2 if i < n_dims else descending,
-                                n_dims)
+        x, ids = _bitonic_merge(x, ids, i, 2 if i < n_dims else descending, n_dims)
     return x, ids
 
 
@@ -1403,8 +1433,7 @@ def convert_to_sortable_uint16(values):
     values_fp16 = values.to(tl.float16)
     values_u16 = values_fp16.to(tl.uint16, bitcast=True)
     # For negative numbers, flip all bits; for positive, flip sign bit
-    values_u16 = tl.where(values < 0.0, ~values_u16 & 0xffff,
-                          values_u16 | 0x8000)
+    values_u16 = tl.where(values < 0.0, ~values_u16 & 0xFFFF, values_u16 | 0x8000)
     return values_u16
 
 
@@ -1413,17 +1442,16 @@ def extract_bin_idx(values_u16, step: tl.constexpr):
     if step == 0:
         return 255 - (values_u16 >> 8)
     else:
-        return 255 - (values_u16 & 0xff)
+        return 255 - (values_u16 & 0xFF)
 
 
 @triton.jit
-def is_partial_match(values_u16, pattern, step: tl.constexpr,
-                     BLOCK_SIZE: tl.constexpr):
+def is_partial_match(values_u16, pattern, step: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     if step == 0:
-        return tl.full((BLOCK_SIZE, ), True, dtype=tl.int1)
+        return tl.full((BLOCK_SIZE,), True, dtype=tl.int1)
     else:
         values_high = values_u16 >> 8
-        pattern_high = tl.full((BLOCK_SIZE, ), pattern >> 8, dtype=tl.uint16)
+        pattern_high = tl.full((BLOCK_SIZE,), pattern >> 8, dtype=tl.uint16)
         return values_high == pattern_high
 
 
@@ -1455,14 +1483,12 @@ def process_histogram_step(
         pass
 
     # Build histogram
-    histogram = tl.zeros((NUM_BINS, ), dtype=tl.int32)
+    histogram = tl.zeros((NUM_BINS,), dtype=tl.int32)
 
     for i in tl.range(0, input_len, BLOCK_SIZE):
         block_offsets = i + tl.arange(0, BLOCK_SIZE)
         block_mask = block_offsets < input_len
-        values = tl.load(input_ptr + input_base + block_offsets,
-                         mask=block_mask,
-                         other=-1e10)
+        values = tl.load(input_ptr + input_base + block_offsets, mask=block_mask, other=-1e10)
 
         values_u16 = convert_to_sortable_uint16(values)
 
@@ -1472,8 +1498,7 @@ def process_histogram_step(
         bin_indices = extract_bin_idx(values_u16, step).to(tl.int32)
 
         # Apply pattern mask
-        bin_indices_masked = tl.where(pattern_match & block_mask, bin_indices,
-                                      NUM_BINS - 1)
+        bin_indices_masked = tl.where(pattern_match & block_mask, bin_indices, NUM_BINS - 1)
 
         histogram += tl.histogram(bin_indices_masked, NUM_BINS)
 
@@ -1486,8 +1511,7 @@ def process_histogram_step(
     threshold_indices = tl.where(crosses_threshold, bin_range, NUM_BINS)
     threshold_bin_idx = tl.min(threshold_indices)
 
-    threshold_bin_size = tl.sum(
-        tl.where(bin_range == threshold_bin_idx, histogram, 0))
+    threshold_bin_size = tl.sum(tl.where(bin_range == threshold_bin_idx, histogram, 0))
 
     if step == 0:
         new_pattern = (255 - threshold_bin_idx) << 8
@@ -1501,9 +1525,7 @@ def process_histogram_step(
     for i in tl.range(0, input_len, BLOCK_SIZE):
         block_offsets = i + tl.arange(0, BLOCK_SIZE)
         block_mask = block_offsets < input_len
-        values = tl.load(input_ptr + input_base + block_offsets,
-                         mask=block_mask,
-                         other=-1e10)
+        values = tl.load(input_ptr + input_base + block_offsets, mask=block_mask, other=-1e10)
 
         values_u16 = convert_to_sortable_uint16(values)
 
@@ -1512,40 +1534,34 @@ def process_histogram_step(
         bin_indices = extract_bin_idx(values_u16, step).to(tl.int32)
 
         # Elements smaller than threshold bin are guaranteed top-k
-        guaranteed_mask = (bin_indices
-                           < threshold_bin_idx) & pattern_match & block_mask
+        guaranteed_mask = (bin_indices < threshold_bin_idx) & pattern_match & block_mask
 
         guaranteed_int = guaranteed_mask.to(tl.int32)
         write_positions = tl.cumsum(guaranteed_int, axis=0) - guaranteed_int
         num_guaranteed = tl.sum(guaranteed_int)
 
         guaranteed_write_offsets = base_offset + output_base + write_positions
-        tl.store(output_indices_ptr + guaranteed_write_offsets,
-                 block_offsets,
-                 mask=guaranteed_mask)
+        tl.store(output_indices_ptr + guaranteed_write_offsets, block_offsets, mask=guaranteed_mask)
 
         base_offset += num_guaranteed
 
         # Write candidate elements to temp storage (only if threshold bin is small)
         # Then we can directly sort the temp storage
         if threshold_bin_size <= FINAL_SIZE:
-            candidate_mask = (bin_indices
-                              == threshold_bin_idx) & pattern_match & block_mask
+            candidate_mask = (bin_indices == threshold_bin_idx) & pattern_match & block_mask
             candidate_int = candidate_mask.to(tl.int32)
-            candidate_positions = tl.cumsum(candidate_int,
-                                            axis=0) - candidate_int
+            candidate_positions = tl.cumsum(candidate_int, axis=0) - candidate_int
             num_candidates = tl.sum(candidate_int)
 
             candidate_write_offsets = final_offset + temp_base + candidate_positions
-            candidate_write_mask = (final_offset + candidate_positions
-                                    < FINAL_SIZE) & candidate_mask
+            candidate_write_mask = (
+                final_offset + candidate_positions < FINAL_SIZE
+            ) & candidate_mask
 
-            tl.store(temp_values_ptr + candidate_write_offsets,
-                     values,
-                     mask=candidate_write_mask)
-            tl.store(temp_indices_ptr + candidate_write_offsets,
-                     block_offsets,
-                     mask=candidate_write_mask)
+            tl.store(temp_values_ptr + candidate_write_offsets, values, mask=candidate_write_mask)
+            tl.store(
+                temp_indices_ptr + candidate_write_offsets, block_offsets, mask=candidate_write_mask
+            )
 
             final_offset += num_candidates
 
@@ -1554,32 +1570,28 @@ def process_histogram_step(
         for i in tl.range(0, input_len, BLOCK_SIZE):
             block_offsets = i + tl.arange(0, BLOCK_SIZE)
             block_mask = block_offsets < input_len
-            values = tl.load(input_ptr + input_base + block_offsets,
-                             mask=block_mask,
-                             other=-1e10)
+            values = tl.load(input_ptr + input_base + block_offsets, mask=block_mask, other=-1e10)
 
             values_u16 = convert_to_sortable_uint16(values)
 
-            pattern_match = is_partial_match(values_u16, pattern, step,
-                                             BLOCK_SIZE)
+            pattern_match = is_partial_match(values_u16, pattern, step, BLOCK_SIZE)
 
             bin_indices = extract_bin_idx(values_u16, step).to(tl.int32)
 
-            candidate_mask = (bin_indices
-                              == threshold_bin_idx) & pattern_match & block_mask
+            candidate_mask = (bin_indices == threshold_bin_idx) & pattern_match & block_mask
 
             candidate_int = candidate_mask.to(tl.int32)
-            candidate_positions = tl.cumsum(candidate_int,
-                                            axis=0) - candidate_int
+            candidate_positions = tl.cumsum(candidate_int, axis=0) - candidate_int
             num_candidates = tl.sum(candidate_int)
 
             candidate_write_offsets = base_offset + output_base + candidate_positions
-            candidate_write_mask = (base_offset + candidate_positions
-                                    < topk) & candidate_mask
+            candidate_write_mask = (base_offset + candidate_positions < topk) & candidate_mask
 
-            tl.store(output_indices_ptr + candidate_write_offsets,
-                     block_offsets,
-                     mask=candidate_write_mask)
+            tl.store(
+                output_indices_ptr + candidate_write_offsets,
+                block_offsets,
+                mask=candidate_write_mask,
+            )
 
             base_offset += num_candidates
 
@@ -1636,19 +1648,25 @@ def topk_kernel(
         for i in tl.range(0, input_len, BLOCK_SIZE):
             block_offsets = i + tl.arange(0, BLOCK_SIZE)
             block_mask = block_offsets < input_len
-            tl.store(output_indices_ptr + output_base + block_offsets,
-                     block_offsets,
-                     mask=block_mask)
+            tl.store(
+                output_indices_ptr + output_base + block_offsets, block_offsets, mask=block_mask
+            )
         return
 
     pattern = 0
     found_topk_values = 0
 
-    continue_step, pattern, threshold_bin_size, found_topk_values, final_offset = \
+    continue_step, pattern, threshold_bin_size, found_topk_values, final_offset = (
         process_histogram_step(
-            input_ptr, input_base, input_len,
-            output_indices_ptr, temp_values_ptr, temp_indices_ptr,
-            output_base, temp_base, topk,
+            input_ptr,
+            input_base,
+            input_len,
+            output_indices_ptr,
+            temp_values_ptr,
+            temp_indices_ptr,
+            output_base,
+            temp_base,
+            topk,
             step=0,
             pattern=pattern,
             found_topk_values=found_topk_values,
@@ -1656,13 +1674,20 @@ def topk_kernel(
             NUM_BINS=NUM_BINS,
             FINAL_SIZE=FINAL_SIZE,
         )
+    )
 
     if continue_step:
-        continue_step, pattern, threshold_bin_size, found_topk_values, final_offset = \
+        continue_step, pattern, threshold_bin_size, found_topk_values, final_offset = (
             process_histogram_step(
-                input_ptr, input_base, input_len,
-                output_indices_ptr, temp_values_ptr, temp_indices_ptr,
-                output_base, temp_base, topk,
+                input_ptr,
+                input_base,
+                input_len,
+                output_indices_ptr,
+                temp_values_ptr,
+                temp_indices_ptr,
+                output_base,
+                temp_base,
+                topk,
                 step=1,
                 pattern=pattern,
                 found_topk_values=found_topk_values,
@@ -1670,37 +1695,40 @@ def topk_kernel(
                 NUM_BINS=NUM_BINS,
                 FINAL_SIZE=FINAL_SIZE,
             )
+        )
 
     # Sort the final candidates
     if not continue_step and final_offset > 0:
         final_offsets = tl.arange(0, FINAL_SIZE)
         final_mask = final_offsets < final_offset
-        final_values = tl.load(temp_values_ptr + temp_base + final_offsets,
-                               mask=final_mask,
-                               other=-1e10)
-        final_indices = tl.load(temp_indices_ptr + temp_base + final_offsets,
-                                mask=final_mask,
-                                other=-1)
+        final_values = tl.load(
+            temp_values_ptr + temp_base + final_offsets, mask=final_mask, other=-1e10
+        )
+        final_indices = tl.load(
+            temp_indices_ptr + temp_base + final_offsets, mask=final_mask, other=-1
+        )
 
-        _, final_sorted_indices = argsort(final_values,
-                                          final_indices,
-                                          dim=0,
-                                          descending=True)
+        _, final_sorted_indices = argsort(final_values, final_indices, dim=0, descending=True)
 
         remain_num = topk - found_topk_values
 
         write_offsets = tl.arange(0, FINAL_SIZE)
         write_mask = write_offsets < remain_num
 
-        tl.store(output_indices_ptr + output_base + found_topk_values +
-                 write_offsets,
-                 final_sorted_indices,
-                 mask=write_mask)
+        tl.store(
+            output_indices_ptr + output_base + found_topk_values + write_offsets,
+            final_sorted_indices,
+            mask=write_mask,
+        )
 
 
-def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
-                output_offsets: torch.Tensor, total_output_tokens: int,
-                topk: int) -> torch.Tensor:
+def triton_topk(
+    input_tensor: torch.Tensor,
+    input_offsets: torch.Tensor,
+    output_offsets: torch.Tensor,
+    total_output_tokens: int,
+    topk: int,
+) -> torch.Tensor:
     """
     Perform topk operation on input tensor using two-stage histogram algorithm.
     Args:
@@ -1719,9 +1747,9 @@ def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
     device = input_tensor.device
 
     # Create output tensor
-    output_indices = torch.empty((num_kv_heads, total_output_tokens),
-                                 dtype=torch.int32,
-                                 device=device)
+    output_indices = torch.empty(
+        (num_kv_heads, total_output_tokens), dtype=torch.int32, device=device
+    )
 
     grid = (batch_size, num_kv_heads)
 
@@ -1729,12 +1757,12 @@ def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
     NUM_BINS = 256
     FINAL_SIZE = 256
 
-    temp_values = torch.empty((num_kv_heads, batch_size, FINAL_SIZE),
-                              dtype=torch.float32,
-                              device=device)
-    temp_indices = torch.empty((num_kv_heads, batch_size, FINAL_SIZE),
-                               dtype=torch.int32,
-                               device=device)
+    temp_values = torch.empty(
+        (num_kv_heads, batch_size, FINAL_SIZE), dtype=torch.float32, device=device
+    )
+    temp_indices = torch.empty(
+        (num_kv_heads, batch_size, FINAL_SIZE), dtype=torch.int32, device=device
+    )
 
     topk_kernel[grid](
         input_tensor,

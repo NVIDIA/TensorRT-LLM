@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
+
 from __future__ import annotations
 
 from typing import Optional, Tuple
@@ -10,8 +11,11 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionForwardArgs, AttentionInputType, MLAParams,
-    PositionalEmbeddingParams)
+    AttentionForwardArgs,
+    AttentionInputType,
+    MLAParams,
+    PositionalEmbeddingParams,
+)
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -27,32 +31,34 @@ class DSATrtllmAttention(TrtllmAttention):
 
     Metadata = DSAtrtllmAttentionMetadata
 
-    def __init__(self,
-                 layer_idx: int,
-                 num_heads: int,
-                 head_dim: int,
-                 num_kv_heads: Optional[int] = None,
-                 quant_config: Optional[QuantConfig] = None,
-                 q_scaling: Optional[float] = None,
-                 pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-                 mla_params: Optional[MLAParams] = None,
-                 skip_create_weights_in_init: bool = False,
-                 attention_chunk_size: Optional[int] = None,
-                 sparse_params: Optional[DSAParams] = None,
-                 dtype: Optional[torch.dtype] = None,
-                 aux_stream: Optional[torch.cuda.Stream] = None,
-                 **kwargs):
+    def __init__(
+        self,
+        layer_idx: int,
+        num_heads: int,
+        head_dim: int,
+        num_kv_heads: Optional[int] = None,
+        quant_config: Optional[QuantConfig] = None,
+        q_scaling: Optional[float] = None,
+        pos_embd_params: Optional[PositionalEmbeddingParams] = None,
+        mla_params: Optional[MLAParams] = None,
+        skip_create_weights_in_init: bool = False,
+        attention_chunk_size: Optional[int] = None,
+        sparse_params: Optional[DSAParams] = None,
+        dtype: Optional[torch.dtype] = None,
+        aux_stream: Optional[torch.cuda.Stream] = None,
+        **kwargs,
+    ):
         """Initialize DSA attention with an Indexer sub-module for sparse TopK selection."""
         sparse_attention_config = kwargs.pop("sparse_attention_config", None)
         self.sparse_attention_config = sparse_attention_config
-        if (sparse_params is None and sparse_attention_config is not None
-                and hasattr(sparse_attention_config, "to_sparse_params")):
-            sparse_params = sparse_attention_config.to_sparse_params(
-                layer_idx=layer_idx)
+        if (
+            sparse_params is None
+            and sparse_attention_config is not None
+            and hasattr(sparse_attention_config, "to_sparse_params")
+        ):
+            sparse_params = sparse_attention_config.to_sparse_params(layer_idx=layer_idx)
         if sparse_params is None:
-            raise ValueError(
-                "sparse_params is required for DSATrtllmAttention and cannot be None"
-            )
+            raise ValueError("sparse_params is required for DSATrtllmAttention and cannot be None")
         TrtllmAttention.__init__(
             self,
             layer_idx,
@@ -66,24 +72,26 @@ class DSATrtllmAttention(TrtllmAttention):
             mla_params=mla_params,
             skip_create_weights_in_init=skip_create_weights_in_init,
             attention_chunk_size=attention_chunk_size,
-            **kwargs)
+            **kwargs,
+        )
 
         # Cross-layer indexer sharing: only "full" layers own an indexer;
         # "shared" layers reuse the previous full layer's top-k (see
         # MLA.forward_dsa_*). Resolved per-layer in to_sparse_params; defaults to
         # full (dense per-layer indexer). indexer=None also makes the weight
         # loader skip the (absent) shared-layer indexer weights.
-        self.is_full_indexer_layer = getattr(sparse_params,
-                                             'is_full_indexer_layer', True)
+        self.is_full_indexer_layer = getattr(sparse_params, "is_full_indexer_layer", True)
         if self.is_full_indexer_layer:
-            self.indexer = Indexer(quant_config,
-                                   pos_embd_params,
-                                   mla_params,
-                                   skip_create_weights_in_init,
-                                   sparse_params,
-                                   dtype=dtype,
-                                   layer_idx=layer_idx,
-                                   aux_stream=aux_stream)
+            self.indexer = Indexer(
+                quant_config,
+                pos_embd_params,
+                mla_params,
+                skip_create_weights_in_init,
+                sparse_params,
+                dtype=dtype,
+                layer_idx=layer_idx,
+                aux_stream=aux_stream,
+            )
         else:
             self.indexer = None
 
@@ -98,8 +106,7 @@ class DSATrtllmAttention(TrtllmAttention):
         is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
         sparse_backend_args = forward_args.sparse_backend_args
         phase_start = metadata.num_ctx_tokens if is_generation else 0
-        phase_end = (metadata.num_tokens
-                     if is_generation else metadata.num_ctx_tokens)
+        phase_end = metadata.num_tokens if is_generation else metadata.num_ctx_tokens
         shared_topk_indices = metadata.shared_topk_indices
         if self.indexer is None:
             topk_indices = shared_topk_indices[phase_start:phase_end]
@@ -113,13 +120,13 @@ class DSATrtllmAttention(TrtllmAttention):
             )
             if shared_topk_indices is not None:
                 shared_topk_indices[
-                    phase_start:phase_start + topk_indices.shape[0],
-                    :topk_indices.shape[1],
+                    phase_start : phase_start + topk_indices.shape[0],
+                    : topk_indices.shape[1],
                 ].copy_(topk_indices)
 
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
-            topk_indices, metadata, self.get_local_layer_idx(metadata),
-            is_generation)
+            topk_indices, metadata, self.get_local_layer_idx(metadata), is_generation
+        )
 
         return topk_indices_global, None
 
@@ -147,8 +154,7 @@ class DSATrtllmAttention(TrtllmAttention):
             kv_indptr = metadata.gen_kv_indptr
             num_seqs = metadata.num_generations
             max_seq_len = metadata.max_gen_seq_len
-            block_offsets = metadata.kv_cache_block_offsets[:, metadata.
-                                                            num_contexts:]
+            block_offsets = metadata.kv_cache_block_offsets[:, metadata.num_contexts :]
         else:
             cached_token_indptr = metadata.ctx_cached_token_indptr
             kv_indptr = metadata.ctx_kv_indptr
