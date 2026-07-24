@@ -131,6 +131,15 @@ srun --mpi=pmix \
         # --container-mount-home above.
         export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-rank\${SLURM_PROCID:-0}
 
+        # Node-local HF remote-code modules cache: all ranks share \$HOME
+        # (mounted at /root), and racing mkdir of
+        # ~/.cache/huggingface/modules at startup escapes pathlib's
+        # exist_ok on NFS (stale attribute cache fails the is_dir()
+        # recheck after EEXIST) -> 'FileExistsError: /root/.cache' spam
+        # from every rank. Only the trust_remote_code modules move
+        # node-local; the dataset/hub cache stays shared for reuse.
+        export HF_MODULES_CACHE=/tmp/hf-modules-rank\${SLURM_PROCID:-0}
+
         # Run trtllm-eval from the in-place installation created in the
         # README Prerequisites section (build_wheel.py creates .venv-3.12).
         export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
