@@ -46,6 +46,7 @@ State management:
   - single state_ready_mbar after both passes (TMEM no-overlap constraint)
 """
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cutlass_dsl as _dsl_mod
@@ -1258,6 +1259,12 @@ def k4_persistent_kernel(
 
 
 def make_host_fn(num_sm=148):
+    """Create one K4 host function for all runtime context batch sizes.
+
+    ``num_seqs`` is a runtime scalar. ``H`` and the token extent come from
+    dynamic tensor layouts, while ``num_sm`` is the fixed persistent-grid
+    ceiling. The scheduler computes ``min(num_seqs * H, num_sm)`` at launch.
+    """
     _num_sm = num_sm
 
     @cute.jit
@@ -1274,6 +1281,11 @@ def make_host_fn(num_sm=148):
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
         tm_workspace: cute.Tensor,
+        num_seqs: cutlass.Int32,
+        # Launch stream — runtime argument; launching on the DSL default
+        # stream races with the executor's non-blocking execution stream.
+        # Same stream as akk_inv, so the PDL chain stays intact.
+        stream: cuda.CUstream,
     ):
         # Raw tensors from from_dlpack have PyTorch layout (T, H, dim)
         # stride (H*dim, dim, 1). Reshape to 3D for TMA:
@@ -1396,9 +1408,12 @@ def make_host_fn(num_sm=148):
         tma_st = cpasync.CopyBulkTensorTileS2GOp()
         ta_o = cpasync.make_tiled_tma_atom(tma_st, o_out, sl_store, (M, N))
 
-        n_seqs = cu_seqlens.shape[0] - 1
         scheduler_params = GDNTileSchedulerParams(
-            num_seqs=n_seqs, num_q_heads=H, num_v_heads=H, is_GQA=False, is_persistent=True
+            num_seqs=num_seqs,
+            num_q_heads=H,
+            num_v_heads=H,
+            is_GQA=False,
+            is_persistent=True,
         )
         grid_shape = GDNTileScheduler.get_grid_shape(scheduler_params, _num_sm)
 
@@ -1438,6 +1453,7 @@ def make_host_fn(num_sm=148):
             o_out,
             tm_workspace,
             scheduler_params,
-        ).launch(grid=grid_shape, block=(threads_per_cta, 1, 1), use_pdl=True)
+        ).launch(grid=grid_shape, block=(threads_per_cta, 1, 1), use_pdl=True,
+                 stream=stream)
 
     return host_fn
