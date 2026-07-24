@@ -64,8 +64,10 @@ import sys
 import tempfile
 import time
 
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
+# tensorrt_llm imports live inside _build_llm/_generate so the comparison
+# machinery (_compare_logits_parity, _parity_prompts, _chosen_logprob) stays
+# importable from client-side tools (kimi_k3_disagg_parity.py) that run
+# without a GPU-side tensorrt_llm install.
 
 # Keeps the truncated-checkpoint temp dir alive for the process lifetime.
 _TRUNCATED_CKPT_DIR = None
@@ -85,8 +87,7 @@ def _truncated_checkpoint(ckpt: str, num_layers: int) -> str:
     integration test this serves always fits one node.
     """
     global _TRUNCATED_CKPT_DIR
-    _TRUNCATED_CKPT_DIR = tempfile.TemporaryDirectory(
-        prefix="kimi-k3-truncated-")
+    _TRUNCATED_CKPT_DIR = tempfile.TemporaryDirectory(prefix="kimi-k3-truncated-")
     out = _TRUNCATED_CKPT_DIR.name
     with open(os.path.join(ckpt, "config.json")) as f:
         config = json.load(f)
@@ -94,10 +95,8 @@ def _truncated_checkpoint(ckpt: str, num_layers: int) -> str:
     assert 0 < num_layers <= text["num_hidden_layers"]
     text["num_hidden_layers"] = num_layers
     lin = dict(text["linear_attn_config"])
-    lin["kda_layers"] = [l for l in lin["kda_layers"] if l <= num_layers]
-    lin["full_attn_layers"] = [
-        l for l in lin["full_attn_layers"] if l <= num_layers
-    ]
+    lin["kda_layers"] = [n for n in lin["kda_layers"] if n <= num_layers]
+    lin["full_attn_layers"] = [n for n in lin["full_attn_layers"] if n <= num_layers]
     text["linear_attn_config"] = lin
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump(config, f)
@@ -105,6 +104,7 @@ def _truncated_checkpoint(ckpt: str, num_layers: int) -> str:
         if entry.name != "config.json":
             os.symlink(entry.path, os.path.join(out, entry.name))
     return out
+
 
 PROMPTS_AND_CHECKS = [
     ("The capital of France is", "Paris"),
@@ -124,23 +124,24 @@ def _graphs_enabled() -> bool:
 
 
 def _build_llm(ckpt: str, tp: int, spec_mode: str, adp: bool):
+    from tensorrt_llm import LLM
+    from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
+
     speculative_config = None
     if spec_mode == "sa":
         from tensorrt_llm.llmapi import SADecodingConfig
+
         speculative_config = SADecodingConfig(
             max_draft_len=int(os.environ.get("KIMI_K3_SPEC_DRAFT_LEN", "2")),
             # -1 = longest match via the suffix automaton (the SA
             # differentiator); >=1 pins a fixed ngram size.
-            max_matching_ngram_size=int(
-                os.environ.get("KIMI_K3_SA_NGRAM_SIZE", "-1")),
+            max_matching_ngram_size=int(os.environ.get("KIMI_K3_SA_NGRAM_SIZE", "-1")),
             # Cross-request pattern reuse (SA's differentiator on
             # homogeneous workloads); pool must be >= max_batch_size.
-            enable_global_pool=os.environ.get(
-                "KIMI_K3_SA_GLOBAL_POOL", "0") == "1",
+            enable_global_pool=os.environ.get("KIMI_K3_SA_GLOBAL_POOL", "0") == "1",
         )
     elif spec_mode != "off":
-        raise ValueError(f"KIMI_K3_SPEC_MODE={spec_mode!r} (expected"
-                         " 'off' or 'sa')")
+        raise ValueError(f"KIMI_K3_SPEC_MODE={spec_mode!r} (expected 'off' or 'sa')")
     return LLM(
         model=ckpt,
         tensor_parallel_size=tp,
@@ -149,8 +150,7 @@ def _build_llm(ckpt: str, tp: int, spec_mode: str, adp: bool):
         trust_remote_code=True,  # tiktoken tokenizer ships with the ckpt
         # VANILLA = per-expert dequant reference MoE (parity oracle, no
         # fused-cubin dependency); AUTO = fused on SM100/SM103.
-        moe_config=MoeConfig(
-            backend=os.environ.get("KIMI_K3_MOE_BACKEND", "AUTO")),
+        moe_config=MoeConfig(backend=os.environ.get("KIMI_K3_MOE_BACKEND", "AUTO")),
         max_batch_size=int(os.environ.get("KIMI_K3_MAX_BATCH_SIZE", "8")),
         max_seq_len=int(os.environ.get("KIMI_K3_MAX_SEQ_LEN", "4096")),
         max_num_tokens=int(os.environ.get("KIMI_K3_MAX_NUM_TOKENS", "4096")),
@@ -166,14 +166,15 @@ def _build_llm(ckpt: str, tp: int, spec_mode: str, adp: bool):
         # (EXPERIMENTAL: SA is graph-safe by design — draft padding keeps
         # shapes static — but the K3 verify/promote path is not yet
         # certified under capture). Overlap stays off for spec runs.
-        disable_overlap_scheduler=(speculative_config is not None
-                                   or not _graphs_enabled()),
-        cuda_graph_config=(CudaGraphConfig(enable_padding=True,
-                                           max_batch_size=8)
-                           if _graphs_enabled()
-                           and (speculative_config is None or os.environ.get(
-                               "KIMI_K3_SPEC_CUDA_GRAPHS", "0") == "1")
-                           else None),
+        disable_overlap_scheduler=(speculative_config is not None or not _graphs_enabled()),
+        cuda_graph_config=(
+            CudaGraphConfig(enable_padding=True, max_batch_size=8)
+            if _graphs_enabled()
+            and (
+                speculative_config is None or os.environ.get("KIMI_K3_SPEC_CUDA_GRAPHS", "0") == "1"
+            )
+            else None
+        ),
         speculative_config=speculative_config,
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
@@ -198,8 +199,18 @@ def _parity_prompts(extra: int):
     dominates runtime, so extra prompts are nearly free.
     """
     subjects = [
-        "France", "Japan", "Brazil", "Canada", "Egypt", "Kenya", "Norway",
-        "Peru", "Thailand", "Greece", "Chile", "Poland"
+        "France",
+        "Japan",
+        "Brazil",
+        "Canada",
+        "Egypt",
+        "Kenya",
+        "Norway",
+        "Peru",
+        "Thailand",
+        "Greece",
+        "Chile",
+        "Poland",
     ]
     templates = [
         "The capital of {s} is",
@@ -207,22 +218,31 @@ def _parity_prompts(extra: int):
         "{s}, {s}, {s}. The word repeated above is",
         "Count by twos: 2, 4, 6, 8, 10,",
     ]
-    return [(templates[i % len(templates)].format(
-        s=subjects[(i // len(templates)) % len(subjects)]), None)
-            for i in range(extra)]
+    return [
+        (
+            templates[i % len(templates)].format(s=subjects[(i // len(templates)) % len(subjects)]),
+            None,
+        )
+        for i in range(extra)
+    ]
 
 
 def _generate(llm, prompts, max_tokens: int, want_logprobs: bool = False):
+    from tensorrt_llm import SamplingParams
+
     want_stats = os.environ.get("KIMI_K3_SPEC_STATS", "0") == "1"
-    sampling = SamplingParams(max_tokens=max_tokens,
-                              temperature=0.0,
-                              logprobs=5 if want_logprobs else None,
-                              return_perf_metrics=want_stats)
+    sampling = SamplingParams(
+        max_tokens=max_tokens,
+        temperature=0.0,
+        logprobs=5 if want_logprobs else None,
+        return_perf_metrics=want_stats,
+    )
     t0 = time.monotonic()
     outputs = llm.generate(prompts, sampling)
     wall = time.monotonic() - t0
-    print(f"[sanity] generate wall: {wall:.1f}s for {len(prompts)} prompts "
-          f"x {max_tokens} max_tokens")
+    print(
+        f"[sanity] generate wall: {wall:.1f}s for {len(prompts)} prompts x {max_tokens} max_tokens"
+    )
     if want_stats:
         _print_spec_stats(outputs)
     return [out.outputs[0] for out in outputs]
@@ -236,7 +256,8 @@ def _print_spec_stats(outputs):
     non-spec baseline run both simply report the trivial values.
     """
     tokens_per_iter = [
-        out.avg_decoded_tokens_per_iter for out in outputs
+        out.avg_decoded_tokens_per_iter
+        for out in outputs
         if getattr(out, "avg_decoded_tokens_per_iter", None) is not None
     ]
     accepted = drafted = 0
@@ -248,12 +269,13 @@ def _print_spec_stats(outputs):
             drafted += sd.total_draft_tokens
     if tokens_per_iter:
         mean_tpi = sum(tokens_per_iter) / len(tokens_per_iter)
-        print(f"[sanity] spec stats: tokens/step mean {mean_tpi:.3f} "
-              f"(min {min(tokens_per_iter):.3f}, "
-              f"max {max(tokens_per_iter):.3f}, n={len(tokens_per_iter)})")
+        print(
+            f"[sanity] spec stats: tokens/step mean {mean_tpi:.3f} "
+            f"(min {min(tokens_per_iter):.3f}, "
+            f"max {max(tokens_per_iter):.3f}, n={len(tokens_per_iter)})"
+        )
     if drafted > 0:
-        print(f"[sanity] spec stats: acceptance {accepted}/{drafted} "
-              f"= {accepted / drafted:.1%}")
+        print(f"[sanity] spec stats: acceptance {accepted}/{drafted} = {accepted / drafted:.1%}")
 
 
 def _chosen_logprob(logprob_dict, token_id):
@@ -265,14 +287,15 @@ def _chosen_logprob(logprob_dict, token_id):
 
 def _dump_completions(path, completions, want_logprobs):
     import json
+
     payload = []
     for comp in completions:
         entry = {"text": comp.text, "token_ids": list(comp.token_ids)}
         if want_logprobs and comp.logprobs is not None:
-            entry["logprobs"] = [{
-                str(tid): float(getattr(lp, "logprob", lp))
-                for tid, lp in pos.items()
-            } for pos in comp.logprobs]
+            entry["logprobs"] = [
+                {str(tid): float(getattr(lp, "logprob", lp)) for tid, lp in pos.items()}
+                for pos in comp.logprobs
+            ]
         payload.append(entry)
     with open(path, "w") as f:
         json.dump(payload, f)
@@ -282,24 +305,21 @@ def _dump_completions(path, completions, want_logprobs):
 def _load_completions(path):
     import json
     from types import SimpleNamespace
+
     with open(path) as f:
         payload = json.load(f)
     loaded = []
     for entry in payload:
         logprobs = None
         if "logprobs" in entry:
-            logprobs = [{int(t): lp
-                         for t, lp in pos.items()}
-                        for pos in entry["logprobs"]]
+            logprobs = [{int(t): lp for t, lp in pos.items()} for pos in entry["logprobs"]]
         loaded.append(
-            SimpleNamespace(text=entry["text"],
-                            token_ids=entry["token_ids"],
-                            logprobs=logprobs))
+            SimpleNamespace(text=entry["text"], token_ids=entry["token_ids"], logprobs=logprobs)
+        )
     return loaded
 
 
-def _compare_logits_parity(base, spec, prompt, failures,
-                           tol=None, tie_tol=None):
+def _compare_logits_parity(base, spec, prompt, failures, tol=None, tie_tol=None):
     """Tolerance-based spec-dec parity along the shared output prefix.
 
     Logits at position i depend only on tokens 0..i-1, so positions up to
@@ -329,8 +349,7 @@ def _compare_logits_parity(base, spec, prompt, failures,
     b_ids, s_ids = list(base.token_ids), list(spec.token_ids)
     b_lp, s_lp = base.logprobs, spec.logprobs
     shared = 0
-    while (shared < min(len(b_ids), len(s_ids))
-           and b_ids[shared] == s_ids[shared]):
+    while shared < min(len(b_ids), len(s_ids)) and b_ids[shared] == s_ids[shared]:
         shared += 1
     # One-engine spec samplers (SA/MTP/Eagle3) do not emit per-token
     # logprobs (SpecSamplerBase stores tokens only); the spec run's
@@ -341,11 +360,13 @@ def _compare_logits_parity(base, spec, prompt, failures,
     # sampler returned aligned per-token logprobs (host-drafter modes).
     s_lp_aligned = bool(s_lp) and len(s_lp) == len(s_ids)
     if not s_lp_aligned:
-        print(f"[sanity] NOTE: spec run returned "
-              f"{len(s_lp) if s_lp else 0} logprob entries for "
-              f"{len(s_ids)} tokens (one-engine sampler); one-sided "
-              "parity — drift check skipped, near-tie classification "
-              "(baseline-side) active")
+        print(
+            f"[sanity] NOTE: spec run returned "
+            f"{len(s_lp) if s_lp else 0} logprob entries for "
+            f"{len(s_ids)} tokens (one-engine sampler); one-sided "
+            "parity — drift check skipped, near-tie classification "
+            "(baseline-side) active"
+        )
     for i in range(shared if s_lp_aligned else 0):
         lb = _chosen_logprob(b_lp[i], b_ids[i])
         ls = _chosen_logprob(s_lp[i], s_ids[i])
@@ -355,7 +376,8 @@ def _compare_logits_parity(base, spec, prompt, failures,
             failures.append(
                 f"logit drift for {prompt!r} at shared position {i}: "
                 f"baseline lp={lb:.4f} vs specdec lp={ls:.4f} "
-                f"(|diff| > {tol})")
+                f"(|diff| > {tol})"
+            )
             return "drift"
     if shared < min(len(b_ids), len(s_ids)):
         # First divergence: expected to be a near-tie in the baseline
@@ -364,21 +386,23 @@ def _compare_logits_parity(base, spec, prompt, failures,
         # a warning (borderline gaps occur legitimately on noise models),
         # but the caller hard-fails when non-ties dominate in aggregate —
         # a real state bug corrupts trajectories systematically.
-        top = sorted((getattr(v, "logprob", v) for v in b_lp[shared].values()),
-                     reverse=True)
+        top = sorted((getattr(v, "logprob", v) for v in b_lp[shared].values()), reverse=True)
         gap = top[0] - top[1] if len(top) > 1 else float("inf")
         if gap > tie_tol:
             message = (
                 f"non-tie divergence for {prompt!r} at position {shared}: "
                 f"baseline top-2 logprob gap {gap:.4f} > {tie_tol} "
-                f"(confident token flipped — investigate if drift also seen)")
+                f"(confident token flipped — investigate if drift also seen)"
+            )
             if os.environ.get("KIMI_K3_SPEC_TIE_STRICT", "0") == "1":
                 failures.append(message)
             else:
                 print(f"[sanity] WARNING: {message}")
             return "non_tie"
-        print(f"[sanity] {prompt!r}: benign divergence at position "
-              f"{shared} (top-2 gap {gap:.4f}, shared prefix verified)")
+        print(
+            f"[sanity] {prompt!r}: benign divergence at position "
+            f"{shared} (top-2 gap {gap:.4f}, shared prefix verified)"
+        )
         return "benign"
     print(f"[sanity] {prompt!r}: full output identical ({shared} tokens)")
     return "identical"
@@ -407,12 +431,13 @@ def main() -> int:
     # dispatch/combine; EP width == tp) is the default. KIMI_K3_ADP=0
     # selects the plain EP mode (replicated attention + latent allreduce).
     adp = os.environ.get("KIMI_K3_ADP", "1") == "1"
-    print(f"[sanity] ckpt={ckpt} tp(EP)={tp} adp={adp} truncated={truncated} "
-          f"moe_backend={os.environ.get('KIMI_K3_MOE_BACKEND', 'AUTO')} "
-          f"spec_mode={spec_mode} spec_parity={spec_parity}")
+    print(
+        f"[sanity] ckpt={ckpt} tp(EP)={tp} adp={adp} truncated={truncated} "
+        f"moe_backend={os.environ.get('KIMI_K3_MOE_BACKEND', 'AUTO')} "
+        f"spec_mode={spec_mode} spec_parity={spec_parity}"
+    )
 
-    want_logprobs = (spec_parity == "logits"
-                     or os.environ.get("KIMI_K3_DUMP_LOGPROBS", "0") == "1")
+    want_logprobs = spec_parity == "logits" or os.environ.get("KIMI_K3_DUMP_LOGPROBS", "0") == "1"
     # Cross-process parity: a prior baseline run dumps its outputs via
     # KIMI_K3_OUTPUT_JSON; this run loads them via KIMI_K3_BASELINE_JSON
     # instead of loading a second in-process model (the full model does
@@ -440,13 +465,13 @@ def main() -> int:
         assert spec_mode != "off" or baseline_json, (
             "KIMI_K3_SPEC_PARITY requires a spec mode, or a cross-process "
             "baseline via KIMI_K3_BASELINE_JSON for no-spec regression "
-            "checks")
+            "checks"
+        )
         if baseline_json:
             baseline = _load_completions(baseline_json)
         else:
             llm = _build_llm(ckpt, tp, "off", adp)
-            baseline = _generate(llm, prompt_texts, max_tokens,
-                                 want_logprobs)
+            baseline = _generate(llm, prompt_texts, max_tokens, want_logprobs)
             llm.shutdown()
 
     llm = _build_llm(ckpt, tp, spec_mode, adp)
@@ -464,32 +489,34 @@ def main() -> int:
         if not truncated and expected is not None and expected not in text:
             failures.append(f"expected {expected!r} in output of {prompt!r}")
     if spec_parity == "text":
-        for base, spec, (prompt, _) in zip(baseline, completions,
-                                           prompt_set):
+        for base, spec, (prompt, _) in zip(baseline, completions, prompt_set):
             if base.text != spec.text:
                 failures.append(
                     f"spec-dec parity mismatch for {prompt!r}:\n"
                     f"    baseline: {base.text!r}\n"
-                    f"    specdec:  {spec.text!r}")
+                    f"    specdec:  {spec.text!r}"
+                )
     elif spec_parity == "logits":
         outcomes = [
             _compare_logits_parity(base, spec, prompt, failures)
-            for base, spec, (prompt,
-                             _) in zip(baseline, completions, prompt_set)
+            for base, spec, (prompt, _) in zip(baseline, completions, prompt_set)
         ]
         divergences = [o for o in outcomes if o in ("benign", "non_tie")]
         non_ties = outcomes.count("non_tie")
-        print(f"[sanity] logits-parity summary: {len(outcomes)} prompts, "
-              f"{outcomes.count('identical')} identical, "
-              f"{len(divergences)} divergences ({non_ties} non-tie), "
-              f"{outcomes.count('drift')} drift")
+        print(
+            f"[sanity] logits-parity summary: {len(outcomes)} prompts, "
+            f"{outcomes.count('identical')} identical, "
+            f"{len(divergences)} divergences ({non_ties} non-tie), "
+            f"{outcomes.count('drift')} drift"
+        )
         # Aggregate systemic check: scattered non-tie flips are rounding;
         # a real state bug makes them dominate.
         if non_ties >= 2 and non_ties > 0.25 * max(len(divergences), 1):
             failures.append(
                 f"non-tie divergences dominate: {non_ties}/"
                 f"{len(divergences)} divergences exceeded the tie bound "
-                "(systemic — suspect state bug)")
+                "(systemic — suspect state bug)"
+            )
 
     if failures:
         print("[sanity] FAIL")
