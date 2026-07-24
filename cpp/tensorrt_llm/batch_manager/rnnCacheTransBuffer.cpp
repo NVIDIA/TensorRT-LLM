@@ -21,7 +21,6 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <algorithm>
 
@@ -96,7 +95,7 @@ size_t RnnCacheTransBufferManager::computeTransferBufferSizeFromPool(
 RnnCacheTransBufferManager::RnnCacheTransBufferManager(kv_cache_manager::BaseKVCacheManager* kvCacheManager,
     executor::kv_cache::CacheState const& cacheState, std::optional<size_t> maxNumTokens)
     : BaseTransBufferManager(computeTransferBufferSizeFromPool(kvCacheManager, cacheState, maxNumTokens),
-        tensorrt_llm::DataType::kUINT8, maxNumTokens)
+        nvinfer1::DataType::kUINT8, maxNumTokens)
 {
     TLLM_CHECK(kvCacheManager != nullptr);
     TLLM_LOG_INFO("RnnCacheTransBufferManager created for unified pool RNN cache");

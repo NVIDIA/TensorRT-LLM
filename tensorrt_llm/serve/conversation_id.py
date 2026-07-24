@@ -36,10 +36,9 @@ class RequestWithConversationParams(Protocol):
 
 def get_request_conversation_id(request: RequestWithConversationParams) -> Optional[str]:
     conversation_params = request.conversation_params
-    if conversation_params is not None:
-        return conversation_params.conversation_id
-    disaggregated_params = getattr(request, "disaggregated_params", None)
-    return None if disaggregated_params is None else disaggregated_params.conversation_id
+    if conversation_params is None:
+        return None
+    return conversation_params.conversation_id
 
 
 def extract_conversation_id_from_headers(headers: Optional[Mapping[str, str]]) -> Optional[str]:

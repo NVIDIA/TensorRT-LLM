@@ -120,7 +120,7 @@ class ResourceGovernor:
     ) -> List[int]:
         """Convert chat messages to token IDs via chat template + tokenization."""
         conversation: List[ConversationMessage] = []
-        conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
+        conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
             messages, self.model_config, None
         )
         token_task = async_apply_chat_template(

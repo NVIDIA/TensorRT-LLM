@@ -19,7 +19,6 @@ attributes that the fingerprint projection reads.
 """
 
 import copy
-from pathlib import Path
 
 import pytest
 from _source_identity_fakes import (
@@ -30,7 +29,6 @@ from _source_identity_fakes import (
     FakeQuantConfig,
     FakeQuantConfigWithPythonOnlyField,
     identity_from,
-    make_artifact_identity,
 )
 
 from tensorrt_llm._torch.weight_sharing import (
@@ -48,24 +46,6 @@ def test_identical_configs_match():
     assert result.matched
     assert result.mismatched_fields == []
     assert bool(result) is True
-
-
-def test_from_model_config_derives_artifact_identity(tmp_path: Path) -> None:
-    (tmp_path / "model.safetensors").write_bytes(b"checkpoint")
-    identity = SourceIdentity.from_model_config(FakeModelConfig(), checkpoint_dir=str(tmp_path))
-    assert identity.artifact_identity.scheme == "checkpoint_manifest_sha256"
-
-
-def test_from_model_config_requires_one_artifact_source() -> None:
-    config = FakeModelConfig()
-    with pytest.raises(ValueError, match="Exactly one"):
-        SourceIdentity.from_model_config(config)
-    with pytest.raises(ValueError, match="Exactly one"):
-        SourceIdentity.from_model_config(
-            config,
-            checkpoint_dir="/checkpoint",
-            artifact_identity=make_artifact_identity(),
-        )
 
 
 def test_rank_defaults_from_mapping():
@@ -103,14 +83,10 @@ def test_param_dtype_override_flags_shard():
     # the realized-layout fingerprint catches it.
     cfg = FakeModelConfig()
     a = SourceIdentity.from_model_config(
-        cfg,
-        FakeModel(cfg.pretrained_config, dtype="torch.bfloat16"),
-        artifact_identity=make_artifact_identity(),
+        cfg, FakeModel(cfg.pretrained_config, dtype="torch.bfloat16")
     )
     b = SourceIdentity.from_model_config(
-        cfg,
-        FakeModel(cfg.pretrained_config, dtype="torch.float16"),
-        artifact_identity=make_artifact_identity(),
+        cfg, FakeModel(cfg.pretrained_config, dtype="torch.float16")
     )
     result = a.matches(b)
     assert not result.matched
@@ -133,24 +109,11 @@ def test_cross_architecture_same_shapes_flags_global():
     assert "model_fingerprint" in result.mismatched_fields
 
 
-def test_different_checkpoint_artifacts_flag_global():
-    a = identity_from(FakeModelConfig(), artifact_key="fine-tune-a")
-    b = identity_from(FakeModelConfig(), artifact_key="fine-tune-b")
-    result = a.matches(b)
-    assert not result.matched
-    assert result.mismatched_fields == ["artifact_identity"]
-    assert a.global_fingerprint != b.global_fingerprint
-
-
 def test_no_model_degrades_to_architecture_only():
-    # Without a module, the shard fingerprint has no realized tensor layout,
-    # while matching artifacts and configurations remain comparable.
-    a = SourceIdentity.from_model_config(
-        FakeModelConfig(), None, artifact_identity=make_artifact_identity()
-    )
-    b = SourceIdentity.from_model_config(
-        FakeModelConfig(), None, artifact_identity=make_artifact_identity()
-    )
+    # Without a module, the fingerprint still builds (architecture-only) and
+    # two identical configs still match.
+    a = SourceIdentity.from_model_config(FakeModelConfig(), None)
+    b = SourceIdentity.from_model_config(FakeModelConfig(), None)
     assert a.matches(b).matched
 
 
@@ -205,29 +168,6 @@ def test_serialization_roundtrip():
     restored = SourceIdentity.from_dict(a.to_dict())
     assert restored == a
     assert a.matches(restored).matched
-    assert restored.artifact_identity == a.artifact_identity
-
-
-def test_deserialization_rejects_missing_artifact_identity():
-    payload = identity_from(FakeModelConfig()).to_dict()
-    payload.pop("artifact_identity")
-    with pytest.raises(KeyError):
-        SourceIdentity.from_dict(payload)
-
-
-def test_deserialization_rejects_unknown_format_version():
-    payload = identity_from(FakeModelConfig()).to_dict()
-    payload["format_version"] += 1
-    with pytest.raises(ValueError, match="Unsupported SourceIdentity format version"):
-        SourceIdentity.from_dict(payload)
-
-
-def test_deserialization_rejects_v1_identity_without_artifact_binding():
-    payload = identity_from(FakeModelConfig()).to_dict()
-    payload["format_version"] = 1
-    payload.pop("artifact_identity")
-    with pytest.raises(ValueError, match="Unsupported SourceIdentity format version"):
-        SourceIdentity.from_dict(payload)
 
 
 def test_check_warn_fallback_on_mismatch():
@@ -279,7 +219,6 @@ def test_format_version_mismatch_never_matches():
         if hasattr(copy, "replace")
         else SourceIdentity(
             format_version=a.format_version + 1,
-            artifact_identity=a.artifact_identity,
             model_fingerprint=a.model_fingerprint,
             quant_fingerprint=a.quant_fingerprint,
             backend_fingerprint=a.backend_fingerprint,

@@ -17,7 +17,6 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/common/vec_dtypes.cuh"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
@@ -130,25 +129,25 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 #define SWITCH_DTYPE(dtype, TYPE, ...)                                                                                 \
     switch (dtype)                                                                                                     \
     {                                                                                                                  \
-    case tensorrt_llm::DataType::kHALF:                                                                                \
+    case nvinfer1::DataType::kHALF:                                                                                    \
     {                                                                                                                  \
         using TYPE = half;                                                                                             \
         __VA_ARGS__;                                                                                                   \
         break;                                                                                                         \
     }                                                                                                                  \
-    case tensorrt_llm::DataType::kBF16:                                                                                \
+    case nvinfer1::DataType::kBF16:                                                                                    \
     {                                                                                                                  \
         using TYPE = __nv_bfloat16;                                                                                    \
         __VA_ARGS__;                                                                                                   \
         break;                                                                                                         \
     }                                                                                                                  \
-    case tensorrt_llm::DataType::kFLOAT:                                                                               \
+    case nvinfer1::DataType::kFLOAT:                                                                                   \
     {                                                                                                                  \
         using TYPE = float;                                                                                            \
         __VA_ARGS__;                                                                                                   \
         break;                                                                                                         \
     }                                                                                                                  \
-    case tensorrt_llm::DataType::kFP8:                                                                                 \
+    case nvinfer1::DataType::kFP8:                                                                                     \
     {                                                                                                                  \
         using TYPE = __nv_fp8_e4m3;                                                                                    \
         __VA_ARGS__;                                                                                                   \
@@ -1404,7 +1403,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
 
     // When use_low_precision is set the recv buffers contain FP8 data regardless of params.dtype,
     // so dispatch the FP8 accumulation kernel in that case.
-    auto const effective_dtype = params.use_low_precision ? tensorrt_llm::DataType::kFP8 : params.dtype;
+    auto const effective_dtype = params.use_low_precision ? nvinfer1::DataType::kFP8 : params.dtype;
 
     // Launch appropriate kernel with compact macros
     SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {

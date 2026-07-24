@@ -20,7 +20,6 @@
 #include "modelConfig.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/eagleModule.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensModule.h"
 #include "tensorrt_llm/runtime/jsonSerialization.h"
@@ -81,14 +80,14 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     return value;
 }
 
-tensorrt_llm::DataType strToDType(std::string type)
+nvinfer1::DataType strToDType(std::string type)
 {
-    static std::map<std::string, tensorrt_llm::DataType> const typeMap = {{"int64", tensorrt_llm::DataType::kINT64},
-        {"int32", tensorrt_llm::DataType::kINT32}, {"int", tensorrt_llm::DataType::kINT32},
-        {"float32", tensorrt_llm::DataType::kFLOAT}, {"bfloat16", tensorrt_llm::DataType::kBF16},
-        {"float16", tensorrt_llm::DataType::kHALF}, {"bool", tensorrt_llm::DataType::kBOOL},
-        {"uint8", tensorrt_llm::DataType::kUINT8}, {"int8", tensorrt_llm::DataType::kINT8},
-        {"fp8", tensorrt_llm::DataType::kFP8}, {"int4", tensorrt_llm::DataType::kINT4}};
+    static std::map<std::string, nvinfer1::DataType> const typeMap = {{"int64", nvinfer1::DataType::kINT64},
+        {"int32", nvinfer1::DataType::kINT32}, {"int", nvinfer1::DataType::kINT32},
+        {"float32", nvinfer1::DataType::kFLOAT}, {"bfloat16", nvinfer1::DataType::kBF16},
+        {"float16", nvinfer1::DataType::kHALF}, {"bool", nvinfer1::DataType::kBOOL},
+        {"uint8", nvinfer1::DataType::kUINT8}, {"int8", nvinfer1::DataType::kINT8}, {"fp8", nvinfer1::DataType::kFP8},
+        {"int4", nvinfer1::DataType::kINT4}};
 
     TLLM_CHECK_WITH_INFO(typeMap.count(type) > 0, type + " not found in strToDtype.");
     return typeMap.at(type);
@@ -141,14 +140,14 @@ std::vector<ModelConfig::LayerType> buildLayerTypes(
     return result;
 }
 
-ModelConfig parseMultimodalConfig(Json const& json, tensorrt_llm::DataType dataType)
+ModelConfig parseMultimodalConfig(Json const& json, nvinfer1::DataType dataType)
 {
     return ModelConfig{128, 10, 10, 0, 1, 128,
         dataType}; // use dummy values because vision engines of multimodal models does not record this info in config
 }
 
 ModelConfig createModelConfig(Json const& json, bool engineVersionNone, SizeType32 tensorParallelism,
-    SizeType32 contextParallelism, tensorrt_llm::DataType dataType)
+    SizeType32 contextParallelism, nvinfer1::DataType dataType)
 {
     auto const& config = engineVersionNone ? json.at("builder_config") : json.at("pretrained_config");
     auto const multiModalName = parseJsonFieldOptional<std::string>(config, "model_name");
@@ -249,14 +248,14 @@ ModelConfig createModelConfig(Json const& json, bool engineVersionNone, SizeType
     modelConfig.setLayerTypes(layerTypes);
 
     // Set logits datatype
-    auto logitsDtype = tensorrt_llm::DataType::kFLOAT;
+    auto logitsDtype = nvinfer1::DataType::kFLOAT;
     if (logitsDtypeStr == "float32")
     {
-        logitsDtype = tensorrt_llm::DataType::kFLOAT;
+        logitsDtype = nvinfer1::DataType::kFLOAT;
     }
     else if (logitsDtypeStr == "float16")
     {
-        logitsDtype = tensorrt_llm::DataType::kHALF;
+        logitsDtype = nvinfer1::DataType::kHALF;
     }
     else
     {
@@ -491,15 +490,15 @@ GptJsonConfig parseJson(InputType&& input)
     {
         if (precision == "float32")
         {
-            return tensorrt_llm::DataType::kFLOAT;
+            return nvinfer1::DataType::kFLOAT;
         }
         if (precision == "float16")
         {
-            return tensorrt_llm::DataType::kHALF;
+            return nvinfer1::DataType::kHALF;
         }
         if (precision == "bfloat16")
         {
-            return tensorrt_llm::DataType::kBF16;
+            return nvinfer1::DataType::kBF16;
         }
         TLLM_THROW("Model data type '%s' not supported", precision.c_str());
     }();

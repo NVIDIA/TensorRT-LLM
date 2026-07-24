@@ -78,7 +78,6 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-      transceiver_runtime: PYTHON
     disable_overlap_scheduler: true
     num_postprocess_workers: 4
     stream_interval: 20
@@ -110,5 +109,4 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-      transceiver_runtime: PYTHON
     disable_overlap_scheduler: true

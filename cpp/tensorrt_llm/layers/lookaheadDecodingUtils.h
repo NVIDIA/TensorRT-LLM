@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
@@ -319,12 +318,12 @@ public:
     {
         switch (mTensor.getDataType())
         {
-        case tensorrt_llm::DataType::kBOOL: return values<bool>();
-        case tensorrt_llm::DataType::kFLOAT: return values<float>();
-        case tensorrt_llm::DataType::kINT8: return values<std::int8_t>();
-        case tensorrt_llm::DataType::kINT32: return values<std::int32_t>();
-        case tensorrt_llm::DataType::kINT64: return values<std::int64_t>();
-        case tensorrt_llm::DataType::kUINT8: return values<std::uint8_t>();
+        case nvinfer1::DataType::kBOOL: return values<bool>();
+        case nvinfer1::DataType::kFLOAT: return values<float>();
+        case nvinfer1::DataType::kINT8: return values<std::int8_t>();
+        case nvinfer1::DataType::kINT32: return values<std::int32_t>();
+        case nvinfer1::DataType::kINT64: return values<std::int64_t>();
+        case nvinfer1::DataType::kUINT8: return values<std::uint8_t>();
         default: return std::string(mName + ": Unsupported data type");
         }
     }
@@ -377,12 +376,12 @@ public:
         {
             switch (mTensor.getDataType())
             {
-            case tensorrt_llm::DataType::kBOOL: return randomize<bool>(3);
-            case tensorrt_llm::DataType::kFLOAT: return randomize<float>(3);
-            case tensorrt_llm::DataType::kINT8: return randomize<std::int8_t>(3);
-            case tensorrt_llm::DataType::kINT32: return randomize<std::int32_t>(3);
-            case tensorrt_llm::DataType::kINT64: return randomize<std::int64_t>(3);
-            case tensorrt_llm::DataType::kUINT8: return randomize<std::uint8_t>(3);
+            case nvinfer1::DataType::kBOOL: return randomize<bool>(3);
+            case nvinfer1::DataType::kFLOAT: return randomize<float>(3);
+            case nvinfer1::DataType::kINT8: return randomize<std::int8_t>(3);
+            case nvinfer1::DataType::kINT32: return randomize<std::int32_t>(3);
+            case nvinfer1::DataType::kINT64: return randomize<std::int64_t>(3);
+            case nvinfer1::DataType::kUINT8: return randomize<std::uint8_t>(3);
             default: return;
             }
         }
@@ -392,12 +391,12 @@ public:
     {
         switch (mTensor.getDataType())
         {
-        case tensorrt_llm::DataType::kBOOL: return randomize<bool>(0);
-        case tensorrt_llm::DataType::kFLOAT: return randomize<float>(0);
-        case tensorrt_llm::DataType::kINT8: return randomize<std::int8_t>(0);
-        case tensorrt_llm::DataType::kINT32: return randomize<std::int32_t>(0);
-        case tensorrt_llm::DataType::kINT64: return randomize<std::int64_t>(0);
-        case tensorrt_llm::DataType::kUINT8: return randomize<std::uint8_t>(0);
+        case nvinfer1::DataType::kBOOL: return randomize<bool>(0);
+        case nvinfer1::DataType::kFLOAT: return randomize<float>(0);
+        case nvinfer1::DataType::kINT8: return randomize<std::int8_t>(0);
+        case nvinfer1::DataType::kINT32: return randomize<std::int32_t>(0);
+        case nvinfer1::DataType::kINT64: return randomize<std::int64_t>(0);
+        case nvinfer1::DataType::kUINT8: return randomize<std::uint8_t>(0);
         default: return;
         }
     }
@@ -406,12 +405,12 @@ public:
     {
         switch (mTensor.getDataType())
         {
-        case tensorrt_llm::DataType::kBOOL: return randomize<bool>(1);
-        case tensorrt_llm::DataType::kFLOAT: return randomize<float>(1);
-        case tensorrt_llm::DataType::kINT8: return randomize<std::int8_t>(1);
-        case tensorrt_llm::DataType::kINT32: return randomize<std::int32_t>(1);
-        case tensorrt_llm::DataType::kINT64: return randomize<std::int64_t>(1);
-        case tensorrt_llm::DataType::kUINT8: return randomize<std::uint8_t>(1);
+        case nvinfer1::DataType::kBOOL: return randomize<bool>(1);
+        case nvinfer1::DataType::kFLOAT: return randomize<float>(1);
+        case nvinfer1::DataType::kINT8: return randomize<std::int8_t>(1);
+        case nvinfer1::DataType::kINT32: return randomize<std::int32_t>(1);
+        case nvinfer1::DataType::kINT64: return randomize<std::int64_t>(1);
+        case nvinfer1::DataType::kUINT8: return randomize<std::uint8_t>(1);
         default: return;
         }
     }

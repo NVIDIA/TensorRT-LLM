@@ -15,7 +15,6 @@
  */
 
 #include "tensorrt_llm/runtime/tllmBuffers.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 
 namespace tensorrt_llm::runtime
 {
@@ -63,12 +62,12 @@ std::shared_ptr<MulticastBuffer> MulticastTensorView::lock() const
 ///////////////////////////////////////
 // MulticastTensorView ITensor methods
 ///////////////////////////////////////
-tensorrt_llm::Dims const& MulticastTensorView::getShape() const
+nvinfer1::Dims const& MulticastTensorView::getShape() const
 {
     return mDims;
 }
 
-void MulticastTensorView::reshape(tensorrt_llm::Dims const& dims)
+void MulticastTensorView::reshape(nvinfer1::Dims const& dims)
 {
     auto new_size = nonNegative(volume(dims));
     if (new_size > getCapacity())
@@ -103,7 +102,7 @@ std::size_t MulticastTensorView::getCapacity() const
     return lock()->getCapacity();
 }
 
-tensorrt_llm::DataType MulticastTensorView::getDataType() const
+nvinfer1::DataType MulticastTensorView::getDataType() const
 {
     return lock()->getDataType();
 }

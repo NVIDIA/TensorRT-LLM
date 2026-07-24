@@ -12,7 +12,7 @@ l0_gh200:
       cpu: aarch64
     terms:
       stage: post_merge
-      backend: pytorch
+      backend: tensorrt
   tests:
   - unittest/bindings
   - unittest/llmapi/test_llm_quant.py

@@ -18,6 +18,7 @@ import os
 import platform
 import threading
 import time
+from functools import wraps
 from pathlib import Path
 
 import torch
@@ -88,3 +89,27 @@ def _init(log_level: object = None) -> None:
         print_stacks_thread.start()
 
     logger.info("TensorRT LLM inited.")
+
+
+# TODO: dead on the Python side (no remaining @_is_building users); the IS_BUILDING
+# env var is only read by the C++ isBuilding() in the TensorRT plugins. Remove this
+# together with that C++ half in the C++ decouple step.
+class _BuildingFlag:
+    def __enter__(self):
+        os.environ["IS_BUILDING"] = "1"
+
+    def __exit__(self, type, value, tb):
+        del os.environ["IS_BUILDING"]
+
+
+def _is_building(f):
+    """Use this to decorate functions which are called during engine building/refitting process,
+    otherwise, the plugin registration will fail.
+    """
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        with _BuildingFlag():
+            return f(*args, **kwargs)
+
+    return decorated

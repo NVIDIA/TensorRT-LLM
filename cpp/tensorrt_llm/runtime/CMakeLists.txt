@@ -26,6 +26,7 @@ set(SRCS
     eagleBuffers.cpp
     explicitDraftTokensBuffers.cpp
     lookaheadBuffers.cpp
+    layerProfiler.cpp
     loraManager.cpp
     loraUtils.cpp
     loraModule.cpp
@@ -50,6 +51,9 @@ set(SRCS
     promptTuningParams.cpp
     runtimeKernels.cu
     tllmBuffers.cpp
+    tllmRuntime.cpp
+    tllmStreamReaders.cpp
+    tllmLogger.cpp
     workerPool.cpp
     worldConfig.cpp
     virtualMemory.cpp)

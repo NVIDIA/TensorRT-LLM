@@ -19,8 +19,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, ClassVar, Dict, Iterable, List, Optional,
-                    Sequence, Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
+                    Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -307,9 +307,6 @@ class KVCacheManager(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
-        # Consumed by the disaggregation page-table builder to expose the DSA
-        # indexer K cache pool as a REPLICATED pool view.
-        self.enable_indexer_k_cache = enable_indexer_k_cache
         self.spec_config = spec_config
         self.pp_layers, self.num_layers = get_pp_layers(
             num_layers,
@@ -2176,13 +2173,9 @@ class KVCacheManager(BaseResourceManager):
     def pin_blocks(self, request_id: int):
         self.impl.pin_blocks(request_id)
 
-    def copy_batch_block_offsets(self,
-                                 dst_tensor: torch.Tensor,
-                                 request_ids: List[int],
-                                 beam_width: int,
-                                 num_context: int,
-                                 num_seqs: int,
-                                 max_blocks: Optional[int] = None):
+    def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
+                                 request_ids: List[int], beam_width: int,
+                                 num_context: int, num_seqs: int):
         # Fill the persistent host buffer in place, exactly as before. CPU-side
         # consumers read self.host_kv_cache_block_offsets directly and depend on
         # its persistent, max_batch-sized layout: DSA sparse attention, the
@@ -2248,39 +2241,23 @@ class KVCacheManager(BaseResourceManager):
         # matching the already-safe kv_lens / block_ids_per_seq staging. The
         # persistent buffer above is untouched by this and stays valid for the
         # synchronous CPU readers.
-        host_block_offsets = self._stage_block_offsets_for_copy(
-            num_seqs, max_blocks)
-        width = host_block_offsets.shape[-1]
+        host_block_offsets = self._stage_block_offsets_for_copy(num_seqs)
         for pool_idx in range(self.num_pools):
-            dst_tensor[pool_idx, :num_seqs, :, :width].copy_(
-                host_block_offsets[pool_idx], non_blocking=True)
+            dst_tensor[pool_idx, :num_seqs].copy_(host_block_offsets[pool_idx],
+                                                  non_blocking=True)
 
-    def _stage_block_offsets_for_copy(
-            self,
-            num_rows: int,
-            max_blocks: Optional[int] = None) -> torch.Tensor:
+    def _stage_block_offsets_for_copy(self, num_rows: int) -> torch.Tensor:
         """Snapshot the first ``num_rows`` rows of the persistent host block
         offset buffer into a fresh pinned buffer, to serve as the private source
-        of an asynchronous H2D copy (nvbug 6293536).
-
-        ``max_blocks`` bounds the copied block width. The buffer is laid out
-        for max_seq_len (max_blocks_per_seq columns) but consumers only read
-        each sequence's allocated block prefix, so a caller that knows the
-        batch's maximum KV length can skip the unused tail — with a large
-        max_seq_len the tail dominates the copy cost."""
-        if max_blocks is None:
-            width = self.max_blocks_per_seq
-        else:
-            width = min(max(max_blocks, 1), self.max_blocks_per_seq)
+        of an asynchronous H2D copy (nvbug 6293536)."""
         host_block_offsets = torch.empty(self.num_pools,
                                          num_rows,
                                          2,
-                                         width,
+                                         self.max_blocks_per_seq,
                                          dtype=torch.int32,
                                          pin_memory=prefer_pinned(),
                                          device='cpu')
-        host_block_offsets.copy_(
-            self.host_kv_cache_block_offsets[:, :num_rows, :, :width])
+        host_block_offsets.copy_(self.host_kv_cache_block_offsets[:, :num_rows])
         return host_block_offsets
 
     def truncate_blocks(self, target_tokens: List[int],
@@ -2424,34 +2401,14 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
     base implementations below translate those callbacks into the lifecycle
     hooks.
 
-    Concrete compression methods subclass this directly. The hooks default to
+    Concrete compression methods subclass this directly. All 4 hooks default to
     no-op; subclasses override what they need. The manager never inherits from
     any cache manager because this layer decides *how* the physical KV is used,
     not *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
-
-    A subclass compacts through the ``KVCacheManagerV2`` it holds and records
-    the evicted count on ``LlmRequest.py_num_compressed_tokens``; the model
-    engine subtracts that count when building ``num_cached_tokens_per_seq``.
     """
 
-    adjusts_generation_kv_length: ClassVar[bool] = False
-    """Whether this manager can make target and logical KV lengths diverge."""
-
-    def __init__(
-        self,
-        kv_cache_manager: "KVCacheManagerV2",
-        draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
-    ):
-        from .kv_cache_manager_v2 import KVCacheManagerV2
-
-        if not isinstance(kv_cache_manager, KVCacheManagerV2):
-            raise TypeError("KV-cache compression requires KVCacheManagerV2")
-        if draft_kv_cache_manager is not None and not isinstance(
-                draft_kv_cache_manager, KVCacheManagerV2):
-            raise TypeError(
-                "draft KV-cache compression requires KVCacheManagerV2")
+    def __init__(self, kv_cache_manager: "KVCacheManagerV2"):
         self.kv_cache_manager = kv_cache_manager
-        self.draft_kv_cache_manager = draft_kv_cache_manager
         # Compression evicts/rewrites stored keys and values, so a shared prefix
         # block is no longer safe to reuse (same constraint as RocketKVCacheManager).
         if kv_cache_manager.enable_block_reuse:
@@ -2459,18 +2416,9 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
                 f"{type(self).__name__} changes stored keys and values and cannot "
                 f"run with KV-cache block reuse. Set "
                 f"KvCacheConfig.enable_block_reuse to False.")
-        kv_cache_manager.kv_compression_manages_history = self.adjusts_generation_kv_length
-        if draft_kv_cache_manager is not None:
-            # The draft cache is compacted together with the target.
-            draft_kv_cache_manager.kv_compression_manages_history = (
-                self.adjusts_generation_kv_length)
-
-    @property
-    def has_independent_draft_kv_cache(self) -> bool:
-        return self.draft_kv_cache_manager is not None
 
     # ================================================================== #
-    # KV-cache lifecycle hooks (5, in temporal order).                   #
+    # KV-cache lifecycle hooks (4, in temporal order).                   #
     # Subclasses override what they need; all default to no-op.          #
     # ================================================================== #
 
@@ -2481,23 +2429,20 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         scoring buffers).
         """
 
-    def on_context_step_end(self, requests: List["LlmRequest"],
-                            **kwargs) -> None:
-        """Fired once per iteration with the requests whose prefill finished
-        (their final chunk) this step. Batched like the generation hook so a
-        one-shot prefill-end eviction can process the cohort in one launch.
-        """
-
-    def on_generation_step_begin(
+    def on_context_step_end(
         self,
-        scheduled_batch: "ScheduledRequests",
+        request: "LlmRequest",
+        metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
-        """Fired once per generation step before this step's forward."""
+        """Fired once per request, when its prefill finishes (its final
+        chunk). Override for a one-shot prefill-end eviction.
+        """
 
     def on_generation_step_end(
         self,
         scheduled_batch: "ScheduledRequests",
+        attn_metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
         """Fired once per generation step, after every layer's forward
@@ -2537,7 +2482,6 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         for req in scheduled_batch.context_requests:
             if req.is_first_context_chunk:
                 self.on_request_init(req)
-        self.on_generation_step_begin(scheduled_batch)
 
     def update_resources(
         self,
@@ -2545,8 +2489,8 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         attn_metadata: Optional["AttentionMetadata"] = None,
         kv_cache_dtype_byte_size: Optional[float] = None,
     ) -> None:
-        """Fire :meth:`on_context_step_end` with the requests whose final
-        prefill chunk ran this iteration, then :meth:`on_generation_step_end`.
+        """Fire :meth:`on_context_step_end` once per request, on the iteration its
+        final prefill chunk runs, then :meth:`on_generation_step_end` once.
 
         Uses the scheduler's ``context_requests_last_chunk`` split (computed at
         schedule time from ``is_last_context_chunk``) rather than tracking
@@ -2557,10 +2501,9 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         managers so PyExecutor passes ``attn_metadata`` /
         ``kv_cache_dtype_byte_size`` through transparently.
         """
-        if scheduled_batch.context_requests_last_chunk:
-            self.on_context_step_end(
-                scheduled_batch.context_requests_last_chunk)
-        self.on_generation_step_end(scheduled_batch)
+        for req in scheduled_batch.context_requests_last_chunk:
+            self.on_context_step_end(req, attn_metadata)
+        self.on_generation_step_end(scheduled_batch, attn_metadata)
 
     def free_resources(self, request: "LlmRequest") -> None:
         """Fire :meth:`on_request_finish`."""
@@ -2597,9 +2540,9 @@ class ResourceManager:
         attn_metadata: Optional["AttentionMetadata"] = None,
         kv_cache_dtype_byte_size: Optional[float] = None,
     ):
-        for resource_type, resource_manager in self.resource_managers.items():
+        for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
-                if resource_type == ResourceManagerType.KV_CACHE_MANAGER:
+                if isinstance(resource_manager, KVCacheManager):
                     resource_manager.update_resources(scheduled_batch,
                                                       attn_metadata,
                                                       kv_cache_dtype_byte_size)

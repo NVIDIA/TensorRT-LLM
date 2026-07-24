@@ -1,3 +1,4 @@
+#include <NvInferRuntime.h>
 #include <cublasLt.h>
 #include <cuda_fp8.h>
 #include <cuda_profiler_api.h>

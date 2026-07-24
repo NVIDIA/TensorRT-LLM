@@ -52,7 +52,7 @@ __device__ __forceinline__ float reciprocal_approximate_ftz_local(float a)
 // (8 lanes × 16 BF16 elems = 128 elems). After per-block amax, lanes
 // 0/8/16/24 each hold one UE8M0 scale byte; lane 0 packs them into a uint32
 // and stores in the deep_gemm-expected MN-major layout.
-template <int WarpsPerBlock, bool OutputCuteDslSf>
+template <int WarpsPerBlock>
 __global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict__ fp8_output,
     int32_t* __restrict__ packed_scale_output, __nv_bfloat16 const* __restrict__ input, int const m, int const k,
     int const scale_leading_dim_uint32)
@@ -72,7 +72,6 @@ __global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict_
     bool const row_in_range = (m_idx < m);
 
     uint32_t packed = 0u;
-    uint32_t scale_byte = 0u;
     if (row_in_range)
     {
         int const k_base = packed_sf_k_idx * 512 + lane_id * 16;
@@ -121,7 +120,6 @@ __global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict_
         float const dequant_scale_raw = amax * reciprocal_approximate_ftz_local(448.0f);
         __nv_fp8_e8m0 ue8m0_scale;
         ue8m0_scale.__x = __nv_cvt_float_to_e8m0(dequant_scale_raw, __NV_SATFINITE, cudaRoundPosInf);
-        scale_byte = static_cast<uint32_t>(ue8m0_scale.__x);
 
         // Recover quant_scale = 1 / 2^(exp - 127) for fp8 conversion.
         constexpr uint32_t FP32_EXPONENT_BIAS = 127u;
@@ -164,58 +162,32 @@ __global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict_
         }
 
         // ---- 5. Pack 4 UE8M0 scales (lanes 0/8/16/24). ----
-        if constexpr (!OutputCuteDslSf)
+        uint32_t const s0 = __shfl_sync(0xFFFFFFFFu, static_cast<uint32_t>(ue8m0_scale.__x), 0);
+        uint32_t const s1 = __shfl_sync(0xFFFFFFFFu, static_cast<uint32_t>(ue8m0_scale.__x), 8);
+        uint32_t const s2 = __shfl_sync(0xFFFFFFFFu, static_cast<uint32_t>(ue8m0_scale.__x), 16);
+        uint32_t const s3 = __shfl_sync(0xFFFFFFFFu, static_cast<uint32_t>(ue8m0_scale.__x), 24);
+        if (lane_id == 0)
         {
-            uint32_t const s0 = __shfl_sync(0xFFFFFFFFu, scale_byte, 0);
-            uint32_t const s1 = __shfl_sync(0xFFFFFFFFu, scale_byte, 8);
-            uint32_t const s2 = __shfl_sync(0xFFFFFFFFu, scale_byte, 16);
-            uint32_t const s3 = __shfl_sync(0xFFFFFFFFu, scale_byte, 24);
-            if (lane_id == 0)
-            {
-                // Mask off scale bytes whose sf_k is past the actual K.
-                int const num_sf_k = (k + 127) / 128;
-                int const sf_k_base = packed_sf_k_idx * 4;
-                if (sf_k_base + 0 < num_sf_k)
-                    packed |= s0;
-                if (sf_k_base + 1 < num_sf_k)
-                    packed |= (s1 << 8);
-                if (sf_k_base + 2 < num_sf_k)
-                    packed |= (s2 << 16);
-                if (sf_k_base + 3 < num_sf_k)
-                    packed |= (s3 << 24);
-            }
+            // Mask off scale bytes whose sf_k is past the actual K.
+            int const num_sf_k = (k + 127) / 128;
+            int const sf_k_base = packed_sf_k_idx * 4;
+            if (sf_k_base + 0 < num_sf_k)
+                packed |= s0;
+            if (sf_k_base + 1 < num_sf_k)
+                packed |= (s1 << 8);
+            if (sf_k_base + 2 < num_sf_k)
+                packed |= (s2 << 16);
+            if (sf_k_base + 3 < num_sf_k)
+                packed |= (s3 << 24);
         }
     }
 
-    if constexpr (OutputCuteDslSf)
+    // Always write the packed scale — `packed` is 0 for padded rows. The grid
+    // covers the full [0, scale_leading_dim_uint32) leading dim (rounded up to
+    // WarpsPerBlock), and the m_idx guard drops the few rows past the buffer end.
+    if (lane_id == 0 && m_idx < scale_leading_dim_uint32)
     {
-        // Native MXF8 MMA consumes one UE8M0 scale per 32 K values.  Preserve
-        // the production 1x128 quantization contract by replicating each scale
-        // four times directly into CUTLASS/CuTe's 128x4 swizzled layout.
-        if (lane_id % 8 == 0 && m_idx < scale_leading_dim_uint32)
-        {
-            int const sf128_idx = packed_sf_k_idx * 4 + lane_id / 8;
-            int const num_sf128 = (k + 127) / 128;
-            if (sf128_idx < num_sf128)
-            {
-                int const num_sf32 = (k + 31) / 32;
-                int const num_k_tiles = (num_sf32 + 3) / 4;
-                int64_t const dst_offset = static_cast<int64_t>(m_idx / 128) * num_k_tiles * 512
-                    + static_cast<int64_t>(sf128_idx) * 512 + (m_idx % 32) * 16 + ((m_idx % 128) / 32) * 4;
-                uint32_t const replicated = row_in_range ? scale_byte * 0x01010101u : 0u;
-                *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(packed_scale_output) + dst_offset) = replicated;
-            }
-        }
-    }
-    else
-    {
-        // Always write the packed scale — `packed` is 0 for padded rows. The grid
-        // covers the full [0, scale_leading_dim_uint32) leading dim (rounded up to
-        // WarpsPerBlock), and the m_idx guard drops the few rows past the buffer end.
-        if (lane_id == 0 && m_idx < scale_leading_dim_uint32)
-        {
-            packed_scale_output[static_cast<int64_t>(packed_sf_k_idx) * scale_leading_dim_uint32 + m_idx] = packed;
-        }
+        packed_scale_output[static_cast<int64_t>(packed_sf_k_idx) * scale_leading_dim_uint32 + m_idx] = packed;
     }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
@@ -243,27 +215,8 @@ void launch_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, int32
     dim3 const block(kWarpsPerBlock * 32, 1, 1);
 
     tensorrt_llm::common::launchWithPdlWhenEnabled("fp8_quantize_1x128_packed_kernel_impl",
-        fp8_quantize_1x128_packed_kernel_impl<kWarpsPerBlock, false>, grid, block, 0, stream, fp8_output,
-        packed_scale_output, input, m, k, scale_leading_dim_uint32);
-}
-
-void launch_fp8_quantize_1x128_cutedsl_bf16_e4m3(__nv_fp8_e4m3* fp8_output, uint8_t* swizzled_scale_output,
-    __nv_bfloat16 const* input, int m, int k, int padded_m, cudaStream_t stream)
-{
-    if (m <= 0 || k <= 0)
-    {
-        return;
-    }
-
-    constexpr int kWarpsPerBlock = 4;
-    int const num_packed_sf_k = (((k + 127) / 128) + 3) / 4;
-    int const m_blocks = (padded_m + kWarpsPerBlock - 1) / kWarpsPerBlock;
-    dim3 const grid(num_packed_sf_k, m_blocks, 1);
-    dim3 const block(kWarpsPerBlock * 32, 1, 1);
-
-    tensorrt_llm::common::launchWithPdlWhenEnabled("fp8_quantize_1x128_cutedsl_kernel_impl",
-        fp8_quantize_1x128_packed_kernel_impl<kWarpsPerBlock, true>, grid, block, 0, stream, fp8_output,
-        reinterpret_cast<int32_t*>(swizzled_scale_output), input, m, k, padded_m);
+        fp8_quantize_1x128_packed_kernel_impl<kWarpsPerBlock>, grid, block, 0, stream, fp8_output, packed_scale_output,
+        input, m, k, scale_leading_dim_uint32);
 }
 
 } // namespace kernels::fp8_blockscale_gemm

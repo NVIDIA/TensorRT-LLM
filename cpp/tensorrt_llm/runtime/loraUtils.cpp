@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -58,7 +57,7 @@ void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optR
         keys->getShape().d[0] == expectedBatchSize, "Expected batch dimension to be 1 for each lora request");
     TLLM_CHECK_WITH_INFO(weights->getMemoryType() != MemoryType::kGPU, "Expected lora weights to be in CPU memory");
     TLLM_CHECK_WITH_INFO(keys->getMemoryType() != MemoryType::kGPU, "Expected lora weights to be in CPU memory");
-    TLLM_CHECK_WITH_INFO(keys->getDataType() == tensorrt_llm::DataType::kINT32,
+    TLLM_CHECK_WITH_INFO(keys->getDataType() == nvinfer1::DataType::kINT32,
         "Expected  lora keys to have TYPE_INT32 but was " + std::string(keys->getDataTypeName()));
 
     TLLM_CHECK_WITH_INFO(keys->getShape().d[1] == weights->getShape().d[1],

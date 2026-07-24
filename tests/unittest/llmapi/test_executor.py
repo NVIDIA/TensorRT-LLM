@@ -2,10 +2,8 @@ import asyncio
 import datetime
 import tempfile
 import threading
-import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from queue import Empty
 
 import pytest
 import torch
@@ -19,7 +17,6 @@ from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationResultBase, PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
-from tensorrt_llm.llmapi.utils import AsyncQueue
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
@@ -116,74 +113,6 @@ def test_GenerationResult():
     result._handle_response(create_rsp(44, finished=True))
     assert len(result.outputs[0].token_ids) == 12
     assert result._done
-
-
-def test_result_timeout_raises():
-    request = GenerationRequest(prompt_token_ids=[12, 23, 34],
-                                sampling_params=SamplingParams(max_tokens=4))
-    result = GenerationResult(request)
-
-    # Queue stays empty (no worker pushing responses) -> must time out fast, not block indefinitely.
-    start = time.monotonic()
-    with pytest.raises(TimeoutError):
-        result.result(timeout=0.1)
-    elapsed = time.monotonic() - start
-    assert elapsed < 2.0, f"result() did not honor timeout (took {elapsed:.2f}s)"
-    assert not result._done
-
-
-def test_result_timeout_budget_across_steps():
-    request = GenerationRequest(prompt_token_ids=[12, 23, 34],
-                                sampling_params=SamplingParams(max_tokens=4))
-    result = GenerationResult(request)
-
-    # A single non-final response is available, then the queue goes empty and the request never
-    # completes.
-    result.queue.put(create_rsp(33, finished=False))
-
-    start = time.monotonic()
-    with pytest.raises(TimeoutError):
-        result.result(timeout=0.1)
-    elapsed = time.monotonic() - start
-    assert elapsed < 2.0, f"result() did not honor timeout (took {elapsed:.2f}s)"
-    assert not result._done
-
-
-def test_result_zero_timeout_completes_with_queued_responses():
-    request = GenerationRequest(prompt_token_ids=[12, 23, 34],
-                                sampling_params=SamplingParams(max_tokens=4))
-    result = GenerationResult(request)
-
-    result.queue.put(create_rsp(33, finished=False))
-    result.queue.put(create_rsp(44, finished=True))
-
-    assert result.result(timeout=0) is result
-    assert result._done
-    assert len(result.outputs[0].token_ids) == 2
-
-
-def test_sync_queue_zero_timeout_checks_for_queued_item():
-    queue = AsyncQueue()
-    queue.put("ready")
-
-    with pytest.warns(UserWarning):
-        assert queue.sync_q.get(timeout=0) == "ready"
-    with pytest.warns(UserWarning), pytest.raises(Empty):
-        queue.sync_q.get(timeout=0)
-
-
-def test_result_completes_within_timeout():
-    request = GenerationRequest(prompt_token_ids=[12, 23, 34],
-                                sampling_params=SamplingParams(max_tokens=4))
-    result = GenerationResult(request)
-
-    result.queue.put(create_rsp(33, finished=False))
-    result.queue.put(create_rsp(44, finished=True))
-
-    ret = result.result(timeout=30.0)
-    assert ret is result
-    assert result._done
-    assert len(result.outputs[0].token_ids) == 2
 
 
 def test_DetokenizedGenerationResultBase():
@@ -389,7 +318,7 @@ def ResponsePostprocessWorker_worker_task(pull_pipe_addr, push_pipe_addr,
                                           tokenizer_dir):
     worker = PostprocWorker(
         pull_pipe_addr=pull_pipe_addr,
-        push_pipe_addrs=[push_pipe_addr],
+        push_pipe_addr=push_pipe_addr,
         tokenizer_dir=tokenizer_dir,
         record_creator=ResponsePostprocessWorker_record_creator)
     worker.start()

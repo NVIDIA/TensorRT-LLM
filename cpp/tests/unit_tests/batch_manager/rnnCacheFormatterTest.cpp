@@ -7,7 +7,6 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 
 #include <random>
@@ -28,12 +27,12 @@ protected:
         std::vector<SizeType32> kvLayersPerPP(pp, 0); // No attention layers
         auto state = texec::kv_cache::CacheState(
             /*nbAttentionLayers=*/0, /*nbKvHeads=*/1, /*sizePerHead=*/64, /*tokensPerBlock=*/32, tp, pp,
-            /*contextParallelism=*/1, kvLayersPerPP, tensorrt_llm::DataType::kFLOAT);
+            /*contextParallelism=*/1, kvLayersPerPP, nvinfer1::DataType::kFLOAT);
 
         texec::kv_cache::CacheState::RnnModelConfig rnnModelConfig{/*mDState=*/16, /*mDConv=*/4, /*mHiddenSize=*/256,
             /*mHeadDim=*/64,
             /*mConvDimSize=*/128, /*mNGroups=*/1, /*mNumLayers=*/numLayers, /*mNumHeads=*/4};
-        state.setRnnConfig(rnnModelConfig, layersPerPP, tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kFLOAT);
+        state.setRnnConfig(rnnModelConfig, layersPerPP, nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kFLOAT);
         return state;
     }
 };
@@ -217,7 +216,7 @@ protected:
         SizeType32 tokensPerBlock = 32)
     {
         return texec::kv_cache::CacheState(numLayers, numHeads, sizePerHead, tokensPerBlock, tp, pp,
-            /*contextParallelism=*/1, layersPerPP, tensorrt_llm::DataType::kFLOAT,
+            /*contextParallelism=*/1, layersPerPP, nvinfer1::DataType::kFLOAT,
             texec::kv_cache::CacheState::AttentionType::kDEFAULT, /*kvFactor=*/2,
             /*enableAttentionDP=*/false, /*DPrank=*/0, /*DPsize=*/1);
     }
@@ -229,8 +228,7 @@ protected:
     {
         auto state = makeKvCacheState(kvNumLayers, tp, pp, kvLayersPerPP, numHeads, sizePerHead, tokensPerBlock);
         texec::kv_cache::CacheState::RnnModelConfig rnnModelConfig{16, 4, 256, 64, 128, 1, rnnNumLayers, 4};
-        state.setRnnConfig(
-            rnnModelConfig, rnnLayersPerPP, tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kFLOAT);
+        state.setRnnConfig(rnnModelConfig, rnnLayersPerPP, nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kFLOAT);
         return state;
     }
 
@@ -473,7 +471,7 @@ protected:
         SizeType32 tokensPerBlock = 32)
     {
         return texec::kv_cache::CacheState(numLayers, numHeads, sizePerHead, tokensPerBlock, tp, pp,
-            /*contextParallelism=*/1, layersPerPP, tensorrt_llm::DataType::kFLOAT,
+            /*contextParallelism=*/1, layersPerPP, nvinfer1::DataType::kFLOAT,
             texec::kv_cache::CacheState::AttentionType::kDEFAULT, /*kvFactor=*/2,
             /*enableAttentionDP=*/false, /*DPrank=*/0, /*DPsize=*/1);
     }

@@ -32,7 +32,7 @@ from tensorrt_llm._torch.modules.linear import Linear  # noqa: E402  (avoid cycl
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import is_sm_100f, prefer_pinned
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
@@ -250,7 +250,6 @@ def make_deepseek_v4_sparse_metadata_params(
         ),
         enable_indexer_skip=sparse_attention_config.skip_indexer_for_short_seqs,
         enable_heuristic_topk=sparse_attention_config.enable_heuristic_topk,
-        use_cute_dsl_topk=sparse_attention_config.use_cute_dsl_topk,
         use_cute_dsl_paged_mqa_logits=(sparse_attention_config.use_cute_dsl_paged_mqa_logits),
         q_split_threshold=sparse_attention_config.q_split_threshold,
         compress_ratios=sparse_attention_config.compress_ratios,
@@ -275,7 +274,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         super().__post_init__()
         self.num_total_compressed_tokens = {}
         self.max_ctx_compressed_tokens = {}
-        self._ctx_output_sizes: Optional[Dict[int, int]] = None
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DeepSeekV4MetadataParams):
             raise ValueError("DeepSeek-V4 sparse attention metadata params are not set")
@@ -531,10 +529,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.host_indexer_k_cache_block_offsets[: self.num_seqs],
             non_blocking=True,
         )
-        # Columns beyond each sequence's allocated indexer blocks contain BAD_PAGE_INDEX (-1).
-        # CUDA-graph padded token slots may still compute scatter addresses from those columns
-        # before being ignored, so map them to block 0, matching the base DSA metadata path.
-        self.indexer_k_cache_block_offsets.clamp_(min=0)
 
     def prepare_for_block_tables(self):
         """Prepare block tables for sliding-window and compressed attention."""
@@ -738,18 +732,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         kv_lens_slice = kv_lens[:num_requests]
         cached_slice = cached_token_lens[:num_requests]
 
-        # Host-side per-ratio ctx compressed-token counts (Python ints), so
-        # _compute_ctx_compressed_position_ids never reads a device scalar
-        # (implicit D2H + stream sync) for its arange size / slice bound.
-        ctx_output_sizes: Optional[Dict[int, int]] = None
         if num_contexts > 0:
             # Prefill path: need per-request tensor ops for ctx scalar metadata.
-            ctx_output_sizes = {}
             for compress_ratio in self.compress_ratio_set:
                 new_comp_kv_lens = kv_lens_slice // compress_ratio - cached_slice // compress_ratio
                 cu_new = new_comp_kv_lens.cumsum(0)
                 num_ctx_compressed_tokens = cu_new[num_contexts - 1].item()
-                ctx_output_sizes[compress_ratio] = num_ctx_compressed_tokens
                 num_gen_compressed_tokens = num_generations * (
                     (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
                 )
@@ -768,15 +756,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 )
                 self.max_ctx_compressed_tokens[compress_ratio] = 0
 
-        # Cached for on_update_kv_lens(); see the reuse gate there.
-        self._ctx_output_sizes = ctx_output_sizes
-
         # 2) CUDA-side: fill *_cuda buffers on device.
         kv_lens_cuda = (
             self.cached_token_lens_cuda[:num_requests] + self._seq_lens_cuda[:num_requests]
         )
         cached_tokens_cuda = self.cached_token_lens_cuda[:num_requests]
-        self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda, ctx_output_sizes)
+        self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda)
 
         self._compute_compressed_mask(
             self.new_comp_kv_lens_cuda,
@@ -791,7 +776,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self,
         kv_lens: torch.Tensor,
         cached_tokens: torch.Tensor,
-        ctx_output_sizes: Optional[Dict[int, int]] = None,
     ):
         """Compute per-ratio compressed KV lens and position IDs on device.
 
@@ -800,12 +784,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         Args:
             kv_lens: Total KV lengths per request (device tensor, [batch_size]).
             cached_tokens: Cached token counts per request (device tensor, [batch_size]).
-            ctx_output_sizes: Optional per-ratio host-computed ctx
-                compressed-token counts (Python ints); avoids implicit
-                device-scalar reads (D2H + stream sync) in the ctx position-id
-                computation. prepare() always passes it; on_update_kv_lens()
-                reuses the cached copy unless the extend_ctx path may have
-                mutated ctx-row kv_lens on device.
         """
         batch_size = kv_lens.shape[0]
         num_contexts = self.num_contexts
@@ -829,7 +807,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 self.compressed_position_ids_cuda,
                 num_contexts,
                 self._compress_ratios_sorted,
-                ctx_output_sizes,
             )
 
         if self.num_gen_tokens_per_seq > 0 and num_generations > 0:
@@ -866,13 +843,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
         )
 
-        # Reuse prepare()'s host-computed ctx sizes unless the extend_ctx path
-        # (num_chunked_ctx_requests > 0) may have mutated ctx-row kv_lens on
-        # device; every other path only changes gen rows.
-        ctx_output_sizes = (
-            self._ctx_output_sizes if getattr(self, "num_chunked_ctx_requests", 0) == 0 else None
-        )
-        self.prepare_compressed_kv_metadata(kv_lens, cached_tokens, ctx_output_sizes)
+        self.prepare_compressed_kv_metadata(kv_lens, cached_tokens)
 
         self._compute_compressed_mask(
             self.new_comp_kv_lens_cuda,
@@ -1028,24 +999,14 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         compressed_position_ids_bufs: Dict[int, torch.Tensor],
         num_contexts: int,
         compress_ratios: list,
-        ctx_output_sizes: Optional[Dict[int, int]] = None,
     ):
-        """Context-only compressed position IDs (eager, data-dependent shapes).
-
-        ctx_output_sizes (host ints) keeps the arange size and slice bound off
-        the device; the 0-dim-CUDA fallback costs two implicit D2H syncs per
-        ratio.
-        """
+        """Context-only compressed position IDs (eager, data-dependent shapes)."""
         device = past_kv_lens_bufs[compress_ratios[0]].device
         for compress_ratio in compress_ratios:
             past_kv = past_kv_lens_bufs[compress_ratio]
             cu_new_comp = cu_new_comp_kv_bufs[compress_ratio]
 
-            total_ctx_comp = (
-                ctx_output_sizes[compress_ratio]
-                if ctx_output_sizes is not None
-                else cu_new_comp[num_contexts]
-            )
+            total_ctx_comp = cu_new_comp[num_contexts]
             ctx_idx = torch.arange(total_ctx_comp, dtype=torch.int32, device=device)
             ctx_cu = cu_new_comp[: num_contexts + 1].to(torch.int32)
             ctx_req = torch.searchsorted(ctx_cu[1:], ctx_idx, right=True)
@@ -1079,11 +1040,6 @@ class DeepseekV4Indexer(Indexer):
             layer_idx,
             aux_stream,
         )
-        # Preserve the checkpoint's 128x128 FP8 quantization while deriving a
-        # native-MXF8 (sf_vec=32) scale view for the TRT-LLM CuTe DSL fused
-        # indexer-Q projection.  FP8BlockScalesLinearMethod materializes the
-        # derived, swizzled scale once after weight loading.
-        self.wq_b.use_indexer_q_cutedsl_fusion = True
         # Override base Indexer.weights_proj to bf16 (matches V4 checkpoint).
         self.weights_proj = Linear(
             self.hidden_size,
@@ -1143,10 +1099,6 @@ class DeepseekV4Indexer(Indexer):
         """
         q = self.wq_b(qr)
         q = q.view(-1, self.n_heads, self.head_dim)
-        return self._apply_q_rope(q, position_ids)
-
-    def _apply_q_rope(self, q: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        """Apply RoPE in-place to a projected indexer Q tensor."""
         # Fused in-place RoPE on the rope portion of each head
         nope_dim = self.head_dim - self.rope_dim
         torch.ops.trtllm.mla_rope_inplace(
@@ -1160,49 +1112,6 @@ class DeepseekV4Indexer(Indexer):
             self.rotary_emb.is_neox,
         )
         return q
-
-    def _project_and_quantize_q(
-        self, qr: torch.Tensor, position_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Project Q and produce the cache precision consumed by the indexer.
-
-        The DSv4 MXFP4 configuration can fuse projection, interleaved RoPE,
-        and FP4 quantization. If the optional Hadamard transform is active,
-        retain the legacy path because that transform changes all 128 values
-        in a head and is not part of the CuTe DSL kernel.
-        """
-        use_fused_project_mxfp4 = (
-            self.indexer_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE
-            and not HAS_FAST_HADAMARD
-            and not self.rotary_emb.is_neox
-            and self.head_dim == 128
-            and self.rope_dim == 64
-            and self.wq_b.has_fp8_block_scales
-            and hasattr(self.wq_b, "indexer_q_weight_scale_cutedsl")
-            and hasattr(
-                torch.ops.trtllm,
-                "cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell",
-            )
-            and qr.dtype == torch.bfloat16
-            and is_sm_100f()
-        )
-        if use_fused_project_mxfp4:
-            q_fp4, q_scale = torch.ops.trtllm.cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell(
-                qr,
-                self.wq_b.weight,
-                self.wq_b.indexer_q_weight_scale_cutedsl,
-                position_ids.view(-1),
-                self.rotary_emb.rotary_cos_sin.view(-1, self.rope_dim),
-                self.wq_b.indexer_q_alpha_cutedsl,
-                use_tvm_ffi=True,
-            )
-            return q_fp4.view(-1, self.n_heads, self.head_dim // 2), q_scale.view(
-                -1, self.n_heads, 1
-            )
-
-        q = self.wq_b(qr).view(-1, self.n_heads, self.head_dim)
-        q = self._apply_q_rope(q, position_ids)
-        return self._quantize_q(q)
 
     def _quantize_q(self, q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # Rotate + quantize (layout matches compressor K: [nope|pe]). After
@@ -1333,7 +1242,7 @@ class DeepseekV4Indexer(Indexer):
         if pre_aux is None:
             self.indexer_start_event.record()
 
-            q_fp8, q_scale = self._project_and_quantize_q(qr, position_ids)
+            q = self._qk_projection_and_rope(qr, position_ids)
 
             with torch.cuda.stream(self.aux_stream):
                 self.indexer_start_event.wait()
@@ -1354,7 +1263,9 @@ class DeepseekV4Indexer(Indexer):
                 k_fp8.record_stream(cur_stream)
             if k_scale is not None:
                 k_scale.record_stream(cur_stream)
-            q_fp8, q_scale = self._project_and_quantize_q(qr, position_ids)
+            q = self._qk_projection_and_rope(qr, position_ids)
+
+        q_fp8, q_scale = self._quantize_q(q)
 
         self.weights_proj_event.wait()
         weights = self._apply_weight_scale(weights, q_scale)
@@ -1371,7 +1282,9 @@ class DeepseekV4Indexer(Indexer):
     ) -> Tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor
     ]:
-        q_fp8, q_scale = self._project_and_quantize_q(qr, position_ids)
+        q = self._qk_projection_and_rope(qr, position_ids)
+
+        q_fp8, q_scale = self._quantize_q(q)
 
         weights = self.weights_proj(hidden_states)
 

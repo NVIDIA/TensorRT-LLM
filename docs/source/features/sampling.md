@@ -75,8 +75,7 @@ llm.generate(["Hello, my name is",
 
 * The sampling is controlled via `SamplingParams`.
 
-* By default (`temperature = top_p = top_k = None`), greedy sampling is used
-  (unless top-p decay is active, see below).
+* By default (`temperature = top_p = top_k = None`), greedy sampling is used.
 
 * If either `temperature = 0`, `top_p = 0`, and/or `top_k = 1`, is specified, sampling is greedy,
   irrespective of the values of the remaining parameters.
@@ -101,19 +100,6 @@ llm.generate(["Hello, my name is",
     such that they sum to one before `top_p` is applied.
 
   * The implementation does not guarantee any particular treatment of tied probabilities.
-
-* Top-P decay is supported: if `top_p_decay < 1` is specified, the effective `top_p` is
-  multiplied by `top_p_decay` after every sampled token, bounded from below by `top_p_min`
-  (default `1e-6`), and reset to the initial `top_p` whenever the token `top_p_reset_ids`
-  is sampled (default `-1`, which never matches a token). Out-of-range values
-  (`top_p_decay` or `top_p_min` outside `(0, 1]`, negative `top_p_reset_ids`) are rejected.
-
-  * An active top-p decay implies top-p sampling even if `top_p` is unspecified or `top_p = 1`
-    (the initial `top_p` then defaults to 1). However, explicitly requested greedy sampling
-    (`temperature = 0`, `top_p = 0`, and/or `top_k = 1`) takes precedence over top-p decay.
-
-  * Top-P decay is not supported in combination with beam search or with speculative decoding
-    modes that route draft tokens through the Torch Sampler; such requests are rejected.
 
 ### Performance
 

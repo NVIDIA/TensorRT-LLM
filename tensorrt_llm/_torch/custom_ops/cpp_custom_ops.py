@@ -731,15 +731,6 @@ def _register_fake():
                                 dtype=torch.float8_e4m3fn), input.new_empty(
                                     (m, num_packed_sf_k), dtype=torch.int32)
 
-    @torch.library.register_fake("trtllm::fp8_quantize_1x128_cutedsl_ue8m0")
-    def _(input: torch.Tensor):
-        m, k = input.shape
-        padded_m = fp4_utils.pad_up(m, 128)
-        sf_cols = fp4_utils.pad_up(k // 32, 4)
-        return torch.empty_like(input,
-                                dtype=torch.float8_e4m3fn), input.new_empty(
-                                    (padded_m * sf_cols, ), dtype=torch.uint8)
-
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
         x: torch.Tensor,

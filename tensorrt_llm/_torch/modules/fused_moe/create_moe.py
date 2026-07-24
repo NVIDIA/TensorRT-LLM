@@ -64,15 +64,10 @@ def get_moe_cls(
         quant_config = override_quant_config
     layer_prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
     if moe_backend.upper() == "MARLIN":
-        # Marlin MoE is a Hopper-specific NVFP4 W4A16 backend. Layers without
-        # NVFP4 quantization (e.g. deliberately-unquantized MTP draft layers in
-        # MIXED_PRECISION checkpoints) fall back to CutlassFusedMoE, matching
-        # the CUTEDSL / DENSEGEMM / MEGAMOE_* fallback behavior below.
+        # Marlin MoE is a Hopper-specific NVFP4 W4A16 backend. Require nvfp4
+        # quantization explicitly so a misconfigured model fails fast.
         if quant_config is None or not quant_config.quant_mode.has_nvfp4():
-            logger.warning(f"{layer_prefix}MarlinFusedMoE only supports NVFP4 "
-                           "quantization. Check out details in quant_config: "
-                           f"{quant_config}. Using CutlassFusedMoE instead.")
-            return CutlassFusedMoE
+            raise ValueError("MarlinFusedMoE only supports NVFP4 quantization.")
         return MarlinFusedMoE
     if moe_backend.upper() == "CUTLASS":
         return CutlassFusedMoE

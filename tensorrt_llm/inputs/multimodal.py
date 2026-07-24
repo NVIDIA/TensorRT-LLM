@@ -3,7 +3,7 @@
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -503,12 +503,6 @@ class MultimodalParams:
     multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
     input_ids_start_offset: int = 0
-    # Prompt-order manifest of data-backed items. Each entry is
-    # ``{"modality": m, "index": i, "placeholder": p}`` where ``i`` indexes
-    # ``multi_modal_data[m]``. Encoders that interleave items across modalities
-    # in prompt order read ``modality``/``index``; ``placeholder`` is carried
-    # for parity with the tracker manifest.
-    mm_item_order: Optional[List[Dict[str, Union[str, int]]]] = None
     # CUDA event recorded on a side stream by the MM encoder prefetch path.
     # When set, the consume site in `get_multimodal_embeddings` issues a
     # `wait_event` on the current stream before reading cached embeddings.
@@ -820,26 +814,11 @@ def _update_hash(hasher, item: object) -> None:
     hasher.update(serialize_item(item))
 
 
-class MMHashResult(NamedTuple):
-    """Parallel per-modality dicts of content hashes and their UUIDs.
-
-    Both dicts are indexed first by modality name (`"image"`, `"video"`,
-    ...) then by within-modality item position, so `hashes[m][i]` and
-    `uuids[m][i]` describe the same item.
-    """
-
-    hashes: Dict[str, List[str]]
-    """Modality -> list of BLAKE3 hex digests (64 chars each)."""
-
-    uuids: Optional[Dict[str, List[Optional[str]]]]
-    """Modality -> list of original UUID strings. `None` entries mark
-    items that fell back to content-only hashing. The whole dict is
-    `None` when the caller supplied no UUIDs at all."""
-
-
-def apply_mm_hashes(mm_data: Dict[str, Any],
-                    mm_uuids: Optional[Dict[str, List[Optional[str]]]] = None,
-                    hash_lib=default_hasher) -> "MMHashResult":
+def apply_mm_hashes(
+    mm_data: Dict[str, Any],
+    mm_uuids: Optional[Dict[str, List[Optional[str]]]] = None,
+    hash_lib=default_hasher
+) -> Tuple[Dict[str, List[str]], Optional[List[Optional[str]]]]:
     """Apply hashing to multimodal data, one hash per multimodal item.
 
     When a UUID is provided for an item, the hash is computed from both the UUID
@@ -855,8 +834,9 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
         hash_lib: Hash function to use (default: blake3)
 
     Returns:
-        `MMHashResult` with per-modality `hashes` and `uuids` dicts. See
-        the type's own docstring for the field-level contract.
+        Tuple of:
+        - Dictionary of modality -> list of hash hex strings (64 chars each)
+        - Flattened list of original UUID strings (or None for content-hashed items)
     """
 
     def _hash_item(item):
@@ -888,8 +868,9 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
         for modality, items in mm_data.items()
     }
 
+    # Collect UUIDs in the same order as items
+    all_uuids: List[Optional[str]] = []
     mm_hashes: Dict[str, List[str]] = {}
-    mm_uuids_by_key: Dict[str, List[Optional[str]]] = {}
 
     for modality, items in mm_items.items():
         modality_uuids = None
@@ -903,25 +884,22 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
                     f"data items length ({len(items)}) for modality '{modality}'"
                 )
 
-        hashes: List[str] = []
-        uuids: List[Optional[str]] = []
+        hashes = []
         for i, item in enumerate(items):
             uuid = modality_uuids[i] if modality_uuids else None
             if uuid is not None:
                 # Hash UUID + content together for cache correctness
                 hashes.append(_hash_item_with_uuid(item, uuid))
+                all_uuids.append(uuid)  # Store original UUID
             else:
                 # Fall back to content-only hashing
                 hashes.append(_hash_item(item))
-            uuids.append(uuid)  # `None` when the caller didn't supply one
+                all_uuids.append(None)
 
         mm_hashes[modality] = hashes
-        mm_uuids_by_key[modality] = uuids
 
-    return MMHashResult(
-        hashes=mm_hashes,
-        uuids=mm_uuids_by_key if mm_uuids is not None else None,
-    )
+    # Return None for uuids if no UUIDs were provided at all
+    return mm_hashes, all_uuids if mm_uuids is not None else None
 
 
 def hexdigest_to_int32(hex_digest: str) -> List[int]:

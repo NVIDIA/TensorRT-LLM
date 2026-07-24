@@ -30,7 +30,7 @@
 #include "tensorrt_llm/runtime/workerPool.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntime.h>
 
 #include <cstdint>
 #include <limits>
@@ -52,8 +52,7 @@ PeftTaskNotCachedException::PeftTaskNotCachedException(std::string const& msg)
 PeftTaskNotCachedException::~PeftTaskNotCachedException() noexcept = default;
 
 std::pair<uint64_t, uint64_t> PeftCacheManager::getMaxNumSlots(PeftCacheManagerConfig const& config,
-    tensorrt_llm::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize,
-    runtime::BufferManager const& bufferManager)
+    nvinfer1::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize, runtime::BufferManager const& bufferManager)
 {
     TLLM_LOG_DEBUG("max1dModeSize=%llu", max1dModSize);
     TLLM_LOG_DEBUG("pageWidth=%llu", pageWidth);

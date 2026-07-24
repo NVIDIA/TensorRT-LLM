@@ -16,13 +16,10 @@ Differences vs the Triton path are absorbed inside this wrapper:
     (the FlashInfer prefill kernel does NOT apply L2 norm internally; the
     ``use_qk_l2norm_in_kernel`` parameter on ``flashinfer.chunk_gated_delta_rule``
     is currently a dead arg, see ``flashinfer/gdn_prefill.py:317-356``).
-  * Pre-gather and post-scatter of indexed SSM state into FlashInfer's packed
-    ``[num_seqs, H, V, K]`` layout. TRT-LLM's GDN state pool uses the same
-    ``[N, H, V, K]`` logical layout, so the adapter gathers/scatters without
-    transposing the last two dims. The SM100/SM103 kernel carries the recurrent
-    state in fp32 in TMEM regardless of the initial/output-state I/O dtype, so
-    the round-trip stays in the native pool dtype (bf16/fp16) there with no
-    precision change; only SM90/SM120 need an fp32 up-cast/down-cast.
+  * Pre-gather and post-scatter of indexed SSM state (FlashInfer requires
+    packed ``[num_seqs, H, V, K]`` fp32 initial/output state). TRT-LLM's GDN
+    state pool uses the same ``[N, H, V, K]`` logical layout, so the adapter
+    casts/gathers/scatters without transposing the last two dims.
 
 This module is only imported when ``TLLM_USE_FLASHINFER_GDN_PREFILL=1`` is set
 at process start; do not import it lazily inside hot paths.
@@ -37,7 +34,6 @@ from tensorrt_llm._torch.modules.fla.fused_state_io import (
     gather_cast_vk_to_fp32_vk,
 )
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
-from tensorrt_llm._utils import is_sm_100f
 
 
 # Mirror the @torch.compiler.disable on the legacy Triton wrapper
@@ -107,18 +103,10 @@ def chunk_gated_delta_rule(
         q3 = l2norm_fwd(q3)
         k3 = l2norm_fwd(k3)
 
-    # --- Step 4: gather initial state (+ cast dtype only when required) ---
+    # --- Step 4: gather initial state and cast dtype ---------------------
     # TRT-LLM's GDN kernels and FlashInfer both use [N, H, V, K] state layout.
-    # The SM100/SM103 kernel carries the recurrent state in fp32 in TMEM
-    # regardless of the initial/output-state I/O dtype (the state tensors are
-    # only the gmem load/store format), so passing bf16/fp16 state there is
-    # numerically identical to the fp32 round-trip while moving half the bytes.
-    # SM90/SM120 still require fp32 state. Fuse gather (+ optional cast) and
-    # contiguous into a single Triton kernel.
-    state_dtype = initial_state.dtype if is_sm_100f() else torch.float32
-    gathered_init = gather_cast_vk_to_fp32_vk(
-        initial_state, initial_state_indices, out_dtype=state_dtype
-    )
+    # Fuse gather + cast-to-fp32 + contiguous into a single Triton kernel.
+    gathered_init = gather_cast_vk_to_fp32_vk(initial_state, initial_state_indices)
 
     # --- Step 5+6: call FlashInfer with pre-allocated output/state buffers
     # FI 0.6.10 accepts `output=` / `output_state=`; pre-allocating skips its
@@ -138,10 +126,7 @@ def chunk_gated_delta_rule(
     )
     if need_state:
         num_seqs = cu_seqlens.shape[0] - 1
-        # Match the initial-state dtype (native bf16/fp16 on SM100/SM103, else
-        # fp32); FlashInfer writes the final state in this dtype and the scatter
-        # below adapts to the destination pool dtype without an extra cast.
-        state_buf = q3.new_empty(num_seqs, num_o_heads, head_size, head_size, dtype=state_dtype)
+        state_buf = q3.new_empty(num_seqs, num_o_heads, head_size, head_size, dtype=torch.float32)
         out_packed, out_state = flashinfer.chunk_gated_delta_rule(
             q=q3,
             k=k3,
@@ -173,9 +158,8 @@ def chunk_gated_delta_rule(
         )
         out_state = None
 
-    # --- Step 7: cast state back (if needed), scatter / return ---------
-    # Fuse cast (out_state.dtype -> destination dtype; a no-op on SM100/SM103
-    # where both are the native pool dtype) + optional indexed scatter into a
+    # --- Step 7: cast state back, scatter / return ---------------------
+    # Fuse cast (fp32 -> initial_state.dtype) + optional indexed scatter into a
     # single Triton pass, mirroring Step 4. The inplace branch writes only the
     # slots named by ``initial_state_indices`` and leaves the rest untouched.
     if inplace_indexed_state_update:

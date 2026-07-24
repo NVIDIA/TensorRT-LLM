@@ -30,7 +30,6 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/dataType.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cuda_graph_grouped_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
@@ -88,8 +87,7 @@ enum class MoeLoraRequestType : int32_t
 // ---------------------------------------------------------------------------
 inline void moeLoraGroupedGemmRunImpl(::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGroupedGemmModule const& mod,
     int64_t num_permuted_tokens, int64_t in_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes,
-    int64_t splitk_slices, void const* input_base, void* output_base, tensorrt_llm::DataType data_type,
-    cudaStream_t stream)
+    int64_t splitk_slices, void const* input_base, void* output_base, nvinfer1::DataType data_type, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(mod.permuted_ranks_dev != nullptr,
         "Grouped-GEMM LoRA module is missing permuted ranks buffer (forgot to populate grouped_gemm?).");
@@ -1208,17 +1206,17 @@ private:
 
     // ===== LoRA helpers =====
 
-    // Map a torch dtype to the TRT-LLM tensorrt_llm::DataType used to size the
+    // Map a torch dtype to the TRT-LLM nvinfer1::DataType used to size the
     // grouped-GEMM low-rank scratch. Kept as a const member (not static) so the
     // FP8 case can read mOutputDtype to pick the fp16/bf16 LoRA compute dtype.
-    tensorrt_llm::DataType loraTypeFromActDtype(c10::ScalarType dtype) const
+    nvinfer1::DataType loraTypeFromActDtype(c10::ScalarType dtype) const
     {
         switch (dtype)
         {
-        case c10::ScalarType::Half: return tensorrt_llm::DataType::kHALF;
-        case c10::ScalarType::Float: return tensorrt_llm::DataType::kFLOAT;
+        case c10::ScalarType::Half: return nvinfer1::DataType::kHALF;
+        case c10::ScalarType::Float: return nvinfer1::DataType::kFLOAT;
 #ifdef ENABLE_BF16
-        case c10::ScalarType::BFloat16: return tensorrt_llm::DataType::kBF16;
+        case c10::ScalarType::BFloat16: return nvinfer1::DataType::kBF16;
 #endif
 #ifdef ENABLE_FP8
         case c10::ScalarType::Float8_e4m3fn:

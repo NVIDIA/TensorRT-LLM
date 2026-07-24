@@ -6,10 +6,9 @@ import yaml
 
 # isort: off
 from tensorrt_llm.llmapi.disagg_utils import (
-    MIN_GLOBAL_ID, CtxGenServerConfig, DisaggServerConfig,
-    disagg_process_id_space, extract_ctx_gen_cfgs, extract_router_config,
-    extract_disagg_cfg, get_global_disagg_request_id, get_local_request_id,
-    get_server_configs_dict, parse_disagg_config_file, worker_local_process_id)
+    MIN_GLOBAL_ID, CtxGenServerConfig, DisaggServerConfig, extract_ctx_gen_cfgs,
+    extract_router_config, extract_disagg_cfg, get_global_disagg_request_id,
+    get_local_request_id, get_server_configs_dict, parse_disagg_config_file)
 # isort: on
 
 
@@ -111,26 +110,9 @@ def test_parse_disagg_config_file(sample_yaml_file, sample_yaml_config):
 @pytest.mark.parametrize("sample_yaml_config", ["disagg_cluster", ""],
                          indirect=True)
 def test_extract_disagg_cfg(sample_yaml_config):
-    sample_yaml_config.update({
-        "gen_tokids_ctxbytes":
-        True,
-        "num_workers":
-        4,
-        "disagg_coordinator_url":
-        "http://coordinator:7999",
-    })
     config = extract_disagg_cfg(**sample_yaml_config)
     assert isinstance(config, DisaggServerConfig)
     verify_disagg_config(config, sample_yaml_config)
-    assert config.gen_tokids_ctxbytes is True
-    assert config.num_workers == 4
-    assert config.disagg_coordinator_url == "http://coordinator:7999"
-
-
-@pytest.mark.parametrize("node_id", [-1, 256])
-def test_extract_disagg_cfg_rejects_out_of_range_node_id(node_id):
-    with pytest.raises(ValueError, match="node_id must be in range"):
-        extract_disagg_cfg(node_id=node_id)
 
 
 def test_extract_ctx_gen_cfgs():
@@ -218,57 +200,29 @@ def test_get_server_configs_dict():
                          ids=["multithread", "singlethread"])
 def test_get_global_disagg_request_id(multithread):
     iter = 10000
-    # (node_id, process_id) pairs — the pair uniquely identifies a fleet worker.
-    # Mix of distinct nodes and distinct processes on the same node.
-    worker_ids = [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (3, 5), (7, 2),
-                  (10, 0), (10, 3), (255, 63)]
-    thread_num = len(worker_ids)
+    node_ids = list(range(10))
+    thread_num = len(node_ids)
 
-    def get_ids(worker_ids):
-        all_ids = [[] for _ in range(len(worker_ids))]
+    def get_ids(node_ids):
+        all_node_ids = [[] for _ in range(len(node_ids))]
         for i in range(iter):
             if i % (4000 // thread_num) == 0:
                 time.sleep(0.001)
-            for j, (node_id, process_id) in enumerate(worker_ids):
-                all_ids[j].append(
-                    get_global_disagg_request_id(node_id, process_id))
-        return all_ids
+            for i, node_id in enumerate(node_ids):
+                all_node_ids[i].append(get_global_disagg_request_id(node_id))
+        return all_node_ids
 
     if multithread:
-        with ThreadPoolExecutor(max_workers=len(worker_ids)) as executor:
-            all_worker_ids = [
-                ids[0]
-                for ids in executor.map(get_ids, [[w] for w in worker_ids])
+        with ThreadPoolExecutor(max_workers=len(node_ids)) as executor:
+            all_node_ids = [
+                ids[0] for ids in executor.map(get_ids, [[i] for i in node_ids])
             ]
     else:
-        all_worker_ids = get_ids(worker_ids)
+        all_node_ids = get_ids(node_ids)
 
-    all_ids = set(i for ids in all_worker_ids for i in ids)
-    # Each (node_id, process_id) worker's ids must be globally unique across all.
-    assert len(all_ids) == iter * len(worker_ids)
+    all_ids = set(i for ids in all_node_ids for i in ids)
+    assert len(all_ids) == iter * len(node_ids)
     assert all(id >= MIN_GLOBAL_ID and id < ((1 << 63) - 1) for id in all_ids)
-
-
-def test_get_global_disagg_request_id_range_validation():
-    # node_id: 8 bits [0,256); process_id: 6 bits [0,64).
-    with pytest.raises(ValueError):
-        get_global_disagg_request_id(256, 0)
-    with pytest.raises(ValueError):
-        get_global_disagg_request_id(0, 64)
-    # valid extremes
-    assert get_global_disagg_request_id(255, 63) >= MIN_GLOBAL_ID
-    assert get_global_disagg_request_id(0, 0) >= MIN_GLOBAL_ID
-
-
-def test_worker_local_process_id_range_validation(monkeypatch):
-    process_id_space = disagg_process_id_space()
-    monkeypatch.setenv("TRTLLM_DISAGG_WORKER_PROCESS_ID",
-                       str(process_id_space - 1))
-    assert worker_local_process_id() == process_id_space - 1
-
-    monkeypatch.setenv("TRTLLM_DISAGG_WORKER_PROCESS_ID", str(process_id_space))
-    with pytest.raises(ValueError):
-        worker_local_process_id()
 
 
 def test_get_local_request_id():
@@ -282,4 +236,5 @@ def test_get_local_request_id():
     assert len(ids) == 1000
     assert min(ids) == 0
     assert max(ids) == MIN_GLOBAL_ID - 1
-    assert max(ids) - min(ids) == MIN_GLOBAL_ID - 1
+    assert max(ids) - min(ids) > (
+        1 << 40)  # ensure there is enough space for local ids

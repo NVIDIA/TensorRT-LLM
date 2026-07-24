@@ -1,20 +1,13 @@
-import os
-import sys
 import unittest
 
-import pytest
 import torch
 from parameterized import parameterized
 
 import tensorrt_llm
-from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.speculative.mtp import MTPHiddenStatesManager, MTPSpecMetadata, MTPWorker
-from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from utils.llm_data import llm_models_root
+from tensorrt_llm.llmapi import MTPDecodingConfig
 
 
 def unittest_name_func(testcase_func, param_num, param):
@@ -1731,90 +1724,3 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
 
         torch.testing.assert_close(draft_inputs["input_ids"], ref_input_ids)
         torch.testing.assert_close(draft_inputs["hidden_states"], ref_previous_hidden_states)
-
-
-@pytest.mark.high_cuda_memory
-def test_vanilla_mtp_rejection():
-    """Vanilla MTP with rejection sampling on: the per-step rejection path
-    (draft-prob scatter -> fail-closed guard -> rejection acceptance) runs
-    end-to-end with non-greedy sampling and produces coherent output."""
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 60:
-        pytest.skip("Not enough memory to load DeepSeek-V3-Lite")
-
-    model_dir = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
-    spec_config = MTPDecodingConfig(
-        max_draft_len=1,
-        use_mtp_vanilla=True,
-        speculative_model=model_dir,
-        use_rejection_sampling=True,
-    )
-    llm = LLM(
-        model=model_dir,
-        backend="pytorch",
-        disable_overlap_scheduler=True,
-        max_batch_size=2,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_tokens=8192),
-        max_num_tokens=2048,
-        speculative_config=spec_config,
-        trust_remote_code=True,
-    )
-    prompts = [
-        "The capital of France is",
-        "The president of the United States is",
-    ]
-    # Non-greedy so rejection sampling actually engages (all-greedy bypasses it).
-    sampling_params = SamplingParams(
-        max_tokens=32, temperature=0.8, top_p=0.95, top_k=50, seed=1234
-    )
-    outputs = llm.generate(prompts, sampling_params)
-    llm.shutdown()
-
-    assert len(outputs) == len(prompts)
-    for out in outputs:
-        assert len(out.outputs[0].token_ids) > 0
-        assert out.outputs[0].text.strip()
-
-
-@pytest.mark.high_cuda_memory
-def test_mtp_eagle_one_model_rejection():
-    """MTP-Eagle one-model with rejection sampling on: it shares the Eagle3
-    one-model worker/sampler, so the same per-step rejection path runs
-    end-to-end with non-greedy sampling and produces coherent output."""
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 60:
-        pytest.skip("Not enough memory to load DeepSeek-V3-Lite")
-
-    model_dir = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
-    spec_config = MTPDecodingConfig(
-        max_draft_len=1,
-        use_mtp_vanilla=False,
-        mtp_eagle_one_model=True,
-        speculative_model=model_dir,
-        use_rejection_sampling=True,
-    )
-    llm = LLM(
-        model=model_dir,
-        backend="pytorch",
-        disable_overlap_scheduler=True,
-        max_batch_size=2,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_tokens=8192),
-        max_num_tokens=2048,
-        speculative_config=spec_config,
-        trust_remote_code=True,
-    )
-    prompts = [
-        "The capital of France is",
-        "The president of the United States is",
-    ]
-    # Non-greedy so rejection sampling actually engages (all-greedy bypasses it).
-    sampling_params = SamplingParams(
-        max_tokens=32, temperature=0.8, top_p=0.95, top_k=50, seed=1234
-    )
-    outputs = llm.generate(prompts, sampling_params)
-    llm.shutdown()
-
-    assert len(outputs) == len(prompts)
-    for out in outputs:
-        assert len(out.outputs[0].token_ids) > 0
-        assert out.outputs[0].text.strip()

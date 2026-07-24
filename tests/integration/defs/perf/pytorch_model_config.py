@@ -90,61 +90,6 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
-        # DeepSeek V4 Flash uses TRTLLM for MXFP4 routed experts.
-        {
-            'patterns': ['deepseek_v4_flash-bench'],
-            'config': {
-                'enable_attention_dp': True,
-                'moe_config': {
-                    'backend': 'TRTLLM',
-                },
-                'max_seq_len': 10240,
-                'max_num_tokens': 4096,
-                'enable_chunked_prefill': True,
-                'kv_cache_config': {
-                    'free_gpu_memory_fraction': 0.5,
-                },
-            }
-        },
-        # DeepSeek V4 Flash-Base uses WIDEEP for FP8 block-scale on Blackwell.
-        {
-            'patterns': ['deepseek_v4_flash_base'],
-            'config': {
-                'enable_attention_dp': True,
-                'moe_config': {
-                    'backend': 'WIDEEP',
-                },
-                'max_seq_len': 10240,
-            }
-        },
-        # DeepSeek V4 Pro DSpark mirrors the upstream 8-GPU accuracy configuration.
-        {
-            'patterns': ['deepseek_v4_pro_dspark'],
-            'config': {
-                'attn_backend': 'TRTLLM',
-                'enable_attention_dp': True,
-                'moe_config': {
-                    'backend': 'MEGAMOE_DEEPGEMM',
-                },
-                'max_seq_len': 10240,
-                'max_num_tokens': 9216,
-                'kv_cache_config': {
-                    'enable_block_reuse': False,
-                    'free_gpu_memory_fraction': 0.5,
-                },
-                'enable_chunked_prefill': False,
-                'disable_overlap_scheduler': True,
-                'custom_tokenizer': 'deepseek_v4',
-                'speculative_config': {
-                    'decoding_type':
-                    'DSpark',
-                    'max_draft_len':
-                    5,
-                    'speculative_model':
-                    f'{llm_models_root()}/DeepSeek-V4-Pro-DSpark',
-                },
-            }
-        },
         # DeepSeek R1 models with MTP speculative decoding
         {
             'patterns': [
@@ -306,19 +251,6 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
-        # Qwen3.6-35B-A3B NVFP4 GDN-attn MoE: trust_remote_code, TRTLLM-Gen NVFP4 MoE (SM100/103), block reuse off.
-        {
-            'patterns': ['qwen3.6_35b_a3b_fp4'],
-            'config': {
-                'trust_remote_code': True,
-                'moe_config': {
-                    'backend': 'TRTLLM',
-                },
-                'kv_cache_config': {
-                    'enable_block_reuse': False,
-                },
-            }
-        },
         # MiniMax-M2.5 FP8: route MoE through attention DP.
         # TP=8: intermediate_size=1536 is not block-scale divisible (1536/8=192, %128!=0).
         # TP=4: trtllm-gen FP8 block-scale MoE kernel IMAs during CUDA-graph warmup
@@ -341,32 +273,6 @@ def get_model_yaml_config(model_label: str,
             ],
             'config': {
                 'enable_attention_dp': True,
-            }
-        },
-        # MiniMax-M3 MXFP8 block-sparse MoE: sparse backend, no KV reuse, trust_remote_code, capped max_seq_len to avoid the 1M-default CUDA-graph OOM.
-        {
-            'patterns': ['minimax_m3_mxfp8'],
-            'config': {
-                'enable_attention_dp': True,
-                'trust_remote_code': True,
-                'max_seq_len': 4096,
-                'sparse_attention_config': {
-                    'algorithm': 'minimax_m3',
-                },
-                'kv_cache_config': {
-                    'enable_block_reuse': False,
-                },
-            }
-        },
-        # MiniMax-M3 8000,1000 cases need max_seq_len >= ISL+OSL (9000).
-        {
-            'patterns': [
-                'minimax_m3_mxfp8-bench-pytorch-float8-input_output_len:8000,1000-tp:4-gpus:4',
-                'minimax_m3_mxfp8-bench-pytorch-float8-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-tp:4-gpus:4',
-                'minimax_m3_mxfp8-bench-pytorch-float8-maxbs:512-input_output_len:8000,1000-con:256-tp:4-gpus:4',
-            ],
-            'config': {
-                'max_seq_len': 9216,
             }
         },
         {

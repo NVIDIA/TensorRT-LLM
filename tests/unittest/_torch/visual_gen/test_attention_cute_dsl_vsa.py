@@ -24,49 +24,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.attention_backend import (
-    CuTeDSLAttention,
-    VSAAttention,
-    VSAMetadataBuilder,
-)
-from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
+from tensorrt_llm._torch.visual_gen.attention_backend import VSAMetadataBuilder
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm.visual_gen.args import (
-    AttentionConfig,
-    QuantAttentionConfig,
-    VideoSparseAttentionConfig,
-)
-
-
-def test_cute_dsl_factory_dispatches_quantized_fmha_and_vsa() -> None:
-    quant_config = QuantAttentionConfig(qk_dtype="mxfp8", v_dtype="fp8", v_block_size=1)
-    dense_config = AttentionConfig(backend="CUTEDSL", quant_attention_config=quant_config)
-    dense_attention = create_attention(
-        backend="CUTEDSL",
-        layer_idx=0,
-        num_heads=8,
-        head_dim=128,
-        attention_config=dense_config,
-    )
-
-    sparse_config = VideoSparseAttentionConfig(vsa_sparsity=0.9)
-    vsa_config = AttentionConfig(backend="CUTEDSL", sparse_attention_config=sparse_config)
-    vsa_attention = create_attention(
-        backend="CUTEDSL",
-        layer_idx=0,
-        num_heads=8,
-        head_dim=128,
-        attention_config=vsa_config,
-    )
-
-    assert isinstance(dense_attention, CuTeDSLAttention)
-    assert dense_attention.quant_attention_config is quant_config
-    assert isinstance(vsa_attention, VSAAttention)
-    assert vsa_attention.sparse_attention_config is sparse_config
+from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionConfig
 
 
 def _make_config(

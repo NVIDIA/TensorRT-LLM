@@ -27,7 +27,7 @@
 #include <cuda_fp4.h>
 #endif
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntime.h>
 #include <array>
 #include <cuda_runtime_api.h>
 #include <map>
@@ -1032,8 +1032,8 @@ public:
     using Config = cutlass_extensions::CutlassGemmConfig;
     using GemmToProfile = MoeGemmId;
 
-    void init(CutlassMoeFCRunnerInterface& runner, GemmToProfile gemm_to_profile, tensorrt_llm::DataType dtype,
-        tensorrt_llm::DataType wtype, tensorrt_llm::DataType otype, int num_experts, int k, int64_t hidden_size,
+    void init(CutlassMoeFCRunnerInterface& runner, GemmToProfile gemm_to_profile, nvinfer1::DataType dtype,
+        nvinfer1::DataType wtype, nvinfer1::DataType otype, int num_experts, int k, int64_t hidden_size,
         int64_t unpadded_hidden_size, int64_t inter_size, int64_t group_size, ActivationType activation_type, bool bias,
         bool use_lora, bool min_latency_mode, bool need_weights, MOEParallelismConfig parallelism_config,
         bool const enable_alltoall, bool use_mxfp8_weight_scaling = false)
@@ -1061,21 +1061,20 @@ public:
         mSM = common::getSMVersion();
 
         mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
-        if (dtype == tensorrt_llm::DataType::kFP8
-            && (wtype == tensorrt_llm::DataType::kFP4 || wtype == tensorrt_llm::DataType::kINT64))
+        if (dtype == nvinfer1::DataType::kFP8
+            && (wtype == nvinfer1::DataType::kFP4 || wtype == nvinfer1::DataType::kINT64))
         {
             mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
         }
-        else if (dtype == tensorrt_llm::DataType::kFP8 && wtype == tensorrt_llm::DataType::kFP8
-            && use_mxfp8_weight_scaling)
+        else if (dtype == nvinfer1::DataType::kFP8 && wtype == nvinfer1::DataType::kFP8 && use_mxfp8_weight_scaling)
         {
             // MXFP8 W8A8: e4m3 acts × e4m3 weights with UE8M0 1x32 block scales on both sides.
             // Profiler must produce MXFPX block-scaled inputs (otherwise the per-expert SF
             // pointer arrays stay uninitialized and the kernel reads garbage SF addresses).
             mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
         }
-        else if ((dtype == tensorrt_llm::DataType::kFP4 || dtype == tensorrt_llm::DataType::kINT64)
-            && (wtype == tensorrt_llm::DataType::kFP4 || wtype == tensorrt_llm::DataType::kINT64))
+        else if ((dtype == nvinfer1::DataType::kFP4 || dtype == nvinfer1::DataType::kINT64)
+            && (wtype == nvinfer1::DataType::kFP4 || wtype == nvinfer1::DataType::kINT64))
         {
             mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
         }
@@ -1107,9 +1106,9 @@ public:
 
     int mSampleIndex = 0;
 
-    tensorrt_llm::DataType mDType{};
-    tensorrt_llm::DataType mWType{};
-    tensorrt_llm::DataType mOType{};
+    nvinfer1::DataType mDType{};
+    nvinfer1::DataType mWType{};
+    nvinfer1::DataType mOType{};
 
     // This will be a unique value for every iteration of warmup and actual bench
     constexpr static int64_t NUM_ROUTING_SAMPLES = 16;

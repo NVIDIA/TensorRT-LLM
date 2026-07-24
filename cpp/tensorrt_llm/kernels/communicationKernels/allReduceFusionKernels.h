@@ -16,7 +16,7 @@
 
 #pragma once
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -124,7 +124,7 @@ struct AllReduceFusionParams
 {
     int nranks;
     int rank;
-    tensorrt_llm::DataType dtype;
+    nvinfer1::DataType dtype;
     int size;
     int hidden_dim;
     void** workspace;

@@ -15,7 +15,6 @@
  */
 
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/banRepeatNgram.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -53,25 +52,24 @@ public:
         SizeType32 const batchSize = outputIds.size();
         auto const maxBatchSize = 2 * batchSize;
 
-        mLogits
-            = BufferManager::pinned(ITensor::makeShape({batchSize, mVocabSizePadded}), tensorrt_llm::DataType::kFLOAT);
+        mLogits = BufferManager::pinned(ITensor::makeShape({batchSize, mVocabSizePadded}), nvinfer1::DataType::kFLOAT);
 
         mSequenceLengths
-            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), tensorrt_llm::DataType::kINT32);
+            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), nvinfer1::DataType::kINT32);
         mFinished = BufferManager::pinned(
             ITensor::makeShape({maxBatchSize, mBeamWidth}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
         mOutputIds = BufferManager::pinned(
-            ITensor::makeShape({maxBatchSize, mBeamWidth, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({maxBatchSize, mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
         mOutputIdsPtr = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), ptrType);
 
         mParentIds = BufferManager::pinned(
-            ITensor::makeShape({maxBatchSize, mBeamWidth, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({maxBatchSize, mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
         mParentIdsPtr = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), ptrType);
 
-        mNGramSizes = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
+        mNGramSizes = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
-        mBatchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
+        mBatchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
         for (SizeType32 bi = 0; bi < batchSize; ++bi)

@@ -49,13 +49,7 @@ def test_disaggregated_command_sets_shared_deployment_id(monkeypatch) -> None:
         raising=False,
     )
 
-    disagg_config = SimpleNamespace(
-        hostname="127.0.0.1",
-        port=0,
-        schedule_style=None,
-        num_workers=1,
-        disagg_coordinator_url=None,
-    )
+    disagg_config = SimpleNamespace(hostname="127.0.0.1", port=0, schedule_style=None)
     fake_socket = mock.MagicMock()
     fake_socket.__enter__.return_value = fake_socket
     deployment_id = SimpleNamespace(hex="deploy123")
@@ -66,7 +60,7 @@ def test_disaggregated_command_sets_shared_deployment_id(monkeypatch) -> None:
         mock.patch.object(serve.socket, "socket", return_value=fake_socket),
         mock.patch.object(serve, "parse_metadata_server_config_file", return_value=None),
         mock.patch.object(serve, "OpenAIDisaggServer"),
-        mock.patch.object(serve.uvloop, "run"),
+        mock.patch.object(serve.asyncio, "run"),
     ):
         serve.disaggregated.callback(
             config_file="disagg.yaml",
@@ -80,80 +74,6 @@ def test_disaggregated_command_sets_shared_deployment_id(monkeypatch) -> None:
 
     assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] == "deploy123"
     fake_socket.bind.assert_called_once_with(("127.0.0.1", 0))
-
-
-@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
-def test_launch_disagg_fleet_propagates_resolved_schedule_style(
-    monkeypatch,
-    schedule_style,
-) -> None:
-    """Fleet children receive the resolved CLI-or-config schedule style."""
-    observed_envs = []
-
-    class _FakePopen:
-        pid = 12345
-
-        def __init__(self, _command, **kwargs):
-            observed_envs.append(kwargs["env"])
-
-        def poll(self):
-            return None
-
-    disagg_config = SimpleNamespace(
-        hostname="127.0.0.1",
-        port=8000,
-        schedule_style=schedule_style,
-    )
-    monkeypatch.setattr(serve.subprocess, "Popen", _FakePopen)
-    monkeypatch.setattr(serve.atexit, "register", lambda *_: None)
-    monkeypatch.setattr(serve.signal, "signal", lambda *_: None)
-
-    serve._launch_disagg_fleet(
-        disagg_config,
-        "disagg.yaml",
-        None,
-        180,
-        180,
-        1,
-        "http://coordinator:8001",
-    )
-
-    assert observed_envs[0][serve.DisaggWorkerEnvs.TLLM_DISAGG_SCHEDULE_STYLE] == schedule_style
-
-
-@pytest.mark.parametrize(
-    ("config_style", "resolved_style"),
-    [
-        ("context_first", "generation_first"),
-        ("generation_first", "context_first"),
-    ],
-)
-def test_build_fleet_worker_applies_resolved_schedule_style(
-    monkeypatch,
-    config_style,
-    resolved_style,
-) -> None:
-    """A fleet worker overrides its reparsed YAML with the parent resolution."""
-    disagg_config = SimpleNamespace(schedule_style=config_style)
-    monkeypatch.setenv(serve.DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE, "disagg.yaml")
-    monkeypatch.setenv(
-        serve.DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_URL,
-        "http://coordinator:8001",
-    )
-    monkeypatch.setenv(
-        serve.DisaggWorkerEnvs.TLLM_DISAGG_SCHEDULE_STYLE,
-        resolved_style,
-    )
-
-    with (
-        mock.patch.object(serve, "parse_disagg_config_file", return_value=disagg_config),
-        mock.patch.object(serve, "parse_metadata_server_config_file", return_value=None),
-        mock.patch.object(serve, "OpenAIDisaggServer") as mock_server,
-    ):
-        serve._build_disagg_server_from_env()
-
-    assert disagg_config.schedule_style == resolved_style
-    assert mock_server.call_args.kwargs["config"] is disagg_config
 
 
 def test_launch_disaggregated_leader_propagates_deployment_id(monkeypatch) -> None:
@@ -233,10 +153,7 @@ def test_launch_disaggregated_server_sets_worker_role(
 
     llm_args = {"model": "dummy/model"}
     server_config = SimpleNamespace(type=server_type, hostname="127.0.0.1", port=8000)
-    disagg_config = SimpleNamespace(
-        server_configs=[server_config],
-        allow_request_chat_template=False,
-    )
+    disagg_config = SimpleNamespace(server_configs=[server_config])
 
     with (
         mock.patch.object(serve, "parse_disagg_config_file", return_value=disagg_config),
@@ -250,5 +167,4 @@ def test_launch_disaggregated_server_sets_worker_role(
         host="127.0.0.1",
         port=8000,
         llm_args=llm_args,
-        allow_request_chat_template=False,
     )

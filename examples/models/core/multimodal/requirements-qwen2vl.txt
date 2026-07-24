@@ -1,0 +1,2 @@
+accelerate
+qwen-vl-utils==0.0.8 # 0.0.9 has bug https://github.com/QwenLM/Qwen2-VL/pull/673, rollback until a newer version is released

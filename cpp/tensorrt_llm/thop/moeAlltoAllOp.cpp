@@ -15,7 +15,6 @@
  */
 
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/moeAlltoAllMeta.h"
@@ -485,20 +484,20 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
     TORCH_CHECK(topK > 0 && topK <= kMaxTopK, "topK must be in the range (0, kMaxTopK]");
 
-    // Map torch dtype to tensorrt_llm::DataType
-    tensorrt_llm::DataType nvDtype = tensorrt_llm::DataType::kFLOAT;
+    // Map torch dtype to nvinfer1::DataType
+    nvinfer1::DataType nvDtype = nvinfer1::DataType::kFLOAT;
     auto scalarType = payload.scalar_type();
     if (scalarType == at::kHalf)
     {
-        nvDtype = tensorrt_llm::DataType::kHALF;
+        nvDtype = nvinfer1::DataType::kHALF;
     }
     else if (scalarType == at::kBFloat16)
     {
-        nvDtype = tensorrt_llm::DataType::kBF16;
+        nvDtype = nvinfer1::DataType::kBF16;
     }
     else if (scalarType == at::kFloat)
     {
-        nvDtype = tensorrt_llm::DataType::kFLOAT;
+        nvDtype = nvinfer1::DataType::kFLOAT;
     }
     else
     {

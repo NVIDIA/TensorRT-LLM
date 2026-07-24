@@ -19,7 +19,6 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/eagleDecodingKernels.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/explicitDraftTokensKernels.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -42,51 +41,50 @@ void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, BufferManager cons
     auto const numEagleLayers = speculativeDecodingModule.getMaxDraftPathLen();
     auto constexpr TRTTokenIdType = runtime::TRTDataType<runtime::TokenIdType>::value;
 
-    temperatures = manager.gpu(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kFLOAT);
-    randomDataSample = manager.gpu(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kFLOAT);
+    temperatures = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kFLOAT);
+    randomDataSample = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kFLOAT);
     randomDataValidation
-        = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingTokens}), tensorrt_llm::DataType::kFLOAT);
+        = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingTokens}), nvinfer1::DataType::kFLOAT);
     draftTokens = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), TRTTokenIdType);
-    draftLens = manager.gpu(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+    draftLens = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     draftPaths
-        = manager.gpu(ITensor::makeShape({maxNumSequences, maxNumPaths, maxPathLen}), tensorrt_llm::DataType::kINT32);
+        = manager.gpu(ITensor::makeShape({maxNumSequences, maxNumPaths, maxPathLen}), nvinfer1::DataType::kINT32);
     draftPathsHost = BufferManager::pinnedPool(
-        ITensor::makeShape({maxNumSequences, maxNumPaths, maxPathLen}), tensorrt_llm::DataType::kINT32);
-    specDecodingGenerationLengths = manager.gpu(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({maxNumSequences, maxNumPaths, maxPathLen}), nvinfer1::DataType::kINT32);
+    specDecodingGenerationLengths = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     specDecodingGenerationLengthsHost
-        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     specDecodingPackedMasks
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingTokens, common::ceilDiv(maxDecodingTokens, 32)}),
-            tensorrt_llm::DataType::kINT32);
+            nvinfer1::DataType::kINT32);
     specDecodingPositionOffsets
-        = manager.gpu(ITensor::makeShape({maxNumSequences * maxDecodingTokens}), tensorrt_llm::DataType::kINT32);
+        = manager.gpu(ITensor::makeShape({maxNumSequences * maxDecodingTokens}), nvinfer1::DataType::kINT32);
 
     eagleNetCtxRequestTypesHost
-        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     eagleNetCtxContextLengthsHost
-        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     eagleNetCtxPastKeyValueLengthsHost
-        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     eagleNetGenRequestTypesHost
-        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     eagleNetGenContextLengthsHost
-        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     eagleNetGenPastKeyValueLengthsHost
-        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     inputGenTokensHost = BufferManager::pinnedPool(
-        ITensor::makeShape({maxNumSequences * maxDecodingTokens}), tensorrt_llm::DataType::kINT32);
-    chunkedContextNextTokens = manager.gpu(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
-    useSpecDecoding = manager.cpu(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({maxNumSequences * maxDecodingTokens}), nvinfer1::DataType::kINT32);
+    chunkedContextNextTokens = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+    useSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
     // Eagle-2
-    useDynamicTreeHost = BufferManager::pinnedPool(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
-    dynamicTreeMaxTopKHost = BufferManager::pinnedPool(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
-    prevScores
-        = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), tensorrt_llm::DataType::kFLOAT);
+    useDynamicTreeHost = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    dynamicTreeMaxTopKHost = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    prevScores = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), nvinfer1::DataType::kFLOAT);
     currentExpandIndices = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), TRTTokenIdType);
     allLayersScores = manager.gpu(
         ITensor::makeShape({maxNumSequences, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens}),
-        tensorrt_llm::DataType::kFLOAT);
+        nvinfer1::DataType::kFLOAT);
     allLayersDraftTokenIds = manager.gpu(
         ITensor::makeShape({maxNumSequences, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens}),
         TRTTokenIdType);
@@ -116,63 +114,58 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
     auto constexpr TRTTokenIdType = runtime::TRTDataType<runtime::TokenIdType>::value;
 
     // input tensors
-    engineInputs.temperatures = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kFLOAT);
-    engineInputs.posteriorAlpha = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kFLOAT);
-    engineInputs.posteriorThreshold = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kFLOAT);
-    posteriorAlphaHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, tensorrt_llm::DataType::kFLOAT);
-    posteriorThresholdHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, tensorrt_llm::DataType::kFLOAT);
-    greedySamplingHost = BufferManager::pinnedPool(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+    engineInputs.temperatures = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+    engineInputs.posteriorAlpha = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+    engineInputs.posteriorThreshold = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+    posteriorAlphaHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kFLOAT);
+    posteriorThresholdHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kFLOAT);
+    greedySamplingHost = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
     engineInputs.draftTokens
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), TRTTokenIdType);
-    engineInputs.draftLens = manager.gpu(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+    engineInputs.draftLens = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     engineInputs.draftPaths
-        = manager.gpu(ITensor::makeShape({maxNumSequences, numPaths, pathLen}), tensorrt_llm::DataType::kINT32);
+        = manager.gpu(ITensor::makeShape({maxNumSequences, numPaths, pathLen}), nvinfer1::DataType::kINT32);
 
     engineInputs.specDecodingGenerationLengths
-        = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
+        = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
     engineInputs.specDecodingPositionOffsets
-        = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
-    engineInputs.specDecodingPackedMasks
-        = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
+        = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    engineInputs.specDecodingPackedMasks = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
 
-    engineInputs.randomDataSample = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kFLOAT);
-    engineInputs.randomDataValidation = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kFLOAT);
+    engineInputs.randomDataSample = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+    engineInputs.randomDataValidation = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
 
     engineInputs.eagleNetCtxRequestTypesHost
-        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, tensorrt_llm::DataType::kINT32);
+        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     engineInputs.eagleNetCtxContextLengthsHost
-        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, tensorrt_llm::DataType::kINT32);
+        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     engineInputs.eagleNetCtxPastKeyValueLengthsHost
-        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, tensorrt_llm::DataType::kINT32);
+        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     engineInputs.eagleNetGenRequestTypesHost
-        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, tensorrt_llm::DataType::kINT32);
+        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     engineInputs.eagleNetGenContextLengthsHost
-        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, tensorrt_llm::DataType::kINT32);
+        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     engineInputs.eagleNetGenPastKeyValueLengthsHost
-        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, tensorrt_llm::DataType::kINT32);
-    engineInputs.inputGenTokensHost
-        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, tensorrt_llm::DataType::kINT32);
-    engineInputs.chunkedContextNextTokens
-        = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
-    engineInputs.useSpecDecoding = BufferManager::cpu(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
+    engineInputs.inputGenTokensHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
+    engineInputs.chunkedContextNextTokens = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    engineInputs.useSpecDecoding = BufferManager::cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     bufferCast<SizeType32>(*engineInputs.useSpecDecoding)[0] = 1;
-    chunkedContextNextTokensHost
-        = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, tensorrt_llm::DataType::kINT32);
+    chunkedContextNextTokensHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
 
     // Eagle-2
-    engineInputs.useDynamicTreeHost
-        = BufferManager::pinnedPool(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+    engineInputs.useDynamicTreeHost = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     engineInputs.dynamicTreeMaxTopKHost
-        = BufferManager::pinnedPool(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
     engineInputs.prevScores
-        = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), tensorrt_llm::DataType::kFLOAT);
+        = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), nvinfer1::DataType::kFLOAT);
     engineInputs.currentExpandIndices
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), TRTTokenIdType);
     engineInputs.allLayersScores = manager.gpu(
         ITensor::makeShape({maxNumSequences, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens}),
-        tensorrt_llm::DataType::kFLOAT);
+        nvinfer1::DataType::kFLOAT);
     engineInputs.allLayersDraftTokenIds = manager.gpu(
         ITensor::makeShape({maxNumSequences, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens}),
         TRTTokenIdType);
@@ -183,24 +176,24 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
     // output tensors
     engineOutputs.nextDraftTokens
         = manager.gpu(ITensor::makeShape({maxNumSequences, numPaths, pathLen}), TRTTokenIdType);
-    engineOutputs.nextDraftLens = manager.gpu(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+    engineOutputs.nextDraftLens = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     engineOutputs.nextDraftPaths
-        = manager.gpu(ITensor::makeShape({maxNumSequences, numPaths, pathLen}), tensorrt_llm::DataType::kINT32);
+        = manager.gpu(ITensor::makeShape({maxNumSequences, numPaths, pathLen}), nvinfer1::DataType::kINT32);
 
     engineOutputs.acceptedTokens
-        = manager.gpu(ITensor::makeShape({maxNumSequences, pathLen}), tensorrt_llm::DataType::kINT32);
-    engineOutputs.acceptedLens = manager.gpu(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
-    engineOutputs.acceptedPaths = manager.gpu(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+        = manager.gpu(ITensor::makeShape({maxNumSequences, pathLen}), nvinfer1::DataType::kINT32);
+    engineOutputs.acceptedLens = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+    engineOutputs.acceptedPaths = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     engineOutputs.chunkedContextNextTokens
-        = manager.gpu(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+        = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
 
     // helper tensors
     scanReduceTempStorageBytes = tksd::invokeScanReduceGenerationLengths(
         maxNumSequences, nullptr, nullptr, 0, nullptr, nullptr, manager.getStream().get());
     scanReduceTempStorage = manager.gpu(scanReduceTempStorageBytes);
 
-    cumSumGenerationLengths = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
-    maxGenerationLength = manager.gpu(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+    cumSumGenerationLengths = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    maxGenerationLength = manager.gpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
     // pre-allocate empty tensors
     reshape(0, maxNumSequences, modelConfig);
@@ -527,15 +520,15 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
 
     switch (dtype)
     {
-    case tensorrt_llm::DataType::kFLOAT:
+    case nvinfer1::DataType::kFLOAT:
         setFromInputs<float>(
             contextRequests, genRequests, vocabSizePadded, seqSlots, draftBuffers, *eagleModule, manager);
         break;
-    case tensorrt_llm::DataType::kHALF:
+    case nvinfer1::DataType::kHALF:
         setFromInputs<half>(
             contextRequests, genRequests, vocabSizePadded, seqSlots, draftBuffers, *eagleModule, manager);
         break;
-    case tensorrt_llm::DataType::kBF16:
+    case nvinfer1::DataType::kBF16:
         setFromInputs<__nv_bfloat16>(
             contextRequests, genRequests, vocabSizePadded, seqSlots, draftBuffers, *eagleModule, manager);
         break;

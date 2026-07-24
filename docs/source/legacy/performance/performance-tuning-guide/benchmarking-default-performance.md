@@ -86,7 +86,7 @@ The README in the examples folder for supported models walks through building en
 
 `trtllm-bench` expects to be passed in a dataset of requests to run through the model. This guide creates a dummy dataset of 1000 requests with every request having input and output sequence length of 2048.  TensorRT-LLM provides the `prepare_dataset.py` script to produce the dataset. To use it clone the TensorRT-LLM Repo and run the following command:
 
-`python benchmarks/prepare_dataset.py --stdout --tokenizer /path/to/hf/Llama-3.3-70B-Instruct/ token-norm-dist --input-mean 2048 --output-mean 2048 --input-stdev 0 --output-stdev 0 --num-requests 1000 > synthetic_2048_2048.txt`
+`python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer /path/to/hf/Llama-3.3-70B-Instruct/ token-norm-dist --input-mean 2048 --output-mean 2048 --input-stdev 0 --output-stdev 0 --num-requests 1000 > synthetic_2048_2048.txt`
 
 `trtllm-bench` can also take in real data, see [`trtllm-bench` documentation](../perf-benchmarking.md) for more details on the required format.
 

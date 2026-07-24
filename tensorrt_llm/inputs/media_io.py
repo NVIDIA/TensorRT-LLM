@@ -421,13 +421,12 @@ def _load_video_by_cv2(
     tempfile required. Callers that have no stream-buffered backend
     available should spill to a tempfile themselves and pass a path.
 
-    `format` controls the return type:
-      `"pt"`  - list[torch.Tensor], dtype=float32, shape=(C, H, W), range
-                [0, 1]; rescaled and permuted to CHW here.
-      `"np"`  - np.ndarray of shape (N, H, W, 3), dtype=uint8; a single
-                contiguous 4D buffer that HF video processors pass through
-                without an extra frame-by-frame copy.
-      `"pil"` - list[PIL.Image], one per sampled frame.
+    `format` controls the per-frame return type:
+      `"pt"`    - list[torch.Tensor], dtype=float32, shape=(C, H, W), range
+                  [0, 1]; rescaled and permuted to CHW here.
+      `"np"` - list[np.ndarray], dtype=uint8, shape=(H, W, 3); returned as
+                  decoded, leaving rescale/permute to the HF processor.
+      `"pil"`   - list[PIL.Image], one per sampled frame.
     """
     assert format in ("pt", "np", "pil"), "format must be one of 'pt', 'np', 'pil'"
 
@@ -478,66 +477,42 @@ def _load_video_by_cv2(
 
         indices = np.linspace(0, frame_count - 1, num_frames_to_sample, dtype=int).tolist()
 
-        # Defer allocating the stacked buffer until the first frame is actually
-        # decoded: container metadata (CAP_PROP_FRAME_WIDTH/HEIGHT) can be 0
-        # or stale before the first decode for some codecs.
-        stacked_rgb: Optional[np.ndarray] = None
-        H = W = None
-
+        # Sequential forward scan — grab() without per-frame seek
         target_set = set(indices)
         max_idx = indices[-1]
-        bgr_scratch: Optional[np.ndarray] = None
-        valid_indices: list[int] = []
-        # Log at most once per decode to avoid spamming when a whole stream is
-        # affected (e.g. every frame retrieves with a drifted shape).
-        skip_warned = False
+        raw_frames: dict[int, np.ndarray] = {}
         frame_idx = 0
-        while frame_idx <= max_idx and vidcap.grab():
+        while frame_idx <= max_idx:
+            grab_succeeded = vidcap.grab()
+            if not grab_succeeded:
+                break
             if frame_idx in target_set:
-                # Reuse a single BGR buffer across retrieves; cv2 replaces its
-                # contents in place when the argument is shape-compatible.
-                ok, bgr_scratch = vidcap.retrieve(bgr_scratch)
-                if ok:
-                    fh, fw = bgr_scratch.shape[:2]
-                    if stacked_rgb is None:
-                        H, W = fh, fw
-                        stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
-                    if (fh, fw) == (H, W):
-                        cv2.cvtColor(
-                            bgr_scratch,
-                            cv2.COLOR_BGR2RGB,
-                            dst=stacked_rgb[len(valid_indices)],
-                        )
-                        valid_indices.append(frame_idx)
-                    elif not skip_warned:
-                        logger.warning(
-                            f"Skipping frame {frame_idx} and subsequent size-drifted frames: "
-                            f"shape={(fh, fw)} differs from first decoded shape=({H}, {W})."
-                        )
-                        skip_warned = True
-                elif not skip_warned:
-                    logger.warning(
-                        f"Skipping frame {frame_idx} and subsequent retrieve failures: retrieve returned ok=False."
-                    )
-                    skip_warned = True
+                # cv2 decodes frames in BGR order; convert to RGB for downstream use
+                retrieve_succeeded, bgr_frame = vidcap.retrieve()
+                if retrieve_succeeded:
+                    raw_frames[frame_idx] = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
             frame_idx += 1
         vidcap.release()
 
-        if stacked_rgb is None or not valid_indices:
+        if not raw_frames:
             raise ValueError("Video has no readable frames.")
-        stacked_rgb = stacked_rgb[: len(valid_indices)]
 
+        valid_indices = [i for i in indices if i in raw_frames]
         if format == "pt":
-            stacked_f32 = stacked_rgb.astype(np.float32)
-            stacked_f32 *= 1.0 / 255.0
+            # uint8 -> float32 + /255 rescale done once on the stacked buffer
+            # so the dtype conversion is a single memory pass and there's one
+            # Python torch call instead of one per frame.
+            stacked_uint8 = np.stack([raw_frames[i] for i in valid_indices])
+            stacked_f32 = stacked_uint8.astype(np.float32) * (1.0 / 255.0)
             tensor_nchw = torch.from_numpy(stacked_f32).permute(0, 3, 1, 2).contiguous()
             if device != "cpu":
                 tensor_nchw = tensor_nchw.to(device)
             loaded_frames = list(torch.unbind(tensor_nchw, dim=0))
         elif format == "np":
-            loaded_frames = stacked_rgb
+            # uint8 HWC frames as-is; the HF processor rescales/permutes.
+            loaded_frames = [raw_frames[i] for i in valid_indices]
         else:  # "pil"
-            loaded_frames = [Image.fromarray(frame) for frame in stacked_rgb]
+            loaded_frames = [Image.fromarray(raw_frames[i]) for i in valid_indices]
 
         metadata = {
             "total_num_frames": frame_count,

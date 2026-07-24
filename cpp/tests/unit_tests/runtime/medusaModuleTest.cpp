@@ -20,7 +20,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/speculativeChoicesUtils.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntime.h>
 
 #include <gmock/gmock-matchers.h>
 #include <gmock/gmock.h>
@@ -58,16 +58,14 @@ protected:
         auto const tokensPerStep = medusaModule.getMaxDecodingTokens();
 
         // batch size = 1 here.
-        TensorPtr medusaGenerationLengthsHost
-            = mManager->pinned(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+        TensorPtr medusaGenerationLengthsHost = mManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
         TensorPtr medusaPositionOffsetsHost
-            = mManager->pinned(ITensor::makeShape({tokensPerStep}), tensorrt_llm::DataType::kINT32);
-        TensorPtr medusaTreeIdsHost
-            = mManager->pinned(ITensor::makeShape({tokensPerStep}), tensorrt_llm::DataType::kINT32);
+            = mManager->pinned(ITensor::makeShape({tokensPerStep}), nvinfer1::DataType::kINT32);
+        TensorPtr medusaTreeIdsHost = mManager->pinned(ITensor::makeShape({tokensPerStep}), nvinfer1::DataType::kINT32);
         TensorPtr medusaPathsHost
-            = mManager->pinned(ITensor::makeShape({tokensPerStep, medusaHeads + 1}), tensorrt_llm::DataType::kINT32);
+            = mManager->pinned(ITensor::makeShape({tokensPerStep, medusaHeads + 1}), nvinfer1::DataType::kINT32);
         TensorPtr attentionPackedMaskHost
-            = mManager->pinned(ITensor::makeShape({tokensPerStep, numPackedMasks}), tensorrt_llm::DataType::kINT32);
+            = mManager->pinned(ITensor::makeShape({tokensPerStep, numPackedMasks}), nvinfer1::DataType::kINT32);
 
         std::vector<SizeType32> topKs;
         utils::initTensorsFromChoices(medusaModule, choices, topKs, medusaGenerationLengthsHost,

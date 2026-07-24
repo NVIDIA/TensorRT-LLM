@@ -496,11 +496,7 @@ public:
         tg::CudaRunner::Grid grid{numCtasX, numCtasY, numCtasZ};
 
         // Prepare custom mask for spec-decoding generation kernels if needed.
-        bool const prepareSpecDecTreeMask = params.mIsSpecDecTree
-            && (params.mForcePrepareSpecDecTreeMask || params.mLayerIdx == 0
-                || (params.mSpecDecodingTargetMaxGenLen > 0
-                    && params.mMaxSeqLenQ != params.mSpecDecodingTargetMaxGenLen));
-        if (prepareSpecDecTreeMask)
+        if (params.mLayerIdx == 0 && params.mIsSpecDecTree)
         {
             int32_t stepQ = options.mTileSizeQ * options.mNumInstsQ;
             int32_t stepKv = options.mTileSizeKv * options.mNumInstsKv;

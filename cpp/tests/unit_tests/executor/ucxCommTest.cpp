@@ -36,7 +36,6 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -133,11 +132,11 @@ TEST_F(UcxCommTest, Basic)
         tensorrt_llm::runtime::BufferManager bufferManager{std::make_shared<tensorrt_llm::runtime::CudaStream>()};
 
         // Create and fill source CUDA buffer with random data
-        auto srcBuffer = bufferManager.gpu(buffer.size(), tensorrt_llm::DataType::kINT8);
+        auto srcBuffer = bufferManager.gpu(buffer.size(), nvinfer1::DataType::kINT8);
         bufferManager.copy(buffer.data(), *srcBuffer);
         bufferManager.getStream().synchronize();
 
-        auto dstBuffer = bufferManager.gpu(buffer.size(), tensorrt_llm::DataType::kINT8);
+        auto dstBuffer = bufferManager.gpu(buffer.size(), nvinfer1::DataType::kINT8);
 
         // Send CUDA buffer using connection1
         connection1->send(DataContext{0x75}, srcBuffer->data(), srcBuffer->getSizeInBytes());
@@ -205,14 +204,14 @@ TEST_F(UcxCommTest, multiSend)
 
         tensorrt_llm::runtime::BufferManager bufferManager{std::make_shared<tensorrt_llm::runtime::CudaStream>()};
 
-        auto srcBuffer1 = bufferManager.gpu(buffer1.size(), tensorrt_llm::DataType::kINT8);
-        auto srcBuffer2 = bufferManager.gpu(buffer2.size(), tensorrt_llm::DataType::kINT8);
+        auto srcBuffer1 = bufferManager.gpu(buffer1.size(), nvinfer1::DataType::kINT8);
+        auto srcBuffer2 = bufferManager.gpu(buffer2.size(), nvinfer1::DataType::kINT8);
         bufferManager.copy(buffer1.data(), *srcBuffer1);
         bufferManager.copy(buffer2.data(), *srcBuffer2);
         bufferManager.getStream().synchronize();
 
-        auto dstBuffer1 = bufferManager.gpu(buffer1.size(), tensorrt_llm::DataType::kINT8);
-        auto dstBuffer2 = bufferManager.gpu(buffer2.size(), tensorrt_llm::DataType::kINT8);
+        auto dstBuffer1 = bufferManager.gpu(buffer1.size(), nvinfer1::DataType::kINT8);
+        auto dstBuffer2 = bufferManager.gpu(buffer2.size(), nvinfer1::DataType::kINT8);
 
         connection1Peer->send(DataContext{0x75}, srcBuffer1->data(), srcBuffer1->getSizeInBytes());
         connection2Peer->send(DataContext{0x75}, srcBuffer2->data(), srcBuffer2->getSizeInBytes());

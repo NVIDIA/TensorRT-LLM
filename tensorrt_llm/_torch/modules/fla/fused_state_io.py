@@ -79,16 +79,8 @@ def _gather_cast_vk_to_fp32_vk_kernel(
 def gather_cast_vk_to_fp32_vk(
     initial_state: torch.Tensor,
     initial_state_indices: Optional[torch.Tensor],
-    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """Fused ``initial_state[indices].to(out_dtype).contiguous()`` for ``[N, H, V, K]`` state.
-
-    ``out_dtype`` defaults to ``torch.float32``, the dtype the SM90/SM120
-    FlashInfer GDN prefill kernels require. On the SM100/SM103 kernel, which
-    reads native bf16/fp16 state and casts to fp32 internally, pass
-    ``initial_state.dtype`` to gather without an up-cast (paired with a matching
-    scatter that skips the down-cast).
-    """
+    """Fused ``initial_state[indices].to(fp32).contiguous()`` for ``[N, H, V, K]`` state."""
     assert initial_state.dim() == 4, f"initial_state must be 4D, got {initial_state.shape}"
     n_pool, h, v, k = initial_state.shape
     if initial_state_indices is not None:
@@ -101,9 +93,7 @@ def gather_cast_vk_to_fp32_vk(
     # K and V are typically 128 in GDN; one (BLOCK_K, BLOCK_V) tile covers the full K and V dimensions.
     # entire (K, V) plane per (seq, head). Larger tiles save grid overhead;
     # smaller tiles improve occupancy at small num_seqs * H.
-    if out_dtype is None:
-        out_dtype = torch.float32
-    output = torch.empty(num_seqs, h, v, k, dtype=out_dtype, device=initial_state.device)
+    output = torch.empty(num_seqs, h, v, k, dtype=torch.float32, device=initial_state.device)
     block_v = min(v, 128)
     block_k = min(k, 128)
     num_v_blocks = triton.cdiv(v, block_v)

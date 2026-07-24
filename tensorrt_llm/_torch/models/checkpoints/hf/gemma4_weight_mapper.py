@@ -23,10 +23,6 @@ from tensorrt_llm._torch.modules.linear import W4A16_AWQ_LinearMethod
 _LANG_PREFIX = "model.language_model."
 _MODEL_PREFIX = "model."
 _LAYER_IDX_RE = re.compile(r"layers\.(\d+)$")
-_LAYER_SCALAR_KEY_RE = re.compile(r"^(?:language_model\.)?model\.layers\.(\d+)\.layer_scalar$")
-_K_PROJ_KEY_RE = re.compile(
-    r"^((?:language_model\.)?model\.layers\.(\d+)\.self_attn\.)k_proj(\..+)$"
-)
 
 
 @register_mapper("HF", "Gemma4ForCausalLM")
@@ -277,6 +273,9 @@ class Gemma4HfWeightMapper(HfWeightMapper):
 
     def _handle_buffers_and_kvdup(self, weights: dict) -> dict:
         """Load layer_scalar buffers and duplicate k_proj for k_eq_v layers."""
+        # Determine the layer scalar key pattern and accessor based on
+        # whether any key starts with "language_model." (VLM sub-model
+        # weights after filter_weights) or "model." (text-only).
         # Navigate to decoder layers regardless of model structure
         # (multimodal wrapper has .llm.model.layers, text-only has .model.layers)
         _root = self.model
@@ -290,9 +289,17 @@ class Gemma4HfWeightMapper(HfWeightMapper):
         def get_layer(idx):
             return _layers[idx] if _layers else None
 
+        sample = next(iter(weights), "")
+        if sample.startswith("language_model.model."):
+            scalar_pattern = r"language_model\.model\.layers\.(\d+)\.layer_scalar"
+            key_tmpl = "language_model.model.layers.{}.self_attn.{}_proj.weight"
+        else:
+            scalar_pattern = r"model\.layers\.(\d+)\.layer_scalar"
+            key_tmpl = "model.layers.{}.self_attn.{}_proj.weight"
+
         layer_scalar_keys = [k for k in weights if k.endswith(".layer_scalar")]
         for key in layer_scalar_keys:
-            m = _LAYER_SCALAR_KEY_RE.match(key)
+            m = re.match(scalar_pattern, key)
             if m:
                 layer_idx = int(m.group(1))
                 try:
@@ -305,17 +312,12 @@ class Gemma4HfWeightMapper(HfWeightMapper):
         config = self.model.config
         if getattr(config, "attention_k_eq_v", False):
             layer_types = getattr(config, "layer_types", [])
-            for k_key, value in list(weights.items()):
-                match = _K_PROJ_KEY_RE.match(k_key)
-                if match is None:
-                    continue
-                layer_idx = int(match.group(2))
-                if layer_idx >= len(layer_types) or layer_types[layer_idx] != "full_attention":
-                    continue
-                suffix = match.group(3)
-                suffix = {".k_scale": ".v_scale", ".k_bias": ".v_bias"}.get(suffix, suffix)
-                v_key = f"{match.group(1)}v_proj{suffix}"
-                weights.setdefault(v_key, value)
+            for layer_idx, lt in enumerate(layer_types):
+                if lt == "full_attention":
+                    k_key = key_tmpl.format(layer_idx, "k")
+                    v_key = key_tmpl.format(layer_idx, "v")
+                    if k_key in weights and v_key not in weights:
+                        weights[v_key] = weights[k_key]
 
         # KV shared layers: HF omits k_proj/v_proj for shared layers.
         # The model uses Q-only projection for these layers, so no dummy

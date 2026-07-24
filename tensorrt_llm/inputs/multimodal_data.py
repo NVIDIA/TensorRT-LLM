@@ -147,8 +147,7 @@ class VideoData(BaseModalityData):
     """Data class for video loading results.
 
     Attributes:
-        frames: Video frames as a list of PIL Images, a list of PyTorch
-            tensors, or a single 4D numpy array of shape (N, H, W, 3).
+        frames: List of video frames, either as PIL Images or PyTorch tensors.
         metadata: Dictionary containing video metadata including:
             - total_num_frames: Total number of frames in the video
             - fps: Original frames per second of the video
@@ -164,14 +163,14 @@ class VideoData(BaseModalityData):
             content without walking pixels.
     """
 
-    frames: list[Image.Image] | list[torch.Tensor] | np.ndarray
+    frames: list[Image.Image] | list[torch.Tensor]
     metadata: dict[str, Any]
     audio: AudioData | None = None
     raw_bytes_hash: str | None = None
 
     def __post_init__(self) -> None:
-        if len(self.frames) == 0:
-            raise ValueError("frames cannot be empty")
+        if not self.frames:
+            raise ValueError("frames list cannot be empty")
         if not isinstance(self.metadata, dict):
             raise TypeError("metadata must be a dictionary")
 

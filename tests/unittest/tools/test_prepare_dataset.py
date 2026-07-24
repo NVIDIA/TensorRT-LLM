@@ -16,14 +16,15 @@ _DEFAULT_OUTPUT_MEAN = 100
 _DEFAULT_OUTPUT_STDEV = 10
 _TEST_TASK_IDS = [0, 1, 2]
 _TOKENIZER_SUBPATH = "llama-models-v2/tinyllama-tarot-v1/"
+_PREPARE_DATASET_SCRIPT_PATH = "benchmarks/cpp/prepare_dataset.py"
 
 
 class TestPrepareDatasetLora:
     """
-    Test suite for the trtllm-bench prepare-dataset LoRA metadata generation
+    Test suite for prepare_dataset.py CLI tool LoRA metadata generation
     functionality.
 
-    This test class validates that trtllm-bench prepare-dataset correctly
+    This test class validates that the prepare_dataset.py script correctly
     generates LoRA request metadata when LoRA-specific parameters are provided.
     It covers both fixed task ID and random task ID scenarios.
     """
@@ -49,7 +50,7 @@ class TestPrepareDatasetLora:
 
     def _build_base_command(self, output_path: Path) -> List[str]:
         """
-        Build the base command for running trtllm-bench prepare-dataset.
+        Build the base command for running prepare_dataset.py.
 
         Args:
             output_path: Path to the output dataset file
@@ -109,7 +110,7 @@ class TestPrepareDatasetLora:
 
     def _run_prepare_dataset(self, **kwargs) -> str:
         """
-        Execute trtllm-bench prepare-dataset with specified parameters and capture
+        Execute prepare_dataset.py with specified parameters and capture
         output.
 
         Args:
@@ -139,7 +140,7 @@ class TestPrepareDatasetLora:
 
     def _parse_json_output(self, output: str) -> List[Dict[str, Any]]:
         """
-        Parse JSON lines from the prepare-dataset output.
+        Parse JSON lines from prepare_dataset.py output.
 
         Args:
             output: Raw stdout output containing JSON lines

@@ -49,8 +49,8 @@ def get_visual_gen_attention_backend(
                     Better performance but requires fused QKV
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                  Requires flash-attn package with cute interface
-        - "CUTEDSL": CuTe DSL kernels. create_attention selects dense FMHA or VSA from
-                      AttentionConfig.sparse_attention_config.
+        - "CUTEDSL": CuTe DSL FMHA kernels; uses packaged cubins when present,
+                     otherwise compiles from CuTe DSL source
     """
     # Lazy imports to avoid circular dependency
     from .cute_dsl import CuTeDSLAttention
@@ -105,8 +105,8 @@ def create_attention(
             will automatically reallocate if larger batches are encountered.
         max_seq_len: Initial sequence length for metadata pre-allocation. The backend
             will automatically reallocate if longer sequences are encountered.
-        attention_config: Optional AttentionConfig used to select the attention algorithm and
-            forward its quantization or sparsity configuration.
+        attention_config: Optional AttentionConfig; quant_attention_config is
+            extracted and forwarded to the TRTLLM backend when present.
         attention_metadata_state: Optional model-scoped metadata state from
             visual-gen config. Required for TRTLLM backend.
         **kwargs: Additional backend-specific arguments
@@ -116,7 +116,9 @@ def create_attention(
     """
     attn_cls = get_visual_gen_attention_backend(backend)
 
-    # Forward the validated quantization recipe to TRTLLM or the dense CuTe DSL FMHA backend.
+    # Extract quant_attention_config from AttentionConfig and pass to backends
+    # that support it (TRTLLM SAGE recipes, CUTEDSL QK16PV8). AttentionConfig
+    # validation rejects unsupported (backend, recipe) combinations upstream.
     if attention_config is not None and attention_config.quant_attention_config is not None:
         kwargs["quant_attention_config"] = attention_config.quant_attention_config
     if backend.upper() == "TRTLLM":
@@ -131,6 +133,7 @@ def create_attention(
             attention_config.sparse_attention_config is not None
             and getattr(attention_config.sparse_attention_config, "algorithm", None) == "vsa"
         ):
+            # VSA sparse path: use VSAAttention
             from .cute_dsl.vsa import VSAAttention
 
             attn_cls = VSAAttention

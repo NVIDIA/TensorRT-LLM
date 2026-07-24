@@ -18,7 +18,6 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/explicitDraftTokensKernels.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -41,24 +40,23 @@ void ExplicitDraftTokensBuffers::Inputs::create(SizeType32 maxNumSequences, Buff
     auto constexpr TRTTokenIdType = runtime::TRTDataType<runtime::TokenIdType>::value;
     auto const dtype = modelConfig.getDataType();
 
-    maxGenLengthHost = manager.pinned(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+    maxGenLengthHost = manager.pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     temperatures = manager.gpu(ITensor::makeShape({maxNumSequences}), dtype);
-    positionIdsBase = manager.gpu(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
-    generationLengths = manager.gpu(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
-    generationLengthsHost = manager.pinned(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+    positionIdsBase = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+    generationLengths = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+    generationLengthsHost = manager.pinned(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     randomDataSample = manager.gpu(ITensor::makeShape({maxNumSequences}), dtype);
     randomDataValidation = manager.gpu(ITensor::makeShape({maxNumSequences, maxNumPaths, maxDraftPathLen}), dtype);
     draftTokens = manager.gpu(ITensor::makeShape({maxNumSequences, maxNumPaths, maxPathLen}), TRTTokenIdType);
     draftIndices
-        = manager.gpu(ITensor::makeShape({maxNumSequences, maxNumPaths, maxPathLen}), tensorrt_llm::DataType::kINT32);
+        = manager.gpu(ITensor::makeShape({maxNumSequences, maxNumPaths, maxPathLen}), nvinfer1::DataType::kINT32);
     draftProbs
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxNumPaths, maxDraftPathLen, vocabSizePadded}), dtype);
     packedMasks
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingTokens, common::ceilDiv(maxDecodingTokens, 32)}),
-            tensorrt_llm::DataType::kINT32);
-    positionIds
-        = manager.gpu(ITensor::makeShape({maxNumSequences * maxDecodingTokens}), tensorrt_llm::DataType::kINT32);
-    useSpecDecoding = manager.cpu(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+            nvinfer1::DataType::kINT32);
+    positionIds = manager.gpu(ITensor::makeShape({maxNumSequences * maxDecodingTokens}), nvinfer1::DataType::kINT32);
+    useSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 }
 
 ExplicitDraftTokensBuffers::ExplicitDraftTokensBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
@@ -83,53 +81,52 @@ ExplicitDraftTokensBuffers::ExplicitDraftTokensBuffers(SizeType32 maxBatchSize, 
     auto const dtype = modelConfig.getDataType();
 
     // input tensors
-    engineInputs.requestTypesDevice = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
+    engineInputs.requestTypesDevice = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
     engineInputs.temperatures = manager.emptyTensor(runtime::MemoryType::kGPU, dtype);
 
     engineInputs.draftTokens = manager.gpu(ITensor::makeShape({maxNumSequences, numBeams, beamLength}), TRTTokenIdType);
     engineInputs.draftIndices
-        = manager.gpu(ITensor::makeShape({maxNumSequences, numBeams, beamLength}), tensorrt_llm::DataType::kINT32);
+        = manager.gpu(ITensor::makeShape({maxNumSequences, numBeams, beamLength}), nvinfer1::DataType::kINT32);
     engineInputs.draftProbs
         = manager.gpu(ITensor::makeShape({maxNumSequences, numBeams, beamDraftLength, vocabSizePadded}), dtype);
 
-    engineInputs.generationLengths = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
-    engineInputs.positionIds = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
-    engineInputs.positionOffsets = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
-    engineInputs.packedMasks = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
+    engineInputs.generationLengths = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    engineInputs.positionIds = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    engineInputs.positionOffsets = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    engineInputs.packedMasks = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
 
     engineInputs.randomDataSample = manager.emptyTensor(runtime::MemoryType::kGPU, dtype);
     engineInputs.randomDataValidation = manager.emptyTensor(runtime::MemoryType::kGPU, dtype);
-    engineInputs.positionIdsBase = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
-    engineInputs.useSpecDecoding = manager.cpu(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+    engineInputs.positionIdsBase = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    engineInputs.useSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     bufferCast<SizeType32>(*engineInputs.useSpecDecoding)[0] = 1;
 
     // output tensors
     engineOutputs.nextDraftTokens
         = manager.gpu(ITensor::makeShape({maxNumSequences, numBeams, beamLength}), TRTTokenIdType);
     engineOutputs.nextDraftIndices
-        = manager.gpu(ITensor::makeShape({maxNumSequences, numBeams, beamLength}), tensorrt_llm::DataType::kINT32);
+        = manager.gpu(ITensor::makeShape({maxNumSequences, numBeams, beamLength}), nvinfer1::DataType::kINT32);
     engineOutputs.nextDraftProbs
         = manager.gpu(ITensor::makeShape({maxNumSequences, numBeams, beamDraftLength, vocabSizePadded}), dtype);
 
-    engineOutputs.maxGenToken = manager.gpu(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
-    engineOutputs.totalGenToken = manager.gpu(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+    engineOutputs.maxGenToken = manager.gpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    engineOutputs.totalGenToken = manager.gpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
-    engineOutputs.nextGenerationLengths
-        = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
-    engineOutputs.nextPositionOffsets = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
-    engineOutputs.masks = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kBOOL);
+    engineOutputs.nextGenerationLengths = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    engineOutputs.nextPositionOffsets = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    engineOutputs.masks = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kBOOL);
 
     engineOutputs.nextFlatTokens = manager.emptyTensor(runtime::MemoryType::kGPU, TRTTokenIdType);
-    engineOutputs.bestPathLengths = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
-    engineOutputs.bestPathIndices = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
-    engineOutputs.packedPositionIds = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
+    engineOutputs.bestPathLengths = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    engineOutputs.bestPathIndices = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    engineOutputs.packedPositionIds = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
 
     // helper tensors
     auto const& stream = manager.getStream();
     scanTempStorageBytes
         = tksd::invokeScanGenerationLengths(nullptr, 0, nullptr, nullptr, maxNumSequences, stream.get());
     scanTempStorage = manager.gpu(scanTempStorageBytes);
-    cumSumGenerationLengths = manager.emptyTensor(runtime::MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
+    cumSumGenerationLengths = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
 
     // pre-allocate empty tensors
     reshape(0, maxNumSequences, modelConfig);
@@ -298,15 +295,15 @@ void ExplicitDraftTokensBuffers::setFromInputs(SizeType32 numCtxSequences, SizeT
 
     switch (dtype)
     {
-    case tensorrt_llm::DataType::kFLOAT:
+    case nvinfer1::DataType::kFLOAT:
         setFromInputs<float>(numCtxSequences, numGenSequences, vocabSizePadded, seqSlots, draftBuffers,
             contextPositionIds, *explicitDraftTokensModule, stream);
         break;
-    case tensorrt_llm::DataType::kHALF:
+    case nvinfer1::DataType::kHALF:
         setFromInputs<half>(numCtxSequences, numGenSequences, vocabSizePadded, seqSlots, draftBuffers,
             contextPositionIds, *explicitDraftTokensModule, stream);
         break;
-    case tensorrt_llm::DataType::kBF16:
+    case nvinfer1::DataType::kBF16:
         setFromInputs<__nv_bfloat16>(numCtxSequences, numGenSequences, vocabSizePadded, seqSlots, draftBuffers,
             contextPositionIds, *explicitDraftTokensModule, stream);
         break;

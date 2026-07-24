@@ -32,7 +32,7 @@
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntime.h>
 #include <cuda_runtime.h>
 
 #include <gmock/gmock-matchers.h>
@@ -78,7 +78,7 @@ protected:
 
     void SetUp() override
     {
-        mModelConfig = std::make_unique<ModelConfig>(0, 2, 2, 0, 1, 16, tensorrt_llm::DataType::kFLOAT);
+        mModelConfig = std::make_unique<ModelConfig>(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
         mModelConfig->setMlpHiddenSize(32);
         mWorldConfig = std::make_unique<WorldConfig>(2, 1, 1, 0);
         std::vector<LoraModule> modules{
@@ -285,7 +285,7 @@ TEST_F(PeftCacheManagerTest, gptManagerSim)
     auto peftManager = std::make_unique<PeftCacheManager>(config, *mModelConfig, *mWorldConfig, *mManager);
 
     auto pageConfig = LoraCachePageManagerConfig(
-        runtime::MemoryType::kCPU, tensorrt_llm::DataType::kFLOAT, 128, 128, 2 * 8 * 64, 4 * 16, 1);
+        runtime::MemoryType::kCPU, nvinfer1::DataType::kFLOAT, 128, 128, 2 * 8 * 64, 4 * 16, 1);
     auto loraCache = std::make_unique<LoraCache>(pageConfig, *mModelConfig, *mWorldConfig, *mManager);
 
     std::map<uint64_t, std::pair<TensorPtr, TensorPtr>> loras;
@@ -505,7 +505,7 @@ TEST_F(PeftCacheManagerTest, getMaxNumSlots)
     config.numHostModuleLayer = 8192 * 8;
     config.numDeviceModuleLayer = 8292 * 2;
     auto [hostSlots, deviceSlots]
-        = PeftCacheManager::getMaxNumSlots(config, tensorrt_llm::DataType::kHALF, 256, 4 * 256, *mManager);
+        = PeftCacheManager::getMaxNumSlots(config, nvinfer1::DataType::kHALF, 256, 4 * 256, *mManager);
     EXPECT_EQ(262144, hostSlots);
     EXPECT_EQ(66336, deviceSlots);
 
@@ -516,13 +516,13 @@ TEST_F(PeftCacheManagerTest, getMaxNumSlots)
     config.maxPagesPerBlockDevice = 8;
 
     std::tie(hostSlots, deviceSlots)
-        = PeftCacheManager::getMaxNumSlots(config, tensorrt_llm::DataType::kHALF, 256, 4 * 256, *mManager);
+        = PeftCacheManager::getMaxNumSlots(config, nvinfer1::DataType::kHALF, 256, 4 * 256, *mManager);
 
     EXPECT_EQ(195, hostSlots);
     EXPECT_EQ(66336, deviceSlots);
 
     std::tie(hostSlots, deviceSlots)
-        = PeftCacheManager::getMaxNumSlots(config, tensorrt_llm::DataType::kFLOAT, 384, 4 * 1024, *mManager);
+        = PeftCacheManager::getMaxNumSlots(config, nvinfer1::DataType::kFLOAT, 384, 4 * 1024, *mManager);
 
     config.hostCacheSize = 100000000;
     config.numHostModuleLayer = 8291 * 2;
@@ -539,7 +539,7 @@ TEST_F(PeftCacheManagerTest, getPageManagerConfig)
     auto [hostCfg, deviceCfg] = PeftCacheManager::getPageManagerConfig(config, *mModelConfig, *mWorldConfig, *mManager);
 
     EXPECT_EQ(runtime::MemoryType::kCPU, hostCfg.getMemoryType());
-    EXPECT_EQ(tensorrt_llm::DataType::kFLOAT, hostCfg.getDataType());
+    EXPECT_EQ(nvinfer1::DataType::kFLOAT, hostCfg.getDataType());
     EXPECT_EQ(456, hostCfg.getTotalNumPages());
     EXPECT_EQ(24, hostCfg.getMaxPagesPerBlock());
     EXPECT_EQ(288, hostCfg.getSlotsPerPage());
@@ -547,7 +547,7 @@ TEST_F(PeftCacheManagerTest, getPageManagerConfig)
     EXPECT_FALSE(hostCfg.getInitToZero());
 
     EXPECT_EQ(runtime::MemoryType::kGPU, deviceCfg.getMemoryType());
-    EXPECT_EQ(tensorrt_llm::DataType::kFLOAT, deviceCfg.getDataType());
+    EXPECT_EQ(nvinfer1::DataType::kFLOAT, deviceCfg.getDataType());
     EXPECT_EQ(116, deviceCfg.getTotalNumPages());
     EXPECT_EQ(8, deviceCfg.getMaxPagesPerBlock());
     EXPECT_EQ(288, deviceCfg.getSlotsPerPage());
@@ -563,7 +563,7 @@ TEST_F(PeftCacheManagerTest, getPageManagerConfig)
         = PeftCacheManager::getPageManagerConfig(config, *mModelConfig, *mWorldConfig, *mManager);
 
     EXPECT_EQ(runtime::MemoryType::kCPU, hostCfg.getMemoryType());
-    EXPECT_EQ(tensorrt_llm::DataType::kFLOAT, hostCfg.getDataType());
+    EXPECT_EQ(nvinfer1::DataType::kFLOAT, hostCfg.getDataType());
     EXPECT_EQ(3617, hostCfg.getTotalNumPages());
     EXPECT_EQ(4, hostCfg.getMaxPagesPerBlock());
     EXPECT_EQ(288, hostCfg.getSlotsPerPage());
@@ -571,7 +571,7 @@ TEST_F(PeftCacheManagerTest, getPageManagerConfig)
     EXPECT_FALSE(hostCfg.getInitToZero());
 
     EXPECT_EQ(runtime::MemoryType::kGPU, deviceCfg.getMemoryType());
-    EXPECT_EQ(tensorrt_llm::DataType::kFLOAT, deviceCfg.getDataType());
+    EXPECT_EQ(nvinfer1::DataType::kFLOAT, deviceCfg.getDataType());
     EXPECT_EQ(116, deviceCfg.getTotalNumPages());
     EXPECT_EQ(8, deviceCfg.getMaxPagesPerBlock());
     EXPECT_EQ(288, deviceCfg.getSlotsPerPage());
@@ -586,7 +586,7 @@ protected:
 
     void SetUp() override
     {
-        mModelConfig = std::make_unique<ModelConfig>(0, 2, 2, 0, 1, 16, tensorrt_llm::DataType::kFLOAT);
+        mModelConfig = std::make_unique<ModelConfig>(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
         mModelConfig->setMlpHiddenSize(32);
         mWorldConfig = std::make_unique<WorldConfig>(2, 1, 1, 0);
         std::vector<LoraModule> modules{

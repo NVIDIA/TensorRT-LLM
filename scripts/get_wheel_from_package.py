@@ -78,10 +78,26 @@ def get_wheel_from_package(arch, artifact_path, timeout):
     build_dir = llm_root / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
 
+    benchmarks_dir = llm_root / "cpp" / "build" / "benchmarks"
+    benchmarks_dir.mkdir(parents=True, exist_ok=True)
+
     wheel_files = glob.glob(str(tmp_dir / "tensorrt_llm*.whl"))
     for wheel_file in wheel_files:
         shutil.move(wheel_file, str(build_dir))
         print(f"Moved wheel file: {wheel_file} -> {build_dir}")
+
+    benchmark_files = [
+        "bertBenchmark", "gptManagerBenchmark", "disaggServerBenchmark"
+    ]
+
+    for benchmark in benchmark_files:
+        src_path = tmp_dir / "benchmarks" / "cpp" / benchmark
+        if src_path.exists():
+            dst_path = benchmarks_dir / benchmark
+            shutil.copy2(src_path, dst_path)
+            print(f"Copied benchmark file: {src_path} -> {dst_path}")
+        else:
+            print(f"Warning: Benchmark file not found: {src_path}")
 
     shutil.rmtree(tmp_dir)
 

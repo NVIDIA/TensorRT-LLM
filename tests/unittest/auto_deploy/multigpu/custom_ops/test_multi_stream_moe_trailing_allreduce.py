@@ -476,9 +476,7 @@ def _run_with_retries(worker_fn, world_size, **kwargs):
     max_retries = 5
     last_exc = None
     for _ in range(max_retries):
-        # wait_shutdown: block shutdown until the workers exited, so a test
-        # handed a live pool right after this one cannot race the GPU release.
-        pool = MpiPoolSession(n_workers=world_size, wait_shutdown=True)
+        pool = MpiPoolSession(n_workers=world_size)
         try:
             return pool.submit_sync(worker_fn, port=None, world_size=world_size, **kwargs)
         except DistNetworkError as e:

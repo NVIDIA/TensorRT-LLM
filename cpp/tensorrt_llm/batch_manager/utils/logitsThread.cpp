@@ -19,7 +19,6 @@
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -125,7 +124,7 @@ void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadS
 }
 
 void targetModelReceiveLogits(runtime::ITensor::SharedPtr& draftLogitsHost,
-    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, tensorrt_llm::DataType logitsDtype)
+    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, nvinfer1::DataType logitsDtype)
 {
 #if ENABLE_MULTI_DEVICE
     auto const& worldComm = tensorrt_llm::mpi::MpiComm::world();

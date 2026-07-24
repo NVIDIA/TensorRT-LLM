@@ -19,7 +19,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/layers/decodingParams.h"
@@ -65,42 +64,38 @@ LookaheadDecodingLayer<T>::CpuAlgorithmResources::CpuAlgorithmResources(DecoderD
     mPrompts.reserve(maxBatchSize);
     for (auto bi = 0; bi < maxBatchSize; bi++)
     {
-        mPrompts.emplace_back(BufferManager::cpu(ITensor::makeShape({0}), tensorrt_llm::DataType::kINT32));
+        mPrompts.emplace_back(BufferManager::cpu(ITensor::makeShape({0}), nvinfer1::DataType::kINT32));
     }
 
     auto const maxBatchShape1D = ITensor::makeShape({maxBatchSize});
-    mBatchSlots = BufferManager::cpu(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
+    mBatchSlots = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mTargetTokens
-        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), tensorrt_llm::DataType::kINT32);
-    mTokensPerStep = BufferManager::cpu(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
-    mEndIds = BufferManager::cpu(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
+        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), nvinfer1::DataType::kINT32);
+    mTokensPerStep = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mEndIds = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
 
-    mOutputIds
-        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxNumNewTokens}), tensorrt_llm::DataType::kINT32);
+    mOutputIds = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxNumNewTokens}), nvinfer1::DataType::kINT32);
     mNewTokens = BufferManager::cpu(
-        ITensor::makeShape({maxTokensPerStep, maxBatchSize, beamWidth}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({maxTokensPerStep, maxBatchSize, beamWidth}), nvinfer1::DataType::kINT32);
     mPathsOffsets
-        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxAcceptedDraftLen}), tensorrt_llm::DataType::kINT32);
+        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxAcceptedDraftLen}), nvinfer1::DataType::kINT32);
     mPathsOffsetsBatch
-        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxAcceptedDraftLen}), tensorrt_llm::DataType::kINT32);
-    mNumNewTokens = BufferManager::cpu(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
-    mNumNewTokensCumSum = BufferManager::cpu(ITensor::makeShape({maxBatchSize + 1}), tensorrt_llm::DataType::kINT32);
-    mNextDraftTokens
-        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxDraftLen}), tensorrt_llm::DataType::kINT32);
-    mNextDraftPosIds
-        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxDraftLen}), tensorrt_llm::DataType::kINT32);
-    mGenerationLengths = BufferManager::cpu(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
+        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxAcceptedDraftLen}), nvinfer1::DataType::kINT32);
+    mNumNewTokens = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mNumNewTokensCumSum = BufferManager::cpu(ITensor::makeShape({maxBatchSize + 1}), nvinfer1::DataType::kINT32);
+    mNextDraftTokens = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
+    mNextDraftPosIds = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
+    mGenerationLengths = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mPositionOffsets
-        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), tensorrt_llm::DataType::kINT32);
-    mPositionIds
-        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), tensorrt_llm::DataType::kINT32);
+        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), nvinfer1::DataType::kINT32);
+    mPositionIds = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), nvinfer1::DataType::kINT32);
     mAttentionMask
-        = BufferManager::cpu(ITensor::makeShape({maxTokensPerStep, maxTokensPerStep}), tensorrt_llm::DataType::kBOOL);
+        = BufferManager::cpu(ITensor::makeShape({maxTokensPerStep, maxTokensPerStep}), nvinfer1::DataType::kBOOL);
     mPackedMask = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep,
                                          static_cast<ITensor::DimType64>(divUp(maxTokensPerStep, 32))}),
-        tensorrt_llm::DataType::kINT32);
-    mNextDraftLengths = BufferManager::cpu(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
-    mSequenceLengths = BufferManager::cpu(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
+    mNextDraftLengths = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mSequenceLengths = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
 }
 
 template <typename T>
@@ -122,12 +117,12 @@ LookaheadDecodingLayer<T>::LookaheadDecodingLayer(
     auto const maxBatchShape2D = ITensor::makeShape({maxBatchSize, maxTokensPerStep});
 
     mWorkspaceSize = getTopKWorkspaceSize<T>(maxBatchSize, maxTokensPerStep, maxTopK, vocabSizePadded);
-    mTargetTokensDevice = mBufferManager->gpu(maxBatchShape2D, tensorrt_llm::DataType::kINT32);
+    mTargetTokensDevice = mBufferManager->gpu(maxBatchShape2D, nvinfer1::DataType::kINT32);
     mCurandStatesDevice
-        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, sizeof(curandState_t)}), tensorrt_llm::DataType::kINT8);
+        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, sizeof(curandState_t)}), nvinfer1::DataType::kINT8);
 
     mSetupWorkspaceSize = DecodingLayerWorkspace::calculateRequiredWorkspaceSize(
-        std::make_pair(maxBatchShape1D, tensorrt_llm::DataType::kINT64));
+        std::make_pair(maxBatchShape1D, nvinfer1::DataType::kINT64));
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

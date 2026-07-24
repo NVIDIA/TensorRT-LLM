@@ -22,7 +22,6 @@
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/kvCachePartialCopy.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -164,8 +163,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 
             // If no partial tokens or if the dataType is not supported for partial copy, copy entire block.
             // Note that nvfp4 kv cache SFs use an interleaved layout, so we need to copy the entire block.
-            if (numTokensToCopy <= 0 || srcPtr->getDataType() == tensorrt_llm::DataType::kINT4
-                || srcPtr->getDataType() == tensorrt_llm::DataType::kFP4 || containsBlockScales)
+            if (numTokensToCopy <= 0 || srcPtr->getDataType() == nvinfer1::DataType::kINT4
+                || srcPtr->getDataType() == nvinfer1::DataType::kFP4 || containsBlockScales)
             {
                 // For partial copy not implemented with these data types,
                 // just do a full copy.
@@ -462,8 +461,8 @@ std::size_t KVCacheTransferManager::computeBlockTransferBytes(
 
         // Mirror the logic in copyBlock: a partial copy only happens when numTokensToCopy > 0,
         // the data type supports it (not kINT4/kFP4), not block scales, and numTokensToCopy < tokensPerBlock.
-        bool const isPartialCopy = numTokensToCopy > 0 && dataType != tensorrt_llm::DataType::kINT4
-            && dataType != tensorrt_llm::DataType::kFP4 && !pool.containsBlockScales
+        bool const isPartialCopy = numTokensToCopy > 0 && dataType != nvinfer1::DataType::kINT4
+            && dataType != nvinfer1::DataType::kFP4 && !pool.containsBlockScales
             && numTokensToCopy < pool.tokensPerBlock;
 
         if (isPartialCopy)

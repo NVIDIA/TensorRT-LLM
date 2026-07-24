@@ -117,16 +117,10 @@ class TestPackedBeamBlockLayout:
 
             def __init__(self):
                 self.beam_width = None
-                self.pool_indices_window = None
 
             def get_batch_cache_indices(self, request_ids, layer_idx=None, beam_width=1):
                 self.beam_width = beam_width
                 return [[10, 11, 12, 13]]
-
-            def get_memory_pool_block_indices(self, block_ids, window_size):
-                # Identity translation: nothing offloaded, block_id == pool slot.
-                self.pool_indices_window = window_size
-                return block_ids
 
         req = _FakeReq(prompt_len=7)
         req.py_request_id = 1
@@ -134,10 +128,9 @@ class TestPackedBeamBlockLayout:
         req.sampling_config = _FakeSamplingConfig(beam_width=1)
         mgr = _FakeMgr()
 
-        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids(req, 0, _lg(window=512))
+        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids(req, 0, _lg())
 
         assert mgr.beam_width == 4
-        assert mgr.pool_indices_window == 512
         np.testing.assert_array_equal(block_ids, [10, 11, 12, 13])
 
     def test_pack_beam_cache_indices_single_block_prompt_keeps_all_beams(self):

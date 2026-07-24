@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
+#include "tensorrt_llm/runtime/tllmLogger.h"
 
 #include <gtest/gtest.h>
 
@@ -39,11 +39,14 @@ protected:
 
         if (mDeviceCount == 0)
             GTEST_SKIP() << "No GPUs found";
+
+        mLogger = std::make_shared<TllmLogger>();
     }
 
     void TearDown() override {}
 
     int mDeviceCount;
+    std::shared_ptr<nvinfer1::ILogger> mLogger;
 };
 
 std::shared_ptr<tl::BaseDecodingOutputs> dynamicDecodeTest(std::shared_ptr<BufferManager> manager, size_t vocabSize,
@@ -64,10 +67,10 @@ std::shared_ptr<tl::BaseDecodingOutputs> dynamicDecodeTest(std::shared_ptr<Buffe
 
     tk::FinishedState::UnderlyingType* gpuFinished = nullptr;
 
-    ITensor::SharedPtr gpuEndIds = manager->gpu(ITensor::makeShape({signedBatchSize}), tensorrt_llm::DataType::kINT32);
+    ITensor::SharedPtr gpuEndIds = manager->gpu(ITensor::makeShape({signedBatchSize}), nvinfer1::DataType::kINT32);
     manager->copy(cpuEndIds.data(), *gpuEndIds, MemoryType::kCPU);
     ITensor::SharedPtr gpuOutputIds = manager->gpu(
-        ITensor::makeShape({signedBatchSize, signedBeamWidth, signedMaxSeqLength}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({signedBatchSize, signedBeamWidth, signedMaxSeqLength}), nvinfer1::DataType::kINT32);
     manager->copy(cpuOutputIds.data(), *gpuOutputIds, MemoryType::kCPU);
 
     auto const decodingMode = beamWidth == 1 ? tle::DecodingMode::TopKTopP() : tle::DecodingMode::BeamSearch();
@@ -89,7 +92,7 @@ std::shared_ptr<tl::BaseDecodingOutputs> dynamicDecodeTest(std::shared_ptr<Buffe
     auto forwardParams = std::make_shared<tl::SamplingInputs>(gpuEndIds, batchSlots, step, ite, localBatchSize);
     auto logitsShape
         = ITensor::makeShape({signedBatchSize, static_cast<int64_t>(beamWidth), static_cast<int64_t>(vocabSizePadded)});
-    ITensor::SharedPtr inputLogits = manager->gpu(logitsShape, tensorrt_llm::DataType::kFLOAT);
+    ITensor::SharedPtr inputLogits = manager->gpu(logitsShape, nvinfer1::DataType::kFLOAT);
     forwardParams->logits = inputLogits;
     manager->copy(cpuLogits.data(), *inputLogits, MemoryType::kCPU);
 
@@ -98,10 +101,10 @@ std::shared_ptr<tl::BaseDecodingOutputs> dynamicDecodeTest(std::shared_ptr<Buffe
     forwardParams->stopCriteriaInputs = std::make_shared<tl::StopCriteriaDecodingInputs>(localBatchSize);
 
     auto outputParams = std::make_shared<tl::BaseDecodingOutputs>(gpuOutputIds);
-    outputParams->sequenceLength = manager->gpu(ITensor::makeShape({signedBatchSize}), tensorrt_llm::DataType::kINT32);
+    outputParams->sequenceLength = manager->gpu(ITensor::makeShape({signedBatchSize}), nvinfer1::DataType::kINT32);
     manager->copy(cpuSequenceLengths.data(), *outputParams->sequenceLength.value(), MemoryType::kCPU);
     outputParams->newTokens
-        = manager->gpu(ITensor::makeShape({signedBatchSize, signedBeamWidth}), tensorrt_llm::DataType::kINT32);
+        = manager->gpu(ITensor::makeShape({signedBatchSize, signedBeamWidth}), nvinfer1::DataType::kINT32);
     outputParams->finished = manager->gpu(
         ITensor::makeShape({signedBatchSize, signedBeamWidth}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
 

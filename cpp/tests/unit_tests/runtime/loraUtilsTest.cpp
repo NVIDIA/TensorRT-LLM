@@ -25,7 +25,7 @@
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntime.h>
 
 #include <algorithm>
 #include <optional>
@@ -53,7 +53,7 @@ protected:
 TEST_F(LoraUtilsTest, null_values)
 {
     std::optional<TensorPtr> optReqLoraWeights = std::nullopt;
-    std::optional<TensorPtr> optReqLoraConfig = mManager->emptyTensor(MemoryType::kCPU, tensorrt_llm::DataType::kHALF);
+    std::optional<TensorPtr> optReqLoraConfig = mManager->emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kHALF);
 
     EXPECT_THAT([&]() { loraValidateRequestTensorDims(optReqLoraWeights, optReqLoraConfig); },
         testing::Throws<std::runtime_error>());
@@ -66,35 +66,33 @@ TEST_F(LoraUtilsTest, null_values)
 
 TEST_F(LoraUtilsTest, dims_mem_type)
 {
-    std::optional<TensorPtr> optReqLoraWeights
-        = mManager->cpu(ITensor::makeShape({1, 2}), tensorrt_llm::DataType::kHALF);
+    std::optional<TensorPtr> optReqLoraWeights = mManager->cpu(ITensor::makeShape({1, 2}), nvinfer1::DataType::kHALF);
     std::optional<TensorPtr> optReqLoraConfig
-        = mManager->cpu(ITensor::makeShape({1, 2, 3}), tensorrt_llm::DataType::kINT32);
+        = mManager->cpu(ITensor::makeShape({1, 2, 3}), nvinfer1::DataType::kINT32);
 
     EXPECT_THAT([&]() { loraValidateRequestTensorDims(optReqLoraWeights, optReqLoraConfig); },
         testing::Throws<std::runtime_error>());
 
-    std::optional<TensorPtr> optGpuWeights
-        = mManager->gpu(ITensor::makeShape({1, 2, 50}), tensorrt_llm::DataType::kHALF);
+    std::optional<TensorPtr> optGpuWeights = mManager->gpu(ITensor::makeShape({1, 2, 50}), nvinfer1::DataType::kHALF);
 
     EXPECT_THAT([&]() { loraValidateRequestTensorDims(optGpuWeights, optReqLoraConfig); },
         testing::Throws<std::runtime_error>());
 
-    optReqLoraWeights = mManager->cpu(ITensor::makeShape({1, 2, 50}), tensorrt_llm::DataType::kHALF);
-    optReqLoraConfig = mManager->cpu(ITensor::makeShape({1, 2, 3}), tensorrt_llm::DataType::kINT32);
+    optReqLoraWeights = mManager->cpu(ITensor::makeShape({1, 2, 50}), nvinfer1::DataType::kHALF);
+    optReqLoraConfig = mManager->cpu(ITensor::makeShape({1, 2, 3}), nvinfer1::DataType::kINT32);
 
     loraValidateRequestTensorDims(optReqLoraWeights, optReqLoraConfig);
 }
 
 TEST_F(LoraUtilsTest, loraValidateRequestTensors)
 {
-    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 4, tensorrt_llm::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT);
     auto worldConfig = WorldConfig();
 
     std::optional<TensorPtr> optReqLoraWeights
-        = mManager->cpu(ITensor::makeShape({1, 2, 32}), tensorrt_llm::DataType::kFLOAT);
+        = mManager->cpu(ITensor::makeShape({1, 2, 32}), nvinfer1::DataType::kFLOAT);
     std::optional<TensorPtr> optReqLoraConfig
-        = mManager->cpu(ITensor::makeShape({1, 2, 3}), tensorrt_llm::DataType::kINT32);
+        = mManager->cpu(ITensor::makeShape({1, 2, 3}), nvinfer1::DataType::kINT32);
 
     std::vector<int32_t> config{1, 0, 4, 1, 1, 4};
 

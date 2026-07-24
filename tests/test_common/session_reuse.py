@@ -23,15 +23,10 @@ Eligibility is automatic:
                               bounding worker state accumulation
 
 Between handouts every worker runs a torch.compile/Dynamo reset (exactly once
-per worker, barrier-pinned: ``grouped_test_utils.submit_sync_per_worker``).
-Handover cannot race the previous worker's GPU-memory release: every pool
-these layers build is constructed with ``wait_shutdown=True``, so its
-shutdown blocks until the workers actually exited.
-
-Cache misses (first pool of a size, post-drain rebuild, post-retire
-replacement) take a shadow pool pre-spawned by the session-prefetch layer
-when it is wired (``_prefetcher``), hiding the ~50s spawn; each miss restocks
-one shadow for the next.
+per worker, barrier-pinned: ``grouped_test_utils.submit_sync_per_worker``) and
+the handover waits for
+the previous worker's GPU memory to actually be released (NVML settle barrier)
+— both failure modes were observed in validation, not hypothetical.
 
 Enable/disable with ``TRTLLM_TEST_REUSE_SESSION`` (default on; ``0`` disables).
 Disabled under pytest-xdist workers (parallel tests would multiply live pools).
@@ -40,10 +35,8 @@ Disabled under pytest-xdist workers (parallel tests would multiply live pools).
 import os
 import sys
 import threading
+import time
 
-# The spawn snapshot is shared with the session-prefetch layer (both hand a
-# live pool to a test that did not spawn it — same invariant).
-from test_common._session_utils import _isinstance_transparent_shim, _spawn_snapshot
 from test_common.grouped_test_utils import reset_worker_torch_compile_state, submit_sync_per_worker
 
 # The only places in the library that construct MpiPoolSession for a bare
@@ -66,45 +59,148 @@ _WEIGHT_CACHE_ENV = {
     "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES": "1",
 }
 
+# Workers freeze the parent environment AND sys.path at spawn time, so a
+# cached pool must not be handed to a test that changed either (silently
+# stale env / unimportable monkeypatched modules). Process bookkeeping that
+# legitimately drifts between tests is ignored; a false mismatch only costs
+# one synchronous rebuild.
+_ENV_IGNORE = frozenset(
+    {
+        "PYTEST_CURRENT_TEST",
+        "COLUMNS",
+        "LINES",
+        "PWD",
+        "OLDPWD",
+        "SHLVL",
+        "_",
+    }
+)
+
+
+def _spawn_snapshot():
+    """The worker-visible state a pool freezes at spawn: env + sys.path."""
+    return (
+        {k: v for k, v in os.environ.items() if k not in _ENV_IGNORE},
+        list(sys.path),
+    )
+
+
+# GPU-memory settle barrier at handover: a reused live pool skips the ~50s
+# synchronous spawn that used to give the previous LLM's worker time to exit;
+# its CUDA memory is only released when the process actually exits. Building
+# the next model into that race fails with "insufficient GPU memory".
+_SETTLE_MIN_FREE_FRAC = 0.85
+_SETTLE_POLL_S = 0.5
+_SETTLE_FLAT_POLLS = 3
+_SETTLE_EPSILON = 256 << 20
+_SETTLE_TIMEOUT_S = 30.0
+
+
+def _visible_gpu_indices(count: int):
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        return list(range(count))
+    indices = []
+    for token in visible.split(","):
+        token = token.strip()
+        if not token.isdigit() or int(token) >= count:
+            return list(range(count))  # UUID/MIG form: fall back to all GPUs
+        indices.append(int(token))
+    return indices or list(range(count))
+
+
+def wait_gpu_memory_settle() -> None:
+    """Wait until visible GPUs are mostly free or free memory stops rising.
+
+    Never raises: on any NVML problem the handover proceeds as before.
+    """
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        return
+    try:
+        handles = [
+            pynvml.nvmlDeviceGetHandleByIndex(i)
+            for i in _visible_gpu_indices(pynvml.nvmlDeviceGetCount())
+        ]
+
+        def _free_total():
+            infos = [pynvml.nvmlDeviceGetMemoryInfo(h) for h in handles]
+            return [i.free for i in infos], [i.total for i in infos]
+
+        t0 = time.monotonic()
+        flat, prev = 0, None
+        while True:
+            free, total = _free_total()
+            if all(f >= _SETTLE_MIN_FREE_FRAC * t for f, t in zip(free, total)):
+                break
+            if prev is not None and all(f - p < _SETTLE_EPSILON for f, p in zip(free, prev)):
+                flat += 1
+                if flat >= _SETTLE_FLAT_POLLS:
+                    break  # not increasing: that memory is legitimately in use
+            else:
+                flat = 0
+            if time.monotonic() - t0 >= _SETTLE_TIMEOUT_S:
+                break
+            prev = free
+            time.sleep(_SETTLE_POLL_S)
+        waited = time.monotonic() - t0
+        if waited >= _SETTLE_POLL_S:
+            print(
+                f"[session-reuse] waited {waited:.1f}s before handover for GPU memory release",
+                flush=True,
+            )
+    except Exception:
+        pass
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
 
 _RETIRE_THREADS: list = []
 _RETIRE_LOCK = threading.Lock()
 
 
-def _reap_retires(timeout: float = 60.0) -> None:
-    """Join in-flight retire threads (bounded); no-op when none are running.
+def _proc_start_time(pid: int):
+    """Kernel start time (jiffies since boot) of ``pid``, or None if gone.
 
-    A retired pool's workers hold their (full-model) GPU memory until they
-    exit; the retire thread blocks on that exit (``wait_shutdown=True``), but
-    it is a BACKGROUND thread — the test hot path never waits on it. Before
-    an instant cached-pool handover, joining in-flight retires is what makes
-    the handover safe against a corpse still releasing (e.g. the duplicate
-    retired by ``_release`` moments earlier); every other path spawns fresh
-    (~50s), which outlasts the release naturally. Also called at drain
-    rendezvous points so disposals cannot leak past the session.
+    PIDs are recycled by the OS, but the (pid, start_time) pair is unique:
+    verifying it right before SIGKILL prevents killing an unrelated process
+    (e.g. a replacement pool's worker) that inherited a dead worker's PID.
     """
-    with _RETIRE_LOCK:
-        in_flight, _RETIRE_THREADS[:] = list(_RETIRE_THREADS), []
-    for t in in_flight:
-        t.join(timeout=timeout)
-        if t.is_alive():
-            print(
-                "[session-reuse] WARNING: pool retirement did not finish within 60s",
-                flush=True,
-            )
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat = f.read()
+        # Field 2 (comm) may contain spaces/parens; parse after the last ')'.
+        return stat.rsplit(b")", 1)[1].split()[19]  # field 22 overall
+    except OSError:
+        return None
 
 
-def _prefetcher():
-    """The session-prefetch singleton when that layer is wired, else None.
+def _get_worker_pid() -> tuple:
+    """Runs inside a worker; module-level so it is picklable."""
+    pid = os.getpid()
+    return (pid, _proc_start_time(pid))
 
-    Mirror of the prefetcher's own reuse probe: coordination goes through
-    sys.modules so neither layer imports the other at module load (a suite
-    wired with only one layer pays nothing for the other). The prefetcher
-    yields the pool SEAMS to reuse; reuse in turn consumes prefetched
-    shadows on its cache misses — the two layers compose, not compete.
+
+def _collect_worker_pids(real) -> tuple:
+    """Record the worker PIDs of a freshly spawned pool.
+
+    ``_retire`` uses them to SIGKILL wedged workers: a graceful shutdown
+    blocks forever on a broken pool and ``shutdown_abort`` would MPI_Abort
+    the parent test process too. Records (pid, start_time) pairs so the kill
+    can verify the PID was not recycled. ``submit_sync_per_worker`` runs the
+    collection exactly once per worker. Best effort — if it fails, the pool
+    just falls back to graceful shutdown.
     """
-    mod = sys.modules.get("test_common.session_prefetcher")
-    return getattr(mod, "PREFETCHER", None)
+    try:
+        return tuple(sorted(submit_sync_per_worker(real, _get_worker_pid)))
+    except Exception:
+        return ()
 
 
 def _describe_mismatch(spawn_snap, now_snap, uses, max_uses):
@@ -177,17 +273,6 @@ class SessionReuseCache:
             "on",
         )
 
-    def is_active(self) -> bool:
-        """Public probe for sibling layers: does reuse own the pool seams?
-
-        The session prefetcher yields the ``MpiPoolSession`` seams when this
-        returns True (reuse eliminates the respawn outright; prefetch could
-        only hide it). Deliberately ignores ``_suspended``: a per-test
-        cache bypass (``private_mpi_session``) does not change seam
-        ownership.
-        """
-        return self.enabled
-
     @property
     def max_uses(self) -> int:
         return int(os.environ.get("TRTLLM_TEST_REUSE_MAX_USES", "16"))
@@ -214,13 +299,10 @@ class SessionReuseCache:
         def _dispose():
             import signal
 
-            # Lazy: only runs when a pool exists, so tensorrt_llm is loaded.
-            from tensorrt_llm.llmapi.mpi_session import _process_start_time
-
             for pid, start_time in pids:
                 # Guard against PID recycling: only kill if the process at
                 # this PID is still the worker we recorded at spawn.
-                if start_time is None or _process_start_time(pid) != start_time:
+                if start_time is None or _proc_start_time(pid) != start_time:
                     continue
                 try:
                     os.kill(pid, signal.SIGKILL)
@@ -274,32 +356,23 @@ class SessionReuseCache:
             # Fires exactly when an RPC executor is constructed, whatever the
             # test is named — no name heuristics.
             cache.drain()
-            if args or kwargs:
-                return real_cls(n_workers, *args, **kwargs)
-            # wait_shutdown: the private pool dies at LLM shutdown; block
-            # there until its workers exited so the next pool (often handed
-            # over instantly from the cache) cannot race the GPU release.
-            return real_cls(n_workers=n_workers, wait_shutdown=True)
+            return real_cls(n_workers, *args, **kwargs)
 
         for name in pending:
             mod = sys.modules[name]
             if getattr(mod, "MpiPoolSession", None) is real_cls:
-                mod.MpiPoolSession = _isinstance_transparent_shim(
-                    real_cls, rpc_factory if name == _RPC_PATCH_TARGET else factory
-                )
+                mod.MpiPoolSession = rpc_factory if name == _RPC_PATCH_TARGET else factory
             self._patched.add(name)
 
     # ---- cache operations ----
 
     def acquire(self, real_cls, n_workers):
-        """Hand out a cached same-size pool (workers reset) or build one."""
+        """Hand out a cached same-size pool (reset + settled) or build one."""
         if self._suspended or not self.enabled:
             # Opt-out test (private_mpi_session) or the kill switch flipped
             # after the seams were patched: untracked fresh pool that the LLM
-            # owns and destroys normally (wait_shutdown: its shutdown blocks
-            # until the workers exited, so the next handover cannot race the
-            # GPU-memory release).
-            return real_cls(n_workers=n_workers, wait_shutdown=True)
+            # owns and destroys normally.
+            return real_cls(n_workers=n_workers)
         with self._lock:
             real = self._pools.pop(n_workers, None)
         if real is not None:
@@ -318,15 +391,8 @@ class SessionReuseCache:
                 self._retire(real)  # stale worker state or lifetime cap
             else:
                 try:
-                    # An instant handover must not race a corpse still
-                    # releasing its GPU memory. Retire threads block on the
-                    # workers' exit (wait_shutdown=True) but run in the
-                    # BACKGROUND, so join any in flight (a duplicate retired
-                    # by _release moments ago held full model memory). No-op
-                    # on the common path; every non-cached path spawns fresh
-                    # (~50s), which outlasts the release naturally.
-                    _reap_retires()
                     submit_sync_per_worker(real, reset_worker_torch_compile_state)
+                    wait_gpu_memory_settle()
                     print(
                         f"[session-reuse] reusing {n_workers}-worker pool "
                         f"(use #{real._reuse_uses + 1})",
@@ -342,55 +408,27 @@ class SessionReuseCache:
         return _ReusableSession(self._spawn_fresh(real_cls, n_workers), self)
 
     def _spawn_fresh(self, real_cls, n_workers):
-        """Obtain a cache-managed pool: prefetched if one is armed, else spawn.
+        """Spawn a cache-managed pool with the worker-side HF weight cache on.
 
-        Every cache miss lands here (first pool of a size, post-drain
-        rebuild, post-retire replacement). When the session-prefetch layer is
-        wired, a shadow pool armed at the PREVIOUS miss is taken instantly —
-        hiding the ~50s spawn the miss would otherwise pay — and a
-        replacement shadow is armed for the next miss of this size. Without
-        the prefetch layer (or on a shadow miss) the synchronous spawn is
-        unchanged.
-
-        The worker-side HF weight cache env is frozen into the workers via
-        the library's ``env_overrides`` channel (parent env untouched, so
-        acquire-time snapshot comparisons still match); an explicit user
-        setting of either var is respected and left untouched. Prefetched
-        shadows were armed with the same overlay. wait_shutdown: shutdown of
-        this pool blocks until its workers exited, so a successor cannot
-        race the GPU-memory release.
+        The cache env vars must be visible at spawn (workers freeze the env)
+        and are removed right after, so non-managed pools (private/RPC) and
+        the rest of the suite keep the production default. The spawn snapshot
+        is taken BEFORE adding them so later acquire-time comparisons (which
+        see the restored env) still match. An explicit user setting of either
+        var is respected and left untouched.
         """
         snapshot = _spawn_snapshot()
-        overrides = {k: v for k, v in _WEIGHT_CACHE_ENV.items() if k not in os.environ}
-        real = None
-        prefetcher = _prefetcher()
-        if prefetcher is not None:
-            try:
-                real = prefetcher.take(n_workers)
-            except Exception as e:  # prefetch is an optimization: fall back
-                print(f"[session-reuse] prefetched-pool take failed: {e}", flush=True)
-                real = None
-            try:
-                # Restock ONE shadow for the next miss of this size (no-op if
-                # one is already armed/building, or prefetch is disabled).
-                prefetcher.schedule_shadow(n_workers, env_overlay=overrides)
-            except Exception:
-                pass
-        if real is None:
-            try:
-                real = real_cls(n_workers=n_workers, wait_shutdown=True, env_overrides=overrides)
-            except Exception as e:
-                # wait_shutdown spawns fail closed (identity collection must
-                # complete); a transient slow node deserves one loud retry —
-                # a second failure means the node is genuinely broken.
-                print(f"[session-reuse] pool spawn failed, retrying once: {e}", flush=True)
-                real = real_cls(n_workers=n_workers, wait_shutdown=True, env_overrides=overrides)
+        added = [k for k in _WEIGHT_CACHE_ENV if k not in os.environ]
+        for k in added:
+            os.environ[k] = _WEIGHT_CACHE_ENV[k]
+        try:
+            real = real_cls(n_workers=n_workers)
+        finally:
+            for k in added:
+                os.environ.pop(k, None)
         real._reuse_uses = 0
         real._reuse_spawn_snapshot = snapshot
-        # (pid, start_time) per worker, recorded by the library at spawn
-        # (wait_shutdown=True above). _retire uses them to SIGKILL wedged
-        # workers; best effort — empty means graceful shutdown only.
-        real._reuse_worker_pids = getattr(real, "_worker_identities", ())
+        real._reuse_worker_pids = _collect_worker_pids(real)
         return real
 
     def _release(self, real):
@@ -419,7 +457,15 @@ class SessionReuseCache:
         disposals from leaking past the session without ever blocking the
         per-test hot path. The join is bounded for the same reason as below.
         """
-        _reap_retires()
+        with _RETIRE_LOCK:
+            in_flight, _RETIRE_THREADS[:] = list(_RETIRE_THREADS), []
+        for t in in_flight:
+            t.join(timeout=60)
+            if t.is_alive():
+                print(
+                    "[session-reuse] WARNING: pool retirement did not finish within 60s",
+                    flush=True,
+                )
         with self._lock:
             pools, self._pools = list(self._pools.values()), {}
         if not pools:

@@ -16,7 +16,6 @@
 
 #include "tensorrt_llm/layers/lookaheadPoolManager.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include <cstddef>
 
@@ -68,7 +67,7 @@ void LookaheadPoolManager::accept(TensorConstPtr const& prompt, SizeType32 level
     for (SizeType32 ti = 0; ti + level - 1 < length; ti++)
     {
         auto key = promptRange[ti];
-        TensorPtr ngram = BufferManager::cpu(ITensor::makeShape({level - 1}), tensorrt_llm::DataType::kINT32);
+        TensorPtr ngram = BufferManager::cpu(ITensor::makeShape({level - 1}), nvinfer1::DataType::kINT32);
         BufferRange<TokenIdType const> sourceRange(*ITensor::slice(prompt, ti + 1, level - 1));
         BufferRange<TokenIdType> ngramRange(*ngram);
         std::copy(sourceRange.begin(), sourceRange.end(), ngramRange.begin());
@@ -108,7 +107,7 @@ void LookaheadPoolManager::update(TensorConstPtr const& keyTokens, TensorConstPt
     for (SizeType32 wi = 0; wi < window; wi++)
     {
         TensorConstPtr source = ITensor::at(ngramTokens, {wi});
-        TensorPtr ngram = BufferManager::cpu(source->getShape(), tensorrt_llm::DataType::kINT32);
+        TensorPtr ngram = BufferManager::cpu(source->getShape(), nvinfer1::DataType::kINT32);
         BufferRange<TokenIdType const> sourceRange(*source);
         BufferRange<TokenIdType> ngramRange(*ngram);
         std::copy(sourceRange.begin(), sourceRange.end(), ngramRange.begin());

@@ -103,10 +103,6 @@ def gen_random_tokens(ip_lens, tokenizer, random_seed):
 
 
 def write_dataset_to_file(dataset_generator, output_file):
-    if output_file is None:
-        for item in dataset_generator:
-            print(item)
-        return
     output_file = Path(output_file)
     os.makedirs(output_file.parent, exist_ok=True)
     with open(output_file, "w") as f:

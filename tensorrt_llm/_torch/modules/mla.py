@@ -495,15 +495,6 @@ class MLA(nn.Module):
         if config is not None:
             if "mla_layers" not in config.extra_attrs:
                 config.extra_attrs["mla_layers"] = {}
-            suffix = 0
-            # ``layer_idx`` is local to an attention stack, while this registry is shared
-            # by target and draft modules in one-model speculative decoding. Keep the first
-            # registration under ``"<layer_idx>"`` and suffix later collisions as
-            # ``"<layer_idx>_<n>"`` so custom ops resolve the originating module without
-            # overwriting another stack's weak reference.
-            while self.layer_idx_str in config.extra_attrs["mla_layers"]:
-                self.layer_idx_str = str(layer_idx) + f"_{suffix}"
-                suffix += 1
             config.extra_attrs["mla_layers"][self.layer_idx_str] = weakref.ref(self)
             self.register_to_config = True
 

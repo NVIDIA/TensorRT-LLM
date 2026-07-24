@@ -389,7 +389,7 @@ void launchRmsNormFp4QuantKernel(RmsNormFp4QuantParams const& params, cudaStream
 
 } // namespace rms_norm_fp4_quant
 
-void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, tensorrt_llm::DataType dataType, cudaStream_t stream)
+void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, nvinfer1::DataType dataType, cudaStream_t stream)
 {
     // The NVFP4 epilogue (cvt_warp_fp16_to_fp4) is compiled only for
     // __CUDA_ARCH__ >= 1000 and emits zeros otherwise, so this kernel is correct
@@ -410,11 +410,11 @@ void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, tensorrt_llm::
         switch (dataType)
         {
 #ifdef ENABLE_BF16
-        case tensorrt_llm::DataType::kBF16:
+        case nvinfer1::DataType::kBF16:
             rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<__nv_bfloat16, /*OutNorm=*/true>(params, stream);
             break;
 #endif
-        case tensorrt_llm::DataType::kHALF:
+        case nvinfer1::DataType::kHALF:
             rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<half, /*OutNorm=*/true>(params, stream);
             break;
         default: TLLM_THROW("Unsupported dataType for residualRmsNormFp4Quant");
@@ -425,11 +425,11 @@ void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, tensorrt_llm::
         switch (dataType)
         {
 #ifdef ENABLE_BF16
-        case tensorrt_llm::DataType::kBF16:
+        case nvinfer1::DataType::kBF16:
             rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<__nv_bfloat16, /*OutNorm=*/false>(params, stream);
             break;
 #endif
-        case tensorrt_llm::DataType::kHALF:
+        case nvinfer1::DataType::kHALF:
             rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<half, /*OutNorm=*/false>(params, stream);
             break;
         default: TLLM_THROW("Unsupported dataType for residualRmsNormFp4Quant");

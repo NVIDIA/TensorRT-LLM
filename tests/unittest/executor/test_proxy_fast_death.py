@@ -16,15 +16,10 @@
 
 import asyncio
 import queue as _queue
-import time as _time
-from concurrent.futures import Future as _Future
-from unittest.mock import Mock
-from unittest.mock import Mock as _Mock
 
 import pytest
 
 from tensorrt_llm.executor import EngineDeadError
-from tensorrt_llm.executor import proxy as proxy_module
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.result import GenerationResult
 
@@ -53,7 +48,6 @@ def _bare_proxy():
     proxy._results = {}
     # Set so the __del__ -> shutdown() path is a clean no-op at GC time.
     proxy.workers_started = False
-    proxy._multi_frontend_ipc_dir = None
     return proxy
 
 
@@ -101,20 +95,6 @@ def test_handle_worker_death_broadcasts_event_driven():
     assert item.root_cause is cause
     # Error is also recorded for the monitor loop (which drives pre_shutdown).
     assert proxy._error_queue.get_nowait() is cause
-
-
-def test_register_worker_processes_with_session_reuse_factory(monkeypatch):
-    """Session reuse replaces proxy.MpiPoolSession with a factory function."""
-    pool_session = object()
-    monkeypatch.setattr(proxy_module, "MpiPoolSession", lambda n_workers: pool_session)
-    proxy = _bare_proxy()
-    proxy.mpi_session = proxy_module.MpiPoolSession(1)
-    proxy._worker_process_monitor = Mock()
-    identities = [object()]
-
-    proxy._register_worker_processes((proxy.READY_SIGNAL, None, identities))
-
-    proxy._worker_process_monitor.register.assert_called_once_with(identities)
 
 
 def test_result_step_raises_on_engine_dead():
@@ -342,199 +322,3 @@ def test_proxy_check_remote_worker_death_marks_engine_dead():
     proxy2 = _bare_proxy()
     proxy2.mpi_session = object()
     assert proxy2._check_remote_worker_death() is False
-
-
-# --- Non-blocking teardown on a dead engine ---
-# An abruptly-killed worker world never completes its mpi4py futures and
-# never sends the result-queue shutdown sentinel, so an unbounded shutdown()
-# blocks forever on f.result(), the dispatcher join, and the pool join.
-# These tests pin the bounded-teardown behavior.
-
-
-def _teardown_proxy(engine_dead):
-    proxy = _bare_proxy()
-    proxy.workers_started = True
-    proxy.doing_shutdown = True  # skip pre_shutdown(); teardown path only
-    proxy._engine_dead = engine_dead
-    proxy._fatal_error = RuntimeError("worker died") if engine_dead else None
-    proxy.dispatch_result_thread = None
-    proxy.rpc_client = None
-    proxy.request_queue = _Mock()
-    proxy.worker_init_status_queue = _Mock()
-    proxy.result_queue = _Mock()
-    proxy._resource_governor_queue = None
-    proxy._owns_mpi_session = True
-    proxy.mpi_session = _Mock()
-    proxy._handle_background_error = lambda *a, **k: None
-    return proxy
-
-
-def test_shutdown_does_not_block_on_dead_engine():
-    """With the engine dead, never-completing futures must not hang teardown."""
-    proxy = _teardown_proxy(engine_dead=True)
-    pending = _Future()  # never completes: abrupt worker death
-    done = _Future()
-    done.set_exception(RuntimeError("captured by mpi_done_callback already"))
-    proxy.mpi_futures = [pending, done]
-
-    dispatcher = _Mock()
-    dispatcher.is_alive.return_value = True
-    proxy.dispatch_result_thread = dispatcher
-
-    start = _time.monotonic()
-    proxy.shutdown()
-    elapsed = _time.monotonic() - start
-
-    # One collective 5 s grace, not an unbounded f.result() per future.
-    assert elapsed < 30
-    assert not pending.done()
-    # The dispatcher join is bounded (daemon thread is leaked, not awaited).
-    dispatcher.stop.assert_called_once()
-    dispatcher.join.assert_called_once_with(timeout=5.0)
-    # The dead pool is not joined; the session is abandoned instead.
-    proxy.mpi_session.abandon.assert_called_once_with()
-    proxy.mpi_session.shutdown.assert_not_called()
-    assert proxy.workers_started is False
-
-
-def test_shutdown_keeps_blocking_semantics_when_engine_alive():
-    """Orderly shutdown is unchanged: futures reaped, session joined."""
-    proxy = _teardown_proxy(engine_dead=False)
-    done = _Future()
-    done.set_result(None)
-    proxy.mpi_futures = [done]
-
-    dispatcher = _Mock()
-    dispatcher.is_alive.return_value = True
-    proxy.dispatch_result_thread = dispatcher
-
-    proxy.shutdown()
-
-    dispatcher.join.assert_called_once_with(timeout=None)
-    proxy.mpi_session.shutdown.assert_called_once_with()
-    proxy.mpi_session.abandon.assert_not_called()
-    assert proxy.workers_started is False
-
-
-def test_shutdown_does_not_shut_down_external_session():
-    """An externally owned session must stay alive even on a dead engine."""
-    proxy = _teardown_proxy(engine_dead=True)
-    proxy._owns_mpi_session = False
-    proxy.mpi_futures = []
-
-    proxy.shutdown()
-
-    proxy.mpi_session.shutdown.assert_not_called()
-    proxy.mpi_session.abandon.assert_not_called()
-
-
-def test_abandon_mpi_pool_threads_unblocks_interpreter_exit():
-    """Both exit-join mechanisms release a wedged pool manager thread.
-
-    The thread is deregistered from mpi4py's THREADS_QUEUES and CPython's
-    _shutdown_locks, so process exit can proceed without joining it.
-    """
-    import sys as _sys
-    import threading as _threading
-    import types as _types
-
-    from tensorrt_llm.llmapi.mpi_session import _abandon_mpi_pool_threads
-
-    release = _threading.Event()
-    wedged = _threading.Thread(target=release.wait, name="fake_manager")
-    wedged.daemon = False
-    wedged.start()
-    try:
-        # Fake mpi4py registry module, as mpi4py would have registered it.
-        fake_mod = _types.ModuleType("mpi4py.futures._lib")
-        fake_mod.THREADS_QUEUES = {wedged: object()}
-        prev = _sys.modules.get("mpi4py.futures._lib")
-        _sys.modules["mpi4py.futures._lib"] = fake_mod
-        try:
-            fake_pool = _Mock()
-            fake_pool._pool.thread = wedged
-
-            _abandon_mpi_pool_threads(fake_pool)
-
-            assert wedged not in fake_mod.THREADS_QUEUES
-            shutdown_locks = getattr(_threading, "_shutdown_locks", None)
-            if shutdown_locks is not None:  # CPython 3.9-3.12
-                assert wedged._tstate_lock not in shutdown_locks
-        finally:
-            if prev is None:
-                del _sys.modules["mpi4py.futures._lib"]
-            else:
-                _sys.modules["mpi4py.futures._lib"] = prev
-    finally:
-        release.set()
-        wedged.join(timeout=5)
-
-
-def test_abandon_mpi_pool_threads_tolerates_missing_pool():
-    from tensorrt_llm.llmapi.mpi_session import _abandon_mpi_pool_threads
-
-    _abandon_mpi_pool_threads(None)
-    _abandon_mpi_pool_threads(object())  # no _pool attribute
-
-
-def test_mark_engine_dead_releases_exit_joins_immediately():
-    """Exit-join release must happen at detection time, not at teardown.
-
-    CPython's exit sequence joins non-daemon threads before atexit/GC can
-    run shutdown(), so a wedged pool manager thread must be deregistered
-    the moment the engine is marked dead.
-    """
-    proxy = _bare_proxy()
-    proxy.mpi_session = _Mock()
-
-    proxy._mark_engine_dead(RuntimeError("worker died"))
-    proxy.mpi_session.release_exit_joins.assert_called_once_with()
-
-    # Sticky: a second death report must not re-release.
-    proxy._mark_engine_dead(RuntimeError("again"))
-    proxy.mpi_session.release_exit_joins.assert_called_once_with()
-
-
-def test_mark_engine_dead_releases_external_sessions_too():
-    """Ownership must not gate the exit-join release.
-
-    The LLM API creates the session and passes it in, so the proxy does
-    not own it; the release is non-destructive bookkeeping and must still
-    happen.
-    """
-    proxy = _bare_proxy()
-    proxy._owns_mpi_session = False
-    proxy.mpi_session = _Mock()
-
-    proxy._mark_engine_dead(RuntimeError("worker died"))
-    proxy.mpi_session.release_exit_joins.assert_called_once_with()
-    # But destructive teardown is still reserved for the owner.
-    proxy.mpi_session.abandon.assert_not_called()
-    proxy.mpi_session.shutdown.assert_not_called()
-
-
-def test_pool_session_shutdown_never_blocks_after_release():
-    """A released session never blocks, even on an explicit shutdown().
-
-    After release_exit_joins(), a blocking shutdown() from the session
-    owner must not join the dead pool.
-    """
-    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
-
-    session = MpiPoolSession.__new__(MpiPoolSession)
-    pool = _Mock()
-    pool._pool.thread = None  # no real manager thread to deregister
-    session.mpi_pool = pool
-    # __init__ is bypassed above; seed the attributes that shutdown() reads
-    # so the test exercises the release/shutdown contract, not attribute
-    # lookup on a raw-constructed session. Keep them minimal:
-    #   * n_workers is only used by shutdown()'s log line.
-    #   * _wait_shutdown gates the post-shutdown worker-exit barrier;
-    #     the test targets the blocking-join guard, so leave it off.
-    session.n_workers = 1
-    session._wait_shutdown = False
-
-    session.release_exit_joins()
-    session.shutdown()  # owner asks for the default blocking shutdown
-
-    pool.shutdown.assert_called_once_with(wait=False)

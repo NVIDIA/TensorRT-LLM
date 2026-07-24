@@ -57,9 +57,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
 )
-from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
@@ -71,7 +69,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 logger = logging.getLogger(__name__)
 
@@ -329,41 +327,6 @@ def test_marlin_moe_repack_is_transform_stage():
     assert "transform_weights" in NVFP4MarlinFusedMoEMethod.__dict__
     assert "post_load_weights" not in NVFP4MarlinFusedMoEMethod.__dict__
     assert NVFP4MarlinFusedMoEMethod.post_load_weights is FusedMoEMethodBase.post_load_weights
-
-
-def _marlin_model_config(quant_algo=QuantAlgo.NVFP4):
-    cfg = ModelConfig()
-    cfg.moe_backend = "MARLIN"
-    cfg.quant_config = QuantConfig(quant_algo=quant_algo) if quant_algo else None
-    return cfg
-
-
-def test_get_moe_cls_marlin_selects_marlin_for_nvfp4():
-    assert get_moe_cls(_marlin_model_config()) is MarlinFusedMoE
-
-
-@pytest.mark.parametrize(
-    "quant_algo",
-    [
-        pytest.param(None, id="unquantized"),
-        pytest.param(QuantAlgo.FP8, id="fp8"),
-    ],
-)
-def test_get_moe_cls_marlin_falls_back_to_cutlass_on_non_nvfp4(quant_algo):
-    """MARLIN + non-NVFP4 layers (e.g. unquantized MTP draft layers in
-    MIXED_PRECISION checkpoints) fall back to CutlassFusedMoE instead of
-    raising, matching CUTEDSL/DENSEGEMM fallback behavior."""
-    assert get_moe_cls(_marlin_model_config(quant_algo)) is CutlassFusedMoE
-
-
-def test_get_moe_cls_marlin_override_quant_config_per_layer():
-    """Per-layer override (the MTP draft-layer path): an unquantized per-layer
-    override falls back to Cutlass even though the global config is NVFP4."""
-    cfg = _marlin_model_config()
-    assert (
-        get_moe_cls(cfg, override_quant_config=QuantConfig(quant_algo=None), layer_idx=52)
-        is CutlassFusedMoE
-    )
 
 
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():

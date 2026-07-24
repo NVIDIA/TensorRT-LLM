@@ -18,7 +18,7 @@ import weakref
 from contextlib import nullcontext
 from functools import wraps
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Queue
 from typing import (Any, Callable, ContextManager, Iterable, List, Optional,
                     Tuple, Type, get_type_hints)
 
@@ -534,20 +534,12 @@ class _SyncQueue:
 
         # We can't call asyncio.run_coroutine_threadsafe(self._aq.get(), self.loop) and wait the returned Future,
         # since we are in the same event loop, and we can't yield the thread while waiting result.
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
+        deadline = None if timeout is None else time.time() + timeout
+        while deadline is None or time.time() < deadline:
             try:
                 return self._aq.unsafe_get()
             except asyncio.QueueEmpty:
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        # Match `queue.Queue.get()` semantics; a silent `None` return would be
-                        # mis-handled downstream as an unknown response type.
-                        raise Empty() from None
-                    time.sleep(min(0.01, remaining))
-                else:
-                    time.sleep(0.01)
+                time.sleep(0.01)
 
 
 def get_numa_aware_cpu_affinity(device_id):

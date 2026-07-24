@@ -32,32 +32,29 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
-                                              MetadataServerConfig, ServerRole)
+                                              MetadataServerConfig, ServerRole,
+                                              get_ctx_gen_server_addrs,
+                                              get_global_disagg_request_id)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)
 from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
-from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
-                                                   DisaggCoordinatorService)
+from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionRequest, CompletionRequest, UCompletionRequest,
-    UCompletionResponse, ensure_request_chat_template_allowed)
+    UCompletionRequest, UCompletionResponse,
+    ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds)
-from tensorrt_llm.serve.router import Router
+from tensorrt_llm.serve.router import Router, create_router
 from tensorrt_llm.version import __version__ as VERSION
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 10  # seconds.
-_LOG_CONTROL_CHARACTERS = {
-    code: f"\\x{code:02x}"
-    for code in (*range(32), 127)
-}
 
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, perf_metrics_collector: DisaggPerfMetricsCollector):
@@ -66,14 +63,10 @@ class RawRequestResponseHooks(ResponseHooks):
         self.gen_server = ""
         self.request_arrival_time = raw_req.state.server_arrival_time
         self.server_first_token_time = 0
-        self.ctx_dispatch_time = 0
         self.perf_metrics_collector = perf_metrics_collector
 
     def on_req_begin(self, request: UCompletionRequest):
         self.perf_metrics_collector.queue_latency_seconds.observe(get_steady_clock_now_in_seconds() - self.request_arrival_time)
-
-    def on_ctx_dispatch(self, request: UCompletionRequest):
-        self.ctx_dispatch_time = get_steady_clock_now_in_seconds()
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
@@ -85,19 +78,7 @@ class RawRequestResponseHooks(ResponseHooks):
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
         if request.disaggregated_params:
             ctx_req_id = request.disaggregated_params.ctx_request_id
-            task = asyncio.create_task(
-                self.perf_metrics_collector.add_per_request_metrics(
-                    self.ctx_server,
-                    gen_server,
-                    ctx_req_id,
-                    self.raw_req.state.server_arrival_time,
-                    self.server_first_token_time,
-                    self.ctx_dispatch_time,
-                )
-            )
-            background_tasks = self.perf_metrics_collector._background_tasks
-            background_tasks.add(task)
-            task.add_done_callback(background_tasks.discard)
+            asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time))
 
 
 class OpenAIDisaggServer:
@@ -106,8 +87,7 @@ class OpenAIDisaggServer:
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
                  metadata_server_cfg: Optional[MetadataServerConfig] = None,
-                 metrics_interval_secs: int = 0,
-                 coordinator_url: Optional[str] = None):
+                 metrics_interval_secs: int = 0):
         self._config = config
         self._req_timeout_secs = req_timeout_secs
         self._server_start_timeout_secs = server_start_timeout_secs
@@ -115,11 +95,11 @@ class OpenAIDisaggServer:
         self._metrics_interval_secs = metrics_interval_secs
         self._allow_request_chat_template = getattr(
             config, "allow_request_chat_template", False)
-        # When set, this is a forked worker: routing/readiness are delegated to
-        # the coordinator at coordinator_url (CoordinatorClient). Otherwise this
-        # process owns the routers + cluster state (DisaggCoordinatorService).
-        self._coordinator_url = coordinator_url
 
+        self._ctx_servers, self._gen_servers = get_ctx_gen_server_addrs(config.server_configs)
+        self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
+        self._gen_router = create_router(config.gen_router_config, self._gen_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
+        self._metadata_server = create_metadata_server(metadata_server_cfg)
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 
         self._disagg_cluster_storage = None
@@ -129,27 +109,15 @@ class OpenAIDisaggServer:
             self._disagg_cluster_storage = create_cluster_storage(
                 config.disagg_cluster_config.cluster_uri,
                 config.disagg_cluster_config.cluster_name)
-        # The server doesn't build routers -- the coordinator object does:
-        # DisaggCoordinatorService (owner) or CoordinatorClient (delegating). The
-        # server just reads .ctx_router / .gen_router off whichever it holds.
-        if self._coordinator_url:
-            self._coordinator = CoordinatorClient(
-                self._coordinator_url, self._config, metadata_server_cfg,
-                request_timeout_s=self._req_timeout_secs,
-                startup_timeout_s=self._server_start_timeout_secs)
-        else:
-            self._coordinator = DisaggCoordinatorService(
-                self._config, self._create_client,
-                metadata_config=self._metadata_server_cfg,
-                server_preparation_func=self._sync_server_clock,
-                server_start_timeout_secs=self._server_start_timeout_secs)
-        self._ctx_router = self._coordinator.ctx_router
-        self._gen_router = self._coordinator.gen_router
 
         self._service = OpenAIDisaggregatedService(
-            self._config, self._coordinator, self._create_client,
+            self._config, self._ctx_router, self._gen_router, self._create_client,
+            metadata_server=self._metadata_server,
+            metadata_config=self._metadata_server_cfg,
             req_timeout_secs=self._req_timeout_secs,
-            perf_metrics_collector=self._perf_metrics_collector)
+            server_start_timeout_secs=self._server_start_timeout_secs,
+            perf_metrics_collector=self._perf_metrics_collector,
+            disagg_cluster_storage=self._disagg_cluster_storage)
 
         try:
             otlp_cfg = config.otlp_config
@@ -164,60 +132,35 @@ class OpenAIDisaggServer:
 
         @asynccontextmanager
         async def lifespan(app) -> None:
-            # The cluster manager (via setup) owns server preparation + monitoring.
+            # Prepare servers (sync server clock) when static ctx/gen server list is used
+            await self._ctx_router.prepare_servers()
+            await self._gen_router.prepare_servers()
             await self._service.setup()
             yield
             await self._service.teardown()
-            if self._perf_metrics_collector._background_tasks:
-                await asyncio.gather(
-                    *self._perf_metrics_collector._background_tasks,
-                    return_exceptions=True,
-                )
 
         self.app = FastAPI(lifespan=lifespan)
 
         self.app.add_middleware(ServerArrivalTimeMiddleware)
 
-        # Log request-body validation failures so a client/server schema mismatch
-        # shows up server-side. Throttled (first, then every 1000th) to avoid
-        # flooding the event loop when every request fails identically.
-        self._val_err_n = 0
         @self.app.exception_handler(RequestValidationError)
-        async def validation_exception_handler(request: Request, exc):
+        async def validation_exception_handler(_, exc):
             self._perf_metrics_collector.validation_exceptions.inc()
-            self._val_err_n += 1
-            if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
-                try:
-                    errs = exc.errors()
-                    # Compact: [{loc, type, msg}] -- drops the (large) echoed input.
-                    brief = [{"loc": e.get("loc"), "type": e.get("type"),
-                              "msg": e.get("msg")} for e in errs][:8]
-                except Exception:  # noqa: BLE001
-                    brief = str(exc)[:500]
-                method = request.method.translate(_LOG_CONTROL_CHARACTERS)
-                path = request.url.path.translate(_LOG_CONTROL_CHARACTERS)
-                logger.warning(
-                    f"[validation] {method} {path} 400 "
-                    f"(n={self._val_err_n}): {brief}")
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
 
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
-        async def disagg_id_generator():
-            return await self._coordinator.get_disagg_request_id()
+        node_id = self._config.node_id
         client = OpenAIHttpClient(
             router, role, self._req_timeout_secs, max_retries,
-            disagg_id_generator=disagg_id_generator)
+            disagg_id_generator=lambda: get_global_disagg_request_id(node_id))
         self._perf_metrics_collector.add_client(client)
         return client
 
     def register_routes(self):
-        # The disagg service owns only the request-serving endpoints (/v1/*) and
-        # perf metrics. Readiness / cluster topology are the coordinator's state,
-        # so /health and /cluster_info hook straight to self._coordinator.
-        self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion, CompletionRequest), methods=["POST"])
-        self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
+        self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion), methods=["POST"])
+        self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion), methods=["POST"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -225,38 +168,8 @@ class OpenAIDisaggServer:
         # import prometheus_client lazily to break the `set_prometheus_multiproc_dir`
         from prometheus_client import make_asgi_app
         self.app.mount("/prometheus/metrics", make_asgi_app())
-        # Single-process (local coordinator): mount the in-process HTTP cluster
-        # storage routes on this app. In worker mode the coordinator is remote and
-        # owns those routes (CoordinatorClient has no cluster_storage).
-        cluster_storage = getattr(self._coordinator, "cluster_storage", None)
-        if isinstance(cluster_storage, HttpClusterStorageServer):
-            cluster_storage.add_routes(self.app)
-        elif (isinstance(self._coordinator, CoordinatorClient)
-              and isinstance(self._disagg_cluster_storage,
-                             HttpClusterStorageServer)):
-            # Keep the configured public cluster_uri valid in fleet mode while
-            # the coordinator remains the sole owner of the HTTP storage state.
-            for path, method in (("/set", "POST"), ("/get", "GET"),
-                                 ("/delete", "DELETE"), ("/expire", "GET"),
-                                 ("/get_prefix", "GET")):
-                self.app.add_api_route(path,
-                                       self._proxy_cluster_storage_request,
-                                       methods=[method])
-
-    async def _proxy_cluster_storage_request(self,
-                                             raw_req: Request) -> Response:
-        try:
-            body, status, content_type = (
-                await self._coordinator.proxy_cluster_storage_request(
-                    raw_req.method, raw_req.url.path,
-                    list(raw_req.query_params.multi_items()),
-                    await raw_req.body(), raw_req.headers.get("Content-Type")))
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            logger.warning(f"Failed to proxy cluster storage request: {e}")
-            return JSONResponse(status_code=502,
-                                content={"error": "coordinator unavailable"})
-        headers = {"Content-Type": content_type} if content_type else None
-        return Response(content=body, status_code=status, headers=headers)
+        if self._disagg_cluster_storage and isinstance(self._disagg_cluster_storage, HttpClusterStorageServer):
+            self._disagg_cluster_storage.add_routes(self.app)
 
     @staticmethod
     def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
@@ -267,12 +180,8 @@ class OpenAIDisaggServer:
         """
         resolve_request_conversation_id(req, raw_req.headers)
 
-    def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
-        # Bind the concrete request model per route so FastAPI validates against it.
-        # The bare Union UCompletionRequest (no discriminator) makes Pydantic try
-        # CompletionRequest first and 400 every chat body, so override the wrapper's
-        # annotation with request_type (as openai_server.py does).
-        async def wrapper(req: request_type, raw_req: Request) -> Response:
+    def _wrap_entry_point(self, entry_point: Callable) -> Callable:
+        async def wrapper(req: UCompletionRequest, raw_req: Request) -> Response:
             try:
                 self._perf_metrics_collector.total_requests.inc()
                 if req.stream:
@@ -311,12 +220,12 @@ class OpenAIDisaggServer:
 
 
     async def health(self) -> Response:
-        if not await self._coordinator.is_ready():
-            return Response(status_code=503)
+        if not await self._service.is_ready():
+            return Response(status_code=500)
         return Response(status_code=200)
 
     async def cluster_info(self) -> JSONResponse:
-        return JSONResponse(content=await self._coordinator.cluster_info())
+        return JSONResponse(content=await self._service.cluster_info())
 
     async def version(self) -> JSONResponse:
         return JSONResponse(content={"version": VERSION})

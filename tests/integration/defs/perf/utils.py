@@ -424,17 +424,6 @@ class PerfServeScriptTestCmds:
             self._server_log_file.close()
             self._server_log_file = None
 
-    def get_server_log_content(self) -> str:
-        """Read back the server's captured stdout/stderr so far (e.g. to parse startup info like KV cache size)."""
-        if not self._server_log_path or not os.path.exists(
-                self._server_log_path):
-            return ""
-        with open(self._server_log_path,
-                  'r',
-                  encoding='utf-8',
-                  errors='replace') as f:
-            return f.read()
-
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
         if cmd_idx <= len(self.data_cmds) - 1:
@@ -458,9 +447,6 @@ class PerfServeScriptTestCmds:
                         f.write(output)
         elif cmd_idx == len(self.data_cmds):
             self.start_server()
-            # Return the startup log (e.g. KV cache size) so it can be regex-parsed,
-            # instead of an empty string.
-            output = self.get_server_log_content()
         else:
             client_cmd = self.client_cmds[cmd_idx - 1 - len(self.data_cmds)]
             client_cmd_with_port = client_cmd + [

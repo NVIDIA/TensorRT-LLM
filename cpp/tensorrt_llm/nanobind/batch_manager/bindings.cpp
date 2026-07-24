@@ -24,7 +24,6 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -174,8 +173,6 @@ void initBindings(nb::module_& m)
             nb::arg("kv_tokens_per_block"))
         .def_prop_rw(
             "estimated_reusable_tokens", &GenLlmReq::getEstimatedReusableTokens, &GenLlmReq::setEstimatedReusableTokens)
-        .def_prop_rw(
-            "expect_snapshot_points", &GenLlmReq::getExpectedSnapshotPoints, &GenLlmReq::setExpectedSnapshotPoints)
         .def_prop_rw("guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_prop_rw("context_phase_params", &GenLlmReq::getContextPhaseParams, &GenLlmReq::setContextPhaseParams)
         .def_prop_ro("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
@@ -196,8 +193,6 @@ void initBindings(nb::module_& m)
         .def_prop_ro("kv_cache_transfer_time_ms", &GenLlmReq::getKvCacheTransferTimeMS)
         .def_prop_ro("kv_cache_transfer_start", &GenLlmReq::getKvCacheTransferStart)
         .def_prop_ro("kv_cache_transfer_end", &GenLlmReq::getKvCacheTransferEnd)
-        .def("get_kv_cache_transfer_start", &GenLlmReq::getKvCacheTransferStart)
-        .def("get_kv_cache_transfer_end", &GenLlmReq::getKvCacheTransferEnd)
         .def_prop_ro("kv_cache_size", &GenLlmReq::getKvCacheSize)
         .def("set_kv_cache_transfer_start", &GenLlmReq::setKvCacheTransferStart, nb::arg("time"))
         .def("set_kv_cache_transfer_end", &GenLlmReq::setKvCacheTransferEnd, nb::arg("time"))
@@ -481,11 +476,7 @@ void initBindings(nb::module_& m)
         .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
         .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, nb::arg("iter_counter"))
         .def("remove_lora_tensors", &tb::LlmRequest::removeLoraTensors)
-        // Bind to the single storage owned by libtensorrt_llm.so (reached through
-        // globalSteadyClockOffset()) instead of an inline-static member, so the
-        // offset is shared with the native library rather than living in this
-        // module's separate copy.
-        .def_rw_static("global_steady_clock_offset", &tb::globalSteadyClockOffset());
+        .def_rw_static("global_steady_clock_offset", &tb::LlmRequest::sGlobalSteadyClockOffset);
 
     nb::class_<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(nb::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), nb::arg("max_num_slots"),
@@ -500,7 +491,7 @@ void initBindings(nb::module_& m)
             nb::arg("max_num_sequences"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
             nb::call_guard<nb::gil_scoped_release>())
         .def(nb::init<tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32,
-                 tr::WorldConfig const&, int64_t, tensorrt_llm::DataType, tensorrt_llm::DataType,
+                 tr::WorldConfig const&, int64_t, nvinfer1::DataType, nvinfer1::DataType,
                  std::vector<tr::SizeType32> const&, tr::SizeType32>(),
             nb::arg("d_state"), nb::arg("d_conv"), nb::arg("num_heads"), nb::arg("n_groups"), nb::arg("head_dim"),
             nb::arg("max_batch_size"), nb::arg("world_config"), nb::arg("stream"), nb::arg("dtype"),

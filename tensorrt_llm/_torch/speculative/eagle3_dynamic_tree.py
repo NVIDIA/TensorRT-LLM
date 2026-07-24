@@ -375,7 +375,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 )
 
     @nvtx_range("eagle3_dyn.forward")
-    def _forward_impl(
+    def forward(
         self,
         input_ids,
         position_ids,
@@ -387,11 +387,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         resource_manager=None,
     ):
         """Override to add accepted_draft_tokens_indices to output."""
-        # Initialize spec_tree_manager before super()._forward_impl() which calls
+        # Initialize spec_tree_manager before super().forward() which calls
         # _forward_draft_loop needing spec_tree_manager.
         if resource_manager is not None:
             self._ensure_spec_tree_manager(resource_manager)
-        output = super()._forward_impl(
+        output = super().forward(
             input_ids,
             position_ids,
             hidden_states,
@@ -585,6 +585,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     ):
         """Dynamic tree draft loop with growing context."""
         spec_tree_manager = self.spec_tree_manager
+        self._d2t = getattr(draft_model.model, "d2t", None)
 
         assert batch_size <= self._max_batch_size, (
             f"batch_size {batch_size} exceeds pre-allocated max_batch_size {self._max_batch_size}"
@@ -635,7 +636,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
             )
 
-            new_draft_tokens, new_draft_scores = self.sample(logits, self.K)
+            new_draft_tokens, new_draft_scores = self.sample(
+                logits, self.K, draft_model=draft_model
+            )
 
             previous_draft_scores = self.update_draft_tokens_and_scores(
                 cur_draft_idx=0,
@@ -695,7 +698,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     selected_hs, draft_model.lm_head, attn_metadata, True
                 )
 
-                new_draft_tokens, new_draft_scores = self.sample(logits, self.K)
+                new_draft_tokens, new_draft_scores = self.sample(
+                    logits, self.K, draft_model=draft_model
+                )
 
                 # Reshape for update: [batch_size, K, K]
                 new_draft_tokens = new_draft_tokens.reshape(batch_size, self.K, self.K)
@@ -1010,12 +1015,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         ).to(torch.int32)
 
     @nvtx_range("eagle3_dyn.sample")
-    def sample(self, logits: torch.Tensor, max_top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def sample(
+        self, logits: torch.Tensor, max_top_k: int, draft_model=None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """TopK sampling with softmax for dynamic tree."""
         topk_indices, topk_values = _sample_softmax_topk(logits, max_top_k)
-        # Apply draft-to-target vocab mapping when draft/target vocabs differ.
-        if self._d2t is not None:
-            d2t = self._d2t.data
+        # Apply draft-to-target vocab mapping if the draft model has it
+        if draft_model is not None and hasattr(draft_model.model, "d2t"):
+            d2t = draft_model.model.d2t.data
             topk_indices = topk_indices + d2t[topk_indices]
         return topk_indices, topk_values
 

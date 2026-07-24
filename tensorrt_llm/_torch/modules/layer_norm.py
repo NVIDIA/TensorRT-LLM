@@ -34,9 +34,6 @@ class LayerNorm(nn.Module):
         device: Optional device for parameters.
         has_weights: Whether to include learnable weight parameters.
         has_bias: Whether to include learnable bias parameters.
-        residual_in_fp32: Whether to accumulate the residual in FP32 before
-            normalization. If false, preserve the input dtype for the residual
-            addition and convert the result to FP32 for normalization.
     """
 
     def __init__(
@@ -48,7 +45,6 @@ class LayerNorm(nn.Module):
         device: Optional[torch.device] = None,
         has_weights: bool = True,
         has_bias: bool = True,
-        residual_in_fp32: bool = True,
     ):
         super().__init__()
         if has_weights:
@@ -70,7 +66,6 @@ class LayerNorm(nn.Module):
                                              device=device),
                                  persistent=False)
         self.variance_epsilon = eps
-        self.residual_in_fp32 = residual_in_fp32
 
     @maybe_compile(dynamic=True)
     def forward(
@@ -89,15 +84,10 @@ class LayerNorm(nn.Module):
         """
 
         input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
         if isinstance(residual, torch.Tensor):
-            if self.residual_in_fp32:
-                hidden_states = hidden_states.to(torch.float32) + residual.to(
-                    torch.float32)
-            else:
-                hidden_states = (hidden_states + residual).to(torch.float32)
+            hidden_states = hidden_states + residual.to(torch.float32)
             residual = hidden_states.to(input_dtype)
-        else:
-            hidden_states = hidden_states.to(torch.float32)
 
         hidden_states = nn.functional.layer_norm(
             hidden_states,

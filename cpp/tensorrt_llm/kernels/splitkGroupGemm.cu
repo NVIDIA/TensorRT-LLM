@@ -26,7 +26,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/device/splitk_gemm_grouped.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/default_splitk_gemm_grouped.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/splitk_gemm_grouped.h"
@@ -204,20 +203,20 @@ template <int M1, int N1, int K1, int M2, int N2, int K2, int kAlignmentAB, int 
 void splitkGroupedGemmType_(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkSpaceSize,
-    tensorrt_llm::DataType dataType, int splitKSlices, cudaStream_t stream)
+    nvinfer1::DataType dataType, int splitKSlices, cudaStream_t stream)
 {
-    if (dataType == tensorrt_llm::DataType::kHALF)
+    if (dataType == nvinfer1::DataType::kHALF)
     {
         splitkGroupedGemm_<M1, N1, K1, M2, N2, K2, cutlass::half_t, kAlignmentAB, kAlignmentC, kStages>(problemSizes,
             ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkSpaceSize,
             splitKSlices, stream);
     }
-    else if (dataType == tensorrt_llm::DataType::kFLOAT)
+    else if (dataType == nvinfer1::DataType::kFLOAT)
     {
         TLLM_CHECK_WITH_INFO(false, "not support float input/output");
     }
 #ifdef ENABLE_BF16
-    else if (dataType == tensorrt_llm::DataType::kBF16)
+    else if (dataType == nvinfer1::DataType::kBF16)
     {
         splitkGroupedGemm_<M1, N1, K1, M2, N2, K2, cutlass::bfloat16_t, kAlignmentAB, kAlignmentC, kStages>(
             problemSizes, ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace,
@@ -229,7 +228,7 @@ void splitkGroupedGemmType_(std::vector<cutlass::gemm::GemmCoord> const& problem
 void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkSpaceSize,
-    bool isLoraIn, tensorrt_llm::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream)
+    bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start, isLoraIn: %d, minKN = %d", __PRETTY_FUNCTION__, static_cast<int>(isLoraIn), minKN);
     if (isLoraIn)

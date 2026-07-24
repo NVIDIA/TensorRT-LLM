@@ -60,10 +60,6 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
-      num_serve_frontends:
-        annotation: int
-        default: 1
-        status: prototype
       custom_tokenizer:
         annotation: Optional[str]
         default: null
@@ -441,10 +437,6 @@ methods:
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
     status: beta
-  get_data_transceiver_state:
-    parameters: {}
-    return_annotation: bytes
-    status: prototype
   shutdown:
     parameters: {}
     return_annotation: None

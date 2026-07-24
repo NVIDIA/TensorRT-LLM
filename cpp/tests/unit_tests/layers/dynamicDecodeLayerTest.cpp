@@ -15,7 +15,6 @@
  */
 
 #include "tests/unit_tests/layers/dynamicDecodeLayerTest.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include <algorithm>
@@ -151,43 +150,43 @@ void DynamicDecodeLayerTest<T>::allocateData(TestSamplingParams const& params, T
     mRuntimeLogitsHost
         = BufferManager::pinned(ITensor::makeShape({mBatchSize, mBeamWidth, mVocabSizePadded}), dataType);
 
-    mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
-    mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+    mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+    mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
     mFinishedDevice = mBufferManager->gpu(
         ITensor::makeShape({mMaxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
-    mFinishedSumDevice = BufferManager::pinned(ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
-    mOutputIdsDevice = mBufferManager->gpu(
-        ITensor::makeShape({mMaxBatchSize, mBeamWidth, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
+    mFinishedSumDevice = BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
+    mOutputIdsDevice
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
     mNewTokens
-        = BufferManager::pinned(ITensor::makeShape({mMaxTokensPerStep, mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
-    mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({mMaxTokensPerStep, mMaxBatchSize}), nvinfer1::DataType::kINT32);
+    mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
 
     mEmbeddingBiasHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, mVocabSizePadded}), dataType);
     mEmbeddingBiasDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mVocabSizePadded}), dataType);
 
     mRefLogProbsHost
-        = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), tensorrt_llm::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kFLOAT);
     mOutputLogProbsDevice
-        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), tensorrt_llm::DataType::kFLOAT);
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kFLOAT);
     mOutputLogProbsTiledDevice
-        = mBufferManager->gpu(ITensor::makeShape({mMaxSeqLen, mMaxBatchSize}), tensorrt_llm::DataType::kFLOAT);
+        = mBufferManager->gpu(ITensor::makeShape({mMaxSeqLen, mMaxBatchSize}), nvinfer1::DataType::kFLOAT);
 
-    mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kFLOAT);
+    mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kFLOAT);
 
     mMaxBadWordsLen = getMaxWordsLen(params.badWords);
     mMaxStopWordsLen = getMaxWordsLen(params.stopWords);
 
-    mBadWords = BufferManager::pinned(
-        ITensor::makeShape({mMaxBatchSize, 2, mMaxBadWordsLen}), tensorrt_llm::DataType::kINT32);
-    mBadWordsLens = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
-    mBadWordsPtrs = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT64);
+    mBadWords
+        = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, 2, mMaxBadWordsLen}), nvinfer1::DataType::kINT32);
+    mBadWordsLens = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+    mBadWordsPtrs = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT64);
 
-    mStopWords = BufferManager::pinned(
-        ITensor::makeShape({mMaxBatchSize, 2, mMaxStopWordsLen}), tensorrt_llm::DataType::kINT32);
-    mStopWordsLens = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
-    mStopWordsPtrs = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT64);
+    mStopWords
+        = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, 2, mMaxStopWordsLen}), nvinfer1::DataType::kINT32);
+    mStopWordsLens = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+    mStopWordsPtrs = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT64);
 
-    mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), tensorrt_llm::DataType::kINT32);
+    mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
 
     if (mDecodingMode.isMedusa())
     {
@@ -205,19 +204,19 @@ void DynamicDecodeLayerTest<T>::allocateMedusaData(TestSamplingParams const& par
     auto const dataType = TRTDataType<T>::value;
     mMaxMedusaHeads = params.maxNumMedusaHeads.value();
     mPathsDevice = mBufferManager->gpu(
-        ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep, mMaxMedusaHeads + 1}), tensorrt_llm::DataType::kINT32);
-    mAcceptedLengths = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep, mMaxMedusaHeads + 1}), nvinfer1::DataType::kINT32);
+    mAcceptedLengths = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
     mMedusaLogitsDevice = BufferManager::pinned(
         ITensor::makeShape({mMaxMedusaHeads, mMaxBatchSize, mMaxTokensPerStep, mVocabSizePadded}), dataType);
-    mNextDraftTokensDevice = mBufferManager->gpu(
-        ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep - 1}), tensorrt_llm::DataType::kINT32);
-    mTokensPerStepDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
-    mTreeIdsDevice = mBufferManager->gpu(
-        ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep - 1}), tensorrt_llm::DataType::kINT32);
+    mNextDraftTokensDevice
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep - 1}), nvinfer1::DataType::kINT32);
+    mTokensPerStepDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+    mTreeIdsDevice
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep - 1}), nvinfer1::DataType::kINT32);
     mAcceptedLengthCumSumDevice
-        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize + 1}), tensorrt_llm::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize + 1}), nvinfer1::DataType::kINT32);
     mPackedPathsDevice
-        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize * mMaxMedusaHeads}), tensorrt_llm::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize * mMaxMedusaHeads}), nvinfer1::DataType::kINT32);
 }
 
 template <typename T>
@@ -605,7 +604,7 @@ template <typename T>
 void DynamicDecodeLayerTest<T>::batchCopy(SizeType32 step)
 {
     auto const logitsHost = ITensor::wrap(mTestLogitsInit.data() + step * mVocabSizePadded,
-        std::is_same_v<T, float> ? tensorrt_llm::DataType::kFLOAT : tensorrt_llm::DataType::kHALF,
+        std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF,
         ITensor::makeShape({mMaxTokensPerStep, mVocabSizePadded}));
     for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
     {

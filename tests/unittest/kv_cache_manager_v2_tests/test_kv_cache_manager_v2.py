@@ -46,7 +46,6 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
-        PlannedDropHandle,
         ReuseScope,
         SsmLayerConfig,
         SwaScratchReuseConfig,
@@ -100,7 +99,6 @@ else:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
-        PlannedDropHandle,
         ReuseScope,
         SsmLayerConfig,
         SwaScratchReuseConfig,
@@ -696,46 +694,6 @@ class TestNoBatching(TestKVCacheManagerV2):
         kv2 = self.manager.create_kv_cache(input_tokens=prompt)
         self.assertEqual(kv2.num_committed_tokens, len(prompt))
         kv2.close()
-
-    def test_planned_drop_handle(self) -> None:
-        window_size = 8
-        self.prepare(16 << 20, 0, 0, 2, window_size, 0, tokens_per_block=8)
-        long_tokens = [self.next_token() for _ in range(24)]
-        short_tokens = long_tokens[:8]
-
-        def plan_drop(tokens: list[TokenIdExt]) -> PlannedDropHandle:
-            kv_cache = self.manager.create_kv_cache(None, tokens)
-            with TemporaryCudaStream([]) as stream_holder:
-                stream = cast(CudaStream, stream_holder.handle)
-                self.assertTrue(kv_cache.resume(stream))
-                self.assertTrue(kv_cache.resize(len(tokens)))
-                uncommitted = tokens[kv_cache.num_committed_tokens :]
-                if uncommitted:
-                    kv_cache.commit(uncommitted)
-                kv_cache.stop_committing()
-                drop_handle = kv_cache.plan_committed_block_drop()
-                self.assertIsNotNone(drop_handle)
-                self.assertIsInstance(drop_handle, PlannedDropHandle)
-            _ = stream_holder.take_finish_event()
-            kv_cache.close()
-            assert drop_handle is not None
-            return drop_handle
-
-        long_handle = plan_drop(long_tokens)
-        short_handle = plan_drop(short_tokens)
-        self.assertEqual(self.manager.probe_reuse(None, short_tokens), len(short_tokens))
-
-        short_handle.drop()
-        self.assertEqual(self.manager.probe_reuse(None, short_tokens), 0)
-        self.assertEqual(self.manager.probe_reuse(None, long_tokens), len(long_tokens))
-
-        long_handle.drop()
-        # The SWA window is dropped, while older full-attention blocks remain reusable.
-        self.assertEqual(
-            self.manager.probe_reuse(None, long_tokens), len(long_tokens) - window_size
-        )
-        with self.assertRaisesRegex(ValueError, "already been dropped"):
-            long_handle.drop()
 
     def test_reuse_scope_isolates_reuse(self) -> None:
         self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=8)
@@ -2484,31 +2442,6 @@ class TestInitRatioConfig(unittest.TestCase):
         self.assertAlmostEqual(sum(ratio_constrained), 1.0, places=6)
         mgr_unconstrained.shutdown()
         mgr_constrained.shutdown()
-
-    def test_constraint_reserves_resume_headroom(self):
-        """A full constraint batch must stay below the resume utilization gate."""
-        num_requests = 32
-        constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=1, history_length=0)] * num_requests)
-        granularity = 2 << 20
-        gpu_quota = round_up(num_requests * self.PG0_SLOT_SIZE, granularity) + round_up(
-            num_requests * self.PG1_SLOT_SIZE, granularity
-        )
-        cfg = self._make_config(gpu_quota=gpu_quota, constraints=[constraint])
-        cfg.max_util_for_resume = 0.95
-        manager = KVCacheManager(cfg)
-        stream_holder = CachedCudaStream()
-        stream = cast(CudaStream, stream_holder.handle)
-
-        kv_caches = []
-        for _ in range(num_requests):
-            kv_cache = manager.create_kv_cache()
-            self.assertTrue(kv_cache.resume(stream))
-            kv_cache.capacity = 1
-            kv_caches.append(kv_cache)
-
-        for kv_cache in kv_caches:
-            kv_cache.close()
-        manager.shutdown()
 
     def test_initial_pool_ratio_overrides_typical_step_and_constraints(self):
         """Explicit initial_pool_ratio takes precedence over inferred sizing inputs."""

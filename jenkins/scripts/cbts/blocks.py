@@ -437,6 +437,7 @@ def _classify_map_var(var_name: str) -> Optional[str]:
 # jenkins/L0_Test.groovy (line ~2079). IMPORTANT: keep this list in sync.
 _BACKEND_PATTERNS = [
     ("-PyTorch-", "pytorch"),
+    ("-TensorRT-", "tensorrt"),
     ("-CPP-", "cpp"),
     ("-Triton-", "triton"),
     ("-FMHA-", "fmha"),

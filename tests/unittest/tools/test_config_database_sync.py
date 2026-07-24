@@ -22,7 +22,6 @@ import unittest
 from pathlib import Path
 
 import pytest
-import yaml
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent.resolve()
 EXPECTED_MODEL_METADATA = {
@@ -59,7 +58,6 @@ _db_module = importlib.util.module_from_spec(_db_spec)
 sys.modules[_db_spec.name] = _db_module
 _db_spec.loader.exec_module(_db_module)
 generate_tests = _db_module.generate_tests
-generate_server_name = _db_module.generate_server_name
 TEST_LIST_PATH = _db_module.TEST_LIST_PATH
 PERF_SANITY_DIR = _db_module.PERF_SANITY_DIR
 
@@ -87,9 +85,6 @@ class TestConfigDatabaseSync(unittest.TestCase):
                 int(r.osl),
                 int(r.concurrency),
                 r.config_path,
-                r.profile,
-                r.validated_trtllm_commit,
-                r.validated_trtllm_version,
             )
             for r in recipes
         }
@@ -131,9 +126,6 @@ class TestConfigDatabaseSync(unittest.TestCase):
                 int(e.get("osl")),
                 int(e.get("concurrency")),
                 e.get("config_path"),
-                e.get("profile"),
-                e.get("validated_trtllm_commit"),
-                e.get("validated_trtllm_version"),
             )
             self.assertIn(
                 key,
@@ -159,104 +151,6 @@ class TestConfigDatabaseSync(unittest.TestCase):
             expected_keys,
             "Generated config_db.json is missing entries from lookup.yaml.",
         )
-
-    def test_profile_and_validated_commit_metadata(self) -> None:
-        commit = "93CB6518B6D6DBD6095748189E626DB731F44545"
-        version = "1.3.0rc14"
-        recipes = []
-        for profile in ("latency", "balanced", "throughput"):
-            recipes.append(
-                {
-                    "model": "example/model",
-                    "arch": "ExampleForCausalLM",
-                    "gpu": "B200_NVL",
-                    "num_gpus": 8,
-                    "isl": 1024,
-                    "osl": 1024,
-                    "concurrency": 256,
-                    "config_path": f"examples/configs/database/example_{profile}.yaml",
-                    "profile": profile,
-                    "validated_trtllm_commit": commit,
-                    "validated_trtllm_version": version,
-                }
-            )
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            yaml_path = Path(tmp_dir) / "lookup.yaml"
-            output_path = Path(tmp_dir) / "config_db.json"
-            yaml_path.write_text(yaml.safe_dump(recipes), encoding="utf-8")
-            generate_json(yaml_path, output_path)
-            payload = json.loads(output_path.read_text(encoding="utf-8"))
-
-        self.assertEqual(
-            [entry["profile"] for entry in payload["entries"]],
-            ["latency", "balanced", "throughput"],
-        )
-        self.assertEqual(
-            {entry["performance_profile"] for entry in payload["entries"]},
-            {"Min Latency", "Balanced", "Max Throughput"},
-        )
-        self.assertTrue(
-            all(entry["validated_trtllm_commit"] == commit.lower() for entry in payload["entries"])
-        )
-        self.assertTrue(
-            all(entry["validated_trtllm_version"] == version for entry in payload["entries"])
-        )
-
-        parsed = RecipeList.model_validate(recipes)
-        server_names = [generate_server_name(recipe) for recipe in parsed]
-        self.assertEqual(len(server_names), len(set(server_names)))
-        self.assertTrue(server_names[0].endswith("_latency"))
-
-    def test_recipe_metadata_validation(self) -> None:
-        base = {
-            "model": "example/model",
-            "arch": "ExampleForCausalLM",
-            "gpu": "B200_NVL",
-            "num_gpus": 8,
-            "isl": 1024,
-            "osl": 1024,
-            "concurrency": 256,
-            "config_path": "examples/configs/database/example.yaml",
-        }
-
-        with self.assertRaisesRegex(ValueError, "full 40-character Git SHA"):
-            RecipeList.model_validate(
-                [
-                    {
-                        **base,
-                        "validated_trtllm_commit": "deadbeef",
-                        "validated_trtllm_version": "1.3.0rc14",
-                    }
-                ]
-            )
-
-        with self.assertRaisesRegex(ValueError, "must be provided together"):
-            RecipeList.model_validate([{**base, "validated_trtllm_commit": "a" * 40}])
-
-        with self.assertRaisesRegex(ValueError, "profile is only allowed"):
-            RecipeList.model_validate([{**base, "profile": "balanced"}])
-
-        endpoint_conflict = [
-            {**base, "config_path": "latency.yaml", "profile": "latency"},
-            {**base, "config_path": "throughput.yaml", "profile": "throughput"},
-        ]
-        parsed = RecipeList.model_validate(endpoint_conflict)
-        self.assertEqual([recipe.profile for recipe in parsed], ["latency", "throughput"])
-
-        missing_endpoint = [
-            {**base, "config_path": "latency.yaml", "profile": "latency"},
-            {**base, "config_path": "balanced.yaml", "profile": "balanced"},
-        ]
-        with self.assertRaisesRegex(ValueError, "exactly one latency and throughput"):
-            RecipeList.model_validate(missing_endpoint)
-
-        duplicate_profile = [
-            {**base, "config_path": "latency-a.yaml", "profile": "latency"},
-            {**base, "config_path": "latency-b.yaml", "profile": "latency"},
-        ]
-        with self.assertRaisesRegex(ValueError, "exactly one latency and throughput"):
-            RecipeList.model_validate(duplicate_profile)
 
     @pytest.mark.skip(reason="https://nvbugs/6337224")
     def test_config_database_tests_sync(self):

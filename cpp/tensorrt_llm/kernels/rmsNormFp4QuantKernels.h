@@ -17,8 +17,8 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/quantization.h"
+#include <NvInferRuntime.h>
 #include <cstdint>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -80,7 +80,7 @@ struct RmsNormFp4QuantParams
 // fp4_quantize) pair becomes one launch on the attention-DP path. All inputs,
 // outputs, and layout configuration are carried in params (see the struct
 // field docs above); dataType selects the fp16/bf16 instantiation.
-void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, tensorrt_llm::DataType dataType, cudaStream_t stream);
+void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, nvinfer1::DataType dataType, cudaStream_t stream);
 
 } // namespace kernels
 

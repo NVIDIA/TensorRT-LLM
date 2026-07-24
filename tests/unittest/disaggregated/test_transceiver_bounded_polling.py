@@ -20,8 +20,6 @@ from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import Mock
 
-import pytest
-
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.transfer import TaskStatus, TxSession
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -269,48 +267,6 @@ def test_consensus_outcome_uses_single_batched_allgather() -> None:
     assert new_cancelled == [1]  # union of cancelled across ranks
     assert new_failed == [2, 99]  # union of failed across ranks
     assert new_completed == [7]  # intersection only (8 is completed on the peer only)
-
-
-@pytest.mark.skip(
-    reason="ctx idle fast-path was dropped from this branch. TODO: when the "
-    "fast-path is reintroduced, its terminal-count reduction must mirror "
-    "_ctx_consensus()'s communicator scope (TP group, then PP group; TP "
-    "skipped under attention DP) — a WORLD-scoped allreduce hangs under "
-    "ADP+PP because independent attention-DP lanes poll on their own "
-    "schedules. Re-enable this test and add scoped mock coverage for the "
-    "TP+PP and ADP+PP configurations plus real-collective MP tests."
-)
-def test_ctx_consensus_fastpath_skips_when_idle(monkeypatch) -> None:
-    # With the fast-path enabled, an all-zero terminal count (one fixed-size
-    # allreduce) makes every rank skip the variable-length consensus; a non-zero
-    # count falls through to the normal consensus path.
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.disaggregation.transceiver._CTX_CONSENSUS_FASTPATH", True
-    )
-    transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._ever_had_send_session = True
-    transceiver._ctx_need_tp_sync = True
-    transceiver._ctx_need_pp_sync = False
-    transceiver._send_sessions = {}
-    transceiver._send_reqs = {}
-    transceiver._dist = Mock()
-    transceiver._dist.allreduce = Mock(return_value=0)
-    transceiver._ctx_consensus = Mock(return_value=[])
-    transceiver._build_to_process = Mock(return_value=[])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
-    transceiver._transfer_worker = _FakeTransferWorker()
-    transceiver._close_failed_sessions = Mock()
-
-    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
-
-    assert completed == [] and failed == []
-    transceiver._dist.allreduce.assert_called_once()
-    transceiver._ctx_consensus.assert_not_called()  # idle fast-path skipped the consensus
-
-    # Non-zero global terminal count => fast-path does not skip; consensus runs.
-    transceiver._dist.allreduce = Mock(return_value=2)
-    transceiver.check_context_transfer_status(at_least_request_num=0)
-    transceiver._ctx_consensus.assert_called_once()
 
 
 def test_tx_session_wait_complete_defaults_to_blocking() -> None:

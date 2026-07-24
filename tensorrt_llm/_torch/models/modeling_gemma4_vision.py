@@ -629,11 +629,11 @@ class Gemma4VisionPatchEmbedder(nn.Module):
         self, pixel_position_ids: torch.Tensor, padding_positions: torch.Tensor
     ) -> torch.Tensor:
         clamped = pixel_position_ids.clamp(min=0)
-        position_embeddings = (
-            self.position_embedding_table[0, clamped[..., 0]]
-            + self.position_embedding_table[1, clamped[..., 1]]
-        )
-        return position_embeddings.masked_fill(padding_positions.unsqueeze(-1), 0.0)
+        one_hot = F.one_hot(clamped, num_classes=self.position_embedding_size)
+        one_hot = one_hot.permute(0, 2, 1, 3).to(self.position_embedding_table)
+        position_embeddings = one_hot @ self.position_embedding_table
+        position_embeddings = position_embeddings.sum(dim=1)
+        return torch.where(padding_positions.unsqueeze(-1), 0.0, position_embeddings)
 
     def forward(
         self,

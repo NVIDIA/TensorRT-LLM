@@ -1247,62 +1247,6 @@ class TestConversationAwareADPRouter:
         router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
         assert isinstance(router, ConversationAwareADPRouter)
         assert router._max_sessions == 8
-        # A mocked (non-string) placement value must fall back to round_robin.
-        assert router._new_conv_placement == "round_robin"
-
-    @staticmethod
-    def _lq_router(tp_size=4):
-        return ConversationAwareADPRouter(
-            dist=_mock_dist(tp_size=tp_size), new_conv_placement="least_queued"
-        )
-
-    def test_least_queued_places_new_conversation_on_least_loaded_rank(self):
-        router = self._lq_router()
-        pos = self._route(
-            router, self._states(4, active=[5, 1, 3, 4]), [_make_conv_request_item(1, "A")]
-        )
-        assert pos[1] == 1
-        assert router._conv_to_rank["A"] == 1
-
-    def test_least_queued_fills_valleys_within_one_batch(self):
-        """The shared count accumulator spreads a burst valley-first:
-        [3, 0, 2, 3] + 4 new conversations ends level at [3, 3, 3, 3]."""
-        items = [_make_conv_request_item(i, f"c{i}") for i in range(4)]
-        pos = self._route(self._lq_router(), self._states(4, active=[3, 0, 2, 3]), items)
-        placed = [sum(1 for v in pos.values() if v == r) for r in range(4)]
-        assert placed == [0, 3, 1, 0]
-
-    def test_least_queued_sticky_returns_unaffected(self):
-        """A later turn returns to its pinned rank even when it is the busiest."""
-        router = self._lq_router()
-        home = self._route(
-            router, self._states(4, active=[2, 0, 1, 1]), [_make_conv_request_item(1, "A")]
-        )[1]
-        assert home == 1
-        pos = self._route(
-            router, self._states(4, active=[0, 9, 0, 0]), [_make_conv_request_item(2, "A")], cap=100
-        )
-        assert pos[2] == home
-
-    def test_least_queued_routing_is_deterministic_across_ranks(self):
-        convs = ["A", "B", None, "A", "C", None, "B"]
-
-        def run():
-            items = [_make_conv_request_item(i, convs[i]) for i in range(len(convs))]
-            return self._route(self._lq_router(), self._states(4, active=[2, 5, 0, 1]), items)
-
-        assert run() == run()
-
-    def test_new_conv_placement_config(self):
-        """Factory forwards the knob; unknown values fall back to round_robin."""
-        cfg = MagicMock()
-        cfg.kv_cache_routing_conversation_affinity = True
-        cfg.kv_cache_routing_max_sessions = 8
-        cfg.kv_cache_routing_new_conv_placement = "least_queued"
-        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
-        assert router._new_conv_placement == "least_queued"
-        bad = ConversationAwareADPRouter(dist=_mock_dist(tp_size=4), new_conv_placement="banana")
-        assert bad._new_conv_placement == "round_robin"
 
     def test_factory_default_when_disabled(self):
         cfg = MagicMock()

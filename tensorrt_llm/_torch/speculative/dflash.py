@@ -102,10 +102,10 @@ class DFlashSpecMetadata(SpecMetadata):
                     worker._ctx_len[slot] = 0
                     worker._free_slots.append(slot)
 
-            # Route unknown request IDs (cuda graph padding or warmup dummies)
-            # to dummy slot to avoid corrupting real request's context
+            # Default to slot 0 for unknown request IDs (e.g. during warmup
+            # where synthetic requests may not have assigned slots).
             mapping = torch.tensor(
-                [worker._req_to_slot.get(rid, worker._dummy_slot) for rid in self.request_ids],
+                [worker._req_to_slot.get(rid, 0) for rid in self.request_ids],
                 dtype=torch.long,
                 device="cpu",
                 pin_memory=prefer_pinned(),
@@ -172,25 +172,14 @@ class DFlashWorker(SpecWorkerBase):
         # graph compatible.
         self._ctx_buf_inited = False
         self._ctx_len = None
-        # Snapshot for rolling back in-place _ctx_len updates when a forward
-        # fails (or after warmup). See _ensure_spec_dec_state_restored.
-        self._saved_ctx_len = None
-        self._ctx_len_restore_pending = False
-        # Deferred kv_lens_cuda rewind state (see _prepare_kv_for_draft_forward,
-        # _apply_kv_rewind_after_draft, _ensure_spec_dec_state_restored).
-        self._kv_rewind_pending = False
-        self._kv_rewind_amount = None
-        self._kv_rewind_nc = None
-        self._kv_rewind_bs = None
         self._batch_to_slot = None
         self._max_ctx = 0
-        self._ctx_k_buf = None  # [max_batch+1, L, max_ctx+block, nkv, hd]
+        self._ctx_k_buf = None  # [max_batch, L, max_ctx+block, nkv, hd]
         self._ctx_v_buf = None
 
         # Slot management (Python, updated in prepare() and eager mode)
         self._req_to_slot = {}  # request_id -> slot index
         self._free_slots = deque()  # available slot indices
-        self._dummy_slot = None  # for cudagraph padding or warmup dummy requests
 
         logger.info(
             f"DFlashWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
@@ -232,13 +221,7 @@ class DFlashWorker(SpecWorkerBase):
 
         dtype = draft_model.fc.weight.dtype if hasattr(draft_model, "fc") else torch.bfloat16
 
-        # Reserve slot index max_batch as a scratch slot for padding/unknown
-        # dummies; real requests only draw slots 0..max_batch-1, so dummy
-        # writes land here and can't corrupt a real request's context.
-        self._dummy_slot = max_batch
-        num_slots = max_batch + 1
-
-        self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+        self._ctx_len = torch.zeros(max_batch, dtype=torch.long, device="cuda")
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
         self._free_slots = deque(range(max_batch))
@@ -257,7 +240,7 @@ class DFlashWorker(SpecWorkerBase):
         L = draft_model._num_attn_layers
         nkv = draft_model._num_kv_heads
         hd = draft_model._head_dim
-        kv_shape = (num_slots, L, self._max_ctx + self._resolved_block_size, nkv, hd)
+        kv_shape = (max_batch, L, self._max_ctx + self._resolved_block_size, nkv, hd)
         self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
         self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
         self._ctx_buf_inited = True
@@ -291,20 +274,16 @@ class DFlashWorker(SpecWorkerBase):
 
             if batch_size > num_contexts:
                 attn_metadata.kv_lens_cuda[num_contexts:batch_size] += 1
-            self._kv_rewind_pending = True
 
             attn_metadata.update_for_spec_dec()
 
     def _apply_kv_rewind_after_draft(self, attn_metadata, spec_metadata):
         """Apply the deferred kv_lens rewind after the draft forward."""
-        self._kv_rewind_pending = False
         is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
         if is_warmup:
-            # kv_lens_cuda was saved by prepare_for_spec_dec in this mode and
-            # is restored wholesale, so no rewind is needed.
             return
 
-        if self._kv_rewind_amount is not None and hasattr(attn_metadata, "kv_lens_cuda"):
+        if hasattr(self, "_kv_rewind_amount") and hasattr(attn_metadata, "kv_lens_cuda"):
             nc = self._kv_rewind_nc
             bs = self._kv_rewind_bs
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
@@ -387,28 +366,7 @@ class DFlashWorker(SpecWorkerBase):
                 self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
             offset += slen
 
-    def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
-        # Restore first (in warmup mode kv_lens_cuda was saved and comes back
-        # wholesale), then apply any pending rewind for the other modes so a
-        # failed draft forward does not leave kv_lens_cuda incremented.
-        super()._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
-        if (
-            getattr(self, "_kv_rewind_pending", False)
-            and attn_metadata is not None
-            and spec_metadata is not None
-        ):
-            self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
-        if (
-            getattr(self, "_ctx_len_restore_pending", False)
-            and self._ctx_len is not None
-            and self._saved_ctx_len is not None
-        ):
-            # A failed forward must not keep this iteration's in-place
-            # _ctx_len updates: roll back to the pre-forward snapshot.
-            self._ctx_len.copy_(self._saved_ctx_len)
-            self._ctx_len_restore_pending = False
-
-    def _forward_impl(
+    def forward(
         self,
         input_ids,
         position_ids,
@@ -441,23 +399,24 @@ class DFlashWorker(SpecWorkerBase):
         self._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
         spec_metadata._dflash_worker = self
 
-        # Save context lengths so both warmup and a failed forward can roll
-        # back the in-place _ctx_len updates made during drafting.
+        # Save context lengths before warmup to prevent accumulation
         is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
-        if not torch.cuda.is_current_stream_capturing():
-            # Never allocate the snapshot while capturing a CUDA graph: the
-            # clone would live in the graph memory pool, and its replay-time
-            # writes could alias blocks reused by later captures. Rollback is
-            # only meaningful for eager/warmup forwards anyway; a failure
-            # during capture aborts the graph itself, and captured ops do not
-            # mutate _ctx_len until replay.
-            self._saved_ctx_len = self._ctx_len.clone()
-            self._ctx_len_restore_pending = True
+        if is_warmup:
+            saved_ctx_len = self._ctx_len.clone()
 
         self._execute_guided_decoder_if_present(logits)
 
-        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
-            logits, attn_metadata, spec_metadata
+        # Target now emits K+1 logits per gen request and the previous step
+        # stored K draft tokens per gen request (no filler padding).
+        if num_gens > 0:
+            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, K)
+        else:
+            draft_tokens = spec_metadata.draft_tokens.reshape(0, K)
+
+        logits_for_accept = logits
+
+        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+            logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
         )
 
         # Update GDN/Mamba recurrent states to the accepted token's state.
@@ -492,10 +451,7 @@ class DFlashWorker(SpecWorkerBase):
             # Rebuild batch_to_slot after prefill assigns new slots
             if self._ctx_buf_inited and spec_metadata.request_ids:
                 num_seqs = len(spec_metadata.request_ids)
-                mapping = [
-                    self._req_to_slot.get(rid, self._dummy_slot)
-                    for rid in spec_metadata.request_ids
-                ]
+                mapping = [self._req_to_slot.get(rid, 0) for rid in spec_metadata.request_ids]
                 self._batch_to_slot[:num_seqs].copy_(
                     torch.tensor(mapping, dtype=torch.long, device="cuda")
                 )
@@ -541,21 +497,16 @@ class DFlashWorker(SpecWorkerBase):
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                gen_draft_tokens = self.sample_draft_tokens(
-                    gen_logits,
-                    spec_metadata,
-                    batch_size,
-                    num_contexts=num_contexts,
-                )
+                d2t = getattr(draft_model.model, "d2t", None)
+                gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
+
+                if d2t is not None:
+                    gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
+
+                gen_draft_tokens = gen_draft_tokens.type(torch.int32)
 
         else:
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
-
-        # Context requests are not drafted by the block worker (zero placeholder
-        # token); fill their draft-prob slot rows with a one-hot placeholder so
-        # they are a legal distribution when they become gen requests next iter.
-        gen_vocab = vocab_size if num_gens > 0 else None
-        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, gen_vocab)
 
         if num_contexts > 0 and num_gens > 0:
             ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
@@ -576,10 +527,9 @@ class DFlashWorker(SpecWorkerBase):
             num_accepted_tokens,
         )
 
-        # Restore context lengths after warmup; real runs keep the updates.
+        # Restore context lengths after warmup
         if is_warmup:
-            self._ctx_len.copy_(self._saved_ctx_len)
-        self._ctx_len_restore_pending = False
+            self._ctx_len.copy_(saved_ctx_len)
 
         return {
             "logits": raw_logits,

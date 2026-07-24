@@ -24,7 +24,6 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -32,6 +31,7 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include <NvInferRuntimeBase.h>
 #include <cstddef>
 #include <cstdint>
 #include <sstream>
@@ -366,7 +366,7 @@ void splitRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputConv
 
     // Allocate and copy pointer array to device
     runtime::BufferManager::IBufferPtr PtrsDeviceBuffer
-        = bufferManager.gpu(cachePtrs.size(), tensorrt_llm::DataType::kINT64);
+        = bufferManager.gpu(cachePtrs.size(), nvinfer1::DataType::kINT64);
     TLLM_CHECK(PtrsDeviceBuffer->getSizeInBytes() == cachePtrs.size() * sizeof(uint64_t));
     bufferManager.copy(cachePtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
 
@@ -497,7 +497,7 @@ void splitRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBl
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
 
     runtime::BufferManager::IBufferPtr PtrsDeviceBuffer
-        = bufferManager.gpu(cachePtrs.size(), tensorrt_llm::DataType::kINT64);
+        = bufferManager.gpu(cachePtrs.size(), nvinfer1::DataType::kINT64);
     TLLM_CHECK(PtrsDeviceBuffer->getSizeInBytes() == cachePtrs.size() * sizeof(uint64_t));
     bufferManager.copy(cachePtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
 
@@ -625,7 +625,7 @@ void concatRnnConvState(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
 
     runtime::BufferManager::IBufferPtr PtrsDeviceBuffer
-        = bufferManager.gpu(cachePtrs.size(), tensorrt_llm::DataType::kINT64);
+        = bufferManager.gpu(cachePtrs.size(), nvinfer1::DataType::kINT64);
     TLLM_CHECK(PtrsDeviceBuffer->getSizeInBytes() == cachePtrs.size() * sizeof(uint64_t));
     bufferManager.copy(cachePtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
 
@@ -747,7 +747,7 @@ void concatRnnSsmState(std::vector<runtime::ITensor::SharedPtr> const& inputSpli
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
 
     runtime::BufferManager::IBufferPtr PtrsDeviceBuffer
-        = bufferManager.gpu(cachePtrs.size(), tensorrt_llm::DataType::kINT64);
+        = bufferManager.gpu(cachePtrs.size(), nvinfer1::DataType::kINT64);
     TLLM_CHECK(PtrsDeviceBuffer->getSizeInBytes() == cachePtrs.size() * sizeof(uint64_t));
     bufferManager.copy(cachePtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
 
@@ -1348,7 +1348,7 @@ void splitUnifiedPoolSsm(runtime::ITensor::SharedPtr const& pool, std::vector<Si
     }
     allPtrs.insert(allPtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
 
-    auto PtrsDeviceBuffer = bufferManager.gpu(allPtrs.size(), tensorrt_llm::DataType::kINT64);
+    auto PtrsDeviceBuffer = bufferManager.gpu(allPtrs.size(), nvinfer1::DataType::kINT64);
     bufferManager.copy(allPtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
 
     T const** inputPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data());
@@ -1481,10 +1481,10 @@ void splitUnifiedPoolConv(runtime::ITensor::SharedPtr const& pool, std::vector<S
     sectionInfo.insert(sectionInfo.end(), sectionDimsDomainTP.begin(), sectionDimsDomainTP.end());
     sectionInfo.insert(sectionInfo.end(), sectionOffsetsLocal.begin(), sectionOffsetsLocal.end());
 
-    auto PtrsDeviceBuffer = bufferManager.gpu(allPtrs.size(), tensorrt_llm::DataType::kINT64);
+    auto PtrsDeviceBuffer = bufferManager.gpu(allPtrs.size(), nvinfer1::DataType::kINT64);
     bufferManager.copy(allPtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
 
-    auto sectionInfoBuffer = bufferManager.gpu(sectionInfo.size(), tensorrt_llm::DataType::kINT32);
+    auto sectionInfoBuffer = bufferManager.gpu(sectionInfo.size(), nvinfer1::DataType::kINT32);
     bufferManager.copy(sectionInfo.data(), *sectionInfoBuffer, runtime::MemoryType::kCPU);
 
     T const** inputPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data());
@@ -1606,7 +1606,7 @@ void concatUnifiedPoolSsm(runtime::ITensor::SharedPtr const& pool, std::vector<S
     }
     allPtrs.insert(allPtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
 
-    auto PtrsDeviceBuffer = bufferManager.gpu(allPtrs.size(), tensorrt_llm::DataType::kINT64);
+    auto PtrsDeviceBuffer = bufferManager.gpu(allPtrs.size(), nvinfer1::DataType::kINT64);
     bufferManager.copy(allPtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
 
     T** outputPtrsDev = static_cast<T**>(PtrsDeviceBuffer->data());
@@ -1731,10 +1731,10 @@ void concatUnifiedPoolConv(runtime::ITensor::SharedPtr const& pool, std::vector<
     sectionInfo.insert(sectionInfo.end(), sectionDimsDomainTP.begin(), sectionDimsDomainTP.end());
     sectionInfo.insert(sectionInfo.end(), sectionOffsetsLocal.begin(), sectionOffsetsLocal.end());
 
-    auto PtrsDeviceBuffer = bufferManager.gpu(allPtrs.size(), tensorrt_llm::DataType::kINT64);
+    auto PtrsDeviceBuffer = bufferManager.gpu(allPtrs.size(), nvinfer1::DataType::kINT64);
     bufferManager.copy(allPtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
 
-    auto sectionInfoBuffer = bufferManager.gpu(sectionInfo.size(), tensorrt_llm::DataType::kINT32);
+    auto sectionInfoBuffer = bufferManager.gpu(sectionInfo.size(), nvinfer1::DataType::kINT32);
     bufferManager.copy(sectionInfo.data(), *sectionInfoBuffer, runtime::MemoryType::kCPU);
 
     T** outputPtrsDev = static_cast<T**>(PtrsDeviceBuffer->data());
@@ -1810,8 +1810,7 @@ void concatUnifiedPoolConv(runtime::ITensor::SharedPtr const& pool, std::vector<
 void splitUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
     std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks,
     kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
-    size_t ssmBytes, size_t blockSizeBytes, tensorrt_llm::DataType ssmDataType,
-    runtime::BufferManager const& bufferManager)
+    size_t ssmBytes, size_t blockSizeBytes, nvinfer1::DataType ssmDataType, runtime::BufferManager const& bufferManager)
 {
     auto dataSize = tensorrt_llm::common::getDTypeSize(ssmDataType);
     switch (dataSize)
@@ -1835,7 +1834,7 @@ void splitUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
 void splitUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
     std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks,
     kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
-    size_t ssmBytes, size_t blockSizeBytes, tensorrt_llm::DataType convDataType,
+    size_t ssmBytes, size_t blockSizeBytes, nvinfer1::DataType convDataType,
     runtime::BufferManager const& bufferManager)
 {
     auto dataSize = tensorrt_llm::common::getDTypeSize(convDataType);
@@ -1860,7 +1859,7 @@ void splitUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
 void concatUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
     std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
     kv_cache::CacheState const& srcCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx, size_t ssmBytes,
-    size_t blockSizeBytes, tensorrt_llm::DataType ssmDataType, runtime::BufferManager const& bufferManager)
+    size_t blockSizeBytes, nvinfer1::DataType ssmDataType, runtime::BufferManager const& bufferManager)
 {
     auto dataSize = tensorrt_llm::common::getDTypeSize(ssmDataType);
     switch (dataSize)
@@ -1884,7 +1883,7 @@ void concatUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
 void concatUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
     std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
     kv_cache::CacheState const& srcCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx, size_t ssmBytes,
-    size_t blockSizeBytes, tensorrt_llm::DataType convDataType, runtime::BufferManager const& bufferManager)
+    size_t blockSizeBytes, nvinfer1::DataType convDataType, runtime::BufferManager const& bufferManager)
 {
     auto dataSize = tensorrt_llm::common::getDTypeSize(convDataType);
     switch (dataSize)

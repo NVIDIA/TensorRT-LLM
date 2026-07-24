@@ -52,46 +52,11 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import dsl_user_op
 
 from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from .utils import (TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents,
                     griddepcontrol_wait, is_power_of_2)
-
-
-@dsl_user_op
-def _indexer_q_pack_fp4x4(value0: cutlass.Float32,
-                          value1: cutlass.Float32,
-                          value2: cutlass.Float32,
-                          value3: cutlass.Float32,
-                          *,
-                          loc=None,
-                          ip=None) -> cutlass.Uint16:
-    """Pack four FP32 values with two native E2M1x2 conversions."""
-    return cutlass.Uint16(
-        llvm.inline_asm(
-            cutlass.Uint16.mlir_type,
-            [
-                value0.ir_value(loc=loc, ip=ip),
-                value1.ir_value(loc=loc, ip=ip),
-                value2.ir_value(loc=loc, ip=ip),
-                value3.ir_value(loc=loc, ip=ip),
-            ],
-            """{
-                .reg .b8 byte0, byte1;
-                cvt.rn.satfinite.e2m1x2.f32 byte0, $2, $1;
-                cvt.rn.satfinite.e2m1x2.f32 byte1, $4, $3;
-                mov.b16 $0, {byte0, byte1};
-            }""",
-            "=h,f,f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        ))
 
 
 class Sm100BlockScaledPersistentDenseGemmKernel:
@@ -135,8 +100,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         use_prefetch: bool = False,
         swizzle_size: int = 1,
         raster_along_m: bool = True,
-        indexer_q_fusion: bool = False,
-        indexer_transform_warps: int = 4,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -171,16 +134,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.use_prefetch = use_prefetch
         self.swizzle_size = swizzle_size
         self.raster_along_m = raster_along_m
-        self.indexer_q_fusion = indexer_q_fusion
-        self.indexer_transform_warps = indexer_transform_warps
-        if self.indexer_q_fusion and (sf_vec_size != 32 or mma_tiler_mn[0]
-                                      != 128 or mma_tiler_mn[1] != 16
-                                      or cluster_shape_mn != (1, 1)
-                                      or indexer_transform_warps not in (4, 8)):
-            raise ValueError(
-                "The swapped indexer-Q epilogue currently requires "
-                "MXF8, a 128x16 MMA tile, a 1x1 cluster, and 4 or 8 "
-                "row-transform warps")
         self.cta_group = (tcgen05.CtaGroup.TWO
                           if self.use_2cta_instrs else tcgen05.CtaGroup.ONE)
 
@@ -194,12 +147,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
         self.mma_warp_id = 4
         self.tma_warp_id = 5
-        self.indexer_extra_warp_id = tuple(
-            range(self.tma_warp_id + 1, self.tma_warp_id + 1 +
-                  indexer_transform_warps - 4)) if self.indexer_q_fusion else ()
         self.threads_per_cta = 32 * len(
-            (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id,
-             *self.indexer_extra_warp_id))
+            (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id))
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
@@ -308,14 +257,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
 
         self.epi_tile_n = cute.size(self.epi_tile[1])
-        expected_indexer_epi_n = min(self.mma_tiler[1], 32)
-        if (self.indexer_q_fusion
-                and (cute.size(self.epi_tile[0]) != 128
-                     or self.epi_tile_n != expected_indexer_epi_n)):
-            raise ValueError(
-                f"Unexpected swapped indexer-Q epilogue tile {self.epi_tile}; "
-                f"expected a 128-feature by {expected_indexer_epi_n}-token "
-                "BF16 stage")
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         self.num_acc_stage, self.num_ab_stage, self.num_c_stage = self._compute_stages(
@@ -367,10 +308,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
 
         self.overlapping_accum = self.num_acc_stage == 1
-        if self.indexer_q_fusion and self.overlapping_accum:
-            raise ValueError(
-                "The swapped indexer-Q transform-warp schedule requires at "
-                "least two accumulator stages")
         sf_atom_mn = 32
         self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] //
                                   sf_atom_mn) * mma_inst_tile_k
@@ -399,10 +336,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
-        packed_tensor: Optional[cute.Tensor] = None,
-        indexer_scale_tensor: Optional[cute.Tensor] = None,
-        position_ids_tensor: Optional[cute.Tensor] = None,
-        cos_sin_cache_tensor: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -434,17 +367,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.b_major_mode = utils.LayoutEnum.from_tensor(
             b_tensor).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c_tensor)
-
-        if cutlass.const_expr(
-                self.indexer_q_fusion and
-            (self.c_dtype != cutlass.BFloat16
-             or self.c_layout != utils.LayoutEnum.COL_MAJOR
-             or packed_tensor is None or indexer_scale_tensor is None
-             or position_ids_tensor is None or cos_sin_cache_tensor is None)):
-            raise ValueError(
-                "The swapped indexer-Q epilogue requires a column-major BF16 "
-                "GEMM boundary plus packed output, scale, position, and RoPE tensors"
-            )
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -651,10 +573,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tma_tensor_sfb,
             tma_atom_c,
             tma_tensor_c,
-            packed_tensor,
-            indexer_scale_tensor,
-            position_ids_tensor,
-            cos_sin_cache_tensor,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -693,10 +611,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mSFB_nkl: cute.Tensor,
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: cute.Tensor,
-        mPacked_nml: Optional[cute.Tensor],
-        mIndexerScale_nml: Optional[cute.Tensor],
-        mPositionIds: Optional[cute.Tensor],
-        mCosSinCache: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1516,9 +1430,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         "async.shared",
                         space="cta",
                     )
-                    epilog_threads = 32 * (self.indexer_transform_warps
-                                           if self.indexer_q_fusion else len(
-                                               self.epilog_warp_id))
+                    epilog_threads = 32 * len(self.epilog_warp_id)
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=epilog_threads,
@@ -1527,31 +1439,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     #
                     # TMA store C to global memory
                     #
-                    if cutlass.const_expr(self.indexer_q_fusion):
-                        self._indexer_q_transform_rows(
-                            sC,
-                            c_buffer,
-                            warp_idx,
-                            self.indexer_transform_warps,
-                            cur_tile_coord[0],
-                            cur_tile_coord[1],
-                            cur_tile_coord[2],
-                            real_subtile_idx,
-                            mPacked_nml,
-                            mIndexerScale_nml,
-                            mPositionIds,
-                            mCosSinCache,
+                    if warp_idx == self.epilog_warp_id[0]:
+                        cute.copy(
+                            tma_atom_c,
+                            bSG_sC[(None, c_buffer)],
+                            bSG_gC[(None, real_subtile_idx)],
                         )
-                    else:
-                        if warp_idx == self.epilog_warp_id[0]:
-                            cute.copy(
-                                tma_atom_c,
-                                bSG_sC[(None, c_buffer)],
-                                bSG_gC[(None, real_subtile_idx)],
-                            )
-                            # Fence and barrier to make sure shared memory store is visible to TMA store
-                            c_pipeline.producer_commit()
-                            c_pipeline.producer_acquire()
+                        # Fence and barrier to make sure shared memory store is visible to TMA store
+                        c_pipeline.producer_commit()
+                        c_pipeline.producer_acquire()
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=epilog_threads,
@@ -1591,183 +1487,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             # Wait for C store complete
             #
-            if cutlass.const_expr(not self.indexer_q_fusion):
-                c_pipeline.producer_tail()
-
-        # Optional row-transform-only warps.  The four canonical epilogue
-        # warps remain the sole TMEM drain owners; these warps join only the
-        # two shared-stage barriers and process disjoint complete token rows.
-        if cutlass.const_expr(self.indexer_q_fusion
-                              and self.indexer_transform_warps > 4):
-            if (warp_idx >= self.indexer_extra_warp_id[0]
-                    and warp_idx <= self.indexer_extra_warp_id[-1]):
-                tile_sched = utils.StaticPersistentTileScheduler.create(
-                    tile_sched_params, cute.arch.block_idx(),
-                    cute.arch.grid_dim())
-                work_tile = tile_sched.initial_work_tile_info()
-                subtile_cnt = (self.cta_tile_shape_mnk[1] // self.epi_tile_n)
-                transform_threads = 32 * self.indexer_transform_warps
-                transform_warp_idx = (len(self.epilog_warp_id) + warp_idx -
-                                      self.indexer_extra_warp_id[0])
-
-                while work_tile.is_valid_tile:
-                    cur_tile_coord = work_tile.tile_idx
-                    num_prev_subtiles = (tile_sched.num_tiles_executed *
-                                         subtile_cnt)
-                    for subtile_idx in cutlass.range(subtile_cnt):
-                        c_buffer = ((num_prev_subtiles + subtile_idx) %
-                                    self.num_c_stage)
-                        cute.arch.barrier(
-                            barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=transform_threads,
-                        )
-                        self._indexer_q_transform_rows(
-                            sC,
-                            c_buffer,
-                            transform_warp_idx,
-                            self.indexer_transform_warps,
-                            cur_tile_coord[0],
-                            cur_tile_coord[1],
-                            cur_tile_coord[2],
-                            subtile_idx,
-                            mPacked_nml,
-                            mIndexerScale_nml,
-                            mPositionIds,
-                            mCosSinCache,
-                        )
-                        cute.arch.barrier(
-                            barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=transform_threads,
-                        )
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+            c_pipeline.producer_tail()
 
         griddepcontrol_launch_dependents()
-
-    @cute.jit
-    def _indexer_q_transform_rows(
-        self,
-        sC: cute.Tensor,
-        c_buffer: cutlass.Int32,
-        row_start: cutlass.Int32,
-        row_stride: cutlass.Constexpr,
-        head_idx: cutlass.Int32,
-        token_tile_idx: cutlass.Int32,
-        batch_idx: cutlass.Int32,
-        real_subtile_idx: cutlass.Int32,
-        mPacked_nml: cute.Tensor,
-        mIndexerScale_nml: cute.Tensor,
-        mPositionIds: cute.Tensor,
-        mCosSinCache: cute.Tensor,
-    ):
-        """Transform complete BF16 token rows from the shared epilogue tile."""
-        lane_idx = cute.arch.lane_idx()
-        for row in cutlass.range(row_start,
-                                 self.epi_tile_n,
-                                 row_stride,
-                                 unroll_full=True):
-            token_idx = (token_tile_idx * self.cta_tile_shape_mnk[1] +
-                         real_subtile_idx * self.epi_tile_n + row)
-            if token_idx < mPositionIds.shape[0]:
-                values = cute.make_rmem_tensor((4, ), cutlass.Float32)
-                for value_idx in cutlass.range_constexpr(4):
-                    feature_idx = lane_idx * 4 + value_idx
-                    values[value_idx] = cutlass.Float32(sC[(feature_idx, row,
-                                                            c_buffer)])
-
-                if lane_idx >= 16:
-                    position = mPositionIds[token_idx]
-                    pair_base = (lane_idx * 4 - 64) // 2
-                    for value_idx in cutlass.range_constexpr(0, 4, 2):
-                        cosine = mCosSinCache[position,
-                                              pair_base + value_idx // 2]
-                        sine = mCosSinCache[position,
-                                            pair_base + value_idx // 2 + 32]
-                        x = values[value_idx]
-                        y = values[value_idx + 1]
-                        values[value_idx] = (cosine * x - sine * y).to(
-                            cutlass.BFloat16).to(cutlass.Float32)
-                        values[value_idx + 1] = (cosine * y + sine * x).to(
-                            cutlass.BFloat16).to(cutlass.Float32)
-
-                amax = cute.arch.fmax(
-                    cute.arch.fmax(values[0], -values[0]),
-                    cute.arch.fmax(values[1], -values[1]),
-                )
-                amax = cute.arch.fmax(
-                    amax,
-                    cute.arch.fmax(
-                        cute.arch.fmax(values[2], -values[2]),
-                        cute.arch.fmax(values[3], -values[3]),
-                    ),
-                )
-                amax = cute.arch.fmax(
-                    amax, cute.arch.shuffle_sync_bfly(amax, offset=1))
-                amax = cute.arch.fmax(
-                    amax, cute.arch.shuffle_sync_bfly(amax, offset=2))
-                amax = cute.arch.fmax(
-                    amax, cute.arch.shuffle_sync_bfly(amax, offset=4))
-                if amax < cutlass.Float32(1.0e-12):
-                    amax = cutlass.Float32(1.0e-12)
-
-                scale_reg = cute.make_rmem_tensor((1, ), cutlass.Float8E8M0FNU)
-                scale_reg[0] = (amax * cutlass.Float32(1.0 / 6.0)).to(
-                    cutlass.Float8E8M0FNU)
-                scale_byte = cute.recast_tensor(scale_reg, cutlass.Uint8)[0]
-                exponent = cutlass.Uint32(scale_byte)
-                inverse_bits = cutlass.Uint32(0)
-                if exponent == cutlass.Uint32(254):
-                    inverse_bits = cutlass.Uint32(0x00400000)
-                else:
-                    inverse_bits = (cutlass.Uint32(254) - exponent) << 23
-                inverse_scale = cutlass.Float32(
-                    llvm.bitcast(cutlass.Float32.mlir_type,
-                                 inverse_bits.ir_value()))
-                for value_idx in cutlass.range_constexpr(4):
-                    values[value_idx] = values[value_idx] * inverse_scale
-
-                packed = _indexer_q_pack_fp4x4(
-                    values[0],
-                    values[1],
-                    values[2],
-                    values[3],
-                )
-                midpoint_adjust = cutlass.Uint16(0)
-                for value_idx in cutlass.range_constexpr(4):
-                    abs_value = cute.arch.fmax(values[value_idx],
-                                               -values[value_idx])
-                    nibble_adjust = cutlass.Uint16(1 << (value_idx * 4))
-                    if abs_value == cutlass.Float32(0.75):
-                        midpoint_adjust = midpoint_adjust | nibble_adjust
-                    if abs_value == cutlass.Float32(1.75):
-                        midpoint_adjust = midpoint_adjust | nibble_adjust
-                    if abs_value == cutlass.Float32(3.5):
-                        midpoint_adjust = midpoint_adjust | nibble_adjust
-                packed = packed - midpoint_adjust
-                magnitude = packed & cutlass.Uint16(0x7777)
-                nonzero_sign = ((magnitude | (magnitude << 1)
-                                 | (magnitude << 2))
-                                & cutlass.Uint16(0x4444)) << 1
-                packed = cutlass.Uint16(packed & (cutlass.Uint16(0x7777)
-                                                  | nonzero_sign))
-                mPacked_nml[head_idx * 32 + lane_idx, token_idx,
-                            batch_idx] = packed
-
-                exponent0 = cutlass.Uint32(
-                    cute.arch.shuffle_sync(exponent, cutlass.Int32(0)))
-                exponent1 = cutlass.Uint32(
-                    cute.arch.shuffle_sync(exponent, cutlass.Int32(8)))
-                exponent2 = cutlass.Uint32(
-                    cute.arch.shuffle_sync(exponent, cutlass.Int32(16)))
-                exponent3 = cutlass.Uint32(
-                    cute.arch.shuffle_sync(exponent, cutlass.Int32(24)))
-                if lane_idx == 0:
-                    mIndexerScale_nml[
-                        head_idx,
-                        token_idx,
-                        batch_idx,
-                    ] = (exponent0 | (exponent1 << 8) | (exponent2 << 16)
-                         | (exponent3 << 24))
 
     def mainloop_s2t_copy_and_partition(
         self,
@@ -2218,7 +1940,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
-        l: cutlass.Int64,  # noqa: E741 - CUTLASS names the batch mode L.
+        l: cutlass.Int64,
         ab_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
         a_major: str,
@@ -2270,7 +1992,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
-        l: cutlass.Int64,  # noqa: E741 - CUTLASS names the batch mode L.
+        l: cutlass.Int64,
         a_major: str,
         b_major: str,
         c_major: str,
@@ -2328,7 +2050,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_m: cutlass.Int64,
         sf_n: cutlass.Int64,
         sf_k: cutlass.Int64,
-        l: cutlass.Constexpr,  # noqa: E741 - Preserve the generic wrapper API.
+        l: cutlass.Constexpr,
         a_ptr: cute.Pointer,
         b_ptr: cute.Pointer,
         a_sf_ptr: cute.Pointer,
@@ -2403,102 +2125,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         self(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, alpha_tensor,
              max_active_clusters, current_stream, epilogue_op)
-
-    @cute.jit
-    def wrapper_indexer_q_swap_ab(
-        self,
-        m: cutlass.Int64,
-        n: cutlass.Int64,
-        k: cutlass.Int64,
-        sf_m: cutlass.Int64,
-        sf_n: cutlass.Int64,
-        sf_k: cutlass.Int64,
-        cos_sin_rows: cutlass.Int64,
-        batch_count: cutlass.Constexpr,
-        a_ptr: cute.Pointer,
-        b_ptr: cute.Pointer,
-        a_sf_ptr: cute.Pointer,
-        b_sf_ptr: cute.Pointer,
-        packed_ptr: cute.Pointer,
-        scale_ptr: cute.Pointer,
-        position_ids_ptr: cute.Pointer,
-        cos_sin_ptr: cute.Pointer,
-        alpha_tensor: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
-        current_stream: cuda.CUstream,
-    ):
-        """Run indexer Q with features on MMA-M and tokens on MMA-N.
-
-        The GEMM boundary is a logical column-major BF16 ``[N, M]`` view.
-        It is never written to global memory; the custom epilogue drains it to
-        the existing BF16 shared-memory stage, then writes the production
-        packed-FP4 and four-UE8M0-per-head outputs directly.
-        """
-        # Swap A/B so the fixed 8192 output features occupy hardware MMA-M and
-        # the small dynamic token count occupies hardware MMA-N.
-        weight_tensor = cute.make_tensor(
-            b_ptr,
-            layout=cute.make_ordered_layout((n, k, batch_count),
-                                            order=(1, 0, 2)),
-        )
-        input_tensor = cute.make_tensor(
-            a_ptr,
-            layout=cute.make_ordered_layout((m, k, batch_count),
-                                            order=(1, 0, 2)),
-        )
-        weight_sf_tensor = cute.make_tensor(
-            b_sf_ptr,
-            layout=cute.make_ordered_layout(
-                (32, 4, sf_n, 4, sf_k, batch_count),
-                order=(2, 1, 4, 0, 3, 5),
-            ),
-        )
-        input_sf_tensor = cute.make_tensor(
-            a_sf_ptr,
-            layout=cute.make_ordered_layout(
-                (32, 4, sf_m, 4, sf_k, batch_count),
-                order=(2, 1, 4, 0, 3, 5),
-            ),
-        )
-
-        # Only the shape/layout participate in scheduling and TMEM partitioning.
-        # The custom epilogue does not issue a TMA store through this tensor.
-        c_boundary_tensor = cute.make_tensor(
-            cute.recast_ptr(packed_ptr, dtype=cutlass.BFloat16),
-            layout=cute.make_ordered_layout((n, m, batch_count),
-                                            order=(0, 1, 2)),
-        )
-        packed_tensor = cute.make_tensor(
-            cute.recast_ptr(packed_ptr, dtype=cutlass.Uint16),
-            layout=cute.make_ordered_layout((n // 4, m, batch_count),
-                                            order=(0, 1, 2)),
-        )
-        scale_tensor = cute.make_tensor(
-            cute.recast_ptr(scale_ptr, dtype=cutlass.Uint32),
-            layout=cute.make_ordered_layout((n // 128, m, batch_count),
-                                            order=(0, 1, 2)),
-        )
-        position_ids_tensor = cute.make_tensor(position_ids_ptr,
-                                               cute.make_layout((m, )))
-        cos_sin_cache_tensor = cute.make_tensor(
-            cos_sin_ptr,
-            layout=cute.make_ordered_layout((cos_sin_rows, 64), order=(1, 0)),
-        )
-
-        self(
-            weight_tensor,
-            input_tensor,
-            weight_sf_tensor,
-            input_sf_tensor,
-            c_boundary_tensor,
-            alpha_tensor,
-            max_active_clusters,
-            current_stream,
-            packed_tensor=packed_tensor,
-            indexer_scale_tensor=scale_tensor,
-            position_ids_tensor=position_ids_tensor,
-            cos_sin_cache_tensor=cos_sin_cache_tensor,
-        )
 
 
 @cute.jit

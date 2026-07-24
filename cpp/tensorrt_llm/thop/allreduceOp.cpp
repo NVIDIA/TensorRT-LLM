@@ -23,7 +23,6 @@
 #include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/MiniMaxReduceRMSKernel.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
@@ -62,6 +61,7 @@
 #include <limits>
 #include <unordered_set>
 
+// using namespace nvinfer1;
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
 using tensorrt_llm::mpi::MpiTag;
@@ -234,8 +234,8 @@ std::set<int> getLocalGroupTorch(std::set<int> const& group)
 class AllreduceOp
 {
 public:
-    AllreduceOp(std::set<int> group, tensorrt_llm::DataType type, AllReduceStrategyType strategy, AllReduceFusionOp op,
-        float eps)
+    AllreduceOp(
+        std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy, AllReduceFusionOp op, float eps)
         : mGroup(std::move(group))
         , mIsNVLINKSupported(false)
         , mIsP2PSupported(false)
@@ -248,7 +248,7 @@ public:
     }
 
     AllreduceOp(std::set<int> group, c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_,
-        tensorrt_llm::DataType type, AllReduceStrategyType strategy, AllReduceFusionOp op, float eps)
+        nvinfer1::DataType type, AllReduceStrategyType strategy, AllReduceFusionOp op, float eps)
         : mGroup(std::move(group))
         , mIsNVLINKSupported(false)
         , mIsP2PSupported(false)
@@ -348,7 +348,7 @@ private:
         {
             TORCH_CHECK(norm_weight, "norm_weight is required for residual rms norm allreduce");
             TORCH_CHECK(!bias, "bias is not supported for residual rms norm allreduce");
-            TORCH_CHECK(mType == tensorrt_llm::DataType::kHALF || mType == tensorrt_llm::DataType::kBF16);
+            TORCH_CHECK(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16);
             auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
             tensorrt_llm::kernels::ub::allreduce2_userbuff_rmsnorm_launcher(ub_buffer0.handle, 0, ub_buffer1.handle, 0,
                 size, hidden_size, nullptr, norm_weight.value().data_ptr(), mEps, residual.value().data_ptr(),
@@ -1461,7 +1461,7 @@ private:
     bool mIsNVLINKSupported;
     bool mIsP2PSupported;
     bool mIsMNNVLSupported;
-    tensorrt_llm::DataType mType;
+    nvinfer1::DataType mType;
     AllReduceStrategyType mStrategy;
     AllReduceFusionOp mOp;
     float mEps;

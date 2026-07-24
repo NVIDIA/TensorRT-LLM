@@ -22,19 +22,16 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <cstddef>
-#include <fstream>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <pybind11/pybind11.h>
-#include <string>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/custom_class.h>
 #include <torch/python.h>
@@ -251,12 +248,6 @@ public:
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
-    /// Get the serialized DataTransceiverState (CacheState + CommState) for this transceiver.
-    [[nodiscard]] virtual std::vector<char> getSerializedDataTransceiverState() const
-    {
-        return {};
-    }
-
     [[nodiscard]] virtual bool hasPoisonedTransferBuffer() const
     {
         return false;
@@ -268,7 +259,7 @@ class CacheTransceiver : public BaseCacheTransceiver
 public:
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
         executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
@@ -276,7 +267,7 @@ public:
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
@@ -306,18 +297,12 @@ public:
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
-    [[nodiscard]] std::vector<char> getSerializedDataTransceiverState() const override;
-
     [[nodiscard]] bool hasPoisonedTransferBuffer() const override;
 
 private:
     void initializeCommState();
 
     void setContextState(LlmRequest* llmRequest);
-
-    // Append one row per completed request to the gen-side transfer summary CSV. Opens the file
-    // lazily on first use; expects timing to already be synced across ranks by the caller.
-    void writeGenTransferSummary(std::vector<LlmRequest*> const& completedRequests);
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
@@ -353,13 +338,6 @@ private:
 
     // TODO(shreyasm): update this to use same container as kv by using base trans buffers instead
     std::unique_ptr<rnn_state_manager::RnnCacheTransBufferManager> mRnnCacheTransBufferManager{nullptr};
-
-    // Unique instance identifier for CSV file naming (avoids collisions across gen instances)
-    std::string mInstanceId;
-
-    // Gen-side transfer summary CSV (written after timing sync)
-    std::ofstream mGenTransferSummaryFile;
-    std::mutex mGenTransferSummaryMutex;
 
     // library handle to the communicator related features,
     // this is used to defer dependency resolution until needed.

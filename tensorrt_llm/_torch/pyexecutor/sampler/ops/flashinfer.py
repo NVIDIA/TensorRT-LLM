@@ -15,12 +15,7 @@
 """FlashInfer-accelerated sampling kernels.
 
 These ops depend on flashinfer; the import is guarded so the module stays
-importable without it (sampling_utils imports it unconditionally, and the
-vanilla/TRTLLM sampler paths must keep working without flashinfer). Without
-flashinfer, calling any op raises an ImportError with installation guidance.
-Components that will invoke these ops are expected to fail fast at startup
-instead of relying on that call-time error: TorchSampler enforces flashinfer
-availability in its constructor.
+importable without it.
 
 Randomness can be supplied either way (flashinfer accepts both in one
 signature; explicit ``seed``/``offset`` take precedence over ``generator``):
@@ -30,50 +25,20 @@ signature; explicit ``seed``/``offset`` take precedence over ``generator``):
   capture (a ``torch.Generator`` advances host-side at launch time, so its
   state would be frozen into the graph and every replay would reuse the same
   random values).
-
-Every op is ``@_compiler_disable``d: nothing inside flashinfer is opaque to
-Dynamo (its kernels sit behind a ``functools.cache``-d lazy JIT bootstrap and
-its own custom-op registration is a no-op), so tracing in turns each
-untraceable builtin of the bootstrap into a warn-once plus a permanent
-per-call graph break. Disabling keeps one clean graph break per op and
-preserves the bootstrap's cache fast path.
 """
 
-from typing import Any, Callable, Optional, TypeVar, Union, cast
+from typing import Optional, Union
 
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 
-_OpT = TypeVar("_OpT", bound=Callable[..., Any])
-
-
-def _compiler_disable(fn: _OpT) -> _OpT:
-    """``torch.compiler.disable``, typed: the torch stub is untyped and would
-    fail mypy strict (untyped-decorator) if applied directly."""
-    return cast(_OpT, torch.compiler.disable(fn))
-
-
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer.sampling
-else:
-
-    class _FlashInferUnavailable:
-        """Placeholder that raises on first use instead of a bare NameError."""
-
-        def __getattr__(self, name: str) -> Any:
-            raise ImportError(
-                "flashinfer is required for the FlashInfer sampling ops but is "
-                "not installed; please install the version pinned in "
-                "requirements.txt."
-            )
-
-    flashinfer = _FlashInferUnavailable()  # type: ignore[assignment]
 
 SeedOrTensor = Union[int, torch.Tensor]
 
 
-@_compiler_disable
 def top_k_top_p_sampling_from_logits_op(
     logits: torch.Tensor,
     top_k: torch.Tensor,
@@ -103,7 +68,6 @@ def top_k_top_p_sampling_from_logits_op(
     return tokens
 
 
-@_compiler_disable
 def sampling_from_probs_op(
     probs: torch.Tensor,
     *,
@@ -128,7 +92,6 @@ def sampling_from_probs_op(
     return tokens
 
 
-@_compiler_disable
 def top_k_sampling_from_probs_op(
     probs: torch.Tensor,
     top_k: torch.Tensor,
@@ -155,7 +118,6 @@ def top_k_sampling_from_probs_op(
     return tokens
 
 
-@_compiler_disable
 def top_p_sampling_from_probs_op(
     probs: torch.Tensor,
     top_p: torch.Tensor,
@@ -188,7 +150,6 @@ def top_p_sampling_from_probs_op(
 # the PDL env decision.
 
 
-@_compiler_disable
 def softmax_op(
     logits: torch.Tensor,
     temperature: Optional[torch.Tensor],
@@ -199,7 +160,6 @@ def softmax_op(
     return probs
 
 
-@_compiler_disable
 def top_k_mask_logits_op(
     logits: torch.Tensor,
     top_k: torch.Tensor,
@@ -208,7 +168,6 @@ def top_k_mask_logits_op(
     return masked
 
 
-@_compiler_disable
 def top_p_renorm_probs_op(
     probs: torch.Tensor,
     top_p: torch.Tensor,
@@ -217,7 +176,6 @@ def top_p_renorm_probs_op(
     return renormed
 
 
-@_compiler_disable
 def compute_probs_from_logits_op(
     logits: torch.Tensor,
     temperatures: torch.Tensor,

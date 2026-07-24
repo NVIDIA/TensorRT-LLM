@@ -91,12 +91,6 @@ class PARDWorker(SpecWorkerBase):
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if getattr(spec_config, "sa_config", None) is not None:
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
-        # Deferred kv_lens_cuda rewind state (see _prepare_kv_for_draft_forward,
-        # _apply_kv_rewind_after_draft, _ensure_spec_dec_state_restored).
-        self._kv_rewind_pending = False
-        self._kv_rewind_amount = None
-        self._kv_rewind_nc = None
-        self._kv_rewind_bs = None
         logger.info(
             f"PARDWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
@@ -150,7 +144,6 @@ class PARDWorker(SpecWorkerBase):
 
             if batch_size > num_contexts:
                 attn_metadata.kv_lens_cuda[num_contexts:batch_size] += 1
-            self._kv_rewind_pending = True
 
             attn_metadata.update_for_spec_dec()
 
@@ -162,32 +155,17 @@ class PARDWorker(SpecWorkerBase):
         by prepare_for_spec_dec) to avoid cumulative shrinkage.  Applied during
         capture and normal inference.
         """
-        self._kv_rewind_pending = False
         is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
         if is_warmup:
-            # kv_lens_cuda was saved by prepare_for_spec_dec in this mode and
-            # is restored wholesale, so no rewind is needed.
             return
 
-        if self._kv_rewind_amount is not None and hasattr(attn_metadata, "kv_lens_cuda"):
+        if hasattr(self, "_kv_rewind_amount") and hasattr(attn_metadata, "kv_lens_cuda"):
             nc = self._kv_rewind_nc
             bs = self._kv_rewind_bs
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
             attn_metadata.kv_lens_cuda[nc:bs].clamp_(min=0)
 
-    def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
-        # Restore first (in warmup mode kv_lens_cuda was saved and comes back
-        # wholesale), then apply any pending rewind for the other modes so a
-        # failed draft forward does not leave kv_lens_cuda incremented.
-        super()._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
-        if (
-            getattr(self, "_kv_rewind_pending", False)
-            and attn_metadata is not None
-            and spec_metadata is not None
-        ):
-            self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
-
-    def _forward_impl(
+    def forward(
         self,
         input_ids,
         position_ids,
@@ -218,8 +196,25 @@ class PARDWorker(SpecWorkerBase):
 
         self._execute_guided_decoder_if_present(logits)
 
-        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
-            logits, attn_metadata, spec_metadata
+        # draft_tokens buffer has (2K-1) entries per gen request; extract the K real drafts
+        if num_gens > 0:
+            draft_tokens = spec_metadata.draft_tokens[: num_gens * (2 * K - 1)]
+            draft_tokens = draft_tokens.reshape(num_gens, 2 * K - 1)[:, :K]
+        else:
+            draft_tokens = spec_metadata.draft_tokens.reshape(0, K)
+
+        # logits have 2K entries per gen request; extract K+1 for acceptance
+        if num_gens > 0:
+            ctx_logits = logits[:num_contexts]
+            vocab_size = logits.shape[-1]
+            gen_logits_2k = logits[num_contexts:].reshape(num_gens, 2 * K, vocab_size)
+            gen_logits_kp1 = gen_logits_2k[:, : K + 1, :].reshape(-1, vocab_size)
+            logits_for_accept = torch.cat([ctx_logits, gen_logits_kp1], dim=0)
+        else:
+            logits_for_accept = logits
+
+        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+            logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
         )
 
         # Pad accepted_tokens from (batch, K+1) to (batch, 2K) to match sampler buffer
@@ -290,12 +285,14 @@ class PARDWorker(SpecWorkerBase):
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                gen_draft_tokens = self.sample_draft_tokens(
-                    gen_logits,
-                    spec_metadata,
-                    batch_size,
-                    num_contexts=num_contexts,
-                )
+                # Use torch.argmax directly to avoid cute_argmax stride issues
+                d2t = getattr(draft_model.model, "d2t", None)
+                gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
+
+                if d2t is not None:
+                    gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
+
+                gen_draft_tokens = gen_draft_tokens.type(torch.int32)
 
                 if self.sa_enhancer is not None and sa_manager is not None:
                     gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
@@ -316,12 +313,6 @@ class PARDWorker(SpecWorkerBase):
 
         else:
             gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
-
-        # Context requests are not drafted by the block worker (zero placeholder
-        # token); fill their draft-prob slot rows with a one-hot placeholder so
-        # they are a legal distribution when they become gen requests next iter.
-        gen_vocab = vocab_size if num_gens > 0 else None
-        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, gen_vocab)
 
         if num_contexts > 0 and num_gens > 0:
             ctx_draft_tokens = torch.zeros(
@@ -356,26 +347,23 @@ class PARDWorker(SpecWorkerBase):
             "next_new_tokens": next_new_tokens,
         }
 
-    def _reshape_draft_tokens_for_accept(self, spec_metadata, num_gens, device):
-        # draft_tokens buffer has (2K-1) entries per gen request; extract the K real drafts.
-        K = spec_metadata.runtime_draft_len
-        if num_gens > 0:
-            draft_tokens = spec_metadata.draft_tokens[: num_gens * (2 * K - 1)]
-            return draft_tokens.reshape(num_gens, 2 * K - 1)[:, :K]
-        # Context-only batch: return an empty view without reshaping the
-        # (possibly preallocated, non-empty) draft_tokens buffer.
-        return torch.empty((0, K), dtype=torch.int32, device=device)
+    def draft_decoder(
+        self,
+        logits: torch.Tensor,
+        draft_model: nn.Module,
+    ):
+        """
+        Sample draft tokens using greedy decoding.
 
-    def _reshape_logits_for_accept(self, logits, num_contexts, num_gens, spec_metadata):
-        # logits have 2K entries per gen request; extract K+1 for acceptance.
-        if num_gens == 0:
-            return logits
-        K = spec_metadata.runtime_draft_len
-        ctx_logits = logits[:num_contexts]
-        vocab_size = logits.shape[-1]
-        gen_logits_2k = logits[num_contexts:].reshape(num_gens, 2 * K, vocab_size)
-        gen_logits_kp1 = gen_logits_2k[:, : K + 1, :].reshape(-1, vocab_size)
-        return torch.cat([ctx_logits, gen_logits_kp1], dim=0)
+        Args:
+            logits: [num_tokens, vocab_size] from the draft model.
+            draft_model: The draft model (used to read the d2t mapping).
+
+        Returns:
+            draft_tokens: [batch_size * max_draft_len] flattened token ids.
+        """
+        d2t = getattr(draft_model.model, "d2t", None)
+        return self._draft_sampler_greedy(logits, d2t)
 
     def prepare_1st_drafter_inputs(
         self,

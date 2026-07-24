@@ -97,17 +97,6 @@ def test_s3_stdout_echo_requires_explicit_opt_in():
         context = lines[max(0, idx - 3):idx]
         assert any('if (ENABLE_S3_ECHO_STDOUT)' in line for line in context)
 
-    progress_lines = [
-        idx for idx, line in enumerate(lines)
-        if 'console_output_style=progress-even-when-capture-no' in line
-    ]
-    assert progress_lines, 'Expected upload-only pytest progress configuration'
-
-    for idx in progress_lines:
-        context = lines[max(0, idx - 3):idx]
-        assert any('if (ENABLE_UPLOAD_TEST_RESULTS)' in line
-                   for line in context)
-
 
 @pytest.mark.skip(reason="https://nvbugs/5547275")
 @pytest.mark.parametrize("direction",
@@ -193,22 +182,17 @@ def test_search_functionality(stage_query, sample_test_cases):
 
 
 @pytest.mark.parametrize('file_format', ['txt', 'yml'])
-def test_cli_functionality(tmp_path, stage_query, sample_test_cases,
-                           file_format):
+def test_cli_functionality(tmp_path, sample_test_cases, file_format):
     """Test CLI functionality with sample data."""
-    # Use the first sample that maps to at least one stage (some test-db
-    # files, e.g. multi-node perf-sanity lists, have no L0 stage).
-    test_case = next(
-        (t for t in sample_test_cases if stage_query.tests_to_stages([t])),
-        None)
-    if test_case is None:
-        pytest.skip("No sampled test maps to any stage")
+    if not sample_test_cases:
+        pytest.skip("No test cases available")
 
+    # Use only first sample for CLI test
     test_file = tmp_path / f'sample_tests.{file_format}'
     if file_format == 'txt':
-        test_file.write_text(f'{test_case}\n')
+        test_file.write_text(f'{sample_test_cases[0]}\n')
     else:  # yml
-        test_file.write_text(f'- {test_case}\n')
+        test_file.write_text(f'- {sample_test_cases[0]}\n')
 
     script = os.path.join(SCRIPTS_DIR, 'test_to_stage_mapping.py')
     cmd = [sys.executable, script, '--test-list', str(test_file)]
@@ -216,7 +200,7 @@ def test_cli_functionality(tmp_path, stage_query, sample_test_cases,
     lines = output.decode().strip().splitlines()
 
     # Should return at least one stage
-    assert lines, f"No stages returned for test '{test_case}'"
+    assert lines, f"No stages returned for test '{sample_test_cases[0]}'"
 
 
 def test_backend_filtering_consistency(stage_query):
@@ -262,15 +246,8 @@ def test_backend_filtering_consistency(stage_query):
                 f"at least one stage containing '{backend.upper()}', " \
                 f"but got stages: {stages}"
 
-            # Check that test does NOT map to stages of backends it is not
-            # declared under (tests may legitimately be listed under several
-            # backends across test-db files).
-            declared_backends = {
-                b.strip()
-                for _, _, b in stage_query.test_map[test_name]
-                if b and b.strip()
-            }
-            other_backends = all_backends - declared_backends
+            # Check that test does NOT map to stages of other backends
+            other_backends = all_backends - {backend}
             for stage in stages:
                 stage_upper = stage.upper()
                 for other_backend in other_backends:

@@ -171,7 +171,7 @@ can simply read a line and assume a complete entry. When creating a dataset, be 
 JSON entry is on every line.
 ```
 
-In order to prepare a synthetic dataset, you can use the provided script in the `benchmarks`
+In order to prepare a synthetic dataset, you can use the provided script in the `benchmarks/cpp`
 directory. For example, to generate a synthetic dataset of 1000 requests with a uniform ISL/OSL of
 128/128 for [meta-llama/Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B), run:
 

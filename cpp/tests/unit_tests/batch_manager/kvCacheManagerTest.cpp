@@ -26,7 +26,6 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
@@ -175,8 +174,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0,
-        maxAttentionWindow);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, maxAttentionWindow);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -312,7 +310,7 @@ void writePatternToOffloadedBlocksGDS(
     }
 }
 
-template <typename T, tensorrt_llm::DataType type, int mask, KvCacheTransferMode transferMode>
+template <typename T, nvinfer1::DataType type, int mask, KvCacheTransferMode transferMode>
 void runPartialCopyTest()
 {
     auto constexpr numLayers = 12;
@@ -523,59 +521,59 @@ void runPartialCopyTest()
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyINT64)
 {
-    runPartialCopyTest<std::uint64_t, tensorrt_llm::DataType::kINT64, -1, KvCacheTransferMode::DRAM>();
-    runPartialCopyTest<std::uint64_t, tensorrt_llm::DataType::kINT64, -1, KvCacheTransferMode::GDS>();
+    runPartialCopyTest<std::uint64_t, nvinfer1::DataType::kINT64, -1, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint64_t, nvinfer1::DataType::kINT64, -1, KvCacheTransferMode::GDS>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyINT32)
 {
-    runPartialCopyTest<std::uint32_t, tensorrt_llm::DataType::kINT32, -1, KvCacheTransferMode::DRAM>();
-    runPartialCopyTest<std::uint32_t, tensorrt_llm::DataType::kINT32, -1, KvCacheTransferMode::GDS>();
+    runPartialCopyTest<std::uint32_t, nvinfer1::DataType::kINT32, -1, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint32_t, nvinfer1::DataType::kINT32, -1, KvCacheTransferMode::GDS>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyFLOAT)
 {
-    runPartialCopyTest<std::uint32_t, tensorrt_llm::DataType::kFLOAT, -1, KvCacheTransferMode::DRAM>();
-    runPartialCopyTest<std::uint32_t, tensorrt_llm::DataType::kFLOAT, -1, KvCacheTransferMode::GDS>();
+    runPartialCopyTest<std::uint32_t, nvinfer1::DataType::kFLOAT, -1, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint32_t, nvinfer1::DataType::kFLOAT, -1, KvCacheTransferMode::GDS>();
 }
 
 #ifdef ENABLE_BF16
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyBF16)
 {
-    runPartialCopyTest<std::uint16_t, tensorrt_llm::DataType::kBF16, 65535, KvCacheTransferMode::DRAM>();
-    runPartialCopyTest<std::uint16_t, tensorrt_llm::DataType::kBF16, 65535, KvCacheTransferMode::GDS>();
+    runPartialCopyTest<std::uint16_t, nvinfer1::DataType::kBF16, 65535, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint16_t, nvinfer1::DataType::kBF16, 65535, KvCacheTransferMode::GDS>();
 }
 #endif
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyHALF)
 {
-    runPartialCopyTest<std::uint16_t, tensorrt_llm::DataType::kHALF, 65535, KvCacheTransferMode::DRAM>();
-    runPartialCopyTest<std::uint16_t, tensorrt_llm::DataType::kHALF, 65535, KvCacheTransferMode::GDS>();
+    runPartialCopyTest<std::uint16_t, nvinfer1::DataType::kHALF, 65535, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint16_t, nvinfer1::DataType::kHALF, 65535, KvCacheTransferMode::GDS>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyBOOL)
 {
-    runPartialCopyTest<std::uint8_t, tensorrt_llm::DataType::kBOOL, 255, KvCacheTransferMode::DRAM>();
-    runPartialCopyTest<std::uint8_t, tensorrt_llm::DataType::kBOOL, 255, KvCacheTransferMode::GDS>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kBOOL, 255, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kBOOL, 255, KvCacheTransferMode::GDS>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyUINT8)
 {
-    runPartialCopyTest<std::uint8_t, tensorrt_llm::DataType::kUINT8, 255, KvCacheTransferMode::DRAM>();
-    runPartialCopyTest<std::uint8_t, tensorrt_llm::DataType::kUINT8, 255, KvCacheTransferMode::GDS>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kUINT8, 255, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kUINT8, 255, KvCacheTransferMode::GDS>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyINT8)
 {
-    runPartialCopyTest<std::uint8_t, tensorrt_llm::DataType::kINT8, 255, KvCacheTransferMode::DRAM>();
-    runPartialCopyTest<std::uint8_t, tensorrt_llm::DataType::kINT8, 255, KvCacheTransferMode::GDS>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kINT8, 255, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kINT8, 255, KvCacheTransferMode::GDS>();
 }
 
 #ifdef ENABLE_FP8
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyFP8)
 {
-    runPartialCopyTest<std::uint8_t, tensorrt_llm::DataType::kFP8, 255, KvCacheTransferMode::DRAM>();
-    runPartialCopyTest<std::uint8_t, tensorrt_llm::DataType::kFP8, 255, KvCacheTransferMode::GDS>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kFP8, 255, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kFP8, 255, KvCacheTransferMode::GDS>();
 }
 #endif
 
@@ -733,8 +731,8 @@ TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)
 
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
     KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, false,
-        stream, maxAttentionWindow, maxAttentionWindow, true);
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, false, stream,
+        maxAttentionWindow, maxAttentionWindow, true);
 
     // Add sequence [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16] (17 tokens, three blocks)
     auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
@@ -785,8 +783,8 @@ TEST_F(KVCacheManagerTest, FP4BlockScaleManagementTest)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kFP4, false,
-        stream, maxAttentionWindow, maxAttentionWindow, true);
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kFP4, false, stream,
+        maxAttentionWindow, maxAttentionWindow, true);
 
     kvCacheManager.allocatePools(/*useUvm=*/false);
 
@@ -825,14 +823,14 @@ TEST_F(KVCacheManagerTest, FP4AttentionWithHalfRecurrentStatesPoolTest)
         {maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
     };
     auto const poolConfigurations = std::vector<PoolConfiguration>{
-        {recurrentStatesWindow, sizePerHead, tensorrt_llm::DataType::kHALF},
-        {maxAttentionWindow, sizePerHead, tensorrt_llm::DataType::kFP4},
+        {recurrentStatesWindow, sizePerHead, nvinfer1::DataType::kHALF},
+        {maxAttentionWindow, sizePerHead, nvinfer1::DataType::kFP4},
     };
     auto const stream = std::make_shared<tr::CudaStream>();
 
     KVCacheManager kvCacheManager(std::vector<SizeType32>{0, numKvHeads}, sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, std::vector<SizeType32>{recurrentStatesWindow, maxAttentionWindow},
-        tensorrt_llm::DataType::kFP4,
+        nvinfer1::DataType::kFP4,
         /*sinkTokenLength=*/0, stream, maxAttentionWindow, /*chunkSize=*/0, /*enableBlockReuse=*/false,
         CacheType::kSELF, std::nullopt, nullptr, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr,
         /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
@@ -840,13 +838,13 @@ TEST_F(KVCacheManagerTest, FP4AttentionWithHalfRecurrentStatesPoolTest)
     kvCacheManager.allocatePools(/*useUvm=*/false);
     auto const& blockManager = kvCacheManager.getBlockManager();
 
-    EXPECT_EQ(blockManager.getDataTypeForWindow(recurrentStatesWindow), tensorrt_llm::DataType::kHALF);
-    EXPECT_EQ(blockManager.getDataTypeForWindow(maxAttentionWindow), tensorrt_llm::DataType::kFP4);
+    EXPECT_EQ(blockManager.getDataTypeForWindow(recurrentStatesWindow), nvinfer1::DataType::kHALF);
+    EXPECT_EQ(blockManager.getDataTypeForWindow(maxAttentionWindow), nvinfer1::DataType::kFP4);
 
     auto const& recurrentStatesPool = blockManager.getRecurrentStatesPool();
     ASSERT_NE(recurrentStatesPool.primaryPtr, nullptr);
-    EXPECT_EQ(recurrentStatesPool.primaryPtr->getDataType(), tensorrt_llm::DataType::kHALF);
-    auto const recurrentStatesElementsPerBlock = recurrentStatesBytes / tc::getDTypeSize(tensorrt_llm::DataType::kHALF);
+    EXPECT_EQ(recurrentStatesPool.primaryPtr->getDataType(), nvinfer1::DataType::kHALF);
+    auto const recurrentStatesElementsPerBlock = recurrentStatesBytes / tc::getDTypeSize(nvinfer1::DataType::kHALF);
     EXPECT_EQ(recurrentStatesPool.blockSize, recurrentStatesElementsPerBlock);
 
     SizeType32 numRecurrentScalePools = 0;
@@ -907,8 +905,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0,
-        maxAttentionWindow);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, maxAttentionWindow);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -1243,8 +1240,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0,
-        maxAttentionWindow);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, maxAttentionWindow);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -1479,8 +1475,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0,
-        maxAttentionWindow);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, maxAttentionWindow);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -1684,8 +1679,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0,
-        maxAttentionWindow);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, maxAttentionWindow);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -1978,8 +1972,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0,
-        maxAttentionWindow);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, maxAttentionWindow);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -2248,8 +2241,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0,
-        maxAttentionWindow);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, maxAttentionWindow);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -2481,7 +2473,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerPerRequestStatsTest)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength, true);
     kvCacheManager.allocatePools(false);
 
@@ -2538,8 +2530,7 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0,
-        maxAttentionWindow);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, maxAttentionWindow);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -2677,7 +2668,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeBlockPriorityTest)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength, true);
     kvCacheManager.allocatePools(false);
 
@@ -2784,7 +2775,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerTimedEvictionTest)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength, true);
     kvCacheManager.allocatePools(false);
 
@@ -2856,7 +2847,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength, true);
     kvCacheManager.allocatePools(false);
     {
@@ -2949,7 +2940,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength, true);
     kvCacheManager.allocatePools(false);
 
@@ -3046,7 +3037,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerStoreContextBlocksUsesMaterializedConte
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, /*chunkSize*/ 0, true);
     kvCacheManager.allocatePools(false);
 
@@ -3090,7 +3081,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerReleaseBlocksUsesMaterializedContextExt
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, /*chunkSize*/ 0, true);
     kvCacheManager.allocatePools(false);
 
@@ -3132,7 +3123,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockTest)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength, true);
     kvCacheManager.allocatePools(false);
 
@@ -3217,7 +3208,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength, true);
     kvCacheManager.allocatePools(false);
 
@@ -3321,7 +3312,7 @@ TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerAllocationTest)
     auto constexpr maxNumSequences = 8;
     auto constexpr maxBeamWidth = 4;
     auto constexpr sinkTokenLength = 0;
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
 
     auto constexpr maxSequenceLength = tokensPerBlock * maxBlocksPerSeq;
@@ -3344,12 +3335,11 @@ TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerAllocationTest)
 
     KVCacheManager kvCacheManager = homogeneousLayers
         ? KVCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-            maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
+            maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF,
             sinkTokenLength, stream, maxSequenceLength, maxSequenceLength, enableBlockReuse)
         : KVCacheManager(std::vector<KVCacheManager::SizeType32>(numLayers, numHeads), sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-            tensorrt_llm::DataType::kHALF, sinkTokenLength, stream, maxSequenceLength, maxSequenceLength,
-            enableBlockReuse);
+            nvinfer1::DataType::kHALF, sinkTokenLength, stream, maxSequenceLength, maxSequenceLength, enableBlockReuse);
 
     auto const& blockManager = kvCacheManager.getBlockManager();
     auto const& bufferManager = blockManager.getBufferManager(theOnlyWindowSize(kvCacheManager));
@@ -3420,10 +3410,10 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
 
     KVCacheManager kvCacheManager = homogeneousLayers
         ? KVCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-            maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
+            maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF,
             sinkTokenLength, stream, maxSequenceLength, maxSequenceLength, enableBlockReuse)
         : KVCacheManager(numHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
-            std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, sinkTokenLength,
+            std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, sinkTokenLength,
             stream, maxSequenceLength, maxSequenceLength, enableBlockReuse);
     kvCacheManager.allocatePools(false);
 
@@ -3590,12 +3580,11 @@ TEST_P(KVCacheManagerTest, KVCacheManagerRewindTokensTest)
 
     KVCacheManager kvCacheManager = homogeneousLayers
         ? KVCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-            maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
+            maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF,
             sinkTokenLength, stream, maxSequenceLength, maxSequenceLength, enableBlockReuse)
         : KVCacheManager(std::vector<KVCacheManager::SizeType32>(numLayers, numHeads), sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-            tensorrt_llm::DataType::kHALF, sinkTokenLength, stream, maxSequenceLength, maxSequenceLength,
-            enableBlockReuse);
+            nvinfer1::DataType::kHALF, sinkTokenLength, stream, maxSequenceLength, maxSequenceLength, enableBlockReuse);
     kvCacheManager.allocatePools(false);
 
     EXPECT_EQ(kvCacheManager.getTokensPerBlock(), tokensPerBlock);
@@ -3699,10 +3688,10 @@ TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
 
     KVCacheManager kvCacheManager = homogeneousLayers
         ? KVCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-            maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
+            maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF,
             sinkTokenLength, stream, maxSequenceLength, maxSequenceLength, enableBlockReuse)
         : KVCacheManager(numHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
-            std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, sinkTokenLength,
+            std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, sinkTokenLength,
             stream, maxSequenceLength, maxSequenceLength, enableBlockReuse);
     kvCacheManager.allocatePools(false);
 
@@ -3823,7 +3812,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowSmallerThanBlockSizeT
 
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
+        maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF,
         sinkTokenLength, stream, maxSequenceLength, maxSequenceLength, enableBlockReuse);
     kvCacheManager.allocatePools(false);
 
@@ -3917,7 +3906,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     auto constexpr blocksInPrimaryPool = 8;
     auto constexpr blocksInSecondaryPool = 2;
 
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
 
     auto constexpr beamWidth = 1;
@@ -4101,7 +4090,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
+        maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF,
         sinkTokenLength, stream, maxSequenceLength, /*chunkSize=*/tokensPerBlock, enableBlockReuse);
     kvCacheManager.allocatePools(false);
 
@@ -4228,7 +4217,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSWAInvalidateReuseTest)
     auto constexpr maxNumSequences = 8;
     auto constexpr maxBeamWidth = 1;
     auto constexpr sinkTokenLength = 0;
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr maxSequenceLength = 128;
     SizeType32 constexpr maxNewTokens = 40;
@@ -4311,7 +4300,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     auto constexpr maxNumSequences = 8;
     auto constexpr maxBeamWidth = 1;
     auto constexpr sinkTokenLength = 0;
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr maxSequenceLength = 128;
 
@@ -4437,7 +4426,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamOverflow)
     auto constexpr blocksInPrimaryPool = 8;
     auto constexpr blocksInSecondaryPool = 2;
 
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
 
     auto constexpr beamWidth = 1;
@@ -4497,7 +4486,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamPriority)
     auto constexpr blocksInPrimaryPool = 8;
     auto constexpr blocksInSecondaryPool = 2;
 
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
 
     auto constexpr beamWidth = 1;
@@ -4574,7 +4563,7 @@ TEST_F(KVCacheManagerTest, GetPriorityByBlockId)
     auto constexpr maxAttentionWindow = 32;
     auto constexpr maxNumSequences = 4;
     auto constexpr beamWidth = 1;
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
     SizeType32 constexpr maxNewTokens = 4;
     tr::SamplingConfig const samplingConfig{beamWidth};
@@ -4640,7 +4629,7 @@ TEST_F(KVCacheManagerTest, CommitAndGetBlockHashesForRequest)
     auto constexpr maxNumSequences = 4;
     auto constexpr beamWidth = 1;
     auto constexpr beamIdx = 0;
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
     SizeType32 constexpr maxNewTokens = 8;
     tr::SamplingConfig const samplingConfig{beamWidth};
@@ -4766,7 +4755,7 @@ TEST_F(KVCacheManagerTest, CommitAndGetBlockHashesFrontRunsTrailingFullBlock)
     auto constexpr maxNumSequences = 4;
     auto constexpr beamWidth = 1;
     auto constexpr beamIdx = 0;
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
     SizeType32 constexpr maxNewTokens = 8;
     tr::SamplingConfig const samplingConfig{beamWidth};
@@ -4882,7 +4871,7 @@ TEST_F(KVCacheManagerTest, PinAndUnpinBlocksById)
     BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxAttentionWindow, maxAttentionWindow, true);
     kvCacheManager.allocatePools(false);
 
@@ -4934,7 +4923,7 @@ TEST_F(KVCacheManagerTest, StoreBlocksForReuseWithPinDoesNotCreateGhostFreeBlock
     BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxAttentionWindow, maxAttentionWindow, true /* enableBlockReuse */);
     kvCacheManager.allocatePools(false);
 
@@ -5006,7 +4995,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamBlocking)
     auto constexpr blocksInPrimaryPool = 8;
     auto constexpr blocksInSecondaryPool = 2;
 
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
 
     auto constexpr beamWidth = 1;
@@ -5026,7 +5015,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamBlocking)
     EXPECT_EQ(getEvents(kvCacheManagerTest).size(), 0);
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength, true, CacheType::kSELF, std::nullopt,
         std::make_unique<tlk::KVCacheEventManager>(1024));
 
@@ -5061,7 +5050,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamWindowSize)
     auto blocksInPool = std::vector<SizeType32>{8, 2};
     auto blocksInSlidingWindowPool = std::vector<SizeType32>{4, 2};
 
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
 
     auto constexpr beamWidth = 1;
@@ -5120,11 +5109,10 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
 
     auto pool = KVCacheBlockPool(0, 2, 0, 0, 0);
 
-    pool.primaryPtr = bufferManager.gpu(tr::ITensor::makeShape({1, blockSize}), tensorrt_llm::DataType::kFLOAT);
+    pool.primaryPtr = bufferManager.gpu(tr::ITensor::makeShape({1, blockSize}), nvinfer1::DataType::kFLOAT);
     bufferManager.setZero(*pool.primaryPtr);
 
-    pool.secondaryPtr
-        = tr::BufferManager::pinned(tr::ITensor::makeShape({1, blockSize}), tensorrt_llm::DataType::kFLOAT);
+    pool.secondaryPtr = tr::BufferManager::pinned(tr::ITensor::makeShape({1, blockSize}), nvinfer1::DataType::kFLOAT);
 
     // Write some specific data into the cpu blocks.
     for (int i = 0; i < blockSize; i++)
@@ -5161,11 +5149,11 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerPendingTransfersDistinguishPrim
 
     auto pool = KVCacheBlockPool(0, 2, 0, 0, 0);
     pool.primaryPtr
-        = bufferManager.gpu(tr::ITensor::makeShape({kNumSlotsPerPool, kBlockSize}), tensorrt_llm::DataType::kFLOAT);
+        = bufferManager.gpu(tr::ITensor::makeShape({kNumSlotsPerPool, kBlockSize}), nvinfer1::DataType::kFLOAT);
     bufferManager.setZero(*pool.primaryPtr);
 
-    pool.secondaryPtr = tr::BufferManager::pinned(
-        tr::ITensor::makeShape({kNumSlotsPerPool, kBlockSize}), tensorrt_llm::DataType::kFLOAT);
+    pool.secondaryPtr
+        = tr::BufferManager::pinned(tr::ITensor::makeShape({kNumSlotsPerPool, kBlockSize}), nvinfer1::DataType::kFLOAT);
 
     auto primarySlot0 = std::make_shared<KVCacheBlock>(0, tk::KVCacheIndex(0, false));
     auto primarySlot1 = std::make_shared<KVCacheBlock>(1, tk::KVCacheIndex(1, false));
@@ -5252,10 +5240,10 @@ TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerSinkTokenLengthTest)
     auto const maxSequenceLength = tokensPerBlock * maxBlocksPerSeq;
     KVCacheManager kvCacheManager = homogeneousLayers
         ? KVCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-            maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
+            maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF,
             sinkTokenLength, stream, maxSequenceLength, maxSequenceLength, enableBlockReuse)
         : KVCacheManager(numHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
-            std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, sinkTokenLength,
+            std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, sinkTokenLength,
             stream, maxSequenceLength, maxSequenceLength, enableBlockReuse);
     kvCacheManager.allocatePools(false);
 
@@ -5414,10 +5402,10 @@ TEST_P(KVCacheManagerTest, KVCacheManagerBatchTest)
 
     KVCacheManager kvCacheManager = homogeneousLayers
         ? KVCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-            maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
+            maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF,
             sinkTokenLength, stream, maxSequenceLength, maxSequenceLength, enableBlockReuse)
         : KVCacheManager(numHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
-            std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, sinkTokenLength,
+            std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, sinkTokenLength,
             stream, maxSequenceLength, maxSequenceLength, enableBlockReuse);
     kvCacheManager.allocatePools(false);
 
@@ -5554,12 +5542,12 @@ void testNeededBlocksOneStep(bool kv_cache_block_reuse, int beamWidth, int draft
 
             KVCacheManager kvCacheManager = homogeneousLayers
                 ? KVCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-                    maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-                    tensorrt_llm::DataType::kHALF, sinkTokenLength, stream, maxSequenceLength,
+                    maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF,
+                    sinkTokenLength, stream, maxSequenceLength,
                     /*chunkSize=*/tokensPerBlock, kv_cache_block_reuse)
                 : KVCacheManager(numHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-                    maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-                    tensorrt_llm::DataType::kHALF, sinkTokenLength, stream, maxSequenceLength,
+                    maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF,
+                    sinkTokenLength, stream, maxSequenceLength,
                     /*chunkSize=*/tokensPerBlock, kv_cache_block_reuse);
             kvCacheManager.allocatePools(false);
 
@@ -5762,7 +5750,7 @@ struct KvCacheManagerInstantiationParameters
     SizeType32 maxNumTokens;
     bool kvCacheBlockReuse;
     std::vector<SizeType32> maxAttentionWindowVec = {maxAttentionWindow};
-    tensorrt_llm::DataType dtype = tensorrt_llm::DataType::kFLOAT;
+    nvinfer1::DataType dtype = nvinfer1::DataType::kFLOAT;
 };
 
 BlocksPerWindow blocksAndWindow(SizeType32 numPrimaryBlocks, SizeType32 windowSize)
@@ -7258,7 +7246,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedBatchedWithinWindow)
     auto constexpr maxNumSequences = 4;
     auto constexpr maxAttentionWindow = 32;
     auto constexpr beamWidth = 1;
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
     SizeType32 constexpr maxNewTokens{0};
     tr::SamplingConfig const samplingConfig{beamWidth};
@@ -7336,7 +7324,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedOrderedBeforeStore)
     auto constexpr maxNumSequences = 4;
     auto constexpr maxAttentionWindow = 32;
     auto constexpr beamWidth = 1;
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
     SizeType32 constexpr maxNewTokens{0};
     tr::SamplingConfig const samplingConfig{beamWidth};
@@ -7430,7 +7418,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStoreForDifferentWindowDoesNotFlus
     auto constexpr blocksInSecondaryPool = 0;
     auto constexpr maxNumSequences = 4;
     auto constexpr beamWidth = 1;
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
     SizeType32 constexpr maxNewTokens{0};
     tr::SamplingConfig const samplingConfig{beamWidth};
@@ -7543,8 +7531,7 @@ void testBlockManagerLinearAttention_ContextNoReuse(int beamWidth, int numTokens
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
-        0,
+        std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow}, nvinfer1::DataType::kHALF, 0,
         /*chunkSize*/ 0, CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr, std::nullopt, false, 128, 0,
         false, linearAttentionMetadata);
     blockManager.allocatePools(false);
@@ -7689,8 +7676,7 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow}, tensorrt_llm::DataType::kHALF,
-        0,
+        std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow}, nvinfer1::DataType::kHALF, 0,
         /*chunkSize*/ 0, CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr, std::nullopt, false, 128, 0,
         false, linearAttentionMetadata);
     blockManager.allocatePools(false);
@@ -7914,7 +7900,7 @@ void testKVCacheManagerLinearAttention_DecodingBlockGrowth(
         {linearWindowSizeCode, {blocksInPrimaryPool, blocksInSecondaryPool}}};
     KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
         beamWidth, std::vector<BlockManager::SizeType32>{linearWindowSizeCode},
-        /*dtype*/ tensorrt_llm::DataType::kHALF,
+        /*dtype*/ nvinfer1::DataType::kHALF,
         /*sinkTokenLen*/ sinkTokenLen,
         /*stream*/ stream,
         /*maxSequenceLength*/ maxAttentionWindow,
@@ -8026,7 +8012,7 @@ void testKVCacheManagerLinearAttention_BlockCopying(
         {linearWindowSizeCode, {blocksInPrimaryPool, blocksInSecondaryPool}}};
     KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
         beamWidth, std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow},
-        tensorrt_llm::DataType::kHALF, sinkTokenLen, stream, maxAttentionWindow, /*chunkSize*/ 0, enableContextReuse,
+        nvinfer1::DataType::kHALF, sinkTokenLen, stream, maxAttentionWindow, /*chunkSize*/ 0, enableContextReuse,
         CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr, false, 128, 0, false, linearAttentionMetadata);
     kvCacheManager.allocatePools(false);
 
@@ -8352,7 +8338,7 @@ TEST_F(KVCacheManagerTest, StaticLinearHybridAllocationTest)
     // Static-hybrid path requires block reuse to be disabled.
     tle::KvCacheConfig const kvCacheConfigDisabledReuse{/*enableBlockReuse=*/false};
     auto const blocksPerWindow
-        = KVCacheManager::calculateMaxNumBlocks(kvCacheConfigDisabledReuse, tensorrt_llm::DataType::kHALF,
+        = KVCacheManager::calculateMaxNumBlocks(kvCacheConfigDisabledReuse, nvinfer1::DataType::kHALF,
             numKvHeadsPerLayer, sizePerHead, tokensPerBlock, worldConfig, windowSizeToLayers, allottedPrimaryMemBytes,
             allottedSecondaryMemBytes, extraCostMemory, kvFactor, maxBatchSize, linearAttentionMetadata);
 
@@ -8371,7 +8357,7 @@ TEST_F(KVCacheManagerTest, StaticLinearHybridAllocationTest)
     // so the linear pool falls back to memory-budget-based sizing rather than maxBatchSize.
     tle::KvCacheConfig const kvCacheConfigEnabledReuse{/*enableBlockReuse=*/true};
     auto const dynamicBlocksPerWindow
-        = KVCacheManager::calculateMaxNumBlocks(kvCacheConfigEnabledReuse, tensorrt_llm::DataType::kHALF,
+        = KVCacheManager::calculateMaxNumBlocks(kvCacheConfigEnabledReuse, nvinfer1::DataType::kHALF,
             numKvHeadsPerLayer, sizePerHead, tokensPerBlock, worldConfig, windowSizeToLayers, allottedPrimaryMemBytes,
             allottedSecondaryMemBytes, extraCostMemory, kvFactor, maxBatchSize, linearAttentionMetadata);
     EXPECT_NE(std::get<0>(dynamicBlocksPerWindow.at(linearWindowSizeCode)), maxBatchSize);
@@ -8404,7 +8390,7 @@ static auto makeBatchTestKVCacheManager(std::shared_ptr<tensorrt_llm::runtime::C
 
     auto mgr = std::make_unique<KVCacheManager>(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-        tensorrt_llm::DataType::kHALF, 0, stream, maxAttentionWindow, /*chunkSize=*/maxAttentionWindow,
+        nvinfer1::DataType::kHALF, 0, stream, maxAttentionWindow, /*chunkSize=*/maxAttentionWindow,
         /*enableBlockReuse=*/true, CacheType::kSELF,
         /*secondaryOffloadMinPriority=*/std::nullopt,
         /*eventManager=*/nullptr,
@@ -8733,7 +8719,7 @@ TEST_F(KVCacheManagerTest, BatchAddSequence_NonLeafCopySourceTightPool)
 
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
     KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxAttentionWindow, /*chunkSize=*/maxAttentionWindow, /*enableBlockReuse=*/true, CacheType::kSELF,
         /*secondaryOffloadMinPriority=*/std::nullopt,
         /*eventManager=*/nullptr,
@@ -8890,7 +8876,7 @@ std::unique_ptr<KVCacheManager> makePriorityEvictionManager(
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, 0}}};
     auto mgr = std::make_unique<KVCacheManager>(kPE_NUM_LAYERS, kPE_NUM_HEADS, kPE_SIZE_PER_HEAD, kPE_TOKENS_PER_BLOCK,
         blocksPerWindow, kPE_MAX_NUM_SEQUENCES, kPE_BEAM_WIDTH,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxAttentionWindow, /*chunkSize=*/maxAttentionWindow, /*enableBlockReuse=*/true);
     mgr->allocatePools(false);
     return mgr;
@@ -9224,7 +9210,7 @@ std::unique_ptr<KVCacheManager> makeVSWAManager(
 {
     auto const blocksPerWindow = BlocksPerWindow{{kVSWA_ATTENTION_WINDOW, {blocksInPrimaryPool, 0}}};
     auto mgr = std::make_unique<KVCacheManager>(2, 2, 64, kVSWA_TOKENS_PER_BLOCK, blocksPerWindow, 8, kVSWA_BEAM_WIDTH,
-        std::vector<SizeType32>{kVSWA_ATTENTION_WINDOW}, tensorrt_llm::DataType::kHALF, 0, stream,
+        std::vector<SizeType32>{kVSWA_ATTENTION_WINDOW}, nvinfer1::DataType::kHALF, 0, stream,
         kVSWA_MAX_SEQUENCE_LENGTH, /*chunkSize=*/kVSWA_MAX_SEQUENCE_LENGTH, enableBlockReuse);
     mgr->allocatePools(false);
     return mgr;
@@ -9243,7 +9229,7 @@ std::unique_ptr<KVCacheManager> makeSmallWindowManager(
     SizeType32 constexpr kSmallMaxSeqLen = 128;
     auto const blocksPerWindow = BlocksPerWindow{{kSmallWindow, {blocksInPrimaryPool, 0}}};
     auto mgr = std::make_unique<KVCacheManager>(2, 2, 64, kSmallTpb, blocksPerWindow, 8, kVSWA_BEAM_WIDTH,
-        std::vector<SizeType32>{kSmallWindow}, tensorrt_llm::DataType::kHALF, 0, stream, kSmallMaxSeqLen,
+        std::vector<SizeType32>{kSmallWindow}, nvinfer1::DataType::kHALF, 0, stream, kSmallMaxSeqLen,
         /*chunkSize=*/kSmallMaxSeqLen, /*enableBlockReuse=*/true);
     mgr->allocatePools(false);
     return mgr;
@@ -9966,7 +9952,7 @@ TEST_F(KVCacheManagerTest, VSWAEvictedPlaceholderAnchorAllowsTrailingReuse)
 
     auto const blocksPerWindow = BlocksPerWindow{{window, {blocksInPrimaryPool, 0}}};
     KVCacheManager kvCacheManager(2, 2, 64, tpb, blocksPerWindow, 8, kVSWA_BEAM_WIDTH, std::vector<SizeType32>{window},
-        tensorrt_llm::DataType::kHALF, 0, stream,
+        nvinfer1::DataType::kHALF, 0, stream,
         /*maxSequenceLength=*/128, /*chunkSize=*/128, /*enableBlockReuse=*/true);
     kvCacheManager.allocatePools(false);
     auto const& blockManager = kvCacheManager.getBlockManager();
@@ -10102,7 +10088,7 @@ std::unique_ptr<KVCacheManager> makeConnectorTestKVCacheManager(
     auto mgr
         = std::make_unique<KVCacheManager>(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumSequences, beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-            /*dtype*/ tensorrt_llm::DataType::kHALF,
+            /*dtype*/ nvinfer1::DataType::kHALF,
             /*sinkTokenLength*/ 0, stream,
             /*maxSequenceLength*/ maxAttentionWindow,
             /*chunkSize*/ maxAttentionWindow,
@@ -10296,7 +10282,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTestPerWindowFallback)
     auto constexpr maxBeamWidth = 1;
     auto constexpr smallWindow = 1024;
     auto constexpr largeWindow = 4096;
-    auto constexpr scalarDtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr scalarDtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
     auto const maxAttentionWindowVec = std::vector<SizeType32>{smallWindow, largeWindow};
     auto const blocksPerWindow = BlocksPerWindow{
@@ -10344,7 +10330,7 @@ TEST(BaseKVCacheManagerCalculateMaxNumBlocks, PerWindowOverrideDivergesByteBudge
     uint64_t const allottedPrimaryMemBytes = static_cast<uint64_t>(1) << 30; // 1 GiB
     uint64_t const allottedSecondaryMemBytes = static_cast<uint64_t>(1) << 30;
     size_t const extraCostMemory = 0;
-    auto const dtype = tensorrt_llm::DataType::kHALF;
+    auto const dtype = nvinfer1::DataType::kHALF;
     tensorrt_llm::executor::KvCacheConfig const config{};
     tensorrt_llm::runtime::WorldConfig const worldConfig{};
 
@@ -10398,7 +10384,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSWAEvictionCountPerWindow)
     auto constexpr maxNumSequences = 4;
     auto constexpr maxBeamWidth = 1;
     auto constexpr sinkTokenLength = 0;
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr maxSequenceLength = 128;
     auto constexpr maxNewTokens = 40;
@@ -10488,7 +10474,7 @@ TEST_F(KVCacheManagerTest, GenerationRequestClearCacheBlocksPerWindowResetsOnlyT
 
     BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
         blocksPerWindow, maxNumSequences, stream, /*maxSequenceLength=*/fullWindow, maxBeamWidth, maxAttentionWindowVec,
-        tensorrt_llm::DataType::kHALF, /*sinkBubbleLength=*/0, /*chunkSize=*/0);
+        nvinfer1::DataType::kHALF, /*sinkBubbleLength=*/0, /*chunkSize=*/0);
     blockManager.allocatePools(/*useUvm=*/false);
 
     auto constexpr requestId = 7;
@@ -10541,7 +10527,7 @@ TEST_F(KVCacheManagerTest, VswaMixedHeadDimReuseSmoke)
     auto constexpr smallSizePerHead = 256;
     auto constexpr largeSizePerHead = 512;
     auto constexpr sinkTokenLength = 0;
-    auto constexpr dtype = tensorrt_llm::DataType::kHALF;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto constexpr maxSequenceLength = 64;
     auto constexpr maxNewTokens = 0;
     auto const stream = std::make_shared<tr::CudaStream>();
@@ -10647,12 +10633,11 @@ TEST_F(KVCacheManagerTest, VswaDisaggDtypeMismatchTriggersGuard)
     auto const maxAttentionWindowVec = std::vector<SizeType32>{smallWindow, largeWindow};
     auto const blocksPerWindow = BlocksPerWindow{
         {smallWindow, {blocksInPrimary, blocksInSecondary}}, {largeWindow, {blocksInPrimary, blocksInSecondary}}};
-    auto const poolConfigurations
-        = std::vector<PoolConfiguration>{{smallWindow, sizePerHead, tensorrt_llm::DataType::kHALF},
-            {largeWindow, sizePerHead, tensorrt_llm::DataType::kBF16}};
+    auto const poolConfigurations = std::vector<PoolConfiguration>{
+        {smallWindow, sizePerHead, nvinfer1::DataType::kHALF}, {largeWindow, sizePerHead, nvinfer1::DataType::kBF16}};
 
     auto kvCacheManager = std::make_unique<KVCacheManager>(numLayers, numKvHeads, sizePerHead, tokensPerBlock,
-        blocksPerWindow, maxNumSequences, maxBeamWidth, maxAttentionWindowVec, /*dtype=*/tensorrt_llm::DataType::kHALF,
+        blocksPerWindow, maxNumSequences, maxBeamWidth, maxAttentionWindowVec, /*dtype=*/nvinfer1::DataType::kHALF,
         sinkTokenLength, stream, maxSequenceLength,
         /*chunkSize=*/0, /*enableBlockReuse=*/false, CacheType::kSELF,
         /*secondaryOffloadMinPriority=*/std::nullopt, /*eventManager=*/nullptr,

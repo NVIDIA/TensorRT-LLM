@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/promptTuningParams.h"
+#include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 namespace tensorrt_llm::batch_manager
@@ -34,6 +35,10 @@ public:
     using ITensor = tensorrt_llm::runtime::ITensor;
     using TensorPtr = runtime::ITensor::SharedPtr;
     using TensorMap = runtime::StringPtrMap<runtime::ITensor>;
+
+    MedusaBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::BufferManager const& manager,
+        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
+        executor::DecodingConfig const& decodingConfig, runtime::TllmRuntime const& runtime);
 
     void reshape(SizeType32 numCtxSequences, SizeType32 numGenSequences, SizeType32 tokensPerStep);
 

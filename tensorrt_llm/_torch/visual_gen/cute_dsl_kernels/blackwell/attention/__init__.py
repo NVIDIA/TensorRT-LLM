@@ -13,17 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fmha import BlackwellFusedMultiHeadAttentionForward, make_thread_cooperative_group
-from .fmha_blockscaled import (
-    BlackwellFusedMultiHeadBlockScaledAttentionForward,
-    compact_fp4_data,
-    create_scale_factor_tensor,
-)
+from .fmha import cute_dsl_fmha_fwd
 
-__all__ = [
-    "BlackwellFusedMultiHeadAttentionForward",
-    "BlackwellFusedMultiHeadBlockScaledAttentionForward",
-    "compact_fp4_data",
-    "create_scale_factor_tensor",
-    "make_thread_cooperative_group",
-]
+__all__ = ["cute_dsl_fmha_fwd"]

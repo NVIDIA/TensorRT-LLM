@@ -15,8 +15,7 @@ from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
-                                  CppMambaHybridCacheManager,
-                                  MixedMambaHybridCacheManager)
+                                  CppMambaHybridCacheManager)
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
@@ -130,12 +129,6 @@ def create_kv_cache_transceiver(
     if cache_transceiver_config.transceiver_runtime == "auto":
         cache_transceiver_config.transceiver_runtime = None
 
-    if (cache_transceiver_config.transceiver_runtime != "PYTHON"
-            and isinstance(mamba_cache_manager, MixedMambaHybridCacheManager)):
-        raise ValueError(
-            "MixedMambaHybridCacheManager requires the Python transceiver "
-            "runtime in disaggregated serving.")
-
     _validate_disagg_inflight_cancel_config(cache_transceiver_config)
 
     if cache_transceiver_config.backend == "DEFAULT":
@@ -237,10 +230,6 @@ class KvCacheTransceiver(ABC):
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
 
-    def get_data_transceiver_state(self) -> bytes:
-        """Get the serialized DataTransceiverState (CacheState + CommState)."""
-        return b""
-
     def shutdown(self):
         """Shut down the transceiver and release registered resources."""
 
@@ -338,9 +327,6 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # not implemented, an empty placeholder to allow being invoked unconditionally
         ...
-
-    def get_data_transceiver_state(self) -> bytes:
-        return self.impl.get_serialized_data_transceiver_state()
 
     def get_disaggregated_params(self):
         # Cpp kv cache transceiver will set the disaggregated params to context response

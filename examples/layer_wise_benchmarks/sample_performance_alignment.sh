@@ -14,9 +14,8 @@ export TLLM_AUTOTUNER_CACHE_PATH="$PROFILE_DIR/sample_performance_alignment_cach
 mkdir -p -- "$PROFILE_DIR"
 mkdir -p -- "$(dirname -- "$TLLM_AUTOTUNER_CACHE_PATH")"
 
-trtllm-bench \
-    --model "$MODEL" \
-    prepare-dataset \
+python3 ../../benchmarks/cpp/prepare_dataset.py \
+    --tokenizer "$MODEL" \
     --stdout \
     --random-seed 42 \
     token-norm-dist \

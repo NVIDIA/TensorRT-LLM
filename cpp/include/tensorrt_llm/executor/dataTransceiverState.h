@@ -18,7 +18,6 @@
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
@@ -51,7 +50,7 @@ public:
     };
 
     CacheState(ModelConfig modelConfig, runtime::WorldConfig const& worldConfig,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableBlockReuse = false,
         bool enablePartialReuse = false, bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0,
         SizeType32 indexerKCacheQuantBlockSize = 128, bool indexerKCacheUseFp4 = false)
@@ -72,7 +71,7 @@ public:
 
     CacheState(std::vector<SizeType32> nbKvHeadPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
         int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false, bool enablePartialReuse = false,
         bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0, SizeType32 indexerKCacheQuantBlockSize = 128,
@@ -93,7 +92,7 @@ public:
 
     CacheState(SizeType32 nbAttentionLayers, SizeType32 nbKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
         int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false, bool enablePartialReuse = false,
         bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0, SizeType32 indexerKCacheQuantBlockSize = 128,
@@ -239,8 +238,8 @@ public:
         RnnModelConfig mModelConfig;
         /// Number of RNN layers per pipeline parallelism rank.
         std::vector<SizeType32> mLayerNumPerPP;
-        tensorrt_llm::DataType mConvStateDataType;
-        tensorrt_llm::DataType mSsmStateDataType;
+        nvinfer1::DataType mConvStateDataType;
+        nvinfer1::DataType mSsmStateDataType;
 
         [[nodiscard]] bool operator==(RnnCacheState const& other) const noexcept
         {
@@ -264,7 +263,7 @@ public:
         return mAttentionConfig;
     }
 
-    [[nodiscard]] tensorrt_llm::DataType const& getDataType() const
+    [[nodiscard]] nvinfer1::DataType const& getDataType() const
     {
         return mDataType;
     }
@@ -309,7 +308,7 @@ public:
     }
 
     void setRnnConfig(RnnModelConfig rnnModelConfig, std::vector<SizeType32> rnnLayerNumPerPP,
-        tensorrt_llm::DataType convStateDataType, tensorrt_llm::DataType ssmStateDataType)
+        nvinfer1::DataType convStateDataType, nvinfer1::DataType ssmStateDataType)
     {
         mRnnCacheState = RnnCacheState{
             std::move(rnnModelConfig), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType};
@@ -326,12 +325,12 @@ public:
         return getRnnCacheState().mModelConfig;
     }
 
-    [[nodiscard]] tensorrt_llm::DataType getConvStateDataType() const
+    [[nodiscard]] nvinfer1::DataType getConvStateDataType() const
     {
         return getRnnCacheState().mConvStateDataType;
     }
 
-    [[nodiscard]] tensorrt_llm::DataType getSsmStateDataType() const
+    [[nodiscard]] nvinfer1::DataType getSsmStateDataType() const
     {
         return getRnnCacheState().mSsmStateDataType;
     }
@@ -396,7 +395,7 @@ private:
     friend class tensorrt_llm::executor::Serialization;
     ModelConfig mModelConfig;
     ParallelConfig mParallelConfig;
-    tensorrt_llm::DataType mDataType;
+    nvinfer1::DataType mDataType;
     AttentionConfig mAttentionConfig;
     bool mEnableBlockReuse{false};
     bool mEnablePartialReuse{false};
@@ -619,22 +618,9 @@ public:
         return mCacheState.has_value() && mCacheState->hasRnnConfig();
     }
 
-    /// @brief Set only when exported via CacheTransceiver::getSerializedDataTransceiverState:
-    /// transfers driven by such a state have no LlmRequest on the sender.
-    [[nodiscard]] bool isArbitraryTransferState() const noexcept
-    {
-        return mIsArbitraryTransferState;
-    }
-
-    void setIsArbitraryTransferState(bool isArbitraryTransferState) noexcept
-    {
-        mIsArbitraryTransferState = isArbitraryTransferState;
-    }
-
     [[nodiscard]] bool operator==(DataTransceiverState const& other) const noexcept
     {
-        return mCacheState == other.mCacheState && mCommState == other.mCommState
-            && mIsArbitraryTransferState == other.mIsArbitraryTransferState;
+        return mCacheState == other.mCacheState && mCommState == other.mCommState;
     }
 
     [[nodiscard]] std::string toString() const
@@ -655,7 +641,6 @@ private:
     friend class Serialization;
     std::optional<kv_cache::CacheState> mCacheState;
     std::optional<kv_cache::CommState> mCommState;
-    bool mIsArbitraryTransferState{false};
 };
 
 } // namespace tensorrt_llm::executor

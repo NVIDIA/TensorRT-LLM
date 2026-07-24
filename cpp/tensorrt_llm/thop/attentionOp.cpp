@@ -18,7 +18,6 @@
 #include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/attentionWorkspace.h"
 #include "tensorrt_llm/common/dataType.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -1085,8 +1084,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
-    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-    bool const force_prepare_spec_dec_tree_mask)
+    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1125,7 +1123,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool const is_fp4_out = out_dtype == torch::kUInt8;
 
     RunnerPtr runner;
-    if (dtype == tensorrt_llm::DataType::kHALF)
+    if (dtype == nvinfer1::DataType::kHALF)
     {
         if (is_fp8_out)
         {
@@ -1141,13 +1139,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             runner = std::make_shared<Runner<half>>();
         }
     }
-    else if (dtype == tensorrt_llm::DataType::kFLOAT)
+    else if (dtype == nvinfer1::DataType::kFLOAT)
     {
         TLLM_CHECK(out_dtype == torch::kFloat32);
         runner = std::make_shared<Runner<float>>();
     }
 #ifdef ENABLE_BF16
-    else if (dtype == tensorrt_llm::DataType::kBF16)
+    else if (dtype == nvinfer1::DataType::kBF16)
     {
         if (is_fp8_out)
         {
@@ -1170,7 +1168,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
     auto op = std::make_shared<AttentionOp>();
     op->mType = dtype;
-    op->mFMHAForceFP32Acc = dtype == tensorrt_llm::DataType::kBF16;
+    op->mFMHAForceFP32Acc = dtype == nvinfer1::DataType::kBF16;
     op->mLayerIdx = local_layer_idx;
     op->mNumHeads = num_heads;
     op->mNumKVHeads = num_kv_heads;
@@ -1239,7 +1237,6 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     {
         op->mSpecDecodingTargetMaxGenLen = static_cast<int32_t>(spec_decoding_target_max_draft_tokens.value()) + 1;
     }
-    op->mForcePrepareSpecDecTreeMask = force_prepare_spec_dec_tree_mask;
 
     op->mUseSparseAttention = false;
     op->mUseTllmGenSparseAttentionPaged = false;
@@ -1434,7 +1431,7 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     }
 
     auto op = std::make_shared<AttentionOp>();
-    op->mType = tensorrt_llm::DataType::kHALF;
+    op->mType = nvinfer1::DataType::kHALF;
     op->mNumHeads = num_heads;
     op->mNumKVHeads = num_kv_heads;
     op->mHeadSize = head_size;

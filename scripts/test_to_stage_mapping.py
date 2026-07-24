@@ -47,7 +47,7 @@ def _load_tests_file(path: str) -> List[str]:
 
 
 # Regex to parse Jenkins stage configurations from Groovy files
-# Matches patterns like: "Stage-Name": ["platform", "yaml_file", split_id, split_count, gpu_count, node_count, runWithSbatch]
+# Matches patterns like: "Stage-Name": ["platform", "yaml_file", split_id, split_count, gpu_count]
 #
 # Pattern breakdown:
 #   "(?P<stage>[^"]+)"     - Captures stage name in quotes (group 'stage')
@@ -56,12 +56,10 @@ def _load_tests_file(path: str) -> List[str]:
 #   "[^"]+"              - Matches platform string in quotes (ignored)
 #   ,\s*                 - Matches comma with optional whitespace
 #   "(?P<yml>[^"]+)"     - Captures yaml filename in quotes (group 'yml')
-#   (?:,\s*(?:\d+|true|false))* - Matches zero or more comma-separated numbers or
-#                          booleans (split_id, split_count, gpu_count, node_count, runWithSbatch)
+#   (?:,\s*\d+)*         - Matches zero or more comma-separated numbers (split_id, split_count, gpu_count)
 #   \s*\]                - Matches closing bracket with optional whitespace
 _STAGE_RE = re.compile(
-    r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"(?:,\s*(?:\d+|true|false))*\s*\]'
-)
+    r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"(?:,\s*\d+)*\s*\]')
 
 
 def _extract_terms(entry):
@@ -87,8 +85,6 @@ class StageQuery:
         yaml_to_stages = defaultdict(list)
         with open(path, 'r') as f:
             for line in f:
-                if line.lstrip().startswith('//'):
-                    continue
                 m = _STAGE_RE.search(line)
                 if m:
                     stage = m.group('stage')

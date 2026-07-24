@@ -18,7 +18,6 @@
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/cuda_graph_grouped_gemm.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/kernels/lora/loraGroupGEMMParamFillRowReorderFusion.h"
@@ -152,11 +151,11 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     {
         outHiddenSizes[i] = output_hidden_sizes[i];
     }
-    tensorrt_llm::DataType loraRuntimeDataType;
+    nvinfer1::DataType loraRuntimeDataType;
     switch (input.scalar_type())
     {
-    case torch::kFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kHALF; break;
-    case torch::kBFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kBF16; break;
+    case torch::kFloat16: loraRuntimeDataType = nvinfer1::DataType::kHALF; break;
+    case torch::kBFloat16: loraRuntimeDataType = nvinfer1::DataType::kBF16; break;
     default: throw std::invalid_argument("Invalid dtype, only supports float16, bfloat16");
     }
 
@@ -222,11 +221,11 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
     auto* splitk_offsets_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(splitk_offsets.data_ptr()));
 
     // Get data type
-    tensorrt_llm::DataType loraRuntimeDataType;
+    nvinfer1::DataType loraRuntimeDataType;
     switch (dtype)
     {
-    case torch::kFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kHALF; break;
-    case torch::kBFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kBF16; break;
+    case torch::kFloat16: loraRuntimeDataType = nvinfer1::DataType::kHALF; break;
+    case torch::kBFloat16: loraRuntimeDataType = nvinfer1::DataType::kBF16; break;
     default: TORCH_CHECK(false, "Invalid dtype, only supports float16, bfloat16, got %s", c10::toString(dtype));
     }
 
@@ -302,11 +301,11 @@ void lora_group_gemm_param_fill_row_reorder_fusion(th::Tensor const& in_sizes, /
     int32_t const module_count = static_cast<int32_t>(in_sizes.size(0));
 
     // Get data type info
-    tensorrt_llm::DataType loraRuntimeDataType;
+    nvinfer1::DataType loraRuntimeDataType;
     switch (dtype)
     {
-    case torch::kFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kHALF; break;
-    case torch::kBFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kBF16; break;
+    case torch::kFloat16: loraRuntimeDataType = nvinfer1::DataType::kHALF; break;
+    case torch::kBFloat16: loraRuntimeDataType = nvinfer1::DataType::kBF16; break;
     default: TORCH_CHECK(false, "Invalid dtype, only supports float16, bfloat16, got %s", c10::toString(dtype));
     }
 

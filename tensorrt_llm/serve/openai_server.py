@@ -401,10 +401,6 @@ class OpenAIServer(_VideoRoutesMixin):
                     self._iteration_stats_buffer = deque(maxlen=max_buf)
                     self._iteration_stats_collector_task = asyncio.create_task(
                         self._iteration_stats_collector_loop())
-                    # Wake up the collector immediately so it processes the
-                    # initial stats emitted by the executor at startup (e.g.
-                    # cache_config_info).
-                    self._iteration_stats_wakeup_event.set()
                     logger.info(
                         "Started background iteration stats collector task")
 
@@ -795,9 +791,6 @@ class OpenAIServer(_VideoRoutesMixin):
                                methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
-        self.app.add_api_route("/v1/data_transceiver_state",
-                               self.data_transceiver_state,
-                               methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
@@ -1103,19 +1096,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/videos/{video_id}",
                                self.delete_video,
                                methods=["DELETE"])
-
-    async def data_transceiver_state(self) -> JSONResponse:
-        """Return the serialized DataTransceiverState as base64-encoded JSON."""
-        state = self.generator.get_data_transceiver_state()
-        if not state:
-            return JSONResponse(
-                status_code=404,
-                content={"error": "No transceiver state available"})
-        import base64
-        return JSONResponse(content={
-            "data_transceiver_state":
-            base64.b64encode(state).decode("utf-8")
-        })
 
     async def health(self) -> Response:
         if self._check_health():
@@ -1543,7 +1523,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 request.disaggregated_params)
 
             try:
-                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
@@ -1552,7 +1532,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
                 raw_messages = raw_body.get("messages", [])
-                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
@@ -1594,8 +1574,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise ValueError(
                     "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
                 )
-            if mm_data and mm_item_order:
-                prompt["mm_item_order"] = mm_item_order
 
             if request.mm_processor_kwargs:
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
@@ -1731,7 +1709,7 @@ class OpenAIServer(_VideoRoutesMixin):
             ]
 
             try:
-                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
@@ -1740,7 +1718,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
                 raw_messages = raw_body.get("messages", [])
-                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
@@ -1771,8 +1749,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise ValueError("Cannot use multimodal embeddings as input")
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
-                if mm_item_order:
-                    prompt["mm_item_order"] = mm_item_order
 
             promise = self.generator.generate_async(inputs=prompt, )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
@@ -2202,17 +2178,6 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.background:
                 logger.warning(
                     "Request.background is not supported yet, will fallback to foreground processing."
-                )
-
-            # Reject rather than silently ignore: with storage disabled
-            # (TRTLLM_RESPONSES_API_DISABLE_STORE, postproc workers, or
-            # multi-frontend serving) the previous response can never be
-            # resolved.
-            if request.previous_response_id is not None and not self.enable_store:
-                return self.create_error_response(
-                    err_type="InvalidRequestError",
-                    message=("'previous_response_id' requires response "
-                             "storage, which is disabled on this server."),
                 )
 
             # Get prev response

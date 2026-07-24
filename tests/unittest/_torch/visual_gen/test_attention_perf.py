@@ -64,7 +64,7 @@ _flash_attn4_available = _fa4_fwd is not None
 _cute_dsl_available = _cute_dsl_import_error is None
 
 
-def _require_attention_backend(backend: str) -> None:
+def _require_attention_backend(backend: str, head_dim: Optional[int] = None) -> None:
     if backend == "FA4" and not _flash_attn4_available:
         pytest.fail(
             "FlashAttention 4 backend is required for FA4 attention perf test"
@@ -82,6 +82,8 @@ def _require_attention_backend(backend: str) -> None:
         gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
         if gpu_arch not in ("sm_100a", "sm_103a"):
             pytest.skip("CUTEDSL attention perf test requires a supported Blackwell-class GPU")
+        if head_dim is not None and head_dim != 128:
+            pytest.skip("CUTEDSL attention perf test requires head_dim=128")
 
 
 # NVTX support for profiling
@@ -806,7 +808,7 @@ class TestWanAttentionPerformance:
         quant_attention_config: "QuantAttentionConfig | None",
     ):
         """Test that attention backend runs without errors."""
-        _require_attention_backend(backend)
+        _require_attention_backend(backend, head_dim)
 
         batch_size, num_heads, seq_len = 1, 24, 1024
 

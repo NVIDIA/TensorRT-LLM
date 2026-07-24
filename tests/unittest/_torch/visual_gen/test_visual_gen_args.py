@@ -120,48 +120,6 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
-    @pytest.mark.parametrize("v_block_size", [0, 1])
-    def test_supported_quant_config_cute_mxfp8(self, v_block_size):
-        attention = AttentionConfig(
-            backend="CUTEDSL",
-            quant_attention_config=QuantAttentionConfig(
-                qk_dtype="mxfp8",
-                v_dtype="fp8",
-                v_block_size=v_block_size,
-            ),
-        )
-
-        assert attention.quant_attention_config is not None
-        assert attention.quant_attention_config.v_block_size == v_block_size
-
-    @pytest.mark.parametrize("v_block_size", [0, 1])
-    def test_supported_quant_config_cute_nvfp4(self, v_block_size):
-        attention = AttentionConfig(
-            backend="CUTEDSL",
-            quant_attention_config=QuantAttentionConfig(
-                qk_dtype="nvfp4",
-                v_dtype="fp8",
-                v_block_size=v_block_size,
-            ),
-        )
-
-        assert attention.quant_attention_config is not None
-        assert attention.quant_attention_config.v_block_size == v_block_size
-
-    def test_blockscaled_qk_dtype_rejected_on_trtllm(self):
-        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
-            AttentionConfig(
-                backend="TRTLLM",
-                quant_attention_config=QuantAttentionConfig(qk_dtype="nvfp4"),
-            )
-
-    def test_sage_qk_block_size_rejected_on_cute(self):
-        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
-            AttentionConfig(
-                backend="CUTEDSL",
-                quant_attention_config=QuantAttentionConfig(qk_dtype="mxfp8", q_block_size=1),
-            )
-
 
 class TestPipelineRegistryUnique:
     """Guard against duplicate HF IDs across PIPELINE_REGISTRY entries.

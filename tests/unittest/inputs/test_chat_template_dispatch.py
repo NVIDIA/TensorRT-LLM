@@ -381,7 +381,7 @@ class TestServingChatTemplateGather:
         monkeypatch.setattr(
             rg,
             "parse_chat_messages_coroutines",
-            lambda messages, model_config, _: ([], fake_mm_coroutine(), [{}], None),
+            lambda messages, model_config, _: ([], fake_mm_coroutine(), [{}]),
         )
         # Must resolve the top-level model type, matching the serving call
         # sites (not the raw model_config.model_type).
@@ -427,7 +427,7 @@ class TestServingChatTemplateGather:
         monkeypatch.setattr(
             ru,
             "parse_chat_messages_coroutines",
-            lambda messages, model_config: ([], fake_mm_coroutine(), [{}], None),
+            lambda messages, model_config: ([], fake_mm_coroutine(), [{}]),
         )
         monkeypatch.setattr(ru, "resolve_top_level_model_type", lambda cfg: "resolved-model-type")
         monkeypatch.setattr(ru, "_get_chat_completion_function_tools", lambda tools: [])

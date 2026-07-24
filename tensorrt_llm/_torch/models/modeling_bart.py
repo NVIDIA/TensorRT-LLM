@@ -18,21 +18,20 @@ Covers ``BartForConditionalGeneration`` and ``MBartForConditionalGeneration``.
 
 Key differences from T5:
     - LayerNorm instead of RMSNorm.
-    - BART uses post-norm; mBART uses pre-norm and final stack norms.
+    - Post-norm (residual → add → LayerNorm) instead of pre-norm.
     - Learned absolute positional embeddings (not relative bias).
-    - The checkpoint selects the MLP activation (typically GELU for BART and
-      ReLU for mBART).
+    - GELU activation (not ReLU / gated).
     - Bias in attention and MLP projections.
-    - mBART scales token embeddings by sqrt(d_model).
+    - Embedding scale = sqrt(d_model).
 """
 
 import math
 from typing import Dict, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import BartConfig
-from transformers.activations import ACT2FN
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PredefinedAttentionMask
@@ -85,18 +84,6 @@ def _bart_decoder_num_layers(config: BartConfig) -> int:
 
 def _bart_head_dim(config: BartConfig) -> int:
     return config.d_model // config.encoder_attention_heads
-
-
-def _bart_normalize_before(config: BartConfig) -> bool:
-    return getattr(config, "model_type", None) == "mbart" or bool(
-        getattr(config, "normalize_before", False)
-    )
-
-
-def _bart_add_final_layer_norm(config: BartConfig) -> bool:
-    return getattr(config, "model_type", None) == "mbart" or bool(
-        getattr(config, "add_final_layer_norm", False)
-    )
 
 
 def _packed_position_ids(
@@ -180,7 +167,7 @@ class BartCrossAttention(CrossAttention):
 
 
 class BartEncoderLayer(nn.Module):
-    """BART/mBART encoder layer with configurable pre- or post-norm."""
+    """BART encoder layer: self-attention → add+LN → MLP → add+LN (post-norm)."""
 
     def __init__(
         self,
@@ -192,7 +179,6 @@ class BartEncoderLayer(nn.Module):
         hidden_size = config.d_model
         ffn_dim = _bart_encoder_ffn_dim(config)
         num_heads = _bart_encoder_num_heads(config)
-        self.normalize_before = _bart_normalize_before(config)
 
         self.self_attn = BartSelfAttention(model_config, num_heads=num_heads, layer_idx=layer_idx)
 
@@ -201,14 +187,13 @@ class BartEncoderLayer(nn.Module):
             eps=1e-5,
             dtype=config.torch_dtype,
             has_bias=True,
-            residual_in_fp32=False,
         )
 
         self.mlp = MLP(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
             bias=True,
-            activation=ACT2FN[config.activation_function],
+            activation=F.gelu,
             dtype=config.torch_dtype,
             config=model_config,
             layer_idx=layer_idx,
@@ -219,7 +204,6 @@ class BartEncoderLayer(nn.Module):
             eps=1e-5,
             dtype=config.torch_dtype,
             has_bias=True,
-            residual_in_fp32=False,
         )
 
     def forward(
@@ -230,27 +214,19 @@ class BartEncoderLayer(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
-        if self.normalize_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=PredefinedAttentionMask.FULL,
         )
-        if self.normalize_before:
-            hidden_states = residual + hidden_states
-        else:
-            hidden_states, _ = self.self_attn_layer_norm(hidden_states, residual)
+        hidden_states = residual + hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
 
         residual = hidden_states
-        if self.normalize_before:
-            hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if self.normalize_before:
-            hidden_states = residual + hidden_states
-        else:
-            hidden_states, _ = self.final_layer_norm(hidden_states, residual)
+        hidden_states = residual + hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
 
         return hidden_states
 
@@ -261,7 +237,7 @@ class BartEncoderLayer(nn.Module):
 
 
 class BartDecoderLayer(nn.Module):
-    """BART/mBART decoder layer with configurable pre- or post-norm."""
+    """BART decoder layer: self-attn → add+LN → cross-attn → add+LN → MLP → add+LN."""
 
     def __init__(
         self,
@@ -273,7 +249,6 @@ class BartDecoderLayer(nn.Module):
         hidden_size = config.d_model
         ffn_dim = _bart_decoder_ffn_dim(config)
         num_heads = _bart_decoder_num_heads(config)
-        self.normalize_before = _bart_normalize_before(config)
 
         self.self_attn = BartSelfAttention(model_config, num_heads=num_heads, layer_idx=layer_idx)
 
@@ -282,7 +257,6 @@ class BartDecoderLayer(nn.Module):
             eps=1e-5,
             dtype=config.torch_dtype,
             has_bias=True,
-            residual_in_fp32=False,
         )
 
         self.cross_attn = BartCrossAttention(model_config, layer_idx=layer_idx)
@@ -292,14 +266,13 @@ class BartDecoderLayer(nn.Module):
             eps=1e-5,
             dtype=config.torch_dtype,
             has_bias=True,
-            residual_in_fp32=False,
         )
 
         self.mlp = MLP(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
             bias=True,
-            activation=ACT2FN[config.activation_function],
+            activation=F.gelu,
             dtype=config.torch_dtype,
             config=model_config,
             layer_idx=layer_idx,
@@ -310,7 +283,6 @@ class BartDecoderLayer(nn.Module):
             eps=1e-5,
             dtype=config.torch_dtype,
             has_bias=True,
-            residual_in_fp32=False,
         )
 
     def forward(
@@ -323,25 +295,19 @@ class BartDecoderLayer(nn.Module):
         skip_cross_kv_projection: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # Self-attention
+        # Self-attention (post-norm)
         residual = hidden_states
-        if self.normalize_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=PredefinedAttentionMask.CAUSAL,
         )
-        if self.normalize_before:
-            hidden_states = residual + hidden_states
-        else:
-            hidden_states, _ = self.self_attn_layer_norm(hidden_states, residual)
+        hidden_states = residual + hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
 
-        # Cross-attention
+        # Cross-attention (post-norm)
         residual = hidden_states
-        if self.normalize_before:
-            hidden_states = self.cross_attn_layer_norm(hidden_states)
         hidden_states = self.cross_attn(
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
@@ -349,20 +315,14 @@ class BartDecoderLayer(nn.Module):
             cross_attn_metadata=cross_attn_metadata,
             skip_cross_kv_projection=skip_cross_kv_projection,
         )
-        if self.normalize_before:
-            hidden_states = residual + hidden_states
-        else:
-            hidden_states, _ = self.cross_attn_layer_norm(hidden_states, residual)
+        hidden_states = residual + hidden_states
+        hidden_states = self.cross_attn_layer_norm(hidden_states)
 
-        # MLP
+        # MLP (post-norm)
         residual = hidden_states
-        if self.normalize_before:
-            hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if self.normalize_before:
-            hidden_states = residual + hidden_states
-        else:
-            hidden_states, _ = self.final_layer_norm(hidden_states, residual)
+        hidden_states = residual + hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
 
         return hidden_states
 
@@ -373,15 +333,15 @@ class BartDecoderLayer(nn.Module):
 
 
 class BartEncoder(nn.Module):
-    """BART/mBART encoder: positional embedding + encoder layers."""
+    """BART encoder: positional embedding + encoder layers."""
 
     def __init__(self, model_config: ModelConfig[BartConfig]):
         super().__init__()
         config = model_config.pretrained_config
         num_layers = _bart_encoder_num_layers(config)
 
-        # HF BART/mBART uses offset=2 for the padding token, so the actual
-        # embedding table has max_position_embeddings + 2 entries.
+        # HF BART uses offset=2 for the padding token, so the actual embedding
+        # table has max_position_embeddings + 2 entries.
         self.embed_positions = Embedding(
             config.max_position_embeddings + 2,
             config.d_model,
@@ -392,16 +352,6 @@ class BartEncoder(nn.Module):
             eps=1e-5,
             dtype=config.torch_dtype,
             has_bias=True,
-        )
-        self.layer_norm = (
-            LayerNorm(
-                hidden_size=config.d_model,
-                eps=1e-5,
-                dtype=config.torch_dtype,
-                has_bias=True,
-            )
-            if _bart_add_final_layer_norm(config)
-            else None
         )
         self.layers = nn.ModuleList(
             [BartEncoderLayer(model_config, layer_idx=i) for i in range(num_layers)]
@@ -424,13 +374,11 @@ class BartEncoder(nn.Module):
                 attn_metadata=attn_metadata,
                 position_ids=position_ids,
             )
-        if self.layer_norm is not None:
-            hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
 
 class BartDecoder(nn.Module):
-    """BART/mBART decoder: positional embedding + decoder layers."""
+    """BART decoder: positional embedding + decoder layers."""
 
     def __init__(self, model_config: ModelConfig[BartConfig]):
         super().__init__()
@@ -447,16 +395,6 @@ class BartDecoder(nn.Module):
             eps=1e-5,
             dtype=config.torch_dtype,
             has_bias=True,
-        )
-        self.layer_norm = (
-            LayerNorm(
-                hidden_size=config.d_model,
-                eps=1e-5,
-                dtype=config.torch_dtype,
-                has_bias=True,
-            )
-            if _bart_add_final_layer_norm(config)
-            else None
         )
         self.layers = nn.ModuleList(
             [BartDecoderLayer(model_config, layer_idx=i) for i in range(num_layers)]
@@ -485,8 +423,6 @@ class BartDecoder(nn.Module):
                 cross_attn_metadata=cross_attn_metadata,
                 skip_cross_kv_projection=skip_cross_kv_projection,
             )
-        if self.layer_norm is not None:
-            hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
 
@@ -687,7 +623,6 @@ def _convert_hf_bart_weights(
         model.shared.weight
         model.encoder.embed_positions.weight
         model.encoder.layernorm_embedding.{weight,bias}
-        model.encoder.layer_norm.{weight,bias}  # mBART
         model.encoder.layers.{i}.self_attn.{q_proj,k_proj,v_proj,out_proj}.{weight,bias}
         model.encoder.layers.{i}.self_attn_layer_norm.{weight,bias}
         model.encoder.layers.{i}.fc1.{weight,bias}
@@ -695,7 +630,6 @@ def _convert_hf_bart_weights(
         model.encoder.layers.{i}.final_layer_norm.{weight,bias}
         model.decoder.embed_positions.weight
         model.decoder.layernorm_embedding.{weight,bias}
-        model.decoder.layer_norm.{weight,bias}  # mBART
         model.decoder.layers.{i}.self_attn.{q_proj,k_proj,v_proj,out_proj}.{weight,bias}
         model.decoder.layers.{i}.self_attn_layer_norm.{weight,bias}
         model.decoder.layers.{i}.encoder_attn.{q_proj,k_proj,v_proj,out_proj}.{weight,bias}
@@ -741,8 +675,6 @@ def _convert_hf_bart_weights(
     # Encoder positional embedding
     out["model.encoder.embed_positions"] = [{"weight": _get(f"{p}encoder.embed_positions.weight")}]
     out["model.encoder.layernorm_embedding"] = [_wb(f"{p}encoder.layernorm_embedding")]
-    if _maybe(f"{p}encoder.layer_norm.weight") is not None:
-        out["model.encoder.layer_norm"] = [_wb(f"{p}encoder.layer_norm")]
 
     # Encoder layers
     for i in range(enc_layers):
@@ -768,8 +700,6 @@ def _convert_hf_bart_weights(
     # Decoder positional embedding
     out["model.decoder.embed_positions"] = [{"weight": _get(f"{p}decoder.embed_positions.weight")}]
     out["model.decoder.layernorm_embedding"] = [_wb(f"{p}decoder.layernorm_embedding")]
-    if _maybe(f"{p}decoder.layer_norm.weight") is not None:
-        out["model.decoder.layer_norm"] = [_wb(f"{p}decoder.layer_norm")]
 
     # Decoder layers
     for i in range(dec_layers):

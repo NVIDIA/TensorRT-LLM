@@ -411,14 +411,10 @@ class AttentionMetadata:
         return cuda_graph_metadata
 
     def prepare_for_spec_dec(self, *fields) -> None:
-        assert len(self._saved_tensors) == 0, (
-            "prepare_for_spec_dec called while fields "
-            f"{list(self._saved_tensors)} are still saved; a previous "
-            "forward likely raised between prepare_for_spec_dec and "
-            "restore_from_spec_dec")
+        assert len(self._saved_tensors) == 0
         for f in fields:
             v = getattr(self, f)
-            assert isinstance(v, torch.Tensor), f"{f} is not a torch.Tensor"
+            assert isinstance(v, torch.Tensor)
             self._saved_tensors[f] = v
             setattr(self, f, v.clone())
 
@@ -426,11 +422,6 @@ class AttentionMetadata:
         for f, v in self._saved_tensors.items():
             setattr(self, f, v)
         self._saved_tensors.clear()
-
-    @property
-    def has_spec_dec_saved_state(self) -> bool:
-        """True when prepare_for_spec_dec state has not been restored yet."""
-        return bool(self._saved_tensors)
 
     def update_spec_dec_param(
             self,

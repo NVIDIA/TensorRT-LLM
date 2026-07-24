@@ -8,7 +8,7 @@ import pytest
                          indirect=True)
 @pytest.mark.parametrize("test_group", [
     "batch_manager", "common", "executor", "kernels", "layers", "runtime",
-    "thop"
+    "thop", "utils"
 ])
 def test_unit_tests(build_google_tests, test_group, build_dir, lora_setup):
 

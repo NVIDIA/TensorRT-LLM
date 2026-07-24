@@ -69,7 +69,6 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 32832
       backend: NIXL
-      transceiver_runtime: PYTHON
       kv_transfer_timeout_ms: 600000
     disable_overlap_scheduler: true
     speculative_config: &id001
@@ -107,7 +106,6 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 32832
       backend: NIXL
-      transceiver_runtime: PYTHON
       kv_transfer_timeout_ms: 600000
     disable_overlap_scheduler: true
     speculative_config: *id001

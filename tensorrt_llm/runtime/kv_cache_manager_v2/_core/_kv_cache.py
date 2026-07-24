@@ -16,7 +16,7 @@
 import array
 import enum
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -37,7 +37,6 @@ from .._common import (
     CudaStream,
     PageIndex,
     PageIndexMode,
-    PageStatus,
     Priority,
     TokenIdExt,
 )
@@ -128,58 +127,6 @@ class SeqBlock:
     def __del__(self) -> None:
         self.tree_block = None
         self.pages.clear()
-
-
-class PlannedDropHandle:
-    """Track committed pages planned for dropping without owning them.
-
-    The handle stores weak references and does not keep pages alive. Dropping it
-    decrements each live page's planned-drop count and removes an already-droppable
-    page from eviction tracking when no plans remain.
-    """
-
-    __slots__ = ("_page_refs",)
-
-    _page_refs: tuple[rawref.ref[CommittedPage], ...] | None
-
-    def __init__(self, pages: Iterable[CommittedPage]) -> None:
-        planned_pages = tuple({id(page): page for page in pages}.values())
-        self._page_refs = tuple(rawref.ref(page) for page in planned_pages)
-        for page in planned_pages:
-            page.planned_drop_count += 1
-
-    def drop(self) -> None:
-        """Apply this drop plan and invalidate the handle.
-
-        A live page is removed from eviction tracking only when this is its final
-        plan and it is already droppable and queued for eviction. Calling this
-        method twice is invalid.
-        """
-        page_refs = self._page_refs
-        if page_refs is None:
-            raise ValueError("Planned drop handle has already been dropped")
-
-        pages = list[CommittedPage]()
-        for page_ref in page_refs:
-            page = page_ref()
-            if page is not None:
-                if page.planned_drop_count <= 0:
-                    raise ValueError("Committed page has no planned drop")
-                pages.append(page)
-
-        self._page_refs = None
-        for page in pages:
-            page.planned_drop_count -= 1
-            if (
-                page.planned_drop_count == 0
-                and page.status == PageStatus.DROPPABLE
-                and page.scheduled_for_eviction
-            ):
-                page.manager.exclude_from_eviction(page)
-
-    def __del__(self) -> None:
-        if self._page_refs is not None:
-            self.drop()
 
 
 class _Status(enum.Enum):
@@ -1045,43 +992,6 @@ class _KVCache:
     @property
     def reuse_scope(self) -> ReuseScope:
         return self._reuse_scope
-
-    def plan_committed_block_drop(self) -> PlannedDropHandle | None:
-        """Plan dropping SWA blocks needed only by the next conversation turn.
-
-        The plan covers committed pages in each SWA life cycle's current
-        attention window. Full-attention and attention-sink blocks are excluded
-        because later turns may still need them. SSM state is not yet supported.
-        This must be called after stop_committing(). Returns None without
-        creating a plan if any required SWA page is unavailable.
-        """
-        if self._commit_state != self.CommitState.USER_STOP:
-            raise LogicError("plan_committed_block_drop() requires stop_committing()")
-
-        end = self._num_committed_blocks
-        pages_to_drop: list[CommittedPage] = []
-        for lc_idx, lc in self.manager._life_cycles.items():
-            if isinstance(lc, SsmLifeCycle):
-                # TODO: Support recording reusable SSM state pages.
-                continue
-            if lc.window_size is None:
-                continue
-            stale_range = _KVCache._get_stale_range(
-                self.tokens_per_block, self.num_committed_tokens, lc
-            )
-            window_start = min(stale_range.end, end)
-            for ordinal in typed_range(window_start, end):
-                tree_block = self._blocks[ordinal].tree_block
-                if tree_block is None:
-                    return None
-                page_ref = tree_block.storage[lc_idx]
-                if page_ref is None:
-                    return None
-                page = page_ref()
-                if page is None:
-                    return None
-                pages_to_drop.append(page)
-        return PlannedDropHandle(pages_to_drop)
 
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens
     # (eg. CoT), this helps us drop (instead of evict) out-of-window blocks for SWA layers.

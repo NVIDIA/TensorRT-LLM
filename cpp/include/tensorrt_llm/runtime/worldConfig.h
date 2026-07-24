@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/runtime/common.h"
 
+#include <NvInferRuntime.h>
 #include <optional>
 #include <vector>
 

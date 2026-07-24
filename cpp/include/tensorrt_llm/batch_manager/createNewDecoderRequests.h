@@ -20,7 +20,6 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/common/optionalRef.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -67,17 +66,16 @@ public:
         std::vector<executor::LookaheadDecodingConfig>>
     operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
-        tensorrt_llm::DataType logitsType, DecoderInputBuffers& inputBuffers,
-        runtime::decoder::DecoderState& decoderState, CudaStream const& runtimeStream, CudaStream const& decoderStream,
-        SizeType32 maxSequenceLength, SizeType32 beamWidth, OptionalRef<MedusaBuffers const> medusaBuffers) const;
+        nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState,
+        CudaStream const& runtimeStream, CudaStream const& decoderStream, SizeType32 maxSequenceLength,
+        SizeType32 beamWidth, OptionalRef<MedusaBuffers const> medusaBuffers) const;
 
     [[nodiscard]] std::tuple<std::vector<SharedConstPtr>, std::vector<executor::LookaheadDecodingConfig>>
     createDecoderRequests(RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
         executor::DecodingConfig const& decodingConfig, runtime::decoder::DecoderState& decoderState,
-        tensorrt_llm::DataType logitsType, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig, runtime::CudaStream const& runtimeStream,
-        runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
-        OptionalRef<MedusaBuffers const> medusaBuffers) const;
+        nvinfer1::DataType logitsType, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
+        runtime::CudaStream const& runtimeStream, runtime::CudaStream const& decoderStream,
+        SizeType32 maxSequenceLength, OptionalRef<MedusaBuffers const> medusaBuffers) const;
 
 private:
     bool mSpeculativeDecodingFastLogits;

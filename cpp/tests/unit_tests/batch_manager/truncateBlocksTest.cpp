@@ -13,7 +13,6 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
@@ -90,7 +89,7 @@ TEST_F(TruncateBlocksTest, MultiTurnConversationTruncation)
 
     // Create KVCacheManager with block reuse enabled
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength /* chunkSize */, true /* enableBlockReuse */);
     kvCacheManager.allocatePools(false);
 
@@ -220,7 +219,7 @@ TEST_F(TruncateBlocksTest, SharedPrefixTruncation)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength /* chunkSize */, true /* enableBlockReuse */);
     kvCacheManager.allocatePools(false);
 
@@ -318,7 +317,7 @@ TEST_F(TruncateBlocksTest, CompleteTruncation)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength /* chunkSize */, true /* enableBlockReuse */);
     kvCacheManager.allocatePools(false);
 
@@ -378,7 +377,7 @@ TEST_F(TruncateBlocksTest, NonExistentTokensTruncation)
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength /* chunkSize */, true /* enableBlockReuse */);
     kvCacheManager.allocatePools(false);
 
@@ -454,7 +453,7 @@ TEST_F(TruncateBlocksTest, ComplexMultiTurnConversationTruncation)
 
     // Create KVCacheManager with block reuse enabled
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, stream,
         maxSequenceLength, maxSequenceLength /* chunkSize */, true /* enableBlockReuse */);
     kvCacheManager.allocatePools(false);
 

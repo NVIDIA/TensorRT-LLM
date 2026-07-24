@@ -14,9 +14,6 @@ from tensorrt_llm._torch import memory as memory_mod
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
-    ARTIFACT_IDENTITY_FORMAT_VERSION,
-    SOURCE_IDENTITY_FORMAT_VERSION,
-    ArtifactIdentity,
     PostTransformProfile,
     PostTransformProfileRegistry,
     PostTransformTransferScope,
@@ -24,12 +21,7 @@ from tensorrt_llm._torch.weight_sharing import (
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 
 _SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
-    format_version=SOURCE_IDENTITY_FORMAT_VERSION,
-    artifact_identity=ArtifactIdentity(
-        format_version=ARTIFACT_IDENTITY_FORMAT_VERSION,
-        scheme="checkpoint_manifest_sha256",
-        digest="0" * 64,
-    ),
+    format_version=1,
     model_fingerprint="model",
     quant_fingerprint="quant",
     backend_fingerprint="backend",
@@ -108,25 +100,10 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     monkeypatch.setattr(model_loader_mod, "MetaInitMode", lambda: nullcontext())
     # These tests stub ModelConfig, while SourceIdentity has dedicated
     # coverage. Keep this file focused on ModelLoader GMS branch behavior.
-
-    def _build_artifact_identity(_cls, checkpoint_dir):
-        assert checkpoint_dir == "/ckpt"
-        return _SOURCE_IDENTITY.artifact_identity
-
-    monkeypatch.setattr(
-        model_loader_mod.ArtifactIdentity,
-        "from_checkpoint",
-        classmethod(_build_artifact_identity),
-    )
-
-    def _build_source_identity(_cls, *_args, **kwargs):
-        assert kwargs["artifact_identity"] is _SOURCE_IDENTITY.artifact_identity
-        return _SOURCE_IDENTITY
-
     monkeypatch.setattr(
         model_loader_mod.SourceIdentity,
         "from_model_config",
-        classmethod(_build_source_identity),
+        classmethod(lambda cls, *_args, **_kwargs: _SOURCE_IDENTITY),
     )
     monkeypatch.setattr(
         model_loader_mod.AutoModelForCausalLM,
@@ -202,31 +179,6 @@ def _tiny_profile_registry() -> PostTransformProfileRegistry:
             ),
         )
     )
-
-
-def test_gms_artifact_identity_failure_remains_fatal(monkeypatch):
-    loader = _make_loader(monkeypatch, events=[])
-    artifact_error = ValueError(
-        "Checkpoint manifests do not support nested symlinked directories: /ckpt/shards"
-    )
-    monkeypatch.setattr(
-        model_loader_mod.ArtifactIdentity,
-        "from_checkpoint",
-        MagicMock(side_effect=artifact_error),
-    )
-    source_identity_factory = MagicMock()
-    monkeypatch.setattr(
-        model_loader_mod.SourceIdentity,
-        "from_model_config",
-        source_identity_factory,
-    )
-    checkpoint_loader = MagicMock(name="checkpoint_loader")
-    checkpoint_loader.checkpoint_format = "MX"
-
-    with pytest.raises(ValueError, match="nested symlinked directories"):
-        loader.load("/ckpt", checkpoint_loader)
-
-    source_identity_factory.assert_not_called()
 
 
 @pytest.mark.parametrize(

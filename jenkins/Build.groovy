@@ -33,7 +33,7 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 LLM_DOCKER_IMAGE = env.dockerImage
 
 // Always use x86_64 image for agent
-AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64").replace("sbsa", "x86_64")
+AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64")
 
 POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
 
@@ -384,7 +384,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "ccache -sv"
     sh "rm -rf **/*.xml *.tar.gz"
 
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     if (env.alternativeTRT) {
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
@@ -421,12 +421,24 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     def buildJobs = buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks"
     }
+    if (is_linux_x86_64) {
+        sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
+    }
+
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
 
-    // Step 4: packaging attribution files into tarfile when they exist
+    // Step 4: packaging benchmark and required cpp dependencies into tarfile
+    sh "mkdir -p TensorRT-LLM/benchmarks/cpp"
+    sh "cp ${LLM_ROOT}/cpp/build/benchmarks/bertBenchmark TensorRT-LLM/benchmarks/cpp"
+    sh "cp ${LLM_ROOT}/cpp/build/benchmarks/gptManagerBenchmark TensorRT-LLM/benchmarks/cpp"
+    sh "cp ${LLM_ROOT}/cpp/build/benchmarks/disaggServerBenchmark TensorRT-LLM/benchmarks/cpp"
+    sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
+    sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
+
+    // Step 5: packaging attribution files into tarfile when they exist
     sh "mkdir -p TensorRT-LLM/attribution"
     sh "cp ${LLM_ROOT}/cpp/build/attribution/missing_files.json TensorRT-LLM/attribution/ || true"
     sh "cp ${LLM_ROOT}/cpp/build/attribution/import_payload.json TensorRT-LLM/attribution/ || true"
@@ -459,7 +471,7 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     sh "cat ${CCACHE_DIR}/ccache.conf"
 
     // Step 1: cloning tekit source code
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     if (env.alternativeTRT) {
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
@@ -559,7 +571,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --micro_benchmarks")
+                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --benchmarks --micro_benchmarks")
                         }
                     }
                 })

@@ -21,7 +21,6 @@
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include <cooperative_groups.h>
 #include <tuple>
@@ -1358,7 +1357,7 @@ std::vector<size_t> splitNumber(size_t number)
 }
 
 LowPrecisionAllReduceParams LowPrecisionAllReduceParams::deserialize(
-    size_t tpSize, size_t tpRank, tensorrt_llm::DataType dataType, int token_num, int hidden_size)
+    size_t tpSize, size_t tpRank, nvinfer1::DataType dataType, int token_num, int hidden_size)
 {
 
     // Get appropriate static buffer
@@ -1402,7 +1401,7 @@ LowPrecisionAllReduceParams LowPrecisionAllReduceParams::deserialize(
 }
 
 LowPrecisionAllReduceParams LowPrecisionAllReduceParams::deserialize_hier(
-    size_t tpSize, size_t tpRank, tensorrt_llm::DataType dataType, int token_num, int hidden_size)
+    size_t tpSize, size_t tpRank, nvinfer1::DataType dataType, int token_num, int hidden_size)
 {
 
     // Get appropriate static buffer
@@ -1617,7 +1616,7 @@ int32_t max_workspace_size_lowprecision(int32_t tp_size)
 }
 
 void customLowPrecisionAllReduce(
-    kernels::LowPrecisionAllReduceParams& params, tensorrt_llm::DataType dataType, cudaStream_t stream)
+    kernels::LowPrecisionAllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(lowPrecisionConfigurationSupported(params.ranks_per_node, params.elts_total),
         "Low Precision Custom all-reduce configuration unsupported");
@@ -1626,10 +1625,10 @@ void customLowPrecisionAllReduce(
 
     switch (dataType)
     {
-    case tensorrt_llm::DataType::kFLOAT: lowPrecisionAllReduceDispatchType<float>(params, stream); break;
-    case tensorrt_llm::DataType::kHALF: lowPrecisionAllReduceDispatchType<half>(params, stream); break;
+    case nvinfer1::DataType::kFLOAT: lowPrecisionAllReduceDispatchType<float>(params, stream); break;
+    case nvinfer1::DataType::kHALF: lowPrecisionAllReduceDispatchType<half>(params, stream); break;
 #ifdef ENABLE_BF16
-    case tensorrt_llm::DataType::kBF16: lowPrecisionAllReduceDispatchType<__nv_bfloat16>(params, stream); break;
+    case nvinfer1::DataType::kBF16: lowPrecisionAllReduceDispatchType<__nv_bfloat16>(params, stream); break;
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
     }

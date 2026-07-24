@@ -16,6 +16,7 @@
  */
 
 #include "bindings.h"
+#include "executor.h"
 #include "executorConfig.h"
 #include "request.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -286,6 +287,7 @@ void initBindings(nb::module_& m)
 
     tensorrt_llm::nanobind::executor::initRequestBindings(m);
     tensorrt_llm::nanobind::executor::initConfigBindings(m);
+    tensorrt_llm::nanobind::executor::Executor::initBindings(m);
 }
 
 } // namespace tensorrt_llm::nanobind::executor

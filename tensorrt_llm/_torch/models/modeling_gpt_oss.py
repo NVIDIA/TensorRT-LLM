@@ -1,4 +1,4 @@
-from typing import Any, Dict, Literal, Optional
+from typing import Dict, Optional
 
 import torch
 from torch import nn
@@ -60,10 +60,7 @@ class AttentionBlock(Attention):
                 beta_fast=pretrained_config.rope_scaling['beta_fast'],
                 beta_slow=pretrained_config.rope_scaling['beta_slow'],
                 duplicate_data=False),
-            # GPT-OSS applies NeoX-style (rotate-half) RoPE, matching the HF
-            # reference. The fused kernel ignores this flag for yarn (which
-            # masked the wrong value); the unfused path honors it.
-            is_neox=True,
+            is_neox=False,
         )
 
         super().__init__(
@@ -551,13 +548,6 @@ class Transformer(DecoderModel):
 
 @register_auto_model("GptOssForCausalLM")
 class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
-
-    @classmethod
-    def get_preferred_transceiver_runtime(
-        cls,
-        pretrained_config: Any = None,
-    ) -> Optional[Literal["CPP", "PYTHON"]]:
-        return "PYTHON"
 
     params_map = {
         # TRTLLM module name : GptOss module name

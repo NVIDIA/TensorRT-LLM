@@ -21,7 +21,6 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 
 namespace tc = tensorrt_llm::common;
 namespace tr = tensorrt_llm::runtime;
@@ -49,7 +48,7 @@ TEST_F(BlockIteratorTest, BasicTest)
     auto constexpr mNumLayers = 5;
     auto constexpr mBlockSize = 32;
     auto const cacheShape = tr::ITensor::makeShape({mNumPrimaryBlocks, mNumLayers, 2, mBlockSize});
-    constexpr tensorrt_llm::DataType dtype{tr::TRTDataType<DataType>::value};
+    constexpr nvinfer1::DataType dtype{tr::TRTDataType<DataType>::value};
     tr::ITensor::SharedPtr pool = tr::BufferManager::cpu(cacheShape, dtype);
     std::vector<SizeType32> blockIds(mNumPrimaryBlocks);
     std::iota(blockIds.begin(), blockIds.end(), 0);
@@ -76,7 +75,7 @@ TEST_F(BlockIteratorTest, BasicTest)
 
 TEST_F(BlockIteratorTest, CacheManagerTest)
 {
-    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
     auto constexpr numLayers = 12;
     auto constexpr numKvHeads = 6;
     auto constexpr sizePerHead = 16;

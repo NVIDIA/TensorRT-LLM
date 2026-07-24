@@ -37,7 +37,6 @@ l0_a10:
   - unittest/_torch/executor/test_kv_pool_rebalance.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
   - unittest/_torch/executor/test_kv_cache_compression_manager.py
-  - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py
   - unittest/_torch/modules/dwdp/test_dwdp_manager.py
@@ -52,7 +51,6 @@ l0_a10:
   - unittest/inputs/test_url_validation.py
   - unittest/inputs/test_multimodal.py
   - unittest/inputs/test_multimodal_input_processor.py
-  - unittest/inputs/test_video_decode.py
   - unittest/others/test_convert_utils.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_lora_module_count.py
@@ -60,8 +58,6 @@ l0_a10:
   - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py
   - unittest/disaggregated/test_disagg_utils.py
-  - unittest/disaggregated/test_coordinator_e2e.py
-  - unittest/disaggregated/test_coordinator_worker.py
   - unittest/disaggregated/test_openai_disagg_server.py
   - unittest/disaggregated/test_openai_disagg_service.py
   - unittest/disaggregated/test_router.py
@@ -72,7 +68,6 @@ l0_a10:
   - unittest/disaggregated/test_cluster_storage.py
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_peer.py
-  - unittest/disaggregated/test_cache_reuse_adapter.py
   - unittest/disaggregated/test_bounce.py
   - unittest/disaggregated/region/test_block.py
   - unittest/disaggregated/test_mamba_transfer.py
@@ -105,8 +100,6 @@ l0_a10:
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer[False-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer_missing_blocks[False-TinyLlama-1.1B-Chat-v1.0]
   - test_e2e.py::test_get_ci_container_port
   - test_e2e.py::test_openai_chat_multimodal_example ISOLATION
   - test_e2e.py::test_openai_mmencoder_example
@@ -183,6 +176,36 @@ l0_a10:
   - thirdparty/test_git_modules.py::test_gitmodules
   # helper-script unit tests (CPU-only, ~3s)
   - unittest/scripts
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a10*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: cpp
+  tests:
+  # ------------- CPP tests ---------------
+  - cpp/test_e2e.py::test_model[-redrafter-86]
+  - cpp/test_e2e.py::test_model[-mamba-86]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a10*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: tensorrt
+  tests:
+  # ------------- TRT tests ---------------
   - unittest/kv_cache_manager_v2_tests # 4 min
   - unittest/dynamo
   - unittest/api_stability
@@ -198,16 +221,30 @@ l0_a10:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
-      backend: pytorch
+      backend: tensorrt
   tests:
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test]
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
+  # ------------- Move from pre_merge to post_merge ---------------
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
   - llmapi/test_llm_examples.py::test_llmapi_server_example
   - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen2-0.5B]
   - test_e2e.py::test_openai_health
   - test_e2e.py::test_trtllm_serve_example
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a10*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
 - condition:
     ranges:
       system_gpu_count:

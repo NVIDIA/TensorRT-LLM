@@ -1,18 +1,853 @@
 import datetime
-import inspect
 import json
 import os as _os
 import pickle
+import random
+import sys as _sys
+import time
 import typing as tp
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+from binding_test_utils import *
 from pydantic import BaseModel
 
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.version as trtllm_version
+from tensorrt_llm._utils import torch_to_numpy
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
+
+_sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
+import inspect
+
+from utils.cpp_paths import *
+from utils.llm_data import llm_models_root
+from utils.util import skip_pre_hopper
+
+
+@pytest.fixture
+def model_files(llm_root: Path, resource_path: Path, results_data_path: Path):
+    # Model engines and expected outputs need to be generated.
+    if not results_data_path.exists():
+        model_cache = llm_models_root()
+        model_cache_arg = ["--model_cache", str(model_cache)
+                           ] if model_cache is not None else []
+        prepare_model_tests(llm_root, resource_path, "gpt", model_cache_arg)
+
+
+@pytest.fixture
+def lora_config_paths(llm_root: Path, resource_path: Path,
+                      lora_config_path: Path):
+    if not lora_config_path.exists():
+        prepare_lora_configs(llm_root, resource_path, lora_config_path)
+    return (lora_config_path / "source.npy", lora_config_path / "config.npy")
+
+
+def get_expected_num_tokens(prompt_len, max_tokens, streaming,
+                            exclude_input_from_output):
+    if not streaming and not exclude_input_from_output:
+        return prompt_len + max_tokens
+    return max_tokens
+
+
+def test_executor_valid_ctor(model_files, model_path):
+    executor_config = trtllm.ExecutorConfig(
+        1, kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+
+def test_executor_from_memory(model_files, model_path):
+    executor_config = trtllm.ExecutorConfig(
+        1, kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    engine_buffer = open(model_path / "rank0.engine", mode="rb").read()
+    json_config_str = open(model_path / "config.json", 'r').read()
+    executor = trtllm.Executor(engine_buffer, json_config_str,
+                               trtllm.ModelType.DECODER_ONLY, executor_config)
+
+
+def test_executor_with_managed_weights(model_files, model_path):
+    """Test executor constructor with standard dtypes in managed weights."""
+
+    executor_config = trtllm.ExecutorConfig(
+        1, kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    engine_buffer = open(model_path / "rank0.engine", mode="rb").read()
+    json_config_str = open(model_path / "config.json", 'r').read()
+
+    managed_weights = {
+        "weight_float32":
+        np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+        "weight_int32":
+        np.array([[1, 2], [3, 4]], dtype=np.int32),
+        "weight_int64":
+        np.array([[1, 2], [3, 4]], dtype=np.int64),
+        "weight_int8":
+        np.array([[1, 2], [3, 4]], dtype=np.int8),
+        "weight_fp16":
+        np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float16),
+        "weight_bf16":
+        torch_to_numpy(
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)),
+        "weight_fp8":
+        torch_to_numpy(
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float8_e4m3fn)),
+    }
+
+    executor = trtllm.Executor(engine_buffer, json_config_str,
+                               trtllm.ModelType.DECODER_ONLY, executor_config,
+                               managed_weights)
+
+    assert executor.can_enqueue_requests() == True
+
+
+def test_executor_invalid_ctor():
+    executor_config = trtllm.ExecutorConfig(
+        1, kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    invalid_path = "Bla"
+    try:
+        executor = trtllm.Executor(invalid_path, trtllm.ModelType.DECODER_ONLY,
+                                   executor_config)
+        assert False, "Expected an error"
+    except Exception as e:
+        assert "File does not exist" in str(e)
+
+
+def test_shutdown(model_files, model_path):
+
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create the request
+    max_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=False,
+                             sampling_config=trtllm.SamplingConfig())
+
+    # Enqueue the request
+    assert executor.can_enqueue_requests() == True
+    req_id = executor.enqueue_request(request)
+
+    executor.shutdown()
+    assert executor.can_enqueue_requests() == False
+
+    with pytest.raises(Exception):
+        executor.enqueue_request(request)
+    with pytest.raises(Exception):
+        executor.await_responses()
+    with pytest.raises(Exception):
+        executor.get_latest_iteration_stats()
+    with pytest.raises(Exception):
+        executor.get_latest_request_stats()
+    with pytest.raises(Exception):
+        executor.get_latest_debug_tensors()
+    with pytest.raises(Exception):
+        executor.cancel_request(req_id)
+    with pytest.raises(Exception):
+        executor.get_num_responses_ready(req_id)
+
+
+def test_embedding_bias(model_files, model_path):
+    streaming = False
+    exclude_input_from_output = False
+    output_config = trtllm.OutputConfig()
+    output_config.exclude_input_from_output = exclude_input_from_output
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create the request
+    max_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    # Set embedding bias so "biased_output" is always picked
+    biased_output = 10
+    vocab_size_padded = 50257
+    embedding_bias = torch.zeros(vocab_size_padded)
+    embedding_bias[biased_output] = torch.finfo(torch.float32).max
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=streaming,
+                             sampling_config=trtllm.SamplingConfig(),
+                             output_config=output_config,
+                             embedding_bias=embedding_bias)
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+
+    # Get the new tokens
+    tokens = []
+    done = False
+    i = 0
+    max_wait_ms = 10000
+    while not done and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(request_id, wait_time)
+        for response in responses:
+            assert not response.has_error(
+            ), f"Request id {request_id} failed with err {response.error_msg}"
+            result = response.result
+            done = result.is_final
+            new_tokens = result.output_token_ids[beam_width - 1]
+            tokens.extend(new_tokens)
+        i += 1
+    assert i < max_wait_ms
+    assert len(tokens) == get_expected_num_tokens(
+        len(input_tokens), max_tokens, streaming,
+        exclude_input_from_output), f"{request_id}"
+    # All generated tokens should equal biased_output
+    assert tokens[-max_tokens:] == [biased_output] * max_tokens
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("exclude_input_from_output", [False])
+def test_single_request(streaming: bool, exclude_input_from_output: bool,
+                        model_files, model_path):
+    output_config = trtllm.OutputConfig()
+    output_config.exclude_input_from_output = exclude_input_from_output
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create the request
+    max_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=streaming,
+                             sampling_config=trtllm.SamplingConfig(),
+                             output_config=output_config)
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+
+    # Get the new tokens
+    tokens = []
+    done = False
+    i = 0
+    max_wait_ms = 10000
+    while not done and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(request_id, wait_time)
+        for response in responses:
+            assert not response.has_error(
+            ), f"Request id {request_id} failed with err {response.error_msg}"
+            result = response.result
+            done = result.is_final
+            new_tokens = result.output_token_ids[beam_width - 1]
+            tokens.extend(new_tokens)
+        i += 1
+    assert i < max_wait_ms
+    assert len(tokens) == get_expected_num_tokens(
+        len(input_tokens), max_tokens, streaming,
+        exclude_input_from_output), f"{request_id}"
+
+    executor.get_latest_iteration_stats()
+    executor.get_latest_request_stats()
+    executor.get_latest_debug_tensors()
+
+
+def test_single_request_lora(model_files, model_path_lora, lora_config_paths):
+    streaming = False
+    exclude_input_from_output = False
+    output_config = trtllm.OutputConfig()
+    output_config.exclude_input_from_output = exclude_input_from_output
+
+    # Create executor
+    beam_width = 1
+
+    peft_cache_config = trtllm.PeftCacheConfig(num_put_workers=4,
+                                               num_ensure_workers=4)
+    executor_config = trtllm.ExecutorConfig(
+        1,
+        peft_cache_config=peft_cache_config,
+        kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor = trtllm.Executor(model_path_lora, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create the request
+    max_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    lora_weights = torch.tensor(np.load(lora_config_paths[0])).half()
+    lora_config = torch.tensor(np.load(lora_config_paths[1]))
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=streaming,
+                             sampling_config=trtllm.SamplingConfig(),
+                             output_config=output_config,
+                             lora_config=trtllm.LoraConfig(
+                                 0, lora_weights, lora_config))
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+
+    # Get the new tokens
+    tokens = []
+    done = False
+    i = 0
+    max_wait_ms = 10000
+    while not done and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(request_id, wait_time)
+        for response in responses:
+            assert not response.has_error(
+            ), f"Request id {request_id} failed with err {response.error_msg}"
+            result = response.result
+            done = result.is_final
+            new_tokens = result.output_token_ids[beam_width - 1]
+            tokens.extend(new_tokens)
+        i += 1
+    assert i < max_wait_ms
+    assert len(tokens) == get_expected_num_tokens(
+        len(input_tokens), max_tokens, streaming,
+        exclude_input_from_output), f"{request_id}"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("exclude_input_from_output", [False])
+def test_multi_request(streaming: bool, exclude_input_from_output: bool,
+                       model_files, model_path):
+    output_config = trtllm.OutputConfig()
+    output_config.exclude_input_from_output = exclude_input_from_output
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    num_requests = 20
+    max_prompt_len = 20
+    max_max_tokens = 20
+    end_id = -1
+
+    # Enqueue the requests
+    tokens = {}
+    expected_num_tokens = {}
+    for i in range(num_requests):
+        prompt_len = random.randint(1, max_prompt_len)
+        max_tokens = random.randint(1, max_max_tokens)
+        input_tokens = [1] * prompt_len
+
+        # Some requests has num_return_sequences > 1.
+        num_return_sequences = 2 if i % 5 == 1 else 1
+
+        request = trtllm.Request(input_tokens,
+                                 max_tokens=max_tokens,
+                                 streaming=streaming,
+                                 sampling_config=trtllm.SamplingConfig(
+                                     num_return_sequences=num_return_sequences),
+                                 output_config=output_config,
+                                 end_id=end_id)
+        request_id = executor.enqueue_request(request)
+        tokens[request_id] = [
+            [] for _ in range(request.sampling_config.num_return_sequences)
+        ]
+        expected_num_tokens[request_id] = get_expected_num_tokens(
+            prompt_len, max_tokens, streaming, exclude_input_from_output)
+
+    # Get the new tokens for each request
+    num_finished = 0
+    i = 0
+    num_responses = 0
+    max_wait_ms = 10000
+    while num_finished < num_requests and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(wait_time)
+        for response in responses:
+            num_responses += 1
+            assert not response.has_error(
+            ), f"Request id {response.request_id} failed with err {response.error_msg}"
+            result = response.result
+            num_finished += result.is_final
+            new_tokens = result.output_token_ids[beam_width - 1]
+            tokens[response.request_id][result.sequence_index].extend(
+                new_tokens)
+        i += 1
+    assert i < max_wait_ms
+
+    for request_id in expected_num_tokens:
+        for actual_tokens in tokens[request_id]:
+            assert len(actual_tokens) == expected_num_tokens[request_id]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("exclude_input_from_output", [False])
+def test_multi_request_with_ids(streaming: bool,
+                                exclude_input_from_output: bool, model_files,
+                                model_path):
+    output_config = trtllm.OutputConfig()
+    output_config.exclude_input_from_output = exclude_input_from_output
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    num_requests = 20
+    max_prompt_len = 20
+    max_max_tokens = 20
+    end_id = -1
+
+    # Enqueue the requests
+    tokens = {}
+    expected_num_tokens = {}
+    for i in range(num_requests):
+        prompt_len = random.randint(1, max_prompt_len)
+        max_tokens = random.randint(1, max_max_tokens)
+        input_tokens = [1] * prompt_len
+        num_return_sequences = 2 if i % 5 == 1 else 1
+
+        request = trtllm.Request(input_tokens,
+                                 max_tokens=max_tokens,
+                                 streaming=streaming,
+                                 sampling_config=trtllm.SamplingConfig(
+                                     num_return_sequences=num_return_sequences),
+                                 output_config=output_config,
+                                 end_id=end_id)
+        request_id = executor.enqueue_request(request)
+        tokens[request_id] = [
+            [] for _ in range(request.sampling_config.num_return_sequences)
+        ]
+        expected_num_tokens[request_id] = get_expected_num_tokens(
+            prompt_len, max_tokens, streaming, exclude_input_from_output)
+
+    # Get the new tokens for each request
+    num_finished = 0
+    i = 0
+    num_responses = 0
+    max_wait_ms = 10000
+    while num_finished < num_requests and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        id_responses = executor.await_responses(list(tokens.keys()), wait_time)
+        for responses in id_responses:
+            for response in responses:
+                num_responses += 1
+                # Allow response with error only if await_response processed a terminated request id
+                if response.has_error():
+                    terminated_request_error = "ReqId " + str(
+                        response.request_id
+                    ) + " has already been processed and was terminated."
+                    assert response.error_msg == terminated_request_error, (
+                        f"Request id {response.request_id} failed with err "
+                        f"{response.error_msg}")
+                else:
+                    result = response.result
+                    num_finished += result.is_final
+                    new_tokens = result.output_token_ids[beam_width - 1]
+                    tokens[response.request_id][result.sequence_index].extend(
+                        new_tokens)
+            i += 1
+    assert i < max_wait_ms
+
+    for request_id in expected_num_tokens:
+        for seq_idx, actual_tokens in enumerate(tokens[request_id]):
+            assert len(actual_tokens) == expected_num_tokens[request_id]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("exclude_input_from_output", [False])
+def test_get_num_responses_ready(streaming: bool,
+                                 exclude_input_from_output: bool, model_files,
+                                 model_path):
+    output_config = trtllm.OutputConfig()
+    output_config.exclude_input_from_output = exclude_input_from_output
+
+    # Create executor
+    executor_config = trtllm.ExecutorConfig(
+        1, kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    max_prompt_len = 20
+    max_max_tokens = 20
+
+    # Enqueue the requests
+    num_requests = random.randint(1, 50)
+    num_expected_responses = 0
+    req_num_expected_responses = {}
+    for i in range(num_requests):
+        prompt_len = random.randint(1, max_prompt_len)
+        max_tokens = random.randint(1, max_max_tokens)
+        num_return_sequences = 2 if i % 5 == 1 else 1
+
+        request = trtllm.Request([1] * prompt_len,
+                                 max_tokens=max_tokens,
+                                 streaming=streaming,
+                                 sampling_config=trtllm.SamplingConfig(
+                                     num_return_sequences=num_return_sequences),
+                                 output_config=output_config)
+        request_id = executor.enqueue_request(request)
+        req_num_expected_responses[request_id] = (
+            (max_tokens if streaming else 1) * num_return_sequences)
+        num_expected_responses += req_num_expected_responses[request_id]
+
+    i = 0
+    num_ready = 0
+    max_wait_ms = 10000
+    while num_ready < num_expected_responses and i < max_wait_ms:
+        num_ready = 0
+        for request_id in req_num_expected_responses:
+            num_ready += executor.get_num_responses_ready(request_id)
+        time.sleep(0.001)
+        i += 1
+    assert i < max_wait_ms
+
+    for request_id in req_num_expected_responses:
+        num_ready = executor.get_num_responses_ready(request_id)
+        assert num_ready == req_num_expected_responses[request_id]
+    assert executor.get_num_responses_ready() == num_expected_responses
+
+
+@pytest.mark.parametrize("batching_type", [trtllm.BatchingType.INFLIGHT])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("beam_width", [1])
+@pytest.mark.parametrize("compute_log_probs", [False, True])
+@pytest.mark.parametrize("exclude_input_from_output", [False])
+@pytest.mark.parametrize("return_context_logits", [False, True])
+@pytest.mark.parametrize("return_generation_logits", [False, True])
+def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
+                          beam_width: int, compute_log_probs: bool,
+                          exclude_input_from_output: bool,
+                          return_context_logits: bool,
+                          return_generation_logits: bool, model_files,
+                          model_path, model_path_return_logits, input_data_path,
+                          results_data_path, results_data_path_beam_width_2):
+    if streaming and beam_width > 1:
+        pytest.skip("Test does not support streaming with beam search")
+
+    vocab_size_padded = 50257
+    pad_id = 50256
+    remove_input = not exclude_input_from_output and not streaming
+
+    def load_test_data(input_path, results_path):
+        # Inputs
+        assert input_path.is_file()
+        given_input = np.load(input_path).astype("int32")
+        input_shape = given_input.shape
+        assert len(input_shape) == 2
+        max_input_length = input_shape[1]
+        given_input_lengths = sequence_lengths(given_input, pad_id)
+        assert np.all(given_input_lengths <= max_input_length)
+        # Expected results
+        assert results_path.is_file()
+        expected_outputs = np.load(results_path).astype("int32")
+        output_shape = expected_outputs.shape
+        assert len(output_shape) == 2
+        assert input_shape[0] * beam_width == output_shape[0]
+        max_seq_length = output_shape[1]
+        max_tokens = max_seq_length - max_input_length
+
+        end_ids = [pad_id for _ in range(len(given_input_lengths))]
+        expected_lengths = []
+        for i in range(len(given_input_lengths)):
+            expected_lengths.append([
+                given_input_lengths[i] + max_tokens for _ in range(beam_width)
+            ])
+
+        test_data = {
+            "expected_output_ids": expected_outputs,
+            "expected_output_lengths": expected_lengths,
+            "max_seq_length": max_seq_length,
+            "end_ids": end_ids
+        }
+        return given_input, given_input_lengths, max_input_length, test_data
+
+    def validate_results_shapes(result, input_length, max_output_len,
+                                beam_tokens):
+        if compute_log_probs:
+            assert result.cum_log_probs is not None
+            assert result.log_probs is not None
+            assert len(result.cum_log_probs) == beam_width
+            assert len(result.log_probs) == beam_width
+            for beam in range(beam_width):
+                expected_len = len(
+                    beam_tokens[beam]) - (input_length if remove_input else 0)
+                assert len(result.log_probs[beam]) == expected_len
+        else:
+            assert result.cum_log_probs is None
+            assert result.log_probs is None
+        if return_context_logits:
+            assert result.context_logits is not None
+            assert len(result.context_logits.shape) == 2
+            assert list(result.context_logits.shape) == [
+                input_length, vocab_size_padded
+            ]
+        else:
+            assert result.context_logits is None
+        if return_generation_logits:
+            assert len(result.generation_logits.shape) == 3
+            if streaming:
+                assert list(result.generation_logits.shape) == [
+                    max_output_len, beam_width, vocab_size_padded
+                ] or list(result.generation_logits.shape) == [
+                    1, beam_width, vocab_size_padded
+                ]
+            else:
+                assert list(result.generation_logits.shape) == [
+                    beam_width, max_output_len, vocab_size_padded
+                ]
+
+    def verify_output(beam_tokens, test_data, given_input_lengths):
+
+        for batch_id, seq_tokens in beam_tokens.items():
+            input_length = given_input_lengths[batch_id]
+            end_id = test_data["end_ids"][batch_id]
+            for tokens in seq_tokens:
+                for beam in range(beam_width):
+
+                    predicted_tokens = tokens[beam]
+                    if remove_input:
+                        predicted_tokens = predicted_tokens[input_length:]
+                    expected_length = test_data["expected_output_lengths"][
+                        batch_id][beam] - input_length
+                    assert len(predicted_tokens) == expected_length
+
+                    expected_tokens = test_data["expected_output_ids"][
+                        batch_id * beam_width + beam][input_length:]
+
+                    # From experiments find out when set return_context_logits
+                    # or return_generation_logits, the predicted_tokens cannot match with expected_tokens
+                    # Fixed by comparing partial output tokens like in c++ test
+                    compare_length = 2 if (
+                        return_context_logits
+                        or return_generation_logits) else len(predicted_tokens)
+
+                    for i in range(compare_length):
+                        if expected_tokens[i] == end_id:
+                            break
+                        # Predicted: [21221, 290, 373, 257, 2888, 286, 262, 4141]
+                        # Expected: [21221, 290, 257, 4255, 379, 262, 1957, 7072]
+                        # generation logits are almost same at token ids 257 and 373,
+                        # which causes unstable generation results.
+                        assert predicted_tokens[i] == expected_tokens[i], \
+                            f"Predicted: {predicted_tokens} vs Expected: {expected_tokens}"
+
+    output_config = trtllm.OutputConfig()
+    output_config.exclude_input_from_output = exclude_input_from_output
+    output_config.return_log_probs = compute_log_probs
+    output_config.return_generation_logits = return_generation_logits
+    output_config.return_context_logits = return_context_logits
+    # Change free_gpu_memory_fraction to solve OOM error
+    kv_cache_config = trtllm.KvCacheConfig(False, free_gpu_memory_fraction=0.3)
+    executor_config = trtllm.ExecutorConfig(beam_width)
+    executor_config.batching_type = batching_type
+    executor_config.kv_cache_config = kv_cache_config
+    if return_generation_logits:
+        executor_config.gather_generation_logits = True
+
+    if return_context_logits or return_generation_logits:
+        model_path = model_path_return_logits
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Load test data
+    results_path = results_data_path if beam_width == 1 else results_data_path_beam_width_2
+    given_input, given_input_lengths, max_input_length, test_data = load_test_data(
+        input_data_path, results_path)
+
+    # Create requests from input data
+    num_requests = len(given_input_lengths)
+    requests = []
+    req_max_tokens = []
+
+    for i in range(num_requests):
+        input_len = given_input_lengths[i]
+        max_tokens = test_data["max_seq_length"] - max_input_length
+        req_max_tokens.append(max_tokens)
+        req_tokens = given_input[i][:input_len]
+        num_return_sequences = 2 if i % 5 == 1 else 1
+        request = trtllm.Request(req_tokens,
+                                 max_tokens=max_tokens,
+                                 streaming=streaming,
+                                 sampling_config=trtllm.SamplingConfig(
+                                     beam_width,
+                                     num_return_sequences=num_return_sequences),
+                                 output_config=output_config,
+                                 end_id=-1)
+        requests.append(request)
+
+    req_ids = executor.enqueue_requests(requests)
+
+    req_to_batch_id = {req_ids[i]: i for i in range(len(requests))}
+    tokens = {
+        i: [[[] for _ in range(beam_width)]
+            for _ in range(req.sampling_config.num_return_sequences)]
+        for i, req in enumerate(requests)
+    }
+
+    num_finished = 0
+    i = 0
+    num_responses = 0
+    max_wait_ms = 10000
+    while num_finished < num_requests and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(wait_time)
+        for response in responses:
+            num_responses += 1
+            assert not response.has_error(
+            ), f"Request id {response.request_id} failed with err {response.error_msg}"
+            result = response.result
+            num_finished += result.is_final
+
+            batch_id = req_to_batch_id[response.request_id]
+            for beam in range(beam_width):
+                new_tokens = result.output_token_ids[beam]
+                tokens[batch_id][result.sequence_index][beam] += new_tokens
+
+            validate_results_shapes(result, given_input_lengths[batch_id],
+                                    req_max_tokens[batch_id],
+                                    tokens[batch_id][result.sequence_index])
+        i += 1
+    assert i < max_wait_ms
+    verify_output(tokens, test_data, given_input_lengths)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("beam_width", [1])
+def test_finish_reason(streaming: bool, beam_width: int, model_files,
+                       model_path):
+    if streaming and beam_width > 1:
+        pytest.skip("Test does not support streaming with beam search")
+    executor = trtllm.Executor(
+        model_path, trtllm.ModelType.DECODER_ONLY,
+        trtllm.ExecutorConfig(
+            beam_width,
+            kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5)))
+    requests = [
+        # Finish due to length.
+        trtllm.Request([1, 2, 3, 4],
+                       max_tokens=5,
+                       streaming=streaming,
+                       sampling_config=trtllm.SamplingConfig(beam_width)),
+        # Finish due to end id.
+        trtllm.Request([1, 2, 3, 4],
+                       max_tokens=5,
+                       streaming=streaming,
+                       sampling_config=trtllm.SamplingConfig(beam_width),
+                       end_id=4),
+        # Finish due to stop word.
+        trtllm.Request([1, 2, 3, 4],
+                       max_tokens=5,
+                       streaming=streaming,
+                       sampling_config=trtllm.SamplingConfig(beam_width),
+                       stop_words=[[4, 2]]),
+    ]
+    req_ids = executor.enqueue_requests(requests)
+    req_to_batch_id = {req_ids[i]: i for i in range(len(requests))}
+
+    num_finished = 0
+    i = 0
+    num_responses = 0
+    max_wait_ms = 10000
+    while num_finished < len(requests) and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(wait_time)
+        for response in responses:
+            num_responses += 1
+            assert not response.has_error(
+            ), f"Request id {response.request_id} failed with err {response.error_msg}"
+            result = response.result
+            num_finished += result.is_final
+            batch_id = req_to_batch_id[response.request_id]
+
+            # Non final results should have "NOT_FINISHED". Revise this when streaming + beam_width > 1 is enabled.
+            if not result.is_final:
+                assert all([
+                    r == trtllm.FinishReason.NOT_FINISHED
+                    for r in result.finish_reasons
+                ])
+            # Check if finish reason is correct.
+            elif batch_id == 0:
+                assert all([
+                    r == trtllm.FinishReason.LENGTH
+                    for r in result.finish_reasons
+                ])
+            elif batch_id == 1:
+                assert all([
+                    r == trtllm.FinishReason.END_ID
+                    for r in result.finish_reasons
+                ])
+            elif batch_id == 2:
+                assert all([
+                    r == trtllm.FinishReason.STOP_WORDS
+                    for r in result.finish_reasons
+                ])
+        i += 1
+    assert i < max_wait_ms
+
+
+def test_gpt_executor_timed_out(model_files, model_path):
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # No requests enqueued, expect no responses
+    num_responses_ready = executor.get_num_responses_ready()
+    assert num_responses_ready == 0
+
+    wait_time = datetime.timedelta(milliseconds=10)
+    responses = executor.await_responses(wait_time)
+    assert len(responses) == 0
+
+
+def test_single_request_invalid_inputs(model_files, model_path):
+    streaming = True
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    max_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=streaming)
+    # Invalid embedding bias shape
+    embedding_bias = torch.ones(1)
+    request.embedding_bias = embedding_bias
+    expected_error_msg = "embedding bias shape is not as expected"
+
+    request_id = executor.enqueue_request(request)
+
+    done = False
+    i = 0
+    max_wait_ms = 10000
+    while not done and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(request_id, wait_time)
+        for response in responses:
+            assert response.has_error(), "Expected an error"
+            assert expected_error_msg in response.error_msg
+            done = True
+        i += 1
+    assert done
 
 
 def test_sampling_config():
@@ -312,6 +1147,36 @@ def test_lora_config():
     assert lora_config.task_id == task_id
     assert (lora_config.weights == weights).all()
     assert (lora_config.config == config).all()
+
+
+def test_wakeup(model_files, model_path):
+    import threading
+
+    def resp_thread(stop_signal: threading.Event, executor: trtllm.Executor):
+        while not stop_signal.is_set():
+            timeout = None
+            responses = executor.await_responses(timeout=timeout)
+            if stop_signal.is_set():
+                return
+            for response in responses:
+                response.result.output_token_ids
+
+    executor = trtllm.Executor(
+        model_path, trtllm.ModelType.DECODER_ONLY,
+        trtllm.ExecutorConfig(kv_cache_config=trtllm.KvCacheConfig(
+            free_gpu_memory_fraction=0.5)))
+    stop_signal = threading.Event()
+    thread = threading.Thread(target=resp_thread, args=(stop_signal, executor))
+    thread.start()
+    request = trtllm.Request(input_token_ids=[1, 2, 3, 4],
+                             max_tokens=5,
+                             streaming=True)
+    executor.enqueue_request(request)
+    time.sleep(2)
+    stop_signal.set()
+    executor.shutdown()
+    thread.join()
+    assert not thread.is_alive()
 
 
 def test_guided_decoding_params():
@@ -833,7 +1698,7 @@ def test_decoding_mode():
     assert mode.isEagle()
 
 
-def test_decoding_config():
+def test_speculative_decoding_config():
     config = trtllm.DecodingConfig()
     assert config.decoding_mode is None
     assert config.lookahead_decoding_config is None
@@ -1108,6 +1973,427 @@ def test_peft_cache_config():
                       device_cache_percent)
     assert peft_cache_config.host_cache_size == host_cache_size
     assert peft_cache_config.lora_prefetch_dir == lora_prefetch_dir
+
+
+def test_logits_post_processor(model_files, model_path):
+
+    # Define the logits post-processor callback
+    def logits_post_processor(req_id: int, logits: torch.Tensor,
+                              ids: tp.List[tp.List[int]], stream_ptr: int,
+                              client_id: tp.Optional[int]):
+        assert client_id == 123
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            logits[:] = float("-inf")
+            logits[..., 42] = 0
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor_config.logits_post_processor_config = trtllm.LogitsPostProcessorConfig(
+        {"my_logits_pp": logits_post_processor})
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create the request
+    max_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=False,
+                             client_id=123)
+    request.logits_post_processor_name = "my_logits_pp"
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+
+    # Get the new tokens
+    tokens = []
+    done = False
+    i = 0
+    max_wait_ms = 10000
+    while not done and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(request_id, wait_time)
+        for response in responses:
+            assert not response.has_error(
+            ), f"Request id {request_id} failed with err {response.error_msg}"
+            result = response.result
+            done = result.is_final
+            new_tokens = result.output_token_ids[beam_width - 1]
+            tokens.extend(new_tokens)
+        i += 1
+    assert i < max_wait_ms
+    assert len(tokens) == get_expected_num_tokens(len(input_tokens), max_tokens,
+                                                  False, False), f"{request_id}"
+
+    # check that all output tokens are 42
+    print(tokens)
+    assert tokens[-max_tokens:] == [42] * max_tokens
+
+
+def test_logits_post_processor_batched(model_files, model_path):
+
+    # Define the logits post-processor callback
+    def logits_post_processor_batched(
+            req_id_batch: tp.List[int], logits_batch: tp.List[torch.Tensor],
+            ids_batch: tp.List[tp.List[tp.List[int]]], stream_ptr: int,
+            client_id_batch: tp.List[tp.Optional[int]]):
+        for client_id in client_id_batch:
+            assert client_id == 123
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            for logits in logits_batch:
+                logits[:] = float("-inf")
+                logits[..., 42] = 0
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor_config.logits_post_processor_config = trtllm.LogitsPostProcessorConfig(
+        None, logits_post_processor_batched)
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create the request
+    max_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=False,
+                             client_id=123)
+    request.logits_post_processor_name = request.BATCHED_POST_PROCESSOR_NAME
+
+    batch_size = 4
+    # Enqueue the requests
+    request_ids = []
+    for _ in range(batch_size):
+        request_id = executor.enqueue_request(request)
+        request_ids.append(request_id)
+
+    # Get the new tokens
+    tokens = {req_id: [] for req_id in request_ids}
+    num_finished = 0
+    i = 0
+    max_wait_ms = 10000
+    while num_finished < len(request_ids) and i < max_wait_ms:
+        responses = executor.await_responses(datetime.timedelta(milliseconds=1))
+        for response in responses:
+            req_id = response.request_id
+            assert not response.has_error(
+            ), f"Request id {req_id} failed with err {response.error_msg}"
+            result = response.result
+            num_finished += 1 if result.is_final else 0
+            new_tokens = result.output_token_ids[beam_width - 1]
+            tokens[req_id].extend(new_tokens)
+    assert i < max_wait_ms
+
+    expected_num_tokens = get_expected_num_tokens(len(input_tokens), max_tokens,
+                                                  False, False)
+    for req_id in request_ids:
+        assert len(tokens[req_id]) == expected_num_tokens, f"{req_id}"
+
+
+@pytest.mark.skip("https://nvbugs/5082576")
+def test_kv_event_stream(model_path):
+
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(True,
+                                             4 * 64,
+                                             event_buffer_max_size=1024,
+                                             host_cache_size=3000000,
+                                             free_gpu_memory_fraction=0.5))
+
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    cache_manager = executor.get_kv_cache_event_manager()
+
+    events = cache_manager.get_latest_events()
+
+    assert len(events) == 1
+    assert isinstance(events[0], trtllm.kv_cache.KVCacheEvent)
+    assert events[0].event_id == 0
+    assert isinstance(events[0].data, trtllm.kv_cache.KVCacheCreatedData)
+
+    for req in range(2):
+        input_tokens = list(range(req, req + 127))
+        request = trtllm.Request(input_tokens,
+                                 max_tokens=5,
+                                 streaming=False,
+                                 sampling_config=trtllm.SamplingConfig())
+
+        id = executor.enqueue_request(request)
+
+        responses = executor.await_responses(id)
+
+        for response in responses:
+            assert not response.has_error()
+            if response.result.is_final:
+                time.sleep(0.1)
+                events = cache_manager.get_latest_events(
+                    datetime.timedelta(milliseconds=100))
+
+                if req == 0:
+                    assert events[0].event_id == 1
+                    assert isinstance(events[0].data,
+                                      trtllm.kv_cache.KVCacheStoredData)
+                    assert events[0].data.parent_hash is None
+                    assert len(events[0].data.blocks) == 1
+
+                    assert events[1].data.parent_hash == events[0].data.blocks[
+                        0].block_hash
+                    assert len(events[1].data.blocks) == 2
+                else:
+                    # Swap a block to secondary
+                    assert isinstance(events[0].data,
+                                      trtllm.kv_cache.KVCacheUpdatedData)
+                    assert events[0].data.cache_level.old_value == 0
+                    assert events[0].data.cache_level.new_value == 1
+                    # Store the filled context block
+                    assert isinstance(events[1].data,
+                                      trtllm.kv_cache.KVCacheStoredData)
+                    assert len(events[1].data.blocks) == 1
+                    assert events[1].data.parent_hash is None
+                    # Swap another block to secondary
+                    assert isinstance(events[2].data,
+                                      trtllm.kv_cache.KVCacheUpdatedData)
+                    assert events[2].data.cache_level.old_value == 0
+                    assert events[2].data.cache_level.new_value == 1
+                    assert isinstance(events[2].data.cache_level,
+                                      trtllm.kv_cache.KVCacheEventDiffInt)
+                    # Remove the first block in secondary
+                    assert isinstance(events[3].data,
+                                      trtllm.kv_cache.KVCacheRemovedData)
+                    assert len(events[3].data.block_hashes) == 1
+                    assert events[3].data.block_hashes[0] == events[
+                        0].data.block_hash
+                    # Store the second context block and the decode block
+                    assert isinstance(events[4].data,
+                                      trtllm.kv_cache.KVCacheStoredData)
+                    assert len(events[4].data.blocks) == 2
+                    assert events[4].data.parent_hash == events[1].data.blocks[
+                        0].block_hash
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_request_perf_metrics(streaming: bool, model_path):
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create request
+    max_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    output_config = trtllm.OutputConfig(return_perf_metrics=True)
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=streaming,
+                             output_config=output_config)
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+
+    def check_perf_metrics(perf_metrics, done, response_id):
+        assert perf_metrics is not None
+
+        timing_metrics = perf_metrics.timing_metrics
+        assert timing_metrics.arrival_time < timing_metrics.first_scheduled_time
+        assert timing_metrics.first_scheduled_time < timing_metrics.first_token_time
+        if done:
+            assert timing_metrics.first_token_time < timing_metrics.last_token_time
+        else:
+            assert timing_metrics.last_token_time == datetime.timedelta(0)
+
+        kv_cache_metrics = perf_metrics.kv_cache_metrics
+        assert kv_cache_metrics.num_total_allocated_blocks == 1
+        assert kv_cache_metrics.num_new_allocated_blocks == 1
+        assert kv_cache_metrics.num_reused_blocks == 0
+        assert kv_cache_metrics.num_missed_blocks == 1
+        assert kv_cache_metrics.kv_cache_hit_rate == 0
+
+        assert perf_metrics.first_iter == 0
+        if done:
+            assert perf_metrics.iter == (max_tokens - 1)
+            assert perf_metrics.last_iter == max_tokens - 1
+        else:
+            assert perf_metrics.iter == response_id
+            assert perf_metrics.last_iter is None
+
+    # Get the new tokens
+    tokens = []
+    done = False
+    i = 0
+    max_wait_ms = 10000
+    response_id = 0
+    while not done and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(request_id, wait_time)
+        for response in responses:
+            assert not response.has_error(
+            ), f"Request id {request_id} failed with err {response.error_msg}"
+            result = response.result
+            done = result.is_final
+            check_perf_metrics(result.request_perf_metrics, done, response_id)
+            new_tokens = result.output_token_ids[beam_width - 1]
+            tokens.extend(new_tokens)
+            response_id += 1
+        i += 1
+    assert i < max_wait_ms
+    assert len(tokens) == get_expected_num_tokens(
+        len(input_tokens),
+        max_tokens,
+        streaming=streaming,
+        exclude_input_from_output=False), f"{request_id}"
+
+
+def test_request_perf_metrics_kv_cache(model_path):
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(beam_width)
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create request: model uses 32 tokens per block, so it will fill a full block
+    max_tokens = 32
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens, max_tokens=max_tokens)
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+    # Store two blocks with a total of 35 reusable tokens (4 input + 32 output, but last token is not stored)
+
+    # Get the response
+    responses = executor.await_responses(request_id)
+    assert not responses[0].has_error()
+    result = responses[0].result
+    assert result.is_final
+
+    # Prepare second request using the first output
+    input_tokens = result.output_token_ids[beam_width - 1] + [1, 2, 3, 4]
+    output_config = trtllm.OutputConfig(return_perf_metrics=True)
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             output_config=output_config)
+
+    # Enqueue the request
+    # New query has 36 tokens that match input and output of first request plus 4 additional tokens.
+    # First block reused completely (32 tokens), from second block we'll partially reuse 3 tokens.
+    request_id = executor.enqueue_request(request)
+
+    # Get the response
+    responses = executor.await_responses(request_id)
+    assert not responses[0].has_error()
+    result = responses[0].result
+    assert result.is_final
+
+    # Check KV cache metric: Two blocks will be reused, although second block is partially reused.
+    # Cache hit rate is 100% since granularity is blocks, not tokens.
+    kv_cache_metrics = result.request_perf_metrics.kv_cache_metrics
+    assert kv_cache_metrics.num_total_allocated_blocks == 0
+    assert kv_cache_metrics.num_new_allocated_blocks == 0
+    assert kv_cache_metrics.num_reused_blocks == 2
+    assert kv_cache_metrics.num_missed_blocks == 0
+    assert kv_cache_metrics.kv_cache_hit_rate == 1.0
+
+
+# Skip test for pre-Hopper: https://nvbugs/5404000
+@skip_pre_hopper
+@pytest.mark.parametrize("exclude_input_from_output", [False, True])
+def test_request_perf_metrics_draft(model_path_draft_tokens_external,
+                                    exclude_input_from_output: bool):
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    executor = trtllm.Executor(model_path_draft_tokens_external,
+                               trtllm.ModelType.DECODER_ONLY, executor_config)
+
+    # Create request
+    max_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+
+    # Only first two tokens will be accepted -> 50% acceptance rate
+    draft_config = trtllm.ExternalDraftTokensConfig([2, 4, 9, 10])
+    output_config = trtllm.OutputConfig(
+        exclude_input_from_output=exclude_input_from_output,
+        return_perf_metrics=True)
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             output_config=output_config,
+                             external_draft_tokens_config=draft_config)
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+
+    # Get the response
+    responses = executor.await_responses(request_id)
+    assert not responses[0].has_error()
+    result = responses[0].result
+    assert result.is_final
+
+    # check the new tokens
+    new_tokens = result.output_token_ids[beam_width - 1]
+    if exclude_input_from_output:
+        assert new_tokens == [2, 4, 2]
+    else:
+        assert new_tokens == [1, 2, 3, 4, 2, 4, 2]
+
+    # Check the perf metrics
+    perf_metrics = result.request_perf_metrics
+    assert perf_metrics is not None
+
+    timing_metrics = perf_metrics.timing_metrics
+    assert timing_metrics.arrival_time < timing_metrics.first_scheduled_time
+    assert timing_metrics.first_scheduled_time < timing_metrics.first_token_time
+    assert timing_metrics.first_token_time <= timing_metrics.last_token_time
+
+    assert perf_metrics.first_iter == 0
+    assert perf_metrics.iter == 0
+    assert perf_metrics.last_iter == 0
+
+    spec_dec_metrics = perf_metrics.speculative_decoding
+    assert spec_dec_metrics.acceptance_rate == 0.5
+    assert spec_dec_metrics.total_accepted_draft_tokens == 2
+    assert spec_dec_metrics.total_draft_tokens == 4
+
+
+def test_kv_event_stream_timeout(model_path):
+
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(
+        beam_width,
+        kv_cache_config=trtllm.KvCacheConfig(True,
+                                             4 * 64,
+                                             event_buffer_max_size=1024,
+                                             free_gpu_memory_fraction=0.5))
+
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    cache_manager = executor.get_kv_cache_event_manager()
+
+    events = cache_manager.get_latest_events()
+    assert len(events) == 1
+
+    start = datetime.datetime.now()
+    events = cache_manager.get_latest_events(1000)
+    end = datetime.datetime.now()
+    # Make sure that it actually waited
+    assert abs(end - start) > datetime.timedelta(milliseconds=900)
+    assert len(events) == 0
 
 
 def test_request_perf_metrics_pickle():

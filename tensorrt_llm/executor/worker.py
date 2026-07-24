@@ -153,6 +153,11 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def block_subordinates(self):
         if self.rank != 0:
+            if isinstance(self.engine, tllm.Executor):
+                self.shutdown()
+                raise self.WorkerExit(
+                    "block_subordinates() should be used in a `with GenerationExecutorWorker() as ...:` block"
+                )
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
             if isinstance(self.engine, PyExecutor):
                 self.engine.wait_shutdown()
@@ -216,10 +221,6 @@ def worker_main(
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
 
     is_leader: bool = mpi_rank() == 0
-    # Multi-frontend serving: the worker binds the request ingress (PULL)
-    # and pushes responses to per-frontend result lanes.
-    multi_frontend_addrs = worker_queues.frontend_result_queue_addrs
-    frontend_result_queues: Optional[List[FusedIpcQueue]] = None
     if tracer_init_kwargs is not None and is_leader:
         tracer = VizTracer(**tracer_init_kwargs)
         tracer.register_exit()
@@ -237,9 +238,7 @@ def worker_main(
         # inherit the log level from "TLLM_LOG_LEVEL" environment variable
         logger.set_level(log_level)
         request_queue = IpcQueue(worker_queues.request_queue_addr,
-                                 is_server=multi_frontend_addrs is not None,
-                                 socket_type=zmq.PULL if multi_frontend_addrs
-                                 is not None else zmq.PAIR,
+                                 is_server=False,
                                  name="worker_request_queue")
         worker_init_status_queue = IpcQueue(
             worker_queues.worker_init_status_queue_addr,
@@ -261,16 +260,6 @@ def worker_main(
                               name=f"postprocess_{i}_feedin_queue")
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
-        elif multi_frontend_addrs is not None:
-            # One PUSH lane per frontend (see base_worker._send_rsp).
-            frontend_result_queues = [
-                FusedIpcQueue(addr,
-                              is_server=False,
-                              fuse_message=False,
-                              socket_type=zmq.PUSH,
-                              name=f"worker_result_queue_{i}")
-                for i, addr in enumerate(multi_frontend_addrs)
-            ]
         else:
             # IPC queue for sending results back to the proxy, and let the
             # Proxy process to handle the postprocess
@@ -280,12 +269,9 @@ def worker_main(
                                          name="worker_result_queue")
 
     def notify_proxy_threads_to_quit():
-        # Signal the dispatcher thread in every frontend proxy to quit
+        # Signal the dispatcher thread in the proxy to quit
         if result_queue is not None:
             result_queue.put(None)
-        elif frontend_result_queues is not None:
-            for q in frontend_result_queues:
-                q.put(None)
         else:
             assert result_queues is not None
             for q in result_queues:
@@ -295,20 +281,18 @@ def worker_main(
     if is_leader and postproc_worker_config.enabled:
         logger_debug(f"initiate postprocess workers...", "yellow")
 
-        # Each postproc worker pushes to every frontend result lane (a
-        # single lane in single-frontend mode).
-        proxy_result_addrs = (multi_frontend_addrs
-                              if multi_frontend_addrs is not None else
-                              [worker_queues.result_queue_addr])
+        proxy_result_queue: tuple[
+            str, Optional[bytes]] = worker_queues.result_queue_addr
 
         assert result_queues is not None
         postproc_worker_pool = ProcessPoolExecutor(
             max_workers=postproc_worker_config.num_postprocess_workers)
+        assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
                 postproc_worker_main,
                 result_queues[i].address,
-                proxy_result_addrs,
+                proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
                 postproc_worker_config.post_processor_hook,
@@ -365,8 +349,6 @@ def worker_main(
             if is_leader:
                 if postproc_worker_config.enabled:
                     worker.set_postproc_queues(result_queues)
-                elif frontend_result_queues is not None:
-                    worker.set_frontend_result_queues(frontend_result_queues)
                 else:
                     worker.set_result_queue(result_queue)
 

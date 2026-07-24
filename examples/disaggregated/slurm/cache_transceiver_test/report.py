@@ -184,7 +184,7 @@ def _mean(values):
 
 
 def _parse_cpp_recv_csvs(csv_dir):
-    """Return {rid: [per_rank_GBps, ...]} from C++ *_recv.csv files.
+    """Return {rid: [per_rank_GBps, ...]} from C++ rank_*_recv.csv files.
 
     Each rank writes one row per request with a repeating Bandwidth(Gbps) column
     per transmission; we take the mean transmission bandwidth as that rank's
@@ -194,10 +194,9 @@ def _parse_cpp_recv_csvs(csv_dir):
     per-rank rates with unequal durations would overstate the real throughput.
     """
     per_rid = {}  # rid -> list[per-rank mean bw]
-    # C++ writes "<instanceId>_<rank>_recv.csv" (instanceId is a runtime UUID);
-    # the driver renames each combination's *_recv.csv to *_recv__c<ci>l<li>.csv
+    # The driver renames each combination's rank_*_recv.csv to rank_*_recv__c<ci>l<li>.csv
     # (and the un-renamed name may exist for the last iteration). Match both.
-    for path in glob.glob(os.path.join(csv_dir, "*_recv*.csv")):
+    for path in glob.glob(os.path.join(csv_dir, "rank_*_recv*.csv")):
         with open(path) as f:
             reader = csv.reader(f)
             header = next(reader, None)

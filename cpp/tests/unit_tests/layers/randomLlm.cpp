@@ -16,7 +16,6 @@
 #include "tests/unit_tests/layers/randomLlm.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -35,7 +34,7 @@ TensorPtr initTensor(std::string str, std::optional<ITensor::Shape> shape)
     {
         TLLM_CHECK(ITensor::volume(shape1d) == ITensor::volume(shape.value()));
     }
-    TensorPtr tensor = BufferManager::cpu(shape.value_or(shape1d), tensorrt_llm::DataType::kINT32);
+    TensorPtr tensor = BufferManager::cpu(shape.value_or(shape1d), nvinfer1::DataType::kINT32);
     auto tensorRange = BufferRange<TokenIdType>(*tensor);
     std::copy(str.begin(), str.end(), tensorRange.begin());
     return tensor;
@@ -43,7 +42,7 @@ TensorPtr initTensor(std::string str, std::optional<ITensor::Shape> shape)
 
 TensorConstPtr RandomTokenLogits::tokenToLogits(TokenIdType token) const
 {
-    TensorPtr logits = BufferManager::cpu(mVocabulary->getShape(), tensorrt_llm::DataType::kFLOAT);
+    TensorPtr logits = BufferManager::cpu(mVocabulary->getShape(), nvinfer1::DataType::kFLOAT);
     tokenToLogits(logits, token);
     return logits;
 }
@@ -153,7 +152,7 @@ void RandomTokenLogits::logitsToTensor(TensorPtr const& tokens, TensorConstPtr c
 TensorConstPtr RandomTokenLogits::logitsToTensor(TensorConstPtr const& logits) const
 {
     auto len = logits->getShape().d[0];
-    TensorPtr result = BufferManager::cpu(ITensor::makeShape({len}), tensorrt_llm::DataType::kINT32);
+    TensorPtr result = BufferManager::cpu(ITensor::makeShape({len}), nvinfer1::DataType::kINT32);
     logitsToTensor(result, logits);
     return result;
 }
@@ -210,7 +209,7 @@ bool RandomLlm::verify(SizeType32 const offset, TensorConstPtr const& script) co
 void RandomLlm::forward(TensorPtr const& output, runtime::SizeType32 startId, TensorConstPtr const& input,
     TensorConstPtr const& offsets, TensorConstPtr const mask) const
 {
-    TensorPtr posIds = BufferManager::cpu(input->getShape(), tensorrt_llm::DataType::kINT32);
+    TensorPtr posIds = BufferManager::cpu(input->getShape(), nvinfer1::DataType::kINT32);
     BufferRange<SizeType32> idRange(*posIds);
     BufferRange<SizeType32 const> offsetRange(*offsets);
     for (auto i = 0; i < idRange.size(); i++)
@@ -227,7 +226,7 @@ void RandomLlm::forward(TensorPtr const& output, TensorConstPtr const& input, Te
     TLLM_CHECK(ITensor::volume(input->getShape()) == ITensor::volume(position->getShape()));
     TLLM_CHECK(ITensor::volume(output->getShape()) == ITensor::volume(input->getShape()) * mTable->getVocabSize());
 
-    TensorPtr tokens = BufferManager::cpu(input->getShape(), tensorrt_llm::DataType::kINT32);
+    TensorPtr tokens = BufferManager::cpu(input->getShape(), nvinfer1::DataType::kINT32);
     foretell(tokens, input, position, mask);
     // foretellOld(tokens, input, position);
     mTable->tensorToLogits(output, tokens);
@@ -248,7 +247,7 @@ void LookaheadRandomLlm::foretell(TensorPtr const& output, TensorConstPtr const&
         TLLM_CHECK(mask->getShape().d[1] >= len);
     }
 
-    TensorPtr maskRebuilt = BufferManager::cpu(ITensor::makeShape({len, len}), tensorrt_llm::DataType::kBOOL);
+    TensorPtr maskRebuilt = BufferManager::cpu(ITensor::makeShape({len, len}), nvinfer1::DataType::kBOOL);
     posIdsToMask(maskRebuilt, position);
 
     auto outputRange = BufferRange<TokenIdType>(*output);

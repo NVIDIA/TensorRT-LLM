@@ -219,7 +219,6 @@ class StorageManager:
         constraints: list[BatchDesc] | None = None,
         initial_pool_ratio: list[float] | None = None,
         event_manager: "KVCacheEventManager | None" = None,
-        max_util_for_resume: float = 1.0,
     ) -> None:
         self.__rawref__ = rawref.NULL
         self._event_manager = event_manager
@@ -246,10 +245,7 @@ class StorageManager:
 
         constraints_for_min_slots = [] if initial_pool_ratio is not None else constraints or []
         self._min_slots = self._compute_min_slots_from_constraints(
-            constraints_for_min_slots,
-            tokens_per_block,
-            swa_scratch_reuse,
-            max_util_for_resume,
+            constraints_for_min_slots, tokens_per_block, swa_scratch_reuse
         )
 
         # Compute init_ratio from explicit config, typical_batch, constraints, or fallback.
@@ -911,12 +907,10 @@ class StorageManager:
         constraints: list[BatchDesc],
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
-        max_util_for_resume: float,
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute the minimum slots per pool group across all constraints (element-wise max).
 
-        All returned elements are positive. Constraint-derived floors include
-        headroom for the utilization gate checked by ``_KVCache.resume``.
+        All returned elements are positive.
         """
         max_slots = filled_list(0, self.num_pool_groups)
 
@@ -943,8 +937,7 @@ class StorageManager:
         for batch in constraints:
             slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
             for pg_idx in typed_range(self.num_pool_groups):
-                scaled_slots = math.ceil(slots[pg_idx] / max_util_for_resume)
-                max_slots[pg_idx] = max(max_slots[pg_idx], scaled_slots)
+                max_slots[pg_idx] = max(max_slots[pg_idx], slots[pg_idx])
         return max_slots
 
     def _compute_slots_for_batch(

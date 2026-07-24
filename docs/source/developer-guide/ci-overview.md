@@ -98,8 +98,8 @@ Each line contains the fully qualified test name followed by an optional
 specific hardware family. Example:
 
 ```text
-accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
-full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6422318)
+examples/test_openai.py::test_llm_openai_triton_1gpu SKIP (https://nvbugspro.nvidia.com/bug/4963654)
+full:GH200/examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct] SKIP (arm is not supported)
 ```
 
 Changes to `waives.txt` should include a bug link or brief explanation so other
@@ -109,17 +109,8 @@ developers understand why the test is disabled.
 
 ### Triggering Post-merge tests
 
-Full `/bot run --post-merge` runs require the `ci: post-merge approved` PR
-label because they can consume substantial shared GPU resources. The label is
-intended to be applied by an active member of the
-`NVIDIA/trt-llm-ci-approvers` GitHub team. A GitHub workflow validates the label
-actor and normally removes invalid approvals. This is a best-effort resource
-governance guard, not a strict authorization boundary. The label remains in
-place when new commits are pushed and can be removed manually when the approval
-no longer applies.
-
-When you only need to verify a handful of post-merge tests, specify exactly
-which stages to run:
+When you only need to verify a handful of post-merge tests, avoid the heavy
+`/bot run --post-merge` command. Instead, specify exactly which stages to run:
 
 ```bash
 /bot run --stage-list "stage-A,stage-B"
@@ -132,14 +123,8 @@ default pre-merge set:
 /bot run --extra-stage "stage-A,stage-B"
 ```
 
-Both options accept stage names and wildcard patterns defined in
-`jenkins/L0_Test.groovy`. The `"*"`, `"*Post-Merge*"`, and `"*PerfSanity*"`
-selectors require the same approval label, including when they appear in a
-comma-separated list. Equivalent escaped or repeated-star forms are treated the
-same. Other stage selectors, including explicit stage names and other limited
-wildcard patterns, retain their existing behavior.
-
-Being selective keeps CI turnaround fast and conserves hardware resources.
+Both options accept any stage name defined in `jenkins/L0_Test.groovy`. Being
+selective keeps CI turnaround fast and conserves hardware resources.
 
 ### Avoiding unnecessary `--disable-fail-fast` usage
 

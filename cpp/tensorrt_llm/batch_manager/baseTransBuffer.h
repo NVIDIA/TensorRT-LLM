@@ -17,7 +17,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
@@ -226,7 +225,7 @@ protected:
     /// @param dataType Data type for the buffers.
     /// @param maxNumTokens Optional max tokens for sizing.
     BaseTransBufferManager(
-        size_t transferBufferSize, tensorrt_llm::DataType dataType, std::optional<size_t> maxNumTokens = std::nullopt);
+        size_t transferBufferSize, nvinfer1::DataType dataType, std::optional<size_t> maxNumTokens = std::nullopt);
 
     struct ConcurrenceResource
     {
@@ -257,7 +256,7 @@ protected:
     bool mOnlyUseDynamicBuffer;
     bool mUseFabricMemory;
     size_t mNumberOfElements;
-    tensorrt_llm::DataType mDataType;
+    nvinfer1::DataType mDataType;
     ConcurrenceResource mConcurrenceSendResource;
     ConcurrenceResource mConcurrenceRecvResource;
     runtime::BufferManager mBufferManager;

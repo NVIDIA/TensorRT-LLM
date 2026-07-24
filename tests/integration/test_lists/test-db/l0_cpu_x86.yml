@@ -14,4 +14,3 @@ l0_cpu_x86:
       orchestrator: mpi
   tests:
   - unittest/executor/test_rpc.py
-  - unittest/executor/test_multi_frontend_routing.py

@@ -17,10 +17,10 @@ except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
 from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
-from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
-                                 mpi_comm, mpi_disabled, mpi_isend,
-                                 mpi_isend_object, mpi_recv, mpi_recv_object,
-                                 mpi_send, mpi_send_object, mpi_world_size,
+from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
+                                 mpi_disabled, mpi_isend, mpi_isend_object,
+                                 mpi_recv, mpi_recv_object, mpi_send,
+                                 mpi_send_object, mpi_world_size,
                                  torch_pybind11_abi)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
@@ -157,11 +157,6 @@ class Distributed(ABC):
     @property
     def cp_config(self):
         return self.mapping.cp_config
-
-    @property
-    @abstractmethod
-    def local_world_size(self):
-        """Number of ranks co-located on this physical node."""
 
     @abstractmethod
     def barrier(self):
@@ -673,10 +668,6 @@ class MPIDist(Distributed):
     def allgather(self, obj):
         return mpi_allgather(obj)
 
-    @property
-    def local_world_size(self):
-        return local_mpi_size()
-
     def barrier(self):
         mpi_barrier()
 
@@ -800,10 +791,6 @@ class TorchDist(Distributed):
     @property
     def rank(self):
         return torch.distributed.get_rank()
-
-    @property
-    def local_world_size(self):
-        return dist.get_world_size(group=self.local_comm)
 
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)

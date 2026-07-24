@@ -21,7 +21,7 @@
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntimeBase.h>
 #include <mutex>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -194,7 +194,7 @@ bool FabricMemory::supportFabricMemory()
 size_t CacheTransBufferManager::computeTransferBufferSize(
     KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
 {
-    tensorrt_llm::DataType dataType;
+    nvinfer1::DataType dataType;
     if (transferIndexerKCache)
     {
         dataType = cacheManager->getIndexerKCachePool()->getDataType();

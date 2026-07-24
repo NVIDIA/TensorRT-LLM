@@ -18,7 +18,7 @@
 #include "nlohmann/json.hpp"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntime.h>
 #include <cstdint>
 #include <fstream>
 #include <map>
@@ -30,7 +30,7 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace common::safetensors
 {
-using tensorrt_llm::DataType;
+using nvinfer1::DataType;
 
 static DataType convertDataTypeStrToEnum(std::string const& str)
 {

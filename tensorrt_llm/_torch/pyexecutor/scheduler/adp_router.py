@@ -201,7 +201,6 @@ class ADPRouter(ABC):
                 dist=dist,
                 max_sessions=attention_dp_config.kv_cache_routing_max_sessions,
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
-                new_conv_placement=attention_dp_config.kv_cache_routing_new_conv_placement,
             )
 
         if (
@@ -798,11 +797,10 @@ class KVCacheAwareADPRouter(ADPRouter):
 
 class ConversationAwareADPRouter(ADPRouter):
     """Pins each conversation to a single attention-DP rank: the first request
-    of a conversation is placed by ``new_conv_placement`` (round-robin by
-    default, or least-queued), and every later request with the same
+    of a conversation is round-robined, and every later request with the same
     ``conversation_id`` returns to that rank, keeping the conversation's
-    KV-cache prefix on one rank. Requests without a ``conversation_id`` fall
-    back to the same ``new_conv_placement`` policy.
+    KV-cache prefix on one rank. Falls back to load-balanced round-robin when no
+    ``conversation_id`` is present.
     """
 
     # Default LRU cap on the conversation->rank map (entries are ~tens of
@@ -814,15 +812,11 @@ class ConversationAwareADPRouter(ADPRouter):
         dist: "Distributed",
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         fair_share_multiplier: float = 2.0,
-        new_conv_placement: str = "round_robin",
     ):
         super().__init__(dist)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
-        self._new_conv_placement = (
-            "least_queued" if new_conv_placement == "least_queued" else "round_robin"
-        )
         self._round_robin_cursor = 0
 
     def create_rank_state(
@@ -929,13 +923,8 @@ class ConversationAwareADPRouter(ADPRouter):
 
             if rank is None:
                 # First turn of a new conversation, sticky-overflow, or no
-                # conversation_id -> spread under the soft cap: round-robin
-                # (count-uniform) or least-queued (steers away from ranks kept
-                # busy by heavy pinned conversations).
-                if self._new_conv_placement == "least_queued":
-                    rank = _least_loaded(expected_num_active_requests)
-                else:
-                    rank = _next_rr(expected_num_active_requests)
+                # conversation_id -> round-robin spread under the soft cap.
+                rank = _next_rr(expected_num_active_requests)
                 if conv_id is not None and conv_id not in self._conv_to_rank:
                     # Bind this new conversation to its first-turn rank.
                     self._record_target_rank(conv_id, rank)

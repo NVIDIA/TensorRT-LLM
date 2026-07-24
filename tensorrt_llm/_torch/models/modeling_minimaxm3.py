@@ -35,17 +35,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (
-    AttentionForwardArgs,
-    PositionalEmbeddingParams,
-    RopeParams,
-)
-from ..attention_backend.sparse.minimax_m3 import (
-    MiniMaxM3MsaSparseAttention,
-    MiniMaxM3SparseRuntimeBackend,
-    _gather_paged_batched,
-    _write_main_kv_slots_to_pool,
-)
+from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import AllReduce, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -62,8 +52,6 @@ from ..utils import (
     get_model_extra_attrs,
     is_torch_compiling,
 )
-from .checkpoints.base_weight_mapper import BaseWeightMapper
-from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, ModelConfig, register_auto_model
 
 # Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
@@ -923,6 +911,11 @@ class MiniMaxM3Attention(Attention):
         output: torch.Tensor,
     ) -> torch.Tensor:
         """Run dense cache updates and attention into ``output``."""
+        from ..attention_backend.sparse.minimax_m3 import (
+            _gather_paged_batched,
+            _write_main_kv_slots_to_pool,
+        )
+
         kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
         if kv_cache_manager is None:
             raise RuntimeError(
@@ -1124,27 +1117,11 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        # The MSA backend runs the sparse GQA or dense paged GQA through its
-        # inherited forward; this layer selects the top-k blocks (sparse only)
-        # and builds the forward_args the FMHA reads.
-        if isinstance(self.attn, MiniMaxM3MsaSparseAttention):
-            if self.is_sparse_attention_layer:
-                assert idx_q is not None and idx_k is not None
-                # Publish the selected blocks so the FMHA runs the sparse path.
-                kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
-                forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
-            else:
-                assert idx_q is None and idx_k is None
-                # No top-k selection means the FMHA attends the full page table.
-                forward_args = AttentionForwardArgs(output=output)
-            self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
-            return output
-        else:
-            if self.is_sparse_attention_layer:
-                assert idx_q is not None and idx_k is not None
-                return self._sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
-            assert idx_q is None and idx_k is None
-            return self._dense_attention_core(q, k, v, attn_metadata, output)
+        if self.is_sparse_attention_layer:
+            assert idx_q is not None and idx_k is not None
+            return self._sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+        assert idx_q is None and idx_k is None
+        return self._dense_attention_core(q, k, v, attn_metadata, output)
 
     def _sparse_forward(
         self,
@@ -1164,7 +1141,7 @@ class MiniMaxM3Attention(Attention):
           4. Pull paged main K/V cache (reshaped to flat-slot view) and
              paged side index-K cache from the
              :class:`MiniMaxM3KVCacheManagerV2`.
-          5. Build a :class:`MiniMaxM3TritonSparseAttentionMetadata` from the
+          5. Build a :class:`MiniMaxM3SparseAttentionMetadata` from the
              standard :class:`AttentionMetadata` (using ``request_ids``
              + ``seq_lens`` + ``num_cached_tokens_per_seq``).
           6. Write the new token's K/V/idx_K to the slots named by the
@@ -1177,7 +1154,7 @@ class MiniMaxM3Attention(Attention):
         Production callers (the LLM API path) drive
         :meth:`MiniMaxM3AttentionMetadata.prepare` outside any
         CUDA-graph capture window; that method attaches a pre-built
-        :class:`MiniMaxM3TritonSparseAttentionMetadata` and an
+        :class:`MiniMaxM3SparseAttentionMetadata` and an
         ``out_cache_loc`` tensor as ``attn_metadata.minimax_m3``. Test
         callers attach the same dict manually.  This forward path
         always reads the pre-built attachment and never builds metadata
@@ -1221,7 +1198,7 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Run sparse cache updates and attention into ``output`` (Triton path)."""
+        """Run sparse cache updates and attention into ``output``."""
         kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
         if kv_cache_manager is None:
             raise RuntimeError(
@@ -1291,7 +1268,10 @@ class MiniMaxM3Attention(Attention):
         # registers :class:`MiniMaxM3SparseRuntimeBackend` as
         # ``self.attn``; any other backend on a sparse layer is a
         # configuration error.
-        if not isinstance(self.attn, MiniMaxM3SparseRuntimeBackend):
+        from ..attention_backend.sparse.minimax_m3 import get_minimax_m3_attention_backend_cls
+
+        m3_backend_cls = get_minimax_m3_attention_backend_cls()
+        if not isinstance(self.attn, m3_backend_cls):
             raise RuntimeError(
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
                 f"self.attn to be a MiniMaxM3SparseRuntimeBackend, got "
@@ -1473,6 +1453,20 @@ class MiniMaxM3Model(DecoderModel):
         return hidden_states
 
 
+# HF MiniMax-M3 stores the routed score-correction bias one level above
+# the router weight (``block_sparse_moe.e_score_correction_bias``,
+# sibling of ``block_sparse_moe.gate.weight``). The TRT-LLM module tree
+# binds it to :class:`MiniMaxM3Gate`, so the generic loader expects to
+# see it at ``block_sparse_moe.gate.e_score_correction_bias``. The
+# regex below moves the key into the gate's prefix before the loader
+# dispatches; this lets ``mark_consumed("...gate")`` cleanly remove
+# both the weight and the bias together without disturbing the sibling
+# ``block_sparse_moe.experts.*`` backend subtree.
+_M3_GATE_BIAS_RENAME_MAP = {
+    r"^(.*\.block_sparse_moe)\.e_score_correction_bias$": (r"\1.gate.e_score_correction_bias"),
+}
+
+
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
@@ -1488,23 +1482,13 @@ class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedCon
             vocab_size=model_config.pretrained_config.vocab_size,
         )
 
-    def load_weights(
-        self,
-        weights: Dict,
-        weight_mapper: Optional[BaseWeightMapper] = None,
-        params_map: Optional[Dict[str, str]] = None,
-        allow_partial_loading: bool = False,
-    ) -> None:
-        if weight_mapper is None:
-            weight_mapper = MiniMaxM3HfWeightMapper()
-        weight_mapper.init_model_and_config(self, self.model_config)
-        merged_params_map = {**MINIMAX_M3_PARAMS_MAP, **(params_map or {})}
-        super().load_weights(
-            weights=weights,
-            weight_mapper=weight_mapper,
-            params_map=merged_params_map,
-            allow_partial_loading=allow_partial_loading,
-        )
+    def load_weights(self, weights, *args, **kwargs):
+        # Merge the M3-specific gate-bias rename into any caller-
+        # supplied ``params_map`` so the VL wrapper and any downstream
+        # tooling that already passes one keep working.
+        params_map = kwargs.pop("params_map", None) or {}
+        merged = {**_M3_GATE_BIAS_RENAME_MAP, **params_map}
+        return super().load_weights(weights, *args, params_map=merged, **kwargs)
 
 
 def _strip_language_model_prefix(
@@ -1640,13 +1624,7 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
         self.last_loaded_vision_keys = []
         self.last_missing_vision_keys = []
 
-    def load_weights(
-        self,
-        weights: Dict,
-        weight_mapper: Optional[BaseWeightMapper] = None,
-        params_map: Optional[Dict[str, str]] = None,
-        allow_partial_loading: bool = False,
-    ) -> None:
+    def load_weights(self, weights, *args, **kwargs):
         text_cfg = self.config
         if is_minimax_m3_vl_config(text_cfg):
             text_cfg = get_text_config(text_cfg)
@@ -1669,12 +1647,7 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             self.last_loaded_vision_keys = loaded
             self.last_missing_vision_keys = missing
 
-        super().load_weights(
-            weights=text_weights,
-            weight_mapper=weight_mapper,
-            params_map=params_map,
-            allow_partial_loading=allow_partial_loading,
-        )
+        return super().load_weights(text_weights, *args, **kwargs)
 
     def forward(
         self,

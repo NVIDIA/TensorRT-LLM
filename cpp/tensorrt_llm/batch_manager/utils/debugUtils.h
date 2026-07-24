@@ -23,6 +23,11 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+namespace tensorrt_llm::runtime
+{
+class TllmRuntime;
+} // namespace tensorrt_llm::runtime
+
 namespace tensorrt_llm::batch_manager::utils
 {
 

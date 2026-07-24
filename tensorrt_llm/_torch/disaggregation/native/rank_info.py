@@ -1,18 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from dataclasses import asdict, dataclass
 from typing import List, Optional
 
@@ -74,15 +59,6 @@ class RankInfo:
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
         enable_attention_dp = m.enable_attention_dp
-        kv_heads_per_rank = next((h for h in kvm.num_kv_heads_per_layer if h > 0), 0)
-        # Eight is the smallest element count guaranteed to occupy whole bytes
-        # for every supported sub-byte cache dtype (including NVFP4).
-        bytes_for_eight_elements = get_size_in_bytes(8, kvm.dtype)
-        element_bytes = (
-            bytes_for_eight_elements // 8
-            if bytes_for_eight_elements % 8 == 0
-            else bytes_for_eight_elements / 8
-        )
         return cls(
             instance_name=instance_name,
             instance_rank=m.rank,
@@ -101,10 +77,10 @@ class RankInfo:
             self_endpoint="",
             transfer_engine_info=bytes(),
             attention=AttentionInfo(
-                kv_heads_per_rank=kv_heads_per_rank,
+                kv_heads_per_rank=kvm.num_kv_heads_per_layer[0],
                 tokens_per_block=kvm.tokens_per_block,
                 dims_per_head=kvm.head_dim,
-                element_bytes=element_bytes,
+                element_bytes=get_size_in_bytes(1, kvm.dtype),
                 enable_attention_dp=enable_attention_dp,
                 is_mla=kvm.kv_factor == 1,
             ),

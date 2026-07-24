@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 import ast
 import inspect
 import json
@@ -36,7 +33,6 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4MTP,
     _copy_deepseek_v4_fused_a_weight_scale,
     _deepseek_v4_pos_embd_params,
-    _normalize_deepseek_v4_nvfp4_mixed_precision_config,
     _remap_deepseek_v4_checkpoint_keys,
     _resolve_enable_fused_hc,
 )
@@ -444,48 +440,6 @@ def test_deepseek_v4_moe_auto_backend_on_blackwell(monkeypatch):
     monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
 
     assert ModelConfig.resolve_moe_backend("AUTO", "DeepseekV4ForCausalLM") == "TRTLLM"
-
-
-def test_deepseek_v4_nvfp4_mixed_precision_config():
-    config = DeepseekV4Config()
-    config.quantization_config = {
-        "quant_method": "fp8",
-        "weight_block_size": [128, 128],
-        "modules_to_not_convert": ["lm_head"],
-    }
-    mixed_quant_config = QuantConfig(
-        quant_algo=QuantAlgo.MIXED_PRECISION,
-        group_size=16,
-        exclude_modules=["*.attn.*", "*.ffn.shared_experts.*", "head", "mtp.*"],
-    )
-    mixed_quant_config.mamba_ssm_cache_dtype = torch.bfloat16
-    assert not mixed_quant_config.layer_quant_mode.has_fp8_block_scales()
-    experts_quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
-    model_config = ModelConfig(
-        pretrained_config=config,
-        quant_config=mixed_quant_config,
-        quant_config_dict={"model.layers.0.mlp.experts": experts_quant_config},
-    )
-    model_config._frozen = True
-
-    normalized_config = _normalize_deepseek_v4_nvfp4_mixed_precision_config(model_config)
-
-    assert normalized_config is model_config
-    assert mixed_quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
-    assert normalized_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-    assert normalized_config.quant_config.layer_quant_mode.has_fp8_block_scales()
-    assert normalized_config.quant_config.group_size == 128
-    assert normalized_config.quant_config.mamba_ssm_cache_dtype == torch.bfloat16
-    assert normalized_config.quant_config.exclude_modules == [
-        "lm_head",
-        "*kv_b_proj*",
-        "*k_b_proj*",
-        "*eh_proj*",
-    ]
-    assert (
-        normalized_config.quant_config_dict["model.layers.0.mlp.experts"].quant_algo
-        == QuantAlgo.NVFP4
-    )
 
 
 def test_deepseek_v4_routed_moe_quant_config_from_mxfp4_header(tmp_path, monkeypatch):

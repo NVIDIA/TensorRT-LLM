@@ -1,17 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import functools
 import math
 import os
@@ -221,10 +207,6 @@ class FlashInferWrappers:
                                                         repr=False)
     host_decode_block_tables: Optional[torch.Tensor] = field(default=None,
                                                              repr=False)
-    # Remember the previously populated rectangle so a smaller subsequent batch can clear stale rows
-    # and columns before narrowing future updates.
-    decode_block_table_active_rows: int = field(default=0, repr=False)
-    decode_block_table_active_width: int = field(default=0, repr=False)
 
 
 @dataclass(kw_only=True)
@@ -648,7 +630,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._host_pool_indices: Dict[int, torch.Tensor] = {}
         self._host_paged_kv_indices: Optional[torch.Tensor] = None
         self._host_paged_kv_indptr_decode: Optional[torch.Tensor] = None
-        self._max_num_blocks_per_seq = 0
+        self._max_num_blocks = 0
 
         # VSWA (Variable Sliding Window Attention): models with per-layer
         # max_attention_window create separate V2 pool groups with independent
@@ -668,16 +650,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             )
 
             # Maximum block count across ALL pools: sizes the VSWA pool
-            # buffers below. Computed for every model, not just VSWA —
-            # non-VSWA managers have a single pool, so this stays
-            # blocks_in_primary_pool for them.
+            # buffers below and bounds the per-request width of the
+            # persistent trtllm-gen decode block tables (a request can
+            # never reference more blocks than its pool holds).  Computed
+            # for every model, not just VSWA — non-VSWA managers have a
+            # single pool, so this stays blocks_in_primary_pool for them.
             max_num_blocks = blocks_in_primary_pool
             if hasattr(self.kv_cache_manager, 'layer_offsets'):
                 for lid in self.kv_cache_manager.layer_offsets:
                     lbuf = self.kv_cache_manager.get_buffers(lid)
                     if lbuf is not None:
                         max_num_blocks = max(max_num_blocks, lbuf.shape[0])
-            self._max_num_blocks_per_seq = self.kv_cache_manager.max_blocks_per_seq
+            self._max_num_blocks = max_num_blocks
 
             # Layers may share one page-index list only when they are in the
             # same pool AND have the same page-index scale: VSWA splits pools,
@@ -1005,9 +989,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         gen_num_blocks = np.asarray(self.num_blocks[self.num_contexts:],
                                     dtype=np.int64)
         max_n = int(gen_num_blocks.max())
-        if max_n > self._max_num_blocks_per_seq:
-            # A request can never reference more than max_blocks_per_seq;
-            # defensive guard for inconsistent metadata.
+        if max_n > self._max_num_blocks:
+            # A request can never reference more blocks than any pool
+            # holds; defensive guard for inconsistent metadata.
             return None
         block_tables = wrappers.decode_block_tables
         if (self.is_cuda_graph and block_tables is not None
@@ -1019,12 +1003,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             if self.is_cuda_graph:
                 # Allocated once at capture warmup; full capacity width so
                 # replays never need a wider table.
-                width = self._max_num_blocks_per_seq
+                width = self._max_num_blocks
             else:
                 # Eager path replans (and re-reads the table) every step,
                 # so the buffer may grow geometrically as sequences do.
                 width = min(max(64, 1 << (max_n - 1).bit_length()),
-                            self._max_num_blocks_per_seq)
+                            self._max_num_blocks)
             try:
                 block_tables = torch.zeros((self.max_num_requests, width),
                                            dtype=torch.int32,
@@ -1055,10 +1039,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # completed.
         block_tables[:num_gens, :max_n].copy_(
             host_block_tables[:num_gens, :max_n], non_blocking=True)
-        # Seed the extent used by `prepare()` to clear entries if the first graph replay has fewer
-        # requests or a narrower block table.
-        wrappers.decode_block_table_active_rows = num_gens
-        wrappers.decode_block_table_active_width = max_n
         return block_tables[:num_gens]
 
     def _clean_cached_plans(self, *, defer_plan: bool):
@@ -1330,7 +1310,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if (self.is_cuda_graph and self._vswa_layer_to_pool is not None
                 and self._vswa_pool_indices_cache is not None
                 and self.num_generations > 0):
-            decode_blocks = num_blocks[self.num_contexts:]
+            decode_blocks = self.num_blocks[self.num_contexts:]
             head_dim_to_pool = getattr(self, '_vswa_head_dim_to_pool', None)
             for plan_params, wrappers in self._plan_params_to_wrappers.items():
                 if plan_params.attention_mask_data is not None:
@@ -1343,62 +1323,34 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                            if head_dim_to_pool else None)
                 if pool_id is None:
                     continue
+                pool_buf = self._vswa_pool_indices_cache[pool_id]
                 batch_size, table_width = block_tables.shape
                 rows = min(batch_size, self.num_generations)
-                num_blocks_per_row = decode_blocks[:rows]
-                active_width = min(int(num_blocks_per_row.max()), table_width)
-                # Include the previous live extent once when the batch or its longest sequence
-                # shrinks. The zero-filled copy below clears entries that are no longer live; the
-                # next update can shrink.
-                update_rows = min(
-                    batch_size,
-                    max(rows, wrappers.decode_block_table_active_rows))
-                update_width = min(
-                    table_width,
-                    max(active_width, wrappers.decode_block_table_active_width))
-                host_block_tables = wrappers.host_decode_block_tables
-                if (host_block_tables is None
-                        or host_block_tables.size(0) < update_rows
-                        or host_block_tables.size(1) < update_width):
-                    # Grow geometrically to avoid reallocating whenever the longest sequence
-                    # acquires one more KV-cache block.
-                    host_width = min(
-                        max(64, 1 << (update_width - 1).bit_length()),
-                        table_width)
-                    host_block_tables = torch.zeros(
-                        (self.max_num_requests, host_width),
-                        dtype=torch.int32,
-                        pin_memory=prefer_pinned())
-                    wrappers.host_decode_block_tables = host_block_tables
-
-                # Build only the live (or previously live) rectangle on the host. This preserves
-                # padded-row zeroing when batch size shrinks without launching full-capacity
-                # `arange`, `gather`, `where`, `zero`, and copy kernels on every decode step.
-                host_table = host_block_tables[:update_rows, :update_width]
-                host_table.zero_()
-                host_pool_indices = self._host_pool_indices[pool_id]
-                # Pool indices are flattened as context blocks followed by each generation request's
-                # blocks.
-                source_offset = self.num_context_blocks
-                # This loop scales with the number of generation requests. Vectorizing ragged
-                # rows would require padded mask or index tensor, so keep contiguous row copies
-                # until profiling identifies this as a CPU bottleneck.
-                for row, num_blocks_for_row in enumerate(num_blocks_per_row):
-                    num_blocks_for_row = int(num_blocks_for_row)
-                    copy_width = min(num_blocks_for_row, table_width)
-                    host_table[row, :copy_width].copy_(
-                        host_pool_indices[source_offset:source_offset +
-                                          copy_width])
-                    # Advance by the uncropped count so the next request starts at the correct
-                    # offset even if this row hit `table_width`.
-                    source_offset += num_blocks_for_row
-                # Keep the graph-captured device address stable and transfer only the compact
-                # rectangle prepared in pinned host memory.
-                block_tables[:update_rows, :update_width].copy_(
-                    host_block_tables[:update_rows, :update_width],
-                    non_blocking=True)
-                wrappers.decode_block_table_active_rows = rows
-                wrappers.decode_block_table_active_width = active_width
+                # Vectorized equivalent of a per-request copy loop: row i
+                # gets pool_buf[offset + row_starts[i] :] for its first
+                # min(num_blocks_per_row[i], table_width) columns, zero-
+                # padded — one gather + where instead of ~batch slice
+                # copies per pool per step.
+                num_blocks_per_row = torch.tensor(
+                    decode_blocks[:rows],
+                    dtype=torch.int64).to(device=block_tables.device,
+                                          non_blocking=True)
+                row_starts = torch.cumsum(num_blocks_per_row,
+                                          dim=0) - num_blocks_per_row
+                columns = torch.arange(table_width,
+                                       dtype=torch.int64,
+                                       device=block_tables.device)
+                mask = columns.unsqueeze(0) < num_blocks_per_row.clamp(
+                    max=table_width).unsqueeze(1)
+                source_indices = (self.num_context_blocks +
+                                  row_starts.unsqueeze(1) +
+                                  columns.unsqueeze(0)).clamp(
+                                      max=pool_buf.numel() - 1)
+                new_block_tables = torch.zeros_like(block_tables)
+                new_block_tables[:rows] = torch.where(
+                    mask, pool_buf[source_indices.reshape(-1)].view(
+                        rows, table_width), new_block_tables[:rows])
+                block_tables.copy_(new_block_tables)
                 kv_lens_buf = getattr(decode_wrapper, '_kv_lens_buffer', None)
                 if kv_lens_buf is not None:
                     decode_kv_lens = _to_int32_tensor(

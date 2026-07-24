@@ -64,6 +64,42 @@ l0_a30:
   - cpp/test_unit_tests.py::test_unit_tests[layers-80]
   - cpp/test_unit_tests.py::test_unit_tests[runtime-80]
   - cpp/test_unit_tests.py::test_unit_tests[thop-80]
+  - cpp/test_unit_tests.py::test_unit_tests[utils-80]
+  - cpp/test_e2e.py::test_model[-gpt-80]
+  - cpp/test_e2e.py::test_benchmarks[gpt-80] TIMEOUT (90)
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a30*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: tensorrt
+  tests:
+  # ------------- TRT tests ---------------
+  - examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct]
+  - examples/test_granite.py::test_llm_granite[granite-3.0-1b-a400m-instruct-bfloat16] # 5 mins
+  - examples/test_internlm.py::test_llm_internlm2_7b_1node_1gpu[bfloat16-enable_context_fmha-enable_gemm_plugin-enable_attention_plugin-nb:2] # 5 mins
+  - examples/test_ngram.py::test_llm_ngram_1gpu[streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs2] # 1 min
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a30*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: tensorrt
+  tests:
+  - examples/test_granite.py::test_llm_granite[granite-3.0-2b-instruct-bfloat16] # 5 mins
+  - examples/test_ngram.py::test_llm_ngram_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs2] # 1 min
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:

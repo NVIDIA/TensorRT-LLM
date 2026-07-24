@@ -13,10 +13,10 @@ import torch
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._torch.weight_sharing import (
-    ArtifactIdentity, IdentityCheckPolicy, PostTransformFeature,
-    PostTransformProfile, PostTransformProfileRegistry,
-    PostTransformQualificationDecision, PostTransformTransferScope,
-    SourceIdentity, check_weight_sharing_compatibility)
+    IdentityCheckPolicy, PostTransformFeature, PostTransformProfile,
+    PostTransformProfileRegistry, PostTransformQualificationDecision,
+    PostTransformTransferScope, SourceIdentity,
+    check_weight_sharing_compatibility)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
@@ -71,7 +71,7 @@ def validate_and_set_mamba_ssm_cache_dtype(
 
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,
-                                    pyt_kv_cache_dtype: str) -> None:
+                                    pyt_kv_cache_dtype: str) -> QuantAlgo:
     logger.info(
         f'Validating KV Cache config against kv_cache_dtype="{pyt_kv_cache_dtype}"'
     )
@@ -105,14 +105,6 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     # Apply explicit override from kv_cache_config.dtype.
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
-    # MIXED_PRECISION checkpoints carry per-layer QuantConfigs in
-    # quant_config_dict; modules built from them (e.g. attention) must agree
-    # with the global config on the KV element size, otherwise the KV pool is
-    # allocated with the overridden dtype while attention layers read/write
-    # with the checkpoint dtype -> out-of-bounds access.
-    if model_config.quant_config_dict is not None:
-        for layer_quant_config in model_config.quant_config_dict.values():
-            layer_quant_config.kv_cache_quant_algo = mapped_pyt_quant
 
 
 def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
@@ -440,39 +432,6 @@ class ModelLoader:
         """
         return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == "MX"
 
-    @staticmethod
-    def _build_source_identity(
-        config: ModelConfig,
-        model: DecoderModelForCausalLM,
-        *,
-        checkpoint_dir: str,
-        model_name: str,
-        fallback_on_artifact_error: bool,
-    ) -> Optional[SourceIdentity]:
-        """Build the local identity without weakening artifact validation.
-
-        Artifact construction remains fail-closed. MX may convert an artifact
-        error into an unavailable local identity so its compatibility gate
-        falls back to disk; GMS propagates the error because it has no fallback.
-        """
-        try:
-            artifact_identity = ArtifactIdentity.from_checkpoint(checkpoint_dir)
-        except (OSError, RuntimeError, ValueError) as error:
-            if not fallback_on_artifact_error:
-                raise
-            logger.warning(
-                "Unable to build checkpoint artifact identity for MX checkpoint "
-                f"{checkpoint_dir}; falling back to regular checkpoint loading: {error}"
-            )
-            return None
-
-        return SourceIdentity.from_model_config(
-            config,
-            model,
-            artifact_identity=artifact_identity,
-            model_name=model_name,
-        )
-
     def load(
         self,
         checkpoint_dir: str,
@@ -516,16 +475,12 @@ class ModelLoader:
                 # ground truth; building it here (post-construction,
                 # pre-weight-load) gives producer and consumer a common,
                 # comparable lifecycle point.
-                self._source_identity = self._build_source_identity(
+                self._source_identity = SourceIdentity.from_model_config(
                     config,
                     model,
-                    checkpoint_dir=checkpoint_dir,
                     model_name=str(
                         getattr(self.llm_args, "model", None)
                         or checkpoint_dir),
-                    fallback_on_artifact_error=(
-                        load_format != LoadFormat.GMS
-                        and checkpoint_loader.checkpoint_format == "MX"),
                 )
 
             memo: dict[torch.Tensor, torch.Tensor] = {}
@@ -1317,8 +1272,6 @@ class ModelLoader:
             force_dynamic_quantization=self.llm_args.force_dynamic_quantization,
             spec_config=self.spec_config,
             sparse_attention_config=self.sparse_attention_config,
-            kv_cache_compression_config=(
-                self.llm_args.kv_cache_compression_config),
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
             moe_max_num_tokens=self.llm_args.moe_config.max_num_tokens,

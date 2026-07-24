@@ -219,43 +219,25 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
     }
 
 
-def _join_env(*parts):
-    """Space-join non-empty env-var strings (drops falsy entries)."""
-    return " ".join(p for p in parts if p)
-
-
 def get_env_config(config, runtime_mode, benchmark_mode, server_name):
     """Get worker / server / benchmark env vars from the yaml.
 
     Aggregated yaml stores env vars per server config under
     `server_configs[i].server_env_var`. Disaggregated yaml stores them at the
-    top-level `environment.{worker,server,benchmark}_env_var`, plus optional
-    `environment.{ctx,gen}_worker_env_var` for role-specific extras (appended
-    to the shared `worker_env_var`).
+    top-level `environment.{worker,server,benchmark}_env_var`.
 
     ctx_only is a hybrid: the launch path is aggregated, but the yaml is the
     disagg one, so the agg launch's "server_env_var" comes from
-    `environment.worker_env_var` (merged with ctx-side extras when present).
+    `environment.worker_env_var`.
 
-    Returns: {worker_env_var (shared, back-compat),
-              ctx_worker_env_var, gen_worker_env_var,
-              server_env_var, benchmark_env_var}.
+    Returns: {worker_env_var, server_env_var, benchmark_env_var}.
     """
     env = config.get("environment", {}) or {}
-    common = env.get("worker_env_var", "") or ""
-    ctx_extra = env.get("ctx_worker_env_var", "") or ""
-    gen_extra = env.get("gen_worker_env_var", "") or ""
-    ctx_env = _join_env(common, ctx_extra)
-    gen_env = _join_env(common, gen_extra)
     if runtime_mode == "aggregated":
         if benchmark_mode == "ctx_only":
             return {
-                "worker_env_var": common,
-                "ctx_worker_env_var": ctx_env,
-                "gen_worker_env_var": gen_env,
-                # ctx_only launches through the aggregated single-pytest path;
-                # the ctx-merged env is what actually runs.
-                "server_env_var": ctx_env,
+                "worker_env_var": env.get("worker_env_var", "") or "",
+                "server_env_var": env.get("worker_env_var", "") or "",
                 "benchmark_env_var": env.get("benchmark_env_var", "") or "",
             }
         agg_server_env_var = ""
@@ -265,15 +247,11 @@ def get_env_config(config, runtime_mode, benchmark_mode, server_name):
                 break
         return {
             "worker_env_var": "",
-            "ctx_worker_env_var": "",
-            "gen_worker_env_var": "",
             "server_env_var": agg_server_env_var,
             "benchmark_env_var": "",
         }
     return {
-        "worker_env_var": common,
-        "ctx_worker_env_var": ctx_env,
-        "gen_worker_env_var": gen_env,
+        "worker_env_var": env.get("worker_env_var", "") or "",
         "server_env_var": env.get("server_env_var", "") or "",
         "benchmark_env_var": env.get("benchmark_env_var", "") or "",
     }
@@ -535,13 +513,13 @@ def main():
         srun_args_lines.append("--container-env=pytestCommand")
     else:
         # Disaggregated (e2e or gen_only).
-        base_prefix = (
-            "FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${SLURM_LOCALID} HF_HOME=/tmp/hf_home"
+        base_worker_env_vars = (
+            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
+            f"HF_HOME=/tmp/hf_home "
+            f"{env_config['worker_env_var']}"
         )
-        # ctx / gen env vars: shared worker_env_var + optional per-role extras
-        # from the yaml. get_env_config already merged them.
-        ctx_worker_env_vars = f"{base_prefix} {env_config['ctx_worker_env_var']}".rstrip()
-        gen_worker_env_vars = f"{base_prefix} {env_config['gen_worker_env_var']}".rstrip()
+        ctx_worker_env_vars = base_worker_env_vars
+        gen_worker_env_vars = base_worker_env_vars
         server_env_vars = env_config["server_env_var"]
 
         # gen_only_no_context comes from yaml's benchmark.mode, not the test

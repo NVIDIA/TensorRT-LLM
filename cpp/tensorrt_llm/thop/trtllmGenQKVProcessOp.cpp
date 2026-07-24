@@ -18,7 +18,6 @@
 #include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
@@ -402,16 +401,16 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
 
         switch (qkvDtype)
         {
-        case tensorrt_llm::DataType::kFLOAT:
+        case nvinfer1::DataType::kFLOAT:
             tensorrt_llm::kernels::invokeQKVPreprocessing(
                 reinterpret_cast<QKVPreprocessingParams<float, KVBlockArray>&>(qkvParams), stream);
             break;
-        case tensorrt_llm::DataType::kHALF:
+        case nvinfer1::DataType::kHALF:
             tensorrt_llm::kernels::invokeQKVPreprocessing(
                 reinterpret_cast<QKVPreprocessingParams<half, KVBlockArray>&>(qkvParams), stream);
             break;
 #ifdef ENABLE_BF16
-        case tensorrt_llm::DataType::kBF16:
+        case nvinfer1::DataType::kBF16:
             tensorrt_llm::kernels::invokeQKVPreprocessing(
                 reinterpret_cast<QKVPreprocessingParams<__nv_bfloat16, KVBlockArray>&>(qkvParams), stream);
             break;
@@ -550,16 +549,16 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
 
         switch (qkvDtype)
         {
-        case tensorrt_llm::DataType::kFLOAT:
+        case nvinfer1::DataType::kFLOAT:
             tensorrt_llm::kernels::invokeKvCachePostprocessing(
                 reinterpret_cast<QKVPreprocessingParams<float, KVBlockArray>&>(qkvParams), stream);
             break;
-        case tensorrt_llm::DataType::kHALF:
+        case nvinfer1::DataType::kHALF:
             tensorrt_llm::kernels::invokeKvCachePostprocessing(
                 reinterpret_cast<QKVPreprocessingParams<half, KVBlockArray>&>(qkvParams), stream);
             break;
 #ifdef ENABLE_BF16
-        case tensorrt_llm::DataType::kBF16:
+        case nvinfer1::DataType::kBF16:
             tensorrt_llm::kernels::invokeKvCachePostprocessing(
                 reinterpret_cast<QKVPreprocessingParams<__nv_bfloat16, KVBlockArray>&>(qkvParams), stream);
             break;
@@ -734,16 +733,16 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
 
         switch (qkvDtype)
         {
-        case tensorrt_llm::DataType::kFLOAT:
+        case nvinfer1::DataType::kFLOAT:
             tensorrt_llm::kernels::invokeQKVPreprocessing(
                 reinterpret_cast<QKVPreprocessingParams<float, KVBlockArray>&>(qkvParams), stream);
             break;
-        case tensorrt_llm::DataType::kHALF:
+        case nvinfer1::DataType::kHALF:
             tensorrt_llm::kernels::invokeQKVPreprocessing(
                 reinterpret_cast<QKVPreprocessingParams<half, KVBlockArray>&>(qkvParams), stream);
             break;
 #ifdef ENABLE_BF16
-        case tensorrt_llm::DataType::kBF16:
+        case nvinfer1::DataType::kBF16:
             tensorrt_llm::kernels::invokeQKVPreprocessing(
                 reinterpret_cast<QKVPreprocessingParams<__nv_bfloat16, KVBlockArray>&>(qkvParams), stream);
             break;

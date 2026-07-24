@@ -20,7 +20,7 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntime.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -32,6 +32,11 @@
 #include <ostream>
 #include <string>
 #include <type_traits>
+
+namespace nvinfer1
+{
+class IExecutionContext;
+}
 
 namespace tensorrt_llm::runtime
 {
@@ -45,7 +50,7 @@ public:
     using SharedPtr = std::shared_ptr<ITensor>;
     using UniqueConstPtr = std::unique_ptr<ITensor const>;
     using SharedConstPtr = std::shared_ptr<ITensor const>;
-    using Shape = tensorrt_llm::Dims;
+    using Shape = nvinfer1::Dims;
     using DimType64 = std::remove_reference_t<decltype(Shape::d[0])>;
     using TensorMap = runtime::StringPtrMap<runtime::ITensor>;
 
@@ -347,9 +352,9 @@ public:
     //! \param shape The shape of the tensor.
     //! \param capacity The capacity of the buffer.
     //! \return An `ITensor`.
-    static UniquePtr wrap(void* data, tensorrt_llm::DataType type, Shape const& shape, std::size_t capacity);
+    static UniquePtr wrap(void* data, nvinfer1::DataType type, Shape const& shape, std::size_t capacity);
 
-    static UniquePtr wrap(void* data, tensorrt_llm::DataType type, Shape const& shape)
+    static UniquePtr wrap(void* data, nvinfer1::DataType type, Shape const& shape)
     {
         return wrap(data, type, shape, volumeNonNegative(shape));
     }

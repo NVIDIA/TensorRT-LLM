@@ -18,7 +18,7 @@
 #include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntime.h>
 #include <gtest/gtest.h>
 #include <memory>
 #include <optional>
@@ -95,7 +95,7 @@ protected:
 
         mKv = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
             maxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{kvMaxNumTokens},
-            tensorrt_llm::DataType::kFLOAT, sinkTokenLength, stream, kvMaxNumTokens, kvMaxNumTokens,
+            nvinfer1::DataType::kFLOAT, sinkTokenLength, stream, kvMaxNumTokens, kvMaxNumTokens,
             /*enableBlockReuse=*/true, CacheType::kSELF, std::nullopt, nullptr, true);
         mKv->allocatePools(false);
         mTrans = std::make_unique<ObservableTransBufferManager>(mKv.get(), std::optional<size_t>{kvMaxNumTokens});

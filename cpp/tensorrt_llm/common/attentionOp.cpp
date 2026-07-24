@@ -22,7 +22,6 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/sageQuant.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cascadeAttentionKernel.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
@@ -217,7 +216,6 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Medusa mode will have multiple query tokens.
     xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
     xqaParams.is_spec_dec_tree = mIsSpecDecTree;
-    xqaParams.force_prepare_spec_dec_tree_mask = mForcePrepareSpecDecTreeMask;
     xqaParams.layer_idx = generationsParams.layer_idx;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
@@ -760,8 +758,8 @@ size_t AttentionOp::getFmhaMultiCtasKvScratchSize() const noexcept
     return partialStatsSize + partialOSize;
 }
 
-size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int32_t max_num_seq,
-    int32_t input_seq_length, int32_t cross_kv_length, int32_t max_num_tokens, int32_t total_kv_len) const noexcept
+size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
+    int32_t cross_kv_length, int32_t max_num_tokens, int32_t total_kv_len) const noexcept
 {
     if (max_num_tokens == 0)
     {
@@ -913,7 +911,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
     return context_workspace_size;
 }
 
-size_t AttentionOp::getWorkspaceSizeForGeneration(tensorrt_llm::DataType type, int32_t max_num_seq,
+size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t max_num_seq,
     int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept
 {
     if (max_num_tokens == 0)
@@ -2820,7 +2818,7 @@ int AttentionOp::initialize() noexcept
     if (mEnableContextFMHA)
     {
         mEnableContextFMHA = false;
-        if (!(mType == tensorrt_llm::DataType::kHALF || mType == tensorrt_llm::DataType::kBF16))
+        if (!(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16))
         {
             TLLM_LOG_WARNING("Fall back to unfused MHA because of unsupported data type.");
         }
@@ -2865,7 +2863,7 @@ int AttentionOp::initialize() noexcept
         "mFP8ContextFMHA must enable if FP4 KV cache is enabled");
 
     TLLM_CHECK(isRoPE() == (mRotaryEmbeddingDim != 0));
-    TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != tensorrt_llm::DataType::kBF16),
+    TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != nvinfer1::DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 
     // Pre-check whether the head size is supported by MMHA.
@@ -2917,11 +2915,11 @@ int AttentionOp::initialize() noexcept
 
         // Pre-checked during constructing.
         Data_type data_type, data_type_kv;
-        if (mType == tensorrt_llm::DataType::kHALF)
+        if (mType == nvinfer1::DataType::kHALF)
         {
             data_type = DATA_TYPE_FP16;
         }
-        else if (mType == tensorrt_llm::DataType::kBF16)
+        else if (mType == nvinfer1::DataType::kBF16)
         {
             data_type = DATA_TYPE_BF16;
         }
@@ -3081,13 +3079,13 @@ int AttentionOp::initialize() noexcept
                 Data_type kvDataType = DATA_TYPE_FP32;
                 Data_type outputDataType = DATA_TYPE_FP32;
 
-                if (mType == tensorrt_llm::DataType::kHALF)
+                if (mType == nvinfer1::DataType::kHALF)
                 {
                     qDataType = DATA_TYPE_FP16;
                     kvDataType = DATA_TYPE_FP16;
                     outputDataType = DATA_TYPE_FP16;
                 }
-                else if (mType == tensorrt_llm::DataType::kBF16)
+                else if (mType == nvinfer1::DataType::kBF16)
                 {
                     qDataType = DATA_TYPE_BF16;
                     kvDataType = DATA_TYPE_BF16;
@@ -3177,7 +3175,7 @@ int AttentionOp::initialize() noexcept
     }
 
     mEnableXQA = (mEnableXQA || mIsSpecDecodingEnabled)
-        && (mType == tensorrt_llm::DataType::kHALF || mType == tensorrt_llm::DataType::kBF16) && mUseKVCache;
+        && (mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16) && mUseKVCache;
 
     if (mEnableXQA)
     {
@@ -3187,12 +3185,12 @@ int AttentionOp::initialize() noexcept
         fixedParams.isMLA = mIsGenerationMLA;
         // TODO: support more combinations.
         // Update Q and O dtype.
-        if (mType == tensorrt_llm::DataType::kHALF)
+        if (mType == nvinfer1::DataType::kHALF)
         {
             fixedParams.inputDataType = DATA_TYPE_FP16;
             fixedParams.outputDataType = DATA_TYPE_FP16;
         }
-        else if (mType == tensorrt_llm::DataType::kBF16)
+        else if (mType == nvinfer1::DataType::kBF16)
         {
             fixedParams.inputDataType = DATA_TYPE_BF16;
             fixedParams.outputDataType = DATA_TYPE_BF16;
@@ -3260,6 +3258,10 @@ int AttentionOp::initialize() noexcept
         reserveSemaphoreArray(mNbMultiBlockSemaphores);
     }
 
+    if (isBuilding())
+    {
+        return 0;
+    }
 #if ENABLE_MULTI_DEVICE
     if (mCpSize > 1 && COMM_SESSION.getSize() > 1)
     {

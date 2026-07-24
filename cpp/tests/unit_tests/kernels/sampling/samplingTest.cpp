@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #include "tests/unit_tests/kernels/sampling/samplingTest.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 
 namespace tensorrt_llm::tests::kernels::sampling
 {
@@ -52,78 +51,75 @@ void SamplingKernelTest<T>::allocateBuffers(SamplingKernelTestParam const& param
     auto const ptrType = TRTDataType<T*>::value;
 
     // Allocate GPU data
-    mSeqLengthsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
-    mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
+    mSeqLengthsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+    mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
     mFinishedHost = BufferManager::pinned(
         ITensor::makeShape({maxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
     mFinishedDevice = mBufferManager->gpu(
         ITensor::makeShape({maxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
-    mOutputIdsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
-    mOutputIdsDevice
-        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
+    mOutputIdsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+    mOutputIdsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kINT32);
 
     mProbsHost = BufferManager::pinned(ITensor::makeShape({batchSize, maxTokensPerStep, vocabSize}), dataType);
     mProbsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize, maxTokensPerStep, vocabSize}), dataType);
     mProbsPtrsDevice
-        = BufferManager::pinned(ITensor::makeShape({batchSize, maxTokensPerStep}), tensorrt_llm::DataType::kINT64);
+        = BufferManager::pinned(ITensor::makeShape({batchSize, maxTokensPerStep}), nvinfer1::DataType::kINT64);
 
-    mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
+    mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
 
     if (param.returnAllSelectedTokens)
     {
         SizeType32 maxTopK = param.topK == 0 ? vocabSize : param.topK;
         mOutputLogProbsDevice
-            = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxTopK}), tensorrt_llm::DataType::kFLOAT);
+            = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxTopK}), nvinfer1::DataType::kFLOAT);
     }
     else
     {
         mOutputLogProbsDevice
-            = mBufferManager->gpu(ITensor::makeShape({mMaxSeqLen, maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
+            = mBufferManager->gpu(ITensor::makeShape({mMaxSeqLen, maxBatchSize}), nvinfer1::DataType::kFLOAT);
     }
 
     mZeroParentIdsDevice
-        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), tensorrt_llm::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), nvinfer1::DataType::kINT32);
 
     mLogitsHost = BufferManager::pinned(ITensor::makeShape({batchSize, maxTokensPerStep, vocabSize}), dataType);
     mLogProbsHost = BufferManager::pinned(ITensor::makeShape({batchSize, maxTokensPerStep, vocabSize}), dataType);
     mIdsPtrHost = BufferManager::pinned(ITensor::makeShape({2 * maxBatchSize}), ptrType);
 
-    mEndIdsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
-    mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
+    mEndIdsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+    mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
-    mTopPsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
-    mTopPsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
+    mTopPsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+    mTopPsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
 
-    mTopKsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
-    mTopKsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
+    mTopKsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+    mTopKsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
-    mSkipDecodeHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kBOOL);
-    mSkipDecodeDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kBOOL);
+    mSkipDecodeHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kBOOL);
+    mSkipDecodeDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kBOOL);
 
-    mTokensPerStep = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
+    mTokensPerStep = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
-    mBatchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
+    mBatchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
-    mExpectedCumLogProbsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
+    mExpectedCumLogProbsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
 
     if (param.returnAllSelectedTokens)
     {
         SizeType32 maxTopK = param.topK == 0 ? vocabSize : param.topK;
         mExpectedLogProbsHost
-            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, maxTopK}), tensorrt_llm::DataType::kFLOAT);
+            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, maxTopK}), nvinfer1::DataType::kFLOAT);
     }
     else
     {
         mExpectedLogProbsHost
-            = BufferManager::pinned(ITensor::makeShape({mMaxSeqLen, maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
+            = BufferManager::pinned(ITensor::makeShape({mMaxSeqLen, maxBatchSize}), nvinfer1::DataType::kFLOAT);
     }
 
     mCurandStatesDevice
-        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, sizeof(curandState_t)}), tensorrt_llm::DataType::kINT8);
+        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, sizeof(curandState_t)}), nvinfer1::DataType::kINT8);
 }
 
 template <typename T>
@@ -498,7 +494,7 @@ void SamplingKernelTest<T>::runTest(SamplingKernelTestParam const& param)
     // Retrieve the workspace size of the sampling kernel.
     auto const workspaceSize = getWorkspaceSize(param);
     TensorPtr workspaceDevice
-        = mBufferManager->gpu(ITensor::makeShape({static_cast<int32_t>(workspaceSize)}), tensorrt_llm::DataType::kINT8);
+        = mBufferManager->gpu(ITensor::makeShape({static_cast<int32_t>(workspaceSize)}), nvinfer1::DataType::kINT8);
 
     // Call tested function sampling
     callTestedFunction(param, workspaceDevice);

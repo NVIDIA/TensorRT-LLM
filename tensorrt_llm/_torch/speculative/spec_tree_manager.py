@@ -16,40 +16,24 @@ class DynamicTreeSlotStorage:
     Buffers are [S, ...] where S = num_slots + 1 (+1 for CUDA graph dummy).
     """
 
-    def __init__(self,
-                 num_slots: int,
-                 n_dt: int,
-                 mask_width: int,
-                 top_k: int = 1):
+    def __init__(self, num_slots: int, n_dt: int, mask_width: int):
         S = num_slots + 1
         self.dummy_slot_id = num_slots
 
-        # Bootstrap/reused slots may not have a tree yet; keep their metadata
-        # as a valid linear chain so verification kernels can read it directly.
-        no_tree_position_offsets, no_tree_packed_mask = self._make_kary_tree_metadata(
-            n_dt, mask_width, top_k=1)
-        self.position_offsets = no_tree_position_offsets.unsqueeze(0).repeat(
-            S, 1).contiguous()
-        self.packed_mask = no_tree_packed_mask.unsqueeze(0).repeat(
-            S, 1, 1).contiguous()
-        self._no_tree_position_offsets = no_tree_position_offsets
-        self._no_tree_packed_mask = no_tree_packed_mask
-
-        # CUDA-graph dummies use a deterministic K-ary tree, matching real
-        # dynamic-tree mask/position shapes without depending on request state.
-        dummy_position_offsets, dummy_packed_mask = self._make_kary_tree_metadata(
-            n_dt, mask_width, top_k)
-        self.position_offsets[self.dummy_slot_id] = dummy_position_offsets
-        self.packed_mask[self.dummy_slot_id] = dummy_packed_mask
+        # Slot buffers — C++ kernel writes directly via slotIds
+        self.packed_mask = torch.zeros((S, n_dt, mask_width),
+                                       dtype=torch.int32,
+                                       device='cuda')
+        self.position_offsets = torch.zeros((S, n_dt),
+                                            dtype=torch.int32,
+                                            device='cuda')
         self.retrieve_index = torch.zeros((S, n_dt),
                                           dtype=torch.int32,
                                           device='cuda')
-
-        # Mamba verify reads next links unconditionally, so no-tree rows must be
-        # valid linear chains instead of sentinels.
-        self._no_tree_next_token = self._make_no_tree_next_token(n_dt)
-        self.retrieve_next_token = self._no_tree_next_token.unsqueeze(0).repeat(
-            S, 1)
+        self.retrieve_next_token = torch.full((S, n_dt),
+                                              -1,
+                                              dtype=torch.int32,
+                                              device='cuda')
         self.retrieve_next_sibling = torch.full((S, n_dt),
                                                 -1,
                                                 dtype=torch.int32,
@@ -72,43 +56,6 @@ class DynamicTreeSlotStorage:
         self._next_sibling_staging = torch.empty((num_slots, n_dt),
                                                  dtype=torch.int32,
                                                  device='cuda')
-
-    @staticmethod
-    def _make_kary_tree_metadata(
-            n_dt: int, mask_width: int,
-            top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
-        top_k = max(int(top_k), 1)
-        token_ids = torch.arange(n_dt, device='cuda')
-        parents = torch.where(token_ids > 0, (token_ids - 1) // top_k,
-                              token_ids)
-        ancestor_chain = torch.empty((n_dt, n_dt),
-                                     dtype=torch.long,
-                                     device='cuda')
-        current = token_ids
-        for depth in range(n_dt):
-            ancestor_chain[:, depth] = current
-            current = parents[current]
-
-        # Pack bits directly from the parent chain instead of materializing a
-        # dense bool mask and repacking it.
-        valid_ancestors = torch.ones((n_dt, n_dt),
-                                     dtype=torch.bool,
-                                     device='cuda')
-        valid_ancestors[:, 1:] = ancestor_chain[:, 1:] != ancestor_chain[:, :-1]
-        bit_values = (1 << (ancestor_chain % 32)).to(torch.int32)
-        bit_values.masked_fill_(~valid_ancestors, 0)
-        packed_mask = torch.zeros((n_dt, mask_width),
-                                  dtype=torch.int32,
-                                  device='cuda')
-        packed_mask.scatter_add_(1, ancestor_chain // 32, bit_values)
-        position_offsets = valid_ancestors.sum(-1).to(torch.int32) - 1
-        return position_offsets, packed_mask
-
-    @staticmethod
-    def _make_no_tree_next_token(n_dt: int) -> torch.Tensor:
-        next_token = torch.arange(1, n_dt + 1, dtype=torch.int32, device='cuda')
-        next_token[n_dt - 1] = -1
-        return next_token
 
     def fill_all_slot_ids(self, context_requests, generation_requests):
         """Fill all_ids_buf for full batch [ctx | gen] via one HtoD copy."""
@@ -134,12 +81,12 @@ class DynamicTreeSlotStorage:
         self.has_tree.narrow(0, self.dummy_slot_id, 1).fill_(False)
 
     def mark_invalid(self, slot_id):
-        """Clear validity and restore valid no-tree metadata."""
+        """Clear validity and reset slot data."""
         self.has_tree[slot_id] = False
-        self.packed_mask[slot_id] = self._no_tree_packed_mask
-        self.position_offsets[slot_id] = self._no_tree_position_offsets
+        self.packed_mask[slot_id] = 0
+        self.position_offsets[slot_id] = 0
         self.retrieve_index[slot_id] = 0
-        self.retrieve_next_token[slot_id] = self._no_tree_next_token
+        self.retrieve_next_token[slot_id] = -1
         self.retrieve_next_sibling[slot_id] = -1
 
     def pack_retrieve_from_slots(self, slot_ids, count):
@@ -337,7 +284,6 @@ class SpecTreeManager:
             num_slots=self.num_trees,
             n_dt=num_draft_with_root,
             mask_width=mask_width,
-            top_k=self.dynamic_tree_max_topK,
         )
 
     def scatter_to_slot_storage(self, ss, gen_slots, num_gens):

@@ -6,7 +6,6 @@ from tensorrt_llm.inputs import MultimodalDataTracker
 from tensorrt_llm.inputs.media_io import AudioMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
-from tensorrt_llm.inputs.utils import retrieve_multimodal_placeholder
 from tensorrt_llm.serve import chat_utils as _chat_utils
 from tensorrt_llm.serve.chat_utils import (
     _make_media_io,
@@ -420,20 +419,6 @@ _VIDEO_PLACEHOLDER = MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(
 )
 
 
-def _expected_item(modality: str, index: int) -> dict:
-    """Build an expected ``item_order`` entry, mirroring ``add_data``.
-
-    ``add_data`` records the placeholder produced for each item, formatting the
-    modality template with a 1-based running count that equals ``index + 1`` on
-    the data (non-embedding) path exercised by these tests.
-    """
-    return {
-        "modality": modality,
-        "index": index,
-        "placeholder": retrieve_multimodal_placeholder(_MM_MODEL_TYPE, modality, index + 1),
-    }
-
-
 class TestMultimodalPlaceholderCounts:
     """Verify per-message multimodal placeholder counts.
 
@@ -544,76 +529,9 @@ class TestMultimodalPlaceholderCounts:
 
         mock_config = _StubConfig()
 
-        _, _, mm_placeholder_counts, _ = parse_chat_messages_coroutines(messages, mock_config, None)
+        _, _, mm_placeholder_counts = parse_chat_messages_coroutines(messages, mock_config, None)
 
         assert mm_placeholder_counts == expected_mm_placeholder_counts
-
-
-class TestMmItemOrderReturn:
-    """Tests for the ``mm_item_order`` return element.
-
-    The 4th tuple element from ``parse_chat_messages_coroutines`` is the
-    ``MultimodalDataTracker.item_order()`` manifest, indexed within modality
-    in content-parts order. Each entry carries ``modality``, ``index`` and the
-    ``placeholder`` string recorded by ``add_data``.
-    """
-
-    @pytest.mark.parametrize(
-        "messages, expected",
-        [
-            # Mixed image+video+image within one message: proves both
-            # content-parts order preservation (image, video, image) and
-            # per-modality index advance (image indices 0, 1; video 0).
-            (
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": "a"}},
-                            {"type": "video_url", "video_url": {"url": "b"}},
-                            {"type": "image_url", "image_url": {"url": "c"}},
-                        ],
-                    }
-                ],
-                [
-                    _expected_item("image", 0),
-                    _expected_item("video", 0),
-                    _expected_item("image", 1),
-                ],
-            ),
-            # Items spanning multiple messages: indices accumulate across
-            # messages, not per-message.
-            (
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": "a"}},
-                        ],
-                    },
-                    {"role": "assistant", "content": "ok"},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "video_url", "video_url": {"url": "b"}},
-                            {"type": "image_url", "image_url": {"url": "c"}},
-                        ],
-                    },
-                ],
-                [
-                    _expected_item("image", 0),
-                    _expected_item("video", 0),
-                    _expected_item("image", 1),
-                ],
-            ),
-        ],
-    )
-    def test_item_order(self, messages, expected):
-        class _StubConfig:
-            model_type = _MM_MODEL_TYPE
-
-        _, _, _, item_order = parse_chat_messages_coroutines(messages, _StubConfig(), None)
-        assert item_order == expected
 
 
 class TestParseChatMessageContentPart:

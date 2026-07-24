@@ -152,7 +152,6 @@ class DisaggPerfMetricsCollector:
         self._lock = asyncio.Lock()
         self._collect_lock = asyncio.Lock()
         self._clients = []
-        self._background_tasks: set[asyncio.Task] = set()
         self._metrics = {
             definition.name: instance_metric(definition)
             for definition in SERVER_METRICS_DEFINITIONS
@@ -171,7 +170,6 @@ class DisaggPerfMetricsCollector:
         ctx_request_id: int,
         server_arrival_time: float,
         server_first_token_time: float,
-        ctx_dispatch_time: float = 0,
     ):
         async with self._lock:
             self._request_meteics.append(
@@ -181,7 +179,6 @@ class DisaggPerfMetricsCollector:
                     ctx_request_id,
                     server_arrival_time,
                     server_first_token_time,
-                    ctx_dispatch_time,
                 )
             )
 
@@ -215,7 +212,6 @@ class DisaggPerfMetricsCollector:
                     ctx_request_id,
                     server_arrival_time,
                     server_first_token_time,
-                    ctx_dispatch_time,
                 ) in self._request_meteics:
                     gen_perf_metrics = self._server_metrics[gen_server].pop(ctx_request_id, None)
                     if gen_perf_metrics is None:
@@ -227,7 +223,6 @@ class DisaggPerfMetricsCollector:
                                 ctx_request_id,
                                 server_arrival_time,
                                 server_first_token_time,
-                                ctx_dispatch_time,
                             )
                         )
                         continue
@@ -238,10 +233,6 @@ class DisaggPerfMetricsCollector:
                             "ctx_server": ctx_server,
                             "gen_server": gen_server,
                             "disagg_server_arrival_time": server_arrival_time,
-                            # arrival->ctx_dispatch = pre-ctx wait in the
-                            # orchestrator/fleet (accept queue + event loop +
-                            # pipeline), the dominant TTFT term under fleet load.
-                            "disagg_ctx_dispatch_time": ctx_dispatch_time,
                             "disagg_server_first_token_time": server_first_token_time,
                             "ctx_perf_metrics": ctx_perf_metrics,
                             "gen_perf_metrics": gen_perf_metrics,
