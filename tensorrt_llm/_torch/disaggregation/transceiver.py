@@ -280,10 +280,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return 0
         total = 0
         for lg_id, block_ids in enumerate(slice.block_ids_per_layer_groups):
-            if block_ids is None or block_ids.size == 0:
-                continue
             lg = pt.layer_groups[lg_id]
             if isinstance(lg, MambaLayerGroup):
+                # Fixed-size recurrent state (mamba/KDA): one slot per layer in
+                # each of the conv and ssm pools, independent of token count.
+                # For hybrid models (e.g. Kimi K3) this blob can dominate
+                # short-prompt transfers, so it must be counted. The caller's
+                # tp_size scaling then yields total bytes moved across ranks
+                # (exact for sharded state; for replicated state every rank
+                # pair moves a full copy, so it matches bytes on the wire).
+                if slice.mamba_state_index is not None:
+                    total += len(lg.mamba_layer_offsets) * (
+                        lg.conv_states.slot_bytes + lg.ssm_states.slot_bytes
+                    )
+                continue
+            if block_ids is None or block_ids.size == 0:
                 continue
             n = int((block_ids >= 0).sum())
             if n == 0:

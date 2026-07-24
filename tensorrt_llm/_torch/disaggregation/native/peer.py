@@ -4,6 +4,7 @@ from typing import Dict, List, Tuple
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MapperKind
@@ -91,6 +92,16 @@ class PeerRegistrar:
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         if not self._attention_policy.check_peer_compatible(peer_ri):
             return False
+
+        # Recurrent-state (Mamba/KDA) layout gate. Raises ValueError with a
+        # field-level diagnostic instead of returning False, so the precise
+        # mismatch reaches the caller of register().
+        MambaPolicy.validate_peer_compatible(
+            self._ri,
+            peer_ri,
+            self._self_ext_cache.page_table if self._self_ext_cache is not None else None,
+            peer_ri.page_table,
+        )
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
