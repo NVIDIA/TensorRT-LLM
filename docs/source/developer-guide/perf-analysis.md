@@ -66,11 +66,14 @@ python examples/visual_gen/quickstart_example.py
 ```
 
 Each process writes its trace to a rank-specific path such as
-`/tmp/visual-gen-trace-rank-0.json`.
+`/tmp/visual-gen-trace-rank-0.json`. If a process captures more than one
+window, later traces add a window suffix such as
+`/tmp/visual-gen-trace-rank-0-window-1.json`.
 
-These ranges use the existing VisualGen CUDA/Nsight boundaries. Text encoding
-happens before those boundaries and is not included; `all` starts at denoising
-and includes subsequent VAE work through pipeline cleanup.
+These ranges use the existing VisualGen CUDA/Nsight boundaries. `all` captures
+the complete request from text encoding through VAE decode. `predenoise`
+captures text encoding, latent preparation, and denoise-loop setup;
+`postdenoise` captures VAE decode and the remaining request work.
 
 ### Visualize the PyTorch profiler results
 
