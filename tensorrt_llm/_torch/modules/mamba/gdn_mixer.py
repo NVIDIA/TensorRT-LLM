@@ -1036,14 +1036,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         state_indices_p, state_indices_d = torch.split(state_indices, batch_split_size)
         if num_prefills > 0:
-            # PyExecutor guarantees prefill requests are placed before decode requests
+            # PyExecutor guarantees prefill requests are placed before decode requests.
+            # Zero slots whose request has no cached initial state. Use a keep-mask
+            # scaled read-modify-write instead of `state_indices_p[~mask]` boolean-mask
+            # indexed assignment: the latter lowers to torch.nonzero() with a
+            # shape-dependent D2H sync, which under piecewise CUDA-graph capture
+            # produces per-rank divergence and stalls (HangDetector fires after 300s).
             has_initial_states_p = has_initial_states[:num_prefills]
-            ssm_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
-                (), dtype=ssm_states.dtype, device=ssm_states.device
-            )
-            conv_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
-                (), dtype=conv_states.dtype, device=conv_states.device
-            )
+            for cache in (ssm_states, conv_states):
+                keep = has_initial_states_p.view(-1, *([1] * (cache.ndim - 1))).to(cache.dtype)
+                cache[state_indices_p] = cache[state_indices_p] * keep
 
         is_target_verify = (
             num_decodes > 0
