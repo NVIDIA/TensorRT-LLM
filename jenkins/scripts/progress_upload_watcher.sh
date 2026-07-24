@@ -22,13 +22,18 @@
 
 set +e
 last=0
+_poll=0
 while [ ! -f "$PROGRESS_DONE_FILE" ]; do
     sleep "$PROGRESS_INTERVAL"
     [ -f "$PROGRESS_DONE_FILE" ] && break
+    _poll=$((_poll + 1))
 
     if [ -n "$SLURM_SSH_STAT_CMD" ]; then
-        m=$(eval "$SLURM_SSH_STAT_CMD" 2>/dev/null | tr -dc '0-9')
+        _raw=$(eval "$SLURM_SSH_STAT_CMD" 2>&1)
+        _rc=$?
+        m=$(printf '%s' "$_raw" | tr -dc '0-9')
         [ -z "$m" ] && m=0
+        echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: poll #${_poll} ssh_rc=${_rc} raw='${_raw}' mtime=${m} last=${last}"
         [ "$m" -le "$last" ] && continue
         last=$m
         mkdir -p "${WORKSPACE}/${STAGE_NAME}"
