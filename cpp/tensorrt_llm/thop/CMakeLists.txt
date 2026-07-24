@@ -113,6 +113,7 @@ add_library(
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
+  sparseKvCacheCompactOp.cpp
   mlaRopeInplaceOp.cpp
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
