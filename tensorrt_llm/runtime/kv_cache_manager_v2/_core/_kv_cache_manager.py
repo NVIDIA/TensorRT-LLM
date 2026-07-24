@@ -205,6 +205,7 @@ class KVCacheManager:
         "_target_ratio_list_gpu",
         "_target_ratio_list_other",
         "_num_created_kv_caches",
+        "_num_closed_kv_caches",
         "_num_sampled_kv_caches",
         "_last_adjustment_time",
         "_last_update_num_sampled_kv_caches",
@@ -234,6 +235,7 @@ class KVCacheManager:
     _target_ratio_list_gpu: TypedIndexList[PoolGroupIndex, float]
     _target_ratio_list_other: TypedIndexList[PoolGroupIndex, float]
     _num_created_kv_caches: int
+    _num_closed_kv_caches: int
     _num_sampled_kv_caches: int
     _last_adjustment_time: float
     _last_update_num_sampled_kv_caches: int
@@ -277,6 +279,7 @@ class KVCacheManager:
         self._target_ratio_list_gpu = self._current_gpu_ratio
         self._target_ratio_list_other = self._current_other_ratios
         self._num_created_kv_caches = 0
+        self._num_closed_kv_caches = 0
         self._num_sampled_kv_caches = 0
         self._last_adjustment_time = time.monotonic()
         self._last_update_num_sampled_kv_caches = 0
