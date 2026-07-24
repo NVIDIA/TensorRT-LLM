@@ -13,12 +13,11 @@ TriAttention runs entirely in the generation phase and reuses the standard dense
 1. **Calibration (offline, one-time per model).** The importance score needs each attention head's mean and magnitude of the pre-RoPE query, gathered over a small calibration corpus. **TensorRT LLM does not compute calibration** — you produce it once with the official tool and pass the resulting `.pt` file. TensorRT LLM loads it and converts it to its runtime schema at the first request.
 2. **Periodic eviction (Stage during generation).** Every `beta` confirmed generation tokens, once a sequence is over budget, TriAttention scores the whole cache, selects `budget` tokens to keep (the prompt tokens are preserved on top of the budget), and physically compacts the KV cache down to the kept set. A speculative iteration may confirm multiple tokens; crossing multiple periods in one update is coalesced into one eviction.
 
-TriAttention is integrated into TensorRT LLM as a KV-cache compression manager on top of the `KVCacheManagerV2`. The scoring and compaction kernels are implemented in **Triton**.
+TriAttention is integrated into TensorRT LLM as a KV-cache compression manager on top of the `KVCacheManagerV2`. Scoring runs on CuTe DSL (SM100) and Triton kernels; compaction is a native CUDA kernel.
 
 ## Support Matrix
 
-* GPU Compute Capability >= 9.0 (Hopper or newer)
-* FP16 / BF16
+* GPU Compute Capability >= 10.0 (Blackwell or newer)
 * Paged KV Cache (`KVCacheManagerV2`)
 * Tensor Parallel
 * PyTorch backend
@@ -121,6 +120,6 @@ trtllm-eval --model <path_to_model> --config config.yaml longbench_v2 --max_outp
     * `union`: union of each KV head's top-B, re-ranked by the per-token max score. Matches the official base setting.
     * `per_head`: each KV head keeps its own set, shared across layers (mean of per-layer maxima).
     * `per_layer_perhead`: each head keeps its own set, fully independent per layer.
-* **`normalize_scores`** (bool, default=True): Z-normalize each head's scores over the decode region before selection (upstream default). `union` eviction requires `True` (the fused union pipeline always z-normalizes; construction rejects `False`).
+* **`normalize_scores`** (bool, default=True): Z-normalize each head's scores over the decode region before selection (upstream default). `union` eviction always z-normalizes: `False` is overridden to `True` with a warning.
 * **`calibration_path`** (str): Path to the calibration `.pt` from the official tool. Required — TensorRT LLM does not compute calibration.
 * **`model_path`** (str): Checkpoint path, used to derive the model's RoPE tables when converting the official calibration file and to classify kernel-masked sliding-window (SWA) layers from the model config.

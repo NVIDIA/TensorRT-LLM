@@ -117,13 +117,12 @@ def make_ramp_pools(
 
 
 def build_compaction(**overrides):
-    """``init_compaction_buffers`` with the suite's 2-layer defaults:
-    translates ``eviction_mode`` into ``per_layer_sources``/``decision_rows``,
+    """``build_compaction_plans`` with the suite's 2-layer defaults:
     allocates the caller-owned move-offset rows (capacity cumsum) and SWA
     destination bases, and hands the test's pre-settled
     ``kept_token_ordinals`` in as the decision rows. Returns the opaque
     ``plans`` plus a test-side mirror of the caller-owned inputs."""
-    from tensorrt_llm._torch.kv_cache_compression.compaction import init_compaction_buffers
+    from tensorrt_llm._torch.kv_cache_compression.compaction import build_compaction_plans
 
     args = dict(
         eviction_mode="union",
@@ -137,7 +136,6 @@ def build_compaction(**overrides):
     )
     args.update(overrides)
     mode = args.pop("eviction_mode")
-    union = mode == "union"
     per_layer = mode == "per_layer_perhead"
     kept = args.pop("kept_token_ordinals")
     request_count = args["request_count"]
@@ -157,10 +155,6 @@ def build_compaction(**overrides):
     args.setdefault("swa_move_offsets", capacity_offsets(swa_window + tail) if has_swa else None)
     if has_draft:
         args.setdefault("draft_move_offsets", capacity_offsets(keep_count + draft_tail))
-    num_kv_heads = int(args["layer_pools"][args["dense_layers"][0]].shape[2])
-    selection_rows = (
-        1 if union else (len(args["dense_layers"]) * num_kv_heads if per_layer else num_kv_heads)
-    )
     draft = None
     if has_draft:
         draft = dict(
@@ -172,7 +166,7 @@ def build_compaction(**overrides):
             dense_move_offsets=args["draft_move_offsets"],
             protected_tail_capacity=draft_tail,
         )
-    plans = init_compaction_buffers(
+    plans = build_compaction_plans(
         target=dict(
             layer_pools=args["layer_pools"],
             dense_layers=args["dense_layers"],
@@ -187,12 +181,7 @@ def build_compaction(**overrides):
             swa_move_offsets=args["swa_move_offsets"],
             per_layer_sources=per_layer,
             kept_ordinal_rows=kept.reshape(-1, keep_count),
-            decision_rows=selection_rows,
             valid_seq_lens=args["valid_sequence_lengths"],
-        ),
-        capacities=dict(
-            max_requests=request_count,
-            keep_count=keep_count,
             protected_tail_capacity=tail,
         ),
         draft=draft,
@@ -353,6 +342,23 @@ def make_test_model_dir() -> str:
     return _TEST_MODEL_DIR
 
 
+def make_test_calibration_pt() -> str:
+    """A real on-disk flat calibration file: construction loads it for real."""
+    path = os.path.join(make_test_model_dir(), "calibration.pt")
+    if not os.path.exists(path):
+        num_layers, num_heads, freq_count = 2, 2, 4
+        torch.save(
+            {
+                "E_q": torch.zeros(num_layers, num_heads, freq_count, dtype=torch.complex64),
+                "E_q_norm": torch.ones(num_layers, num_heads, freq_count),
+                "omega": torch.ones(freq_count),
+                "freq_scale_sq": torch.ones(freq_count),
+            },
+            path,
+        )
+    return path
+
+
 def make_tri_config(**overrides):
     """A real TriAttentionKvCacheCompressionConfig with test calibration inputs
     (the config validator requires both ``model_path`` and ``calibration_path``)."""
@@ -361,7 +367,7 @@ def make_tri_config(**overrides):
     options = {
         "budget": 8,
         "model_path": make_test_model_dir(),
-        "calibration_path": "/calib/test.pt",
+        "calibration_path": make_test_calibration_pt(),
     }
     options.update(overrides)
     return TriAttentionKvCacheCompressionConfig(**options)
@@ -371,7 +377,7 @@ def make_triattention(**overrides):
     """Construct a fully initialized manager for method-level unit tests."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
-    return TriAttention(make_fake_v2(), make_tri_config(**overrides))
+    return TriAttention(make_tri_config(**overrides), make_fake_v2())
 
 
 def make_prepared_item(

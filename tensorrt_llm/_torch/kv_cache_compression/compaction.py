@@ -15,16 +15,33 @@
 
 """Batched physical KV-cache compaction: an algorithm-neutral mover.
 
-``init_compaction_buffers`` returns opaque launch plans once per geometry;
+``build_compaction_plans`` returns opaque launch plans once per geometry;
 each round the caller writes its keep decision into the agreed rows and
-``compact`` packs every family's move sources and fires its native launches.
+``compact`` packs every plan's move sources and fires its native launches.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TypedDict
 
 import torch
 import triton
 import triton.language as tl
+
+
+class CompactionLaunch(TypedDict):
+    pools: List[torch.Tensor]
+    pool_pointers: torch.Tensor
+    page_table: torch.Tensor
+    move_indices: torch.Tensor
+    move_offsets: torch.Tensor
+    destination_bases: torch.Tensor
+    source_layer_indices: Optional[torch.Tensor]
+
+
+class CompactionPlan(TypedDict):
+    decision_rows: int
+    pack_args: Tuple[Optional[torch.Tensor], ...]
+    pack_constexprs: Dict[str, object]
+    launches: Tuple[CompactionLaunch, ...]
 
 
 @triton.jit
@@ -104,54 +121,55 @@ def _pack_move_sources_kernel(
                 )
 
 
-def _make_move_indices(
-    index_prefix: Tuple[int, ...],
-    moves_per_request: int,
-    max_requests: int,
-    device: torch.device,
-) -> torch.Tensor:
-    return torch.empty(
-        (*index_prefix, moves_per_request * max_requests), dtype=torch.int32, device=device
-    )
-
-
-def init_compaction_buffers(
+def build_compaction_plans(
     *,
     target: Dict[str, object],
-    capacities: Dict[str, int],
     draft: Optional[Dict[str, object]] = None,
-) -> Tuple[Dict[str, object], ...]:
-    """Agree on the decision rows and return opaque launch plans per geometry:
-    one plan per compacted cache family (target, then the optional draft),
-    with init-built contract fields that only :func:`compact` reads at launch."""
-    layer_pools = target["layer_pools"]
-    dense_layers = tuple(int(layer) for layer in target["dense_layers"])
-    swa_layers = tuple(int(layer) for layer in target["swa_layers"])
-    layer_pool_ids = tuple(int(pool_id) for pool_id in target["layer_pool_ids"])
-    kv_block_offsets = target["kv_block_offsets"]
-    layer_group_representative = target["layer_group_representative"]
-    token_starts = target["token_starts"]
-    dense_move_offsets = target["dense_move_offsets"]
-    swa_move_offsets = target["swa_move_offsets"]
-    swa_window = target["swa_window"]
-    per_layer_sources = bool(target["per_layer_sources"])
-    kept_ordinal_rows = target["kept_ordinal_rows"]
-    decision_rows = int(target["decision_rows"])
-    valid_seq_lens = target["valid_seq_lens"]
+) -> Tuple[CompactionPlan, ...]:
+    """One plan per compacted cache family (target, then the optional draft);
+    only :func:`compact` reads the plans' contents at launch."""
+    plans = [_build_plan(target)]
+    if draft is not None:
+        # The draft compacts under the target's decision rows and token starts.
+        plans.append(
+            _build_plan(
+                dict(
+                    draft,
+                    token_starts=target["token_starts"],
+                    kept_ordinal_rows=target["kept_ordinal_rows"],
+                    valid_seq_lens=target["valid_seq_lens"],
+                )
+            )
+        )
+    return tuple(plans)
 
-    device = layer_pools[dense_layers[0]].device
-    max_requests = int(capacities["max_requests"])
-    keep_count = int(capacities["keep_count"])
-    protected_tail_capacity = int(capacities["protected_tail_capacity"])
 
+def _build_plan(cache: Dict[str, object]) -> CompactionPlan:
+    layer_pools = cache["layer_pools"]
+    dense_layers = tuple(int(layer) for layer in cache["dense_layers"])
+    swa_layers = tuple(int(layer) for layer in cache.get("swa_layers", ()))
+    layer_pool_ids = tuple(int(pool_id) for pool_id in cache["layer_pool_ids"])
+    kv_block_offsets = cache["kv_block_offsets"]
+    layer_group_representative = cache["layer_group_representative"]
+    token_starts = cache["token_starts"]
+    dense_move_offsets = cache["dense_move_offsets"]
+    per_layer_sources = bool(cache.get("per_layer_sources", False))
+    kept_ordinal_rows = cache["kept_ordinal_rows"]
+    valid_seq_lens = cache["valid_seq_lens"]
+    protected_tail_capacity = int(cache["protected_tail_capacity"])
+
+    first_pool = layer_pools[dense_layers[0]]
+    device = first_pool.device
+    max_requests = int(valid_seq_lens.shape[0])
+    keep_count = int(kept_ordinal_rows.shape[1])
+    decision_rows = int(kept_ordinal_rows.shape[0]) // max_requests
     # Pool shape [pages, K/V, heads, tokens, dim].
-    num_kv_heads = int(layer_pools[dense_layers[0]].shape[2])
+    num_kv_heads = int(first_pool.shape[2])
     dense_index_prefix = (len(dense_layers), num_kv_heads) if per_layer_sources else (num_kv_heads,)
-    dense_move_indices = _make_move_indices(
-        dense_index_prefix,
-        keep_count + protected_tail_capacity,
-        max_requests,
-        device,
+    dense_move_indices = torch.empty(
+        (*dense_index_prefix, (keep_count + protected_tail_capacity) * max_requests),
+        dtype=torch.int32,
+        device=device,
     )
     dense_entries = [
         (
@@ -161,41 +179,25 @@ def init_compaction_buffers(
         )
         for layer in dense_layers
     ]
-
-    swa_move_indices = None
-    if not swa_layers:
-        swa_move_offsets = None
-        swa_window = 0
-    else:
-        swa_window = int(swa_window)
-        swa_move_indices = _make_move_indices(
-            (num_kv_heads,),
-            swa_window + protected_tail_capacity,
-            max_requests,
-            device,
-        )
-
     dense_slots = (
         {layer: slot for slot, layer in enumerate(dense_layers)} if per_layer_sources else None
     )
-    # Widest per-request move count any staged offsets may express.
-    move_capacity = keep_count + protected_tail_capacity
-    if swa_move_indices is not None:
-        move_capacity = max(move_capacity, swa_window + protected_tail_capacity)
 
-    # One move-descriptor tuple per cache family (dense / SWA / draft).
-    families = [
-        (
-            dense_entries,
-            layer_pool_ids,
-            dense_move_indices,
-            dense_move_offsets,
-            token_starts,
-            dense_slots,
-            False,
-        ),
+    swa_move_indices = None
+    swa_move_offsets = None
+    swa_window = 0
+    # One move group per family axis (dense / SWA): the layers + the tensors driving their moves.
+    move_groups = [
+        (dense_entries, dense_move_indices, dense_move_offsets, token_starts, dense_slots),
     ]
     if swa_layers:
+        swa_move_offsets = cache["swa_move_offsets"]
+        swa_window = int(cache["swa_window"])
+        swa_move_indices = torch.empty(
+            (num_kv_heads, (swa_window + protected_tail_capacity) * max_requests),
+            dtype=torch.int32,
+            device=device,
+        )
         # SWA layers stage against their own page-table slots.
         swa_entries = [
             (
@@ -205,72 +207,21 @@ def init_compaction_buffers(
             )
             for layer in swa_layers
         ]
-        families.append(
-            (
-                swa_entries,
-                layer_pool_ids,
-                swa_move_indices,
-                swa_move_offsets,
-                target["swa_destination_bases"],
-                None,
-                False,
-            )
-        )
-    draft_move_indices = None
-    if draft is not None:
-        # Union-only drafts (one shared decision row) are enforced by the
-        # executor call-site gate; the plan builder just packs.
-        draft_layer_pools = draft["layer_pools"]
-        draft_dense_layers = tuple(int(layer) for layer in draft["dense_layers"])
-        draft_layer_pool_ids = tuple(int(pool_id) for pool_id in draft["layer_pool_ids"])
-        draft_tail = int(draft["protected_tail_capacity"])
-        # Own launch groups: the draft may use a different KV-head count.
-        draft_num_kv_heads = int(draft_layer_pools[draft_dense_layers[0]].shape[2])
-        draft_move_indices = _make_move_indices(
-            (draft_num_kv_heads,),
-            keep_count + draft_tail,
-            max_requests,
-            device,
-        )
-        draft_entries = [
-            (
-                layer,
-                draft_layer_pools[layer],
-                draft["kv_block_offsets"][
-                    draft_layer_pool_ids[draft["layer_group_representative"][layer]],
-                    :max_requests,
-                    0,
-                ],
-            )
-            for layer in draft_dense_layers
-        ]
-        families.append(
-            (
-                draft_entries,
-                draft_layer_pool_ids,
-                draft_move_indices,
-                draft["dense_move_offsets"],
-                token_starts,
-                None,
-                True,
-            )
+        move_groups.append(
+            (swa_entries, swa_move_indices, swa_move_offsets, cache["swa_destination_bases"], None)
         )
 
-    target_launches: List[Dict[str, object]] = []
-    draft_launch_records: List[Dict[str, object]] = []
-    for (
-        entries,
-        pool_ids,
-        move_indices,
-        move_offsets,
-        destination_bases,
-        slots,
-        is_draft,
-    ) in families:
+    # Widest per-request move count any staged offsets may express.
+    move_capacity = keep_count + protected_tail_capacity
+    if swa_layers:
+        move_capacity = max(move_capacity, swa_window + protected_tail_capacity)
+
+    launches: List[CompactionLaunch] = []
+    for entries, move_indices, move_offsets, destination_bases, slots in move_groups:
         grouped = {}
         for layer, pool, page_table in entries:
             key = (
-                pool_ids[layer],
+                layer_pool_ids[layer],
                 str(pool.dtype),
                 str(pool.device),
                 tuple(int(value) for value in pool.shape[1:]),
@@ -287,85 +238,55 @@ def init_compaction_buffers(
                     dtype=torch.int32,
                     device=device,
                 )
-            record = dict(
-                pools=pools,
-                pool_pointers=torch.tensor(
-                    [pool.data_ptr() for pool in pools],
-                    dtype=torch.int64,
-                    device=device,
-                ),
-                page_table=group_entries[0][2],
-                move_indices=move_indices,
-                move_offsets=move_offsets,
-                destination_bases=destination_bases,
-                source_layer_indices=source_layer_indices,
+            launches.append(
+                CompactionLaunch(
+                    pools=pools,
+                    pool_pointers=torch.tensor(
+                        [pool.data_ptr() for pool in pools],
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                    page_table=group_entries[0][2],
+                    move_indices=move_indices,
+                    move_offsets=move_offsets,
+                    destination_bases=destination_bases,
+                    source_layer_indices=source_layer_indices,
+                )
             )
-            (draft_launch_records if is_draft else target_launches).append(record)
-    draft_launches = tuple(draft_launch_records)
 
-    target_plan = dict(
-        kept_ordinal_rows=kept_ordinal_rows,
-        valid_seq_lens=valid_seq_lens,
+    return CompactionPlan(
         decision_rows=decision_rows,
-        per_layer_sources=per_layer_sources,
-        dense_move_offsets=dense_move_offsets,
-        dense_move_indices=dense_move_indices,
-        swa_move_offsets=swa_move_offsets,
-        swa_move_indices=swa_move_indices,
-        swa_window=swa_window,
-        keep_count=keep_count,
-        move_capacity=move_capacity,
-        num_kv_heads=num_kv_heads,
-        dense_total=int(dense_move_indices.shape[-1]),
-        swa_total=int(swa_move_indices.shape[-1]) if swa_move_indices is not None else 0,
-        launches=tuple(target_launches),
+        pack_args=(
+            kept_ordinal_rows,
+            valid_seq_lens,
+            dense_move_offsets,
+            dense_move_indices,
+            swa_move_offsets,
+            swa_move_indices,
+        ),
+        pack_constexprs=dict(
+            KEEP_COUNT=keep_count,
+            DECISION_ROWS=decision_rows,
+            MOVE_CAPACITY=move_capacity,
+            NUM_KV_HEADS=num_kv_heads,
+            PER_LAYER=per_layer_sources,
+            DENSE_TOTAL=int(dense_move_indices.shape[-1]),
+            SWA_TOTAL=int(swa_move_indices.shape[-1]) if swa_move_indices is not None else 0,
+            SWA_WINDOW=swa_window,
+        ),
+        launches=tuple(launches),
     )
-
-    plans = [target_plan]
-    if draft is not None:
-        draft_plan = dict(
-            kept_ordinal_rows=kept_ordinal_rows,
-            valid_seq_lens=valid_seq_lens,
-            decision_rows=1,
-            per_layer_sources=False,
-            dense_move_offsets=draft["dense_move_offsets"],
-            dense_move_indices=draft_move_indices,
-            swa_move_offsets=None,
-            swa_move_indices=None,
-            swa_window=0,
-            keep_count=keep_count,
-            move_capacity=keep_count + draft_tail,
-            num_kv_heads=draft_num_kv_heads,
-            dense_total=int(draft_move_indices.shape[-1]),
-            swa_total=0,
-            launches=draft_launches,
-        )
-        plans.append(draft_plan)
-    return tuple(plans)
 
 
 def compact(
-    plans: Tuple[Dict[str, object], ...],
+    plans: Tuple[CompactionPlan, ...],
     request_count: int,
 ) -> None:
     """Pack each plan's move sources and fire its native compacts, in plan order
     (pure mover: the caller owns the decision rows and the round's completion ordering)."""
     for plan in plans:
         _pack_move_sources_kernel[(request_count, plan["decision_rows"])](
-            plan["kept_ordinal_rows"],
-            plan["valid_seq_lens"],
-            plan["dense_move_offsets"],
-            plan["dense_move_indices"],
-            plan["swa_move_offsets"],
-            plan["swa_move_indices"],
-            KEEP_COUNT=plan["keep_count"],
-            DECISION_ROWS=plan["decision_rows"],
-            MOVE_CAPACITY=plan["move_capacity"],
-            NUM_KV_HEADS=plan["num_kv_heads"],
-            PER_LAYER=plan["per_layer_sources"],
-            DENSE_TOTAL=plan["dense_total"],
-            SWA_TOTAL=plan["swa_total"],
-            SWA_WINDOW=plan["swa_window"],
+            *plan["pack_args"], **plan["pack_constexprs"]
         )
         for launch in plan["launches"]:
             torch.ops.trtllm.sparse_kv_cache_compact_layers(

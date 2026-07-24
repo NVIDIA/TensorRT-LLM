@@ -38,7 +38,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 )
 from tensorrt_llm.logger import logger
 
-from ..compaction import compact, init_compaction_buffers
+from ..compaction import build_compaction_plans, compact
 from .triattention_kernels import (
     _gather_mean_phase_kernel,
     _settle_ties_kernel,
@@ -117,10 +117,12 @@ class TriAttention(KVCacheCompressionManager):
 
     adjusts_generation_kv_length = True
 
+    # ---- construction ----
+
     def __init__(
         self,
-        kv_cache_manager: KVCacheManagerV2,
         config: "TriAttentionKvCacheCompressionConfig",
+        kv_cache_manager: KVCacheManagerV2,
         draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
     ):
         super().__init__(kv_cache_manager, draft_kv_cache_manager)
@@ -129,15 +131,15 @@ class TriAttention(KVCacheCompressionManager):
         self.eviction_mode = config.eviction_mode
         self.normalize_scores = bool(config.normalize_scores)
         if self.eviction_mode == "union" and not self.normalize_scores:
-            raise ValueError(
-                "TriAttention union eviction requires normalize_scores=True: "
-                "the fused union pipeline always z-normalizes score rows"
+            logger.warning(
+                "TriAttention union eviction always z-normalizes scores; "
+                "forcing normalize_scores=True"
             )
+            self.normalize_scores = True
         # Prompt always pinned; budget counts decode tokens only.
         self.model_path = config.model_path
         self.calibration_path = config.calibration_path
-        self.calibration: Optional[Dict[str, torch.Tensor]] = None
-        self._freq_scale_sq: Optional[torch.Tensor] = None
+        self._load_calibration()
 
         # Mean-phase table dict; buffer builds bind its device tables in place.
         self._phase: Optional[Dict[str, object]] = None
@@ -174,72 +176,76 @@ class TriAttention(KVCacheCompressionManager):
             True: None,
         }
 
-    def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
-        """Track the request and resolve the official calibration on first use."""
-        request_id = request.py_request_id
-        if request_id not in self._request_states:
-            self._validate_request_capacity(request)
-            self._request_states[request_id] = {
-                "generation_steps": 0,
-                "evicted_tokens": 0,
-            }
-        self._ensure_calibrated()
+    def _attention_layer_partition(self) -> Tuple[List[int], List[int], Optional[int]]:
+        """SWA layers here are stored at full length; the window applies only in the kernel."""
+        model_path = self.model_path
+        global_layers = self._global_layers
+        num_layers = len(global_layers)
 
-    def _validate_request_capacity(self, request: "LlmRequest") -> None:
-        manager = self.kv_cache_manager
-        speculative_overshoot = int(manager.max_draft_len)
-        first_eviction_decode_length = (
-            self.budget // self.beta + 1
-        ) * self.beta + speculative_overshoot
-        decode_capacity = min(int(request.py_max_new_tokens), first_eviction_decode_length)
-        confirmed_capacity = int(request.py_prompt_len) + decode_capacity
-        protected_tail_capacity = self._protected_tail_capacity
-        required_capacity = confirmed_capacity + protected_tail_capacity
-        pool_confirmed_capacity = manager.get_num_available_tokens(
-            token_num_upper_bound=confirmed_capacity,
-            max_num_draft_tokens=int(manager._kv_reserve_draft_tokens) + 1,
-        )
-        table_capacity = manager.max_blocks_per_seq * manager.tokens_per_block
-        if confirmed_capacity > pool_confirmed_capacity or required_capacity > table_capacity:
-            raise ValueError(
-                "TriAttention target KV capacity is too small to reach its first "
-                f"eviction: request requires {required_capacity} tokens "
-                f"(prompt={request.py_prompt_len}, budget={self.budget}, "
-                f"beta={self.beta}, decode before eviction or completion="
-                f"{decode_capacity}, speculative overshoot="
-                f"{speculative_overshoot}, protected tail="
-                f"{protected_tail_capacity}), "
-                f"but the V2 pool covers {pool_confirmed_capacity + protected_tail_capacity} "
-                f"tokens and its page table covers {table_capacity} tokens"
+        try:
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(
+                model_path, trust_remote_code=True, local_files_only=True
             )
-        draft_manager = self.draft_kv_cache_manager
-        if draft_manager is None:
-            return
-        draft_protected_tail = self._draft_protected_tail_capacity
-        draft_required_capacity = confirmed_capacity + draft_protected_tail
-        draft_pool_capacity = draft_manager.get_num_available_tokens(
-            token_num_upper_bound=confirmed_capacity,
-            max_num_draft_tokens=int(draft_manager._kv_reserve_draft_tokens) + 1,
-        )
-        draft_table_capacity = draft_manager.max_blocks_per_seq * draft_manager.tokens_per_block
-        if (
-            confirmed_capacity > draft_pool_capacity
-            or draft_required_capacity > draft_table_capacity
-        ):
+        except (OSError, ValueError) as exc:
             raise ValueError(
-                "TriAttention draft KV capacity is too small to reach the first "
-                f"co-compression: request requires {draft_required_capacity} "
-                f"tokens (prompt={request.py_prompt_len}, budget={self.budget}, "
-                f"beta={self.beta}, decode before eviction or completion="
-                f"{decode_capacity}, draft protected tail={draft_protected_tail}), "
-                f"but the draft V2 pool covers "
-                f"{draft_pool_capacity + draft_protected_tail} tokens and its "
-                f"page table covers {draft_table_capacity} tokens"
+                f"TriAttention could not load the local model config from {model_path!r}"
+            ) from exc
+        config_values = config.get_text_config().to_dict()
+        layer_types = config_values.get("layer_types")
+        if not layer_types:
+            if self._has_sliding_window_signal(config_values):
+                raise ValueError(
+                    "Model config exposes sliding-window metadata but no layer_types; "
+                    "TriAttention cannot classify kernel-masked SWA layers safely"
+                )
+            return (list(range(num_layers)), [], None)
+        if global_layers and max(global_layers) >= len(layer_types):
+            raise ValueError(
+                f"Model config has {len(layer_types)} layer_types entries, "
+                f"but this PP rank references global layer {max(global_layers)}"
             )
 
-    def _ensure_calibrated(self) -> None:
-        if self.calibration is not None:
-            return
+        swa_layers = [
+            local_layer
+            for local_layer, global_layer in enumerate(global_layers)
+            if "sliding" in str(layer_types[global_layer]).lower()
+        ]
+        swa_set = set(swa_layers)
+        dense_layers = [layer for layer in range(num_layers) if layer not in swa_set]
+        window_size = None
+        if swa_layers:
+            raw_window = config_values.get("sliding_window")
+            if not isinstance(raw_window, int) or raw_window <= 0:
+                raise ValueError(
+                    "TriAttention requires a positive integer model sliding_window "
+                    "when layer_types contains sliding attention"
+                )
+            if self.budget < raw_window:
+                raise ValueError(
+                    f"TriAttention budget={self.budget} must be at least "
+                    f"the kernel-masked SWA window size {raw_window}"
+                )
+            window_size = raw_window
+        return (dense_layers, swa_layers, window_size)
+
+    @staticmethod
+    def _has_sliding_window_signal(config: Dict[str, object]) -> bool:
+        use_sliding_window = config.get("use_sliding_window")
+        if isinstance(use_sliding_window, bool):
+            return use_sliding_window
+        return any(
+            config.get(field)
+            for field in (
+                "sliding_window",
+                "sliding_window_size",
+                "sliding_window_pattern",
+                "max_window_layers",
+            )
+        )
+
+    def _load_calibration(self) -> None:
         self.calibration = self._resolve_calibration()
         self._freq_scale_sq = self.calibration["freq_scale_sq"].to(dtype=torch.float32)
         # Pre-split query stats + MLR coefficient, shapes [L, H, F].
@@ -250,30 +256,168 @@ class TriAttention(KVCacheCompressionManager):
             self.calibration["E_q_norm"].to(torch.float32) - _Eq.abs().to(torch.float32)
         ).contiguous()
 
-    def on_generation_step_end(self, scheduled_batch: "ScheduledRequests", **kwargs) -> None:
-        """Compact after native KV-cache updates have finalized this iteration
-        (must run after KVCacheManagerV2 so capacity reflects the written token and any rewind)."""
-        with nvtx_range_debug("triattention.generation_step_end", color="blue"):
-            self._periodic_evict(scheduled_batch)
+    def _resolve_calibration(self) -> Dict[str, torch.Tensor]:
+        """Load the calibration file, converting the official layout if needed."""
+        raw = torch.load(self.calibration_path, map_location="cpu", weights_only=False)
+        if isinstance(raw, dict) and _REQUIRED_CALIBRATION_KEYS <= set(raw):
+            return raw
+        if isinstance(raw, dict) and {"metadata", "stats"} <= set(raw):
+            return self._convert_official_calibration(raw)
+        got = sorted(raw.keys()) if isinstance(raw, dict) else type(raw).__name__
+        raise ValueError(
+            f"Unrecognized calibration at {self.calibration_path}: expected the "
+            f"official {{metadata, stats}} layout or "
+            f"{sorted(_REQUIRED_CALIBRATION_KEYS)}; got {got}."
+        )
+
+    def _convert_official_calibration(self, raw) -> Dict[str, torch.Tensor]:
+        """Convert the official calibration format to the runtime schema."""
+        stats = raw["stats"]
+        meta = raw.get("metadata", {})
+        if "sampled_heads" in meta:
+            heads = [(int(a), int(b)) for a, b in meta["sampled_heads"]]
+        else:
+            heads = [
+                (int(k[len("layer") : k.index("_head")]), int(k[k.index("_head") + len("_head") :]))
+                for k in stats
+            ]
+        num_layers = max(layer for layer, _ in heads) + 1
+        num_heads = max(h for _, h in heads) + 1
+        freq_count = int(next(iter(stats.values()))["q_mean_real"].numel())
+        E_q = torch.zeros(num_layers, num_heads, freq_count, dtype=torch.complex64)
+        E_q_norm = torch.zeros(num_layers, num_heads, freq_count, dtype=torch.float32)
+        for layer, h in heads:
+            s = stats[f"layer{layer:02d}_head{h:02d}"]
+            E_q[layer, h] = torch.complex(s["q_mean_real"].float(), s["q_mean_imag"].float())
+            E_q_norm[layer, h] = s["q_abs_mean"].float()
+        omega, freq_scale_sq = self._rope_tables(freq_count)
+        calib = {
+            "E_q": E_q,
+            "E_q_norm": E_q_norm,
+            "omega": omega,
+            "freq_scale_sq": freq_scale_sq,
+        }
+        logger.info(
+            f"TriAttention: converted official calibration {self.calibration_path}"
+            f" -> E_q[L={num_layers}, H={num_heads}, F={freq_count}]"
+        )
+        return calib
+
+    def _rope_tables(self, freq_count: int):
+        """Derive the RoPE frequency tables from the model config."""
+        import transformers
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True).get_text_config()
+        config_values = cfg.to_dict()
+        head_dim = freq_count * 2
+        rope_params = (
+            config_values.get("rope_parameters") or config_values.get("rope_scaling") or {}
+        )
+        if rope_params and all(isinstance(v, dict) for v in rope_params.values()):
+            raise ValueError(
+                f"TriAttention: layer-type-keyed rope_parameters are not supported for "
+                f"calibration conversion (model {self.model_path}); got {rope_params!r}."
+            )
+        rope_type = rope_params.get("rope_type") or rope_params.get("type") or "default"
+        theta_seen = rope_params.get("rope_theta", config_values.get("rope_theta"))
+        base = float(theta_seen) if theta_seen is not None else 10000.0
+
+        def analytic_inv_freq():
+            idx = torch.arange(0, head_dim, 2, dtype=torch.float32)
+            return (1.0 / (base ** (idx / head_dim)))[:freq_count].clone()
+
+        if rope_type == "default":
+            # transformers>=5.5 no longer keys "default" in ROPE_INIT_FUNCTIONS: use the formula.
+            omega, scale_sq = analytic_inv_freq(), 1.0
+        else:
+            try:
+                from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+            except ImportError:
+                logger.warning(
+                    f"TriAttention: transformers rope-init unavailable; using the analytic "
+                    f"inv_freq with theta={base} for {self.model_path} and IGNORING "
+                    f"rope_type={rope_type!r} scaling corrections."
+                )
+                return analytic_inv_freq(), torch.ones(freq_count, dtype=torch.float32)
+            if rope_type not in ROPE_INIT_FUNCTIONS:
+                raise ValueError(
+                    f"TriAttention: unknown rope_type {rope_type!r} for {self.model_path} "
+                    f"(transformers {transformers.__version__} provides "
+                    f"{sorted(ROPE_INIT_FUNCTIONS)}); rope config seen: {rope_params!r}."
+                )
+            try:
+                inv_freq, attention_factor = ROPE_INIT_FUNCTIONS[rope_type](cfg, device="cpu")
+            except Exception as exc:
+                raise ValueError(
+                    f"TriAttention: rope-init {rope_type!r} failed for {self.model_path}; "
+                    f"rope config seen: {rope_params!r}."
+                ) from exc
+            omega = inv_freq.to(torch.float32)[:freq_count].clone()
+            scale_sq = float(attention_factor) ** 2
+        return omega, torch.full((freq_count,), scale_sq, dtype=torch.float32)
+
+    # ---- framework hooks (call order) ----
+
+    def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
+        """Register the request for eviction tracking."""
+        request_id = request.py_request_id
+        if request_id not in self._request_states:
+            self._validate_request_capacity(request)
+            self._request_states[request_id] = {
+                "generation_steps": 0,
+                "evicted_tokens": 0,
+            }
 
     def on_generation_step_begin(self, scheduled_batch: "ScheduledRequests", **kwargs) -> None:
         """Snapshot the prepared batch; mutation remains in final update."""
         self._prepared_generation_batch = scheduled_batch
         self._prepared_generation_ids = None
 
-    def _inflight_generation_growth(
-        self, scheduled_batch: "ScheduledRequests", request_id: int
-    ) -> int:
-        prepared = self._prepared_generation_batch
-        if prepared is None or scheduled_batch is prepared:
-            return 0
-        member_ids = self._prepared_generation_ids
-        if member_ids is None:
-            member_ids = {request.py_request_id for request in prepared.generation_requests}
-            self._prepared_generation_ids = member_ids
-        if request_id not in member_ids:
-            return 0
-        return self._generation_growth
+    def on_generation_step_end(self, scheduled_batch: "ScheduledRequests", **kwargs) -> None:
+        """Compact after native KV-cache updates have finalized this iteration
+        (must run after KVCacheManagerV2 so capacity reflects the written token and any rewind)."""
+        with nvtx_range_debug("triattention.generation_step_end", color="blue"):
+            self._periodic_evict(scheduled_batch)
+
+    def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
+        """Drop this request's eviction state; the buffers stay resident."""
+        self._request_states.pop(request.py_request_id, None)
+
+    # ---- request capacity ----
+
+    def _validate_request_capacity(self, request: "LlmRequest") -> None:
+        """Reject a request whose pre-first-eviction peak cannot fit (only
+        TriAttention can compute it: the framework's dense guards are off)."""
+        speculative_overshoot = int(self.kv_cache_manager.max_draft_len)
+        first_eviction_decode_length = (
+            self.budget // self.beta + 1
+        ) * self.beta + speculative_overshoot
+        decode_capacity = min(int(request.py_max_new_tokens), first_eviction_decode_length)
+        confirmed_capacity = int(request.py_prompt_len) + decode_capacity
+        checked = [(self.kv_cache_manager, self._protected_tail_capacity, "target")]
+        if self.draft_kv_cache_manager is not None:
+            checked.append(
+                (self.draft_kv_cache_manager, self._draft_protected_tail_capacity, "draft")
+            )
+        for manager, protected_tail, label in checked:
+            required_capacity = confirmed_capacity + protected_tail
+            pool_capacity = manager.get_num_available_tokens(
+                token_num_upper_bound=confirmed_capacity,
+                max_num_draft_tokens=int(manager._kv_reserve_draft_tokens) + 1,
+            )
+            table_capacity = manager.max_blocks_per_seq * manager.tokens_per_block
+            if confirmed_capacity > pool_capacity or required_capacity > table_capacity:
+                raise ValueError(
+                    f"TriAttention {label} KV capacity is too small to reach the first "
+                    f"eviction: request requires {required_capacity} tokens "
+                    f"(prompt={request.py_prompt_len}, budget={self.budget}, "
+                    f"beta={self.beta}, protected tail={protected_tail}), but the "
+                    f"V2 pool covers {pool_capacity + protected_tail} tokens and "
+                    f"its page table covers {table_capacity} tokens"
+                )
+
+    # ---- eviction round ----
 
     def _periodic_evict(
         self,
@@ -356,6 +500,295 @@ class TriAttention(KVCacheCompressionManager):
             compacted = self._evict_requests(prepared)
         self._resize_compacted_requests(compacted)
 
+    def _inflight_generation_growth(
+        self, scheduled_batch: "ScheduledRequests", request_id: int
+    ) -> int:
+        prepared = self._prepared_generation_batch
+        if prepared is None or scheduled_batch is prepared:
+            return 0
+        member_ids = self._prepared_generation_ids
+        if member_ids is None:
+            member_ids = {request.py_request_id for request in prepared.generation_requests}
+            self._prepared_generation_ids = member_ids
+        if request_id not in member_ids:
+            return 0
+        return self._generation_growth
+
+    def _minimum_evictable_length(self, request: "LlmRequest", seq_len: int) -> int:
+        """Return the largest cache length for which selection is an identity."""
+        prompt_len = min(int(request.py_prompt_len), seq_len)
+        return prompt_len + self.budget
+
+    def _evict_requests(
+        self,
+        prepared: List[Dict[str, object]],
+    ) -> List[Dict[str, object]]:
+        with nvtx_range_debug("triattention.resolve_layout", color="blue"):
+            layout = self._runtime_kv_layout()
+        with nvtx_range_debug("triattention.staging_lookup", color="blue"):
+            # Retained spans always cover the model window (construction rejects budget < window).
+            self._ensure_buffers(layout, prepared)
+        self._execute_eviction_round(prepared)
+        for item in prepared:
+            # Identity cohorts were filtered pre-launch (_periodic_evict).
+            evicted = item["seq_len"] - item["expected_keep_count"]
+            request_state = self._request_states[item["request_id"]]
+            request_state["evicted_tokens"] += evicted
+            # The manager's only channel to the runtime (feeds num_cached_tokens_per_seq).
+            item["request"].py_num_compressed_tokens = request_state["evicted_tokens"]
+        return prepared
+
+    def _execute_eviction_round(
+        self,
+        prepared: Sequence[Dict[str, object]],
+    ) -> None:
+        """Run one eviction round over the prepared cohort (every launch covers
+        the full request capacity; padded rows carry zero lengths and stay inert)."""
+        manager = self.kv_cache_manager
+        draft_manager = self.draft_kv_cache_manager
+        with nvtx_range_debug("triattention.page_table_stage", color="orange"):
+            request_ids = [item["request_id"] for item in prepared]
+            round_starts = [item["round_start"] for item in prepared]
+            token_starts = [item["prompt_len"] for item in prepared]
+            seq_lens = [item["seq_len"] for item in prepared]
+            dense_move_offsets, swa_move_offsets, draft_move_offsets = self._cohort_move_offsets(
+                prepared
+            )
+            stream = torch.cuda.current_stream(self._block_offsets_device.device)
+            # int32 gate before any buffer or device work: the in-place numpy writes below wrap silently.
+            max_round_start = max(round_starts)
+            rows = (
+                (0, round_starts),
+                (1, seq_lens),
+                (2, token_starts),
+                (3, dense_move_offsets),
+                (4, swa_move_offsets),
+                (5, draft_move_offsets),
+            )
+            for row, values in rows:
+                if (
+                    values is not None
+                    and not -0x80000000 <= min(values) <= max(values) <= 0x7FFFFFFF
+                ):
+                    raise ValueError(f"staged metadata row {row} exceeds the int32 range")
+            # Host-staging reuse fence: prior cohort's async copies must finish before the pinned rows are rewritten.
+            self._staging_reuse_event.synchronize()
+            host_table = self._request_metadata_host_np
+            for row, values in rows:
+                if values is not None:
+                    host_table[row, : len(values)] = values
+            # Zero lengths keep the score kernel and selection inert for padded rows.
+            host_table[:3, len(prepared) :] = 0
+            grow_mean_phase_table(self._phase, int(max_round_start) + 1)
+            self._stage_block_offsets(
+                manager,
+                request_ids,
+                self._block_offsets_host,
+                self._block_offsets_device,
+            )
+            if draft_manager is not None:
+                self._stage_block_offsets(
+                    draft_manager,
+                    request_ids,
+                    self._draft_block_offsets_host,
+                    self._draft_block_offsets_device,
+                )
+            try:
+                self._request_metadata_device.copy_(self._request_metadata_host, non_blocking=True)
+            finally:
+                # Guards the pinned staging until the asynchronous copies complete.
+                self._staging_reuse_event.record(stream)
+        request_count = len(prepared)
+        union = self.eviction_mode == "union"
+        try:
+            with nvtx_range("triattention.score", color="blue"):
+                # In-place refresh: the compiled score launches captured these pointers.
+                _gather_mean_phase_kernel[(request_count,)](
+                    self._round_starts_device,
+                    self._phase["cos"],
+                    self._phase["sin"],
+                    self._phase["rows"],
+                    self._valid_seq_lens_device,
+                    self._token_starts_device,
+                    self._mean_cos,
+                    self._mean_sin,
+                    self._valid_widths,
+                    self._swa_destination_bases,
+                    self._swa_rebase_delta,
+                    NUM_FREQS=self._phase_num_freqs,
+                    F_BLOCK=self._phase_f_block,
+                    HAS_SWA=self._swa_destination_bases is not None,
+                    num_warps=1,
+                )
+                if union:
+                    # Union path: fused score+stats, then the normalized union reduction.
+                    cu_stream = cuda_driver.CUstream(stream.cuda_stream)
+                    self._compiled_score_stats[request_count](
+                        *self._cute_score_prefix,
+                        self._cute_mean_cos,
+                        self._cute_mean_sin,
+                        *self._cute_score_tail,
+                        request_count,
+                        cu_stream,
+                    )
+                    self._compiled_normalize_union[request_count](
+                        self._cute_partial_stats,
+                        *self._cute_selection_prefix,
+                        self._cute_union_scores,
+                        request_count,
+                        cu_stream,
+                    )
+                    columns = min(self._union_scores.shape[1], self._selection_scores_rows.shape[1])
+                    self._selection_scores_rows[:request_count, :columns].copy_(
+                        self._union_scores[:request_count, :columns]
+                    )
+                else:
+                    cu_stream = cuda_driver.CUstream(stream.cuda_stream)
+                    self._compiled_score[request_count](
+                        *self._cute_score_prefix,
+                        self._cute_mean_cos,
+                        self._cute_mean_sin,
+                        *self._cute_score_tail,
+                        request_count,
+                        cu_stream,
+                    )
+                    # Gather each decode window into the [request, layer, head, token] layout of the reduces.
+                    group_size = self._num_q_heads // self._num_kv_heads
+                    num_segments = request_count * self._num_layers
+                    pad = self._padded_head_columns
+                    source = (
+                        self._score_scratch[
+                            : self._num_kv_heads * pad * num_segments * self._bucket_seq_len
+                        ]
+                        .view(
+                            self._num_kv_heads,
+                            pad,
+                            request_count,
+                            self._num_layers,
+                            self._bucket_seq_len,
+                        )[:, :group_size]
+                        .permute(2, 3, 0, 1, 4)
+                    )
+                    torch.add(
+                        self._token_starts_device[:request_count].view(-1, 1, 1, 1, 1),
+                        self._gather_columns,
+                        out=self._gather_index_base[:request_count],
+                    )
+                    self._gather_index_base[:request_count].clamp_(max=self._bucket_seq_len - 1)
+                    columns = self._gather_index[:request_count]
+                    torch.gather(
+                        source,
+                        4,
+                        columns,
+                        out=self._score_output[:request_count].view(
+                            request_count,
+                            self._num_layers,
+                            self._num_kv_heads,
+                            group_size,
+                            self._decode_width,
+                        ),
+                    )
+            with nvtx_range("triattention.select", color="yellow"):
+                if not union:
+                    prepare_per_head_scores(
+                        self._score_output[:request_count],
+                        self._valid_widths,
+                        self._row_mean,
+                        self._row_inv_std,
+                        self._selection_scores_rows,
+                        self._selection_row_lengths,
+                        per_layer=self.eviction_mode == "per_layer_perhead",
+                        normalize_scores=self.normalize_scores,
+                    )
+                self._settle_top_tokens(request_count)
+            with nvtx_range("triattention.compact", color="purple"):
+                compact(self._compaction_plans, request_count)
+        finally:
+            # Order V2 page-table reuse and resize after this cohort's compact.
+            self._compaction_done_event.record(stream)
+            manager._stream.wait_event(self._compaction_done_event)
+            if draft_manager is not None:
+                draft_manager._stream.wait_event(self._compaction_done_event)
+
+    def _cohort_move_offsets(
+        self,
+        prepared: Sequence[Dict[str, object]],
+    ) -> Tuple[List[int], Optional[List[int]], Optional[List[int]]]:
+        """Cumulative dense/SWA/draft move offsets for one prepared cohort (keep
+        set plus protected tail per request; rows past the cohort repeat the final
+        offset and contribute no moves)."""
+
+        def padded_offsets(moves_per_request: List[int]) -> List[int]:
+            offsets = [0]
+            for moves in moves_per_request:
+                offsets.append(offsets[-1] + moves)
+            offsets.extend(offsets[-1:] * (self._max_requests - len(moves_per_request)))
+            return offsets
+
+        tails = [int(item["protected_tail"]) for item in prepared]
+        dense = padded_offsets([self._keep_count + tail for tail in tails])
+        swa = None
+        if self._swa_window is not None:
+            swa = padded_offsets([self._swa_window + tail for tail in tails])
+        draft = None
+        if self._draft_protected_tail_capacity is not None:
+            draft = padded_offsets(
+                [self._keep_count + self._draft_protected_tail_capacity] * len(prepared)
+            )
+        return dense, swa, draft
+
+    def _stage_block_offsets(
+        self,
+        manager: KVCacheManagerV2,
+        request_ids: List[int],
+        host_block_offsets: torch.Tensor,
+        device_block_offsets: torch.Tensor,
+    ) -> None:
+        """Gather the pinned snapshot before the async device copy: resize mutates
+        the live host table. The round owner has already fenced host-staging reuse."""
+        manager.index_mapper.gather_k_block_offsets(
+            manager.host_kv_cache_block_offsets,
+            host_block_offsets,
+            request_ids,
+            host_block_offsets.shape[-1],
+        )
+        manager._stream.wait_event(self._staging_reuse_event)
+        copy_batch_block_offsets_to_device(
+            host_block_offsets,
+            device_block_offsets,
+            self._identity_copy_indices_host[: len(request_ids)],
+            manager.index_scales,
+            manager.kv_offset,
+            manager._stream.cuda_stream,
+        )
+        self._block_offsets_ready_event.record(manager._stream)
+        torch.cuda.current_stream(device_block_offsets.device).wait_event(
+            self._block_offsets_ready_event
+        )
+
+    def _settle_top_tokens(self, request_count: int) -> None:
+        """Pick the top-k and settle ties into the kept-ordinal decision rows
+        (the compaction contract packs them into move sources)."""
+        rows = request_count * self._selection_rows_per_request
+        # The trailing 1 is next_n: decode scores one query token per request.
+        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+            self._selection_scores_rows[:rows],
+            self._selection_row_lengths[:rows],
+            self._provisional_rows[:rows],
+            self._keep_count,
+            1,
+        )
+        _settle_ties_kernel[(request_count, self._selection_rows_per_request)](
+            self._selection_scores_rows,
+            self._selection_row_lengths,
+            self._token_starts_device,
+            self._provisional_rows,
+            self._kept_ordinal_rows,
+            WIDTH=self._decode_width,
+            KEEP_COUNT=self._keep_count,
+            SELECTION_ROWS=self._selection_rows_per_request,
+        )
+
     def _resize_compacted_requests(self, prepared) -> None:
         if not prepared:
             return
@@ -385,223 +818,7 @@ class TriAttention(KVCacheCompressionManager):
                                 f"request {item['request_id']} to {resized_capacity} tokens"
                             )
 
-    def _minimum_evictable_length(self, request: "LlmRequest", seq_len: int) -> int:
-        """Return the largest cache length for which selection is an identity."""
-        prompt_len = min(int(request.py_prompt_len), seq_len)
-        return prompt_len + self.budget
-
-    def _local_score_calibration(
-        self,
-        global_layers: List[int],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_layers = len(global_layers)
-        if global_layers and max(global_layers) >= self._triattn_q_real.shape[0]:
-            raise ValueError(
-                f"TriAttention calibration has {self._triattn_q_real.shape[0]} layers, "
-                f"but this PP rank references global layer {max(global_layers)}"
-            )
-        if global_layers == list(range(global_layers[0], global_layers[0] + num_layers)):
-            layer_slice = slice(global_layers[0], global_layers[0] + num_layers)
-            return (
-                self._triattn_q_real[layer_slice],
-                self._triattn_q_imag[layer_slice],
-                self._triattn_mlr_coef[layer_slice],
-            )
-        layer_ids = torch.as_tensor(
-            global_layers,
-            device=self._triattn_q_real.device,
-            dtype=torch.long,
-        )
-        return (
-            self._triattn_q_real.index_select(0, layer_ids),
-            self._triattn_q_imag.index_select(0, layer_ids),
-            self._triattn_mlr_coef.index_select(0, layer_ids),
-        )
-
-    def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
-        """Drop this request's eviction state; the buffers stay resident."""
-        self._request_states.pop(request.py_request_id, None)
-
-    # ---- helpers (eviction / scoring / V2 cache access / calibration) ----
-
-    @staticmethod
-    def _has_sliding_window_signal(config: Dict[str, object]) -> bool:
-        use_sliding_window = config.get("use_sliding_window")
-        if isinstance(use_sliding_window, bool):
-            return use_sliding_window
-        return any(
-            config.get(field)
-            for field in (
-                "sliding_window",
-                "sliding_window_size",
-                "sliding_window_pattern",
-                "max_window_layers",
-            )
-        )
-
-    def _attention_layer_partition(self) -> Tuple[List[int], List[int], Optional[int]]:
-        """SWA layers here are stored at full length; the window applies only in the kernel."""
-        model_path = self.model_path
-        global_layers = self._global_layers
-        num_layers = len(global_layers)
-
-        try:
-            from transformers import AutoConfig
-
-            config = AutoConfig.from_pretrained(
-                model_path, trust_remote_code=True, local_files_only=True
-            )
-        except (OSError, ValueError) as exc:
-            raise ValueError(
-                f"TriAttention could not load the local model config from {model_path!r}"
-            ) from exc
-        config_values = config.get_text_config().to_dict()
-        layer_types = config_values.get("layer_types")
-        if not layer_types:
-            if self._has_sliding_window_signal(config_values):
-                raise ValueError(
-                    "Model config exposes sliding-window metadata but no layer_types; "
-                    "TriAttention cannot classify kernel-masked SWA layers safely"
-                )
-            return (list(range(num_layers)), [], None)
-        if global_layers and max(global_layers) >= len(layer_types):
-            raise ValueError(
-                f"Model config has {len(layer_types)} layer_types entries, "
-                f"but this PP rank references global layer {max(global_layers)}"
-            )
-
-        swa_layers = [
-            local_layer
-            for local_layer, global_layer in enumerate(global_layers)
-            if "sliding" in str(layer_types[global_layer]).lower()
-        ]
-        swa_set = set(swa_layers)
-        dense_layers = [layer for layer in range(num_layers) if layer not in swa_set]
-        window_size = None
-        if swa_layers:
-            raw_window = config_values.get("sliding_window")
-            if not isinstance(raw_window, int) or raw_window <= 0:
-                raise ValueError(
-                    "TriAttention requires a positive integer model sliding_window "
-                    "when layer_types contains sliding attention"
-                )
-            if self.budget < raw_window:
-                raise ValueError(
-                    f"TriAttention budget={self.budget} must be at least "
-                    f"the kernel-masked SWA window size {raw_window}"
-                )
-            window_size = raw_window
-        return (dense_layers, swa_layers, window_size)
-
-    def _runtime_kv_layout(self, *, draft: bool = False) -> Dict[str, object]:
-        # Only pool page counts are polled; manager identity and layer count are manager-lifetime contracts.
-        manager = self.draft_kv_cache_manager if draft else self.kv_cache_manager
-        cached = self._kv_layout_caches[draft]
-        if cached is not None:
-            current_page_counts = self._pool_page_counts(
-                manager,
-                cached["global_layers"],
-                cached["pool_representatives"],
-            )
-            if current_page_counts != cached["pool_page_counts"]:
-                raise RuntimeError(
-                    f"TriAttention {'draft ' if draft else ''}V2 pool layout changed "
-                    "after the layout was built; KV pool rebalance is not supported"
-                )
-            return cached
-
-        if draft:
-            global_layers = [int(layer) for layer in manager.pp_layers]
-            if not global_layers:
-                raise RuntimeError("TriAttention draft KV cache manager exposes no layers")
-            # The draft is never scored: all draft layers compact as dense.
-            dense_layers: List[int] = list(range(len(global_layers)))
-            swa_layers: List[int] = []
-            swa_window: Optional[int] = None
-        else:
-            global_layers = self._global_layers
-            dense_layers, swa_layers, swa_window = self._layer_partition
-            if not dense_layers:
-                raise ValueError("TriAttention requires at least one full-attention layer")
-        layout = self._build_runtime_kv_layout(
-            manager,
-            global_layers,
-            dense_layers=dense_layers,
-            swa_layers=swa_layers,
-            swa_window=swa_window,
-            what="draft " if draft else "",
-        )
-        self._kv_layout_caches[draft] = layout
-        return layout
-
-    def _build_runtime_kv_layout(
-        self,
-        manager: KVCacheManagerV2,
-        global_layers: List[int],
-        *,
-        dense_layers: List[int],
-        swa_layers: List[int],
-        swa_window: Optional[int],
-        what: str,
-    ) -> Dict[str, object]:
-        maybe_layer_pools = [manager.get_buffers(layer, kv_layout="HND") for layer in global_layers]
-        if any(pool is None for pool in maybe_layer_pools):
-            missing = [
-                layer for layer, pool in zip(global_layers, maybe_layer_pools) if pool is None
-            ]
-            raise RuntimeError(f"Missing {what}KV pools for attention layers {missing}")
-        layer_pools = [pool for pool in maybe_layer_pools if pool is not None]
-        # Canonical pool IDs, resolved once; every grouping derives from them
-        # (V2 owns the mapping; its own lookup errors are the precise ones).
-        layer_offsets = manager.layer_offsets
-        layer_to_pool = manager.layer_to_pool_mapping_dict
-        layer_pool_ids = tuple(
-            int(layer_to_pool[layer_offsets[global_layer]]) for global_layer in global_layers
-        )
-        all_storage_groups: Dict[int, List[int]] = {}
-        for layer, pool_id in enumerate(layer_pool_ids):
-            all_storage_groups.setdefault(pool_id, []).append(layer)
-        # Scored/compacted groups cover the dense layers only; SWA layers
-        # stage and compact as their own representatives.
-        storage_groups: Dict[int, List[int]] = {}
-        for layer in dense_layers:
-            storage_groups.setdefault(layer_pool_ids[layer], []).append(layer)
-        layer_group_representative = {
-            layer: layers[0] for layers in storage_groups.values() for layer in layers
-        }
-        pool_representatives = tuple(layers[0] for layers in all_storage_groups.values())
-        return dict(
-            manager=manager,
-            global_layers=global_layers,
-            layer_pools=layer_pools,
-            dense_layers=dense_layers,
-            swa_layers=swa_layers,
-            swa_window=swa_window,
-            storage_groups=storage_groups,
-            layer_group_representative=layer_group_representative,
-            layer_pool_ids=layer_pool_ids,
-            pool_representatives=pool_representatives,
-            pool_page_counts=tuple(
-                int(layer_pools[layer].shape[0]) for layer in pool_representatives
-            ),
-        )
-
-    @staticmethod
-    def _pool_page_counts(
-        manager: KVCacheManagerV2,
-        global_layers: Sequence[int],
-        pool_representatives: Sequence[int],
-    ) -> Tuple[int, ...]:
-        return tuple(
-            int(
-                manager.impl.get_page_index_upper_bound(
-                    manager.layer_offsets[global_layers[layer]],
-                    Role.KEY,
-                )
-            )
-            // int(manager.kv_factor)
-            for layer in pool_representatives
-        )
+    # ---- buffers + layout ----
 
     def _ensure_buffers(
         self,
@@ -1163,7 +1380,7 @@ class TriAttention(KVCacheCompressionManager):
                 dense_move_offsets=draft_move_offsets_row,
                 protected_tail_capacity=int(draft["protected_tail_capacity"]),
             )
-        self._compaction_plan = init_compaction_buffers(
+        self._compaction_plans = build_compaction_plans(
             target=dict(
                 layer_pools=layer_pools,
                 dense_layers=list(dense_layers),
@@ -1180,12 +1397,7 @@ class TriAttention(KVCacheCompressionManager):
                 per_layer_sources=per_layer,
                 # The decision rows the plans pack into move sources.
                 kept_ordinal_rows=self._kept_ordinal_rows,
-                decision_rows=self._selection_rows_per_request,
                 valid_seq_lens=self._valid_seq_lens_device,
-            ),
-            capacities=dict(
-                max_requests=max_requests,
-                keep_count=keep_count,
                 protected_tail_capacity=int(protected_tail_capacity),
             ),
             draft=draft_contract,
@@ -1200,375 +1412,140 @@ class TriAttention(KVCacheCompressionManager):
         # This cohort's compact is done: manager may resize/reuse pages.
         self._compaction_done_event = torch.cuda.Event()
 
-    def _evict_requests(
+    def _local_score_calibration(
         self,
-        prepared: List[Dict[str, object]],
-    ) -> List[Dict[str, object]]:
-        with nvtx_range_debug("triattention.resolve_layout", color="blue"):
-            layout = self._runtime_kv_layout()
-        with nvtx_range_debug("triattention.staging_lookup", color="blue"):
-            # Retained spans always cover the model window (construction rejects budget < window).
-            self._ensure_buffers(layout, prepared)
-        self._execute_eviction_round(prepared)
-        for item in prepared:
-            # Identity cohorts were filtered pre-launch (_periodic_evict).
-            evicted = item["seq_len"] - item["expected_keep_count"]
-            request_state = self._request_states[item["request_id"]]
-            request_state["evicted_tokens"] += evicted
-            # The manager's only channel to the runtime (feeds num_cached_tokens_per_seq).
-            item["request"].py_num_compressed_tokens = request_state["evicted_tokens"]
-        return prepared
+        global_layers: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_layers = len(global_layers)
+        if global_layers and max(global_layers) >= self._triattn_q_real.shape[0]:
+            raise ValueError(
+                f"TriAttention calibration has {self._triattn_q_real.shape[0]} layers, "
+                f"but this PP rank references global layer {max(global_layers)}"
+            )
+        if global_layers == list(range(global_layers[0], global_layers[0] + num_layers)):
+            layer_slice = slice(global_layers[0], global_layers[0] + num_layers)
+            return (
+                self._triattn_q_real[layer_slice],
+                self._triattn_q_imag[layer_slice],
+                self._triattn_mlr_coef[layer_slice],
+            )
+        layer_ids = torch.as_tensor(
+            global_layers,
+            device=self._triattn_q_real.device,
+            dtype=torch.long,
+        )
+        return (
+            self._triattn_q_real.index_select(0, layer_ids),
+            self._triattn_q_imag.index_select(0, layer_ids),
+            self._triattn_mlr_coef.index_select(0, layer_ids),
+        )
 
-    def _stage_block_offsets(
+    def _runtime_kv_layout(self, *, draft: bool = False) -> Dict[str, object]:
+        # Only pool page counts are polled; manager identity and layer count are manager-lifetime contracts.
+        manager = self.draft_kv_cache_manager if draft else self.kv_cache_manager
+        cached = self._kv_layout_caches[draft]
+        if cached is not None:
+            current_page_counts = self._pool_page_counts(
+                manager,
+                cached["global_layers"],
+                cached["pool_representatives"],
+            )
+            if current_page_counts != cached["pool_page_counts"]:
+                raise RuntimeError(
+                    f"TriAttention {'draft ' if draft else ''}V2 pool layout changed "
+                    "after the layout was built; KV pool rebalance is not supported"
+                )
+            return cached
+
+        if draft:
+            global_layers = [int(layer) for layer in manager.pp_layers]
+            if not global_layers:
+                raise RuntimeError("TriAttention draft KV cache manager exposes no layers")
+            # The draft is never scored: all draft layers compact as dense.
+            dense_layers: List[int] = list(range(len(global_layers)))
+            swa_layers: List[int] = []
+            swa_window: Optional[int] = None
+        else:
+            global_layers = self._global_layers
+            dense_layers, swa_layers, swa_window = self._layer_partition
+            if not dense_layers:
+                raise ValueError("TriAttention requires at least one full-attention layer")
+        layout = self._build_runtime_kv_layout(
+            manager,
+            global_layers,
+            dense_layers=dense_layers,
+            swa_layers=swa_layers,
+            swa_window=swa_window,
+            what="draft " if draft else "",
+        )
+        self._kv_layout_caches[draft] = layout
+        return layout
+
+    def _build_runtime_kv_layout(
         self,
         manager: KVCacheManagerV2,
-        request_ids: List[int],
-        host_block_offsets: torch.Tensor,
-        device_block_offsets: torch.Tensor,
-    ) -> None:
-        """Gather the pinned snapshot before the async device copy: resize mutates
-        the live host table. The round owner has already fenced host-staging reuse."""
-        manager.index_mapper.gather_k_block_offsets(
-            manager.host_kv_cache_block_offsets,
-            host_block_offsets,
-            request_ids,
-            host_block_offsets.shape[-1],
-        )
-        manager._stream.wait_event(self._staging_reuse_event)
-        copy_batch_block_offsets_to_device(
-            host_block_offsets,
-            device_block_offsets,
-            self._identity_copy_indices_host[: len(request_ids)],
-            manager.index_scales,
-            manager.kv_offset,
-            manager._stream.cuda_stream,
-        )
-        self._block_offsets_ready_event.record(manager._stream)
-        torch.cuda.current_stream(device_block_offsets.device).wait_event(
-            self._block_offsets_ready_event
-        )
-
-    def _cohort_move_offsets(
-        self,
-        prepared: Sequence[Dict[str, object]],
-    ) -> Tuple[List[int], Optional[List[int]], Optional[List[int]]]:
-        """Cumulative dense/SWA/draft move offsets for one prepared cohort (keep
-        set plus protected tail per request; rows past the cohort repeat the final
-        offset and contribute no moves)."""
-
-        def padded_offsets(moves_per_request: List[int]) -> List[int]:
-            offsets = [0]
-            for moves in moves_per_request:
-                offsets.append(offsets[-1] + moves)
-            offsets.extend(offsets[-1:] * (self._max_requests - len(moves_per_request)))
-            return offsets
-
-        tails = [int(item["protected_tail"]) for item in prepared]
-        dense = padded_offsets([self._keep_count + tail for tail in tails])
-        swa = None
-        if self._swa_window is not None:
-            swa = padded_offsets([self._swa_window + tail for tail in tails])
-        draft = None
-        if self._draft_protected_tail_capacity is not None:
-            draft = padded_offsets(
-                [self._keep_count + self._draft_protected_tail_capacity] * len(prepared)
-            )
-        return dense, swa, draft
-
-    def _settle_top_tokens(self, request_count: int) -> None:
-        """Pick the top-k and settle ties into the kept-ordinal decision rows
-        (the compaction contract packs them into move sources)."""
-        rows = request_count * self._selection_rows_per_request
-        # The trailing 1 is next_n: decode scores one query token per request.
-        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-            self._selection_scores_rows[:rows],
-            self._selection_row_lengths[:rows],
-            self._provisional_rows[:rows],
-            self._keep_count,
-            1,
-        )
-        _settle_ties_kernel[(request_count, self._selection_rows_per_request)](
-            self._selection_scores_rows,
-            self._selection_row_lengths,
-            self._token_starts_device,
-            self._provisional_rows,
-            self._kept_ordinal_rows,
-            WIDTH=self._decode_width,
-            KEEP_COUNT=self._keep_count,
-            SELECTION_ROWS=self._selection_rows_per_request,
-        )
-
-    def _execute_eviction_round(
-        self,
-        prepared: Sequence[Dict[str, object]],
-    ) -> None:
-        """Run one eviction round over the prepared cohort (every launch covers
-        the full request capacity; padded rows carry zero lengths and stay inert)."""
-        manager = self.kv_cache_manager
-        draft_manager = self.draft_kv_cache_manager
-        with nvtx_range_debug("triattention.page_table_stage", color="orange"):
-            request_ids = [item["request_id"] for item in prepared]
-            round_starts = [item["round_start"] for item in prepared]
-            token_starts = [item["prompt_len"] for item in prepared]
-            seq_lens = [item["seq_len"] for item in prepared]
-            dense_move_offsets, swa_move_offsets, draft_move_offsets = self._cohort_move_offsets(
-                prepared
-            )
-            stream = torch.cuda.current_stream(self._block_offsets_device.device)
-            # int32 gate before any buffer or device work: the in-place numpy writes below wrap silently.
-            max_round_start = max(round_starts)
-            rows = (
-                (0, round_starts),
-                (1, seq_lens),
-                (2, token_starts),
-                (3, dense_move_offsets),
-                (4, swa_move_offsets),
-                (5, draft_move_offsets),
-            )
-            for row, values in rows:
-                if (
-                    values is not None
-                    and not -0x80000000 <= min(values) <= max(values) <= 0x7FFFFFFF
-                ):
-                    raise ValueError(f"staged metadata row {row} exceeds the int32 range")
-            # Host-staging reuse fence: prior cohort's async copies must finish before the pinned rows are rewritten.
-            self._staging_reuse_event.synchronize()
-            host_table = self._request_metadata_host_np
-            for row, values in rows:
-                if values is not None:
-                    host_table[row, : len(values)] = values
-            # Zero lengths keep the score kernel and selection inert for padded rows.
-            host_table[:3, len(prepared) :] = 0
-            grow_mean_phase_table(self._phase, int(max_round_start) + 1)
-            self._stage_block_offsets(
-                manager,
-                request_ids,
-                self._block_offsets_host,
-                self._block_offsets_device,
-            )
-            if draft_manager is not None:
-                self._stage_block_offsets(
-                    draft_manager,
-                    request_ids,
-                    self._draft_block_offsets_host,
-                    self._draft_block_offsets_device,
-                )
-            try:
-                self._request_metadata_device.copy_(self._request_metadata_host, non_blocking=True)
-            finally:
-                # Guards the pinned staging until the asynchronous copies complete.
-                self._staging_reuse_event.record(stream)
-        request_count = len(prepared)
-        union = self.eviction_mode == "union"
-        try:
-            with nvtx_range("triattention.score", color="blue"):
-                # In-place refresh: the compiled score launches captured these pointers.
-                _gather_mean_phase_kernel[(request_count,)](
-                    self._round_starts_device,
-                    self._phase["cos"],
-                    self._phase["sin"],
-                    self._phase["rows"],
-                    self._valid_seq_lens_device,
-                    self._token_starts_device,
-                    self._mean_cos,
-                    self._mean_sin,
-                    self._valid_widths,
-                    self._swa_destination_bases,
-                    self._swa_rebase_delta,
-                    NUM_FREQS=self._phase_num_freqs,
-                    F_BLOCK=self._phase_f_block,
-                    HAS_SWA=self._swa_destination_bases is not None,
-                    num_warps=1,
-                )
-                if union:
-                    # Union path: fused score+stats, then the normalized union reduction.
-                    cu_stream = cuda_driver.CUstream(stream.cuda_stream)
-                    self._compiled_score_stats[request_count](
-                        *self._cute_score_prefix,
-                        self._cute_mean_cos,
-                        self._cute_mean_sin,
-                        *self._cute_score_tail,
-                        request_count,
-                        cu_stream,
-                    )
-                    self._compiled_normalize_union[request_count](
-                        self._cute_partial_stats,
-                        *self._cute_selection_prefix,
-                        self._cute_union_scores,
-                        request_count,
-                        cu_stream,
-                    )
-                    columns = min(self._union_scores.shape[1], self._selection_scores_rows.shape[1])
-                    self._selection_scores_rows[:request_count, :columns].copy_(
-                        self._union_scores[:request_count, :columns]
-                    )
-                else:
-                    cu_stream = cuda_driver.CUstream(stream.cuda_stream)
-                    self._compiled_score[request_count](
-                        *self._cute_score_prefix,
-                        self._cute_mean_cos,
-                        self._cute_mean_sin,
-                        *self._cute_score_tail,
-                        request_count,
-                        cu_stream,
-                    )
-                    # Gather each decode window into the [request, layer, head, token] layout of the reduces.
-                    group_size = self._num_q_heads // self._num_kv_heads
-                    num_segments = request_count * self._num_layers
-                    pad = self._padded_head_columns
-                    source = (
-                        self._score_scratch[
-                            : self._num_kv_heads * pad * num_segments * self._bucket_seq_len
-                        ]
-                        .view(
-                            self._num_kv_heads,
-                            pad,
-                            request_count,
-                            self._num_layers,
-                            self._bucket_seq_len,
-                        )[:, :group_size]
-                        .permute(2, 3, 0, 1, 4)
-                    )
-                    torch.add(
-                        self._token_starts_device[:request_count].view(-1, 1, 1, 1, 1),
-                        self._gather_columns,
-                        out=self._gather_index_base[:request_count],
-                    )
-                    self._gather_index_base[:request_count].clamp_(max=self._bucket_seq_len - 1)
-                    columns = self._gather_index[:request_count]
-                    torch.gather(
-                        source,
-                        4,
-                        columns,
-                        out=self._score_output[:request_count].view(
-                            request_count,
-                            self._num_layers,
-                            self._num_kv_heads,
-                            group_size,
-                            self._decode_width,
-                        ),
-                    )
-            with nvtx_range("triattention.select", color="yellow"):
-                if not union:
-                    prepare_per_head_scores(
-                        self._score_output[:request_count],
-                        self._valid_widths,
-                        self._row_mean,
-                        self._row_inv_std,
-                        self._selection_scores_rows,
-                        self._selection_row_lengths,
-                        per_layer=self.eviction_mode == "per_layer_perhead",
-                        normalize_scores=self.normalize_scores,
-                    )
-                self._settle_top_tokens(request_count)
-            with nvtx_range("triattention.compact", color="purple"):
-                compact(self._compaction_plan, request_count)
-        finally:
-            # Order V2 page-table reuse and resize after this cohort's compact.
-            self._compaction_done_event.record(stream)
-            manager._stream.wait_event(self._compaction_done_event)
-            if draft_manager is not None:
-                draft_manager._stream.wait_event(self._compaction_done_event)
-
-    # ---- helpers: calibration loading ----
-
-    def _resolve_calibration(self) -> Dict[str, torch.Tensor]:
-        """Load the calibration file, converting the official layout if needed."""
-        raw = torch.load(self.calibration_path, map_location="cpu", weights_only=False)
-        if isinstance(raw, dict) and _REQUIRED_CALIBRATION_KEYS <= set(raw):
-            return raw
-        if isinstance(raw, dict) and {"metadata", "stats"} <= set(raw):
-            return self._convert_official_calibration(raw)
-        got = sorted(raw.keys()) if isinstance(raw, dict) else type(raw).__name__
-        raise ValueError(
-            f"Unrecognized calibration at {self.calibration_path}: expected the "
-            f"official {{metadata, stats}} layout or "
-            f"{sorted(_REQUIRED_CALIBRATION_KEYS)}; got {got}."
-        )
-
-    def _convert_official_calibration(self, raw) -> Dict[str, torch.Tensor]:
-        """Convert the official calibration format to the runtime schema."""
-        stats = raw["stats"]
-        meta = raw.get("metadata", {})
-        if "sampled_heads" in meta:
-            heads = [(int(a), int(b)) for a, b in meta["sampled_heads"]]
-        else:
-            heads = [
-                (int(k[len("layer") : k.index("_head")]), int(k[k.index("_head") + len("_head") :]))
-                for k in stats
+        global_layers: List[int],
+        *,
+        dense_layers: List[int],
+        swa_layers: List[int],
+        swa_window: Optional[int],
+        what: str,
+    ) -> Dict[str, object]:
+        maybe_layer_pools = [manager.get_buffers(layer, kv_layout="HND") for layer in global_layers]
+        if any(pool is None for pool in maybe_layer_pools):
+            missing = [
+                layer for layer, pool in zip(global_layers, maybe_layer_pools) if pool is None
             ]
-        num_layers = max(layer for layer, _ in heads) + 1
-        num_heads = max(h for _, h in heads) + 1
-        freq_count = int(next(iter(stats.values()))["q_mean_real"].numel())
-        E_q = torch.zeros(num_layers, num_heads, freq_count, dtype=torch.complex64)
-        E_q_norm = torch.zeros(num_layers, num_heads, freq_count, dtype=torch.float32)
-        for layer, h in heads:
-            s = stats[f"layer{layer:02d}_head{h:02d}"]
-            E_q[layer, h] = torch.complex(s["q_mean_real"].float(), s["q_mean_imag"].float())
-            E_q_norm[layer, h] = s["q_abs_mean"].float()
-        omega, freq_scale_sq = self._rope_tables(freq_count)
-        calib = {
-            "E_q": E_q,
-            "E_q_norm": E_q_norm,
-            "omega": omega,
-            "freq_scale_sq": freq_scale_sq,
+            raise RuntimeError(f"Missing {what}KV pools for attention layers {missing}")
+        layer_pools = [pool for pool in maybe_layer_pools if pool is not None]
+        # Canonical pool IDs, resolved once; every grouping derives from them
+        # (V2 owns the mapping; its own lookup errors are the precise ones).
+        layer_offsets = manager.layer_offsets
+        layer_to_pool = manager.layer_to_pool_mapping_dict
+        layer_pool_ids = tuple(
+            int(layer_to_pool[layer_offsets[global_layer]]) for global_layer in global_layers
+        )
+        all_storage_groups: Dict[int, List[int]] = {}
+        for layer, pool_id in enumerate(layer_pool_ids):
+            all_storage_groups.setdefault(pool_id, []).append(layer)
+        # Scored/compacted groups cover the dense layers only; SWA layers
+        # stage and compact as their own representatives.
+        storage_groups: Dict[int, List[int]] = {}
+        for layer in dense_layers:
+            storage_groups.setdefault(layer_pool_ids[layer], []).append(layer)
+        layer_group_representative = {
+            layer: layers[0] for layers in storage_groups.values() for layer in layers
         }
-        logger.info(
-            f"TriAttention: converted official calibration {self.calibration_path}"
-            f" -> E_q[L={num_layers}, H={num_heads}, F={freq_count}]"
+        pool_representatives = tuple(layers[0] for layers in all_storage_groups.values())
+        return dict(
+            manager=manager,
+            global_layers=global_layers,
+            layer_pools=layer_pools,
+            dense_layers=dense_layers,
+            swa_layers=swa_layers,
+            swa_window=swa_window,
+            storage_groups=storage_groups,
+            layer_group_representative=layer_group_representative,
+            layer_pool_ids=layer_pool_ids,
+            pool_representatives=pool_representatives,
+            pool_page_counts=tuple(
+                int(layer_pools[layer].shape[0]) for layer in pool_representatives
+            ),
         )
-        return calib
 
-    def _rope_tables(self, freq_count: int):
-        """Derive the RoPE frequency tables from the model config."""
-        import transformers
-        from transformers import AutoConfig
-
-        cfg = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True).get_text_config()
-        config_values = cfg.to_dict()
-        head_dim = freq_count * 2
-        rope_params = (
-            config_values.get("rope_parameters") or config_values.get("rope_scaling") or {}
-        )
-        if rope_params and all(isinstance(v, dict) for v in rope_params.values()):
-            raise ValueError(
-                f"TriAttention: layer-type-keyed rope_parameters are not supported for "
-                f"calibration conversion (model {self.model_path}); got {rope_params!r}."
+    @staticmethod
+    def _pool_page_counts(
+        manager: KVCacheManagerV2,
+        global_layers: Sequence[int],
+        pool_representatives: Sequence[int],
+    ) -> Tuple[int, ...]:
+        return tuple(
+            int(
+                manager.impl.get_page_index_upper_bound(
+                    manager.layer_offsets[global_layers[layer]],
+                    Role.KEY,
+                )
             )
-        rope_type = rope_params.get("rope_type") or rope_params.get("type") or "default"
-        theta_seen = rope_params.get("rope_theta", config_values.get("rope_theta"))
-        base = float(theta_seen) if theta_seen is not None else 10000.0
-
-        def analytic_inv_freq():
-            idx = torch.arange(0, head_dim, 2, dtype=torch.float32)
-            return (1.0 / (base ** (idx / head_dim)))[:freq_count].clone()
-
-        if rope_type == "default":
-            # transformers>=5.5 no longer keys "default" in ROPE_INIT_FUNCTIONS: use the formula.
-            omega, scale_sq = analytic_inv_freq(), 1.0
-        else:
-            try:
-                from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-            except ImportError:
-                logger.warning(
-                    f"TriAttention: transformers rope-init unavailable; using the analytic "
-                    f"inv_freq with theta={base} for {self.model_path} and IGNORING "
-                    f"rope_type={rope_type!r} scaling corrections."
-                )
-                return analytic_inv_freq(), torch.ones(freq_count, dtype=torch.float32)
-            if rope_type not in ROPE_INIT_FUNCTIONS:
-                raise ValueError(
-                    f"TriAttention: unknown rope_type {rope_type!r} for {self.model_path} "
-                    f"(transformers {transformers.__version__} provides "
-                    f"{sorted(ROPE_INIT_FUNCTIONS)}); rope config seen: {rope_params!r}."
-                )
-            try:
-                inv_freq, attention_factor = ROPE_INIT_FUNCTIONS[rope_type](cfg, device="cpu")
-            except Exception as exc:
-                raise ValueError(
-                    f"TriAttention: rope-init {rope_type!r} failed for {self.model_path}; "
-                    f"rope config seen: {rope_params!r}."
-                ) from exc
-            omega = inv_freq.to(torch.float32)[:freq_count].clone()
-            scale_sq = float(attention_factor) ** 2
-        return omega, torch.full((freq_count,), scale_sq, dtype=torch.float32)
+            // int(manager.kv_factor)
+            for layer in pool_representatives
+        )

@@ -147,7 +147,7 @@ class TestTriAttentionClass:
         manager = _make_fake_v2()
         manager.num_extra_kv_tokens = 4
         manager._kv_reserve_draft_tokens = 4
-        triattention = TriAttention(manager, _make_tri_config(budget=8))
+        triattention = TriAttention(_make_tri_config(budget=8), manager)
         triattention.calibration = {}
 
         triattention.on_request_init(_make_request(11))
@@ -327,7 +327,7 @@ class TestEvictionLifecycle:
         fake_v2 = _make_fake_v2()
         fake_v2.num_extra_kv_tokens = num_extra_kv_tokens
         fake_v2._kv_reserve_draft_tokens = kv_reserve_draft_tokens
-        mgr = TriAttention(fake_v2, _make_tri_config(budget=8))
+        mgr = TriAttention(_make_tri_config(budget=8), fake_v2)
         mgr.calibration = {}
         cache = SimpleNamespace(
             capacity=seq_len,
@@ -458,8 +458,8 @@ class TestEvictionLifecycle:
         # marking is asserted in the executor manager tests).
         draft_manager = _make_fake_v2(is_draft=True)
         TriAttention(
-            _make_fake_v2(),
             _make_tri_config(budget=8),
+            _make_fake_v2(),
             draft_kv_cache_manager=draft_manager,
         )
 
@@ -489,7 +489,7 @@ class TestEvictionLifecycle:
         manager.kv_cache_map = {
             7: SimpleNamespace(capacity=106, is_active=True),
         }
-        triattention = TriAttention(manager, _make_tri_config(budget=8))
+        triattention = TriAttention(_make_tri_config(budget=8), manager)
         batch = SimpleNamespace(
             context_requests=[],
             generation_requests=[_make_request(7, py_draft_tokens=[1, 2, 3])],
@@ -506,11 +506,10 @@ class TestEvictionLifecycle:
 
 
 class TestFixedScoreMetadata:
-    def test_union_rejects_unnormalized_scores(self):
-        # The fused pipeline (THE union path) always z-normalizes, so
-        # normalize_scores=False is rejected loudly at construction.
-        with pytest.raises(ValueError, match="normalize_scores=True"):
-            _make_triattention(budget=4, eviction_mode="union", normalize_scores=False)
+    def test_union_forces_normalized_scores(self):
+        # Union eviction always z-normalizes: False is coerced to True at construction.
+        triattention = _make_triattention(budget=4, eviction_mode="union", normalize_scores=False)
+        assert triattention.normalize_scores is True
 
     def test_execute_rejects_int32_overflowing_round_starts(self):
         # Round starts past the int32 metadata range fail loudly (in the host

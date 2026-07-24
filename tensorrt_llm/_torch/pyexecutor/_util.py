@@ -2159,14 +2159,14 @@ def validate_kv_cache_compression_with_spec(
             raise ValueError(
                 "TriAttention draft KV co-compression supports only "
                 "eviction_mode='union'; draft layers are never scored")
-        if any(window is not None for window in
-               draft_kv_cache_manager.max_attention_window_vec) or any(
-                   not isinstance(layer, AttentionLayerConfig)
-                   or layer.sliding_window_size is not None for layer in
-                   draft_kv_cache_manager.kv_cache_manager_py_config.layers):
-            raise ValueError(
-                "TriAttention draft KV co-compression requires "
-                "full-attention draft V2 lifecycles")
+        if any(window is not None
+               for window in draft_kv_cache_manager.max_attention_window_vec
+               ) or any(not isinstance(layer, AttentionLayerConfig)
+                        or layer.sliding_window_size is not None
+                        for layer in draft_kv_cache_manager.
+                        kv_cache_manager_py_config.layers):
+            raise ValueError("TriAttention draft KV co-compression requires "
+                             "full-attention draft V2 lifecycles")
 
 
 def create_kv_cache_compression_manager(
@@ -2187,8 +2187,8 @@ def create_kv_cache_compression_manager(
             TriAttention
 
         return TriAttention(
+            config,
             kv_cache_manager,
-            config=config,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
 
