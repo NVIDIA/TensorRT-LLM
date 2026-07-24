@@ -51,6 +51,9 @@ class CuError(Exception):
             err_str = "<Failed to get error string with cuGetErrorString>"
         super().__init__(f"CUDA driver error: {error_code} ({err_str})")
 
+    def __reduce__(self) -> tuple[type["CuError"], tuple[drv.CUresult]]:
+        return (self.__class__, (self.error_code,))
+
 
 class ResourceBusyError(Exception):
     pass
