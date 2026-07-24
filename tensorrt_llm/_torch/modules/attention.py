@@ -1049,23 +1049,14 @@ class Attention(nn.Module):
                                                   self.mapping, self.layer_idx)
 
         if bool(lora_params):
+            qkv, qkv_lora_results = LoraLayer.forward_with_base(
+                lambda: self.qkv_proj(hidden_states),
+                (self.splitted_qkv_lora, self.fused_qkv_lora),
+                hidden_states,
+                lora_params,
+                self.layer_idx,
+            )
 
-            def qkv_lora():
-                return (
-                    self.splitted_qkv_lora(hidden_states, lora_params,
-                                           self.layer_idx),
-                    self.fused_qkv_lora(hidden_states, lora_params,
-                                        self.layer_idx),
-                )
-
-            qkv, qkv_lora_results = (
-                self.splitted_qkv_lora.execute_with_base(
-                    lambda: self.qkv_proj(hidden_states),
-                    qkv_lora,
-                    lora_params,
-                    self.layer_idx,
-                    (self.fused_qkv_lora, ),
-                ))
             for qkv_lora_result in qkv_lora_results:
                 if qkv_lora_result is not None:
                     qkv = qkv + qkv_lora_result
