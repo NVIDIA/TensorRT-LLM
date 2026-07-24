@@ -469,6 +469,35 @@ class MambaPolicy:
         return src_frags, dst_frags, kv_sizes
 
     @staticmethod
+    def payload_bytes(
+        sender_page_table: KVCachePageTable,
+        receiver_page_table: KVCachePageTable,
+        dst_slot: Optional[int],
+        sender_ri: RankInfo,
+        receiver_ri: RankInfo,
+    ) -> int:
+        """Total recurrent-state bytes one sender appends to the KV write for a request.
+
+        Mirrors the sender's ``collect_frags`` call in ``_build_kv_write_meta`` with the same
+        argument roles (sender as self/src), so the receiver can size a bounce region for the
+        exact bytes the coalesced write will carry. Slot indices only shift pointers, never
+        fragment sizes, so a dummy ``src_slot`` stands in for the sender's state index (which
+        the receiver does not know at reserve time). Returns 0 when either side has no mamba
+        layer group or the receiver has no state slot for the request.
+        """
+        if dst_slot is None:
+            return 0
+        _, _, sizes = MambaPolicy.collect_frags(
+            self_page_table=sender_page_table,
+            peer_page_table=receiver_page_table,
+            src_slot=0,
+            dst_slot=dst_slot,
+            self_ri=sender_ri,
+            peer_ri=receiver_ri,
+        )
+        return int(sum(sizes))
+
+    @staticmethod
     def collect_frags(
         self_page_table: KVCachePageTable,
         peer_page_table: KVCachePageTable,
