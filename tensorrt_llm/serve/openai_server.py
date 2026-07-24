@@ -1284,7 +1284,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 raw_request,
                 steady_clock_offset=self.disagg_server_steady_clock_offset)
             if record is not None and raw_request is not None:
-                raw_request.state.perf_metrics_record = record
+                raw_request.state.perf_metrics_records.append(record)
         if self.metrics_collector:
             if res.candidate_metrics:
                 for candidate_m in res.candidate_metrics:

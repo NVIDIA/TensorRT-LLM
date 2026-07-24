@@ -128,13 +128,14 @@ class RawRequestResponseHooks(ResponseHooks):
                 "server_first_token_time": self.server_first_token_time or None,
             },
         }
-        self.raw_req.state.perf_metrics_record = combine_disagg_metrics(
-            self.request_id,
-            disagg_phase,
-            self.ctx_metrics,
-            self.gen_metrics,
-            disagg_request_id=self.disagg_request_id,
-        )
+        self.raw_req.state.perf_metrics_records.append(
+            combine_disagg_metrics(
+                self.request_id,
+                disagg_phase,
+                self.ctx_metrics,
+                self.gen_metrics,
+                disagg_request_id=self.disagg_request_id,
+            ))
 
 
 class OpenAIDisaggServer:

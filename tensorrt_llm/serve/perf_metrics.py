@@ -289,64 +289,67 @@ def _elapsed_ms(values: Dict[str, Any], start: str, end: Optional[str] = None) -
     return value if value >= 0 and math.isfinite(value) else None
 
 
-def build_metrics_headers(record: Dict[str, Any]) -> Dict[str, str]:
-    """Format one completed record as Server-Timing-style metric lists."""
+def build_metrics_headers(records: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Format completed records as Server-Timing-style metric lists."""
     values = {
         SERVER_TIMING_HEADER: [],
         START_END_TIME_HEADER: [],
         STEP_METRICS_HEADER: [],
         CTX_CHUNK_METRICS_HEADER: [],
     }
-    for phase, phase_record in record.get("phases", {}).items():
-        timing = phase_record.get("timing_metrics", {})
-        for name, field in (
-            ("start", "arrival_time"),
-            ("end", "last_token_time"),
-        ):
-            timestamp = timing.get(field)
-            if timestamp is not None:
-                values[START_END_TIME_HEADER].append(f"{phase}-{name};ts={float(timestamp):.9f}")
-        timing_ranges = (
-            (
-                ("queue", "server_arrival_time", "ctx_dispatch_time"),
-                ("ttft", "server_arrival_time", "server_first_token_time"),
-            )
-            if phase == "disagg"
-            else (
-                ("queue", "arrival_time", "first_scheduled_time"),
-                ("ttft", "arrival_time", "first_token_time"),
-                ("e2e", "arrival_time", "last_token_time"),
-                ("kv_transfer", "kv_cache_transfer_start", "kv_cache_transfer_end"),
-            )
-        )
-        for name, start, end in timing_ranges:
-            duration = _elapsed_ms(timing, start, end)
-            if duration is not None:
-                values[SERVER_TIMING_HEADER].append(f"{phase}_{name};dur={duration:.6f}")
-
-        breakdown = phase_record.get("time_breakdown_metrics") or {}
-        for header, key, label in (
-            (STEP_METRICS_HEADER, "step_metrics", "step"),
-            (CTX_CHUNK_METRICS_HEADER, "ctx_chunk_metrics", "ctx-chunk"),
-        ):
-            for index, metrics in enumerate(breakdown.get(key, [])):
-                item = metrics.get("iter", index) if key == "step_metrics" else index
-                durations = (
-                    ("forward", _elapsed_ms(metrics, "forward_start_time", "forward_end_time")),
-                    ("sample", _elapsed_ms(metrics, "sample_start_time", "sample_end_time")),
-                    ("gpu-forward", _elapsed_ms(metrics, "gpu_forward_time")),
-                    ("gpu-sample", _elapsed_ms(metrics, "gpu_sample_time")),
+    for record in records:
+        for phase, phase_record in record.get("phases", {}).items():
+            timing = phase_record.get("timing_metrics", {})
+            for name, field in (
+                ("start", "arrival_time"),
+                ("end", "last_token_time"),
+            ):
+                timestamp = timing.get(field)
+                if timestamp is not None:
+                    values[START_END_TIME_HEADER].append(
+                        f"{phase}-{name};ts={float(timestamp):.9f}"
+                    )
+            timing_ranges = (
+                (
+                    ("queue", "server_arrival_time", "ctx_dispatch_time"),
+                    ("ttft", "server_arrival_time", "server_first_token_time"),
                 )
-                values[header].extend(
-                    f"{phase}-{label}-{item}-{name};dur={duration:.6f}"
-                    for name, duration in durations
-                    if duration is not None
+                if phase == "disagg"
+                else (
+                    ("queue", "arrival_time", "first_scheduled_time"),
+                    ("ttft", "arrival_time", "first_token_time"),
+                    ("e2e", "arrival_time", "last_token_time"),
+                    ("kv_transfer", "kv_cache_transfer_start", "kv_cache_transfer_end"),
                 )
+            )
+            for name, start, end in timing_ranges:
+                duration = _elapsed_ms(timing, start, end)
+                if duration is not None:
+                    values[SERVER_TIMING_HEADER].append(f"{phase}_{name};dur={duration:.6f}")
 
-        inherited = phase_record.get("metrics_headers") or {}
-        for header in values:
-            if inherited.get(header):
-                values[header].append(inherited[header])
+            breakdown = phase_record.get("time_breakdown_metrics") or {}
+            for header, key, label in (
+                (STEP_METRICS_HEADER, "step_metrics", "step"),
+                (CTX_CHUNK_METRICS_HEADER, "ctx_chunk_metrics", "ctx-chunk"),
+            ):
+                for index, metrics in enumerate(breakdown.get(key, [])):
+                    item = metrics.get("iter", index) if key == "step_metrics" else index
+                    durations = (
+                        ("forward", _elapsed_ms(metrics, "forward_start_time", "forward_end_time")),
+                        ("sample", _elapsed_ms(metrics, "sample_start_time", "sample_end_time")),
+                        ("gpu-forward", _elapsed_ms(metrics, "gpu_forward_time")),
+                        ("gpu-sample", _elapsed_ms(metrics, "gpu_sample_time")),
+                    )
+                    values[header].extend(
+                        f"{phase}-{label}-{item}-{name};dur={duration:.6f}"
+                        for name, duration in durations
+                        if duration is not None
+                    )
+
+            inherited = phase_record.get("metrics_headers") or {}
+            for header in (STEP_METRICS_HEADER, CTX_CHUNK_METRICS_HEADER):
+                if inherited.get(header):
+                    values[header].append(inherited[header])
 
     return {header: ", ".join(items) for header, items in values.items() if items}
 
@@ -678,6 +681,7 @@ class PerfMetricsMiddleware:
             return
         is_stream = False
         metrics_headers = None
+        records = scope.setdefault("state", {}).setdefault("perf_metrics_records", [])
         return_metrics = self._expose_headers and any(
             name.lower() == _RETURN_METRICS_HEADER_BYTES and value.strip() == b"1"
             for name, value in scope.get("headers", [])
@@ -691,9 +695,8 @@ class PerfMetricsMiddleware:
                     key.lower() == b"content-type" and b"text/event-stream" in value.lower()
                     for key, value in headers
                 )
-                record = scope.get("state", {}).get("perf_metrics_record")
-                if record and return_metrics and not is_stream:
-                    metrics_headers = build_metrics_headers(record)
+                if records and return_metrics and not is_stream:
+                    metrics_headers = build_metrics_headers(records)
                     public_headers = _limit_metrics_headers(metrics_headers)
                     headers.extend(
                         (name.encode(), value.encode()) for name, value in public_headers.items()
@@ -701,24 +704,12 @@ class PerfMetricsMiddleware:
                 message["headers"] = headers
 
             elif message["type"] == "http.response.body" and not message.get("more_body", False):
-                record = scope.get("state", {}).get("perf_metrics_record")
-                if record:
+                if records:
                     if metrics_headers is None:
-                        metrics_headers = build_metrics_headers(record)
+                        metrics_headers = build_metrics_headers(records)
                     if self._writer is not None:
-                        details = {
-                            name: value
-                            for name, value in metrics_headers.items()
-                            if name
-                            in (
-                                START_END_TIME_HEADER,
-                                STEP_METRICS_HEADER,
-                                CTX_CHUNK_METRICS_HEADER,
-                            )
-                        }
-                        self._writer.submit(
-                            {**record, "streaming": is_stream, "metrics_headers": details}
-                        )
+                        for record in records:
+                            self._writer.submit(record)
                     if return_metrics and is_stream:
                         message["body"] = message.get("body", b"") + build_metrics_sse_event(
                             metrics_headers
