@@ -742,6 +742,14 @@ class SpecMetadata:
             top_p: Optional[float],
         ) -> tuple[float, int, float, bool, bool, bool, bool]:
             """Convert request sampling params into normalized per-request scalars."""
+            # NB: min_p is intentionally omitted here. One-engine speculative
+            # decoding does not yet propagate min_p (there is no request_min_p
+            # buffer nor min_p wiring in the sampling_batch_spec_dec_one_model*
+            # kernels), so a min_p-only request is classified greedy and its
+            # min_p is ignored on this path. The two-model draft/target path
+            # honors min_p via _request_strategy. See the method docstring.
+            # TODO: thread min_p through the one-engine sampling
+            # buffers and speculative sampling kernels.
             is_greedy = SamplingParams.params_imply_greedy_decoding(
                 temperature=temperature,
                 top_k=top_k,
@@ -883,6 +891,12 @@ class SpecMetadata:
         Scans sampling configs to set skip_*/is_all_greedy_sample flags. When
         any request needs sampling, also builds per-token/per-request lists
         and copies them to GPU buffers; all-greedy batches skip this entirely.
+
+        Limitation: min_p is not propagated on the one-engine path (only
+        temperature/top_k/top_p are populated). A min_p-only request is
+        therefore treated as greedy here and its min_p is ignored; the
+        two-model draft/target path honors min_p via _request_strategy.
+        TODO: add one-engine min_p support.
         """
         if not self.spec_dec_mode.use_one_engine():
             return

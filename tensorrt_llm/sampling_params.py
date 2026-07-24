@@ -487,9 +487,11 @@ class SamplingParams:
         """Whether the parameters resolve to greedy decoding.
 
         An explicit greedy control always wins. The implicit "all params unset"
-        greedy default is overridden by an active top-p decay (which implies
-        top-p sampling so the decayed runtime top-p can take effect); callers
-        that do not support decay may omit ``top_p_decay``.
+        greedy default is overridden by any active sampling knob: an active
+        top-p decay (which implies top-p sampling so the decayed runtime top-p
+        can take effect) or a positive ``min_p`` (which still selects among
+        multiple tokens); callers that do not support decay may omit
+        ``top_p_decay``.
         """
         if use_beam_search:
             return False
@@ -498,7 +500,9 @@ class SamplingParams:
         ):
             return True
         implicitly_greedy = temperature is None and top_p is None and top_k is None
-        return implicitly_greedy and not SamplingParams.params_imply_top_p_decay_active(top_p_decay)
+        min_p_active = min_p is not None and min_p > 0.0
+        decay_active = SamplingParams.params_imply_top_p_decay_active(top_p_decay)
+        return implicitly_greedy and not min_p_active and not decay_active
 
     @property
     def _greedy_decoding(self) -> bool:

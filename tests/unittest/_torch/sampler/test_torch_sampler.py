@@ -62,6 +62,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     TopP,
     UtilsSamplingParams,
     resolve_sampling_strategy,
+    sample,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
@@ -353,9 +354,10 @@ class TestStrategySelection:
         assert strat[3] == pytest.approx(0.9)
 
     # --- min_p ---
-    # A min_p strategy is ("min_p", top_k, top_p, min_p, temperature). top_k /
-    # top_p carry their disabled sentinels (vocab_size / 1.0) when unset, so
-    # min_p composes with any subset of temperature/top_k/top_p.
+    # A min_p strategy is ("min_p", top_k, top_p, min_p, temperature). When
+    # unset, top_k carries the disabled sentinel 0 ("keep all"; sanitized to
+    # vocab_size downstream) and top_p carries 1.0, so min_p composes with any
+    # subset of temperature/top_k/top_p.
 
     @pytest.mark.parametrize(
         "trivial_temperature, trivial_top_p, trivial_top_k",
@@ -380,7 +382,7 @@ class TestStrategySelection:
         strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
         assert len(strat) == 5
         assert strat[0] == "min_p"
-        assert strat[1] == self.VOCAB_SIZE  # top_k disabled sentinel
+        assert strat[1] == 0  # top_k disabled sentinel (0 == "keep all")
         assert strat[2] == pytest.approx(1.0)  # top_p disabled sentinel
         assert strat[3] == pytest.approx(0.1)
         assert strat[4] == pytest.approx(1.0)  # temperature default
@@ -1229,6 +1231,32 @@ def test_min_p_renorm_probs_per_request_tensor():
     # row 0 (min_p=0) keeps everything; row 2 (min_p=0.95) prunes more aggressively
     assert (got[0] > 0).all()
     assert (got[2] > 0).sum() <= (got[0] > 0).sum()
+
+
+def test_min_p_sample_top_k_disabled_sentinel():
+    """min_p + unset top_k must survive the standalone sample() dispatch.
+
+    Draft-model rejection sampling resolves strategies with vocab_size=2**31
+    (the greedy probe), so a min_p request with an unset top_k carries the
+    disabled-top_k sentinel 0. That 0 flows straight into sample() ->
+    top_k_top_p_sampling_batch without sanitize_top_k, so the vanilla path must
+    treat it as "keep all" instead of tripping ``assert top_k > 1``. Regression
+    test for min_p under speculative decoding with rejection sampling.
+    """
+    min_p = 0.5
+    # ("min_p", top_k, top_p, min_p, temperature) with the top_k=0 sentinel.
+    strategy: MinP = ("min_p", 0, 1.0, min_p, 1.0)
+
+    torch.manual_seed(0)
+    logits = torch.randn(4, 32)
+    # Must not raise (top_k=0 previously hit ``assert top_k > 1``).
+    tokens, _, _ = sample(strategy, logits.clone())
+
+    assert tokens.shape == (4,)
+    # min_p filtering was applied: every sampled token clears the min_p mask.
+    probs = torch.softmax(logits, dim=-1)
+    kept = probs >= (min_p * probs.max(dim=-1, keepdim=True).values)
+    assert kept.gather(1, tokens.unsqueeze(-1)).all()
 
 
 class TestBatchedSampling:
