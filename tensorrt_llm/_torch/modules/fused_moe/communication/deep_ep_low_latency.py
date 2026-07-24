@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
@@ -114,6 +115,12 @@ class DeepEPLowLatency(Communication):
             return False
         # SM120/121 (RTX PRO 6000 Blackwell): no NVSwitch -> NVSHMEM-LL deadlocks.
         if get_sm_version() in (120, 121):
+            return False
+        # On platforms without a fabric-attached MNNVL domain (e.g. H100/H200 NVL
+        # PCIe SKUs), the native NVSHMEM/IBGDA bootstrap aborts the worker
+        # process uncatchably instead of raising; gate on supports_mnnvl() so
+        # the factory falls back to AllGatherReduceScatter cleanly.
+        if not MnnvlMemory.supports_mnnvl():
             return False
         return True
 
