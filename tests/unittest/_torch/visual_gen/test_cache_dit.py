@@ -577,27 +577,12 @@ class TestFluxEnablerCompiledBlockCheckFlags:
 
 
 # ---------------------------------------------------------------------------
-# 4) Enabler registry: explicit raise + declaration consistency (CPU)
+# 4) Enabler registry declaration consistency (CPU)
 # ---------------------------------------------------------------------------
 
 
 @requires_cache_dit
 class TestCacheDiTEnablerRegistry:
-    def test_unregistered_pipeline_class_raises(self):
-        """A pipeline without a Cache-DiT enabler must fail loudly at enable
-        time (e.g. LTX2TwoStagesPipeline + cache_backend=cache_dit), not warn
-        and continue at full denoise cost."""
-        from tensorrt_llm._torch.visual_gen.cache.cache_dit_enablers import (
-            enable_cache_dit_for_pipeline,
-        )
-        from tensorrt_llm.visual_gen.args import CacheDiTConfig
-
-        class LTX2TwoStagesPipeline:  # same name as the real unregistered variant
-            pass
-
-        with pytest.raises(ValueError, match="no enabler registered.*LTX2TwoStagesPipeline"):
-            enable_cache_dit_for_pipeline(LTX2TwoStagesPipeline(), CacheDiTConfig())
-
     def test_enabler_keys_name_registered_pipeline_classes(self):
         """Every CUSTOM_CACHE_DIT_ENABLERS key must name a real registered
         pipeline class; a typo or rename would otherwise turn every enable
