@@ -33,6 +33,8 @@ class PyStartTracker:
         self.tool_id = tool_id
         self._ctx = os.environ.get("CBTS_TEST_ID", "") or ""
         self._data = {}  # context -> set((filename, qualname))
+        self._outcomes = {}  # context -> pytest outcome (filled only in the outer pytest process)
+        self._expected = {}  # context -> pool workers the coordinator spawned for it
         self._file_ok = {}  # co_filename -> bool (cached source-membership)
         self._active = False
         self._new_suffix()
@@ -106,10 +108,21 @@ class PyStartTracker:
         if self._active:
             _MON.restart_events()
 
+    def record_outcome(self, nodeid, outcome):
+        """Record a test's pytest outcome (passed/failed/skipped) for the completeness signal."""
+        self._outcomes[nodeid or ""] = outcome
+
+    def note_expected_workers(self, nodeid, n):
+        """Add to the count of subprocess pool workers the coordinator spawned for a test."""
+        key = nodeid or ""
+        self._expected[key] = self._expected.get(key, 0) + int(n)
+
     def save(self):
         # Write a per-process SQLite the downstream merge reads directly; uploaded compressed only.
         snap = self._data.copy()  # atomic shallow copy; each set snapshotted below
-        if not snap:
+        outcomes = dict(self._outcomes)
+        expected = dict(self._expected)
+        if not snap and not outcomes and not expected:
             return None
         os.makedirs(self.data_dir, exist_ok=True)
         path = os.path.join(self.data_dir, f".cbtscov.{self.stage}.{self._suffix}.sqlite")
@@ -121,6 +134,18 @@ class PyStartTracker:
             con.execute("CREATE TABLE touch (test TEXT, file TEXT, qualname TEXT)")
             rows = ((ctx, f, q) for ctx, fs in snap.items() for (f, q) in fs.copy())
             con.executemany("INSERT INTO touch VALUES (?, ?, ?)", rows)
+            # Stage rides in the file content so the merge attributes rows without parsing the filename.
+            con.execute("CREATE TABLE proc_meta (stage TEXT)")
+            con.execute("INSERT INTO proc_meta VALUES (?)", (self.stage,))
+            # Per-test completeness signal; only the coordinator process fills outcome / expected.
+            con.execute(
+                "CREATE TABLE test_meta "
+                "(test TEXT PRIMARY KEY, outcome TEXT, expected_workers INTEGER)"
+            )
+            con.executemany(
+                "INSERT OR REPLACE INTO test_meta VALUES (?, ?, ?)",
+                [(k, outcomes.get(k), expected.get(k, 0)) for k in set(outcomes) | set(expected)],
+            )
             con.commit()
         finally:
             con.close()
