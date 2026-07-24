@@ -2156,10 +2156,8 @@ def _create_kv_cache_manager(
                 "MTP path")
             use_replay = False
 
-        # Replay is opt-in because its end-to-end benefit is workload-dependent.
+        # Replay is enabled by default for eligible GDN MTP workloads.
         if not is_gdn_replay_enabled():
-            logger.info("GDN replay kernel is disabled; set "
-                        "TRTLLM_USE_GDN_REPLAY=1 to enable it")
             use_replay = False
 
         # Upstream GDN replay commits all local layer checkpoints through the

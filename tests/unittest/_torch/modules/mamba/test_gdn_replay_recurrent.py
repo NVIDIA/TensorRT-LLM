@@ -146,8 +146,11 @@ def test_gdn_replay_vs_legacy_and_ref(H, HV, K, V, T, HIST, iters, pool_dtype, f
             assert packed_qkv.is_contiguous()
             assert not q.is_contiguous() and not k.is_contiguous() and not v.is_contiguous()
         if fused_gating:
-            a_raw = torch.randn(N, T, HV, device=device, dtype=dtype) * 0.5
-            b_raw = torch.randn(N, T, HV, device=device, dtype=dtype)
+            packed_ba = torch.randn(N * T, 2 * HV, device=device, dtype=dtype)
+            packed_ba[:, HV:].mul_(0.5)
+            b_raw = packed_ba[:, :HV].view(N, T, HV)
+            a_raw = packed_ba[:, HV:].view(N, T, HV)
+            assert not a_raw.is_contiguous() and not b_raw.is_contiguous()
             # Host reference of the in-kernel gating (fp32, same inputs).
             g = -(A_log_t.exp() * torch.nn.functional.softplus(a_raw.float() + dt_bias_t))
             beta = torch.sigmoid(b_raw.float())

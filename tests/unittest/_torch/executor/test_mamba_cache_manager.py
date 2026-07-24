@@ -42,6 +42,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     _get_mamba_hybrid_pool_size,
     _get_num_cuda_graph_padding_dummy_slots,
     _mamba_snapshot_rule_counts,
+    _promote_mamba_state_triton,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
@@ -541,6 +542,55 @@ def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
         assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
 
+@pytest.mark.parametrize(
+    ("replay_env", "manager_setting", "expected_v2"),
+    [
+        (None, "auto", False),
+        ("1", "auto", False),
+        ("0", "auto", True),
+        (None, True, True),
+        (None, False, False),
+    ],
+)
+def test_qwen3_gdn_replay_auto_selects_compatible_cache_manager(
+    monkeypatch,
+    replay_env,
+    manager_setting,
+    expected_v2,
+):
+    from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
+
+    if replay_env is None:
+        monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", replay_env)
+
+    llm_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=manager_setting,
+        ),
+        speculative_config=MTPDecodingConfig(max_draft_len=3),
+    )
+    model_defaults = Qwen3NextForCausalLM.get_model_defaults(llm_args)
+    apply_model_defaults_to_llm_args(llm_args, model_defaults)
+    _resolve_kv_cache_manager_v2_auto(
+        llm_args,
+        model_defaults,
+        original_setting=manager_setting,
+    )
+
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is expected_v2
+    expected_manager = MambaHybridCacheManagerV2 if expected_v2 else CppMambaHybridCacheManager
+    assert (
+        get_kv_cache_manager_cls(
+            _hybrid_model_config(),
+            llm_args.kv_cache_config,
+        )
+        is expected_manager
+    )
+
+
 def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 0
@@ -804,6 +854,102 @@ def test_replay_update_mamba_states_skips_dummy_slots():
     assert mgr.mamba_cache.prev_num_accepted_tokens[dummy_slot].item() == 13
     assert mgr.mamba_cache.cache_buf_idx[real_slot].item() == 0
     assert mgr.mamba_cache.cache_buf_idx[dummy_slot].item() == 1
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    (
+        "position_source_values",
+        "position_source_is_token_count",
+        "expected_positions",
+    ),
+    [
+        ([3, 2], True, [2, 1]),
+        ([1, 3], False, [1, 3]),
+    ],
+)
+def test_promote_mamba_state_fuses_replay_bookkeeping(
+    position_source_values,
+    position_source_is_token_count,
+    expected_positions,
+):
+    intermediate = torch.arange(2 * 2 * 4 * 3, dtype=torch.float32, device="cuda").reshape(
+        2, 2, 4, 3
+    )
+    dst = torch.zeros(2, 5, 3, dtype=torch.float32, device="cuda")
+    src_state_indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    accepted_position_source = torch.tensor(
+        position_source_values, dtype=torch.int32, device="cuda"
+    )
+    num_accepted_tokens = torch.tensor([3, 2], dtype=torch.int32, device="cuda")
+    dst_state_indices = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
+    replay_pnat = torch.tensor([0, 13, 0, 7, 0], dtype=torch.int32, device="cuda")
+    replay_cache_buf_idx = torch.tensor([0, 1, 0, 1, 0], dtype=torch.int32, device="cuda")
+    dummy_request_mask = torch.tensor([False, True], dtype=torch.bool, device="cuda")
+
+    _promote_mamba_state_triton(
+        dst,
+        intermediate,
+        src_state_indices,
+        accepted_position_source,
+        dst_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        position_source_is_token_count=position_source_is_token_count,
+        replay_pnat=replay_pnat,
+        replay_cache_buf_idx=replay_cache_buf_idx,
+        dummy_request_mask=dummy_request_mask,
+        replay_step_width=4,
+        replay_history_size=MIN_REPLAY_HISTORY_SIZE,
+    )
+
+    torch.testing.assert_close(dst[:, 1], intermediate[:, 0, expected_positions[0]])
+    torch.testing.assert_close(dst[:, 3], intermediate[:, 1, expected_positions[1]])
+    assert replay_pnat.tolist() == [0, 3, 0, 7, 0]
+    assert replay_cache_buf_idx.tolist() == [0, 0, 0, 1, 0]
+
+
+def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
+    monkeypatch,
+):
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.local_num_mamba_layers = 1
+    mgr._use_replay_state_update = True
+    mgr._dummy_request_mask = torch.tensor([False, True])
+    mgr.prev_num_accepted_tokens = torch.tensor([13, 7], dtype=torch.int32)
+    mgr.cache_buf_idx = torch.tensor([1, 0], dtype=torch.int32)
+    mgr.replay_step_width = 4
+    mgr.replay_history_size = MIN_REPLAY_HISTORY_SIZE
+    mgr.intermediate_state_indices = torch.arange(2, dtype=torch.int32)
+    mgr.all_conv_states = torch.empty(0)
+    mgr.intermediate_conv_states = torch.empty(0)
+    mgr._commit_gdn_cached_replay_history_layers = MagicMock()
+
+    promote_calls = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._promote_mamba_state_triton",
+        lambda *args, **kwargs: promote_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._advance_replay_state",
+        lambda *args, **kwargs: pytest.fail(
+            "Cpp replay bookkeeping must not advance before conv promotion"
+        ),
+    )
+
+    mgr.update_mamba_states(
+        SimpleNamespace(num_seqs=2, num_contexts=0),
+        torch.tensor([3, 2], dtype=torch.int32),
+        state_indices=torch.tensor([0, 1], dtype=torch.int32),
+    )
+
+    mgr._commit_gdn_cached_replay_history_layers.assert_called_once()
+    assert len(promote_calls) == 1
+    _, kwargs = promote_calls[0]
+    assert kwargs["replay_pnat"] is mgr.prev_num_accepted_tokens
+    assert kwargs["replay_cache_buf_idx"] is mgr.cache_buf_idx
+    assert kwargs["dummy_request_mask"].tolist() == [False, True]
+    assert kwargs["replay_step_width"] == 4
+    assert kwargs["replay_history_size"] == MIN_REPLAY_HISTORY_SIZE
 
 
 @skip_no_cuda

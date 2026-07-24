@@ -181,12 +181,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         replay_enabled = is_gdn_replay_enabled()
         if replay_enabled:
             logger.info_once(
-                "Configured GDN MTP replay implementation: cached",
+                "GDN MTP replay is enabled; set TRTLLM_USE_GDN_REPLAY=0 to disable it",
                 key="gdn_mtp_replay_cached",
             )
         else:
             logger.info_once(
-                "GDN MTP replay disabled; set TRTLLM_USE_GDN_REPLAY=1 to enable it",
+                "GDN MTP replay is disabled; set TRTLLM_USE_GDN_REPLAY=1 to enable it",
                 key="gdn_mtp_replay_disabled",
             )
 
