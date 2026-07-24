@@ -21,6 +21,7 @@
 #include "fusedAdaptiveLayerNormKernel.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -433,7 +434,7 @@ void launchFusedAdaptiveLayerNormKernel(
     cfg.stream = stream;
     cudaLaunchAttribute attrs[1] = {};
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     cfg.attrs = attrs;
     cfg.numAttrs = 1;
 
