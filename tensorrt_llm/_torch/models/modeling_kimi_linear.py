@@ -72,19 +72,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+import copy
 import os
 import torch
 from torch import nn
 
 from ...logger import logger
+from ...mapping import Mapping
+from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata, TrtllmAttentionMetadata
-from ..distributed import AllReduce
 from ..metadata import KVCacheParams
 from ..model_config import ModelConfig
-from ..modules.kimi_k3_moe._mlp import KimiK3MLP, KimiK3RMSNorm, SituAndMul
-from ..modules.kimi_k3_moe.kimi_k3_moe_block import KimiK3RoutedExpertBank
+from ..modules.fused_moe import ConfigurableMoE, create_moe
+from ..modules.kimi_k3_moe._mlp import KimiK3MLP, KimiK3RMSNorm
 from ..modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from ..modules.rms_norm import RMSNorm
+from ..utils import ActType_TrtllmGen
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
 
@@ -212,22 +215,15 @@ def _gate_up_ckpt_keys(fused_key: str) -> Tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# MoE block with EP-sharded MXFP4 expert bank.
+# Latent MoE block using the unified ConfigurableMoE stack.
 # ---------------------------------------------------------------------------
 
 
 class KimiK3MoERuntime(nn.Module):
-    """Kimi K3 sparse MoE block for the runtime flow (EP-only sharding).
-
-    The routed-expert compute is delegated to :class:`KimiK3RoutedExpertBank`
-    (``forward_expert(local_idx, tokens)``); a fused MoE backend can be
-    swapped in behind the same bank interface by replacing
-    :meth:`_moe_infer_local`.
-    """
+    """Kimi K3 latent MoE block backed by ConfigurableMoE/TRTLLM-Gen."""
 
     def __init__(self, model_config: ModelConfig, cfg, layer_idx: int):
         super().__init__()
-        mapping = model_config.mapping
         self.layer_idx = layer_idx
         self.hidden_size = cfg.hidden_size
         self.num_experts = cfg.num_experts
@@ -236,22 +232,6 @@ class KimiK3MoERuntime(nn.Module):
         assert self.moe_hidden_size is not None, \
             "Kimi K3 runtime expects the latent MoE (routed_expert_hidden_size)"
 
-        if mapping.enable_attention_dp and mapping.tp_size > 1:
-            # DEP: attention runs data-parallel, experts stay sharded across
-            # the EP group; tokens are exchanged via dispatch/combine below.
-            self.ep_size = mapping.moe_ep_size
-            self.ep_rank = mapping.moe_ep_rank
-        else:
-            self.ep_size = (mapping.tp_size
-                            if not mapping.enable_attention_dp else 1)
-            self.ep_rank = mapping.tp_rank if self.ep_size > 1 else 0
-        assert self.num_experts % self.ep_size == 0, (
-            f"num_experts={self.num_experts} not divisible by "
-            f"ep_size={self.ep_size}")
-        self.experts_per_rank = self.num_experts // self.ep_size
-        self.expert_lo = self.ep_rank * self.experts_per_rank
-        self.expert_hi = self.expert_lo + self.experts_per_rank
-
         situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
         situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
         dtype = torch.bfloat16
@@ -259,13 +239,49 @@ class KimiK3MoERuntime(nn.Module):
         # Routing params stay fp32 (scores are computed in fp32).
         self.gate = KimiK3MoEGate(cfg)
 
-        self.expert_bank = KimiK3RoutedExpertBank(
-            num_experts=self.experts_per_rank,
+        routed_moe_model_config = self._routed_moe_model_config(model_config)
+        routed_quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
+        self.routed_experts = create_moe(
+            routing_method=self.gate.routing_method,
+            num_experts=self.num_experts,
             hidden_size=self.moe_hidden_size,
             intermediate_size=cfg.moe_intermediate_size,
-            activation=SituAndMul(beta=situ_beta,
-                                  linear_beta=situ_linear_beta),
+            dtype=dtype,
+            reduce_results=True,
+            model_config=routed_moe_model_config,
+            override_quant_config=routed_quant_config,
+            layer_idx=layer_idx,
+            trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
+            # Cubin alpha is the gate-side SiTU beta; cubin beta is the
+            # linear-side SiTU beta.
+            trtllm_gen_activation_alpha=float(situ_beta),
+            trtllm_gen_activation_beta=float(
+                situ_linear_beta if situ_linear_beta is not None else 1.0
+            ),
+            # Let CommunicationFactory select the best available strategy.
+            communication_method=None,
         )
+        if not isinstance(self.routed_experts, ConfigurableMoE):
+            raise RuntimeError(
+                "Kimi K3 requires ConfigurableMoE; ENABLE_CONFIGURABLE_MOE must not be disabled."
+            )
+        if self.routed_experts.layer_load_balancer is not None:
+            raise NotImplementedError(
+                "Kimi K3 packed-checkpoint streaming does not yet support "
+                "dynamic EPLB or replicated expert slots."
+            )
+        local_expert_ids = list(self.routed_experts.backend.initial_local_expert_ids)
+        if local_expert_ids != list(
+            range(local_expert_ids[0], local_expert_ids[0] + len(local_expert_ids))
+        ):
+            raise NotImplementedError(
+                "Kimi K3 packed-checkpoint streaming currently requires a "
+                "contiguous static expert partition."
+            )
+        self.local_expert_ids = tuple(local_expert_ids)
+        self.experts_per_rank = len(local_expert_ids)
+        self.expert_lo = local_expert_ids[0]
+        self.expert_hi = self.expert_lo + self.experts_per_rank
 
         self.shared_experts = KimiK3MLP(
             hidden_size=cfg.hidden_size,
@@ -292,246 +308,47 @@ class KimiK3MoERuntime(nn.Module):
                                           eps=cfg.rms_norm_eps,
                                           dtype=dtype)
 
-        import os as _os
-        self.moe = None
-        if (torch.cuda.get_device_capability() in ((10, 0), (10, 3))
-                and (_os.environ.get("KIMI_K3_CMOE") or "1") != "0"):
-            # Middle tier: host the native SiTU op under ConfigurableMoE.
-            # The stock wrapper contributes the ExternalComm scheduler
-            # (chunking via moe_max_num_tokens), the CommunicationFactory
-            # lane selection with per-workload fallback, and the EPLB attr
-            # plumbing; the kernel and the lazily packed bank weights stay
-            # K3-owned. KIMI_K3_CMOE=0 restores the direct path below.
-            self.moe = self._build_configurable_moe(model_config, cfg,
-                                                    layer_idx, dtype)
-        self.dep_comm = None
-        if (self.moe is None and mapping.enable_attention_dp
-                and mapping.tp_size > 1):
-            # KIMI_K3_CMOE=0 escape hatch only: the ConfigurableMoE path
-            # above owns comm-lane selection (stock CommunicationFactory +
-            # scheduler fallback); the direct path stays on the merged
-            # upstream AG/RS form.
-            from ..modules.fused_moe.communication.allgather_reducescatter \
-                import AllGatherReduceScatter
-            self.dep_comm = AllGatherReduceScatter(mapping)
-        self.allreduce = (AllReduce(mapping=mapping,
-                                    strategy=model_config.allreduce_strategy,
-                                    dtype=dtype)
-                          if (self.moe is None and self.ep_size > 1
-                              and self.dep_comm is None) else None)
-
-        # Fused SiTU MoE path selection is automatic: Blackwell
-        # (SM100/SM103) uses the in-tree TRTLLM-Gen SiTU op (W4A8
-        # MXFP4xMXFP8, torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner);
-        # any other arch falls back to the Python per-expert dequant
-        # reference. An explicit ``moe_config.backend="VANILLA"`` forces the
-        # reference on any arch — the bit-parity oracle for tests. In the
-        # fused mode the kernel-layout weights are prepared lazily on the
-        # first forward (after load_weights has populated the bank); the
-        # bank's packed buffers are freed afterwards to avoid holding the
-        # expert slice twice.
-        from ..modules.kimi_k3_moe._moe_kernels import get_moe_sm_version
-        self.use_native_fused_moe = (
-            str(model_config.moe_backend).upper() != "VANILLA"
-            and get_moe_sm_version() in (100, 103))
-        self._situ_alpha = float(situ_beta)
-        self._situ_linear_beta = float(situ_linear_beta
-                                       if situ_linear_beta is not None else 1.0)
-        self._native_fused_weights = None
-
-    def _build_configurable_moe(self, model_config: ModelConfig, cfg,
-                                layer_idx: int, dtype: torch.dtype):
-        """Host the native SiTU op under ``ConfigurableMoE`` (thin shell)."""
-        import copy as _copy
-
-        from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
-        from ..modules.kimi_k3_moe.configurable_moe_shell import \
-            KimiK3ConfigurableMoE
-
-        gate = self.gate
-        assert (gate.moe_router_activation_func == "sigmoid"
-                and gate.moe_renormalize and gate.num_expert_group == 1
-                and gate.topk_group == 1), (
-                    "DeepSeekV3MoeRoutingMethod mirrors the K3 gate only for "
-                    "sigmoid scoring + renormalize + ungrouped top-k")
-        # K3 is EP-only: the non-attention-DP mode reinterprets the TP width
-        # as the EP width, so hand the wrapper a mapping whose moe_ep/moe_tp
-        # split says the same thing. Attention modules keep the original.
+    @staticmethod
+    def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
+        """Build a private EP-only mapping without mutating the shared config."""
+        if model_config.moe_load_balancer is not None:
+            raise NotImplementedError(
+                "Kimi K3 packed-checkpoint streaming does not yet support "
+                "EPLB or replicated expert slots."
+            )
         mapping = model_config.mapping
-        moe_model_config = model_config
-        if mapping.moe_ep_size != self.ep_size:
-            moe_mapping = _copy.deepcopy(mapping)
-            moe_mapping.moe_ep_size = self.ep_size
-            moe_mapping.moe_tp_size = mapping.tp_size // self.ep_size
-            moe_model_config = _copy.copy(model_config)
-            moe_model_config._frozen = False
-            moe_model_config.mapping = moe_mapping
-            moe_model_config._frozen = True
-        routing_method = DeepSeekV3MoeRoutingMethod(
-            top_k=self.top_k,
-            n_group=1,
-            topk_group=1,
-            routed_scaling_factor=cfg.routed_scaling_factor,
-            callable_e_score_correction_bias=lambda:
-            gate.e_score_correction_bias,
-            is_fused=False,
-        )
-        moe = KimiK3ConfigurableMoE(
-            ensure_weights_fn=self._ensure_native_fused_weights,
-            get_weights_fn=lambda: self._native_fused_weights,
-            routing_method=routing_method,
-            num_experts=self.num_experts,
-            hidden_size=self.moe_hidden_size,
-            intermediate_size=cfg.moe_intermediate_size,
-            dtype=dtype,
-            reduce_results=True,
-            model_config=moe_model_config,
-            layer_idx=layer_idx,
-        )
-        assert (moe.slot_start == self.expert_lo
-                and moe.expert_size_per_partition == self.experts_per_rank), (
-                    f"wrapper expert partition [{moe.slot_start}, "
-                    f"{moe.slot_start + moe.expert_size_per_partition}) "
-                    f"diverges from the bank slice "
-                    f"[{self.expert_lo}, {self.expert_hi})")
-        return moe
+        if getattr(mapping, "_dwdp_size", 0) > 1:
+            raise NotImplementedError("Kimi K3 packed-checkpoint streaming does not support DWDP.")
+
+        mapping_dict = mapping.to_dict()
+        mapping_dict["moe_cluster_size"] = 1
+        mapping_dict["moe_tp_size"] = 1
+        mapping_dict["moe_ep_size"] = mapping.tp_size
+        routed_mapping = Mapping.from_dict(mapping_dict)
+
+        routed_model_config = copy.copy(model_config)
+        routed_model_config._frozen = False
+        routed_model_config.extra_attrs = copy.copy(model_config.extra_attrs)
+        routed_model_config.mapping = routed_mapping
+        routed_model_config.moe_backend = "TRTLLM"
+        routed_model_config._frozen = True
+        return routed_model_config
 
     def forward(self, hidden_states: torch.Tensor,
                 all_rank_num_tokens=None) -> torch.Tensor:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
-        if self.moe is not None:
-            # ConfigurableMoE path: the scheduler owns routing (recomputed
-            # per chunk from the fp32 gate logits), dispatch/combine (or the
-            # non-DP EP allreduce) and chunking; the partial latent sums are
-            # still completed BEFORE the nonlinear latent norm, as below.
-            router_logits = self.gate.compute_logits(hidden_states)
-            routed_in = self.routed_expert_down_proj(hidden_states)
-            y = self.moe(routed_in, router_logits,
-                         all_rank_num_tokens=all_rank_num_tokens,
-                         use_dp_padding=False)
-            y = self.routed_expert_norm(y)
-            y = self.routed_expert_up_proj(y)
-            return y + self.shared_experts(identity)
-        # Gate expects a 3D layout (HF contract).
-        topk_idx, topk_weight = self.gate(hidden_states.unsqueeze(0))
+        router_logits = self.gate.compute_logits(hidden_states)
 
         routed_in = self.routed_expert_down_proj(hidden_states)
-        use_dep_comm = (self.dep_comm is not None
-                        and all_rank_num_tokens is not None)
-        if use_dep_comm:
-            # DEP: exchange tokens in the latent space (half the payload of
-            # hidden). Gate ids are GLOBAL expert ids, so gathered tokens go
-            # through the same local-expert kernel unchanged.
-            routed_in, _, topk_idx, topk_weight = self.dep_comm.dispatch(
-                routed_in, None, topk_idx, topk_weight,
-                all_rank_num_tokens, use_dp_padding=False)
-        y = self._moe_infer_local(routed_in, topk_idx, topk_weight)
-        # EP: each rank holds partial routed sums (its experts only) in the
-        # latent space; sum them BEFORE the (nonlinear) latent norm.
-        if use_dep_comm:
-            # Varsize reduce-scatter: this rank gets its own tokens' completed
-            # latent sums (same addends as the allreduce below).
-            y = self.dep_comm.combine(y)
-        elif self.allreduce is not None:
-            y = self.allreduce(y)
+        y = self.routed_experts(
+            routed_in,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+        )
         y = self.routed_expert_norm(y)
         y = self.routed_expert_up_proj(y)
-        # Shared experts are replicated: computed once per rank, added after
-        # the allreduce so they are not double counted.
         return y + self.shared_experts(identity)
-
-    def _ensure_native_fused_weights(self) -> None:
-        """Lazily pack the bank's MXFP4 buffers for the in-tree SiTU op."""
-        if self._native_fused_weights is not None:
-            return
-        from ..modules.kimi_k3_moe._moe_kernels import (
-            assert_native_situ_supported, make_situ_alpha_beta,
-            pack_routed_expert_weights)
-        assert_native_situ_supported(
-            hidden_size=self.moe_hidden_size,
-            intermediate_size=self.expert_bank.intermediate_size)
-        bank = self.expert_bank
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        packed = pack_routed_expert_weights(
-            w1_packed=bank.w1_packed,
-            w1_scales=bank.w1_scales,
-            w3_packed=bank.w3_packed,
-            w3_scales=bank.w3_scales,
-            w2_packed=bank.w2_packed,
-            w2_scales=bank.w2_scales,
-            device=device,
-        )
-        packed["gemm1_alpha"], packed["gemm1_beta"] = make_situ_alpha_beta(
-            local_num_experts=self.experts_per_rank,
-            situ_beta=self._situ_alpha,
-            situ_linear_beta=self._situ_linear_beta,
-            device=device,
-        )
-        self._native_fused_weights = packed
-        logger.info(
-            f"[KimiK3MoERuntime] layer {self.layer_idx}: prepared native "
-            f"TRTLLM-Gen SiTU weights for {self.experts_per_rank} local "
-            f"experts (offset {self.expert_lo})")
-        # Free the (now redundant) bank copies of the expert slice.
-        empty = torch.empty(0, dtype=torch.uint8,
-                            device=bank.w1_packed.device)
-        for name in ("w1_packed", "w1_scales", "w3_packed", "w3_scales",
-                     "w2_packed", "w2_scales"):
-            bank.register_buffer(name, empty.clone())
-
-    def _moe_infer_local(self, x: torch.Tensor, topk_ids: torch.Tensor,
-                         topk_weight: torch.Tensor) -> torch.Tensor:
-        """HF ``KimiSparseMoeBlock.moe_infer`` restricted to local experts.
-
-        Tokens routed to non-local experts contribute zeros; the cross-rank
-        allreduce in :meth:`forward` completes the sum.
-        """
-        if self.use_native_fused_moe:
-            if x.shape[0] == 0:
-                return torch.zeros_like(x)
-            from ..modules.kimi_k3_moe._moe_kernels import \
-                invoke_native_situ_moe
-            self._ensure_native_fused_weights()
-            fw = self._native_fused_weights
-            return invoke_native_situ_moe(
-                hidden_states=x,
-                topk_ids=topk_ids,
-                topk_weights=topk_weight,
-                gemm1_weights=fw["gemm1_weights"],
-                gemm1_weights_scale=fw["gemm1_weights_scale"],
-                gemm2_weights=fw["gemm2_weights"],
-                gemm2_weights_scale=fw["gemm2_weights_scale"],
-                gemm1_alpha=fw["gemm1_alpha"],
-                gemm1_beta=fw["gemm1_beta"],
-                num_experts=self.num_experts,
-                top_k=self.top_k,
-                valid_hidden_size=self.moe_hidden_size,
-                valid_intermediate_size=self.expert_bank.intermediate_size,
-                local_expert_offset=self.expert_lo,
-                local_num_experts=self.experts_per_rank,
-            )
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
-        cnts.scatter_(1, topk_ids, 1)
-        tokens_per_expert = cnts.sum(dim=0).cpu().tolist()
-        idxs = topk_ids.view(-1).argsort()
-        sorted_tokens = x[idxs // topk_ids.shape[1]]
-
-        outs = torch.zeros_like(sorted_tokens)
-        start = 0
-        for i, n_tokens in enumerate(tokens_per_expert):
-            end = start + int(n_tokens)
-            if n_tokens and self.expert_lo <= i < self.expert_hi:
-                outs[start:end] = self.expert_bank.forward_expert(
-                    i - self.expert_lo, sorted_tokens[start:end])
-            start = end
-
-        new_x = torch.empty_like(outs)
-        new_x[idxs] = outs
-        final_out = (new_x.view(*topk_ids.shape, -1).type(
-            topk_weight.dtype).mul_(topk_weight.unsqueeze(dim=-1)).sum(
-                dim=1).type(new_x.dtype))
-        return final_out
 
 
 # ---------------------------------------------------------------------------
@@ -1388,20 +1205,25 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
     # ------------------------------------------------------------------
 
     def checkpoint_name_plan(self, prefix: str):
-        """Return ``(name_map, expected_keys, bank_jobs)``.
+        """Return ``(name_map, expected_keys, expert_jobs)``.
 
         ``name_map`` maps every model parameter name to its checkpoint key
         (for fused ``gate_up_proj`` parameters the mapped key is virtual;
         the two real per-half keys come from ``_gate_up_ckpt_keys``);
         ``expected_keys`` additionally covers the rank-local per-expert MXFP4
-        tensors; ``bank_jobs`` lists ``(layer_idx, moe_module, key_base)``
-        for the expert-bank copies. Exposed separately so the weight-name
+        tensors; ``expert_jobs`` lists ``(layer_idx, moe_module, key_base)``
+        for backend-owned expert slots. Exposed separately so the weight-name
         mapping can be dry-run without touching any tensor data.
         """
         params = dict(self.named_parameters())
         expected_keys = set()
         name_map: Dict[str, str] = {}
         for name in params:
+            # ConfigurableMoE's backend owns already-packed runtime weights,
+            # generated zero biases, and SiTU constants. They do not have
+            # one-to-one checkpoint parameter names.
+            if ".routed_experts.backend." in name:
+                continue
             if name == "lm_head.weight":
                 ckpt_key = prefix + "lm_head.weight"
             else:
@@ -1417,20 +1239,19 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
             else:
                 expected_keys.add(ckpt_key)
 
-        # Expert-bank buffers (per-expert checkpoint tensors, EP-sliced).
-        bank_jobs = []
+        # Backend-owned expert slots (per-expert checkpoint tensors, EP-sliced).
+        expert_jobs = []
         for layer_idx, layer in enumerate(self.model.layers):
             if not getattr(layer, "is_moe", False):
                 continue
             moe = layer.block_sparse_moe
             base = f"{prefix}model.layers.{layer_idx}.block_sparse_moe.experts"
-            for local_idx in range(moe.experts_per_rank):
-                expert_idx = moe.expert_lo + local_idx
+            for expert_idx in moe.local_expert_ids:
                 for w in ("w1", "w2", "w3"):
                     expected_keys.add(f"{base}.{expert_idx}.{w}.weight_packed")
                     expected_keys.add(f"{base}.{expert_idx}.{w}.weight_scale")
-            bank_jobs.append((layer_idx, moe, base))
-        return name_map, expected_keys, bank_jobs
+            expert_jobs.append((layer_idx, moe, base))
+        return name_map, expected_keys, expert_jobs
 
     def load_weights(self, weights: Dict):
         from .modeling_utils import run_concurrently
@@ -1440,7 +1261,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
                   else "")
 
         params = dict(self.named_parameters())
-        name_map, expected_keys, bank_jobs = self.checkpoint_name_plan(prefix)
+        name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
 
         # ---- key-set validation (both directions) ----
         ckpt_keys = set(weights.keys())
@@ -1528,28 +1349,39 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
                                  f"{tuple(param.shape)}")
             param.data.copy_(src.to(param.dtype))
 
-        def load_bank(layer_idx: int, moe: KimiK3MoERuntime, base: str):
+        def load_expert(
+            moe: KimiK3MoERuntime, base: str, local_slot_id: int, expert_idx: int, get_tensor
+        ):
             if device.type == "cuda":
                 torch.cuda.set_device(device)
-            bank = moe.expert_bank
-            for local_idx in range(moe.experts_per_rank):
-                expert_idx = moe.expert_lo + local_idx
-                for w, packed_buf, scales_buf in (
-                    ("w1", bank.w1_packed, bank.w1_scales),
-                    ("w2", bank.w2_packed, bank.w2_scales),
-                    ("w3", bank.w3_packed, bank.w3_scales),
-                ):
-                    packed = _materialize(
-                        weights[f"{base}.{expert_idx}.{w}.weight_packed"])
-                    scales = _materialize(
-                        weights[f"{base}.{expert_idx}.{w}.weight_scale"])
-                    packed_buf[local_idx].copy_(packed)
-                    scales_buf[local_idx].copy_(scales)
+            backend = moe.routed_experts.backend
+            backend.quant_method.load_packed_mxfp4_expert(
+                backend,
+                global_expert_id=expert_idx,
+                local_slot_id=local_slot_id,
+                w1_weight=get_tensor(f"{base}.{expert_idx}.w1.weight_packed"),
+                w1_weight_scale=get_tensor(f"{base}.{expert_idx}.w1.weight_scale"),
+                w2_weight=get_tensor(f"{base}.{expert_idx}.w2.weight_packed"),
+                w2_weight_scale=get_tensor(f"{base}.{expert_idx}.w2.weight_scale"),
+                w3_weight=get_tensor(f"{base}.{expert_idx}.w3.weight_packed"),
+                w3_weight_scale=get_tensor(f"{base}.{expert_idx}.w3.weight_scale"),
+            )
 
-        param_jobs = [(name, param) for name, param in params.items()]
+        def load_experts_from_weights(layer_idx: int, moe: KimiK3MoERuntime, base: str):
+            del layer_idx
+            for local_slot_id, expert_idx in enumerate(moe.local_expert_ids):
+                load_expert(
+                    moe,
+                    base,
+                    local_slot_id,
+                    expert_idx,
+                    lambda key: _materialize(weights[key]),
+                )
+
+        param_jobs = [(name, params[name]) for name in name_map]
         run_concurrently(load_param, param_jobs, num_workers=8)
 
-        # ---- expert banks: file-grouped streaming ----
+        # ---- backend expert slots: file-grouped streaming ----
         # The shared lazy ``weights`` dict keeps every shard mmapped for the
         # whole load, so pages it touches cannot be dropped until the load
         # ends (fadvise skips mapped pages). The expert slices are ~90 GB of
@@ -1562,35 +1394,32 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
                            "_name_or_path", None)
         index_path = os.path.join(ckpt_dir or "",
                                   "model.safetensors.index.json")
-        if bank_jobs and os.path.isfile(index_path):
+        if expert_jobs and os.path.isfile(index_path):
             import json as _json
+            from contextlib import ExitStack
 
             from safetensors import safe_open
             with open(index_path) as f:
                 weight_map = _json.load(f)["weight_map"]
             per_file: Dict[str, list] = {}
-            for layer_idx, moe, base in bank_jobs:
-                bank = moe.expert_bank
-                bufs = (("w1", bank.w1_packed, bank.w1_scales),
-                        ("w2", bank.w2_packed, bank.w2_scales),
-                        ("w3", bank.w3_packed, bank.w3_scales))
-                for local_idx in range(moe.experts_per_rank):
-                    expert_idx = moe.expert_lo + local_idx
-                    for w, packed_buf, scales_buf in bufs:
-                        for kind, buf in (("weight_packed", packed_buf),
-                                          ("weight_scale", scales_buf)):
-                            key = f"{base}.{expert_idx}.{w}.{kind}"
-                            per_file.setdefault(weight_map[key], []).append(
-                                (key, buf, local_idx))
+            split_file_jobs = []
+            for layer_idx, moe, base in expert_jobs:
+                del layer_idx
+                for local_slot_id, expert_idx in enumerate(moe.local_expert_ids):
+                    keys = [
+                        f"{base}.{expert_idx}.{w}.{kind}"
+                        for w in ("w1", "w2", "w3")
+                        for kind in ("weight_packed", "weight_scale")
+                    ]
+                    files = {weight_map[key] for key in keys}
+                    job = (moe, base, local_slot_id, expert_idx)
+                    if len(files) == 1:
+                        per_file.setdefault(files.pop(), []).append(job)
+                    else:
+                        split_file_jobs.append((job, files))
 
-            def load_bank_file(file_name: str, entries: list):
-                if device.type == "cuda":
-                    torch.cuda.set_device(device)
+            def drop_file_pages(file_name: str):
                 path = os.path.join(ckpt_dir, file_name)
-                with safe_open(path, framework="pt", device="cpu") as fh:
-                    for key, buf, local_idx in entries:
-                        buf[local_idx].copy_(fh.get_tensor(key))
-                # Handle closed -> pages unmapped -> the drop takes effect.
                 try:
                     fd = os.open(path, os.O_RDONLY)
                     try:
@@ -1600,10 +1429,53 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
                 except OSError:
                     pass
 
-            run_concurrently(load_bank_file, sorted(per_file.items()),
+            def load_expert_file(file_name: str, jobs: list):
+                if device.type == "cuda":
+                    torch.cuda.set_device(device)
+                path = os.path.join(ckpt_dir, file_name)
+                with safe_open(path, framework="pt", device="cpu") as fh:
+                    for moe, base, local_slot_id, expert_idx in jobs:
+                        load_expert(moe, base, local_slot_id, expert_idx, fh.get_tensor)
+                # Handle closed -> pages unmapped -> the drop takes effect.
+                drop_file_pages(file_name)
+
+            def load_split_file_expert(job, files):
+                if device.type == "cuda":
+                    torch.cuda.set_device(device)
+                with ExitStack() as stack:
+                    handles = {
+                        file_name: stack.enter_context(
+                            safe_open(
+                                os.path.join(ckpt_dir, file_name), framework="pt", device="cpu"
+                            )
+                        )
+                        for file_name in files
+                    }
+
+                    def get_tensor(key):
+                        return handles[weight_map[key]].get_tensor(key)
+
+                    load_expert(*job, get_tensor)
+                for file_name in files:
+                    drop_file_pages(file_name)
+
+            run_concurrently(load_expert_file, sorted(per_file.items()),
                              num_workers=4)
+            run_concurrently(load_split_file_expert, split_file_jobs, num_workers=4)
         else:
-            run_concurrently(load_bank, bank_jobs, num_workers=4)
+            run_concurrently(load_experts_from_weights, expert_jobs, num_workers=4)
+
+        for _, moe, _ in expert_jobs:
+            backend = moe.routed_experts.backend
+            loaded_slots = getattr(backend, "_packed_mxfp4_loaded_slots", set())
+            expected_slots = set(range(backend.expert_size_per_partition))
+            if loaded_slots != expected_slots:
+                missing_slots = sorted(expected_slots - loaded_slots)
+                raise RuntimeError(
+                    "Kimi K3 packed expert loading did not fill all backend "
+                    f"slots; missing {missing_slots[:10]}."
+                )
+            backend._weights_transformed = False
         logger.info(
             f"Kimi K3: loaded {len(param_jobs)} parameters and the expert "
-            f"slices of {len(bank_jobs)} MoE layers")
+            f"slices of {len(expert_jobs)} MoE layers")
