@@ -510,6 +510,7 @@ class MLA(nn.Module):
 
         # MHA is the dense expanded-KV path. Algorithms that do not use it
         # remove it in their initialization hook.
+        mha_sparse_params = self.sparse_params if not self.sparse_attn_hooks else None
         self.mha = create_attention(
             config.attn_backend,
             self.layer_idx,
@@ -527,7 +528,7 @@ class MLA(nn.Module):
             v_head_dim=self.v_head_dim,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            sparse_params=None,
+            sparse_params=mha_sparse_params,
         )
 
         if initialize_sparse_attn := self.sparse_attn_hooks.initialize_sparse_attn:
@@ -788,8 +789,8 @@ class MLA(nn.Module):
         latent_cache_gen: Optional[torch.Tensor] = None,
     ) -> None:
         """Run the dense or sparse implementation of the shared MLA module."""
-        if self.sparse_attn_hooks:
-            self.sparse_attn_hooks.require("forward_sparse_attn")(
+        if forward_sparse_attn := self.sparse_attn_hooks.forward_sparse_attn:
+            forward_sparse_attn(
                 self,
                 position_ids,
                 hidden_states,

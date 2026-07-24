@@ -1691,7 +1691,7 @@ class Indexer(nn.Module):
                         logits_decode,
                         pre_idx,
                         gen_kv_lens_cuda,
-                        topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                        topk_indices_buffer[token_offset:token_offset +
                                             num_gen_tokens, :],
                         self.index_topk,
                         next_n=next_n,

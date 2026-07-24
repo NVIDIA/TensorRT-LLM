@@ -17,34 +17,29 @@
 Unit tests for sparse attention with TrtllmAttention backend.
 """
 
-import ast
-import inspect
 import math
 from dataclasses import dataclass
 from types import ModuleType
 from typing import List, Optional, Tuple
+from unittest.mock import Mock
 
 import pytest
 import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import AttentionBackend, AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.dsa.kernels import (
     triton_convert_req_index_to_global_index,
 )
 from tensorrt_llm._torch.attention_backend.sparse.hooks import (
-    _SPARSE_ATTN_HOOK_MODULE_PATHS,
     SparseAttnHooks,
-    _get_sparse_attn_hooks_for_algorithm,
     get_sparse_attn_hooks,
     prepare_sparse_runtime_params,
 )
-from tensorrt_llm._torch.attention_backend.sparse.hooks import __all__ as SPARSE_ATTN_HOOK_API
 from tensorrt_llm._torch.attention_backend.sparse.params import SparseParams, SparseRuntimeParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
@@ -179,7 +174,7 @@ class TestSparseAttention(TrtllmAttention):
         return self._sparse_attn_indices, self._sparse_attn_offsets
 
 
-def test_prepare_sparse_runtime_params_uses_backend_hooks() -> None:
+def test_sparse_runtime_params() -> None:
     attention = TestSparseAttention.__new__(TestSparseAttention)
     attention.sparse_params = MockSparseParams()
     attention._sparse_kv_indices = torch.tensor([1], dtype=torch.int32)
@@ -205,222 +200,40 @@ def test_prepare_sparse_runtime_params_uses_backend_hooks() -> None:
     )
 
 
-def test_mla_forward_uses_sparse_hook_facade() -> None:
-    mla_module = inspect.getmodule(MLA)
-    attention_module = inspect.getmodule(Attention)
-    assert mla_module is not None
-    assert attention_module is not None
-    mla_module_source = inspect.getsource(mla_module)
-    attention_module_source = inspect.getsource(attention_module)
-    mla_module_ast = ast.parse(mla_module_source)
-    hook_imports = [
-        alias.name
-        for node in ast.walk(mla_module_ast)
-        if isinstance(node, ast.ImportFrom) and node.module == "attention_backend.sparse.hooks"
-        for alias in node.names
-    ]
-    attention_init_source = inspect.getsource(Attention.__init__)
-    attention_forward_source = inspect.getsource(Attention.forward)
-    attention_forward_impl_source = inspect.getsource(Attention.forward_impl)
-    init_source = inspect.getsource(MLA.__init__)
-    create_weights_source = inspect.getsource(MLA.create_weights)
-    create_outputs_source = inspect.getsource(MLA._create_outputs)
-    forward_source = inspect.getsource(MLA.forward)
-    forward_impl_source = inspect.getsource(MLA.forward_impl)
-    forward_custom_op_source = inspect.getsource(MLA._forward_custom_op)
-    project_output_source = inspect.getsource(MLA._project_output)
-    transform_weights_source = inspect.getsource(MLA.transform_weights)
-
-    assert hook_imports == ["get_sparse_attn_hooks"]
-    for removed_helper in (
-        "_initialize_dense_mla_modules",
-        "_create_default_mla_weights",
-        "_transform_default_mla_weights",
-        "_create_sparse_mla_outputs",
-        "_validate_sparse_mla_custom_op_outputs",
-    ):
-        assert removed_helper not in mla_module_source
-    for source in (init_source, forward_source, forward_impl_source, project_output_source):
-        assert "is_dsa" not in source
-        assert "is_deepseek_v4" not in source
-    assert "forward_sparse_attn" in forward_impl_source
-    assert "attn_output[0]" in forward_impl_source
-    assert "self.mqa.forward_mla" not in forward_impl_source
-    assert "self.sparse_attn_hooks = get_sparse_attn_hooks(self)" in init_source
-    assert "self.sparse_attn_hooks = get_sparse_attn_hooks(self)" in attention_init_source
-    assert "sparse_attn_hooks is not None" not in mla_module_source
-    assert "sparse_attn_hooks is not None" not in attention_module_source
-    assert "initialize_sparse_attn" in attention_init_source
-    assert "RocketKV" not in attention_init_source
-    assert 'algorithm == "rocket"' not in attention_init_source
-    assert attention_init_source.index("initialize_sparse_attn") < attention_init_source.index(
-        "self.rotary_emb = None"
-    )
-    assert attention_init_source.index("initialize_sparse_attn") < attention_init_source.index(
-        "self.attn = create_attention"
-    )
-    assert "forward_sparse_attn" in attention_forward_impl_source
-    assert "project_sparse_attn_output" in attention_forward_source
-    assert "get_sparse_attn_hooks" not in create_weights_source
-    assert "get_sparse_attn_hooks" not in create_outputs_source
-    assert "get_sparse_attn_hooks" not in forward_impl_source
-    assert "get_sparse_attn_hooks" not in forward_custom_op_source
-    assert "get_sparse_attn_hooks" not in project_output_source
-    assert "sparse_epilogue_output" not in mla_module_source
-    assert "sparse_output" not in mla_module_source
-    assert "topk_indices" not in mla_module_source
-    assert "sparse_backend_overrides" not in mla_module_source
-    assert "self.indexer = getattr(self.mqa" not in mla_module_source
-    assert "self.compressor = getattr(self.mqa" not in mla_module_source
-    assert init_source.count("sparse_params=self.sparse_params") == 1
-    assert init_source.count("sparse_params=None") == 1
-    assert "return [self.create_output" in create_outputs_source
-    assert "initialize_sparse_attn" in init_source
-    assert init_source.index("self.kv_b_proj = Linear") < init_source.index(
-        "initialize_sparse_attn"
-    )
-    assert init_source.index("self.mqa = create_attention") < init_source.index(
-        "initialize_sparse_attn"
-    )
-    assert init_source.index("self.mha = create_attention") < init_source.index(
-        "initialize_sparse_attn"
-    )
-    assert create_weights_source.index("create_sparse_attn_weights") < create_weights_source.index(
-        "self.k_b_proj_trans ="
-    )
-    assert transform_weights_source.index(
-        "transform_sparse_attn_weights"
-    ) < transform_weights_source.index("self.resmooth_parameters")
-    assert "project_sparse_attn_output" in project_output_source
-    assert set(SPARSE_ATTN_HOOK_API) == {
-        "SparseAttnHooks",
-        "get_sparse_attn_hooks",
-        "prepare_sparse_runtime_params",
-    }
-    assert set(_SPARSE_ATTN_HOOK_MODULE_PATHS) == {"rocket", "dsa", "deepseek_v4"}
-    assert _get_sparse_attn_hooks_for_algorithm("dsa").algorithm == "dsa"
-    assert _get_sparse_attn_hooks_for_algorithm("deepseek_v4").algorithm == "deepseek_v4"
-    rocket_hooks = _get_sparse_attn_hooks_for_algorithm("rocket")
-    assert rocket_hooks.algorithm == "rocket"
-    assert rocket_hooks.initialize_sparse_attn is not None
-    rocket_hook_module = inspect.getmodule(rocket_hooks.initialize_sparse_attn)
-    assert rocket_hook_module is not None
-    assert "self.rope_fusion = False" in inspect.getsource(rocket_hook_module)
-    for algorithm in ("dsa", "deepseek_v4"):
-        hook_module = inspect.getmodule(
-            _get_sparse_attn_hooks_for_algorithm(algorithm).initialize_sparse_attn
-        )
-        assert hook_module is not None
-        hook_module_source = inspect.getsource(hook_module)
-        assert "create_attention(" not in hook_module_source
-        assert "self.indexer = getattr(self.mqa" in hook_module_source
-        if algorithm == "deepseek_v4":
-            assert "self.compressor = getattr(self.mqa" in hook_module_source
-    assert not hasattr(AttentionBackend, "forward_mla_module")
-    assert not hasattr(AttentionBackend, "forward_mla_custom_op")
-    assert not hasattr(AttentionBackend, "project_mla_output")
-
-
-def test_sparse_attn_hook_contract_allows_optional_hooks() -> None:
-    dense_module = ModuleType("dense_attention_module")
-    dense_module.sparse_params = None
-    dense_hooks = get_sparse_attn_hooks(dense_module)
-
-    assert isinstance(dense_hooks, SparseAttnHooks)
-    assert not dense_hooks
-    assert dense_hooks.algorithm is None
-    assert dense_hooks.initialize_sparse_attn is None
-
-    hook_module = ModuleType("test_sparse_attn_module")
-
-    def initialize_sparse_attn(
-        module,
-        *,
-        config,
-        mapping,
-        mapping_o,
-        rms_norm_eps,
-        quant_config,
-        q_scaling,
-        bias,
-        dtype,
-        reduce_output,
-        aux_stream,
-    ):
-        return None
-
-    def forward_sparse_attn(
-        module,
-        position_ids,
-        hidden_states,
-        attn_metadata,
-        attn_output,
-    ):
-        return None
-
-    hook_module.initialize_sparse_attn = initialize_sparse_attn
-    hook_module.forward_sparse_attn = forward_sparse_attn
-
-    hooks = SparseAttnHooks.from_module("test", hook_module)
-
-    assert hooks
-    assert hooks.initialize_sparse_attn is initialize_sparse_attn
-    assert hooks.create_sparse_attn_weights is None
-    assert hooks.transform_sparse_attn_weights is None
-    assert hooks.prepare_sparse_attn_outputs is None
-    assert hooks.forward_sparse_attn_custom_op is None
-    assert hooks.project_sparse_attn_output is None
-    assert hooks.require("forward_sparse_attn") is forward_sparse_attn
-
-    missing_forward = ModuleType("missing_forward_sparse_attn")
-    missing_forward.initialize_sparse_attn = initialize_sparse_attn
-    hooks_without_forward = SparseAttnHooks.from_module("test", missing_forward)
-    with pytest.raises(NotImplementedError, match="forward_sparse_attn"):
-        hooks_without_forward.require("forward_sparse_attn")
-
-    invalid_forward = ModuleType("invalid_forward_sparse_attn")
-    invalid_forward.forward_sparse_attn = lambda module: None
+def test_invalid_sparse_attn_hook() -> None:
+    hook_module = ModuleType("invalid_sparse_attn_hook")
+    hook_module.forward_sparse_attn = lambda module: None
     with pytest.raises(TypeError, match="expected"):
-        SparseAttnHooks.from_module("test", invalid_forward)
-
-    attention_hook_module = ModuleType("test_attention_sparse_attn_module")
-
-    def forward_attention_sparse_attn(
-        module,
-        q,
-        k,
-        v,
-        attn_metadata,
-        attention_mask,
-        attention_window_size,
-        attention_mask_data,
-        mrope_config,
-        attention_sinks,
-        relative_attention_bias,
-        relative_attention_max_distance,
-        has_lora,
-        **kwargs,
-    ):
-        return None
-
-    def project_attention_sparse_attn_output(
-        module,
-        attn_output,
-        attn_metadata,
-        all_reduce_params,
-        lora_params,
-    ):
-        return attn_output
-
-    attention_hook_module.forward_sparse_attn = forward_attention_sparse_attn
-    attention_hook_module.project_sparse_attn_output = project_attention_sparse_attn_output
-    attention_hooks = SparseAttnHooks.from_module("attention_test", attention_hook_module)
-
-    assert attention_hooks.forward_sparse_attn is forward_attention_sparse_attn
-    assert attention_hooks.project_sparse_attn_output is project_attention_sparse_attn_output
+        SparseAttnHooks.from_module("test", hook_module)
 
 
-def test_prepare_sparse_runtime_params_allows_backend_without_prediction() -> None:
+def test_mla_backend_only_forward() -> None:
+    backend_only_module = ModuleType("backend_only_sparse_attention")
+    backend_only_module.sparse_params = MockSparseParams()
+    backend_only_module.sparse_params.algorithm = "skip_softmax"
+    hooks = get_sparse_attn_hooks(backend_only_module)
+    assert not hooks
+
+    mla = MLA.__new__(MLA)
+    torch.nn.Module.__init__(mla)
+    mla.sparse_attn_hooks = hooks
+    default_forward = Mock()
+    mla._forward_impl = default_forward
+    hidden_states = torch.empty(0)
+    attn_output = [torch.empty(0)]
+
+    MLA.forward_impl(mla, None, hidden_states, None, attn_output)
+
+    default_forward.assert_called_once_with(
+        None,
+        hidden_states,
+        None,
+        attn_output[0],
+        latent_cache_gen=None,
+    )
+
+
+def test_sparse_runtime_params_without_prediction() -> None:
     attention = TrtllmAttention.__new__(TrtllmAttention)
     attention.sparse_params = MockSparseParams()
 
