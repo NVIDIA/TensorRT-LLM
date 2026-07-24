@@ -72,6 +72,12 @@ def _arg(llm: object, name: str, default: Any = None) -> Any:
     return getattr(parallel, name, default)
 
 
+def _data_parallel_size(llm: object) -> int:
+    if bool(_arg(llm, "enable_attention_dp", False)):
+        return max(1, int(_arg(llm, "tensor_parallel_size", _arg(llm, "tp_size", 1))))
+    return max(1, int(_arg(llm, "data_parallel_size", 1)))
+
+
 def _token_text(llm: object, token_id: int) -> str:
     tokenizer = getattr(llm, "tokenizer", None)
     if tokenizer is None:
@@ -698,7 +704,7 @@ class OpenEngineServicer(
         if target_dp_rank is None:
             return None
         rank = target_dp_rank
-        data_parallel_size = int(_arg(self.llm, "data_parallel_size", 1))
+        data_parallel_size = _data_parallel_size(self.llm)
         if rank >= data_parallel_size:
             raise ValueError(
                 f"data_parallel_rank {rank} is outside the configured DP size {data_parallel_size}"
@@ -850,7 +856,7 @@ class OpenEngineServicer(
         del request, context
         tp = _arg(self.llm, "tensor_parallel_size", 1)
         pp = _arg(self.llm, "pipeline_parallel_size", 1)
-        dp = _arg(self.llm, "data_parallel_size", 1)
+        dp = _data_parallel_size(self.llm)
         args = getattr(self.llm, "args", None)
         kv_capacity = self._kv_capacity()
         capacity = server_pb2.DeploymentCapacity()
@@ -1269,7 +1275,7 @@ class OpenEngineServicer(
     ) -> kv_pb2.GetKvEventSourcesResponse:
         if not self._kv_events_enabled():
             return kv_pb2.GetKvEventSourcesResponse()
-        data_parallel_size = int(_arg(self.llm, "data_parallel_size", 1))
+        data_parallel_size = _data_parallel_size(self.llm)
         available_ranks = set(range(data_parallel_size))
         requested_ranks = set(request.data_parallel_ranks)
         invalid_ranks = requested_ranks - available_ranks
@@ -1311,7 +1317,7 @@ class OpenEngineServicer(
             )
             return
         selected_ranks = set(request.data_parallel_ranks)
-        available_ranks = set(range(int(_arg(self.llm, "data_parallel_size", 1))))
+        available_ranks = set(range(_data_parallel_size(self.llm)))
         invalid_ranks = selected_ranks - available_ranks
         if invalid_ranks:
             await context.abort(

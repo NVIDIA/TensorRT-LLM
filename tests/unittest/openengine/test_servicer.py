@@ -900,6 +900,32 @@ async def test_kv_event_sources_are_rank_scoped() -> None:
 
 
 @pytest.mark.asyncio
+async def test_attention_dp_uses_tensor_parallel_size_for_discovery_and_placement() -> None:
+    llm = _Llm()
+    llm.args = SimpleNamespace(
+        enable_attention_dp=True,
+        tensor_parallel_size=2,
+        data_parallel_size=1,
+        kv_cache_config=SimpleNamespace(event_buffer_max_size=8),
+    )
+    llm._on_trt_backend = False
+    service = OpenEngineServicer(
+        llm,
+        "model",
+        server_pb2.ENGINE_ROLE_AGGREGATED,
+        RequestTracker(llm),
+        kv_event_fanout=KvEventFanout(llm, buffer_size=8),
+    )
+
+    info = await service.GetServerInfo(server_pb2.GetServerInfoRequest(), _Context())
+    sources = await service.GetKvEventSources(kv_pb2.GetKvEventSourcesRequest(), _Context())
+
+    assert info.parallelism.data_parallel_size == 2
+    assert [source.data_parallel_rank for source in sources.sources] == [0, 1]
+    assert service._scheduling_params(1).attention_dp_rank == 1
+
+
+@pytest.mark.asyncio
 async def test_kv_event_discovery_requires_decimal_compatible_hashes() -> None:
     llm = _Llm()
     llm.args = SimpleNamespace(
