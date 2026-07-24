@@ -69,6 +69,9 @@ def compute_threshold(num_samples: int,
         return ref_accuracy - z_alpha * scale
 
 
+STDERR_MARGIN_SIGMAS = 2.0
+
+
 @dataclass(slots=True)
 class HypothesisTestingParams:
     ref_accuracy: float
@@ -78,10 +81,19 @@ class HypothesisTestingParams:
     beta: float = 0.2
     sigma: float = 50.0
     higher_is_better: bool = True
+    # lm-eval-style per-metric stderr. When set, ref_accuracy is treated as an
+    # anchor and the strict floor is offset by STDERR_MARGIN_SIGMAS * stderr so
+    # single-run noise does not trip the outer assertion (nvbugs/6506920).
+    stderr: Optional[float] = None
+    ref_accuracy_anchor: float = field(init=False)
     theta: float = field(init=False)
     threshold: float = field(init=False)
 
     def __post_init__(self) -> None:
+        self.ref_accuracy_anchor = self.ref_accuracy
+        if self.stderr is not None and self.stderr > 0:
+            sign = -1 if self.higher_is_better else 1
+            self.ref_accuracy += sign * STDERR_MARGIN_SIGMAS * self.stderr
         self.theta = compute_theta(self.num_samples,
                                    sigma=self.sigma,
                                    alpha=self.alpha,
@@ -95,6 +107,13 @@ class HypothesisTestingParams:
 
     def report(self, accuracy: Optional[float] = None) -> str:
         metric_name = self.metric_name.upper()
+        if self.stderr is not None and self.stderr > 0:
+            stderr_line = (
+                f"\nAnchor {self.metric_name}: {self.ref_accuracy_anchor:.3f}"
+                f" (adjusted by {STDERR_MARGIN_SIGMAS:.1f}sigma * stderr={self.stderr:.3f})"
+            )
+        else:
+            stderr_line = ""
         report = f"""===========================================================
 = {metric_name} HYPOTHESIS TESTING
 ===========================================================
@@ -104,7 +123,7 @@ Sigma (Standard deviation): {self.sigma:.3f}
 #Samples: {self.num_samples}
 Higher is better: {self.higher_is_better}
 Theta (Minimum detectable effect): {self.theta:.3f}
-Reference {self.metric_name}: {self.ref_accuracy:.3f}
+Reference {self.metric_name}: {self.ref_accuracy:.3f}{stderr_line}
 Threshold: {self.threshold:.3f}
 ==========================================================="""
         if accuracy is not None:
@@ -190,7 +209,8 @@ class AccuracyTask:
             sigma=entry.get("sigma", self.SIGMA),
             num_samples=entry.get("num_samples", self.NUM_SAMPLES),
             higher_is_better=entry.get("higher_is_better",
-                                       self.HIGHER_IS_BETTER))
+                                       self.HIGHER_IS_BETTER),
+            stderr=entry.get("stderr"))
 
     def evaluate(self,
                  llm: Union[PyTorchLLM, AutoDeployLLM],

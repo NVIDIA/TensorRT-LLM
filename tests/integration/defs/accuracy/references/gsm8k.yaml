@@ -156,11 +156,16 @@ deepseek-ai/DeepSeek-V4-Pro:
     spec_dec_algo: MTP
     accuracy: 96.0
   # Full GSM8K DEP8 DSpark path: TP=8, EP=8, attention DP, MegaMoE DeepGEMM,
-  # and max_draft_len=5. Measured 96.475 on 1319 samples; floor set to 96.0
-  # for run-to-run margin.
+  # and max_draft_len=5. Author-anchor 96.475 on 1319 samples with lm-eval
+  # reporting per-metric stderr ~0.55; observed spread across runs
+  # 95.94..96.55 tracks that stderr. accuracy_core subtracts 2*stderr from
+  # the anchor for the strict floor (95.375), so single-run tails no longer
+  # trip the outer gate (nvbugs/6506920). The hypothesis-testing threshold
+  # (~92.3) remains the primary regression gate.
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: DSpark
-    accuracy: 96.0
+    accuracy: 96.475
+    stderr: 0.55
 Qwen3/Qwen3-4B:
   - spec_dec_algo: Eagle
     accuracy: 85.823
