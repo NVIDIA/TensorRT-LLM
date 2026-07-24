@@ -380,7 +380,6 @@ unittest/llmapi/test_llm.py::test_llm_with_customized_tokenizer SKIP (https://nv
 unittest/llmapi/test_llm.py::test_openai_completion_list_prompt_stream_reuses_stream_metadata SKIP (https://nvbugs/6507081)
 unittest/llmapi/test_llm.py::test_tokenizer_decode_incrementally[/scratch.trt_llm_data/llm-models/falcon-7b-instruct-False-0.95-HF] SKIP (https://nvbugs/6507082)
 unittest/llmapi/test_llm.py::test_tokenizer_decode_incrementally[/scratch.trt_llm_data/llm-models/falcon-7b-instruct-False-0.95-TRTLLM] SKIP (https://nvbugs/6507082)
-unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2" SKIP (https://nvbugs/6428092)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_get_stats_pp2[False-False-True] SKIP (https://nvbugs/6432826)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_get_stats_pp4[False-False-True] SKIP (https://nvbugs/6427411)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_get_stats_pp4[False-True-True] SKIP (https://nvbugs/6427411)
