@@ -53,6 +53,7 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
+#include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <algorithm>
@@ -501,6 +502,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     if (backendType.value() == executor::CacheTransceiverConfig::BackendType::UCX)
     {
         std::lock_guard<std::mutex> lock(mDllMutex);
+        executor::kv_cache::promoteHostLibraryToGlobalScope();
         mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
         TLLM_CHECK_WITH_INFO(
             mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly. error : %s", dlerror());

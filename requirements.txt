@@ -10,8 +10,6 @@ lark
 lazy_loader~=0.5
 mpi4py
 numpy>=2.0.0,<2.4 # numba 0.63.1 requires numpy<2.4
-onnx>=1.21.0
-onnx_graphsurgeon>=0.5.2
 graphviz
 openai
 polygraphy
@@ -25,7 +23,6 @@ sentencepiece>=0.1.99
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05 uses 2.12.0a0.
 torch>=2.11.0,<=2.13.0a0
 torchvision
-nvidia-modelopt[torch]~=0.37.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05 uses 2.30.4
 # torch 2.11.0+cu130 depends on nvidia-nccl-cu13==2.28.9
 nvidia-nccl-cu13>=2.28.9,<=2.30.4
