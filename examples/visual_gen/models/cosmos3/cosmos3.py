@@ -25,8 +25,8 @@ Cosmos3 supports the following generation modes from a single checkpoint:
   ``file://`` / ``http(s)://`` URL, or a ``data:`` URI.
 - **V2V** — video-conditioned video (``prompts/v2v.json``). Condition on the
   first (or last, per ``condition_video_keep``) frames of a reference video
-  via ``--video_path`` (a local frame directory, ``.mp4``/``.avi`` file, or
-  single image; ``.mp4``/``.avi`` decode requires OpenCV).
+  via ``--video_path`` (a local MP4/AVI file; its encoded bytes pass through
+  and each worker decodes the conditioning window on NVDEC).
 - **T2AV** — text-to-video with synchronized audio (``prompts/t2av.json`` with
   ``enable_audio: true``, or pass ``--enable_audio``). Combine with a
   ``vision_path`` for image-conditioned audio-video (TI2AV).
@@ -107,7 +107,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
-from tensorrt_llm.inputs.media_io import load_video_frames_tensor
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -235,7 +234,7 @@ def main():
         "--video_path",
         type=str,
         default=None,
-        help="Reference video for V2V: a local frame directory or .mp4/.avi file",
+        help="Reference video for V2V: a local MP4/AVI file (decoded on worker NVDEC)",
     )
     parser.add_argument(
         "--output_type", type=str, default="video", help="Output type (video, image)"
@@ -286,9 +285,7 @@ def main():
     params.extra_params["output_type"] = output_type
 
     if args.video_path is not None:
-        # Decode client-side into the uint8 [T, H, W, C] tensor contract; the
-        # worker keeps the conditioning window and VAE-encodes.
-        params.extra_params["video"] = load_video_frames_tensor(args.video_path)
+        params.extra_params["video"] = Path(args.video_path).read_bytes()
 
     if negative_prompt is None:
         params.negative_prompt = None
