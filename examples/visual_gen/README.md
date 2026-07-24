@@ -37,6 +37,7 @@ python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
 python models/cosmos3_ti2v.py --visual_gen_args configs/cosmos3-nano-1gpu.yaml --prompt "A robot arm picks fruit in a grocery store"
 python models/qwen_image.py --visual_gen_args configs/qwen-image-fp8-1gpu.yaml
 python models/qwen_image_layered.py --visual_gen_args configs/qwen-image-layered-1gpu.yaml --image /path/to/image.png
+python models/qwen_image_layered.py --visual_gen_args configs/qwen-image-layered-fp8-1gpu.yaml --image /path/to/image.png
 python models/qwen_image_edit.py --visual_gen_args configs/qwen-image-edit-2511-fp4-1gpu.yaml --image /path/to/source.png --prompt "Make the image look like a watercolor painting"
 python models/hunyuan_t2v.py --visual_gen_args configs/hunyuan-t2v-fp8-1gpu.yaml
 ```

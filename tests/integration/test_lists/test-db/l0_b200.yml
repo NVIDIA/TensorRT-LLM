@@ -300,7 +300,9 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_example
-  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_example
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_example[baseline]
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_example[fp8]
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_example[cache-dit]
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_edit_example
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_example TIMEOUT (30)
   - unittest/_torch/visual_gen/test_cosmos3_edge.py

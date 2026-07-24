@@ -226,9 +226,9 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image-Layered** [^vg2] | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
+| **Qwen-Image-Layered** [^vg2] | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | No | No | Yes | Yes | Yes | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 
 [^vg1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
-[^vg2]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition through `trtllm-serve` image-edit routing. By default it returns one RGBA image per generated layer; set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable image grid. FP8 blockwise, NVFP4, and attention-parallel backends are not enabled yet.
+[^vg2]: Qwen-Image-Layered supports baseline BF16 and FP8 blockwise image-conditioned layer decomposition through `trtllm-serve` image-edit routing. By default it returns one RGBA image per generated layer; set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable image grid. NVFP4 and attention-parallel backends are not enabled yet.
