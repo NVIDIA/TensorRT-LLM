@@ -20,11 +20,30 @@ to the provided Hugging Face checkpoint.
 
 ## Current Support Scope
 
-The post-transform MX receive path currently supports only
-`LlamaForCausalLM` with transform protocol version 1. TensorRT LLM publishes
-post-transform weights together with source-identity and layout metadata. A
-receiver whose model family is not allow-listed does not consume those bytes;
-it falls back to the standard Hugging Face checkpoint path.
+The post-transform MX receive path currently supports one exact qualification
+profile:
+
+| Profile | Root class | Config identity | Scope | Protocol | Transform-layout ABI | Constraints |
+|---------|------------|-----------------|-------|----------|----------------------|-------------|
+| `llama-for-causal-lm-target-v1` | `LlamaForCausalLM` | `LlamaForCausalLM` / `llama` | Target model | 1 | `trtllm-llama-target-layout-v1` | No speculative mode or separately loaded draft model |
+
+The registry matches the exact root class and the architecture/model type
+captured from the resolved config before model construction. An unregistered
+subclass or config alias does not inherit support. It falls back to the
+standard Hugging Face checkpoint path before any P2P transfer starts.
+
+TensorRT LLM applies two independent compatibility gates:
+
+- The qualification profile records that a model/config/lifecycle combination
+  has passed full-load versus staged-load equivalence testing.
+- `SourceIdentity` format version 3 binds two concrete runs to the same
+  checkpoint artifact, runtime layout choices, local shard layout, and
+  transform-layout ABI.
+
+The transfer protocol version identifies the staged receiver protocol. The
+transform-layout ABI identifies the meaning of the transferred tensor names,
+layouts, aliases, and receiver finalization. A pre-version-3 identity, a
+missing ABI, or a different ABI is rejected rather than treated as compatible.
 
 Loads that require a separately loaded draft model also fall back to the
 standard checkpoint path. Target-plus-draft post-transform transfer remains
@@ -42,15 +61,39 @@ Support for another model family requires a focused qualification change:
 2. Verify that every one-time transform is guarded by `_weights_transformed`
    and that the staged receiver can skip `transform_weights()` without
    changing aliases, derived state, tensor layout, or outputs.
-3. Add the model class and transform protocol version to the MX staged-receiver
-   allow-list only after full-load and staged-load equivalence tests pass.
+3. Add an exact qualification profile only after the reusable harness in
+   `tests/unittest/utils/post_transform_qualification.py` proves tensor,
+   alias, transform-guard, derived-state, and deterministic output
+   equivalence. Include an unregistered-root negative control.
 4. Cover compatible transfer, source-identity mismatch, unsupported layout or
-   protocol, and non-allow-listed fallback. Keep target-plus-draft loading
-   disabled unless that combination has its own mixed-layout tests.
+   protocol/ABI, no-disk staged reception, and unqualified-profile fallback.
+   Keep target-plus-draft loading disabled unless that combination has its own
+   mixed-layout tests.
 5. Run a real ModelExpress donor/receiver test with the model configurations
    being claimed, including the supported quantization and TP/PP/EP layouts.
    Compare deterministic output token IDs with the standard Hugging Face load
    path before documenting the family as supported.
+
+### Transform-Layout ABI Rules
+
+An existing transform-layout ABI ID is immutable. Introduce a new ID when a
+change affects any transferred tensor name, shape, dtype, packing, sharding,
+alias relationship, one-shot transform result, or receiver-side
+`setup_aliases()`/`cache_derived_state()` interpretation. Keep the existing ID
+for implementation-only changes that preserve all of those observable
+semantics.
+
+When adding an ABI ID:
+
+1. Give the qualified profile the new ID and propagate it through
+   `SourceIdentity` and MX source metadata.
+2. Add matching, missing, and mismatched producer/receiver compatibility
+   tests. ABI mismatches remain incompatible even under the `ENFORCE` identity
+   policy.
+3. Re-run the qualification harness and the real donor/receiver GPU test for
+   every profile that adopts the ID.
+4. Never reinterpret an already published ID. Supporting two ABIs requires an
+   explicit compatibility decision and tests for each producer/receiver pair.
 
 ## Installation
 
@@ -140,7 +183,7 @@ path.
 
 - Post-transform MX reception is currently limited to the Llama model family.
   Other model families safely fall back to Hugging Face loading until they are
-  explicitly qualified and added to the staged-receiver allow-list.
+  explicitly qualified and added as exact capability profiles.
 - The MX server and Redis lifecycle is external to TensorRT LLM. Every
   TensorRT LLM instance must be able to reach the configured MX server URL.
 - The MX server coordinates source discovery but does not store model weights.

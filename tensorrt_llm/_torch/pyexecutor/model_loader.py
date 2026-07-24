@@ -13,10 +13,11 @@ import torch
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._torch.weight_sharing import (
-    ArtifactIdentity, IdentityCheckPolicy, PostTransformFeature,
-    PostTransformProfile, PostTransformProfileRegistry,
-    PostTransformQualificationDecision, PostTransformTransferScope,
-    SourceIdentity, check_weight_sharing_compatibility)
+    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity, IdentityCheckPolicy,
+    PostTransformConfigIdentity, PostTransformFeature, PostTransformProfile,
+    PostTransformProfileRegistry, PostTransformQualificationDecision,
+    PostTransformTransferScope, SourceIdentity,
+    check_weight_sharing_compatibility)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
@@ -318,6 +319,7 @@ class ModelLoader:
             model_type="llama",
             speculative_mode=None,
             protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         ), ))
 
@@ -447,6 +449,7 @@ class ModelLoader:
         *,
         checkpoint_dir: str,
         model_name: str,
+        transform_abi_id: Optional[str],
         fallback_on_artifact_error: bool,
     ) -> Optional[SourceIdentity]:
         """Build the local identity without weakening artifact validation.
@@ -471,6 +474,7 @@ class ModelLoader:
             model,
             artifact_identity=artifact_identity,
             model_name=model_name,
+            transform_abi_id=transform_abi_id,
         )
 
     def load(
@@ -490,6 +494,12 @@ class ModelLoader:
         """
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
+        # Some model constructors normalize or rewrite config fields. Capture
+        # the registry identity from the resolved input before construction so
+        # publication and reception qualify the architecture the user asked
+        # to load, not a post-construction alias.
+        post_transform_config_identity = PostTransformConfigIdentity.from_model_config(
+            config)
         load_format = self.llm_args.load_format
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
@@ -508,6 +518,16 @@ class ModelLoader:
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
 
+            loads_draft_weights = (
+                self.spec_config is not None
+                and self.spec_config.spec_dec_mode.need_load_draft_weights())
+            speculative_mode = self._speculative_mode_name(self.spec_config)
+            post_transform_qualification = self._qualify_post_transform_profile(
+                model,
+                config_identity=post_transform_config_identity,
+                speculative_mode=speculative_mode,
+                loads_draft_weights=loads_draft_weights)
+
             self._source_identity: Optional[SourceIdentity] = None
             if self._needs_source_identity(checkpoint_loader, load_format):
                 # Receiver's local SourceIdentity, built once from the final
@@ -523,6 +543,8 @@ class ModelLoader:
                     model_name=str(
                         getattr(self.llm_args, "model", None)
                         or checkpoint_dir),
+                    transform_abi_id=(
+                        post_transform_qualification.transform_abi_id),
                     fallback_on_artifact_error=(
                         load_format != LoadFormat.GMS
                         and checkpoint_loader.checkpoint_format == "MX"),
@@ -601,10 +623,6 @@ class ModelLoader:
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
             weights_preloaded = False
-            loads_draft_weights = (
-                self.spec_config is not None
-                and self.spec_config.spec_dec_mode.need_load_draft_weights())
-            speculative_mode = self._speculative_mode_name(self.spec_config)
             # Set when either GMS RW or GMS RO branch has already run the
             # post_load_* hooks itself, so the shared post-load block below
             # must skip them. RW handles them inside `mem_pool_scope` so the
@@ -629,13 +647,9 @@ class ModelLoader:
                     # do not accept post-transform bytes for only the target
                     # model. Enable this only after target and draft subgraphs
                     # have an explicit mixed-layout policy.
-                    qualification = self._qualify_post_transform_profile(
-                        model,
-                        speculative_mode=speculative_mode,
-                        loads_draft_weights=loads_draft_weights)
                     load_weights_kwargs[
-                        "allow_post_transform_weights"] = qualification.qualified
-                    if qualification.qualified:
+                        "allow_post_transform_weights"] = post_transform_qualification.qualified
+                    if post_transform_qualification.qualified:
                         load_weights_kwargs[
                             "prepare_post_transform_receiver"] = self._setup_aliases
 
@@ -756,13 +770,9 @@ class ModelLoader:
                                 "source_identity": self._source_identity,
                             }
                             if checkpoint_loader.checkpoint_format == "MX":
-                                qualification = self._qualify_post_transform_profile(
-                                    model,
-                                    speculative_mode=speculative_mode,
-                                    loads_draft_weights=loads_draft_weights)
                                 load_weights_kwargs[
-                                    "allow_post_transform_weights"] = qualification.qualified
-                                if qualification.qualified:
+                                    "allow_post_transform_weights"] = post_transform_qualification.qualified
+                                if post_transform_qualification.qualified:
                                     load_weights_kwargs[
                                         "prepare_post_transform_receiver"] = self._setup_aliases
                             weights = checkpoint_loader.load_weights(
@@ -828,8 +838,7 @@ class ModelLoader:
                                 checkpoint_loader,
                                 model,
                                 weights_preloaded=weights_preloaded,
-                                speculative_mode=speculative_mode,
-                                loads_draft_weights=loads_draft_weights)
+                                qualification=post_transform_qualification)
                             if mx_staged_receiver_path:
                                 self._setup_aliases(model)
                                 self._mark_weights_transformed(model)
@@ -855,8 +864,7 @@ class ModelLoader:
                                 model,
                                 checkpoint_dir=checkpoint_dir,
                                 weights_preloaded=weights_preloaded,
-                                speculative_mode=speculative_mode,
-                                loads_draft_weights=loads_draft_weights)
+                                qualification=post_transform_qualification)
 
                         # Pool closed. Commit the post-post_load layout.
                         gms_backend.finalize_write(model)
@@ -909,8 +917,7 @@ class ModelLoader:
                             model,
                             checkpoint_dir=checkpoint_dir,
                             weights_preloaded=True,
-                            speculative_mode=speculative_mode,
-                            loads_draft_weights=loads_draft_weights)
+                            qualification=post_transform_qualification)
                         gms_post_load_handled = True
                         logger.info("LoadFormat.GMS (RO): materialized weights")
                     else:
@@ -949,20 +956,19 @@ class ModelLoader:
                     checkpoint_loader,
                     model,
                     weights_preloaded=weights_preloaded,
-                    speculative_mode=speculative_mode,
-                    loads_draft_weights=loads_draft_weights)
+                    qualification=post_transform_qualification)
                 if mx_staged_receiver_path:
                     self._setup_aliases(model)
                     self._mark_weights_transformed(model)
                     self._walk_cache_state(model)
                 else:
                     self._walk_full_post_load(model)
-                self._post_load_publish(checkpoint_loader,
-                                        model,
-                                        checkpoint_dir=checkpoint_dir,
-                                        weights_preloaded=weights_preloaded,
-                                        speculative_mode=speculative_mode,
-                                        loads_draft_weights=loads_draft_weights)
+                self._post_load_publish(
+                    checkpoint_loader,
+                    model,
+                    checkpoint_dir=checkpoint_dir,
+                    weights_preloaded=weights_preloaded,
+                    qualification=post_transform_qualification)
 
             # TODO(GMS-MOE-LB): when the (MoE, GMS) combination is enabled,
             # `register_weight_slots_after_to_cuda` and `finalize_model`
@@ -1017,13 +1023,9 @@ class ModelLoader:
 
     @classmethod
     def _should_run_mx_staged_receiver_path(
-            cls,
-            checkpoint_loader: BaseCheckpointLoader,
-            model: DecoderModelForCausalLM,
-            *,
-            weights_preloaded: bool,
-            speculative_mode: Optional[str] = None,
-            loads_draft_weights: bool = False) -> bool:
+            cls, checkpoint_loader: BaseCheckpointLoader,
+            model: DecoderModelForCausalLM, *, weights_preloaded: bool,
+            qualification: PostTransformQualificationDecision) -> bool:
         """Whether an MX receiver can skip one-shot weight transforms.
 
         MXCheckpointLoader only accepts post-transform P2P bytes when this same
@@ -1041,18 +1043,15 @@ class ModelLoader:
         ):
             return False
 
-        qualification = cls._qualify_post_transform_profile(
-            model,
-            speculative_mode=speculative_mode,
-            loads_draft_weights=loads_draft_weights)
         profile = qualification.profile
         if qualification.qualified and profile is not None:
             logger.info(
                 "MX receiver using staged post-load profile %s for %s "
-                "(transform protocol v%d).",
+                "(transform protocol v%d, layout ABI %s).",
                 profile.profile_id,
                 type(model).__name__,
                 cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+                profile.transform_abi_id,
             )
             return True
 
@@ -1076,49 +1075,49 @@ class ModelLoader:
             return None
         spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
         mode_name = getattr(spec_dec_mode, "name", None)
-        return mode_name.lower() if isinstance(mode_name, str) else "unknown"
+        if not isinstance(mode_name, str):
+            logger.warning(
+                "Unable to identify the speculative decoding mode from %s; "
+                "post-transform sharing is disabled for this load.",
+                type(spec_dec_mode).__name__,
+            )
+            return "unknown"
+        return mode_name.lower()
 
     @classmethod
     def _qualify_post_transform_profile(
-            cls, model: DecoderModelForCausalLM, *,
+            cls,
+            model: DecoderModelForCausalLM,
+            *,
+            config_identity: Optional[PostTransformConfigIdentity] = None,
             speculative_mode: Optional[str],
             loads_draft_weights: bool) -> PostTransformQualificationDecision:
-        pretrained_config = model.model_config.pretrained_config
-        architectures = getattr(pretrained_config, "architectures", None)
-        architecture = (architectures[0]
-                        if isinstance(architectures,
-                                      (list, tuple)) and architectures
-                        and isinstance(architectures[0], str) else None)
-        configured_model_type = getattr(pretrained_config, "model_type", None)
-        model_type = (configured_model_type if isinstance(
-            configured_model_type, str) else None)
+        if config_identity is None:
+            config_identity = PostTransformConfigIdentity.from_model_config(
+                model.model_config)
         enabled_features = set()
         if loads_draft_weights:
             enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
         return cls._POST_TRANSFORM_PROFILE_REGISTRY.qualify(
             root_model_class=type(model),
-            architecture=architecture,
-            model_type=model_type,
+            architecture=config_identity.architecture,
+            model_type=config_identity.model_type,
             speculative_mode=speculative_mode,
             protocol_version=cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             enabled_features=frozenset(enabled_features),
         )
 
-    def _post_load_publish(self, checkpoint_loader: BaseCheckpointLoader,
-                           model: DecoderModelForCausalLM, *,
-                           checkpoint_dir: str, weights_preloaded: bool,
-                           speculative_mode: Optional[str],
-                           loads_draft_weights: bool) -> None:
+    def _post_load_publish(
+            self, checkpoint_loader: BaseCheckpointLoader,
+            model: DecoderModelForCausalLM, *, checkpoint_dir: str,
+            weights_preloaded: bool,
+            qualification: PostTransformQualificationDecision) -> None:
         kwargs = {
             "checkpoint_dir": checkpoint_dir,
             "weights_preloaded": weights_preloaded,
         }
         if checkpoint_loader.checkpoint_format == "MX":
-            qualification = self._qualify_post_transform_profile(
-                model,
-                speculative_mode=speculative_mode,
-                loads_draft_weights=loads_draft_weights)
             if not qualification.qualified:
                 if not weights_preloaded:
                     logger.info(

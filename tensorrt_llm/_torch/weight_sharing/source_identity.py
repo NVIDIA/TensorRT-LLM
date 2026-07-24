@@ -42,15 +42,16 @@ Layered design
 --------------
 The fingerprint is split so comparison can be selective:
 
-* **global fingerprint** -- immutable checkpoint artifact, rank-invariant
-  model identity, quantization, backend selection, fusion flags, and parallel
-  *sizes* (TP/PP/EP/CP).
+* **global fingerprint** -- immutable checkpoint artifact, transform-layout
+  ABI, rank-invariant model identity, quantization, backend selection, fusion
+  flags, and parallel *sizes* (TP/PP/EP/CP).
 * **shard fingerprint** -- this rank's TP/PP/EP/CP *rank* slice plus the
   realized local parameter/buffer `(shape, dtype)` layout. Receiver rank `N`
   must align with the source rank that produced shard `N`.
 
 A caller that wants *enforced* sharing across otherwise-divergent runs can skip
-the global comparison (`compare_global=False`) and trust the source.
+the global comparison (`compare_global=False`) and trust the source. Identity
+format and transform-layout ABI compatibility remain mandatory.
 
 Adding fields
 -------------
@@ -82,7 +83,7 @@ if TYPE_CHECKING:
 # Bump when the fingerprint projection changes in a way that makes previously
 # stored identities incomparable. Two identities with different format versions
 # never match.
-SOURCE_IDENTITY_FORMAT_VERSION = 2
+SOURCE_IDENTITY_FORMAT_VERSION = 3
 
 _PRETRAINED_METADATA_FIELDS = frozenset(
     {
@@ -198,10 +199,10 @@ class IdentityCheckPolicy(Enum):
     * `WARN_FALLBACK` (default): log a warning and fall back to non-shared
       loading. Never raises.
     * `STRICT`: raise :class:`SourceIdentityMismatchError` on mismatch.
-    * `ENFORCE`: always share regardless of concrete-identity mismatch (the
+    * `ENFORCE`: share despite concrete artifact/config/shard differences (the
       caller explicitly trusts the source, e.g. enforced cross-run sharing).
-      Still requires both local and source identities to be present. Logs at
-      debug.
+      Identity format and transform-layout ABI must still match, and both
+      identities must be present.
     """
 
     WARN_FALLBACK = "warn_fallback"
@@ -242,6 +243,17 @@ class SourceIdentity:
     pp_size: int = 1
     ep_size: int = -1
     dtype: Optional[str] = None
+    # Layout semantics are safety-critical and always compared, including
+    # under ENFORCE. `None` denotes a source that does not use a qualified
+    # post-transform layout contract. Keep this last to preserve existing
+    # positional construction of the discovery fields above.
+    transform_abi_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.transform_abi_id is not None and (
+            not isinstance(self.transform_abi_id, str) or not self.transform_abi_id
+        ):
+            raise ValueError("SourceIdentity transform_abi_id must be a non-empty string")
 
     # ---- construction --------------------------------------------------
 
@@ -254,6 +266,7 @@ class SourceIdentity:
         checkpoint_dir: Optional[str] = None,
         artifact_identity: Optional[ArtifactIdentity] = None,
         model_name: Optional[str] = None,
+        transform_abi_id: Optional[str] = None,
     ) -> "SourceIdentity":
         """Build an identity from a torch-backend :class:`ModelConfig`.
 
@@ -274,6 +287,9 @@ class SourceIdentity:
             model_name: Human-readable model identity used by discovery layers
                 (e.g. the MX server's source catalog). Does not affect the
                 compatibility fingerprints.
+            transform_abi_id: Stable identifier for the post-transform tensor
+                layout and receiver-finalization contract. `None` when the
+                source does not use a qualified post-transform layout.
 
         Returns:
             A fully populated :class:`SourceIdentity` for
@@ -305,6 +321,7 @@ class SourceIdentity:
             parallel_fingerprint=cls._build_parallel_fingerprint(mapping),
             rank=rank,
             shard_fingerprint=cls._build_shard_fingerprint(mapping, model),
+            transform_abi_id=transform_abi_id,
             model_name=model_name,
             tp_size=getattr(mapping, "tp_size", 1),
             pp_size=getattr(mapping, "pp_size", 1),
@@ -443,6 +460,7 @@ class SourceIdentity:
             {
                 "format_version": self.format_version,
                 "artifact": self.artifact_identity.to_dict(),
+                "transform_abi_id": self.transform_abi_id,
                 "model": self.model_fingerprint,
                 "quant": self.quant_fingerprint,
                 "backend": self.backend_fingerprint,
@@ -470,6 +488,11 @@ class SourceIdentity:
 
         if self.format_version != other.format_version:
             mismatched.append("format_version")
+
+        # A transform ABI mismatch changes the meaning of transferred tensors,
+        # so no identity policy may bypass it.
+        if self.transform_abi_id != other.transform_abi_id:
+            mismatched.append("transform_abi_id")
 
         if compare_global:
             if self.artifact_identity != other.artifact_identity:
@@ -507,6 +530,7 @@ class SourceIdentity:
             "parallel_fingerprint": self.parallel_fingerprint,
             "rank": self.rank,
             "shard_fingerprint": self.shard_fingerprint,
+            "transform_abi_id": self.transform_abi_id,
             "model_name": self.model_name,
             "tp_size": self.tp_size,
             "pp_size": self.pp_size,
@@ -537,6 +561,7 @@ class SourceIdentity:
             parallel_fingerprint=data["parallel_fingerprint"],
             rank=data["rank"],
             shard_fingerprint=data["shard_fingerprint"],
+            transform_abi_id=data["transform_abi_id"],
             model_name=data.get("model_name"),
             tp_size=data.get("tp_size", 1),
             pp_size=data.get("pp_size", 1),
@@ -596,10 +621,15 @@ def check_weight_sharing_compatibility(
     if policy is IdentityCheckPolicy.ENFORCE:
         result = local.matches(source, compare_global=False, compare_shard=False)
         if not result.matched:
-            logger.debug(
-                f"SourceIdentity ENFORCE: sharing despite mismatch in {result.mismatched_fields}."
+            logger.warning(
+                "SourceIdentity ENFORCE cannot bypass identity format or "
+                f"transform-layout ABI mismatch in {result.mismatched_fields}."
             )
-        return IdentityCheckDecision(should_share=True, match_result=result, policy=policy)
+        return IdentityCheckDecision(
+            should_share=result.matched,
+            match_result=result,
+            policy=policy,
+        )
 
     result = local.matches(source, compare_global=compare_global, compare_shard=compare_shard)
     if result.matched:
