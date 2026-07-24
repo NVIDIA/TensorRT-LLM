@@ -61,6 +61,12 @@ except ImportError:
 class TokenizerBase(PreTrainedTokenizerBase):
     ''' This is a protocol for the tokenizer. Users can implement their own tokenizer by inheriting this class.  '''
 
+    def __repr__(self) -> str:
+        # PreTrainedTokenizerBase.__repr__ reads properties (e.g.
+        # added_tokens_decoder) that TokenizerBase subclasses are not
+        # required to implement, so fall back to a class-name-only repr.
+        return f"{self.__class__.__name__}()"
+
 
 def _reconstruct_transformers_tokenizer(inner_bytes: bytes):
     '''Reconstruct a TransformersTokenizer from cloudpickle-serialized bytes.'''
