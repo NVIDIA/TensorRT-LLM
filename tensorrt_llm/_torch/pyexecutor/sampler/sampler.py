@@ -88,6 +88,7 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
+from .ops.vanilla import apply_batched_occurrence_penalties, update_occurrence_workspace
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
@@ -448,6 +449,18 @@ def _unwrap_singleton(p: Optional[List[T]]) -> Optional[T]:
         return None
     (t,) = p
     return t
+
+
+def _has_occurrence_penalty(request: LlmRequest) -> bool:
+    sampling_config = request.sampling_config
+    repetition = _unwrap_singleton(sampling_config.repetition_penalty)
+    presence = _unwrap_singleton(sampling_config.presence_penalty)
+    frequency = _unwrap_singleton(sampling_config.frequency_penalty)
+    return (
+        (repetition is not None and repetition != 1.0)
+        or (presence is not None and presence != 0.0)
+        or (frequency is not None and frequency != 0.0)
+    )
 
 
 def _get_beam_width_in(request: LlmRequest) -> int:
@@ -1343,6 +1356,325 @@ class AsyncWorkerMixin:
             side_stream_event=side_stream_event,
             worker_futures=worker_futures,
         )
+
+
+class _OccurrencePenaltyHandler:
+    """Applies repetition / presence / frequency penalties for :class:`TorchSampler`.
+
+    Occurrence tracking and the individual penalty transforms follow the C++
+    ``batchApplyPenalty`` kernel (``cpp/tensorrt_llm/kernels/penaltyKernels.cu``) as
+    driven by ``PenaltyLayer``. Their ordering follows TorchSampler: penalties are
+    applied before the sampling strategy handles temperature. All persistent device
+    state lives in a single :class:`_PenaltyStore`, the torch counterpart of the tensors
+    ``PenaltyLayer`` allocates:
+
+    * per-slot penalty-parameter buffers (``repetition`` / ``presence`` / ``frequency``,
+      shape ``[max_num_sequences]``) -- the counterpart of
+      ``allocateBuffer`` + ``fillBuffers``; filled once per request in
+      ``prepare_for_new_request`` and gathered per step (no per-step host rebuild);
+    * an occurrence workspace (dense ``counts`` plus a dense ``presence_prefix``
+      mask) -- the counterpart of ``allocateWorkspace`` /
+      ``mPenaltyWorkspaceDevice``; updated incrementally each step.
+
+    The actual logits math lives in the ops module. Parameter buffers are allocated
+    eagerly (tiny, vocab-independent); vocab-sized workspaces are allocated lazily and
+    skipped entirely when no matching request uses an occurrence penalty.
+    """
+
+    @dataclass(kw_only=True)
+    class _PenaltyStore:
+        """Persistent device state: penalty-parameter buffers + occurrence workspace."""
+
+        # --- Penalty parameters (allocateBuffer counterpart), shape [max_num_sequences] ---
+        repetition: torch.Tensor
+        """float32; per-slot repetition penalty (default 1.0)."""
+        presence: torch.Tensor
+        """float32; per-slot presence penalty (default 0.0)."""
+        frequency: torch.Tensor
+        """float32; per-slot frequency penalty (default 0.0)."""
+        active: torch.Tensor
+        """bool[slots]; whether a slot has an active occurrence penalty."""
+        has_previous_token: torch.Tensor
+        """bool[slots]; whether ``new_tokens`` contains a token to accumulate."""
+
+        # --- Occurrence workspace (allocateWorkspace counterpart), allocated lazily ---
+        counts: torch.Tensor | None = None
+        """int32 or None; per-slot occurrence counts of prompt (beyond
+        prompt_ignore_length) and generated tokens. Drives presence/frequency and (via
+        counts > 0) repetition."""
+        presence_prefix: torch.Tensor | None = None
+        """bool or None; per-slot presence mask with shape
+        ``[slots, vocab_size]`` for the ignored prompt prefix
+        ``[0, prompt_ignore_length)``. It contributes to repetition only."""
+
+    @dataclass(kw_only=True)
+    class _SlotState:
+        """Per-slot host-only bookkeeping (never read by the ops)."""
+
+        prompt_ignore_length: int
+        initialized: bool = False
+
+    def __init__(
+        self,
+        *,
+        max_num_sequences: int,
+        device: torch.device | str,
+    ):
+        self._max_num_sequences = max_num_sequences
+        self._device = torch.device(device)
+        # Whether any (past or current) active request uses prompt_ignore_length > 0,
+        # which requires allocating the presence-prefix mask.
+        self._needs_prefix = False
+        self._num_active_slots = 0
+        # Per-slot state; None marks a slot without active occurrence penalties.
+        self._slots: list[_OccurrencePenaltyHandler._SlotState | None] = [None] * max_num_sequences
+        # Eagerly allocate the (tiny, vocab-independent) parameter buffers with their
+        # no-op defaults. inference_mode(False) so they stay mutable in place later.
+        with torch.inference_mode(False):
+            self.store = self._PenaltyStore(
+                repetition=torch.ones(max_num_sequences, dtype=torch.float32, device=self._device),
+                presence=torch.zeros(max_num_sequences, dtype=torch.float32, device=self._device),
+                frequency=torch.zeros(max_num_sequences, dtype=torch.float32, device=self._device),
+                active=torch.zeros(max_num_sequences, dtype=torch.bool, device=self._device),
+                has_previous_token=torch.zeros(
+                    max_num_sequences, dtype=torch.bool, device=self._device
+                ),
+            )
+
+    @staticmethod
+    def _fill_slot(tensor: torch.Tensor, slot: int, value: bool | float | int) -> None:
+        """Asynchronously fill one slot without CUDA scalar-assignment synchronization."""
+        tensor.narrow(0, slot, 1).fill_(value)
+
+    def prepare_for_new_request(self, request: LlmRequest, slot: int) -> None:
+        """Fill the slot's penalty parameters and reset its workspace.
+
+        Called from ``TorchSampler.setup_sampler_step`` for each new request, mirroring
+        ``PenaltyLayer::setup`` (``fillBuffers`` + per-``batchSlot`` ``setZero``).
+        Inactive slots are never gathered, so their stale parameters/counts are left
+        untouched.
+        """
+        was_active = self._slots[slot] is not None
+        if not (_get_max_beam_width(request) == 1 and _has_occurrence_penalty(request)):
+            self._slots[slot] = None
+            if was_active:
+                self._num_active_slots -= 1
+                self._fill_slot(self.store.active, slot, False)
+            return
+
+        sampling_config = request.sampling_config
+        repetition = _unwrap_singleton(sampling_config.repetition_penalty)
+        presence = _unwrap_singleton(sampling_config.presence_penalty)
+        frequency = _unwrap_singleton(sampling_config.frequency_penalty)
+        prompt_ignore_length = _unwrap_singleton(sampling_config.prompt_ignore_length)
+        # min(prompt_ignore_length, inputLen), matching the C++ kernel.
+        prompt_ignore_length = min(
+            prompt_ignore_length if prompt_ignore_length is not None else 0,
+            request.py_orig_prompt_len,
+        )
+        if prompt_ignore_length > 0:
+            self._needs_prefix = True
+
+        state = self._SlotState(prompt_ignore_length=prompt_ignore_length)
+        self._slots[slot] = state
+        # Fill the per-slot parameter buffers (once per request; gathered every step).
+        self._fill_slot(
+            self.store.repetition,
+            slot,
+            repetition if repetition is not None else 1.0,
+        )
+        self._fill_slot(
+            self.store.presence,
+            slot,
+            presence if presence is not None else 0.0,
+        )
+        self._fill_slot(
+            self.store.frequency,
+            slot,
+            frequency if frequency is not None else 0.0,
+        )
+        if not was_active:
+            self._num_active_slots += 1
+            self._fill_slot(self.store.active, slot, True)
+        self._fill_slot(self.store.has_previous_token, slot, False)
+
+        # Re-zero the workspace slot so a prior occupant's counts do not leak in.
+        if self.store.counts is not None:
+            self.store.counts[slot].zero_()
+
+        if self.store.presence_prefix is not None:
+            self.store.presence_prefix[slot].zero_()
+
+    def _ensure_workspace(self, vocab_size: int) -> None:
+        # Lazily allocate the occurrence workspace on first use (vocab_size is only known
+        # here), mirroring PenaltyLayer::allocateWorkspace being gated on penalty usage.
+        # inference_mode(False) so the persistent tensors can be mutated in place later.
+        with torch.inference_mode(False):
+            if self.store.counts is None:
+                self.store.counts = torch.zeros(
+                    (self._max_num_sequences, vocab_size), dtype=torch.int32, device=self._device
+                )
+            if self._needs_prefix and self.store.presence_prefix is None:
+                self.store.presence_prefix = torch.zeros(
+                    (self._max_num_sequences, vocab_size),
+                    dtype=torch.bool,
+                    device=self._device,
+                )
+
+    def _to_device(self, values: list[int], dtype: torch.dtype) -> torch.Tensor:
+        return torch.tensor(values, dtype=dtype, pin_memory=prefer_pinned()).to(
+            self._device, non_blocking=True
+        )
+
+    def _initialize_workspace(
+        self,
+        request: LlmRequest,
+        state: "_OccurrencePenaltyHandler._SlotState",
+        vocab_size: int,
+    ) -> None:
+        """Initialize one regular slot from its prompt exactly once."""
+        if state.initialized:
+            return
+
+        slot = request.py_seq_slot
+        assert slot is not None
+        counts = self.store.counts
+        assert counts is not None
+        counted_tokens: list[int] = []
+        prefix_tokens: list[int] = []
+        for index, token in enumerate(request.get_tokens(0)[: request.py_orig_prompt_len]):
+            if token < 0 or token >= vocab_size:
+                continue
+            if index < state.prompt_ignore_length:
+                prefix_tokens.append(token)
+            else:
+                counted_tokens.append(token)
+
+        slot_index = torch.full(
+            (len(counted_tokens),), slot, dtype=torch.int64, device=self._device
+        )
+        prefix_slot_index = torch.full(
+            (len(prefix_tokens),), slot, dtype=torch.int64, device=self._device
+        )
+        update_occurrence_workspace(
+            counts,
+            self.store.presence_prefix,
+            slot_index,
+            self._to_device(counted_tokens, torch.int64),
+            prefix_slot_index,
+            self._to_device(prefix_tokens, torch.int64),
+        )
+        state.initialized = True
+
+    def update_token_counts(
+        self,
+        updates: list[tuple[int, list[int]]],
+    ) -> None:
+        """Commit finalized sampled tokens that replaced the device pending token.
+
+        This is used after sampler-side postprocessing has finalized a multi-token
+        result. The complete confirmed sequence is counted here, then the raw first
+        token left in ``new_tokens`` is marked consumed so the next kernel cannot count
+        it again. Regular one-token sampling never calls this method and keeps its
+        fused device-pending fast path.
+        """
+        if not updates or self._num_active_slots == 0:
+            return
+
+        counts = self.store.counts
+        assert counts is not None
+        vocab_size = counts.size(-1)
+        counted_slots: list[int] = []
+        counted_tokens: list[int] = []
+
+        for slot, tokens in updates:
+            if self._slots[slot] is None:
+                continue
+            self._fill_slot(self.store.has_previous_token, slot, False)
+            for token in tokens:
+                if 0 <= token < vocab_size:
+                    counted_slots.append(slot)
+                    counted_tokens.append(token)
+
+        if not counted_tokens:
+            return
+
+        update_occurrence_workspace(
+            counts,
+            self.store.presence_prefix,
+            self._to_device(counted_slots, torch.int64),
+            self._to_device(counted_tokens, torch.int64),
+            self._to_device([], torch.int64),
+            self._to_device([], torch.int64),
+        )
+
+    @nvtx_range("apply_occurrence_penalties")
+    @torch.inference_mode()
+    def apply(
+        self,
+        logits: torch.Tensor,
+        requests: list[LlmRequest],
+        *,
+        new_tokens: torch.Tensor,
+        seq_slots: torch.Tensor,
+        request_offsets: torch.Tensor,
+        request_num_steps: torch.Tensor,
+    ) -> None:
+        """Apply occurrence penalties to ``logits`` in place.
+
+        ``logits`` is the packed generated-token logits ``[sum(num_steps * num_beams),
+        vocab_size]``; the row layout matches ``TorchSampler._apply_min_length_penalty``.
+        """
+        if self._num_active_slots == 0:
+            return
+
+        # Cheap per-batch scan so the vocab-sized workspace is only allocated when this
+        # batch actually contains a penalized request.
+        active_requests: list[tuple[LlmRequest, "_OccurrencePenaltyHandler._SlotState"]] = []
+        for request in requests:
+            slot = request.py_seq_slot
+            assert slot is not None
+            state = self._slots[slot]
+            if state is not None:
+                active_requests.append((request, state))
+        if not active_requests:
+            return
+
+        self._ensure_workspace(logits.size(-1))
+        store = self.store
+        counts = store.counts
+        assert counts is not None
+        for request, state in active_requests:
+            self._initialize_workspace(request, state, logits.size(-1))
+
+        apply_batched_occurrence_penalties(
+            logits,
+            counts,
+            store.presence_prefix,
+            store.active,
+            store.has_previous_token,
+            new_tokens,
+            seq_slots,
+            request_offsets,
+            request_num_steps,
+            store.repetition,
+            store.presence,
+            store.frequency,
+        )
+        # Flag has_previous_token for the slots this call penalized (active, num_steps > 0)
+        # so the next apply folds their sampled new_tokens. Kept on the host, out of the
+        # multi-vocab-block kernel, to avoid a cross-block race on the flag.
+        pending_token_slots: list[int] = []
+        for request, num_steps in zip(requests, request_num_steps.tolist()):
+            slot = request.py_seq_slot
+            if slot is None:
+                continue
+            if self._slots[slot] is not None and num_steps > 0:
+                pending_token_slots.append(slot)
+        if pending_token_slots:
+            store.has_previous_token.index_fill_(
+                0, self._to_device(pending_token_slots, torch.int64), True
+            )
 
 
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
@@ -2482,6 +2814,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self.store.new_tokens.shape
                 == self._finish_reasons_handler.store.finish_reasons_cuda.shape
             )
+            self._penalty_handler = _OccurrencePenaltyHandler(
+                max_num_sequences=self.max_num_sequences,
+                device="cuda",
+            )
 
         # Initialize seed for multi-GPU consistency
         self._global_seed = 42
@@ -3068,6 +3404,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # sampling, would abort the whole executor step).
         self._validate_top_p_decay_request(request)
         if self._use_beam_search:
+            if _get_max_beam_width(request) > 1 and _has_occurrence_penalty(request):
+                logger.warning(
+                    "TorchSampler does not support repetition, presence, or frequency "
+                    "penalties with beam search; these penalties will be ignored."
+                )
             if request.py_return_log_probs:
                 if request.py_num_logprobs > 1:
                     raise ValueError(
@@ -3115,6 +3456,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     self._prev_first_finish_reasons_host[slot] = None
 
             self._request_grouper.prepare_for_new_request(request, slot)
+            self._penalty_handler.prepare_for_new_request(request, slot)
 
         max_lens = self._finish_reasons_handler.new_max_lens
         end_ids = self._finish_reasons_handler.new_end_ids
@@ -3939,6 +4281,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             else:
                 return None
 
+        finalized_token_updates: list[tuple[int, list[int]]] = []
         # Fast-path (batched pybind): when the batch is greedy with no beam
         # search, no logprobs, no draft tokens, no stop-words, and no
         # speculative tree, collapse per-request pybind chatter into one
@@ -4029,6 +4372,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 req.py_rewind_len = 0
             else:
                 processed = 1
+                num_tokens_before = req.get_num_tokens(DEFAULT_BEAM_IDX)
                 num_accepted = self.process_draft_tokens(
                     req,
                     new_tokens_tensor=new_tokens,
@@ -4043,6 +4387,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     req.py_num_accepted_draft_tokens = 0
                     req.py_rewind_len = 0
                 processed += num_accepted
+                if actual_draft_len > 0:
+                    num_new_tokens = req.get_num_tokens(DEFAULT_BEAM_IDX) - num_tokens_before
+                    if num_new_tokens > 0:
+                        assert req.py_seq_slot is not None
+                        confirmed_tokens = req.get_tokens(DEFAULT_BEAM_IDX)[-num_new_tokens:]
+                        finalized_token_updates.append((req.py_seq_slot, confirmed_tokens))
                 self.handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=processed)
             req.py_decoding_iter += 1
             # Check None or empty list
@@ -4052,6 +4402,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 ] = req.py_num_accepted_draft_tokens
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 self._retire_top_p_decay_slot(req)
+
+        self._penalty_handler.update_token_counts(finalized_token_updates)
 
     def _retire_top_p_decay_slot(self, req: LlmRequest) -> None:
         """Retire a finished request's slot from the top-p-decay membership set
@@ -5260,6 +5612,21 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             sampling_requests_metadata.req_num_steps,
             sampling_requests_metadata.req_num_beams,
         )
+
+        # Apply repetition/presence/frequency penalties in place (before the greedy fast
+        # path, so both greedy and grouped-sampling logits are penalized). Draft batches
+        # share this sampler but draw py_seq_slot from a separate numbering space that
+        # collides with target slots, so penalizing them would read/write an unrelated
+        # target request's occurrence state; skip them like the pending-steps tracking.
+        if sampling_requests and not self._is_draft_batch(sampling_requests):
+            self._penalty_handler.apply(
+                logits_cuda,
+                sampling_requests,
+                new_tokens=new_tokens_cuda,
+                seq_slots=seq_slots_cuda,
+                request_offsets=sampling_requests_metadata.req_offsets,
+                request_num_steps=sampling_requests_metadata.req_num_steps,
+            )
 
         if any(getattr(r, "py_bad_words", None) for r in sampling_requests):
             stale_by_one: list[bool] | None = None
