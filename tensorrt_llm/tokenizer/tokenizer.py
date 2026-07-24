@@ -151,6 +151,38 @@ def _fallback_to_fast_tokenizer(pretrained_model_dir: str,
                                                    **merged)
 
 
+def _resolve_missing_local_path_to_hf_hub_id(pretrained_model_dir: str) -> str:
+    """Rewrite a nonexistent absolute path to a matching HF Hub repo id.
+
+    Transformers 5.x's tightened ``validate_repo_id`` rejects strings with
+    more than one ``/`` before the Hub lookup can fall back, so absolute
+    filesystem paths that no longer exist now raise ``HFValidationError``
+    instead of resolving from the cache as they did in 4.x. When the local
+    HF cache holds exactly one model repo whose basename matches, rewrite
+    to that repo id; otherwise return unchanged so the original error path
+    is preserved.
+    """
+    if not os.path.isabs(pretrained_model_dir) or os.path.isdir(
+            pretrained_model_dir):
+        return pretrained_model_dir
+    basename = os.path.basename(pretrained_model_dir.rstrip("/"))
+    if not basename:
+        return pretrained_model_dir
+    from huggingface_hub import scan_cache_dir
+    from huggingface_hub.utils import CacheNotFound
+    try:
+        cache_info = scan_cache_dir()
+    except CacheNotFound:
+        return pretrained_model_dir
+    matches = [
+        repo.repo_id for repo in cache_info.repos if repo.repo_type == "model"
+        and repo.repo_id.rsplit("/", 1)[-1] == basename
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return pretrained_model_dir
+
+
 def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
                                    **kwargs):
     """Work around Transformers 5.x LlamaTokenizer overriding tokenizer.json.
@@ -285,6 +317,8 @@ class TransformersTokenizer(TokenizerBase):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
+        pretrained_model_dir = _resolve_missing_local_path_to_hf_hub_id(
+            pretrained_model_dir)
         try:
             tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
                                                       **kwargs)
