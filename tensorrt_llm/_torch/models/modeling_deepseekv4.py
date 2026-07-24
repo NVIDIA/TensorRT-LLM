@@ -52,7 +52,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..attention_backend.sparse.deepseek_v4.metadata import DeepseekV4TrtllmAttentionMetadata
+from ..attention_backend.sparse.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
 from ..distributed import (
     AllReduce,
     AllReduceFusionOp,

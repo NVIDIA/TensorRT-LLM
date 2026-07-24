@@ -6,6 +6,7 @@
 from .backend import DSATrtllmAttention
 from .cache_manager import DSACacheManager
 from .indexer import (
+    _DG_SCHEDULE_BLOCK_KV,
     HAS_FAST_HADAMARD,
     Indexer,
     IndexerParams,
@@ -36,6 +37,7 @@ __all__ = [
     "IndexerParams",
     "IndexerPrefillChunkMetadata",
     "RotaryEmbedding",
+    "_DG_SCHEDULE_BLOCK_KV",
     "_compute_slot_mappings",
     "_effective_compress_ratio_divisor",
     "_pick_dsl_expand",

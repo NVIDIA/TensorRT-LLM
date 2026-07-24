@@ -41,7 +41,7 @@ def initialize_sparse_attn(
     aux_stream: Optional[torch.cuda.Stream],
 ) -> None:
     """Initialize DSA state and remove the unused dense MHA backend."""
-    del config, mapping, mapping_o, rms_norm_eps, quant_config, q_scaling
+    del mapping, mapping_o, rms_norm_eps, quant_config, q_scaling
     del bias, dtype, reduce_output, aux_stream
 
     threshold = os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")
@@ -56,6 +56,23 @@ def initialize_sparse_attn(
     if not use_short_seq_mha:
         self.mha = None
     self.indexer = getattr(self.mqa, "indexer", None)
+
+    pp_mapping = config.mapping
+    num_hidden_layers = getattr(config.pretrained_config, "num_hidden_layers", None)
+    if (
+        pp_mapping.has_pp()
+        and self.layer_idx is not None
+        and num_hidden_layers is not None
+        and self.indexer is None
+    ):
+        pp_layers = pp_mapping.pp_layers(num_hidden_layers)
+        if pp_layers and self.layer_idx == pp_layers[0]:
+            raise ValueError(
+                f"DSA pipeline stage {pp_mapping.pp_rank} starts with "
+                f"shared-indexer layer {self.layer_idx}, but shared TopK data "
+                "is local to a pipeline stage. Choose a pp_partition whose "
+                "first layer on every stage runs a full indexer."
+            )
 
 
 def forward_context_sparse_attn(

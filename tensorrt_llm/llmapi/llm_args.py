@@ -1136,7 +1136,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         return False
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import \
+        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
             DeepSeekV4Params
 
         pretrained_config = kwargs.get("pretrained_config", None)
@@ -1166,7 +1166,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         )
 
     def to_sparse_metadata_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import \
+        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
             DeepSeekV4MetadataParams
 
         pretrained_config = kwargs.get("pretrained_config", None)
