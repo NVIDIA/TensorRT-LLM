@@ -124,8 +124,6 @@ class TriAttention(KVCacheCompressionManager):
         draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
     ):
         super().__init__(kv_cache_manager, draft_kv_cache_manager)
-        # budget/beta positivity and the eviction_mode literal are validated at
-        # the config boundary (TriAttentionKvCacheCompressionConfig).
         self.budget = config.budget
         self.beta = config.beta
         self.eviction_mode = config.eviction_mode
@@ -135,8 +133,7 @@ class TriAttention(KVCacheCompressionManager):
                 "TriAttention union eviction requires normalize_scores=True: "
                 "the fused union pipeline always z-normalizes score rows"
             )
-        # Prompt always pinned; budget counts decode tokens only. Calibration
-        # is the official TriAttention .pt (TRT-LLM never computes it).
+        # Prompt always pinned; budget counts decode tokens only.
         self.model_path = config.model_path
         self.calibration_path = config.calibration_path
         self.calibration: Optional[Dict[str, torch.Tensor]] = None
@@ -145,13 +142,12 @@ class TriAttention(KVCacheCompressionManager):
         # Mean-phase table dict; buffer builds bind its device tables in place.
         self._phase: Optional[Dict[str, object]] = None
 
-        # Per-request {generation_steps, evicted_tokens}.
+        # Per-request eviction progress.
         self._request_states: Dict[int, Dict[str, object]] = {}
         # In-flight overlap batch reference; membership resolves lazily.
         self._prepared_generation_batch: Optional[object] = None
         self._prepared_generation_ids: Optional[set] = None
-        # Manager-lifetime constants (V2 fixes every input at construction):
-        # protected tails are num_extra + reserved draft width + 1 sampled token.
+        # Manager-lifetime constants.
         self._protected_tail_capacity = (
             int(kv_cache_manager.num_extra_kv_tokens)
             + int(kv_cache_manager._kv_reserve_draft_tokens)
@@ -342,7 +338,7 @@ class TriAttention(KVCacheCompressionManager):
                         "kv_cache": kv_cache,
                         "draft_kv_cache": draft_kv_cache,
                         "seq_len": int(seq_len),
-                        # Uncompressed logical position (prefix + evicted).
+                        # Uncompressed logical position.
                         "round_start": int(seq_len + request_state["evicted_tokens"]),
                         "prompt_len": min(int(request.py_prompt_len), int(seq_len)),
                         "expected_keep_count": expected_keep_count,
@@ -376,9 +372,7 @@ class TriAttention(KVCacheCompressionManager):
                     for item in prepared:
                         kv_cache = item[cache_key]
                         if not kv_cache.is_active:
-                            # Bytes already moved: skipping the ledger resize would
-                            # leave silent corruption; the compact-to-resize window
-                            # is owned by this hook.
+                            # Bytes already moved: the compact-to-resize window is owned by this hook.
                             raise RuntimeError(
                                 f"Request {item['request_id']} {label} KV cache was "
                                 "suspended between compact and resize"
@@ -500,10 +494,7 @@ class TriAttention(KVCacheCompressionManager):
         return (dense_layers, swa_layers, window_size)
 
     def _runtime_kv_layout(self, *, draft: bool = False) -> Dict[str, object]:
-        # The manager identity and layer count are manager-lifetime owner
-        # contracts; only the pool page counts are polled (stale-pointer
-        # safety until V2 exposes a layout epoch). Production draft callers
-        # gate on ``draft_kv_cache_manager is not None``.
+        # Only pool page counts are polled; manager identity and layer count are manager-lifetime contracts.
         manager = self.draft_kv_cache_manager if draft else self.kv_cache_manager
         cached = self._kv_layout_caches[draft]
         if cached is not None:
@@ -663,8 +654,7 @@ class TriAttention(KVCacheCompressionManager):
 
         first_pool = layout["layer_pools"][layout["dense_layers"][0]]
         if self._phase is None:
-            # Upstream geometric offsets [1, 2, 4, ... <= max]: the table
-            # builder consumes them as host floats only (no device copy).
+            # Host-only width offsets for the table builder (no device copy).
             self._phase = {
                 "omega": self.calibration["omega"]
                 .to(device=first_pool.device, dtype=torch.float32)
@@ -708,10 +698,8 @@ class TriAttention(KVCacheCompressionManager):
         protected_tail_capacity: int,
         draft: Optional[Dict[str, object]] = None,
     ) -> None:
-        """Build the round's buffers, compiled score launches, and compaction data
-        in place as plain attributes on this manager
-        (the compiled kernels capture raw pool addresses: scored pools must stay alive and stay put).
-        """
+        """Build the round's buffers, compiled launches, and compaction data as attributes
+        (compiled kernels capture raw pool addresses: pools must stay alive and stay put)."""
         import cutlass
         import cutlass.cute as cute
 
@@ -803,7 +791,7 @@ class TriAttention(KVCacheCompressionManager):
         )
         self._round_starts_device = self._request_metadata_device[0, :max_requests]
         self._valid_seq_lens_device = self._request_metadata_device[1, :max_requests]
-        # Per-request pinned prompt lengths (per-request decode window starts).
+        # Pinned per-request decode-window starts.
         self._token_starts_device = self._request_metadata_device[2, :max_requests]
         dense_move_offsets_row = self._request_metadata_device[3]
         swa_move_offsets_row = self._request_metadata_device[4]
@@ -863,10 +851,8 @@ class TriAttention(KVCacheCompressionManager):
         self._gather_columns = torch.arange(decode_width, dtype=torch.int64, device=device).view(
             1, 1, 1, 1, -1
         )
-        # Compile the mode's SM100 CuTe entries; no other score path, no fallback.
         union = self.eviction_mode == "union"
-        # Persistent gather index (per-head modes): per round only the
-        # token-start base is re-added in place; the expanded view is fixed.
+        # Per-head gather index: per round only the token-start base is re-added in place.
         self._gather_index_base = None
         self._gather_index = None
         if not union:
@@ -887,10 +873,10 @@ class TriAttention(KVCacheCompressionManager):
                 (max_requests, seq_len), dtype=torch.float32, device=device
             )
 
-        # ---- THE score path (no fallback): compiled per request-count/page-shard ----
+        # ---- score path: compiled per request-count/page-shard ----
         anchor_pool = p0
         sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
-        # One [stats_row, page_shard, {count, mean, m2}] record array.
+        # Per-shard partial score statistics.
         partial_stats_elements = (
             max_requests
             * self._num_layers
@@ -945,9 +931,7 @@ class TriAttention(KVCacheCompressionManager):
             _to_cute(anchor_pool),
             _to_cute(self._tma_descriptors, assumed_align=128),
         )
-        # Ctor-bound persistent launch operands (one from_dlpack wrap each):
-        # the round path refreshes their contents in place and launches with
-        # the active cohort size only.
+        # Ctor-bound persistent launch operands: refreshed in place each round.
         self._cute_mean_cos = _to_cute(self._mean_cos.view(-1))
         self._cute_mean_sin = _to_cute(self._mean_sin.view(-1))
         self._cute_union_scores = _to_cute(self._union_scores.view(-1)) if union else None
@@ -1120,7 +1104,7 @@ class TriAttention(KVCacheCompressionManager):
             self._provisional_rows = torch.zeros(
                 (max_requests, keep_count), dtype=torch.int32, device=device
             )
-            # Kept decode ordinals only (prompt-length independent rows).
+            # Kept decode ordinals.
             self._kept_ordinal_rows = torch.empty(
                 (max_requests, keep_count), dtype=torch.int32, device=device
             )
@@ -1347,9 +1331,7 @@ class TriAttention(KVCacheCompressionManager):
                     and not -0x80000000 <= min(values) <= max(values) <= 0x7FFFFFFF
                 ):
                     raise ValueError(f"staged metadata row {row} exceeds the int32 range")
-            # The one host-staging reuse fence: the previous cohort's async copies
-            # must complete before the pinned metadata rows AND the pinned
-            # target/draft block-offset snapshots are rewritten.
+            # Host-staging reuse fence: prior cohort's async copies must finish before the pinned rows are rewritten.
             self._staging_reuse_event.synchronize()
             host_table = self._request_metadata_host_np
             for row, values in rows:
@@ -1399,9 +1381,7 @@ class TriAttention(KVCacheCompressionManager):
                     num_warps=1,
                 )
                 if union:
-                    # THE union path: the fused score+stats entry, then the
-                    # normalized union reduction, straight off the ctor-bound
-                    # cute handles (only the active cohort size varies).
+                    # Union path: fused score+stats, then the normalized union reduction.
                     cu_stream = cuda_driver.CUstream(stream.cuda_stream)
                     self._compiled_score_stats[request_count](
                         *self._cute_score_prefix,
@@ -1493,16 +1473,7 @@ class TriAttention(KVCacheCompressionManager):
     # ---- helpers: calibration loading ----
 
     def _resolve_calibration(self) -> Dict[str, torch.Tensor]:
-        """Load the user-supplied calibration .pt and return our runtime schema.
-
-        TriAttention does NOT compute calibration -- the user calibrates with the
-        official tool (github.com/WeianMao/triattention) and passes that file via
-        ``calibration_path``; we only run inference. Both the official R-KV layout
-        (``{metadata, stats{"layerLL_headHH": {q_mean_real, q_mean_imag,
-        q_abs_mean}}}``) and our already-converted flat layout are accepted -- the
-        official one is converted here. Calibration resolves lazily on the
-        first request (``on_request_init``), not at manager construction, and
-        stays on CPU: runtime construction moves it to the pool device once."""
+        """Load the calibration file, converting the official layout if needed."""
         raw = torch.load(self.calibration_path, map_location="cpu", weights_only=False)
         if isinstance(raw, dict) and _REQUIRED_CALIBRATION_KEYS <= set(raw):
             return raw
@@ -1516,13 +1487,7 @@ class TriAttention(KVCacheCompressionManager):
         )
 
     def _convert_official_calibration(self, raw) -> Dict[str, torch.Tensor]:
-        """Convert the official per-(layer, head) stats to our flat runtime schema.
-
-        ``E_q[l,h] = q_mean_real + i*q_mean_imag`` and ``E_q_norm[l,h] =
-        q_abs_mean`` are the same statistic, just restacked into ``[L, H, F]``.
-        ``omega`` / ``freq_scale_sq`` are not in the official file (its runtime
-        recomputes them from the model rotary), so we derive them from the model
-        config -- model-intrinsic and corpus-independent."""
+        """Convert the official calibration format to the runtime schema."""
         stats = raw["stats"]
         meta = raw.get("metadata", {})
         if "sampled_heads" in meta:
@@ -1542,7 +1507,6 @@ class TriAttention(KVCacheCompressionManager):
             E_q[layer, h] = torch.complex(s["q_mean_real"].float(), s["q_mean_imag"].float())
             E_q_norm[layer, h] = s["q_abs_mean"].float()
         omega, freq_scale_sq = self._rope_tables(freq_count)
-        # CPU schema: runtime construction moves tensors to the pool device once.
         calib = {
             "E_q": E_q,
             "E_q_norm": E_q_norm,
@@ -1556,15 +1520,7 @@ class TriAttention(KVCacheCompressionManager):
         return calib
 
     def _rope_tables(self, freq_count: int):
-        """RoPE ``omega`` (inv_freq) + ``freq_scale_sq`` (squared position-0
-        amplitude) from the model config -- model-intrinsic, corpus-independent
-        (the official file does not store them). Reads both config generations:
-        transformers>=5.5 ``rope_parameters`` (rope_theta folded inside) and the
-        legacy top-level ``rope_scaling``/``rope_theta``. Plain RoPE uses the
-        standard formula with the resolved theta (attention_factor 1); scaled
-        variants (yarn, llama3, ...) go through transformers' rope-init so their
-        attention_factor is honored. The analytic fallback survives ONLY for
-        ImportError (rope-init module absent); every other failure raises."""
+        """Derive the RoPE frequency tables from the model config."""
         import transformers
         from transformers import AutoConfig
 

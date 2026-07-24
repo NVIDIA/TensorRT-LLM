@@ -15,13 +15,9 @@
 
 """Batched physical KV-cache compaction: an algorithm-neutral mover.
 
-``init_compaction_buffers`` agrees on the decision rows (kept ordinals;
-move offsets ride the caller's staged rows) once per geometry and returns
-opaque launch plans. The caller materializes its keep decision into the
-agreed rows each round, then ``compact`` loops the plans: each packs its
-family's move sources and fires its native launches. This module knows
-cache-family geometry and the decision format only; the plans' internals
-are private to it.
+``init_compaction_buffers`` returns opaque launch plans once per geometry;
+each round the caller writes its keep decision into the agreed rows and
+``compact`` packs every family's move sources and fires its native launches.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -49,10 +45,9 @@ def _pack_move_sources_kernel(
     SWA_WINDOW: tl.constexpr,
     BLOCK: tl.constexpr = 256,
 ):
-    """Pack one decision row into one family's move sources (increasing
-    kept ordinals; C++ in-place copy contract): dense rows forward the row
-    content verbatim for the first KEEP_COUNT moves, then append the
-    protected tail; SWA rows write latest-window ordinals once per KV head."""
+    """Pack one decision row into one family's move sources: dense rows emit the
+    kept tokens then the protected tail; SWA rows emit the latest window
+    (ascending order: the native copy moves in place)."""
     BROADCAST: tl.constexpr = DECISION_ROWS == 1
     HAS_SWA: tl.constexpr = SWA_TOTAL > 0
     request = tl.program_id(0)
@@ -188,9 +183,7 @@ def init_compaction_buffers(
     if swa_move_indices is not None:
         move_capacity = max(move_capacity, swa_window + protected_tail_capacity)
 
-    # Families: (entries, pool ids, move indices, move offsets, destination
-    # bases, per-layer slots, is_draft). One grouping loop below batches each
-    # family into per-pool native-operand records (all init-time construction).
+    # One move-descriptor tuple per cache family (dense / SWA / draft).
     families = [
         (
             dense_entries,

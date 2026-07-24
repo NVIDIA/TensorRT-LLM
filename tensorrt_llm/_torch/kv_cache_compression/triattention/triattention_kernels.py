@@ -222,10 +222,8 @@ def _settle_ties_kernel(
     SELECTION_ROWS: tl.constexpr,
     BLOCK: tl.constexpr = 256,
 ):
-    """Settle one selection row's ties into its kept-ordinal output row
-    (threshold recovery with sentinel-skip, strictly-greater count,
-    lowest-index tie quota, ascending prompt-rebased emission; entries past
-    the emitted count keep their previous value)."""
+    """Settle one selection row's score ties into its final kept-token row
+    (deterministic lowest-index tie break, ascending output)."""
     request = tl.program_id(0)
     selection_domain = tl.program_id(1)
     row = request * SELECTION_ROWS + selection_domain
