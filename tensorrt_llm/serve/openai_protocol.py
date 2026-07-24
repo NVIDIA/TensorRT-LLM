@@ -847,7 +847,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     tools: Optional[List[ChatCompletionToolsParam]] = None
-    tool_choice: Optional[Union[Literal["none", "auto"],
+    tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
@@ -1042,9 +1042,24 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if "tool_choice" not in data and data.get("tools"):
             data["tool_choice"] = "auto"
         if "tool_choice" in data and data["tool_choice"] != "none":
-            if "tools" not in data or data["tools"] is None:
+            tools = data.get("tools")
+            if not tools:
                 raise ValueError(
                     "When using `tool_choice`, `tools` must be set.")
+            choice = data["tool_choice"]
+            if isinstance(choice, dict) and choice.get("type") == "function":
+                requested_name = choice.get("function", {}).get("name")
+                if requested_name:
+                    available_names = {
+                        tool.get("function", {}).get("name")
+                        for tool in tools if isinstance(tool, dict)
+                    }
+                    available_names.discard(None)
+                    if requested_name not in available_names:
+                        raise ValueError(
+                            f"tool_choice specifies function "
+                            f"'{requested_name}' which is not present in "
+                            "`tools`.")
         return data
 
     @model_validator(mode="before")
