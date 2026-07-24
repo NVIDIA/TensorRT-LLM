@@ -2231,22 +2231,39 @@ def test_v2_hybrid_replay_bookkeeping_matches_checkpoint_predicate(monkeypatch):
         lambda *args, **kwargs: None,
     )
     try:
+        # Derive the checkpoint threshold from the manager's own replay
+        # metadata instead of hardcoding it: replay_history_size is
+        # max(MIN_REPLAY_HISTORY_SIZE, tokens_per_gen_step), so the boundary
+        # is not simply tokens_per_gen_step.
+        replay_metadata = mgr.get_replay_state_update_metadata()
+        step_width = replay_metadata.replay_step_width
+        history_size = replay_metadata.replay_history_size
+
         slot = torch.tensor([0], dtype=torch.int32, device="cuda")
         attn_metadata = SimpleNamespace(num_seqs=1, num_contexts=0)
 
-        mgr.update_mamba_states(
-            attn_metadata,
-            torch.tensor([3], dtype=torch.int32, device="cuda"),
-            state_indices=slot,
-        )
-        assert mgr.prev_num_accepted_tokens[0].item() == 3
-        assert mgr.cache_buf_idx[0].item() == 0
+        def advance(accepted):
+            mgr.update_mamba_states(
+                attn_metadata,
+                torch.tensor([accepted], dtype=torch.int32, device="cuda"),
+                state_indices=slot,
+            )
 
-        mgr.update_mamba_states(
-            attn_metadata,
-            torch.tensor([2], dtype=torch.int32, device="cuda"),
-            state_indices=slot,
-        )
+        # Accumulate below the checkpoint threshold: while
+        # prev + step_width <= history_size the manager keeps writing into the
+        # same cache_buf_idx and grows prev_num_accepted_tokens monotonically.
+        prev = 0
+        while prev + step_width <= history_size:
+            advance(1)
+            prev += 1
+            assert mgr.prev_num_accepted_tokens[0].item() == prev
+            assert mgr.cache_buf_idx[0].item() == 0
+
+        # The next step crosses the threshold (prev + step_width > history_size):
+        # the manager starts a fresh checkpoint, resetting
+        # prev_num_accepted_tokens to the accepted count and flipping
+        # cache_buf_idx to the other buffer.
+        advance(2)
         assert mgr.prev_num_accepted_tokens[0].item() == 2
         assert mgr.cache_buf_idx[0].item() == 1
     finally:
