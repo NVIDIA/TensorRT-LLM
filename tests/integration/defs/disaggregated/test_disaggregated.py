@@ -1523,9 +1523,15 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
         # Use helper function to validate all timing metrics comprehensively
         validate_timing_metrics(item, "perf_metrics test")
 
+    # Python V2 does not yet populate KV-cache transfer timestamps. Force
+    # DEFAULT to UCX so this timing-metrics test continues to use C++.
+    env = llm_venv._new_env | {
+        "TRTLLM_USE_NIXL_KVCACHE": "0",
+        "TRTLLM_USE_UCX_KVCACHE": "1",
+    }
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
-                           env=llm_venv._new_env,
+                           env=env,
                            extra_endpoints_test=extra_endpoints_test,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory(),
