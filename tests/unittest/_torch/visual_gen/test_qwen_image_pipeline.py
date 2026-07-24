@@ -10,7 +10,7 @@ true-CFG path (dual cond/uncond forward plus the norm-preserving CFG
 combination) and the non-CFG path, on CPU.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -226,20 +226,28 @@ def test_forward_runs_true_cfg_pipeline():
 def test_forward_honors_profile_step_range():
     pipe, _ = _pipeline_with_test_doubles()
     pipe._profile_range = (frozenset({0}), frozenset({1}))
-    pipe._cuda_profiler_start = MagicMock()
-    pipe._cuda_profiler_stop = MagicMock()
+    pipe._torch_profiler = MagicMock()
+    pipe._torch_profile_trace_path = "visual-gen-trace-rank-0.json"
+    cudart = MagicMock()
 
-    pipe.forward(
-        prompt=["a cat"],
-        negative_prompt=None,
-        height=32,
-        width=48,
-        num_inference_steps=2,
-        true_cfg_scale=1.0,
-        seed=123,
-        max_sequence_length=16,
-        sigmas=[1.0, 0.5],
-    )
+    with patch(
+        "tensorrt_llm._torch.visual_gen.pipeline.torch.cuda.cudart",
+        return_value=cudart,
+    ):
+        pipe.forward(
+            prompt=["a cat"],
+            negative_prompt=None,
+            height=32,
+            width=48,
+            num_inference_steps=2,
+            true_cfg_scale=1.0,
+            seed=123,
+            max_sequence_length=16,
+            sigmas=[1.0, 0.5],
+        )
 
-    pipe._cuda_profiler_start.assert_called_once_with()
-    pipe._cuda_profiler_stop.assert_called_once_with()
+    cudart.cudaProfilerStart.assert_called_once_with()
+    pipe._torch_profiler.start.assert_called_once_with()
+    pipe._torch_profiler.stop.assert_called_once_with()
+    pipe._torch_profiler.export_chrome_trace.assert_called_once_with("visual-gen-trace-rank-0.json")
+    cudart.cudaProfilerStop.assert_called_once_with()
