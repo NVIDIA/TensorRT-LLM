@@ -64,6 +64,7 @@ Outputs (g_cumsum stays in SMEM, not written to GMEM):
   A_kk       [B,T,H,BT]  fp32  block-transposed upper-tri (input to akk_inv)
 """
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import for_generate, yield_out
@@ -958,9 +959,9 @@ def fused_kernel123(
     qk_smem_layout,
     g_smem_layout,
     g_cumsum_layout,
-    num_chunks: int,
-    num_heads: int,
-    batch_size: int,
+    num_chunks: cutlass.Int32,  # runtime — shape-independent compile
+    num_heads: int,  # baked (single variant in practice)
+    batch_size: cutlass.Int32,  # runtime — shape-independent compile
     mCuSeqlens: cute.Tensor,
     mChunkIndices: cute.Tensor,
     IS_VARLEN: cutlass.Constexpr[int],
@@ -1015,10 +1016,10 @@ def fused_kernel123(
     sAkk = smem.allocate_tensor(cutlass.BFloat16, akk_tile_layout, 128)
     # sAkk_pkd / sTemp removed: akk_inv runs as a separate kernel call (chained back-to-back).
 
-    # sBeta: chunk's 64 beta values staged in SMEM. K1 reads from here in inner loop
-    # to reduce register pressure / avoid repeated gmem broadcast.
-    beta_smem_layout = cute.make_layout((BT, NUM_STAGES), stride=(1, BT))
-    sBeta = smem.allocate_tensor(cutlass.BFloat16, beta_smem_layout, 128)
+    # sBeta staging removed: its only consumer (K1 Pass 2b) moved beta fusion
+    # into the akk_inv epilogue, and the dead staging loop kept reading
+    # mBeta[chunk_start .. chunk_start+63] unguarded — OOB past the tensor
+    # end for the final partial chunk of a varlen batch.
 
     # =====================================================================
     # Mbarrier allocation & init
@@ -1177,15 +1178,6 @@ def fused_kernel123(
                 csGcum = sGcum[(None, None, cur_stage)]
                 csQ = sQ[(None, None, cur_stage)]
                 csK = sK[(None, None, cur_stage)]
-                csBeta = sBeta[(None, cur_stage)]
-
-                # Stage chunk's 64 beta values to SMEM (warp 0 of K1 group, 32 threads × 2).
-                # Synced via the existing k1_internal_barrier() before Pass 2b reads it.
-                if k1_warp == 0:
-                    for _bi in cutlass.range_constexpr(BT // 32):
-                        _idx = _bi * 32 + _lane
-                        csBeta[_idx] = mBeta[i_b, chunk_start + _idx, i_h]
-
                 rGact = cute.make_rmem_tensor(
                     cute.make_layout((ROWS_PER_K1_WARP, VEC)), cutlass.Float32
                 )
@@ -1294,9 +1286,6 @@ def fused_kernel123(
                     tCsQ = thr_copy_k1.partition_S(sQ_tile)
                     tCrQ = cute.make_fragment_like(tCsQ)
                     cute.copy(tiled_copy_qk_k1, tCsQ, thr_copy_k1.retile(tCrQ))
-
-                    # Read beta from SMEM (staged once per chunk by warp 0).
-                    # beta_val = cutlass.Float32(csBeta[row])
 
                     for vi in cutlass.range_constexpr(VEC):
                         rAcc[vi] = rAcc[vi] + rGact[ri, vi]
@@ -1496,6 +1485,7 @@ def fused_kernel123(
                 phase = chunk_iter // NUM_STAGES % 2
                 chunk_idx = chunk_base + chunk_iter
                 chunk_start = cutlass.Int32(0)
+                mma_eos = cutlass.Int32(0)
                 if IS_VARLEN:
                     if chunk_idx < num_chunks:
                         _sid = cutlass.Int32(mChunkIndices[chunk_idx, 0])
@@ -1503,6 +1493,7 @@ def fused_kernel123(
                             cutlass.Int32(mCuSeqlens[_sid])
                             + cutlass.Int32(mChunkIndices[chunk_idx, 1]) * BT
                         )
+                        mma_eos = cutlass.Int32(mCuSeqlens[_sid + 1])
                 else:
                     chunk_start = chunk_idx * BT
 
@@ -1518,8 +1509,31 @@ def fused_kernel123(
 
                     _z = cutlass.Float32(0.0)
 
-                    beta_row0 = mBeta[i_b, chunk_start + q_row_base + row0, i_h].to(cutlass.Float32)
-                    beta_row1 = mBeta[i_b, chunk_start + q_row_base + row1, i_h].to(cutlass.Float32)
+                    # Varlen non-pure: a partial chunk's rows past the
+                    # sequence end must not be read — for the batch's final
+                    # chunk they lie past the end of the beta tensor
+                    # entirely (OOB read; NaN/IMA under memory pressure).
+                    # Their A-row contributions are discarded downstream, so
+                    # beta=0 is safe. Eqlen and VARLEN_PURE inputs are
+                    # padded/aligned upstream — load unconditionally there.
+                    beta_row0 = _z
+                    beta_row1 = _z
+                    if IS_VARLEN and not VARLEN_PURE:
+                        if chunk_start + q_row_base + row0 < mma_eos:
+                            beta_row0 = mBeta[
+                                i_b, chunk_start + q_row_base + row0, i_h
+                            ].to(cutlass.Float32)
+                        if chunk_start + q_row_base + row1 < mma_eos:
+                            beta_row1 = mBeta[
+                                i_b, chunk_start + q_row_base + row1, i_h
+                            ].to(cutlass.Float32)
+                    else:
+                        beta_row0 = mBeta[
+                            i_b, chunk_start + q_row_base + row0, i_h
+                        ].to(cutlass.Float32)
+                        beta_row1 = mBeta[
+                            i_b, chunk_start + q_row_base + row1, i_h
+                        ].to(cutlass.Float32)
 
                     acc_aqk_n0_0, acc_aqk_n0_1, acc_aqk_n0_2, acc_aqk_n0_3 = _z, _z, _z, _z
                     acc_aqk_n1_0, acc_aqk_n1_1, acc_aqk_n1_2, acc_aqk_n1_3 = _z, _z, _z, _z
@@ -2078,25 +2092,21 @@ def make_host_function(
     Store row mask) are guaranteed to never fire and are dead-code eliminated
     at compile time. Caller's data layout is unchanged — this is a hint only.
     """
-    _B, _NT, _H = B, NT, H
+    _H = H
     _IS_VARLEN = 1 if is_varlen else 0
     _HAS_BIAS = 1 if has_bias else 0
     _USE_SAFE_GATE = 1 if use_safe_gate else 0
     _VARLEN_PURE = 1 if (is_varlen and varlen_pure) else 0
     if is_varlen:
-        assert _B == 1, "Varlen requires B=1"
+        assert B == 1, "Varlen requires B=1"
         assert T_padded is not None, "T_padded required for varlen"
-        _T = T_padded
-    else:
-        _T = _NT * BT
 
-    if is_varlen:
-        _total_cgs_val = ((_NT + CHUNKS_PER_BLOCK - 1) // CHUNKS_PER_BLOCK) * _H
-    else:
-        _total_cgs_val = (_NT // CHUNKS_PER_BLOCK) * _H * _B
-
-    # 3D TMA view: (B*T, K_DIM, H) — domain_offset handles non-aligned addressing
-    _T_total = _B * _T
+    # B / NT / T are RUNTIME arguments of host_fn (rt_b / rt_nt /
+    # rt_t_total below), not closure constants: baking them keyed every
+    # compiled kernel to the batch shape, and eval traffic (a distinct
+    # total token count per prefill batch) recompiled ~100 s per batch —
+    # observed as GSM8K "hangs" (0/1319 responses). Only genuine constexpr
+    # specializers (H, is_varlen, bias/gate/pure variants) stay baked.
     s_row = _H * K_DIM
     s_col = 1
     s_h = K_DIM
@@ -2119,11 +2129,20 @@ def make_host_function(
         mChunkIndices,
         mDtBias,
         lower_bound_val,
+        rt_nt: cutlass.Int32,
+        rt_b: cutlass.Int32,
+        rt_t_total: cutlass.Int32,
+        # Launch stream — a runtime argument (the executor runs the model on
+        # a dedicated non-blocking torch stream; launching on the DSL default
+        # stream races with the caller's stream). See _launch_fused_k123_inv.
+        stream: cuda.CUstream,
     ):
         # 3D TMA view: (B*T, K_DIM, H). domain_offset in kernel shifts to
         # arbitrary chunk_start — no BT alignment required for varlen.
+        # Dynamic T extent: the TMA tensormap is materialized per call from
+        # the runtime shape, so one compiled host_fn serves every batch.
         view_layout_3d = cute.make_layout(
-            (_T_total, K_DIM, _H),
+            (rt_t_total, K_DIM, _H),
             stride=(s_row, s_col, s_h),
         )
         mQ_view = cute.make_tensor(mQ.iterator, view_layout_3d)
@@ -2163,9 +2182,15 @@ def make_host_function(
             val_layout=cute.make_layout((1, 2)),
         )
 
+        # The v2 views are indexed [i_b, per-batch row, ...] by the kernel,
+        # so their T extent / batch stride must be PER-BATCH T, not the flat
+        # B*T used by the 3D TMA view above. Using rt_t_total here sent every
+        # i_b > 0 store rt_b× too far (OOB writes + parity failure for the
+        # eqlen B=2 path; varlen is B=1 so it never noticed).
+        rt_t_pb = rt_t_total // rt_b
         out_v2_layout = cute.make_layout(
-            (_B, _T, _H, K_VEC, VEC),
-            stride=(_T * _H * K_DIM, _H * K_DIM, K_DIM, VEC, 1),
+            (rt_b, rt_t_pb, _H, K_VEC, VEC),
+            stride=(rt_t_pb * _H * K_DIM, _H * K_DIM, K_DIM, VEC, 1),
         )
         mKscaled_v2 = cute.make_tensor(mKscaled.iterator, out_v2_layout)
         mQscaled_v2 = cute.make_tensor(mQscaled.iterator, out_v2_layout)
@@ -2177,15 +2202,15 @@ def make_host_function(
         # STG.E.32 with 32 lanes coalesced to 1 cache line per row.
         BT_VEC = BT // VEC  # 32
         akk_v2_layout = cute.make_layout(
-            (_B, _T, _H, BT_VEC, VEC),
-            stride=(_T * _H * BT, _H * BT, BT, VEC, 1),
+            (rt_b, rt_t_pb, _H, BT_VEC, VEC),
+            stride=(rt_t_pb * _H * BT, _H * BT, BT, VEC, 1),
         )
         mAqk_v2 = cute.make_tensor(mAqk.iterator, akk_v2_layout)
         mAkk_v2 = cute.make_tensor(mAkk.iterator, akk_v2_layout)
 
         gklast_v2_layout = cute.make_layout(
-            (_B, _NT, _H, K_VEC, VEC),
-            stride=(_NT * _H * K_DIM, _H * K_DIM, K_DIM, VEC, 1),
+            (rt_b, rt_nt, _H, K_VEC, VEC),
+            stride=(rt_nt * _H * K_DIM, _H * K_DIM, K_DIM, VEC, 1),
         )
         mGkLast_v2 = cute.make_tensor(mGkLast.iterator, gklast_v2_layout)
 
@@ -2221,7 +2246,10 @@ def make_host_function(
             + 512
         )
 
-        _grid_x = min(NUM_SMS, _total_cgs_val)
+        # Constant grid: the persistent for_generate loop bounds work by the
+        # runtime total_cgs, so blocks past the work count exit immediately.
+        # (A shape-dependent min() here would re-bake the grid per NT.)
+        _grid_x = NUM_SMS
 
         fused_kernel123(
             tma_atom_Q,
@@ -2250,9 +2278,9 @@ def make_host_function(
             qk_smem_3d,
             g_smem_3d,
             g_cumsum_layout,
-            _NT,
+            rt_nt,
             _H,
-            _B,
+            rt_b,
             mCuSeqlens,
             mChunkIndices,
             _IS_VARLEN,
@@ -2265,6 +2293,7 @@ def make_host_function(
             grid=(_grid_x, 1, 1),
             block=(THREADS, 1, 1),
             smem=smem_size,
+            stream=stream,
         )
 
     return host_fn

@@ -137,6 +137,8 @@ srun --mpi=pmix \
         
         # Log a running partial score every N completed responses (0 = off).
         export TLLM_EVAL_PARTIAL_SCORES_EVERY=\"\${TLLM_EVAL_PARTIAL_SCORES_EVERY:-100}\"
+        # Cap in-flight requests: may cost some throughput vs submit-all, but yields steady partial scores (early failure signal) instead of one burst at the end (0 = off).
+        export TLLM_EVAL_MAX_IN_FLIGHT=\"\${TLLM_EVAL_MAX_IN_FLIGHT:-512}\"
 
         exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' python3 \
             '$REPO/.venv-3.12/bin/trtllm-eval' \
