@@ -104,6 +104,55 @@ public:
     }
 };
 
+namespace
+{
+
+template <typename T>
+struct OpCustomHash : public std::hash<T>
+{
+};
+
+template <class T>
+inline size_t hash_combine(size_t hash, T const& value)
+{
+    static constexpr size_t seed = 0x9e3779b9ULL;
+    using RemoveCVRefT = std::remove_cv_t<std::remove_reference_t<T>>;
+    return OpCustomHash<RemoveCVRefT>{}(value) + seed + (hash << 6) + (hash >> 2);
+}
+
+template <typename T>
+struct OpCustomHash<std::set<T>>
+{
+    size_t operator()(std::set<T> const& s) const
+    {
+        size_t hash_value = 0;
+        for (auto const& item : s)
+        {
+            // Recursively hash each element
+            hash_value ^= hash_combine(hash_value, item);
+        }
+        return hash_value;
+    }
+};
+
+template <class... Args>
+class OpCustomHash<std::tuple<Args...>>
+{
+    template <std::size_t... Idx>
+    static size_t hash_impl(std::tuple<Args...> const& t, std::integer_sequence<std::size_t, Idx...>)
+    {
+        size_t value = 0;
+        return ((value ^= hash_combine(value, std::get<Idx>(t))), ...);
+    }
+
+public:
+    size_t operator()(std::tuple<Args...> const& t) const
+    {
+        return hash_impl(t, std::make_index_sequence<sizeof...(Args)>{});
+    }
+};
+} // namespace
+
 // for testing only
 void const* getCommSessionHandle();
 } // namespace common::op
@@ -141,48 +190,7 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 std::shared_ptr<cublasHandle_t> getCublasHandle();
 std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
 
-namespace
-{
-template <class T>
-inline size_t hash_combine(size_t hash, T const& value)
-{
-    static constexpr size_t seed = 0x9e3779b9ULL;
-    return std::hash<std::remove_cv_t<std::remove_reference_t<T>>>{}(value) + seed + (hash << 6) + (hash >> 2);
-}
-} // namespace
-
 TRTLLM_NAMESPACE_END
-
-template <typename T>
-struct std::hash<std::set<T>>
-{
-    size_t operator()(std::set<T> const& s) const
-    {
-        size_t hash_value = 0;
-        for (auto const& item : s)
-        {
-            // Recursively hash each element
-            hash_value ^= tensorrt_llm::hash_combine(hash_value, item);
-        }
-        return hash_value;
-    }
-};
-
-template <class... Args>
-struct std::hash<std::tuple<Args...>>
-{
-    template <std::size_t... Idx>
-    static size_t hash_impl(std::tuple<Args...> const& t, std::integer_sequence<std::size_t, Idx...>)
-    {
-        size_t value = 0;
-        return ((value ^= tensorrt_llm::hash_combine(value, std::get<Idx>(t))), ...);
-    }
-
-    size_t operator()(std::tuple<Args...> const& t) const
-    {
-        return hash_impl(t, std::make_index_sequence<sizeof...(Args)>{});
-    }
-};
 
 #ifndef DEBUG
 
