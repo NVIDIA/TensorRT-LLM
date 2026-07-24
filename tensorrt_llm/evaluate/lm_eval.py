@@ -321,7 +321,8 @@ class LmEvalWrapper(TemplateLM):
                                              streaming=self.streaming)
             return pool.submit(lambda: (idx, output.result()))
 
-        pbar = tqdm(total=total, desc="Fetching responses (windowed)",
+        pbar = tqdm(total=total,
+                    desc="Fetching responses (windowed)",
                     disable=disable_tqdm)
         try:
             with concurrent.futures.ThreadPoolExecutor(
@@ -332,8 +333,7 @@ class LmEvalWrapper(TemplateLM):
                 }
                 while pending:
                     done, pending = concurrent.futures.wait(
-                        pending,
-                        return_when=concurrent.futures.FIRST_COMPLETED)
+                        pending, return_when=concurrent.futures.FIRST_COMPLETED)
                     for fut in done:
                         # A failed request re-raises here (same as the
                         # non-windowed path's output.result()); no deadlock —
@@ -345,8 +345,7 @@ class LmEvalWrapper(TemplateLM):
                         done_count += 1
                         pbar.update(1)
                         if scorer is not None:
-                            scorer.update(requests[idx],
-                                          output.outputs[0].text)
+                            scorer.update(requests[idx], output.outputs[0].text)
                             scorer.maybe_log(done_count, total)
                         if next_idx < total:
                             pending.add(_submit_next(pool))
@@ -383,7 +382,8 @@ class LmEvalWrapper(TemplateLM):
 
             outputs = []
             for output, request in zip(
-                    tqdm(results, desc="Fetching responses",
+                    tqdm(results,
+                         desc="Fetching responses",
                          disable=disable_tqdm), requests):
                 outputs.append(output.result())
                 if scorer is not None:
