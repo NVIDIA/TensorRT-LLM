@@ -28,7 +28,6 @@ import time
 import urllib.request
 import zipfile
 
-import numpy as np
 import pytest
 import torch
 import torch._inductor.config as inductor_config
@@ -854,8 +853,8 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
 
     Returns the generated video tensor ``(B, T, H, W, C)`` (T == ``num_frames``),
     or ``None`` if generation produced no video.  ``num_frames=1`` yields the
-    single-frame text-to-image path; passing ``video`` (a uint8 [T, H, W, C]
-    conditioning-window tensor) yields the video-to-video path.
+    single-frame text-to-image path; passing ``video`` (encoded MP4 bytes,
+    decoded on the worker's NVDEC) yields the video-to-video path.
     """
     # Cosmos3 re-reads the guardrail flag in __init__; set it before the pipeline loads.
     guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
@@ -914,21 +913,20 @@ def _generate_cosmos3_lpips_video(output_path):
     _save_lpips_video_mp4(video, output_path, frame_rate=COSMOS3_LPIPS_FRAME_RATE)
 
 
-def _synthesize_cosmos3_v2v_lpips_reference():
-    """Deterministic 5-frame 720p conditioning window.
+# 5-frame 720p conditioning window (the default
+# ``max(condition_video_latent_indexes) * 4 + 1``): gray background with a
+# block moving 40 px/frame — a real structure signal. Encoded once offline
+# with ffmpeg/libx264 (H.264 decode is bit-exact by spec, so NVDEC output is
+# deterministic across machines); provenance in test_data/README.md.
+COSMOS3_LPIPS_V2V_REFERENCE_MP4 = os.path.join(
+    os.path.dirname(__file__), "test_data", "cosmos3_v2v_lpips_reference.mp4"
+)
 
-    Five frames is the default window (``max(condition_video_latent_indexes)
-    * 4 + 1``). Built directly as a tensor — no codec round-trip — so it is
-    bit-identical on every machine and OpenCV build; a moving block gives the
-    conditioning a real structure signal.
-    """
-    frames = []
-    for i in range(5):
-        frame = np.full((COSMOS3_LPIPS_HEIGHT, COSMOS3_LPIPS_WIDTH, 3), 30, dtype=np.uint8)
-        x = 100 + i * 40
-        frame[200:520, x : x + 200] = (200, 120, 40)
-        frames.append(frame)
-    return torch.from_numpy(np.stack(frames))
+
+def _cosmos3_v2v_lpips_reference_bytes():
+    _skip_if_missing(COSMOS3_LPIPS_V2V_REFERENCE_MP4, "Cosmos3 V2V LPIPS reference fixture")
+    with open(COSMOS3_LPIPS_V2V_REFERENCE_MP4, "rb") as f:
+        return f.read()
 
 
 def _generate_cosmos3_v2v_lpips_frame(output_path):
@@ -944,7 +942,7 @@ def _generate_cosmos3_v2v_lpips_frame(output_path):
     from tensorrt_llm.media.encoding import save_image
 
     video = _run_cosmos3_lpips_pipeline(
-        COSMOS3_LPIPS_V2V_NUM_FRAMES, video=_synthesize_cosmos3_v2v_lpips_reference()
+        COSMOS3_LPIPS_V2V_NUM_FRAMES, video=_cosmos3_v2v_lpips_reference_bytes()
     )
     assert video is not None, "Cosmos3-Nano V2V LPIPS run produced no video"
     # video is (B, T, H, W, C); take the free frame -> (H, W, C) for save_image.
