@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import time
 import uuid
@@ -41,6 +44,12 @@ from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
+
+_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED = os.getenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS") == "1"
+
+
+def _is_disagg_transfer_diagnostics_enabled() -> bool:
+    return _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
@@ -102,6 +111,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_sessions: Dict[int, RxSessionBase] = {}
         self._send_reqs = {}
         self._recv_reqs = {}
+        self._diagnostic_ready_rids = set() if _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED else None
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
         # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
@@ -671,6 +681,44 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._poll_gen_sessions_for_poll_interval(wait_num)
 
         local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+        diagnostic_ready_rids = getattr(self, "_diagnostic_ready_rids", None)
+        if _is_disagg_transfer_diagnostics_enabled():
+            assert diagnostic_ready_rids is not None
+            for rid in local_completed:
+                if rid in diagnostic_ready_rids:
+                    continue
+                session = self._recv_sessions[rid]
+                service_start_time = getattr(session, "kv_transfer_start_time_s", None)
+                ready_time = getattr(session, "kv_ready_time_s", None)
+                if ready_time is None:
+                    diagnostic_ready_rids.add(rid)
+                    logger.warning(
+                        "[DISAGG_DIAG][python-transfer] "
+                        f"rank={self._dist.rank} action=missing-native-timestamp "
+                        f"request={self._recv_reqs[rid].py_request_id}"
+                    )
+                    continue
+                req = self._recv_reqs[rid]
+                if service_start_time is not None:
+                    req.py_kv_transfer_service_start_time_s = service_start_time
+                req.py_kv_transfer_ready_time_s = ready_time
+                diagnostic_ready_rids.add(rid)
+                service_ms = (
+                    (ready_time - service_start_time) * 1000
+                    if service_start_time is not None
+                    else -1.0
+                )
+                diagnostic_service_start_time = (
+                    service_start_time if service_start_time is not None else -1.0
+                )
+                logger.info(
+                    "[DISAGG_DIAG][python-transfer] "
+                    f"t={ready_time:.9f} rank={self._dist.rank} "
+                    f"action=local-ready request={req.py_request_id} "
+                    f"bytes={getattr(req, 'py_kv_cache_xfer_bytes', 0)} "
+                    f"service_start_t={diagnostic_service_start_time:.9f} "
+                    f"service_ms={service_ms:.3f}"
+                )
         to_process = self._build_to_process(
             self._recv_sessions,
             self._gen_consensus(local_completed + local_failed),
@@ -710,6 +758,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._recv_sessions[rid].close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+            if diagnostic_ready_rids is not None:
+                diagnostic_ready_rids.discard(rid)
 
         # Log gen-side transfer summary after consensus.
         if completed and os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH"):
@@ -737,12 +787,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session.close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+            if diagnostic_ready_rids is not None:
+                diagnostic_ready_rids.discard(rid)
         if failed:
             logger.warning(
                 f"Disagg gen transfer FAILED rank={self._dist.rank} "
                 f"rids={failed} gen_need_sync={self._gen_need_sync}"
             )
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
+        if diagnostic_ready_rids is not None:
+            for rid in failed:
+                diagnostic_ready_rids.discard(rid)
 
         return completed, failed, cancelled_reqs
 

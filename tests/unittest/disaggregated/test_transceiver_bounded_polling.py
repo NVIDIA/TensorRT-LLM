@@ -17,13 +17,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Optional
 from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
-from tensorrt_llm._torch.disaggregation.native.transfer import TaskStatus, TxSession
+from tensorrt_llm._torch.disaggregation.native import transfer as native_transfer_module
+from tensorrt_llm._torch.disaggregation.native.transfer import (
+    KVRecvTask,
+    RxSession,
+    TaskStatus,
+    TxSession,
+)
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm.bindings import LlmRequestState
 
@@ -50,12 +58,16 @@ class _FakeSession:
         status: SessionStatus = SessionStatus.READY,
         is_completed: bool = False,
         has_failed: bool = False,
+        kv_transfer_start_time_s: Optional[float] = None,
+        kv_ready_time_s: Optional[float] = None,
     ) -> None:
         self._rid = rid
         self._wait_result = wait_result
         self._status = status
         self._is_completed = is_completed
         self._has_failed = has_failed
+        self.kv_transfer_start_time_s = kv_transfer_start_time_s
+        self.kv_ready_time_s = kv_ready_time_s
         self.blocking_calls: list[bool] = []
         self.closed = False
 
@@ -245,6 +257,91 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     assert failed == []
     assert cancelled == []
     transceiver._gen_consensus.assert_called_once_with([])
+
+
+def test_gen_transfer_status_stamps_first_local_ready_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+    monkeypatch.setattr(transceiver_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    log_info = Mock()
+    monkeypatch.setattr(transceiver_module.logger, "info", log_info)
+    session = _FakeSession(
+        rid=21,
+        wait_result=WaitResult.COMPLETED,
+        is_completed=True,
+        kv_transfer_start_time_s=10.25,
+        kv_ready_time_s=12.5,
+    )
+    request = Mock(
+        py_request_id=21,
+        py_kv_cache_xfer_bytes=8192,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver._recv_sessions = {21: session}
+    transceiver._recv_reqs = {21: request}
+    transceiver._diagnostic_ready_rids = set()
+    transceiver._dist = Mock(rank=2)
+    transceiver._collect_done = Mock(return_value=([21], []))
+    transceiver._gen_consensus = Mock(return_value=[21])
+    transceiver._build_to_process = Mock(return_value=[21])
+    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [21]))
+    transceiver._need_aux_transfer = Mock(return_value=False)
+    transceiver._assert_disagg_history_declared = Mock()
+    transceiver._close_failed_sessions = Mock()
+
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
+
+    assert completed == [21]
+    assert failed == []
+    assert cancelled == []
+    assert request.py_kv_transfer_service_start_time_s == 10.25
+    assert request.py_kv_transfer_ready_time_s == 12.5
+    message = log_info.call_args.args[0]
+    assert "[DISAGG_DIAG][python-transfer]" in message
+    assert "rank=2" in message
+    assert "request=21" in message
+    assert "bytes=8192" in message
+    assert "service_start_t=10.250000000" in message
+    assert "service_ms=2250.000" in message
+
+
+def test_kv_recv_task_records_native_transfer_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+    monkeypatch.setattr(native_transfer_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    timestamps = iter((timedelta(seconds=3.25), timedelta(seconds=4.75)))
+    monkeypatch.setattr(
+        native_transfer_module.tensorrt_llm.bindings,
+        "steady_clock_now",
+        lambda: next(timestamps),
+    )
+    task = KVRecvTask(17, Mock(), 0, Mock(), None)
+
+    task.mark_transferring()
+    task.mark_transferring()
+    task.complete()
+
+    assert task.transfer_start_time_s == 3.25
+    assert task.completion_time_s == 4.75
+    assert task.status == TaskStatus.TRANSFERRED
+
+
+def test_rx_session_aggregates_native_task_timestamps() -> None:
+    session = object.__new__(RxSession)
+    first_task = Mock(transfer_start_time_s=2.5, completion_time_s=7.0)
+    second_task = Mock(transfer_start_time_s=3.0, completion_time_s=8.25)
+    session._kv_tasks = [first_task, second_task]
+
+    assert session.kv_transfer_start_time_s == 2.5
+    assert session.kv_ready_time_s == 8.25
+
+    second_task.completion_time_s = None
+    assert session.kv_ready_time_s is None
 
 
 def test_consensus_outcome_uses_single_batched_allgather() -> None:

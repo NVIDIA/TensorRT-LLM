@@ -78,6 +78,7 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
 # Number of worker threads for KV transfer queues (default: 1)
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
+_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED = os.getenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS") == "1"
 
 
 @dataclass
@@ -1424,6 +1425,17 @@ class KVRecvTask:
         self._exception: Optional[Exception] = None
         self._aux_slot = aux_slot
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
+        if _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            self.transfer_start_time_s: Optional[float] = None
+            self.completion_time_s: Optional[float] = None
+
+    def mark_transferring(self) -> None:
+        if (
+            _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+            and getattr(self, "transfer_start_time_s", None) is None
+        ):
+            self.transfer_start_time_s = tensorrt_llm.bindings.steady_clock_now().total_seconds()
+        self.status = TaskStatus.TRANSFERRING
 
     def fail(self, exc: Exception) -> None:
         self._exception = exc
@@ -1431,6 +1443,11 @@ class KVRecvTask:
         self._event.set()
 
     def complete(self) -> None:
+        if (
+            _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+            and getattr(self, "completion_time_s", None) is None
+        ):
+            self.completion_time_s = tensorrt_llm.bindings.steady_clock_now().total_seconds()
         self.status = TaskStatus.TRANSFERRED
         self._event.set()
 
@@ -1862,7 +1879,23 @@ class RxSession(RxSessionBase):
 
     def mark_transferring(self, slice_id: int):
         with self.lock:
-            self._kv_tasks[slice_id].status = TaskStatus.TRANSFERRING
+            self._kv_tasks[slice_id].mark_transferring()
+
+    @property
+    def kv_transfer_start_time_s(self) -> Optional[float]:
+        start_times = [
+            getattr(task, "transfer_start_time_s", None)
+            for task in self._kv_tasks
+            if getattr(task, "transfer_start_time_s", None) is not None
+        ]
+        return min(start_times) if start_times else None
+
+    @property
+    def kv_ready_time_s(self) -> Optional[float]:
+        completion_times = [getattr(task, "completion_time_s", None) for task in self._kv_tasks]
+        if not completion_times or any(time_s is None for time_s in completion_times):
+            return None
+        return max(time_s for time_s in completion_times if time_s is not None)
 
     def receive(self, slice: KVSlice) -> None:
         if self.transfer_start_time is None:

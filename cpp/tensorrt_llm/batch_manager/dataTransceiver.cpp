@@ -31,11 +31,14 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <variant>
 
@@ -43,6 +46,33 @@ namespace tensorrt_llm::batch_manager
 {
 
 using BlockRange = tensorrt_llm::batch_manager::kv_cache_manager::BlockRange;
+
+namespace
+{
+
+bool isDisaggTransferDiagnosticsEnabled()
+{
+    static bool const enabled = []
+    {
+        auto const* value = std::getenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+
+double getSteadyClockTimeSeconds()
+{
+    using Seconds = std::chrono::duration<double>;
+    return Seconds(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::mutex& getDisaggDiagnosticsLogMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+} // namespace
 
 std::vector<Connection const*> const& TransferSession::getConnections() const
 {
@@ -160,16 +190,68 @@ bool TransferSession::releaseReservedRecvBuffer(BaseTransBufferManager const& ma
     {
         return false;
     }
+    auto const diagnosticsEnabled = isDisaggTransferDiagnosticsEnabled();
+    auto const wasHeld = diagnosticsEnabled && holderIt->held();
+    auto const bufferIndex = diagnosticsEnabled ? holderIt->index() : std::nullopt;
+    // Sample before release so a waiter awakened by release() cannot appear
+    // to acquire the slot before this event. This is a conservative upper
+    // bound on the true release-to-refill interval by the release call cost.
+    auto const releaseTime = wasHeld ? getSteadyClockTimeSeconds() : 0.0;
     holderIt->release();
+    if (diagnosticsEnabled && mRequest != nullptr && wasHeld)
+    {
+        try
+        {
+            auto const contextRequestId = mRequest->getContextPhaseParams().has_value()
+                ? mRequest->getContextPhaseParams().value().getReqId()
+                : 0;
+            std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+            TLLM_LOG_INFO(
+                "[DISAGG_DIAG][receiver-slot] t=%.9f rank=%d action=released request=%zu context_request=%zu "
+                "manager=%p buffer=%d release_reason=formatter",
+                releaseTime, mpi::MpiComm::world().getRank(), mRequest->mRequestId, contextRequestId,
+                static_cast<void const*>(&manager), bufferIndex.value_or(-1));
+        }
+        catch (...)
+        {
+            // This method is noexcept; diagnostics must not alter release semantics.
+        }
+    }
     mReservedRecvBuffers.erase(holderIt);
     return true;
 }
 
 void TransferSession::releaseReservedRecvBuffers() noexcept
 {
+    auto const diagnosticsEnabled = isDisaggTransferDiagnosticsEnabled();
     for (auto& holder : mReservedRecvBuffers)
     {
+        auto const wasHeld = diagnosticsEnabled && holder.held();
+        auto const bufferIndex = diagnosticsEnabled ? holder.index() : std::nullopt;
+        auto const* manager = diagnosticsEnabled ? holder.manager() : nullptr;
+        // See releaseReservedRecvBuffer(): preserve causal ordering with a
+        // waiter that may acquire the slot as soon as release() notifies it.
+        auto const releaseTime = wasHeld ? getSteadyClockTimeSeconds() : 0.0;
         holder.release();
+        if (diagnosticsEnabled && mRequest != nullptr && wasHeld)
+        {
+            try
+            {
+                auto const contextRequestId = mRequest->getContextPhaseParams().has_value()
+                    ? mRequest->getContextPhaseParams().value().getReqId()
+                    : 0;
+                std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+                TLLM_LOG_INFO(
+                    "[DISAGG_DIAG][receiver-slot] t=%.9f rank=%d action=released request=%zu "
+                    "context_request=%zu manager=%p buffer=%d release_reason=session",
+                    releaseTime, mpi::MpiComm::world().getRank(), mRequest->mRequestId, contextRequestId,
+                    static_cast<void const*>(manager), bufferIndex.value_or(-1));
+            }
+            catch (...)
+            {
+                // This method is noexcept; diagnostics must not alter release semantics.
+            }
+        }
     }
     mReservedRecvBuffers.clear();
 }
@@ -1268,10 +1350,37 @@ public:
             auto const& managers = agentConnectionManager->getCacheTransBufferManagers();
             recvHolders.reserve(managers.size());
             cacheBufferIds.reserve(managers.size());
-            for (auto& cacheTransBufferManager : managers)
+            auto const diagnosticsEnabled = isDisaggTransferDiagnosticsEnabled();
+            for (size_t managerIdx = 0; managerIdx < managers.size(); ++managerIdx)
             {
+                auto* cacheTransBufferManager = managers[managerIdx];
+                auto const waitStart
+                    = diagnosticsEnabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 auto rawIdx = cacheTransBufferManager->assignBufferIndexForRecv(bufferCancel);
                 recvHolders.emplace_back(*cacheTransBufferManager, rawIdx, /*isRecv=*/true);
+                if (diagnosticsEnabled)
+                {
+                    try
+                    {
+                        using Milliseconds = std::chrono::duration<double, std::milli>;
+                        using Seconds = std::chrono::duration<double>;
+                        auto const acquiredTime = std::chrono::steady_clock::now();
+                        auto const waitMs = Milliseconds(acquiredTime - waitStart).count();
+                        auto const* action = rawIdx.has_value() ? "acquired" : "not-acquired";
+                        std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+                        TLLM_LOG_INFO(
+                            "[DISAGG_DIAG][receiver-slot] t=%.9f wait_start_t=%.9f rank=%d action=%s "
+                            "request=%zu context_request=%zu manager_index=%zu manager=%p buffer=%d wait_ms=%.3f",
+                            Seconds(acquiredTime.time_since_epoch()).count(),
+                            Seconds(waitStart.time_since_epoch()).count(), mpi::MpiComm::world().getRank(), action,
+                            llmRequest.mRequestId, requestId, managerIdx,
+                            static_cast<void const*>(cacheTransBufferManager), rawIdx.value_or(-1), waitMs);
+                    }
+                    catch (...)
+                    {
+                        // Diagnostics must not alter transfer semantics.
+                    }
+                }
                 if (rawIdx.has_value())
                 {
                     cacheBufferIds.push_back(static_cast<size_t>(rawIdx.value()));
@@ -1686,6 +1795,22 @@ private:
                 session->poisonReservedRecvBuffers();
             }
             llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+            if (isDisaggTransferDiagnosticsEnabled())
+            {
+                try
+                {
+                    std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+                    TLLM_LOG_INFO(
+                        "[DISAGG_DIAG][receiver-transfer] t=%.9f rank=%d action=failed request=%zu "
+                        "context_request=%zu phase=%s",
+                        getSteadyClockTimeSeconds(), mpi::MpiComm::world().getRank(), requestId, contextRequestId,
+                        phase);
+                }
+                catch (...)
+                {
+                    // Preserve the original transfer exception if diagnostics fail.
+                }
+            }
             TLLM_LOG_ERROR("KV cache receive request %zu, context request %zu failed in phase=%s: %s", requestId,
                 contextRequestId, phase, err.what());
             throw;
@@ -1697,6 +1822,22 @@ private:
                 session->poisonReservedRecvBuffers();
             }
             llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+            if (isDisaggTransferDiagnosticsEnabled())
+            {
+                try
+                {
+                    std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+                    TLLM_LOG_INFO(
+                        "[DISAGG_DIAG][receiver-transfer] t=%.9f rank=%d action=failed request=%zu "
+                        "context_request=%zu phase=%s",
+                        getSteadyClockTimeSeconds(), mpi::MpiComm::world().getRank(), requestId, contextRequestId,
+                        phase);
+                }
+                catch (...)
+                {
+                    // Preserve the original transfer exception if diagnostics fail.
+                }
+            }
             TLLM_LOG_ERROR(
                 "KV cache receive request %zu, context request %zu failed in phase=%s with an unknown "
                 "exception",

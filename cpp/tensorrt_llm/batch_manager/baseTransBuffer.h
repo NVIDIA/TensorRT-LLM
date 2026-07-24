@@ -112,6 +112,11 @@ public:
         return mHeld;
     }
 
+    [[nodiscard]] BaseTransBufferManager const* manager() const noexcept
+    {
+        return mMgr;
+    }
+
     [[nodiscard]] bool isBoundTo(BaseTransBufferManager const& manager) const noexcept
     {
         return mMgr == &manager;
