@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
@@ -114,6 +115,12 @@ class DeepEPLowLatency(Communication):
             return False
         # SM120/121 (RTX PRO 6000 Blackwell): no NVSwitch -> NVSHMEM-LL deadlocks.
         if get_sm_version() in (120, 121):
+            return False
+        # Native NVSHMEM/IBGDA bootstrap aborts instead of raising on split
+        # H100/H200 NVL systems, so reject them before setup. DeepEP low
+        # latency otherwise uses RDMA and does not require MNNVL support.
+        dev_id = torch.cuda.current_device()
+        if MnnvlMemory._is_pcie_nvl_sku(dev_id):
             return False
         return True
 
