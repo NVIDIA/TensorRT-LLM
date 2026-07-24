@@ -197,3 +197,72 @@ def ratio_to_slot_count_list(
             quota, slot_size_lists, ratio_list, granularity, min_slots
         )
     )
+
+
+def attention_life_cycle_ids(manager: Any) -> list[int]:
+    """Return the lifecycle ids of all attention lifecycles, in order."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return list(cpp_introspection.attention_life_cycle_ids(manager))
+    return [lc_id for lc_id, _ in manager._life_cycles.attention_life_cycles()]
+
+
+def swa_life_cycle_ids(manager: Any) -> list[int]:
+    """Return the lifecycle ids of attention lifecycles that use a sliding window."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return list(cpp_introspection.swa_life_cycle_ids(manager))
+    return [
+        lc_id
+        for lc_id, lc in manager._life_cycles.attention_life_cycles()
+        if lc.window_size is not None
+    ]
+
+
+def ssm_life_cycle_id(manager: Any) -> int | None:
+    """Return the SSM lifecycle id, or None if there is no SSM lifecycle."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return cpp_introspection.ssm_life_cycle_id(manager)
+    return manager._life_cycles.ssm_life_cycle_id
+
+
+def reuse_match_pages(
+    manager: Any,
+    reuse_scope: Any,
+    tokens: Any,
+    lc_id: int,
+    enable_partial: bool = False,
+) -> tuple[int, list[tuple[int, int | None] | None]]:
+    """Match ``tokens`` against the radix tree and report reusable pages per block.
+
+    Returns ``(num_tokens, pages)`` where ``pages[i]`` is ``None`` when block ``i``
+    holds no page for lifecycle ``lc_id``, otherwise ``(slot_id, num_tokens_in_block)``
+    with ``num_tokens_in_block`` set only for SSM pages (``None`` for attention pages).
+    """
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        num_tokens, raw_pages = cpp_introspection.reuse_match_pages(
+            manager, reuse_scope, list(tokens), lc_id, enable_partial
+        )
+        pages: list[tuple[int, int | None] | None] = []
+        for entry in raw_pages:
+            if entry is None:
+                pages.append(None)
+            else:
+                slot_id, num_tokens_in_block = entry
+                pages.append((slot_id, None if num_tokens_in_block < 0 else num_tokens_in_block))
+        return num_tokens, pages
+
+    from ._utils import unwrap_rawref
+
+    match = manager._radix_tree.match(reuse_scope, list(tokens), enable_partial)
+    py_pages: list[tuple[int, int | None] | None] = []
+    for block in match.blocks:
+        ref = block.storage[lc_id]
+        if ref is None:
+            py_pages.append(None)
+        else:
+            page = unwrap_rawref(ref)
+            py_pages.append((page.slot_id, getattr(page, "num_tokens_in_block", None)))
+    return match.num_tokens, py_pages

@@ -275,13 +275,18 @@ class KVCacheEventManager:
     def flush_iteration_events(self) -> None: ...
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]: ...
 
-# From _block_radix_tree.py
+# From _cache_key.py
 def gen_multimodal_cache_key_tokens(
     id_offset: int,
     multi_modal_data_digest: bytes,
     num_tokens: int,
     token_offset: int = 0,
 ) -> list[TokenIdExt]: ...
+def sequence_to_blockchain_keys(
+    tokens_per_block: int,
+    reuse_scope: ReuseScope,
+    tokens: Sequence[TokenIdExt],
+) -> Iterator[tuple[list[TokenIdExt], bytes]]: ...
 
 # From _core/_kv_cache.py
 class _Status(enum.Enum):

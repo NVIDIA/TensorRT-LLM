@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 
 import pytest
 import torch
@@ -26,9 +27,15 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManager,
     KVCacheManagerConfig,
     KVCacheStatsDelta,
+    PoolGroupPeakBlockStats,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def initialize_cuda_context() -> None:
+    torch.empty(1, device="cuda")
 
 
 def _make_config(*, enable_stats: bool = True) -> KVCacheManagerConfig:
@@ -62,6 +69,45 @@ def test_stats_delta_arithmetic() -> None:
     iteration.clear()
     assert iteration.empty
     assert iteration.iter_cache_hit_rate == 0.0
+
+
+def test_cpp_stats_types_are_native() -> None:
+    if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "cpp":
+        pytest.skip("C++ backend only")
+
+    from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2 as cpp
+
+    assert KVCacheStatsDelta is cpp.KVCacheStatsDelta
+    assert KVCacheIterationStatsDelta is cpp.KVCacheIterationStatsDelta
+    assert PoolGroupPeakBlockStats is cpp.PoolGroupPeakBlockStats
+
+    stats = KVCacheStatsDelta(alloc_total_blocks=1, reused_blocks=2)
+    assert repr(stats) == (
+        "KVCacheStatsDelta(alloc_total_blocks=1, alloc_new_blocks=0, "
+        "reused_blocks=2, missed_blocks=0)"
+    )
+    peak = PoolGroupPeakBlockStats(available=3, unavailable=4, evictable=5)
+    assert peak == PoolGroupPeakBlockStats(3, 4, 5)
+    with pytest.raises(AttributeError):
+        peak.available = 6
+
+
+def test_manager_accepts_uint64_max_request_id() -> None:
+    manager = KVCacheManager(_make_config())
+    cache = None
+    cuda_graph_dummy_request_id = (1 << 64) - 1
+    try:
+        cache = manager.create_kv_cache(id=cuda_graph_dummy_request_id)
+        assert cache.id == cuda_graph_dummy_request_id
+        manager.mark_stats_dirty(cuda_graph_dummy_request_id)
+        assert manager.get_dirty_stats_kv_cache_ids() == {cuda_graph_dummy_request_id}
+        manager.mark_stats_excluded(cuda_graph_dummy_request_id)
+        assert manager.is_stats_excluded(cuda_graph_dummy_request_id)
+        assert manager.get_dirty_stats_kv_cache_ids() == set()
+    finally:
+        if cache is not None:
+            cache.close()
+        manager.shutdown()
 
 
 @pytest.mark.parametrize("enable_stats", [False, True])
