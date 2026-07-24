@@ -56,6 +56,9 @@ class _WorkerStub:
         self.popped = []
         self.result_queue = None
         self.postproc_queues = None
+        # responses_handler() reads this unguarded (base_worker.py); BaseWorker
+        # sets it in __init__, which this stub bypasses, so seed it to None.
+        self.frontend_result_queues = None
 
         # Echoed straight back so __call__'s filter is a no-op.
         def _engine_response_callback(r):

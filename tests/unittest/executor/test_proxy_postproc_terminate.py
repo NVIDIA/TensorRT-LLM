@@ -38,7 +38,12 @@ class _RecordingQueue:
 def _make_proxy():
     # Avoid GenerationExecutorProxy.__init__ (it spawns workers); we only
     # exercise the pure dispatch logic with hand-set attributes.
-    return object.__new__(GenerationExecutorProxy)
+    proxy = object.__new__(GenerationExecutorProxy)
+    # GC-time __del__ -> shutdown() reads these; __init__ is bypassed here, so
+    # seed them to keep teardown a clean no-op.
+    proxy.workers_started = False
+    proxy._multi_frontend_ipc_dir = None
+    return proxy
 
 
 def test_late_response_after_terminate_is_dropped_without_keyerror():
