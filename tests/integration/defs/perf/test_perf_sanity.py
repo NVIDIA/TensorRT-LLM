@@ -28,7 +28,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import pytest
 import yaml
 from test_common.error_utils import report_error
-from test_common.http_utils import wait_for_endpoint_ready
+from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
 
 from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
@@ -96,6 +96,46 @@ def ensure_bench_serving_repo() -> str:
 
 
 DEFAULT_TIMEOUT = 10800
+# Defaults for the server *ready* wait, separate from the whole-test timeout:
+# a server that is not healthy after this long is not going to be, and failing
+# here (with server-log tails, see wait_for_endpoint_ready) instead of at the
+# per-test pytest kill both saves GPU-hours and leaves a classifiable failure
+# in the CI log. The disagg bound is larger because its /health only answers
+# once EVERY ctx/gen worker has finished model load + autotune + warmup.
+AGG_SERVER_READY_TIMEOUT = 1800
+DISAGG_SERVER_READY_TIMEOUT = 3600
+
+
+def server_ready_timeout(default: int, mode: str) -> int:
+    """Ready-wait bound for one serving mode ("AGG" or "DISAGG").
+
+    Agg and disagg servers have very different init times (disagg's /health
+    answers only after every ctx/gen worker is up), so each mode has its own
+    override var, with the generic one as a shared fallback:
+    TRTLLM_TEST_<mode>_SERVER_READY_TIMEOUT > TRTLLM_TEST_SERVER_READY_TIMEOUT
+    > the built-in per-mode default.
+
+    Read at call time (not import time) so the env vars can be adjusted per
+    invocation, and parsed defensively so a malformed value cannot break
+    pytest collection of this module.
+    """
+    for var in (
+        f"TRTLLM_TEST_{mode.upper()}_SERVER_READY_TIMEOUT",
+        "TRTLLM_TEST_SERVER_READY_TIMEOUT",
+    ):
+        raw = os.environ.get(var)
+        if not raw:
+            continue
+        try:
+            timeout = int(raw)
+        except ValueError:
+            timeout = 0
+        if timeout > 0:
+            return timeout
+        print_info(f"Invalid {var}={raw!r}; ignoring it")
+    return default
+
+
 AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
 DISAGG_CONFIG_FOLDER = os.environ.get(
     "DISAGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/disaggregated"
@@ -1095,7 +1135,9 @@ class AggrTestCmds(NamedTuple):
 
                 wait_for_endpoint_ready(
                     f"http://{server_hostname}:{server_port}/health",
-                    timeout=self.timeout,
+                    timeout=min(
+                        self.timeout, server_ready_timeout(AGG_SERVER_READY_TIMEOUT, "AGG")
+                    ),
                     check_files=[server_file_path],
                     server_proc=server_proc,
                 )
@@ -1270,8 +1312,25 @@ class DisaggTestCmds(NamedTuple):
             server_config = yaml.safe_load(f)
         return server_config["hostname"], server_config["port"]
 
-    def wait_for_benchmark_ready(self, benchmark_status_file: str):
-        """Wait for benchmark to complete."""
+    def wait_for_benchmark_ready(
+        self,
+        benchmark_status_file: str,
+        server_proc: subprocess.Popen | None = None,
+        server_log: str | None = None,
+    ):
+        """Wait for benchmark to complete, failing fast if our server dies.
+
+        The liveness check is event-driven (process exit), not a timeout: a
+        ctx/gen/disagg server that dies here raises within one loop iteration
+        with its log tail in the CI log, and the rank exits nonzero. Teardown
+        of the rest of the stage then follows from the launcher
+        (``srun --kill-on-bad-exit=1`` kills this rank's step) plus the
+        benchmark rank's bounded ready-wait failing fast on the dead endpoint
+        -- instead of every rank sitting in this loop for the full timeout.
+
+        The benchmark-done check runs FIRST so a server exiting just after a
+        completed benchmark cannot fail an otherwise-passing test.
+        """
         start_time = time.time()
         while True:
             if os.path.exists(benchmark_status_file):
@@ -1279,6 +1338,11 @@ class DisaggTestCmds(NamedTuple):
                     f"Benchmark status file found, terminating server {self.disagg_serving_type}"
                 )
                 break
+            fail_if_proc_died(
+                server_proc,
+                f"{self.disagg_serving_type} server",
+                [server_log] if server_log else None,
+            )
             elapsed_time = time.time() - start_time
             print_info(f"Waiting for benchmark status file, elapsed time: {elapsed_time}s")
             if elapsed_time > self.timeout:
@@ -1359,7 +1423,11 @@ class DisaggTestCmds(NamedTuple):
                         stdout=server_ctx,
                         stderr=subprocess.STDOUT,
                     )
-                    self.wait_for_benchmark_ready(benchmark_status_file)
+                    self.wait_for_benchmark_ready(
+                        benchmark_status_file,
+                        server_proc=server_proc,
+                        server_log=server_file_path,
+                    )
             finally:
                 print_info(f"Server {self.disagg_serving_type} stopped")
                 server_proc.terminate()
@@ -1384,7 +1452,11 @@ class DisaggTestCmds(NamedTuple):
                         stdout=disagg_server_ctx,
                         stderr=subprocess.STDOUT,
                     )
-                    self.wait_for_benchmark_ready(benchmark_status_file)
+                    self.wait_for_benchmark_ready(
+                        benchmark_status_file,
+                        server_proc=disagg_server_proc,
+                        server_log=disagg_server_file_path,
+                    )
             finally:
                 print_info(f"Disagg server {self.disagg_serving_type} stopped")
                 disagg_server_proc.terminate()
@@ -1398,7 +1470,9 @@ class DisaggTestCmds(NamedTuple):
 
                 wait_for_endpoint_ready(
                     f"http://{disagg_server_hostname}:{disagg_server_port}/health",
-                    timeout=self.timeout,
+                    timeout=min(
+                        self.timeout, server_ready_timeout(DISAGG_SERVER_READY_TIMEOUT, "DISAGG")
+                    ),
                     check_files=self.get_server_logs(server_idx),
                 )
 
