@@ -137,7 +137,10 @@ class FilteredTopKKernelVarlen:
                                    histogram, so refinement operates consistently on
                                    the stored set.  Non-exact (may output fewer than
                                    top_k indices when the threshold bin is dense).  No
-                                   extra_buffer needed.
+                                   extra_buffer needed.  Requires
+                                   top_k <= filtered_topk_smem_input_size; larger
+                                   top_k is rejected at construction because too few
+                                   candidates could be retained to fill the output.
                 "REREAD_ALWAYS" -- Skip SMEM collection entirely in the coarse pass;
                                    always perform a second GMEM scan to collect
                                    threshold-bin candidates.  Exact result.  No
@@ -242,6 +245,18 @@ class FilteredTopKKernelVarlen:
         self.filtered_topk_smem_input_size = self._compute_smem_input_size()
 
         _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
+        # TRUNCATE retains at most filtered_topk_smem_input_size threshold-bin
+        # candidates. When top_k exceeds that, a dense threshold bin can leave
+        # fewer than top_k valid candidates, and the unfilled s_indices tail
+        # would be written back as undefined/duplicate indices (violating the
+        # no-duplicate contract). This configuration is under-determined, so
+        # reject it up front; use REREAD or GMEM_SPILL for larger top_k.
+        if overflow_policy == "TRUNCATE" and self.top_k > self.filtered_topk_smem_input_size:
+            raise ValueError(
+                f"TRUNCATE overflow_policy requires top_k ({self.top_k}) <= "
+                f"filtered_topk_smem_input_size ({self.filtered_topk_smem_input_size}); "
+                "use REREAD or GMEM_SPILL for larger top_k."
+            )
         self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
         self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
         self.enable_reread_always = overflow_policy == "REREAD_ALWAYS"
