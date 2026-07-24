@@ -241,6 +241,10 @@ class KvCacheTransceiver(ABC):
         """Get the serialized DataTransceiverState (CacheState + CommState)."""
         return b""
 
+    def get_status_dump(self) -> str:
+        """Return a human-readable dump of transceiver state for debugging hangs."""
+        return ""
+
     def shutdown(self):
         """Shut down the transceiver and release registered resources."""
 
@@ -334,6 +338,9 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         if not is_disagg_inflight_cancel_enabled():
             return False
         return self.impl.has_poisoned_transfer_buffer()
+
+    def get_status_dump(self) -> str:
+        return self.impl.get_status_dump()
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # not implemented, an empty placeholder to allow being invoked unconditionally

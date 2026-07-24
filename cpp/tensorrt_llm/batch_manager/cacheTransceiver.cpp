@@ -64,6 +64,7 @@
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -101,6 +102,20 @@ namespace
 using RequestIdType = LlmRequest::RequestIdType;
 
 constexpr int kTransferFuturePollIntervalMs = 10;
+
+char const* cacheTransceiverBackendName(executor::CacheTransceiverConfig::BackendType backendType)
+{
+    using BackendType = executor::CacheTransceiverConfig::BackendType;
+    switch (backendType)
+    {
+    case BackendType::DEFAULT: return "DEFAULT";
+    case BackendType::MPI: return "MPI";
+    case BackendType::UCX: return "UCX";
+    case BackendType::NIXL: return "NIXL";
+    case BackendType::MOONCAKE: return "MOONCAKE";
+    }
+    return "UNKNOWN";
+}
 
 // Finite status checks are scheduler polls, not terminal deadlines. Pure polls
 // use short slices; calls that ask for at least one completion keep bounded
@@ -729,6 +744,65 @@ CacheTransceiver::~CacheTransceiver()
     }
 }
 
+std::string CacheTransceiver::getStatusDump() const
+{
+    auto const backendType = mCacheTransceiverConfig->getBackendType().value();
+    StatusSnapshot snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mStatusSnapshotMutex);
+        snapshot = mStatusSnapshot;
+    }
+    auto const requesterSyncActive = mSyncRequesterActive.load(std::memory_order_relaxed);
+    std::ostringstream oss;
+    oss << "KV cache transceiver | backend=" << cacheTransceiverBackendName(backendType)
+        << " | TX(async_active=" << snapshot.senderAsyncActive << ", timed_out=" << snapshot.timedOutSenders
+        << ", cancel_requested=" << snapshot.cancelingSenders << ", local_completed=" << snapshot.completedSenders
+        << ", local_failed=" << snapshot.failedSenders << ", awaiting_consensus=" << snapshot.sendersAwaitingConsensus
+        << ") | RX(async_active=" << snapshot.requesterAsyncActive << ", sync_active=" << requesterSyncActive
+        << ", timed_out=" << snapshot.timedOutRequesters << ", cancel_requested=" << snapshot.cancelingRequesters
+        << ", local_completed=" << snapshot.completedRequesters << ", local_failed=" << snapshot.failedRequesters
+        << ", awaiting_consensus=" << snapshot.requestersAwaitingConsensus
+        << ") | poisoned=" << (hasPoisonedTransferBuffer() ? "yes" : "no");
+    return oss.str();
+}
+
+void CacheTransceiver::publishStatusSnapshot() noexcept
+{
+    StatusSnapshot snapshot;
+    snapshot.senderAsyncActive = mSenderFutures.size();
+    snapshot.requesterAsyncActive = mRequesterFutures.size();
+    snapshot.timedOutSenders = mTimedOutSenderIds.size();
+    snapshot.timedOutRequesters = mTimedOutRequesterIds.size();
+    snapshot.cancelingSenders = mCancelRequestedSenderIds.size();
+    snapshot.cancelingRequesters = mCancelRequestedRequesterIds.size();
+    snapshot.completedSenders = mCompletedSenderRequestIds.size();
+    snapshot.completedRequesters = mCompletedRequesterRequestIds.size();
+    snapshot.failedSenders = mFailedSenderRequestIds.size();
+    snapshot.failedRequesters = mFailedRequesterRequestIds.size();
+    snapshot.sendersAwaitingConsensus = mSenderRequestsAwaitingConsensus.size();
+    snapshot.requestersAwaitingConsensus = mRequesterRequestsAwaitingConsensus.size();
+    try
+    {
+        std::lock_guard<std::mutex> lock(mStatusSnapshotMutex);
+        mStatusSnapshot = snapshot;
+    }
+    catch (std::system_error const&)
+    {
+        // Status publication is best-effort and must never fail a transfer path.
+    }
+}
+
+CacheTransceiver::SyncRequesterStatusGuard::SyncRequesterStatusGuard(CacheTransceiver& transceiver)
+    : mTransceiver{transceiver}
+{
+    mTransceiver.mSyncRequesterActive.fetch_add(1, std::memory_order_relaxed);
+}
+
+CacheTransceiver::SyncRequesterStatusGuard::~SyncRequesterStatusGuard() noexcept
+{
+    mTransceiver.mSyncRequesterActive.fetch_sub(1, std::memory_order_relaxed);
+}
+
 void CacheTransceiver::initializeCommState()
 {
     mCommState = std::addressof(mCacheSender->getCommState());
@@ -780,6 +854,7 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
     setContextState(llmRequest.get());
     auto future = mCacheSender->sendAsync(llmRequest);
     mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
+    publishStatusSnapshot();
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -797,6 +872,7 @@ void CacheTransceiver::respondAndSendLayerWise(
         auto future = mCacheSender->sendAsync(llmRequest);
         mSenderFutures.emplace_back(llmRequest, std::move(future));
     }
+    publishStatusSnapshot();
 }
 
 void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest)
@@ -806,6 +882,7 @@ void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequ
     auto const contextRequestId = llmRequest->getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG("Synchronous KV cache receive request %zu, context request %zu waiting for native completion.",
         requestId, contextRequestId);
+    SyncRequesterStatusGuard statusGuard{*this};
     try
     {
         auto future = mCacheReceiver->receiveAsync(llmRequest);
@@ -854,6 +931,7 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
     auto* requestPtr = llmRequest.get();
     mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
     requestPtr->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    publishStatusSnapshot();
 }
 
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
@@ -1024,7 +1102,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             contextCompleteRequestIds.push_back(request->mRequestId);
         }
     }
-
+    publishStatusSnapshot();
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
     if ((syncComm) && syncComm->getSize() > 1)
     {
@@ -1174,6 +1252,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         }
     }
 
+    // Publish after local polling and before consensus, which may be the point at which a rank hangs.
+    publishStatusSnapshot();
     RequestStatuses requestsStatus{};
     TransferConsensusOutcome consensusOutcome;
     if (mContextTransferCoordinator)
@@ -1271,6 +1351,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
     }
 
+    publishStatusSnapshot();
     return requestsStatus;
 }
 
@@ -1313,6 +1394,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             collectReadyRequestIds();
         }
     }
+    publishStatusSnapshot();
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
 
     std::vector<LlmRequest::RequestIdType> toBlockRequestIds;
@@ -1466,6 +1548,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         }
     }
 
+    // Publish after local polling and before collectives, which may be the point at which a rank hangs.
+    publishStatusSnapshot();
     auto const consensusOutcome
         = reduceTransferStates(syncComm, mCompletedRequesterRequestIds, mFailedRequesterRequestIds,
             inflightCancelEnabled ? mTimedOutRequesterIds : std::unordered_set<RequestIdType>{});
@@ -1524,6 +1608,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         eraseLocalTransferOutcome(
             requestId, mCompletedRequesterRequestIds, mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
     }
+    publishStatusSnapshot();
 
     // Batch-sync timing across ranks in one allgather (instead of per-request), then write
     // the gen-side transfer summary CSV.

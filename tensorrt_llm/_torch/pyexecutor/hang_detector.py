@@ -100,6 +100,7 @@ class HangDetector:
         self.lock = threading.Lock()
         self.active = False
         self._detected = False
+        self._status_providers: list[Callable[[], str]] = []
 
     def start(self):
         """Enable hang detection."""
@@ -113,11 +114,22 @@ class HangDetector:
         self.loop_thread = threading.Thread(target=run_loop, daemon=True, name="hang_detector_loop")
         self.loop_thread.start()
 
+    def register_status_provider(self, provider: Callable[[], str]):
+        """Register a callable that returns a status string to dump on hang detection."""
+        self._status_providers.append(provider)
+
     async def _detect_hang(self):
         await asyncio.sleep(self.timeout)
         with self.lock:
             self._detected = True
             logger.error(f"Hang detected after {self.timeout} seconds.")
+            for provider in self._status_providers:
+                try:
+                    status = provider()
+                    if status:
+                        logger.error(status)
+                except Exception:
+                    pass
             print_all_stacks()
             self.on_detected()
 
