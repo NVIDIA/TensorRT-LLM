@@ -10,6 +10,8 @@ true-CFG path (dual cond/uncond forward plus the norm-preserving CFG
 combination) and the non-CFG path, on CPU.
 """
 
+from unittest.mock import MagicMock, patch
+
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImagePipeline
@@ -81,6 +83,14 @@ def _pipeline_with_test_doubles():
     pipe.vae_scale_factor = 8
     pipe.transformer = _RecordingTransformer()
     pipe.scheduler = _RecordingScheduler()
+    pipe._profile_range = None
+    pipe._profiling_active = False
+    pipe._torch_profiler = None
+    pipe._torch_profile_trace_path = None
+    pipe._torch_profile_window = 0
+    pipe._is_warmup = False
+    pipe._predenoise_pending = False
+    pipe._postdenoise_pending = False
     captured = {"encoded_prompts": []}
 
     def _encode_prompt(prompt, device, max_sequence_length):
@@ -211,3 +221,34 @@ def test_forward_runs_true_cfg_pipeline():
     )
     assert torch.allclose(pipe.scheduler.step_calls[0]["noise_pred"], expected_cfg_noise)
     assert pipe.scheduler.step_calls[0]["return_dict"] is False
+
+
+def test_forward_honors_profile_step_range():
+    pipe, _ = _pipeline_with_test_doubles()
+    pipe._profile_range = (frozenset({0}), frozenset({1}))
+    torch_profiler = MagicMock()
+    pipe._torch_profiler = torch_profiler
+    pipe._torch_profile_trace_path = "visual-gen-trace-rank-0.json"
+    cudart = MagicMock()
+
+    with patch(
+        "tensorrt_llm._torch.visual_gen.pipeline.torch.cuda.cudart",
+        return_value=cudart,
+    ):
+        pipe.forward(
+            prompt=["a cat"],
+            negative_prompt=None,
+            height=32,
+            width=48,
+            num_inference_steps=2,
+            true_cfg_scale=1.0,
+            seed=123,
+            max_sequence_length=16,
+            sigmas=[1.0, 0.5],
+        )
+
+    cudart.cudaProfilerStart.assert_called_once_with()
+    torch_profiler.start.assert_called_once_with()
+    torch_profiler.stop.assert_called_once_with()
+    torch_profiler.export_chrome_trace.assert_called_once_with("visual-gen-trace-rank-0.json")
+    cudart.cudaProfilerStop.assert_called_once_with()
