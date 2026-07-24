@@ -23,6 +23,7 @@ from tensorrt_llm import LLM as TorchLLM
 from tensorrt_llm._torch.auto_deploy.llm_args import \
     LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
@@ -3149,6 +3150,14 @@ class TestTransceiverRuntimeAutoResolution:
         cfg_kwargs = {"transceiver_runtime": "auto"} if explicit_auto else {}
         args = self._disagg_args(**cfg_kwargs)
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    @pytest.mark.parametrize("model_cls", [Gemma3ForCausalLM, LlamaForCausalLM])
+    def test_llama_and_gemma_model_preferences_adopted(self, model_cls):
+        """Llama and Gemma adopt Python when the runtime is left at auto."""
+        args = self._disagg_args()
+        assert args.cache_transceiver_config.transceiver_runtime == "auto"
+        _resolve_transceiver_runtime_auto(args, model_cls)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
     @pytest.mark.parametrize("explicit_runtime", ["CPP", "PYTHON", None])
