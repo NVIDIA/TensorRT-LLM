@@ -43,7 +43,6 @@ Warp assignment (5 warpgroups, 128 threads each):
             gk_last_ready_mbar(K1→WG1: gkLast ready)
 """
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -2085,9 +2084,6 @@ def make_host_fn(has_bias=False, use_safe_gate=False, profile_clocks=False):
         num_chunks: cutlass.Int32,
         num_heads: cutlass.Int32,
         batch_size: cutlass.Int32,
-        # Launch stream — runtime argument; launching on the DSL default
-        # stream races with the executor's non-blocking execution stream.
-        stream: cuda.CUstream,
     ):
         # Derive GMEM shapes from runtime dimensions
         T_total = batch_size * num_chunks * BT
@@ -2269,8 +2265,7 @@ def make_host_fn(has_bias=False, use_safe_gate=False, profile_clocks=False):
             num_heads,
             batch_size,
         ).launch(
-            grid=(BH, 1, 1), block=(THREADS, 1, 1), smem=225 * 1024,
-            stream=stream,
+            grid=(BH, 1, 1), block=(THREADS, 1, 1), smem=225 * 1024
         )  # Force high SMEM to prevent >1 block per SM (TMEM conflict)
 
     return host_fn
