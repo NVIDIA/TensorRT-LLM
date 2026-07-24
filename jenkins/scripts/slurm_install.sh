@@ -9,9 +9,6 @@ bashUtilsPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | s
 source "$bashUtilsPath"
 
 slurm_install_setup() {
-    cd $resourcePathNode
-    llmSrcNode=$resourcePathNode/TensorRT-LLM/src
-
     # Use unique lock file for this job ID
     lock_file="install_lock_job_${SLURM_JOB_ID:-local}_node_${SLURM_NODEID:-0}.lock"
 
@@ -20,18 +17,27 @@ slurm_install_setup() {
             rm -f "$lock_file"
         fi
 
-        retry_command --timeout 1800 bash -c "wget -nv $llmTarfile"
-        tar -zxf $tarName
-        which python3
-        python3 --version
-        retry_command apt-get install -y libffi-dev
         nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
-        if [[ $pytestCommand == *--run-ray* ]]; then
-            retry_command --timeout 2700 pip3 install --retries 10 "ray[default]==2.55.1"
+        if [[ "${SKIP_INSTALL:-0}" == "1" ]]; then
+            # Fat sqsh: source tree and packages are already in the container at /tmp/TensorRT-LLM/.
+            echo "SKIP_INSTALL=1: skipping wget, tar, apt, and pip installs (pre-baked in fat sqsh at /tmp/TensorRT-LLM/)"
+            resourcePathNode=/tmp
+        else
+            retry_command --timeout 1800 bash -c "wget -nv $llmTarfile"
+            tar -zxf $tarName
+            which python3
+            python3 --version
+            retry_command apt-get install -y libffi-dev
+            if [[ $pytestCommand == *--run-ray* ]]; then
+                retry_command --timeout 2700 pip3 install --retries 10 "ray[default]==2.55.1"
+            fi
+            retry_command --timeout 2700 bash -c "pip3 install --retries 10 opencv-python-headless"
+            llmSrcNode=$resourcePathNode/TensorRT-LLM/src
+            retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
+            retry_command --timeout 2700 bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
         fi
-        retry_command --timeout 2700 bash -c "pip3 install --retries 10 opencv-python-headless"
-        retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
-        retry_command --timeout 2700 bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
+        llmSrcNode=$resourcePathNode/TensorRT-LLM/src
+        cd $resourcePathNode
         gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
         hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
         echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
