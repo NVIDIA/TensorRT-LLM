@@ -48,6 +48,7 @@ from ..attention_backend.sparse.dsa import (
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..utils import (
     Fp4QuantizedTensor,
     compute_swizzled_sf_shape,
@@ -218,6 +219,9 @@ def mla_custom_op_inplace(
         )
 
 
+maybe_bcg_mla_custom_op_inplace = eager_on_graph(True)(mla_custom_op_inplace)
+
+
 @torch.library.custom_op("trtllm::mla_dsa_proj", mutates_args=())
 def mla_dsa_proj(
     hidden_states: torch.Tensor,
@@ -334,6 +338,9 @@ def mla_dsa_attn_inplace(
     mla_layer.forward_dsa_attn(
         q, compressed_kv, k_pe, latent_cache, indexer_intermediates, position_ids, metadata, output
     )
+
+
+maybe_bcg_mla_dsa_attn_inplace = eager_on_graph(True)(mla_dsa_attn_inplace)
 
 
 def fp8_block_scaling_bmm_out(
@@ -3066,7 +3073,8 @@ class MLA(nn.Module):
         )
 
         dsv4_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None
-        if self.register_to_config:
+        use_custom_op = self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph())
+        if use_custom_op:
             if self.is_deepseek_v4:
                 outputs = torch.ops.trtllm.create_mla_outputs(hidden_states, self.layer_idx_str)
                 attn_output = outputs[0]
@@ -3081,7 +3089,7 @@ class MLA(nn.Module):
                         "legacy output plus DSv4 fused epilogue buffers."
                     )
 
-                torch.ops.trtllm.mla_custom_op_inplace(
+                maybe_bcg_mla_custom_op_inplace(
                     hidden_states,
                     position_ids,
                     self.layer_idx_str,
@@ -3112,7 +3120,7 @@ class MLA(nn.Module):
                         )
                     q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
                     indexer_intermediates = proj_outputs[4:]
-                    torch.ops.trtllm.mla_dsa_attn_inplace(
+                    maybe_bcg_mla_dsa_attn_inplace(
                         q,
                         compressed_kv,
                         k_pe,
@@ -3129,7 +3137,7 @@ class MLA(nn.Module):
                     # take dataclasses, so pass the BF16 + FP4 + SF views as
                     # explicit tensors.
                     if isinstance(hidden_states, Fp4QuantizedTensor):
-                        torch.ops.trtllm.mla_custom_op_inplace(
+                        maybe_bcg_mla_custom_op_inplace(
                             hidden_states.unquantized_hidden_states,
                             position_ids,
                             self.layer_idx_str,
@@ -3142,7 +3150,7 @@ class MLA(nn.Module):
                             hidden_states.scaling_factor,
                         )
                     else:
-                        torch.ops.trtllm.mla_custom_op_inplace(
+                        maybe_bcg_mla_custom_op_inplace(
                             hidden_states,
                             position_ids,
                             self.layer_idx_str,

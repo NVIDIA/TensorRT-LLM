@@ -55,6 +55,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, copy_weight, load_weight_shard
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..utils import (
     ActivationType,
     AuxStreamType,
@@ -640,6 +641,11 @@ def minimax_m3_attn_custom_op_inplace(
     )
 
 
+maybe_bcg_minimax_m3_attn_custom_op_inplace = eager_on_graph(True)(
+    minimax_m3_attn_custom_op_inplace
+)
+
+
 class MiniMaxM3Attention(Attention):
     """M3 attention: dense (layers 0-2) or sparse (layers 3-59).
 
@@ -1100,8 +1106,10 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         output = q.new_empty((q.shape[0], self.num_heads * self.head_dim))
-        if self.register_to_config and is_torch_compiling():
-            minimax_m3_attn_custom_op_inplace(
+        if self.register_to_config and (
+            is_torch_compiling() or is_in_breakable_cuda_graph()
+        ):
+            maybe_bcg_minimax_m3_attn_custom_op_inplace(
                 q,
                 k,
                 v,

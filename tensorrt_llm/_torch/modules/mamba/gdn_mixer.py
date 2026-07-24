@@ -31,6 +31,7 @@ from tensorrt_llm.mapping import Mapping
 from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
+from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...speculative import SpecMetadata
 from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
 from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode
@@ -108,6 +109,9 @@ def gdn_custom_op_inplace(
         spec_metadata=spec_metadata,
         output=output[:, :num_tokens, :, :],
     )
+
+
+breakable_gdn_custom_op_inplace = eager_on_graph(True)(gdn_custom_op_inplace)
 
 
 def ensure_divisibility(numerator, denominator):
@@ -989,11 +993,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     ):
         mixed_qkv, z, a, b = self._compute_tokenwise_inputs(hidden_states)
 
-        if self.register_to_config and is_torch_compiling():
+        use_breakable_cuda_graph = not is_torch_compiling() and is_in_breakable_cuda_graph()
+        if self.register_to_config and (is_torch_compiling() or use_breakable_cuda_graph):
             attn_out = mixed_qkv.new_empty(
                 (1, mixed_qkv.shape[0], self.num_v_heads_per_tp, self.head_v_dim)
             )
-            gdn_custom_op_inplace(mixed_qkv, a, b, self.layer_idx_str, attn_out)
+            custom_op = (
+                breakable_gdn_custom_op_inplace
+                if use_breakable_cuda_graph
+                else gdn_custom_op_inplace
+            )
+            custom_op(mixed_qkv, a, b, self.layer_idx_str, attn_out)
         else:
             attn_out = self.forward_core(
                 mixed_qkv,

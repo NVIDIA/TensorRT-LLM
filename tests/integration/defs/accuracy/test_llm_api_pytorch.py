@@ -33,7 +33,7 @@ from tensorrt_llm.llmapi import (
     DFlashDecodingConfig, DSparkDecodingConfig, DraftTargetDecodingConfig,
     Eagle3DecodingConfig, KvCacheConfig, MiniMaxM3SparseAttentionConfig,
     MoeConfig, MTPDecodingConfig, NGramDecodingConfig, PARDDecodingConfig,
-    RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
+    PrefillCudaGraphBackend, RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
     SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
     TorchCompileConfig)
 # isort: on
@@ -6149,6 +6149,46 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.threadleak(enabled=False)
+    def test_bf16_breakable_prefill_cuda_graph(self):
+        model_path = f"{llm_models_root()}/Qwen3.5-4B"
+        prompts = [
+            [[17] * 128],
+            [[17] * 129],
+            # The second request is admitted while the first is decoding,
+            # exercising BCG replay for a mixed context/decode batch.
+            [[17] * 64, [23] * 65],
+            [[31] * 256],
+        ]
+        sampling_params = SamplingParams(max_tokens=4)
+
+        def run(backend):
+            results = []
+            with LLM(
+                    model_path,
+                    trust_remote_code=True,
+                    max_seq_len=1024,
+                    max_num_tokens=512,
+                    max_batch_size=4,
+                    disable_overlap_scheduler=True,
+                    kv_cache_config=self.kv_cache_config,
+                    cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                      max_batch_size=4),
+                    prefill_cuda_graph_backend=backend,
+                    prefill_capture_num_tokens=[128, 256, 512],
+            ) as llm:
+                for batch in prompts:
+                    results.append([
+                        output.outputs[0].token_ids for output in llm.generate(
+                            batch, sampling_params=sampling_params)
+                    ])
+            return results
+
+        eager_results = run(PrefillCudaGraphBackend.DISABLED)
+        breakable_results = run(PrefillCudaGraphBackend.BREAKABLE)
+        assert breakable_results == eager_results
 
     @skip_pre_hopper
     def test_fp8(self):
