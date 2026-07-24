@@ -21,6 +21,8 @@ from tensorrt_llm._torch.utils import torch_multi_arange
 from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
                                  trace_func)
+from tensorrt_llm.bindings.internal import \
+    batch_manager as batch_manager_bindings
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
                                             MultimodalRuntimeData,
@@ -3029,6 +3031,10 @@ class PyTorchModelEngine(ModelEngine):
         encoder_num_cached_tokens_per_seq: List[int],
         attn_metadata: AttentionMetadata,
         resource_manager: Optional[ResourceManager],
+        encoder_kv_lens: Optional[torch.Tensor] = None,
+        context_encoder_kv_tokens: int = 0,
+        generation_encoder_kv_tokens: int = 0,
+        max_encoder_kv_len: int = 0,
     ) -> Dict[str, Any]:
         if not encoder_seq_lens:
             return {}
@@ -3069,6 +3075,19 @@ class PyTorchModelEngine(ModelEngine):
             packed_encoder_hidden_states = None
             skip_cross_kv_projection = True
 
+        def prepare_cross_metadata(
+                cross_attn_metadata: AttentionMetadata) -> None:
+            if encoder_kv_lens is None:
+                cross_attn_metadata.prepare()
+                return
+            assert isinstance(cross_attn_metadata, TrtllmAttentionMetadata)
+            cross_attn_metadata.prepare_encoder_decoder(
+                prompt_lens=attn_metadata.prompt_lens,
+                kv_lens=encoder_kv_lens,
+                context_kv_tokens=context_encoder_kv_tokens,
+                generation_kv_tokens=generation_encoder_kv_tokens,
+                max_kv_len=max_encoder_kv_len)
+
         if attn_metadata.is_cuda_graph and attn_metadata.has_cross_sub_metadata:
             # Fast path for stable CUDA-graph generation steps: the encoder
             # KV lengths (kv_lens_cuda) and the frozen prompt lengths
@@ -3098,7 +3117,7 @@ class PyTorchModelEngine(ModelEngine):
                     encoder_num_cached_tokens_per_seq=
                     encoder_num_cached_tokens_per_seq,
                 )
-                cross_attn_metadata.prepare()
+                prepare_cross_metadata(cross_attn_metadata)
                 if new_encoder_tokens == 0:
                     # Record this stable state for future fast-path use.
                     self._cross_attn_stable_cached_tokens = list(
@@ -3129,7 +3148,7 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 self._cross_attn_stable_cached_tokens = None
                 self._cross_attn_stable_request_ids = None
-            cross_attn_metadata.prepare()
+            prepare_cross_metadata(cross_attn_metadata)
 
         return {
             "encoder_hidden_states": packed_encoder_hidden_states,
@@ -3164,6 +3183,242 @@ class PyTorchModelEngine(ModelEngine):
         text_token_indices_cpu = maybe_pin_memory(text_token_indices_cpu)
         inputs['text_token_indices'] = text_token_indices_cpu.to(
             "cuda", non_blocking=True)
+
+    def _can_use_encoder_decoder_input_fast_path(
+            self, scheduled_requests: ScheduledRequests,
+            new_tokens_device: Optional[torch.Tensor],
+            next_draft_tokens_device: Optional[torch.Tensor]) -> bool:
+        """Return whether the TRT-like persistent input path is sufficient."""
+        static_eligible = getattr(
+            self, '_encoder_decoder_input_fast_path_static_eligible', None)
+        if static_eligible is None:
+            static_eligible = (
+                self._is_encoder_decoder_model() and not self.enable_spec_decode
+                and not self.is_draft_model and self.max_beam_width == 1
+                and self.sparse_attention_config is None and not self.use_mrope
+                and not self.enable_attention_dp
+                and not self.mapping.has_cp_helix() and not self.is_multimodal
+                and self.lora_model_config is None
+                and not self.attn_runtime_features.chunked_prefill
+                and not self.attn_runtime_features.cache_reuse
+                and not self.attn_runtime_features.has_speculative_draft_tokens)
+            self._encoder_decoder_input_fast_path_static_eligible = \
+                static_eligible
+        if (not static_eligible or new_tokens_device is None
+                or next_draft_tokens_device is not None
+                or self.guided_decoder is not None):
+            return False
+
+        if scheduled_requests.batch_size == 0:
+            return False
+        for request in scheduled_requests.generation_requests:
+            if request.py_batch_idx is None and not request.is_dummy:
+                return False
+        return True
+
+    def _acquire_encoder_decoder_host_buffers(self) -> Dict[str, Any]:
+        """Acquire pinned staging whose preceding asynchronous copies finished."""
+        pool = getattr(self, '_encoder_decoder_host_buffer_pool', None)
+        if pool is None:
+            pool = []
+            self._encoder_decoder_host_buffer_pool = pool
+        for buffers in pool:
+            event = buffers['event']
+            if event is None or event.query():
+                return buffers
+
+        buffers = {
+            'input_ids':
+            torch.empty(self.max_num_tokens,
+                        dtype=torch.int,
+                        pin_memory=prefer_pinned()),
+            'position_ids':
+            torch.empty(self.max_num_tokens,
+                        dtype=torch.int,
+                        pin_memory=prefer_pinned()),
+            'sequence_lengths':
+            torch.empty(self.batch_size,
+                        dtype=torch.int,
+                        pin_memory=prefer_pinned()),
+            'prompt_lengths':
+            torch.empty(self.batch_size,
+                        dtype=torch.int,
+                        pin_memory=prefer_pinned()),
+            'cached_token_lengths':
+            torch.empty(self.batch_size,
+                        dtype=torch.int,
+                        pin_memory=prefer_pinned()),
+            'kv_lengths':
+            torch.empty(self.batch_size,
+                        dtype=torch.int,
+                        pin_memory=prefer_pinned()),
+            'encoder_kv_lengths':
+            torch.empty(self.batch_size,
+                        dtype=torch.int,
+                        pin_memory=prefer_pinned()),
+            'previous_batch_indices':
+            torch.empty(self.batch_size,
+                        dtype=torch.int,
+                        pin_memory=prefer_pinned()),
+            'event':
+            None,
+        }
+        pool.append(buffers)
+        return buffers
+
+    @nvtx_range("_prepare_encoder_decoder_inputs_fast")
+    def _prepare_encoder_decoder_inputs_fast(
+            self, scheduled_requests: ScheduledRequests,
+            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+            attn_metadata: AttentionMetadata, new_tokens_device: torch.Tensor,
+            resource_manager: Optional[ResourceManager]):
+        """Prepare a simple BART batch with native collation and reused buffers."""
+        buffers = self._acquire_encoder_decoder_host_buffers()
+        position_id_offset = getattr(self,
+                                     '_encoder_decoder_position_id_offset',
+                                     None)
+        if position_id_offset is None:
+            position_id_offset = self._get_position_id_offset()
+            self._encoder_decoder_position_id_offset = position_id_offset
+        (request_ids, encoder_seq_lens, encoder_cached_token_lengths,
+         total_num_tokens, num_context_tokens, num_previous_batch_requests,
+         cached_kv_tokens, context_kv_tokens, generation_kv_tokens, max_kv_len,
+         context_encoder_kv_tokens, generation_encoder_kv_tokens,
+         max_encoder_kv_len
+         ) = batch_manager_bindings.prepare_encoder_decoder_inputs(
+             scheduled_requests.context_requests,
+             scheduled_requests.generation_requests,
+             buffers['input_ids'],
+             buffers['position_ids'],
+             buffers['sequence_lengths'],
+             buffers['prompt_lengths'],
+             buffers['cached_token_lengths'],
+             buffers['kv_lengths'],
+             buffers['encoder_kv_lengths'],
+             buffers['previous_batch_indices'],
+             position_id_offset,
+         )
+
+        num_sequences = scheduled_requests.batch_size
+        num_generation_requests = scheduled_requests.num_generation_requests
+        if num_context_tokens:
+            self.input_ids_cuda[:num_context_tokens].copy_(
+                buffers['input_ids'][:num_context_tokens], non_blocking=True)
+        if num_previous_batch_requests:
+            previous_slots = self.previous_batch_indices_cuda[:
+                                                              num_previous_batch_requests]
+            previous_slots.copy_(
+                buffers['previous_batch_indices'][:num_previous_batch_requests],
+                non_blocking=True)
+            new_tokens = new_tokens_device[0, previous_slots, 0]
+            generation_begin = num_context_tokens
+            generation_end = generation_begin + num_previous_batch_requests
+            self.input_ids_cuda[generation_begin:generation_end].copy_(
+                new_tokens, non_blocking=True)
+        dummy_begin = num_context_tokens + num_previous_batch_requests
+        if dummy_begin < total_num_tokens:
+            self.input_ids_cuda[dummy_begin:total_num_tokens].fill_(0)
+
+        self.position_ids_cuda[:total_num_tokens].copy_(
+            buffers['position_ids'][:total_num_tokens], non_blocking=True)
+        final_position_ids = self.position_ids_cuda[:
+                                                    total_num_tokens].unsqueeze(
+                                                        0)
+
+        sequence_lengths = buffers['sequence_lengths'][:num_sequences]
+        attn_metadata._seq_lens = sequence_lengths
+        if attn_metadata.is_cuda_graph and attn_metadata._seq_lens_cuda is not None:
+            attn_metadata._seq_lens_cuda.copy_(sequence_lengths,
+                                               non_blocking=True)
+        else:
+            attn_metadata._seq_lens_cuda = sequence_lengths.cuda(
+                non_blocking=True)
+        attn_metadata._num_contexts = scheduled_requests.num_context_requests
+        attn_metadata._num_ctx_tokens = num_context_tokens
+        attn_metadata._num_generations = num_generation_requests
+        attn_metadata._num_tokens = total_num_tokens
+        attn_metadata.beam_width = 1
+        attn_metadata.request_ids = request_ids
+        attn_metadata.prompt_lens = buffers['prompt_lengths'][:num_sequences]
+        attn_metadata.num_chunked_ctx_requests = 0
+        attn_metadata.kv_cache_params = KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=buffers['cached_token_lengths']
+            [:num_sequences],
+            num_extra_kv_tokens=0)
+        attn_metadata.kv_cache_manager = kv_cache_manager
+        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
+        attn_metadata.prepare_encoder_decoder(
+            prompt_lens=buffers['prompt_lengths'][:num_sequences],
+            kv_lens=buffers['kv_lengths'][:num_sequences],
+            context_kv_tokens=context_kv_tokens,
+            generation_kv_tokens=generation_kv_tokens,
+            max_kv_len=max_kv_len)
+
+        encoder_hidden_states = []
+        for request in scheduled_requests.context_requests:
+            encoder_output = request.py_encoder_output
+            if encoder_output is None:
+                raise RuntimeError(
+                    f"Decoder context request {request.py_request_id} has no "
+                    "encoder output.")
+            encoder_hidden_states.append(encoder_output)
+            request.py_batch_idx = request.py_seq_slot
+
+        cross_attention_inputs = self._prepare_enc_dec_cross_attn_inputs(
+            encoder_hidden_states,
+            encoder_seq_lens,
+            encoder_cached_token_lengths,
+            attn_metadata,
+            resource_manager,
+            encoder_kv_lens=buffers['encoder_kv_lengths'][:num_sequences],
+            context_encoder_kv_tokens=context_encoder_kv_tokens,
+            generation_encoder_kv_tokens=generation_encoder_kv_tokens,
+            max_encoder_kv_len=max_encoder_kv_len,
+        )
+
+        attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
+        padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
+            total_num_tokens, scheduled_requests.num_context_requests,
+            attn_all_rank_num_tokens)
+        set_per_request_piecewise_cuda_graph_flag(can_run_piecewise_cuda_graph)
+        attn_metadata.padded_num_tokens = (padded_num_tokens
+                                           if padded_num_tokens
+                                           != total_num_tokens else None)
+
+        virtual_num_tokens = total_num_tokens
+        if attn_metadata.padded_num_tokens is not None:
+            self.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
+            self.position_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
+            virtual_num_tokens = padded_num_tokens
+            final_position_ids = self.position_ids_cuda[:
+                                                        virtual_num_tokens].unsqueeze(
+                                                            0)
+
+        inputs = {
+            'attn_metadata': attn_metadata,
+            'input_ids': self.input_ids_cuda[:virtual_num_tokens],
+            'position_ids': final_position_ids,
+            'inputs_embeds': None,
+            'multimodal_params': [],
+            'resource_manager': resource_manager,
+        }
+        inputs.update(cross_attention_inputs)
+
+        self.iter_states[
+            'num_ctx_requests'] = scheduled_requests.num_context_requests
+        self.iter_states['num_ctx_tokens'] = num_context_tokens
+        self.iter_states['num_generation_tokens'] = num_generation_requests
+        self.iter_states['cached_kv_tokens'] = cached_kv_tokens
+        if not self.is_warmup:
+            self.previous_request_ids = request_ids[scheduled_requests.
+                                                    num_context_requests:]
+            self.has_previous_device_draft = False
+
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        buffers['event'] = event
+        return inputs, None
 
     def _can_use_incremental_update(
             self, scheduled_requests: ScheduledRequests,
@@ -3842,6 +4097,14 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata, new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request,
                 resource_manager)
+
+        if (type(attn_metadata) is TrtllmAttentionMetadata
+                and self._can_use_encoder_decoder_input_fast_path(
+                    scheduled_requests, new_tokens_device,
+                    next_draft_tokens_device)):
+            return self._prepare_encoder_decoder_inputs_fast(
+                scheduled_requests, kv_cache_manager, attn_metadata,
+                new_tokens_device, resource_manager)
 
         if self._can_use_steady_gen_fast_prepare(scheduled_requests,
                                                  new_tokens_device,

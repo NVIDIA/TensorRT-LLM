@@ -42,6 +42,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampler import (
+    SampleStateTensorsHostTorch,
+    SampleStateTorch,
     TorchSampler,
     _BatchedSamplingResult,
     _request_get_sampling_params,
@@ -659,6 +661,84 @@ class TestFinishReasons:
     STOP_WORDS = FinishReason.STOP_WORDS
     END_ID = FinishReason.END_ID
     LENGTH = FinishReason.LENGTH
+
+    def test_single_step_greedy_checks_finish_reasons_on_host(self):
+        sampler = object.__new__(TorchSampler)
+        sampler.max_seq_len = 20
+        sampler._track_pending_steps = False
+        requests = [
+            LlmRequest(
+                request_id=0,
+                seq_slot=0,
+                input_tokens=[2, 0],
+                max_new_tokens=1,
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            ),
+            LlmRequest(
+                request_id=1,
+                seq_slot=1,
+                input_tokens=[2, 0],
+                max_new_tokens=1,
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            ),
+        ]
+        new_tokens = torch.tensor([2, 7], dtype=torch.int32)
+        state = SampleStateTorch(
+            requests=requests,
+            device=None,
+            host=SampleStateTensorsHostTorch(
+                new_tokens=new_tokens,
+                finish_reasons=None,
+                first_finish_reasons=None,
+            ),
+            single_step_greedy=True,
+        )
+
+        sampler.update_requests(state)
+
+        assert all(request.is_finished for request in requests)
+        # The first request reaches EOS and length together; EOS takes precedence.
+        assert not requests[0].is_finished_due_to_length
+        assert requests[1].is_finished_due_to_length
+        assert requests[0].get_tokens(0)[-1] == 2
+        assert requests[1].get_tokens(0)[-1] == 7
+
+    def test_single_step_greedy_filters_requests_completed_after_sampling(self):
+        sampler = object.__new__(TorchSampler)
+        sampler.max_seq_len = 20
+        sampler._track_pending_steps = False
+        requests = [
+            LlmRequest(
+                request_id=request_id,
+                seq_slot=request_id,
+                input_tokens=[2, 0],
+                max_new_tokens=10,
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            )
+            for request_id in range(2)
+        ]
+        requests[0].finish_by(FinishReason.LENGTH, 0)
+        state = SampleStateTorch(
+            requests=requests,
+            device=None,
+            host=SampleStateTensorsHostTorch(
+                new_tokens=torch.tensor([99, 7], dtype=torch.int32),
+                finish_reasons=None,
+                first_finish_reasons=None,
+            ),
+            single_step_greedy=True,
+        )
+
+        sampler.update_requests(state)
+
+        assert requests[0].get_tokens(0) == [2, 0]
+        assert requests[1].get_tokens(0)[-1] == 7
 
     class RequestCase:
         MAX_NEW_TOKENS = 10
