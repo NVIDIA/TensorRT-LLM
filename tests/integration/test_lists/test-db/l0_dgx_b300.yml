@@ -15,7 +15,10 @@ l0_dgx_b300:
       stage: post_merge
       backend: pytorch
   tests:
-  - unittest/_torch/attention
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
+  - unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py
+  - unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py
+  - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
   - unittest/_torch/executor
   # ------------- modules (multi-GPU) ---------------
   - unittest/_torch/modules/test_mla_helix.py
