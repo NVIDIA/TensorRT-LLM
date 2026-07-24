@@ -217,7 +217,7 @@ _EMPTY_SPARSE_ATTN_HOOKS = SparseAttnHooks()
 def _get_sparse_attn_hooks_for_algorithm(algorithm: str) -> SparseAttnHooks:
     module_name = _SPARSE_ATTN_HOOK_MODULE_PATHS.get(algorithm)
     if module_name is None:
-        return SparseAttnHooks(algorithm=algorithm)
+        return _EMPTY_SPARSE_ATTN_HOOKS
     module = import_module(module_name, package=__package__)
     return SparseAttnHooks.from_module(algorithm, module)
 

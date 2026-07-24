@@ -205,7 +205,7 @@ def test_deepseek_v4_q_norm_fused_fp8_zero_rows():
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 129])
-def test_deepseek_v4_q_norm_fused_fp8_accepts_3d_q_pe_buffer(num_tokens):
+def test_dsv4_fused_q_norm_3d_q_pe(num_tokens):
     """Lock down the q_pe dim==3 contract expected by thop.attention's
     sparse-MLA context branch (TORCH_CHECK(q_pe->dim() == 3))."""
     num_heads = 16

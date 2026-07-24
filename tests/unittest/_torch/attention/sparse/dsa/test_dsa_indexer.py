@@ -106,7 +106,7 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     assert metadata._tokens_per_block == 64
 
 
-def test_shared_topk_indices_lifecycle():
+def test_shared_topk_lifecycle():
     sparse_config = DeepSeekSparseAttentionConfig(
         index_n_heads=1,
         index_head_dim=8,
