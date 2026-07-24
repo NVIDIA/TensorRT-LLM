@@ -527,6 +527,10 @@ def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
     # The deterministic fallback stays inside the curated axes.
     for num_tokens in (64, 4096, 16384):
         megamoe_op.validate_megamoe_tactic(megamoe_op.default_megamoe_tactic(num_tokens))
+    invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
+    invalid_tactic[2] = 511
+    with pytest.raises(ValueError, match=r"group_hint must be an int >= 512"):
+        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
 
 
 def run_backend_moe(
