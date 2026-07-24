@@ -44,7 +44,8 @@ from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
 # isort: on
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import binding_to_str_dtype, mpi_rank, nvtx_range
+from ..._utils import (binding_to_str_dtype, binding_to_torch_dtype, mpi_rank,
+                       nvtx_range)
 from ...logger import logger
 from ...mapping import CpType, Mapping
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -2686,6 +2687,10 @@ class PeftCacheManager(BaseResourceManager):
 
     def get_lora_manager(self) -> LoraManager:
         return self._lora_manager
+
+    @property
+    def data_type(self) -> torch.dtype:
+        return binding_to_torch_dtype(self.impl.data_type)
 
     def add_request_peft(self, request: LlmRequest):
         if request.lora_task_id is not None:

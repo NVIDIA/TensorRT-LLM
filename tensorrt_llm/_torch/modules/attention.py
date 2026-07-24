@@ -21,7 +21,7 @@ from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
 from ..model_config import ModelConfig
-from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_nvfp4_marlin_enabled, is_torch_compiling)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
@@ -1014,13 +1014,11 @@ class Attention(nn.Module):
         if bool(lora_params):
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
                                               self.layer_idx)
-            if qkv_lora is not None:
-                qkv = qkv + qkv_lora
+            qkv = add_lora_result(qkv, qkv_lora)
 
             qkv_lora = self.fused_qkv_lora(hidden_states, lora_params,
                                            self.layer_idx)
-            if qkv_lora is not None:
-                qkv = qkv + qkv_lora
+            qkv = add_lora_result(qkv, qkv_lora)
 
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
         # to use tree offsets (same as C++ kernel: past_seq_len + offset).

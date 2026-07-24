@@ -10,7 +10,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
 from ..utils import Fp4QuantizedTensor
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .swiglu import swiglu
@@ -336,12 +336,10 @@ class GatedMLP(nn.Module):
 
         h1_lora = self.splitted_gate_up_lora(x, lora_params, self.layer_idx)
 
-        if h1_lora is not None:
-            h1 = h1 + h1_lora
+        h1 = add_lora_result(h1, h1_lora)
 
         h1_lora = self.fused_gate_up_lora(x, lora_params, self.layer_idx)
-        if h1_lora is not None:
-            h1 = h1 + h1_lora
+        h1 = add_lora_result(h1, h1_lora)
 
         h2 = self._apply_activation(h1, has_lora=True)
         output = self.down_proj(h2,
