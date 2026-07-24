@@ -1520,13 +1520,23 @@ class Receiver(ReceiverBase):
 
     def _build_recv_req_info(self, task: KVRecvTask) -> RecvReqInfo:
         self_ri = self._registrar.self_rank_info
-        assert task._params.ctx_request_id is not None, (
-            f"ctx_request_id is None for task unique_rid={task._unique_rid}"
-        )
         assert task._unique_rid is not None, "KVRecvTask unique_rid is None"
+        # Some requests arrive with ctx_request_id None while disagg_request_id
+        # is set; disagg_request_id is the receive-session key, so fall back to
+        # it instead of failing here (nvbugs/6482576).
+        sender_req_id = task._params.ctx_request_id
+        if sender_req_id is None:
+            sender_req_id = task._params.disagg_request_id
+        if sender_req_id is None:
+            # Not an assert: must survive python -O so a None id never reaches
+            # RecvReqInfo.sender_req_id / the wire.
+            raise ValueError(
+                "both ctx_request_id and disagg_request_id are None for task "
+                f"unique_rid={task._unique_rid}"
+            )
         # Receiver's cached prefix is implicit in block_ids size; sender derives dst_start.
         return RecvReqInfo(
-            sender_req_id=task._params.ctx_request_id,
+            sender_req_id=sender_req_id,
             instance_name=self_ri.instance_name,
             instance_rank=self_ri.instance_rank,
             block_ids_per_layer_groups=task._kv_slice.block_ids_per_layer_groups,
