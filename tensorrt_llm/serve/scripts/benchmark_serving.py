@@ -736,6 +736,30 @@ async def fetch_energy_metrics(base_url: str) -> Optional[dict]:
             return None
 
 
+async def is_server_spec_dec_enabled(base_url: str) -> bool:
+    """Return True iff /v1/models advertises an enabled speculative_config.
+
+    Any network/parse failure is swallowed and reported as False so callers
+    can fall back to safe defaults.
+    """
+    models_url = f"{base_url}/v1/models"
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
+        try:
+            async with session.get(models_url) as response:
+                if response.status != 200:
+                    return False
+                payload = await response.json()
+        except Exception:
+            return False
+    try:
+        spec_enabled = (payload["data"][0]["metadata"]["speculative_config"]
+                        ["spec_enabled"])
+    except (KeyError, IndexError, TypeError):
+        return False
+    return str(spec_enabled).strip().lower() == "true"
+
+
 async def fetch_perf_metrics(base_url: str) -> dict:
     """
     Fetch performance metrics from the /perf_metrics endpoint.
@@ -961,6 +985,15 @@ def main(args: argparse.Namespace):
 
     if "temperature" not in sampling_params:
         sampling_params["temperature"] = 0.0  # Default to greedy decoding.
+
+    # Auto-resolve --ignore-eos when the user did not pass an explicit flag.
+    # Polarity matches trtllm-bench latency (low_latency.py:332): when the server
+    # advertises speculative_config.spec_enabled, requests honor EOS so the
+    # acceptance rate is measured accurately; otherwise EOS is ignored for
+    # stable throughput. A server that does not expose speculative_config (older
+    # build, or non-spec-dec model) is treated as "no spec-dec" → ignore_eos=True.
+    if args.ignore_eos is None:
+        args.ignore_eos = not asyncio.run(is_server_spec_dec_enabled(base_url))
 
     # Avoid GC - reduce pause times.
     gc.disable()
@@ -1274,9 +1307,16 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--ignore-eos",
-        action="store_true",
-        help="Set ignore_eos flag when sending the benchmark request."
-        "Warning: ignore_eos is not supported in deepspeed_mii and tgi.")
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether to ignore EOS when sending the benchmark request. "
+        "If unset, the default is auto-resolved from the server's "
+        "/v1/models speculative_config metadata: when speculative decoding "
+        "is enabled the request honors EOS (so the acceptance rate is "
+        "measured cleanly), otherwise EOS is ignored for stable throughput "
+        "(mirrors trtllm-bench latency). Pass --ignore-eos / --no-ignore-eos "
+        "to override. Warning: ignore_eos is not supported in deepspeed_mii "
+        "and tgi.")
     parser.add_argument(
         "--percentile-metrics",
         type=str,
