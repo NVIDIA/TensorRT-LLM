@@ -3417,6 +3417,14 @@ class PyExecutor:
         if self._is_disagg_gen_only_no_context_benchmark():
             return fitting_disagg_gen_init_requests, False
 
+        # Async transfers stay in flight and don't block the iteration, so the
+        # per-iteration budget must not gate them. It is sized from
+        # max_tokens_in_buffer (a buffer knob, not a concurrency cap), so gating
+        # the async path throttles transfers and times out the ctx->gen handoff
+        # at high concurrency. Keep the budget only for the synchronous path.
+        if self._uses_async_disagg_gen_transfer():
+            return fitting_disagg_gen_init_requests, False
+
         controller = self._get_disagg_transfer_admission_controller()
         if not (getattr(self, "kv_cache_transceiver", None)
                 and controller.enabled() and fitting_disagg_gen_init_requests):
@@ -5757,7 +5765,18 @@ class PyExecutor:
         if not self.enable_attention_dp:
             return
 
-        assert self.expected_num_active_requests >= len(self.active_requests)
+        # Disagg KV-transfer-error requests can transiently linger in
+        # active_requests (len > the ADP-consensus expected count) before cleanup
+        # drains them. It self-corrects and the padding below keys on the
+        # schedulable count, so warn rather than assert -- a hard assert here
+        # would crash the gen loop on every ADP rank.
+        if self.expected_num_active_requests < len(self.active_requests):
+            logger.warning_once(
+                "expected_num_active_requests "
+                f"({self.expected_num_active_requests}) < active_requests "
+                f"({len(self.active_requests)}); transient disagg-error "
+                "overshoot, continuing",
+                key="adp_dummy_active_overshoot")
         num_active_request = self._count_schedulable_active_requests()
 
         if self._should_skip_dummy_for_benchmark_disagg(num_active_request):

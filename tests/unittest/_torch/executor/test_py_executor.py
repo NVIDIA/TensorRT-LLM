@@ -508,7 +508,10 @@ class TestDisaggTransferAdmissionController:
         assert result.admitted_requests == [request]
         assert result.admitted_transfer_blocks == 3
 
-    def test_apply_reverts_deferred_v2_allocations(self):
+    def test_apply_reverts_deferred_v2_allocations(self, monkeypatch):
+        # The transfer budget only gates the synchronous path now, so pin sync
+        # mode to still exercise the deferral + revert logic.
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
         executor._is_kv_manager_v2 = True
@@ -540,7 +543,9 @@ class TestDisaggTransferAdmissionController:
         assert admitted == [candidate]
         assert not wait_for_progress
 
-    def test_apply_missing_v2_flag_defaults_to_non_v2(self):
+    def test_apply_missing_v2_flag_defaults_to_non_v2(self, monkeypatch):
+        # Budget gating is a synchronous-path behavior; pin sync mode.
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
         executor._revert_ctx_alloc = Mock()
@@ -600,6 +605,36 @@ class TestDisaggTransferAdmissionController:
             executor, candidates
         )
 
+        assert admitted == candidates
+        assert not wait_for_progress
+        executor._revert_ctx_alloc.assert_not_called()
+
+    def test_async_mode_bypasses_transfer_budget(self):
+        # On the async path the max_tokens_in_buffer-derived budget must not gate
+        # transfers (gating it throttled high-concurrency disagg and timed out
+        # the ctx->gen handoff). The class fixture clears the mode env, so this
+        # is the default async path: even with the budget exhausted by an active
+        # transfer, every candidate is admitted with nothing deferred.
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        executor.active_requests = [
+            _make_disagg_transfer_request(1, 32, in_progress=True)
+        ]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        candidates = [
+            _make_disagg_transfer_request(2, 32),
+            _make_disagg_transfer_request(3, 32),
+        ]
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, candidates
+        )
+
+        # Sync mode would admit 0 (budget exhausted); async bypasses entirely.
         assert admitted == candidates
         assert not wait_for_progress
         executor._revert_ctx_alloc.assert_not_called()
@@ -1461,6 +1496,22 @@ def test_pad_dummy_added_when_only_to_complete_requests_disagg():
 
     assert len(stub.add_dummy_calls) == 1
     assert len(stub.active_requests) == 2
+
+
+def test_pad_dummy_tolerates_active_request_overshoot():
+    # A transient overshoot (len(active_requests) > expected_num_active_requests,
+    # when disagg transfer-error requests linger a tick before cleanup) used to
+    # trip a hard assert that crashed the gen loop on every ADP rank. It must now
+    # warn and continue instead of raising.
+    stub = _StubADPExecutor()
+    stub.active_requests = [
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS),
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS),
+    ]
+    stub.expected_num_active_requests = 1  # < len(active_requests) == 2
+
+    # Must not raise AssertionError (the pre-fix behavior on overshoot).
+    _run_pad(stub)
 
 
 def test_pad_dummy_added_when_only_wait_scheduler_requests_disagg():
