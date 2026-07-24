@@ -1,0 +1,44 @@
+{
+  "video": "ltx2_feature_eager_lpips_golden_video.mp4",
+  "model": "LTX-2",
+  "source": "TensorRT-LLM VisualGen",
+  "purpose": "Shared compact eager reference for single-feature accuracy tests",
+  "prompt": "A woman with long brown hair and light skin smiles at the camera while standing in a sunlit park, her hair gently blowing in the breeze as she tilts her head slightly to the side.",
+  "negative_prompt": "worst quality, inconsistent motion, blurry, jittery, distorted",
+  "height": 256,
+  "width": 256,
+  "num_frames": 9,
+  "num_inference_steps": 20,
+  "guidance_scale": 4.0,
+  "frame_rate": 24.0,
+  "seed": 42,
+  "feature_config": {
+    "quantization": "none",
+    "cache_backend": "off",
+    "sparse_attention": "off",
+    "cuda_graph": false,
+    "torch_compile": false
+  },
+  "deterministic_algorithms": true,
+  "lpips_net": "alex",
+  "observed_lpips": {
+    "baseline": 0.0,
+    "fp8-blockwise": 0.743483,
+    "nvfp4": 0.568191,
+    "cache_dit": 0.792871,
+    "torch-compile": 0.008694
+  },
+  "lpips_thresholds": {
+    "baseline": 0.05,
+    "fp8-blockwise": 0.80,
+    "nvfp4": 0.65,
+    "cache_dit": 0.85,
+    "torch-compile": 0.05
+  },
+  "sha256": "d887c77f17e96da11becbaf8deea546d24cd3394431ccf23a36830ee37ba7ac1",
+  "ffmpeg_version": "6.1.1-3ubuntu5",
+  "tensorrt_llm_version": "1.3.0rc21",
+  "tensorrt_llm_commit": "0acb1956614c1e58a63c20d05a964c5305b5c904",
+  "container_tag": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-26.05-py3-x86_64-ubuntu24.04-trt10.16.1.11-skip-tritondevel-202607151440-16194",
+  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm@sha256:475999862b896593159f10f486e16a748e7b7abb5cee558932a59ea6fc690d6b"
+}

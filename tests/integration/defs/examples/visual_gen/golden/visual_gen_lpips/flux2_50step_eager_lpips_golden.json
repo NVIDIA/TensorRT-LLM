@@ -1,0 +1,35 @@
+{
+  "image": "flux2_50step_eager_lpips_golden.png",
+  "model": "FLUX.2-dev",
+  "source": "TensorRT-LLM VisualGen",
+  "purpose": "Shared fixed eager reference for TeaCache and Cache-DiT accuracy tests",
+  "prompt": "a tiny astronaut hatching from an egg on the moon",
+  "height": 256,
+  "width": 256,
+  "num_inference_steps": 50,
+  "guidance_scale": 3.5,
+  "seed": 42,
+  "feature_config": {
+    "quantization": "none",
+    "cache_backend": "off",
+    "sparse_attention": "off",
+    "cuda_graph": false,
+    "torch_compile": false
+  },
+  "deterministic_algorithms": true,
+  "lpips_net": "alex",
+  "observed_lpips": {
+    "teacache": 0.038555,
+    "cache_dit": 0.020430
+  },
+  "lpips_thresholds": {
+    "teacache": 0.05,
+    "cache_dit": 0.05
+  },
+  "sha256": "dda1b3f8a5ecf482a582ca269c041a56c88aad034b406306bc40c002ccf19331",
+  "diffusers_version": "0.39.0",
+  "tensorrt_llm_version": "1.3.0rc21",
+  "tensorrt_llm_commit": "b2131b181f5be6717cd302a0b53c22c6a70c65b3",
+  "container_tag": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-26.05-py3-x86_64-ubuntu24.04-trt10.16.1.11-skip-tritondevel-202607151440-16194",
+  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm@sha256:475999862b896593159f10f486e16a748e7b7abb5cee558932a59ea6fc690d6b"
+}

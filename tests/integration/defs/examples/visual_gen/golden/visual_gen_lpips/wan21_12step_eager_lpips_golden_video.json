@@ -1,0 +1,38 @@
+{
+  "video": "wan21_12step_eager_lpips_golden_video.mp4",
+  "model": "Wan 2.1 T2V 1.3B",
+  "source": "TensorRT-LLM VisualGen",
+  "purpose": "Shared fixed eager reference for TeaCache and Cache-DiT accuracy tests",
+  "prompt": "A cat sitting on a windowsill",
+  "negative_prompt": null,
+  "height": 256,
+  "width": 256,
+  "num_frames": 5,
+  "num_inference_steps": 12,
+  "guidance_scale": 5.0,
+  "frame_rate": 16.0,
+  "seed": 42,
+  "feature_config": {
+    "quantization": "none",
+    "cache_backend": "off",
+    "sparse_attention": "off",
+    "cuda_graph": false,
+    "torch_compile": false
+  },
+  "deterministic_algorithms": true,
+  "lpips_net": "alex",
+  "observed_lpips": {
+    "teacache": 0.061988,
+    "cache_dit": 0.088793
+  },
+  "lpips_thresholds": {
+    "teacache": 0.15,
+    "cache_dit": 0.15
+  },
+  "sha256": "7e5a1d7934c19c4214c47443c960cbce585d8ab911d93be7da6ec58bebd812af",
+  "ffmpeg_version": "6.1.1-3ubuntu5",
+  "tensorrt_llm_version": "1.3.0rc22",
+  "tensorrt_llm_commit": "5b731f7a61462a628ac79fe7c7c5237cbc327331",
+  "container_tag": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-26.05-py3-x86_64-ubuntu24.04-trt10.16.1.11-skip-tritondevel-202607151440-16194",
+  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm@sha256:475999862b896593159f10f486e16a748e7b7abb5cee558932a59ea6fc690d6b"
+}
