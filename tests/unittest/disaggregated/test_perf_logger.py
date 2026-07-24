@@ -79,7 +79,7 @@ class TestPerfLogManager:
         # log() should be a no-op, not crash
         mgr.log("inst", 0, "csv_line", "info_msg")
 
-    def test_log_gen_transfer_summary_writes_csv(self):
+    def test_log_gen_transfer_summary_writes_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(
                 "os.environ",
@@ -107,7 +107,7 @@ class TestPerfLogManager:
                 assert "1024" in lines[1]
 
     @patch.dict("os.environ", {}, clear=False)
-    def test_log_gen_transfer_summary_disabled_without_env(self):
+    def test_log_gen_transfer_summary_disabled_without_env(self) -> None:
         os.environ.pop("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", None)
         from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfLogManager
 

@@ -64,7 +64,7 @@ resolved_config.json            # the validated config the job ran with
 logs/ctt-<jobid>.log            # batch-level log (stdout+stderr merged)
 logs/install.log                # TensorRT-LLM install log
 logs/sweep<i>_<role>_rank*.log  # per-rank logs: transfer START/DONE+verify, UCX_PROTO_INFO
-csv/<i>/ctx|gen/<instanceId>_*_{send,recv}.csv # C++ transceiver timing (Bandwidth(Gbps))
+csv/<i>/ctx|gen/<instanceId>_*_{send,recv}.csv # C++ transceiver timing (Bandwidth(Gbps)); renamed to <instanceId>_*_{send,recv}__c<i>.csv per combination
 csv/<i>/ctx/py_*_*.csv                 # Python transceiver perf log (throughput_mbs)
 status/sweep<i>_<role>.jsonl           # PASS / MISMATCH / TRANSFER_ERROR / TIMEOUT
 results.json                    # full results, grouped per combination (longest req_len)
@@ -96,7 +96,7 @@ deliverable for tuning your cluster.
 
 | Transceiver | Env enabling timing | File | Column (native) |
 |---|---|---|---|
-| C++ (UCX/NIXL) | `TRTLLM_KVCACHE_TIME_OUTPUT_PATH` (set by the driver) | `<instanceId>_*_recv.csv` | `Bandwidth(Gbps)` |
+| C++ (UCX/NIXL) | `TRTLLM_KVCACHE_TIME_OUTPUT_PATH` (set by the driver) | `<instanceId>_*_recv.csv` (renamed `<instanceId>_*_recv__c<i>.csv` per combination) | `Bandwidth(Gbps)` |
 | Python (NIXL) | `TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1`, `TLLM_KV_TRANSFER_PERF_LOG_FILE` (set by the driver) | `py_*_*.csv` | `throughput_mbs` (MiB/s) |
 
 `report.py` normalizes both to **per-GPU GB/s** (bytes, ÷1e9): C++

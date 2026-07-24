@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -338,7 +338,7 @@ class PerfLogManager:
         instance_rank: int,
         gen_side_transfer_time_ms: float,
         kv_cache_size: int,
-    ):
+    ) -> None:
         """Log a gen-side transfer summary row to a separate CSV.
 
         Written after timing sync across ranks so values are globally
@@ -388,7 +388,7 @@ class PerfLogManager:
                             file_handler.stream.write(_GEN_SUMMARY_HEADER + "\n")
                             file_handler.stream.flush()
                         self._file_loggers[key] = file_logger
-                    except Exception as e:
+                    except OSError as e:
                         sys.stderr.write(
                             f"[KV Transfer] Warning: Failed to create gen summary log file {log_file}: {e}\n"
                         )

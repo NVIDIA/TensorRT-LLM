@@ -14,40 +14,44 @@
 # limitations under the License.
 """Unit tests for KvCacheTransceiverV2._sync_transfer_timing."""
 
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
 
 class _FakeRequest:
     """Minimal stand-in for LlmRequest with timing getters/setters."""
 
-    def __init__(self, rid, start, end, kv_size):
+    def __init__(self, rid: int, start: int, end: int, kv_size: int) -> None:
         self.request_id = rid
         self.py_disaggregated_params = None  # forces get_unique_rid -> request_id
         self._start = start
         self._end = end
         self._kv_cache_size = kv_size
 
-    def get_kv_cache_transfer_start(self):
+    def get_kv_cache_transfer_start(self) -> int:
         return self._start
 
-    def get_kv_cache_transfer_end(self):
+    def get_kv_cache_transfer_end(self) -> int:
         return self._end
 
     @property
-    def kv_cache_size(self):
+    def kv_cache_size(self) -> int:
         return self._kv_cache_size
 
-    def set_kv_cache_transfer_start(self, v):
+    def set_kv_cache_transfer_start(self, v: int) -> None:
         self._start = v
 
-    def set_kv_cache_transfer_end(self, v):
+    def set_kv_cache_transfer_end(self, v: int) -> None:
         self._end = v
 
-    def set_kv_cache_size(self, v):
+    def set_kv_cache_size(self, v: int) -> None:
         self._kv_cache_size = v
 
 
-def _make_transceiver(**overrides):
+def _make_transceiver(**overrides: Any) -> "KvCacheTransceiverV2":
     """Create a minimal mock of KvCacheTransceiverV2 with _sync_transfer_timing."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
@@ -59,7 +63,7 @@ def _make_transceiver(**overrides):
 
 class TestSyncTransferTiming:
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
-    def test_merges_correctly_two_ranks(self):
+    def test_merges_correctly_two_ranks(self) -> None:
         """Two simulated ranks — verify min(start), max(end), sum(size)."""
         req = _FakeRequest(rid=1, start=10, end=20, kv_size=100)
 
@@ -76,7 +80,7 @@ class TestSyncTransferTiming:
         assert req._kv_cache_size == 300  # 100 + 200
 
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
-    def test_multiple_requests_batched(self):
+    def test_multiple_requests_batched(self) -> None:
         """Multiple requests in one allgather call."""
         req_a = _FakeRequest(rid=1, start=10, end=20, kv_size=100)
         req_b = _FakeRequest(rid=2, start=30, end=40, kv_size=200)
@@ -100,7 +104,7 @@ class TestSyncTransferTiming:
         assert req_b._kv_cache_size == 450
 
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
-    def test_all_ranks_updated(self):
+    def test_all_ranks_updated(self) -> None:
         """Every request object should be updated, not just rank-0."""
         req = _FakeRequest(rid=1, start=10, end=20, kv_size=100)
 
@@ -116,7 +120,7 @@ class TestSyncTransferTiming:
         assert req._kv_cache_size == 300
 
     @patch.dict("os.environ", {}, clear=False)
-    def test_skips_when_no_env(self):
+    def test_skips_when_no_env(self) -> None:
         """Without TRTLLM_KVCACHE_TIME_OUTPUT_PATH, allgather is not called."""
         import os
 
@@ -132,7 +136,7 @@ class TestSyncTransferTiming:
         assert req._start == 10  # unchanged
 
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
-    def test_skips_when_single_rank(self):
+    def test_skips_when_single_rank(self) -> None:
         """When _gen_need_sync is False, allgather is not called."""
         allgather_mock = MagicMock()
         tc = _make_transceiver(gen_need_sync=False, gen_allgather=allgather_mock)
@@ -144,7 +148,7 @@ class TestSyncTransferTiming:
         assert req._start == 10  # unchanged
 
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
-    def test_empty_list(self):
+    def test_empty_list(self) -> None:
         """Empty request list should return immediately."""
         allgather_mock = MagicMock()
         tc = _make_transceiver(gen_need_sync=True, gen_allgather=allgather_mock)
