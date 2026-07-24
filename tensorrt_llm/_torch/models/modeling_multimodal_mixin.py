@@ -115,6 +115,28 @@ class PreparedLlmInputs:
     extra_embeds: Sequence[torch.Tensor] = ()
 
 
+@dataclass(frozen=True)
+class EncoderCachePartition:
+    """Per-item cache partition for a single `MultimodalParams`.
+
+    `hits` maps item index to its cached embedding row-block; `miss_indices` lists item
+    indices that still require encoder work; `keys` is aligned to item order so miss
+    embeddings can be written back after they are computed.
+    """
+
+    hits: Dict[int, torch.Tensor]
+    miss_indices: list[int]
+    keys: list[Hashable]
+
+    @property
+    def is_full_hit(self) -> bool:
+        return bool(self.keys) and not self.miss_indices
+
+    @property
+    def is_full_miss(self) -> bool:
+        return bool(self.keys) and not self.hits
+
+
 class MultimodalModelMixin:
     """Template-method mixin for PyTorch multimodal causal LM models.
 
@@ -124,14 +146,23 @@ class MultimodalModelMixin:
     Current limitations:
 
     * For the time being, the persistent multimodal encoder cache stores per-item embeddings for
-      single-modality `MultimodalParams` objects.
-    * Cache reuse is all-or-nothing for each `MultimodalParams` object: every item in that object
-      hit the cache before cached embeddings are reused. Mixed-modality `MultimodalParams` objects
-      bypass the persistent cache.
+      single-modality `MultimodalParams` objects. Mixed-modality objects bypass the cache.
+    * Per-item cache reuse is all-or-nothing by default. Models can opt into partial reuse by
+      implementing `slice_multimodal_data_items` and setting
+      `supports_granular_encoder_cache = True`; miss items are re-encoded and interleaved with
+      cached items in original per-item order.
     """
 
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
+
+    supports_granular_encoder_cache: ClassVar[bool] = False
+    """Whether the mixin may reuse a partial cache hit for this model.
+
+    When True, a partially cached `MultimodalParams` is handled by encoding only its miss
+    items and interleaving cached items back in per-item order. Requires the model to
+    implement `slice_multimodal_data_items`.
+    """
 
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
@@ -240,6 +271,21 @@ class MultimodalModelMixin:
         # them as extra embeds without changing the base flow.
         return active_embeddings, ()
 
+    def slice_multimodal_data_items(
+        self,
+        param: MultimodalParams,
+        item_indices: Sequence[int],
+    ) -> MultimodalParams:
+        """Return a `MultimodalParams` whose raw modality inputs contain only
+        `item_indices` from `param`, in that order.
+
+        Only the model knows how to slice its own modality tensors (`pixel_values`,
+        `image_grid_thw`, packed audio features, ...). The parallel per-item metadata
+        (`multimodal_embedding_lengths`, `multimodal_hashes`) is re-sliced by the mixin
+        after this returns, so implementations should focus on modality data only.
+        """
+        raise NotImplementedError
+
     # A future optional mixin-owned forward can build on the same template method.
     def prepare_multimodal_inputs(
         self,
@@ -312,15 +358,32 @@ class MultimodalModelMixin:
         the single tensor contract for both encoded and cached-only paths.
         """
         encoder_cache = self._get_multimodal_encoder_cache()
-        cache_misses = []
+        cache_misses: list[MultimodalParams] = []
+        partial_hits: list[tuple[MultimodalParams, EncoderCachePartition]] = []
         if encoder_cache is not None:
             for param in multimodal_params:
                 if param.multimodal_data.get("multimodal_embedding") is not None:
                     # The forward that attached this request-local embedding already populated the
                     # persistent cache.
                     continue
-                if not self._attach_encoder_cache_hit(param, encoder_cache):
+                partition = self._partition_encoder_cache(param, encoder_cache)
+                if partition is None or partition.is_full_miss:
                     cache_misses.append(param)
+                    continue
+                if partition.is_full_hit:
+                    param.multimodal_data["multimodal_embedding"] = self._assemble_full_embedding(
+                        partition.hits, len(partition.keys)
+                    )
+                    continue
+                if self.supports_granular_encoder_cache:
+                    partial_hits.append((param, partition))
+                else:
+                    cache_misses.append(param)
+
+        if partial_hits:
+            # `encoder_cache` is non-None here because partitions are only produced when the cache
+            # exists.
+            self._encode_with_partial_cache(partial_hits, encoder_cache)
 
         embeddings = get_multimodal_embeddings(
             encoder_forward_fn=self.encode_multimodal_inputs,
@@ -476,47 +539,118 @@ class MultimodalModelMixin:
         ]
 
     @classmethod
-    def _attach_encoder_cache_hit(
+    def _partition_encoder_cache(
         cls,
         param: MultimodalParams,
         encoder_cache: TensorLRUCache,
-    ) -> bool:
-        """Attach a full persistent-cache hit and report whether one was found."""
+    ) -> Optional[EncoderCachePartition]:
+        """Look up every item of `param` and return the per-item partition.
+
+        Returns `None` when the param is not cacheable (mixed modality, missing metadata,
+        request-local embedding already attached); the caller treats that as a full miss.
+        """
         if param.multimodal_data.get("multimodal_embedding") is not None:
             logger.debug(
                 f"{_MM_ENCODER_CACHE_LOG_NAME}: request-local multimodal embedding present; "
                 "skipping persistent cache lookup"
             )
-            return False
+            return None
 
         keys = cls._encoder_cache_keys(param)
         if not keys:
-            return False
+            return None
 
-        cached_embeddings = []
-        for key in keys:
-            cached_embedding = encoder_cache.get(key)
-            if cached_embedding is None:
-                # TODO(TRTLLM-13996): allow re-computing only the uncached items.
-                # `get_multimodal_embeddings` treats a param as either fully cached or uncached.
-                # Attaching partial hits would make the later concatenated tensor ambiguous because
-                # there is no placeholder for missing item rows inside `multimodal_embedding`.
-                logger.debug(
-                    f"{_MM_ENCODER_CACHE_LOG_NAME}: cache miss; hit_items={len(cached_embeddings)},"
-                    f" total_items={len(keys)}."
-                )
-                return False
-            cached_embeddings.append(cached_embedding)
+        hits: Dict[int, torch.Tensor] = {}
+        miss_indices: list[int] = []
+        for i, key in enumerate(keys):
+            cached = encoder_cache.get(key)
+            if cached is None:
+                miss_indices.append(i)
+            else:
+                hits[i] = cached
 
-        if len(cached_embeddings) == 1:
-            param.multimodal_data["multimodal_embedding"] = cached_embeddings[0]
-        else:
-            param.multimodal_data["multimodal_embedding"] = torch.cat(cached_embeddings, dim=0)
         logger.debug(
-            f"{_MM_ENCODER_CACHE_LOG_NAME}: full cache hit for {len(keys)} item entries, "
-            f"rows={param.multimodal_data['multimodal_embedding'].shape[0]}."
+            f"{_MM_ENCODER_CACHE_LOG_NAME}: partition hit_items={len(hits)}, "
+            f"miss_items={len(miss_indices)}, total_items={len(keys)}."
         )
-        return True
+        return EncoderCachePartition(hits=hits, miss_indices=miss_indices, keys=keys)
+
+    @staticmethod
+    def _assemble_full_embedding(
+        item_tensors: Dict[int, torch.Tensor],
+        total_items: int,
+    ) -> torch.Tensor:
+        """Concatenate per-item embedding tensors in item-index order.
+
+        `item_tensors` must contain every index in `[0, total_items)`.
+        """
+        if total_items == 1:
+            return item_tensors[0]
+        return torch.cat([item_tensors[i] for i in range(total_items)], dim=0)
+
+    @staticmethod
+    def _apply_metadata_slice(
+        residual: MultimodalParams,
+        source: MultimodalParams,
+        item_indices: Sequence[int],
+    ) -> None:
+        """Overwrite `residual`'s per-item metadata to match the sliced items.
+
+        Models slice raw modality tensors in `slice_multimodal_data_items`; the mixin owns
+        the parallel per-item metadata slice so every model gets it identically.
+        """
+        source_lengths = source.multimodal_data["multimodal_embedding_lengths"]
+        residual.multimodal_data["multimodal_embedding_lengths"] = [
+            source_lengths[i] for i in item_indices
+        ]
+        if residual.multimodal_input is not None and source.multimodal_input is not None:
+            source_hashes = source.multimodal_input.multimodal_hashes
+            residual.multimodal_input.multimodal_hashes = [source_hashes[i] for i in item_indices]
+
+    def _encode_with_partial_cache(
+        self,
+        partials: Sequence[tuple[MultimodalParams, EncoderCachePartition]],
+        encoder_cache: TensorLRUCache,
+    ) -> None:
+        """Encode only the miss items of each partial-hit param and stitch results.
+
+        After this returns, each param's `multimodal_embedding` has the same shape as a
+        full encoder run so downstream `get_multimodal_embeddings` treats it as fully
+        cached.
+        """
+        for param, partition in partials:
+            residual = self.slice_multimodal_data_items(param, partition.miss_indices)
+            self._apply_metadata_slice(residual, param, partition.miss_indices)
+
+            residual_output = self.encode_multimodal_inputs([residual])
+            miss_lengths = [
+                param.multimodal_data["multimodal_embedding_lengths"][i]
+                for i in partition.miss_indices
+            ]
+            miss_tensors = torch.split(residual_output, miss_lengths, dim=0)
+
+            by_item: Dict[int, torch.Tensor] = dict(partition.hits)
+            for miss_idx, tensor in zip(partition.miss_indices, miss_tensors, strict=True):
+                by_item[miss_idx] = tensor
+            param.multimodal_data["multimodal_embedding"] = self._assemble_full_embedding(
+                by_item, len(partition.keys)
+            )
+
+            inserted = 0
+            rejected = 0
+            for miss_idx, tensor in zip(partition.miss_indices, miss_tensors, strict=True):
+                if encoder_cache.put(partition.keys[miss_idx], tensor):
+                    inserted += 1
+                else:
+                    rejected += 1
+            logger.debug(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: partial-hit encode "
+                f"total_items={len(partition.keys)} "
+                f"hit_items={len(partition.hits)} "
+                f"encoded_items={len(partition.miss_indices)} "
+                f"cache_writes_inserted={inserted} "
+                f"cache_writes_rejected={rejected}"
+            )
 
     @classmethod
     def _write_encoder_cache_entries(

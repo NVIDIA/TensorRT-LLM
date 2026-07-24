@@ -670,6 +670,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     """
 
     supports_encoder_cache = True
+    supports_granular_encoder_cache = True
 
     def __init__(
         self,
@@ -824,6 +825,31 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     ) -> torch.Tensor:
         mm_embeds = self._vision_forward(list(multimodal_params))
         return mm_embeds[0]
+
+    def slice_multimodal_data_items(
+        self,
+        param: MultimodalParams,
+        item_indices: Sequence[int],
+    ) -> MultimodalParams:
+        # One item == one image. `pixel_values` is `[B, C, H, W]` with B parallel to
+        # `image_sizes` (a Python list of `[h, w]`), so both are sliced along the item axis.
+        src_image = param.multimodal_data["image"]
+        indices = list(item_indices)
+        sliced_image = {
+            **src_image,
+            "pixel_values": src_image["pixel_values"][indices],
+            "image_sizes": [src_image["image_sizes"][i] for i in indices],
+        }
+        new_multimodal_data = {**param.multimodal_data, "image": sliced_image}
+
+        # Shallow-copy `multimodal_input` so the mixin's metadata slice can rewrite
+        # `multimodal_hashes` on the residual without mutating the source.
+        residual_input = (copy.copy(param.multimodal_input)
+                          if param.multimodal_input is not None else None)
+        return MultimodalParams(
+            multimodal_data=new_multimodal_data,
+            multimodal_input=residual_input,
+        )
 
     def get_language_model_forward_kwargs(
         self,
