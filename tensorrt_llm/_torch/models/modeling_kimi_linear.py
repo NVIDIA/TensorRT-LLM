@@ -299,16 +299,33 @@ class KimiK3MoERuntime(nn.Module):
                                                 eps=cfg.rms_norm_eps,
                                                 dtype=dtype)
 
+        import os as _os
+        self.moe = None
+        if (torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+                and (_os.environ.get("KIMI_K3_CMOE") or "1") != "0"):
+            # Middle tier: host the native SiTU op under ConfigurableMoE.
+            # The stock wrapper contributes the ExternalComm scheduler
+            # (chunking via moe_max_num_tokens), the CommunicationFactory
+            # lane selection with per-workload fallback, and the EPLB attr
+            # plumbing; the kernel and the lazily packed bank weights stay
+            # K3-owned. KIMI_K3_CMOE=0 restores the direct path below.
+            self.moe = self._build_configurable_moe(model_config, cfg,
+                                                    layer_idx, dtype)
         self.dep_comm = None
-        if mapping.enable_attention_dp and mapping.tp_size > 1:
+        if (self.moe is None and mapping.enable_attention_dp
+                and mapping.tp_size > 1):
+            # KIMI_K3_CMOE=0 escape hatch only: the ConfigurableMoE path
+            # above owns comm-lane selection (stock CommunicationFactory +
+            # scheduler fallback); the direct path stays on the merged
+            # upstream AG/RS form.
             from ..modules.fused_moe.communication.allgather_reducescatter \
                 import AllGatherReduceScatter
             self.dep_comm = AllGatherReduceScatter(mapping)
         self.allreduce = (AllReduce(mapping=mapping,
                                     strategy=model_config.allreduce_strategy,
                                     dtype=dtype)
-                          if (self.ep_size > 1 and self.dep_comm is None)
-                          else None)
+                          if (self.moe is None and self.ep_size > 1
+                              and self.dep_comm is None) else None)
 
         # Fused SiTU MoE path selection is automatic: Blackwell
         # (SM100/SM103) uses the in-tree TRTLLM-Gen SiTU op (W4A8
@@ -329,10 +346,80 @@ class KimiK3MoERuntime(nn.Module):
                                        if situ_linear_beta is not None else 1.0)
         self._native_fused_weights = None
 
+    def _build_configurable_moe(self, model_config: ModelConfig, cfg,
+                                layer_idx: int, dtype: torch.dtype):
+        """Host the native SiTU op under ``ConfigurableMoE`` (thin shell)."""
+        import copy as _copy
+
+        from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+        from ..modules.kimi_k3_moe.configurable_moe_shell import \
+            KimiK3ConfigurableMoE
+
+        gate = self.gate
+        assert (gate.moe_router_activation_func == "sigmoid"
+                and gate.moe_renormalize and gate.num_expert_group == 1
+                and gate.topk_group == 1), (
+                    "DeepSeekV3MoeRoutingMethod mirrors the K3 gate only for "
+                    "sigmoid scoring + renormalize + ungrouped top-k")
+        # K3 is EP-only: the non-attention-DP mode reinterprets the TP width
+        # as the EP width, so hand the wrapper a mapping whose moe_ep/moe_tp
+        # split says the same thing. Attention modules keep the original.
+        mapping = model_config.mapping
+        moe_model_config = model_config
+        if mapping.moe_ep_size != self.ep_size:
+            moe_mapping = _copy.deepcopy(mapping)
+            moe_mapping.moe_ep_size = self.ep_size
+            moe_mapping.moe_tp_size = mapping.tp_size // self.ep_size
+            moe_model_config = _copy.copy(model_config)
+            moe_model_config._frozen = False
+            moe_model_config.mapping = moe_mapping
+            moe_model_config._frozen = True
+        routing_method = DeepSeekV3MoeRoutingMethod(
+            top_k=self.top_k,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=cfg.routed_scaling_factor,
+            callable_e_score_correction_bias=lambda:
+            gate.e_score_correction_bias,
+            is_fused=False,
+        )
+        moe = KimiK3ConfigurableMoE(
+            ensure_weights_fn=self._ensure_native_fused_weights,
+            get_weights_fn=lambda: self._native_fused_weights,
+            routing_method=routing_method,
+            num_experts=self.num_experts,
+            hidden_size=self.moe_hidden_size,
+            intermediate_size=cfg.moe_intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=moe_model_config,
+            layer_idx=layer_idx,
+        )
+        assert (moe.slot_start == self.expert_lo
+                and moe.expert_size_per_partition == self.experts_per_rank), (
+                    f"wrapper expert partition [{moe.slot_start}, "
+                    f"{moe.slot_start + moe.expert_size_per_partition}) "
+                    f"diverges from the bank slice "
+                    f"[{self.expert_lo}, {self.expert_hi})")
+        return moe
+
     def forward(self, hidden_states: torch.Tensor,
                 all_rank_num_tokens=None) -> torch.Tensor:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
+        if self.moe is not None:
+            # ConfigurableMoE path: the scheduler owns routing (recomputed
+            # per chunk from the fp32 gate logits), dispatch/combine (or the
+            # non-DP EP allreduce) and chunking; the partial latent sums are
+            # still completed BEFORE the nonlinear latent norm, as below.
+            router_logits = self.gate.compute_logits(hidden_states)
+            routed_in = self.routed_expert_down_proj(hidden_states)
+            y = self.moe(routed_in, router_logits,
+                         all_rank_num_tokens=all_rank_num_tokens,
+                         use_dp_padding=False)
+            y = self.routed_expert_norm(y)
+            y = self.routed_expert_up_proj(y)
+            return y + self.shared_experts(identity)
         # Gate expects a 3D layout (HF contract).
         topk_idx, topk_weight = self.gate(hidden_states.unsqueeze(0))
 
