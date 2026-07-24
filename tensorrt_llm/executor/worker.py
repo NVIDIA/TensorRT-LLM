@@ -80,8 +80,20 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             name="await_response_thread")
 
     def start_thread(self, thread: ManagedThread):
-        if self.engine.can_enqueue_requests() and not thread.is_alive():
-            thread.start()
+        if not self.engine.can_enqueue_requests():
+            return
+        if thread.is_alive():
+            return
+        if thread.ident is not None:
+            # The thread already ran and exited; it can't be restarted, and it
+            # only exits when the engine event loop crashed (stashed in
+            # _event_loop_error). Restarting masks that crash and cascades into a
+            # peer MPI-collective hang, so surface the real error instead.
+            err = getattr(self.engine, "_event_loop_error", None)
+            if err is not None:
+                raise err
+            return
+        thread.start()
 
     def await_response_task(self) -> bool:
         return self._await_response_helper()
