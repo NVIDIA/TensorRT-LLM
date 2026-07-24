@@ -13,26 +13,22 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.resource_manager import (BlockManager,
-                                                             KVCacheManager)
+from tensorrt_llm._torch.pyexecutor.resource_manager import BlockManager, KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.bindings.internal.batch_manager import \
-    CacheType as CacheTypeCpp
+from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.mapping import Mapping
 
 from .params import RocketKVParams
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
-                                              SparseAttentionConfig)
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, SparseAttentionConfig
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
 
 class RocketKVCacheManager(KVCacheManager):
-
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -57,19 +53,22 @@ class RocketKVCacheManager(KVCacheManager):
         pretrained_config=None,
         **kwargs,
     ) -> None:
-
         if sparse_attention_config is None:
-            raise ValueError(
-                "sparse_attention_config is required for RocketKV cache")
+            raise ValueError("sparse_attention_config is required for RocketKV cache")
         sparse_params = sparse_attention_config.to_sparse_params(
-            pretrained_config=pretrained_config)
+            pretrained_config=pretrained_config
+        )
         if not isinstance(sparse_params, RocketKVParams):
-            raise ValueError(
-                "RocketKV cache requires RocketKV sparse parameters")
-        assert not kv_cache_config.enable_block_reuse, "RocketKV cache requires block reuse to be disabled in KV cache config"
+            raise ValueError("RocketKV cache requires RocketKV sparse parameters")
+        assert not kv_cache_config.enable_block_reuse, (
+            "RocketKV cache requires block reuse to be disabled in KV cache config"
+        )
         self.kt_tokens_per_block = next_power_of_2(
-            math.ceil(tokens_per_block / sparse_params.page_size))
-        self.kt_cache_dtype = torch.bfloat16 if sparse_params.kt_cache_dtype == 'bfloat16' else torch.float8_e5m2
+            math.ceil(tokens_per_block / sparse_params.page_size)
+        )
+        self.kt_cache_dtype = (
+            torch.bfloat16 if sparse_params.kt_cache_dtype == "bfloat16" else torch.float8_e5m2
+        )
 
         super().__init__(
             kv_cache_config,
@@ -100,18 +99,18 @@ class RocketKVCacheManager(KVCacheManager):
         # since kt_tokens_per_block * num_blocks * page_size >= tokens_per_block * num_blocks.
         self.num_blocks = self.blocks_in_primary_pool
         self.kt_cache_pool_per_layer = [
-            torch.empty((self.num_blocks, self.kt_tokens_per_block,
-                         num_kv_heads, head_dim * 2),
-                        device="cuda",
-                        dtype=self.kt_cache_dtype)
+            torch.empty(
+                (self.num_blocks, self.kt_tokens_per_block, num_kv_heads, head_dim * 2),
+                device="cuda",
+                dtype=self.kt_cache_dtype,
+            )
             for _ in range(self.num_local_layers)
         ]
         self.max_kt_blocks_per_seq = self.num_blocks
 
         # Block manager to manage the KT cache blocks for each request. Different layers share the
         # same block ids.
-        self.kt_cache_manager = BlockManager(self.num_blocks,
-                                             self.kt_tokens_per_block)
+        self.kt_cache_manager = BlockManager(self.num_blocks, self.kt_tokens_per_block)
 
     def add_dummy_requests(
         self,
@@ -143,16 +142,16 @@ class RocketKVCacheManager(KVCacheManager):
         if prepare_resource:
             for req in requests:
                 request_id = req.py_request_id
-                kt_token_num = math.ceil(req.max_beam_num_tokens /
-                                         self.page_size)
+                kt_token_num = math.ceil(req.max_beam_num_tokens / self.page_size)
                 self.kt_cache_manager.add_tokens(request_id, kt_token_num)
         return requests
 
     def get_kt_buffers(self, layer_idx: int):
         return self.kt_cache_pool_per_layer[layer_idx]
 
-    def copy_kt_block_offsets(self, request_ids: List[int],
-                              block_offsets: torch.Tensor) -> torch.Tensor:
+    def copy_kt_block_offsets(
+        self, request_ids: List[int], block_offsets: torch.Tensor
+    ) -> torch.Tensor:
         self.kt_cache_manager.copy_block_offsets(request_ids, block_offsets)
 
     def prepare_resources(self, scheduled_batch):
@@ -169,10 +168,12 @@ class RocketKVCacheManager(KVCacheManager):
             if num_tokens % self.page_size == 1:
                 self.kt_cache_manager.add_tokens(request_id, 1)
 
-    def update_resources(self,
-                         scheduled_batch,
-                         attn_metadata: AttentionMetadata = None,
-                         kv_cache_dtype_byte_size: float = None):
+    def update_resources(
+        self,
+        scheduled_batch,
+        attn_metadata: AttentionMetadata = None,
+        kv_cache_dtype_byte_size: float = None,
+    ):
         for request in scheduled_batch.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 seq_len = request.get_num_tokens(0)
@@ -181,8 +182,9 @@ class RocketKVCacheManager(KVCacheManager):
                 # get the rewind length for kt cache
                 num_tokens = request.max_beam_num_tokens
                 updated_kt_token_num = num_tokens - rewind_len
-                rewind_len = (math.ceil(num_tokens / self.page_size) -
-                              math.ceil(updated_kt_token_num / self.page_size))
+                rewind_len = math.ceil(num_tokens / self.page_size) - math.ceil(
+                    updated_kt_token_num / self.page_size
+                )
                 self.kt_cache_manager.rewind_cache(request, rewind_len)
 
     def free_resources(self, request):
@@ -190,24 +192,20 @@ class RocketKVCacheManager(KVCacheManager):
         self.kt_cache_manager.free_resources(request)
 
     @staticmethod
-    def get_cache_size_per_token(model_config: ModelConfig,
-                                 mapping: Mapping,
-                                 num_layers: Optional[int] = None,
-                                 **kwargs):
+    def get_cache_size_per_token(
+        model_config: ModelConfig, mapping: Mapping, num_layers: Optional[int] = None, **kwargs
+    ):
         # main KV cache dtype bytes (one each for K and V)
         kv_dtype_bytes = 2
         quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-        ):
+        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
             kv_dtype_bytes = 1
 
         # get num key value heads
         config = model_config.pretrained_config
-        num_key_value_heads = getattr(config, 'num_key_value_heads',
-                                      config.num_attention_heads)
+        num_key_value_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
         if isinstance(num_key_value_heads, Iterable):
-            num_key_value_heads = sum(num_key_value_heads) / len(
-                num_key_value_heads)
+            num_key_value_heads = sum(num_key_value_heads) / len(num_key_value_heads)
 
         # get head dim
         tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
@@ -217,23 +215,22 @@ class RocketKVCacheManager(KVCacheManager):
         head_dim = head_dim * num_key_value_heads // tp_size
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
-            model_config, mapping, num_layers)
+            model_config, mapping, num_layers
+        )
 
         # K and V: two tensors stored at the main KV cache dtype.
         mem_per_token = kv_dtype_bytes * 2 * num_attention_layers * head_dim
 
-        tokens_per_block = kwargs['tokens_per_block']
+        tokens_per_block = kwargs["tokens_per_block"]
         sparse_attention_config = model_config.sparse_attention_config
         if sparse_attention_config is None:
-            raise ValueError(
-                "sparse_attention_config is required for RocketKV cache")
+            raise ValueError("sparse_attention_config is required for RocketKV cache")
         sparse_params = sparse_attention_config.to_sparse_params(
-            pretrained_config=model_config.pretrained_config)
+            pretrained_config=model_config.pretrained_config
+        )
         if not isinstance(sparse_params, RocketKVParams):
-            raise ValueError(
-                "RocketKV cache requires RocketKV sparse parameters")
-        kt_tokens_per_block = next_power_of_2(
-            math.ceil(tokens_per_block / sparse_params.page_size))
+            raise ValueError("RocketKV cache requires RocketKV sparse parameters")
+        kt_tokens_per_block = next_power_of_2(math.ceil(tokens_per_block / sparse_params.page_size))
         # KT (key-landmark) cache: a separate pool stored at kt_cache_dtype,
         # NOT the main KV dtype. Per real token it holds
         # kt_tokens_per_block / tokens_per_block landmark slots, each storing
@@ -243,26 +240,36 @@ class RocketKVCacheManager(KVCacheManager):
         # get_cache_bytes_per_token and the physical pool allocated in
         # RocketKVCacheManager.__init__.
         kt_dtype_bytes = 1 if sparse_params.kt_cache_dtype == "float8_e5m2" else 2
-        mem_per_token += (kt_dtype_bytes * 2 * kt_tokens_per_block /
-                          tokens_per_block * num_attention_layers * head_dim)
+        mem_per_token += (
+            kt_dtype_bytes
+            * 2
+            * kt_tokens_per_block
+            / tokens_per_block
+            * num_attention_layers
+            * head_dim
+        )
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
         # Main K/V cache: stored at the main KV cache dtype (self.dtype).
         cache_size_per_token = math.ceil(
-            self.kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
+            self.kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim
+        )
 
-        if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
-                              DataType.FLOAT, DataType.NVFP4):
-            raise ValueError(f'Cannot support {self.dtype} KV cache.')
+        if self.dtype not in (
+            DataType.FP8,
+            DataType.HALF,
+            DataType.BF16,
+            DataType.FLOAT,
+            DataType.NVFP4,
+        ):
+            raise ValueError(f"Cannot support {self.dtype} KV cache.")
 
-        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
-                                                       self.dtype)
+        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token, self.dtype)
         if self.dtype == DataType.NVFP4:
             cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
-                cache_size_per_token,
-                quant_vector_size=16,
-                scaling_factor_dtype=DataType.FP8)
+                cache_size_per_token, quant_vector_size=16, scaling_factor_dtype=DataType.FP8
+            )
 
         # KT (key-landmark) cache: a separate pool physically allocated at
         # kt_cache_dtype, NOT the main KV dtype -- see __init__:
@@ -275,8 +282,12 @@ class RocketKVCacheManager(KVCacheManager):
         # matches the allocation regardless of self.dtype.
         kt_dtype_bytes = 1 if self.kt_cache_dtype == torch.float8_e5m2 else 2
         kt_elements_per_token = math.ceil(
-            2 * self.kt_tokens_per_block / self.tokens_per_block *
-            sum(self.num_kv_heads_per_layer) * self.head_dim)
+            2
+            * self.kt_tokens_per_block
+            / self.tokens_per_block
+            * sum(self.num_kv_heads_per_layer)
+            * self.head_dim
+        )
         cache_size_bytes_per_token += kt_elements_per_token * kt_dtype_bytes
 
         return cache_size_bytes_per_token

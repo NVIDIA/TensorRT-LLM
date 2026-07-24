@@ -63,8 +63,12 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
     req = tl.load(req_id_ptr + token_id)
 
     # Load local token indices: token_indices[kv_head_idx, token_id, indice_id]
-    ti_ptr = (token_indices_ptr + kv_head_idx * ti_stride0 +
-              token_id * ti_stride1 + indice_id * ti_stride2)
+    ti_ptr = (
+        token_indices_ptr
+        + kv_head_idx * ti_stride0
+        + token_id * ti_stride1
+        + indice_id * ti_stride2
+    )
     tok = tl.load(ti_ptr)
 
     is_invalid_tok = tok < 0
@@ -73,12 +77,13 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
     valid_page = page_idx < max_num_blocks_per_req
 
     # block_table[req, page_idx] → memPoolBlockIdx (physical page index)
-    bt_ptr = (block_table_ptr + req * bt_stride0 + page_idx * bt_stride1)
+    bt_ptr = block_table_ptr + req * bt_stride0 + page_idx * bt_stride1
     mem_pool_idx = tl.load(bt_ptr, mask=valid_page, other=0)
 
     # Base offset within physical page (invariant across kv_factor loop)
-    base_off = (layer_id * kv_factor * num_kv_heads * BLOCK_SIZE +
-                kv_head_idx * BLOCK_SIZE + token_in_page)
+    base_off = (
+        layer_id * kv_factor * num_kv_heads * BLOCK_SIZE + kv_head_idx * BLOCK_SIZE + token_in_page
+    )
 
     for kv_factor_idx in tl.static_range(kv_factor):
         # Within-page offset: layer → kv_factor → kv_head → token
@@ -88,18 +93,20 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
 
         out_val = tl.where(is_invalid_tok | (~valid_page), -1, global_idx)
 
-        out_ptr_ij = (out_ptr + kv_head_idx * out_stride0 +
-                      token_id * out_stride1 + kv_factor_idx * out_stride2 +
-                      indice_id * out_stride3)
+        out_ptr_ij = (
+            out_ptr
+            + kv_head_idx * out_stride0
+            + token_id * out_stride1
+            + kv_factor_idx * out_stride2
+            + indice_id * out_stride3
+        )
         tl.store(out_ptr_ij, out_val)
 
 
 def triton_convert_req_index_to_global_index(
     req_id: torch.Tensor,  # int32 [num_tokens]
-    block_table: torch.
-    Tensor,  # int32 [num_requests, kv_factor, max_num_blocks_per_req]
-    token_indices: torch.
-    Tensor,  # int32 [num_kv_heads, num_tokens, NUM_TOPK_TOKENS]
+    block_table: torch.Tensor,  # int32 [num_requests, kv_factor, max_num_blocks_per_req]
+    token_indices: torch.Tensor,  # int32 [num_kv_heads, num_tokens, NUM_TOPK_TOKENS]
     BLOCK_SIZE: int,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,  # tile width along columns
@@ -129,11 +136,13 @@ def triton_convert_req_index_to_global_index(
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
-    assert token_indices.ndim in (2, 3), \
+    assert token_indices.ndim in (2, 3), (
         f"Expected 2D [num_tokens, topk] or 3D [num_kv_heads, num_tokens, topk], got {token_indices.ndim}D"
+    )
     assert block_table.ndim == 2, f"Expected 2D [batch, max_pages], got {block_table.ndim}D"
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0, \
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
         f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by BLOCK_N ({BLOCK_N})"
+    )
 
     num_tokens = req_id.shape[0]
     max_num_blocks_per_req = block_table.shape[1]
@@ -142,9 +151,11 @@ def triton_convert_req_index_to_global_index(
     req_id_c = req_id.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
-    out = torch.empty((num_kv_heads, num_tokens, kv_factor, NUM_TOPK_TOKENS),
-                      dtype=torch.int32,
-                      device=token_indices.device)
+    out = torch.empty(
+        (num_kv_heads, num_tokens, kv_factor, NUM_TOPK_TOKENS),
+        dtype=torch.int32,
+        device=token_indices.device,
+    )
 
     bt_stride0, bt_stride1 = block_table_c.stride()
     # 2D input: ti_stride0=0 (kv_head_idx is always 0, term vanishes)
@@ -196,16 +207,11 @@ def _triton_gather_k_cache_kernel(
     BLOCK_TOKENS: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    token_offsets = (pid * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)).to(
-        tl.int64)
+    token_offsets = (pid * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)).to(tl.int64)
     token_mask = token_offsets < num_k_tokens
 
-    fp8_base = tl.load(slot_fp8_ptr + k_token_start + token_offsets,
-                       mask=token_mask,
-                       other=0)
-    scale_base = tl.load(slot_scale_ptr + k_token_start + token_offsets,
-                         mask=token_mask,
-                         other=0)
+    fp8_base = tl.load(slot_fp8_ptr + k_token_start + token_offsets, mask=token_mask, other=0)
+    scale_base = tl.load(slot_scale_ptr + k_token_start + token_offsets, mask=token_mask, other=0)
 
     byte_offsets = tl.arange(0, HEAD_DIM).to(tl.int64)
     src_fp8 = fp8_base[:, None] + byte_offsets[None, :]
@@ -217,8 +223,7 @@ def _triton_gather_k_cache_kernel(
 
     scale_byte_offsets = tl.arange(0, SCALE_BYTES).to(tl.int64)
     src_scale = scale_base[:, None] + scale_byte_offsets[None, :]
-    dst_scale = token_offsets[:,
-                              None] * SCALE_BYTES + scale_byte_offsets[None, :]
+    dst_scale = token_offsets[:, None] * SCALE_BYTES + scale_byte_offsets[None, :]
 
     scale_data = tl.load(k_cache_ptr + src_scale, mask=gather_mask, other=0)
     tl.store(out_scale_ptr + dst_scale, scale_data, mask=gather_mask)
@@ -267,16 +272,10 @@ def triton_gather_k_cache(
     BLOCK_TOKENS = 32
 
     k_cache_flat = k_cache.reshape(-1)
-    out_fp8 = torch.empty(num_k_tokens,
-                          head_dim,
-                          dtype=torch.uint8,
-                          device=device)
-    out_scale = torch.empty(num_k_tokens,
-                            SCALE_BYTES,
-                            dtype=torch.uint8,
-                            device=device)
+    out_fp8 = torch.empty(num_k_tokens, head_dim, dtype=torch.uint8, device=device)
+    out_scale = torch.empty(num_k_tokens, SCALE_BYTES, dtype=torch.uint8, device=device)
 
-    grid = (triton.cdiv(num_k_tokens, BLOCK_TOKENS), )
+    grid = (triton.cdiv(num_k_tokens, BLOCK_TOKENS),)
     _triton_gather_k_cache_kernel[grid](
         k_cache_flat,
         slot_mapping_fp8,

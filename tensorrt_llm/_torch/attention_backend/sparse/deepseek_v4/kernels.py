@@ -79,7 +79,9 @@ def _deepseek_v4_local_to_global_kernel(
     swa_bt_ptr = block_table_swa_ptr + req * bt_swa_stride0 + swa_block_ordinal * bt_swa_stride1
     swa_page_index = tl.load(swa_bt_ptr, mask=swa_full_mask, other=0)
 
-    swa_global_index = swa_buffer_offset_in_tokens + swa_page_index * tokens_per_block_swa + swa_token_in_block
+    swa_global_index = (
+        swa_buffer_offset_in_tokens + swa_page_index * tokens_per_block_swa + swa_token_in_block
+    )
     swa_global_index = tl.where(swa_full_mask, swa_global_index, -1)
 
     # Store SWA results at fixed positions [0, num_swa_indices)
@@ -89,9 +91,11 @@ def _deepseek_v4_local_to_global_kernel(
     if has_compressed:
         # Load all compressed local indices for this token
         compressed_ids = tl.arange(0, num_compressed_indices)
-        compressed_ptr = (compressed_local_indices_ptr +
-                          token_id * compressed_indices_stride0 +
-                          compressed_ids * compressed_indices_stride1)
+        compressed_ptr = (
+            compressed_local_indices_ptr
+            + token_id * compressed_indices_stride0
+            + compressed_ids * compressed_indices_stride1
+        )
         compressed_local_idx = tl.load(compressed_ptr)
 
         # Compute global indices for all compressed positions
@@ -101,19 +105,19 @@ def _deepseek_v4_local_to_global_kernel(
         compressed_valid_block = compressed_block_ordinal < max_blocks_compressed
         compressed_full_mask = compressed_valid_mask & compressed_valid_block
 
-        compressed_bt_ptr = (block_table_compressed_ptr +
-                             req * bt_compressed_stride0 +
-                             compressed_block_ordinal * bt_compressed_stride1)
-        compressed_page_index = tl.load(compressed_bt_ptr,
-                                        mask=compressed_full_mask,
-                                        other=0)
+        compressed_bt_ptr = (
+            block_table_compressed_ptr
+            + req * bt_compressed_stride0
+            + compressed_block_ordinal * bt_compressed_stride1
+        )
+        compressed_page_index = tl.load(compressed_bt_ptr, mask=compressed_full_mask, other=0)
 
         compressed_global_index = (
-            compressed_buffer_offset_in_tokens +
-            compressed_page_index * tokens_per_block_compressed +
-            compressed_token_in_block)
-        compressed_global_index = tl.where(compressed_full_mask,
-                                           compressed_global_index, -1)
+            compressed_buffer_offset_in_tokens
+            + compressed_page_index * tokens_per_block_compressed
+            + compressed_token_in_block
+        )
+        compressed_global_index = tl.where(compressed_full_mask, compressed_global_index, -1)
 
         # Store compressed results at fixed positions [num_swa_indices, total)
         compressed_write_pos = num_swa_indices + compressed_ids
@@ -125,20 +129,20 @@ def _deepseek_v4_local_to_global_kernel(
 
 
 def deepseek_v4_local_to_global_indices(
-        req_id: torch.Tensor,  # int32 [num_tokens]
-        block_table_swa: torch.Tensor,  # int32 [num_requests, max_blocks_swa]
-        swa_local_indices: torch.Tensor,  # int32 [num_tokens, num_swa_indices]
-        swa_pool_base_ptr: int,  # int64: base address of SWA pool
-        swa_buffer_ptr: int,  # int64: base address of SWA buffer
-        tokens_per_block: int,  # tokens per block for SWA
-        token_stride: int,  # bytes per token (use SWA token stride)
-        # Optional compressed arguments (for compress_ratio > 1)
+    req_id: torch.Tensor,  # int32 [num_tokens]
+    block_table_swa: torch.Tensor,  # int32 [num_requests, max_blocks_swa]
+    swa_local_indices: torch.Tensor,  # int32 [num_tokens, num_swa_indices]
+    swa_pool_base_ptr: int,  # int64: base address of SWA pool
+    swa_buffer_ptr: int,  # int64: base address of SWA buffer
+    tokens_per_block: int,  # tokens per block for SWA
+    token_stride: int,  # bytes per token (use SWA token stride)
+    # Optional compressed arguments (for compress_ratio > 1)
     block_table_compressed: torch.Tensor | None = None,
-        compressed_local_indices: torch.Tensor | None = None,
-        compress_pool_base_ptr: int = 0,  # int64: base address of compress pool
-        compressed_buffer_ptr: int = 0,
-        compress_ratio: int = 1,
-        num_compressed_indices: int = 0,  # max number of compressed indices
+    compressed_local_indices: torch.Tensor | None = None,
+    compress_pool_base_ptr: int = 0,  # int64: base address of compress pool
+    compressed_buffer_ptr: int = 0,
+    compress_ratio: int = 1,
+    num_compressed_indices: int = 0,  # max number of compressed indices
 ) -> torch.Tensor:
     """
     Convert local token indices to global KV cache pool indices.
@@ -162,7 +166,8 @@ def deepseek_v4_local_to_global_indices(
         tokens_per_block: Number of tokens per block for SWA cache
         token_stride: Bytes per token (use SWA token stride)
         block_table_compressed: Compressed block table [num_requests, max_blocks_compressed], int32 (optional)
-        compressed_local_indices: Local indices for compressed cache [num_tokens, num_compressed_indices], int32 (optional)
+        compressed_local_indices: Local indices for compressed cache
+            [num_tokens, num_compressed_indices], int32 (optional)
             Use -1 for invalid/padding indices.
         compress_pool_base_ptr: Base address of compress pool
         compressed_buffer_ptr: Base address of compressed buffer (optional)
@@ -174,8 +179,12 @@ def deepseek_v4_local_to_global_indices(
         global_indices: int32 [num_tokens, num_swa_indices + num_compressed_indices]
     """
     assert req_id.dtype == torch.int32, f"req_id must be int32, got {req_id.dtype}"
-    assert block_table_swa.dtype == torch.int32, f"block_table_swa must be int32, got {block_table_swa.dtype}"
-    assert swa_local_indices.dtype == torch.int32, f"swa_local_indices must be int32, got {swa_local_indices.dtype}"
+    assert block_table_swa.dtype == torch.int32, (
+        f"block_table_swa must be int32, got {block_table_swa.dtype}"
+    )
+    assert swa_local_indices.dtype == torch.int32, (
+        f"swa_local_indices must be int32, got {swa_local_indices.dtype}"
+    )
 
     num_tokens = req_id.shape[0]
     num_swa_indices = swa_local_indices.shape[1]
@@ -185,27 +194,31 @@ def deepseek_v4_local_to_global_indices(
     has_compressed = compress_ratio > 1
 
     # Compute SWA buffer offset relative to swa_pool_base_ptr in tokens
-    swa_buffer_offset_in_tokens = (swa_buffer_ptr -
-                                   swa_pool_base_ptr) // token_stride
+    swa_buffer_offset_in_tokens = (swa_buffer_ptr - swa_pool_base_ptr) // token_stride
 
     if has_compressed:
-        assert block_table_compressed is not None, "block_table_compressed required when compress_ratio > 1"
-        assert compressed_local_indices is not None, "compressed_local_indices required when compress_ratio > 1"
-        assert (
-            block_table_compressed.dtype == torch.int32
-        ), f"block_table_compressed must be int32, got {block_table_compressed.dtype}"
-        assert (
-            compressed_local_indices.dtype == torch.int32
-        ), f"compressed_local_indices must be int32, got {compressed_local_indices.dtype}"
+        assert block_table_compressed is not None, (
+            "block_table_compressed required when compress_ratio > 1"
+        )
+        assert compressed_local_indices is not None, (
+            "compressed_local_indices required when compress_ratio > 1"
+        )
+        assert block_table_compressed.dtype == torch.int32, (
+            f"block_table_compressed must be int32, got {block_table_compressed.dtype}"
+        )
+        assert compressed_local_indices.dtype == torch.int32, (
+            f"compressed_local_indices must be int32, got {compressed_local_indices.dtype}"
+        )
         assert compressed_local_indices.shape[0] == num_tokens
 
         tokens_per_block_compressed = tokens_per_block // compress_ratio
         # Compute compressed buffer offset relative to compress_pool_base_ptr in tokens
-        assert (
-            compressed_buffer_ptr - compress_pool_base_ptr
-        ) % token_stride == 0, "compressed_buffer_ptr must be aligned to token_stride"
+        assert (compressed_buffer_ptr - compress_pool_base_ptr) % token_stride == 0, (
+            "compressed_buffer_ptr must be aligned to token_stride"
+        )
         compressed_buffer_offset_in_tokens = (
-            compressed_buffer_ptr - compress_pool_base_ptr) // token_stride
+            compressed_buffer_ptr - compress_pool_base_ptr
+        ) // token_stride
         _, max_blocks_compressed = block_table_compressed.shape
         block_table_compressed_c = block_table_compressed.contiguous()
         compressed_local_indices_c = compressed_local_indices.contiguous()
@@ -214,12 +227,8 @@ def deepseek_v4_local_to_global_indices(
         tokens_per_block_compressed = tokens_per_block
         compressed_buffer_offset_in_tokens = 0
         max_blocks_compressed = 1
-        block_table_compressed_c = torch.zeros((1, 1),
-                                               dtype=torch.int32,
-                                               device=req_id.device)
-        compressed_local_indices_c = torch.zeros((1, 1),
-                                                 dtype=torch.int32,
-                                                 device=req_id.device)
+        block_table_compressed_c = torch.zeros((1, 1), dtype=torch.int32, device=req_id.device)
+        compressed_local_indices_c = torch.zeros((1, 1), dtype=torch.int32, device=req_id.device)
 
     total_output_indices = num_swa_indices + num_compressed_indices
     _, max_blocks_swa = block_table_swa.shape
@@ -230,20 +239,16 @@ def deepseek_v4_local_to_global_indices(
     swa_local_indices_c = swa_local_indices.contiguous()
 
     # Create output tensor
-    out = torch.empty((num_tokens, total_output_indices),
-                      dtype=torch.int32,
-                      device=req_id.device)
+    out = torch.empty((num_tokens, total_output_indices), dtype=torch.int32, device=req_id.device)
 
     # Grid: one program per token
-    grid = (num_tokens, )
+    grid = (num_tokens,)
 
     # Get strides
     bt_swa_stride0, bt_swa_stride1 = block_table_swa_c.stride()
-    bt_compressed_stride0, bt_compressed_stride1 = block_table_compressed_c.stride(
-    )
+    bt_compressed_stride0, bt_compressed_stride1 = block_table_compressed_c.stride()
     swa_indices_stride0, swa_indices_stride1 = swa_local_indices_c.stride()
-    compressed_indices_stride0, compressed_indices_stride1 = compressed_local_indices_c.stride(
-    )
+    compressed_indices_stride0, compressed_indices_stride1 = compressed_local_indices_c.stride()
     out_stride0, out_stride1 = out.stride()
     launch_with_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
