@@ -169,12 +169,12 @@ template <uint32_t SHAPE_N, uint32_t HIDDEN, uint32_t HC_MULT, uint32_t BLOCK_M,
     uint32_t kSwizzleCDMode, uint32_t N_B_STAGES, uint32_t N_INPUT_STAGES, uint32_t kNumMMAThreads,
     uint32_t kNumPmapThreads, uint32_t kNumSplits = 1, bool kEarlyRelease = false>
 __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf32_pmap_gemm_rout_atomic_impl(
-    uint32_t const shape_m, __grid_constant__ const cute::TmaDescriptor tensor_map_residual,
-    __grid_constant__ const cute::TmaDescriptor tensor_map_x, __grid_constant__ const cute::TmaDescriptor tensor_map_b,
-    __grid_constant__ const cute::TmaDescriptor tensor_map_residual_out,
+    const uint32_t shape_m, const __grid_constant__ cute::TmaDescriptor tensor_map_residual,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_x, const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_residual_out,
     float* __restrict__ D, // [M, SHAPE_N]  (caller memsets to 0)
     float const* __restrict__ post_mix, float const* __restrict__ comb_mix, float* __restrict__ sqr_sum)
-{ // [M]            (caller memsets to 0)
+{                          // [M]            (caller memsets to 0)
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000) and (__CUDA_ARCH__ < 1100)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -286,11 +286,11 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     }
     __syncthreads();
 
-    uint32_t const block_idx = __shfl_sync(0xffffffff, blockIdx.x, 0);
-    uint32_t const m_block_idx = block_idx / kNumSplits;
-    uint32_t const k_split_idx = block_idx % kNumSplits;
-    uint32_t const m_offset = m_block_idx * BLOCK_M;
-    uint32_t const h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
+    const uint32_t block_idx = __shfl_sync(0xffffffff, blockIdx.x, 0);
+    const uint32_t m_block_idx = block_idx / kNumSplits;
+    const uint32_t k_split_idx = block_idx % kNumSplits;
+    const uint32_t m_offset = m_block_idx * BLOCK_M;
+    const uint32_t h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
     constexpr uint32_t num_total_stages = H_TILES_PER_SPLIT * HC_MULT;
 
     if (warp_idx < kNumMMAThreads / 32)
@@ -303,7 +303,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             uint32_t s = 0;
             for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
             {
-                uint32_t const h_tile = h_tile_start + ht;
+                const uint32_t h_tile = h_tile_start + ht;
                 empty_input[i_stage]->wait(((ht / N_INPUT_STAGES) & 1) ^ 1);
                 uint32_t m_idx = m_block_idx * BLOCK_M;
                 uint32_t h_idx = h_tile * BLOCK_K;
@@ -351,8 +351,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 
             for (uint32_t s = 0; s < num_total_stages; ++s)
             {
-                uint32_t const b_stage = s % N_B_STAGES;
-                uint32_t const cast_stage_idx = s % kNumCastStages;
+                const uint32_t b_stage = s % N_B_STAGES;
+                const uint32_t cast_stage_idx = s % kNumCastStages;
                 full_cast[cast_stage_idx]->wait((s / kNumCastStages) & 1);
                 full_B[b_stage]->wait((s / N_B_STAGES) & 1);
                 tcgen05_after_thread_sync();
@@ -400,7 +400,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         cutlass::arch::NamedBarrier::sync(kNumMMAThreads, 0);
 
         constexpr uint32_t kTotalOut = BLOCK_M * SHAPE_N;
-        uint32_t const tid = threadIdx.x;
+        const uint32_t tid = threadIdx.x;
 #pragma unroll
         for (uint32_t k = tid; k < kTotalOut; k += kNumMMAThreads)
         {
@@ -433,10 +433,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     else
     {
         // ----- Pmap warp group (warps 4..7, 128 threads) -----
-        uint32_t const sub_warp_idx = warp_idx - kNumMMAThreads / 32;
-        uint32_t const upper_row = sub_warp_idx * 16 + lane_idx / 4;
-        uint32_t const lower_row = upper_row + 8;
-        uint32_t const col_lane = lane_idx % 4;
+        const uint32_t sub_warp_idx = warp_idx - kNumMMAThreads / 32;
+        const uint32_t upper_row = sub_warp_idx * 16 + lane_idx / 4;
+        const uint32_t lower_row = upper_row + 8;
+        const uint32_t col_lane = lane_idx % 4;
 
         float pm_u[HC_MULT], pm_l[HC_MULT];
         float cm_u[HC_MULT][HC_MULT], cm_l[HC_MULT][HC_MULT];
@@ -470,7 +470,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         uint32_t s = 0;
         for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
         {
-            uint32_t const i_stage = ht % N_INPUT_STAGES;
+            const uint32_t i_stage = ht % N_INPUT_STAGES;
             full_input[i_stage]->wait((ht / N_INPUT_STAGES) & 1);
 
             uint32_t x_vals[2][kNumLoads];
@@ -608,7 +608,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             cute::tma_store_fence();
             if (cute::elect_one_sync())
             {
-                uint32_t const h_idx = (h_tile_start + ht) * BLOCK_K;
+                const uint32_t h_idx = (h_tile_start + ht) * BLOCK_K;
 #pragma unroll
                 for (uint32_t hc = 0; hc < HC_MULT; ++hc)
                 {
@@ -693,11 +693,11 @@ template <uint32_t SHAPE_N, uint32_t HIDDEN, uint32_t HC_MULT, uint32_t BLOCK_M,
     uint32_t kSwizzleCDMode, uint32_t N_B_STAGES, uint32_t N_INPUT_STAGES, uint32_t kNumMMAThreads,
     uint32_t kNumPmapThreads, uint32_t kNumSplits = 1, bool kFuseNorm = false>
 __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
-    fused_allinone_tf32_pmap_gemm_atomic_impl(uint32_t const shape_m,
-        __grid_constant__ const cute::TmaDescriptor tensor_map_residual,     // residual_prev, bf16
-        __grid_constant__ const cute::TmaDescriptor tensor_map_x,            // x_prev,        bf16
-        __grid_constant__ const cute::TmaDescriptor tensor_map_b,            // W_T,           tf32
-        __grid_constant__ const cute::TmaDescriptor tensor_map_residual_out, // residual_cur,  bf16 (TMA store)
+    fused_allinone_tf32_pmap_gemm_atomic_impl(const uint32_t shape_m,
+        const __grid_constant__ cute::TmaDescriptor tensor_map_residual,     // residual_prev, bf16
+        const __grid_constant__ cute::TmaDescriptor tensor_map_x,            // x_prev,        bf16
+        const __grid_constant__ cute::TmaDescriptor tensor_map_b,            // W_T,           tf32
+        const __grid_constant__ cute::TmaDescriptor tensor_map_residual_out, // residual_cur,  bf16 (TMA store)
         __nv_bfloat16 const* __restrict__ residual_cur_ptr,                  // same buffer as TMA target
         __nv_bfloat16* __restrict__ layer_input_out,                         // [M, HIDDEN]    bf16
         float* __restrict__ D,                   // [M, SHAPE_N]   fp32 (y_acc, caller zeros)
@@ -833,17 +833,17 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     }
     __syncthreads();
 
-    uint32_t const block_idx = __shfl_sync(0xffffffff, blockIdx.x, 0);
-    uint32_t const m_block_idx = block_idx / kNumSplits;
-    uint32_t const k_split_idx = block_idx % kNumSplits;
-    uint32_t const m_offset = m_block_idx * BLOCK_M;
-    uint32_t const h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
+    const uint32_t block_idx = __shfl_sync(0xffffffff, blockIdx.x, 0);
+    const uint32_t m_block_idx = block_idx / kNumSplits;
+    const uint32_t k_split_idx = block_idx % kNumSplits;
+    const uint32_t m_offset = m_block_idx * BLOCK_M;
+    const uint32_t h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
     constexpr uint32_t num_total_stages = H_TILES_PER_SPLIT * HC_MULT;
 
     // Prologue: pmap warp group loads post_mix_prev, comb_mix_prev into SMEM
     if (warp_idx >= kNumMMAThreads / 32)
     {
-        uint32_t const pmap_tid = threadIdx.x - kNumMMAThreads;
+        const uint32_t pmap_tid = threadIdx.x - kNumMMAThreads;
 #pragma unroll
         for (uint32_t t = 0; t < 2; ++t)
         {
@@ -883,7 +883,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             uint32_t s = 0;
             for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
             {
-                uint32_t const h_tile = h_tile_start + ht;
+                const uint32_t h_tile = h_tile_start + ht;
                 empty_input[i_stage]->wait(((ht / N_INPUT_STAGES) & 1) ^ 1);
                 uint32_t m_idx = m_block_idx * BLOCK_M;
                 uint32_t h_idx = h_tile * BLOCK_K;
@@ -931,8 +931,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
 
             for (uint32_t s = 0; s < num_total_stages; ++s)
             {
-                uint32_t const b_stage = s % N_B_STAGES;
-                uint32_t const cast_stage_idx = s % kNumCastStages;
+                const uint32_t b_stage = s % N_B_STAGES;
+                const uint32_t cast_stage_idx = s % kNumCastStages;
                 full_cast[cast_stage_idx]->wait((s / kNumCastStages) & 1);
                 full_B[b_stage]->wait((s / N_B_STAGES) & 1);
                 tcgen05_after_thread_sync();
@@ -980,7 +980,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         cutlass::arch::NamedBarrier::sync(kNumMMAThreads, 0);
 
         constexpr uint32_t kTotalOut = BLOCK_M * SHAPE_N;
-        uint32_t const tid = threadIdx.x;
+        const uint32_t tid = threadIdx.x;
 #pragma unroll
         for (uint32_t k = tid; k < kTotalOut; k += kNumMMAThreads)
         {
@@ -1013,10 +1013,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     else
     {
         // ----- Pmap warp group (warps 4..7, 128 threads) -----
-        uint32_t const sub_warp_idx = warp_idx - kNumMMAThreads / 32;
-        uint32_t const upper_row = sub_warp_idx * 16 + lane_idx / 4;
-        uint32_t const lower_row = upper_row + 8;
-        uint32_t const col_lane = lane_idx % 4;
+        const uint32_t sub_warp_idx = warp_idx - kNumMMAThreads / 32;
+        const uint32_t upper_row = sub_warp_idx * 16 + lane_idx / 4;
+        const uint32_t lower_row = upper_row + 8;
+        const uint32_t col_lane = lane_idx % 4;
 
         float pm_u[HC_MULT], pm_l[HC_MULT];
         float cm_u[HC_MULT][HC_MULT], cm_l[HC_MULT][HC_MULT];
@@ -1048,7 +1048,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         uint32_t s = 0;
         for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
         {
-            uint32_t const i_stage = ht % N_INPUT_STAGES;
+            const uint32_t i_stage = ht % N_INPUT_STAGES;
             full_input[i_stage]->wait((ht / N_INPUT_STAGES) & 1);
 
             uint32_t x_vals[2][kNumLoads];
@@ -1101,7 +1101,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
 #pragma unroll
             for (uint32_t hc = 0; hc < HC_MULT; ++hc)
             {
-                uint32_t const cast_stage_idx = s % kNumCastStages;
+                const uint32_t cast_stage_idx = s % kNumCastStages;
                 empty_cast[cast_stage_idx]->wait(((s / kNumCastStages) & 1) ^ 1);
 
                 uint32_t rc_u_buf[kNumLoads], rc_l_buf[kNumLoads];
@@ -1158,7 +1158,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             cute::tma_store_fence();
             if (cute::elect_one_sync())
             {
-                uint32_t const h_idx = (h_tile_start + ht) * BLOCK_K;
+                const uint32_t h_idx = (h_tile_start + ht) * BLOCK_K;
 #pragma unroll
                 for (uint32_t hc = 0; hc < HC_MULT; ++hc)
                 {
@@ -1258,7 +1258,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     // ========================================================================
     constexpr uint32_t BLOCK_SIZE_BF = kNumMMAThreads + kNumPmapThreads; // 256
     constexpr uint32_t WARP_SIZE_BF = 32;
-    constexpr uint32_t NUM_WARPS_BF = BLOCK_SIZE_BF / WARP_SIZE_BF; // 8
+    constexpr uint32_t NUM_WARPS_BF = BLOCK_SIZE_BF / WARP_SIZE_BF;      // 8
     constexpr uint32_t TOKS_PER_CTA = (BLOCK_M + kNumSplits - 1) / kNumSplits;
     // When TOKS_PER_CTA < NUM_WARPS_BF (large kNumSplits / small BLOCK_M case),
     // have WARPS_PER_TOK warps cooperate on the HIDDEN-stride layer_input loop
@@ -1274,23 +1274,23 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     // old static_assert so HIDDEN values like 7168 (which 8-warp teams cannot
     // cleanly span) are also valid.
     static_assert(HIDDEN % BF16_VEC_LI == 0, "HIDDEN must be a multiple of BF16_VEC_LI=8");
-    uint32_t const tid_bf = threadIdx.x;
-    uint32_t const lane_bf = tid_bf % WARP_SIZE_BF;
-    uint32_t const warp_bf = tid_bf / WARP_SIZE_BF;
-    uint32_t const warp_tok_pos = warp_bf / WARPS_PER_TOK; // which token in a pass
-    uint32_t const warp_in_team = warp_bf % WARPS_PER_TOK; // which warp inside team
-    uint32_t const cta_tok_base = k_split_idx * TOKS_PER_CTA;
+    const uint32_t tid_bf = threadIdx.x;
+    const uint32_t lane_bf = tid_bf % WARP_SIZE_BF;
+    const uint32_t warp_bf = tid_bf / WARP_SIZE_BF;
+    const uint32_t warp_tok_pos = warp_bf / WARPS_PER_TOK; // which token in a pass
+    const uint32_t warp_in_team = warp_bf % WARPS_PER_TOK; // which warp inside team
+    const uint32_t cta_tok_base = k_split_idx * TOKS_PER_CTA;
 
 #pragma unroll 1
     for (uint32_t pass = 0; pass < TOKEN_PASSES; ++pass)
     {
-        uint32_t const t_in_cta = pass * TOKS_PER_PASS + warp_tok_pos;
+        const uint32_t t_in_cta = pass * TOKS_PER_PASS + warp_tok_pos;
         if (t_in_cta >= TOKS_PER_CTA)
             continue;
-        uint32_t const t = cta_tok_base + t_in_cta;
+        const uint32_t t = cta_tok_base + t_in_cta;
         if (t >= BLOCK_M)
             continue;
-        uint32_t const tok = m_offset + t;
+        const uint32_t tok = m_offset + t;
         if (tok >= shape_m)
             continue;
 
@@ -1391,7 +1391,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         // the scalar-vec tail (only relevant when WARPS_PER_TOK*32*8 > HIDDEN
         // residue, e.g. KS=112 / HIDDEN=7168 / H_STRIDE=2048 → tail = 1024).
         constexpr uint32_t H_VEC_END = (HIDDEN / H_STRIDE) * H_STRIDE;
-        uint32_t const h_start = warp_in_team * WARP_SIZE_BF * BF16_VEC_LI + lane_bf * BF16_VEC_LI;
+        const uint32_t h_start = warp_in_team * WARP_SIZE_BF * BF16_VEC_LI + lane_bf * BF16_VEC_LI;
 
         if constexpr (!kFuseNorm)
         {
@@ -1437,10 +1437,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             if constexpr (H_VEC_END < HIDDEN)
             {
                 constexpr uint32_t TAIL_CHUNKS = (HIDDEN - H_VEC_END) / BF16_VEC_LI;
-                uint32_t const my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
+                const uint32_t my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
                 if (my_chunk < TAIL_CHUNKS)
                 {
-                    uint32_t const h = H_VEC_END + my_chunk * BF16_VEC_LI;
+                    const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
                     uint4 raws[HC_MULT];
 #pragma unroll
                     for (uint32_t j = 0; j < HC_MULT; ++j)
@@ -1531,10 +1531,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             if constexpr (H_VEC_END < HIDDEN)
             {
                 constexpr uint32_t TAIL_CHUNKS = (HIDDEN - H_VEC_END) / BF16_VEC_LI;
-                uint32_t const my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
+                const uint32_t my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
                 if (my_chunk < TAIL_CHUNKS)
                 {
-                    uint32_t const h = H_VEC_END + my_chunk * BF16_VEC_LI;
+                    const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
                     uint4 raws[HC_MULT];
 #pragma unroll
                     for (uint32_t j = 0; j < HC_MULT; ++j)
@@ -1619,10 +1619,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             if constexpr (H_VEC_END < HIDDEN)
             {
                 constexpr uint32_t TAIL_CHUNKS = (HIDDEN - H_VEC_END) / BF16_VEC_LI;
-                uint32_t const my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
+                const uint32_t my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
                 if (my_chunk < TAIL_CHUNKS)
                 {
-                    uint32_t const h = H_VEC_END + my_chunk * BF16_VEC_LI;
+                    const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
                     uint4 li_raw = __ldg(reinterpret_cast<uint4 const*>(&obase[h]));
                     uint4 nw_raw = __ldg(reinterpret_cast<uint4 const*>(&nbase[h]));
                     __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
