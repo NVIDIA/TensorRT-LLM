@@ -1189,7 +1189,7 @@ class MLA(nn.Module):
             )
             return attn_output
 
-    def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
+    def create_output(self, hidden_states: torch.Tensor, num_contexts: int): # enable fusion
         # Upstream POST_MoE/MLP fusion (or attention-DP no-fusion fold) may pass
         # an Fp4QuantizedTensor here; unpack to the BF16 view for sizing. The
         # producing fold must have requested return_norm_out so the BF16 view
@@ -1227,6 +1227,7 @@ class MLA(nn.Module):
         if num_contexts == 0 and num_generations == 0:
             return False
         if num_contexts > 0 and num_generations > 0:
+            # mix直接关了
             # Context and generation use separate FMHA calls, but the fused
             # buffers do not carry token offsets for a mixed batch.
             return False
@@ -1291,7 +1292,7 @@ class MLA(nn.Module):
         attn_out_latent: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if isinstance(attn_out_latent, tuple):
+        if isinstance(attn_out_latent, tuple): # if enable fusion
             attn_fp8, attn_scale = attn_out_latent
             num_tokens = attn_fp8.shape[1]
             o_lora = torch.empty(
@@ -1299,6 +1300,7 @@ class MLA(nn.Module):
                 device=attn_fp8.device,
                 dtype=self.dtype,
             )
+            # 塞进mla的op
             torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
                 attn_fp8,
                 self.o_a_proj,
@@ -2046,13 +2048,21 @@ class MLA(nn.Module):
                 compressed_kv_gen,
                 k_pe_gen,
                 attn_metadata,
-                output[num_ctx_tokens:num_tokens, :],
+                output[num_ctx_tokens:num_tokens, :], # 如果是inplace，非fusion，要直接写output # fusion的时候output就该是none # cat output的东西，一起做lora_o的操作 # None if enable epilog else output
                 position_ids=gen_position_ids,
                 latent_cache=latent_cache_gen,
                 topk_indices=topk_indices_gen,
                 enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
                 dsv4_epilogue_output=dsv4_epilogue_output,
             )
+
+
+        # cat 两个dsv4_epilogue_output之后做bmm，bmm直接写最终的输出。所有场景都能开epiloge
+        # valid output变成创建output，在forward用他的时候，最开始的create output换成create lora o的output
+        # 我们就把dim1无法slice的算子放到eager里面了，之后的都能slice了 lora的token在
+        # TODO
+        # if enable fusion:
+        #     torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell
 
     def forward_context_default(
         self,
@@ -2714,7 +2724,7 @@ class MLA(nn.Module):
         if enable_dsv4_epilogue_fusion:
             assert self.is_deepseek_v4
             assert dsv4_epilogue_output is not None
-            dsv4_output, dsv4_output_sf = self._validate_dsv4_epilogue_buffers(
+            dsv4_output, dsv4_output_sf = self._validate_dsv4_epilogue_buffers( # 直接forword的现场创建，tmp的buffer # epilog的时候没有之前的output
                 num_tokens, dsv4_epilogue_output
             )
             dsv4_cos_sin_cache = self.inverse_rotary_emb.rotary_cos_sin
@@ -3132,7 +3142,7 @@ class MLA(nn.Module):
         use_custom_op = self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph())
         if use_custom_op:
             if self.is_deepseek_v4:
-                outputs = torch.ops.trtllm.create_mla_outputs(hidden_states, self.layer_idx_str)
+                outputs = torch.ops.trtllm.create_mla_outputs(hidden_states, self.layer_idx_str) # create buffer
                 attn_output = outputs[0]
                 dsv4_output = None
                 dsv4_output_sf = None
