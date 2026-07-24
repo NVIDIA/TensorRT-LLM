@@ -17,6 +17,8 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.distributed import ProcessGroup
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
@@ -60,7 +62,12 @@ _DEFAULT_GENERATION_PARAMS = {
 }
 
 
-@register_pipeline("QwenImagePipeline")
+@register_pipeline(
+    "QwenImagePipeline",
+    hf_ids=[
+        "Qwen/Qwen-Image",
+    ],
+)
 class QwenImagePipeline(BasePipeline):
     """Qwen-Image text-to-image pipeline.
 
@@ -84,6 +91,7 @@ class QwenImagePipeline(BasePipeline):
         # load_standard_components() once the VAE is loaded.
         self.vae_scale_factor = 8
         self.tokenizer_max_length = 1024
+        self._logged_cfg_disabled_parallel_warning = False
 
     @property
     def dtype(self):
@@ -154,13 +162,16 @@ class QwenImagePipeline(BasePipeline):
         ``forward`` path so CUDA graphs / torch.compile / VAE kernels
         all get triggered with the runtime shape.
         """
+        vgm = self.pipeline_config.visual_gen_mapping
+        cfg_size = vgm.cfg_size if vgm else 1
+        warmup_true_cfg_scale = 4.0 if cfg_size > 1 else 1.0
         with torch.no_grad():
             self.forward(
                 prompt="warmup",
                 height=height,
                 width=width,
                 num_inference_steps=max(steps, 2),
-                true_cfg_scale=1.0,
+                true_cfg_scale=warmup_true_cfg_scale,
                 seed=42,
                 max_sequence_length=64,
             )
@@ -369,6 +380,78 @@ class QwenImagePipeline(BasePipeline):
     def default_generation_params(self) -> dict:
         return dict(_DEFAULT_GENERATION_PARAMS)
 
+    @staticmethod
+    def _normalize_negative_prompt(
+        negative_prompt: Optional[Union[str, List[str]]], batch_size: int
+    ) -> List[str]:
+        if negative_prompt is None:
+            return [""] * batch_size
+        if isinstance(negative_prompt, str):
+            return [negative_prompt] * batch_size
+
+        negative_prompt = list(negative_prompt)
+        if len(negative_prompt) == 1 and batch_size != 1:
+            return negative_prompt * batch_size
+        if len(negative_prompt) != batch_size:
+            raise ValueError(
+                "negative_prompt must be a string, a singleton list, "
+                "or a list with the same length as prompt"
+            )
+        return negative_prompt
+
+    @staticmethod
+    def _select_cfg_inputs(
+        cfg_rank: int,
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: torch.Tensor,
+        neg_prompt_embeds: torch.Tensor,
+        neg_prompt_embeds_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if cfg_rank == 0:
+            return prompt_embeds, prompt_embeds_mask
+        return neg_prompt_embeds, neg_prompt_embeds_mask
+
+    @staticmethod
+    def _combine_true_cfg(
+        noise_pred: torch.Tensor, neg_noise_pred: torch.Tensor, true_cfg_scale: float
+    ) -> torch.Tensor:
+        comb = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+        cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+        noise_norm = torch.norm(comb, dim=-1, keepdim=True)
+        return comb * (cond_norm / noise_norm)
+
+    def _cfg_parallel_state(
+        self, do_true_cfg: bool
+    ) -> Tuple[bool, int, int, Optional[ProcessGroup]]:
+        vgm = self.pipeline_config.visual_gen_mapping
+        cfg_size = vgm.cfg_size if vgm else 1
+        cfg_rank = vgm.cfg_rank if vgm else 0
+        cfg_pg = vgm.cfg_group if vgm else None
+        do_cfg_parallel = do_true_cfg and cfg_size > 1
+        if (
+            cfg_size > 1
+            and not do_true_cfg
+            and cfg_rank == 0
+            and not getattr(self, "_logged_cfg_disabled_parallel_warning", False)
+        ):
+            logger.warning(
+                "Qwen-Image configured with cfg_size=%d but true CFG is disabled; "
+                "CFG-parallel ranks will redundantly compute the same request path.",
+                cfg_size,
+            )
+            self._logged_cfg_disabled_parallel_warning = True
+        if do_cfg_parallel:
+            if cfg_size != 2:
+                raise ValueError(
+                    f"Qwen-Image CFG parallel only supports cfg_size=2 "
+                    f"(cond/uncond), got cfg_size={cfg_size}"
+                )
+            if not dist.is_initialized():
+                raise RuntimeError("Qwen-Image CFG parallel requires torch.distributed")
+            if cfg_rank == 0:
+                logger.info("CFG parallel: cfg_size=2")
+        return do_cfg_parallel, cfg_size, cfg_rank, cfg_pg
+
     def infer(self, req):
         # Fan out by num_images_per_prompt so ``n > 1`` produces multiple
         # images in a single batched forward. Qwen-Image supports this
@@ -426,8 +509,8 @@ class QwenImagePipeline(BasePipeline):
             prompt = [prompt]
         batch_size = len(prompt)
 
-        has_neg = negative_prompt is not None
-        do_true_cfg = true_cfg_scale > 1.0 and has_neg
+        do_true_cfg = true_cfg_scale > 1.0
+        do_cfg_parallel, cfg_size, cfg_rank, cfg_pg = self._cfg_parallel_state(do_true_cfg)
 
         device = self.device
         generator = torch.Generator(device=device).manual_seed(seed)
@@ -437,8 +520,7 @@ class QwenImagePipeline(BasePipeline):
         prompt_embeds, prompt_embeds_mask = self._encode_prompt(prompt, device, max_sequence_length)
         neg_prompt_embeds = neg_prompt_embeds_mask = None
         if do_true_cfg:
-            if isinstance(negative_prompt, str):
-                negative_prompt = [negative_prompt] * batch_size
+            negative_prompt = self._normalize_negative_prompt(negative_prompt, batch_size)
             neg_prompt_embeds, neg_prompt_embeds_mask = self._encode_prompt(
                 negative_prompt, device, max_sequence_length
             )
@@ -486,25 +568,44 @@ class QwenImagePipeline(BasePipeline):
         # Denoise loop.
         timer.mark_denoise_start()
         logger.info("Denoising (%d steps)...", len(timesteps))
-        pipeline_config = getattr(self, "pipeline_config", None)
-        cuda_graph_enabled = getattr(getattr(pipeline_config, "cuda_graph", None), "enable", False)
+        cuda_graph_enabled = self.pipeline_config.cuda_graph.enable
         for i, t in enumerate(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
-            noise_pred = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                encoder_hidden_states=prompt_embeds,
-                img_shapes=img_shapes,
-                return_dict=False,
-            )[0]
+            if do_cfg_parallel:
+                local_embeds, local_mask = self._select_cfg_inputs(
+                    cfg_rank,
+                    prompt_embeds,
+                    prompt_embeds_mask,
+                    neg_prompt_embeds,
+                    neg_prompt_embeds_mask,
+                )
+                noise_pred_local = self.transformer(
+                    hidden_states=latents,
+                    timestep=timestep / 1000,
+                    encoder_hidden_states_mask=local_mask,
+                    encoder_hidden_states=local_embeds,
+                    img_shapes=img_shapes,
+                    return_dict=False,
+                )[0].contiguous()
+                gather_list = [torch.empty_like(noise_pred_local) for _ in range(cfg_size)]
+                dist.all_gather(gather_list, noise_pred_local, group=cfg_pg)
+                noise_pred = self._combine_true_cfg(gather_list[0], gather_list[1], true_cfg_scale)
+            else:
+                noise_pred = self.transformer(
+                    hidden_states=latents,
+                    timestep=timestep / 1000,
+                    encoder_hidden_states_mask=prompt_embeds_mask,
+                    encoder_hidden_states=prompt_embeds,
+                    img_shapes=img_shapes,
+                    return_dict=False,
+                )[0]
 
-            if do_true_cfg and cuda_graph_enabled:
-                # CUDA graph outputs are graph-owned buffers; the negative CFG
-                # replay may reuse the same pool before guidance consumes this one.
-                noise_pred = noise_pred.clone()
+            if do_true_cfg and not do_cfg_parallel:
+                if cuda_graph_enabled:
+                    # CUDA graph outputs are graph-owned buffers; the negative CFG
+                    # replay may reuse the same pool before guidance consumes this one.
+                    noise_pred = noise_pred.clone()
 
-            if do_true_cfg:
                 neg_noise_pred = self.transformer(
                     hidden_states=latents,
                     timestep=timestep / 1000,
@@ -513,10 +614,7 @@ class QwenImagePipeline(BasePipeline):
                     img_shapes=img_shapes,
                     return_dict=False,
                 )[0]
-                comb = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
-                cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-                noise_norm = torch.norm(comb, dim=-1, keepdim=True)
-                noise_pred = comb * (cond_norm / noise_norm)
+                noise_pred = self._combine_true_cfg(noise_pred, neg_noise_pred, true_cfg_scale)
 
             latents_dtype = latents.dtype
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
