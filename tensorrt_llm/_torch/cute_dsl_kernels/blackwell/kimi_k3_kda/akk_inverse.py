@@ -35,7 +35,9 @@ Block layout in sAkk (4×4 sub-blocks of 16×16, packed bf16x2):
 
 Stages:
   0. cp.async load bf16 64×64 → sAkk (packed bf16x2)
-  1. Invert 4 diagonal blocks via Neumann series (all 4 warps, BF16 MMA)
+  1. Invert 4 diagonal blocks (all 4 warps). Default: EXACT forward
+     substitution in FP32 (WAR for BF16 Neumann divergence on real
+     weights); legacy Neumann series behind USE_NEUMANN=1.
   2. Warps 0-2: Ai10, Ai21, Ai32 via chain MMA (C→A pack)
   3. Warps 0+2 → Ai20, warps 1+3 → Ai31 (parallel pairs, sTemp)
   4. Warps 0+1+2 → Ai30 (sTemp aggregation)
@@ -45,6 +47,7 @@ Inputs:  A_in  [B, T, H, BT] bf16
 Outputs: A_out [B, T, H, BT] bf16
 """
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
@@ -451,6 +454,79 @@ def _invert_diag_neumann(sAkk: cute.Tensor, block_idx, lane_id, *, loc=None, ip=
 
 
 # ===========================================================================
+# EXACT diagonal 16×16 inversion via sequential forward substitution.
+#
+# WAR for the Neumann-series divergence (bf16 rounding of the factored
+# Neumann product (I-L)(I+L²)(I+L⁴)(I+L⁸) is algebraically exact for the
+# nilpotent strictly-lower L, but it materialises L², L⁴, L⁸ in BF16 — on
+# real weights those powers overflow/cancel catastrophically (round-trip
+# diag err ~9.2e3, K4 amplifies to ~1e25). Forward substitution never forms
+# powers of L: it solves (I+L)·X = I column-by-column with FP32 accumulation,
+#
+#   X[i,j] = δ(i,j) - Σ_{k<i} L[i,k]·X[k,j]
+#
+# which is exact for a unit-lower-triangular block (same math FLA uses).
+# The off-diagonal 16×16 blocks of the 64×64 inverse were already computed
+# exactly by stages 2-4 (blocked substitution: -Ai_ii @ Akk_ij @ Ai_jj etc.),
+# so fixing the diagonal blocks makes the whole 64×64 inverse exact.
+#
+# Work mapping: each warp owns one 16×16 diagonal block. Lane p (p = lane%8)
+# owns the column pair {2p, 2p+1} (matching the packed-bf16x2 SMEM slot), so
+# the final store is a single conflict-free packed write per row with no
+# cross-lane shuffles. Lanes 8..31 replicate lanes 0..7 bit-identically
+# (same inputs, same op order), so the duplicated stores are benign.
+# Cost: ~240 FP32 FMAs/lane + 64 broadcast SMEM loads — negligible next to
+# the MMA stages.
+# ===========================================================================
+@dsl_user_op
+def _invert_diag_exact(sAkk: cute.Tensor, block_idx, lane_id, *, loc=None, ip=None):
+    r_off = block_idx * 16
+    c_off = block_idx * 8  # packed bf16x2: 16 cols → 8 pairs
+
+    pair = lane_id % 8
+    col_lo = pair * 2
+    col_hi = col_lo + 1
+
+    _one = cutlass.Float32(1.0)
+    _zero = cutlass.Float32(0.0)
+
+    # X[:, col_lo] / X[:, col_hi] kept in registers (trace-time Python lists,
+    # fully unrolled → straight-line code, no dynamic indexing).
+    Xlo = [None] * SB
+    Xhi = [None] * SB
+    # Row 0: X[0,j] = δ(0,j) (unit diagonal, nothing above).
+    Xlo[0] = _one * cutlass.Float32(col_lo == 0) + _zero * cutlass.Float32(col_lo != 0)
+    Xhi[0] = _zero  # col_hi >= 1, never row 0
+
+    for i in range(1, SB):
+        s_lo = cutlass.Float32(0.0)
+        s_hi = cutlass.Float32(0.0)
+        # Σ_{k<i} L[i,k]·X[k,:] — L[i,k] = A[i,k] for k < i (strictly lower
+        # part; unit diagonal is not stored explicitly in the sum).
+        for kp in range((i + 1) // 2):
+            packed = cutlass.Float32(sAkk[r_off + i, c_off + kp])
+            k0 = 2 * kp
+            L0 = _unpack_bf16x2_lo(packed)  # A[i, k0]
+            s_lo = s_lo + L0 * Xlo[k0]
+            s_hi = s_hi + L0 * Xhi[k0]
+            if k0 + 1 < i:
+                L1 = _unpack_bf16x2_hi(packed)  # A[i, k0+1]
+                s_lo = s_lo + L1 * Xlo[k0 + 1]
+                s_hi = s_hi + L1 * Xhi[k0 + 1]
+        d_lo = _one * cutlass.Float32(col_lo == i) + _zero * cutlass.Float32(col_lo != i)
+        d_hi = _one * cutlass.Float32(col_hi == i) + _zero * cutlass.Float32(col_hi != i)
+        Xlo[i] = d_lo - s_lo
+        Xhi[i] = d_hi - s_hi
+
+    # All reads of the input block must complete warp-wide before any lane
+    # overwrites it in place (no MMA/movmatrix implicit convergence here).
+    cute.arch.sync_warp()
+
+    for i in range(SB):
+        sAkk[r_off + i, c_off + pair] = _pack_bf16x2(Xlo[i], Xhi[i])
+
+
+# ===========================================================================
 # 16×16 matmul: load A & B from packed bf16x2 sAkk, BF16 MMA, return FP32 C
 # ===========================================================================
 @dsl_user_op
@@ -654,11 +730,12 @@ def akk_inv_kernel(
     mBeta: cute.Tensor,
     akk_smem_layout: cute.Layout,
     temp_layout: cute.Layout,
-    NT: int,
+    NT: cutlass.Int32,
     H: int,
     mCuSeqlens: cute.Tensor,
     mChunkIndices: cute.Tensor,
     IS_VARLEN: cutlass.Constexpr[int],
+    USE_NEUMANN: cutlass.Constexpr[int],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.warp_idx()
@@ -737,8 +814,15 @@ def akk_inv_kernel(
                 sBeta[_bcol_hi] = cutlass.Float32(mBeta[b_idx, _bt_hi, h_idx])
     cute.arch.barrier()
 
-    # ===== Stage 1: Diagonal block inversion via Neumann series (BF16 MMA) =====
-    _invert_diag_neumann(sAkk, warp_idx, lane_id)
+    # ===== Stage 1: Diagonal block inversion =====
+    # Default (USE_NEUMANN=0): EXACT forward substitution — WAR for the
+    # BF16 Neumann-series divergence on real weights (see _invert_diag_exact
+    # header). Neumann path kept compiled-out behind USE_NEUMANN=1 until the
+    # divergence is root-caused.
+    if USE_NEUMANN:
+        _invert_diag_neumann(sAkk, warp_idx, lane_id)
+    else:
+        _invert_diag_exact(sAkk, warp_idx, lane_id)
 
     cute.arch.barrier()
 
@@ -920,13 +1004,25 @@ def akk_inv_host(
     A_in: cute.Tensor,
     A_out: cute.Tensor,
     Beta_in: cute.Tensor,
-    B: cutlass.Constexpr[int],
-    NT: cutlass.Constexpr[int],
+    # B / NT / T_VAL are runtime scalars (shape-independent compile):
+    # baking them recompiled the kernel per batch shape — at eval traffic
+    # (unique total T per prefill batch) ~100 s of JIT per batch. Only H
+    # and IS_VARLEN remain compile-time specializers.
+    B: cutlass.Int32,
+    NT: cutlass.Int32,
     H: cutlass.Constexpr[int],
     mCuSeqlens: cute.Tensor,
     mChunkIndices: cute.Tensor,
     IS_VARLEN: cutlass.Constexpr[int],
-    T_VAL: cutlass.Constexpr[int],
+    T_VAL: cutlass.Int32,
+    # Launch stream — runtime argument; launching on the DSL default stream
+    # races with the executor's non-blocking execution stream.
+    stream: cuda.CUstream,
+    # WAR flag (compile-time): 0 (default) = exact blocked forward
+    # substitution for the diagonal 16×16 inverses; 1 = legacy BF16 Neumann
+    # series (known to diverge on real weights — keep disabled until
+    # root-caused).
+    USE_NEUMANN: cutlass.Constexpr[int] = 0,
 ):
     # BF16 input: view as FP32 (packed bf16x2). Each FP32 element = 2 BF16.
     # Original BF16 shape: [B, T, H, BS] with stride per-element in BF16.
@@ -940,7 +1036,13 @@ def akk_inv_host(
     _col_stride = 1  # adjacent bf16x2 pairs
     _h_stride = BS // 2  # head stride (BF16 = BS, /2 for bf16x2)
     _dim3_stride = _dim3_stride_bf16 // 2
-    _batch_stride = T_VAL * H * BS // 2
+    # T_VAL is a runtime Int32, so this stride is dynamic. Mathematically it is
+    # T_VAL * (H * BS // 2) = T_VAL * 32 * H, i.e. always a multiple of 4 fp32
+    # elements (16 B). The IR verifier can't derive that on its own, and without
+    # it the b_idx slice offset breaks the 128-bit alignment proof required by
+    # the cp.async G2S atom below (ICE: "src ptr alignment (32 bits) does not
+    # meet requirement (128 bits)"). Assert divisibility explicitly.
+    _batch_stride = cute.assume(T_VAL * (H * BS // 2), divby=H * BS // 2)
 
     view_layout = cute.make_layout(
         (BS, BS // 2, H, _dim3_size, B),
@@ -994,8 +1096,10 @@ def akk_inv_host(
         mCuSeqlens,
         mChunkIndices,
         IS_VARLEN,
+        USE_NEUMANN,
     ).launch(
         grid=(H, NT, B),
         block=(THREADS, 1, 1),
         smem=smem_bytes,
+        stream=stream,
     )

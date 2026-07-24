@@ -46,6 +46,7 @@ State management:
   - single state_ready_mbar after both passes (TMEM no-overlap constraint)
 """
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cutlass_dsl as _dsl_mod
@@ -1274,6 +1275,10 @@ def make_host_fn(num_sm=148):
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
         tm_workspace: cute.Tensor,
+        # Launch stream — runtime argument; launching on the DSL default
+        # stream races with the executor's non-blocking execution stream.
+        # Same stream as akk_inv, so the PDL chain stays intact.
+        stream: cuda.CUstream,
     ):
         # Raw tensors from from_dlpack have PyTorch layout (T, H, dim)
         # stride (H*dim, dim, 1). Reshape to 3D for TMA:
@@ -1438,6 +1443,7 @@ def make_host_fn(num_sm=148):
             o_out,
             tm_workspace,
             scheduler_params,
-        ).launch(grid=grid_shape, block=(threads_per_cta, 1, 1), use_pdl=True)
+        ).launch(grid=grid_shape, block=(threads_per_cta, 1, 1), use_pdl=True,
+                 stream=stream)
 
     return host_fn

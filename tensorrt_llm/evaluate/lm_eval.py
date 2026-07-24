@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import concurrent.futures
 import copy
 import json
 import os
@@ -54,6 +55,11 @@ LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER = "<image>"
 # Interval (in completed responses) for logging running metric estimates
 # during long evals; see _RunningScoreTracker. 0/unset disables the feature.
 PARTIAL_SCORES_ENV_VAR = "TLLM_EVAL_PARTIAL_SCORES_EVERY"
+
+# Cap on concurrently in-flight requests during LmEvalWrapper.generate_until.
+# 0/unset disables windowing (submit everything up front — current behavior).
+# See generate_until for the throughput/early-signal tradeoff.
+MAX_IN_FLIGHT_ENV_VAR = "TLLM_EVAL_MAX_IN_FLIGHT"
 
 
 class _RunningScoreTracker:
@@ -166,6 +172,20 @@ class LmEvalWrapper(TemplateLM):
         # signal for long evals. See _RunningScoreTracker.
         self.partial_scores_every = partial_scores_every
         self.partial_scoring_task_dict = partial_scoring_task_dict
+        # Env-gated cap on concurrently in-flight requests (0/unset = no cap,
+        # submit everything up front). See generate_until for the tradeoff.
+        env_window = os.environ.get(MAX_IN_FLIGHT_ENV_VAR)
+        if env_window:
+            try:
+                self.max_in_flight = int(env_window)
+            except ValueError:
+                raise ValueError(
+                    f"{MAX_IN_FLIGHT_ENV_VAR} must be an integer, got "
+                    f"{env_window!r}") from None
+            if self.max_in_flight < 0:
+                self.max_in_flight = 0
+        else:
+            self.max_in_flight = 0
 
     @property
     def eot_token_id(self) -> int:
@@ -247,32 +267,117 @@ class LmEvalWrapper(TemplateLM):
                 setattr(sampling_params, trtllm_key, value)
         return sampling_params
 
-    def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
-        profiler.start("trtllm exec")
-        results = []
-        for request in tqdm(requests,
-                            desc="Submitting requests",
-                            disable=disable_tqdm):
-            prompt, gen_kwargs = request.args
+    def _generate_until_windowed(self, requests, scorer,
+                                 disable_tqdm: bool) -> List[RequestOutput]:
+        """Submit requests through a sliding window of ``max_in_flight``.
+
+        With unlimited submission and GUARANTEED_NO_EVICT scheduling on large
+        attention-DP deployments, the engine admits ~all requests concurrently
+        and every response completes in a burst at the very end, so the
+        partial-score tracker gives zero mid-run signal. Capping in-flight
+        requests to W makes responses complete steadily throughout the run:
+        as each request finishes, it is scored immediately and the window is
+        topped up with the next unsubmitted request.
+
+        TRADEOFF: windowing can reduce end-to-end throughput — waves of W
+        requests may under-fill the scheduler compared with all-at-once
+        admission. The payoff is EARLY FAILURE SIGNAL via steady partial
+        scores, which is the right default for accuracy testing (kill a bad
+        run in minutes instead of hours). Suggested W: 256-512 for 16-rank
+        deployments.
+
+        Completion (and therefore partial-scoring) order is arbitrary, but
+        outputs are collected into an index-addressed list so the returned
+        order matches submission order — downstream handling is unchanged.
+        """
+        total = len(requests)
+        outputs: List[Optional[RequestOutput]] = [None] * total
+        next_idx = 0
+        done_count = 0
+
+        def _submit_next(pool):
+            # generate_async stays on the caller thread (submission order is
+            # deterministic); only the blocking .result() wait is offloaded,
+            # one waiter thread per in-flight request, so completions surface
+            # in completion order via FIRST_COMPLETED below.
+            nonlocal next_idx
+            idx = next_idx
+            next_idx += 1
+            prompt, gen_kwargs = requests[idx].args
             sampling_params = self._get_sampling_params(gen_kwargs)
             output = self.llm.generate_async(prompt,
                                              sampling_params=sampling_params,
                                              streaming=self.streaming)
-            results.append(output)
+            return pool.submit(lambda: (idx, output.result()))
+
+        pbar = tqdm(total=total, desc="Fetching responses (windowed)",
+                    disable=disable_tqdm)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.max_in_flight) as pool:
+                pending = {
+                    _submit_next(pool)
+                    for _ in range(min(self.max_in_flight, total))
+                }
+                while pending:
+                    done, pending = concurrent.futures.wait(
+                        pending,
+                        return_when=concurrent.futures.FIRST_COMPLETED)
+                    for fut in done:
+                        # A failed request re-raises here (same as the
+                        # non-windowed path's output.result()); no deadlock —
+                        # pool shutdown just drains the remaining in-flight
+                        # waiters, which the engine unblocks on completion or
+                        # via EngineDeadError.
+                        idx, output = fut.result()
+                        outputs[idx] = output
+                        done_count += 1
+                        pbar.update(1)
+                        if scorer is not None:
+                            scorer.update(requests[idx],
+                                          output.outputs[0].text)
+                            scorer.maybe_log(done_count, total)
+                        if next_idx < total:
+                            pending.add(_submit_next(pool))
+        finally:
+            pbar.close()
+        return outputs
+
+    def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
+        profiler.start("trtllm exec")
 
         scorer = None
         if self.partial_scores_every and self.partial_scoring_task_dict:
             scorer = _RunningScoreTracker(self.partial_scoring_task_dict,
                                           self.partial_scores_every)
 
-        outputs = []
-        for output, request in zip(
-                tqdm(results, desc="Fetching responses",
-                     disable=disable_tqdm), requests):
-            outputs.append(output.result())
-            if scorer is not None:
-                scorer.update(request, outputs[-1].outputs[0].text)
-                scorer.maybe_log(len(outputs), len(requests))
+        if self.max_in_flight > 0 and not self.streaming:
+            # Env-gated (TLLM_EVAL_MAX_IN_FLIGHT) submission windowing for the
+            # standard non-streaming path only; streaming (and the multimodal
+            # override below) keep the submit-all behavior untouched.
+            outputs = self._generate_until_windowed(requests, scorer,
+                                                    disable_tqdm)
+        else:
+            results = []
+            for request in tqdm(requests,
+                                desc="Submitting requests",
+                                disable=disable_tqdm):
+                prompt, gen_kwargs = request.args
+                sampling_params = self._get_sampling_params(gen_kwargs)
+                output = self.llm.generate_async(
+                    prompt,
+                    sampling_params=sampling_params,
+                    streaming=self.streaming)
+                results.append(output)
+
+            outputs = []
+            for output, request in zip(
+                    tqdm(results, desc="Fetching responses",
+                         disable=disable_tqdm), requests):
+                outputs.append(output.result())
+                if scorer is not None:
+                    scorer.update(request, outputs[-1].outputs[0].text)
+                    scorer.maybe_log(len(outputs), len(requests))
 
         if self.output_dir:
             dump_inference_results(self.output_dir, outputs,
@@ -508,6 +613,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             List of generated text responses
         """
         profiler.start("trtllm exec")
+        # NOTE: TLLM_EVAL_MAX_IN_FLIGHT submission windowing (see
+        # LmEvalWrapper.generate_until) is intentionally NOT applied to this
+        # multimodal path; it keeps the original submit-all behavior.
         results = []
         for request in tqdm(requests,
                             desc="Submitting requests",
