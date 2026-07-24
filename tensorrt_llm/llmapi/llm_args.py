@@ -563,7 +563,7 @@ class MultimodalConfig(StrictBaseModel):
         ("Maximum number of pending multimodal requests whose encoder work can be prefetched "
          "on a side CUDA stream ahead of admission. 0 disables side-stream prefetch. "
          "Incompatible with encoder_cuda_graph because graph replay uses static buffers. "
-         "For the time being, this is also incompatible with encoder_cache_max_bytes > 0."
+         "Can be combined with encoder_cache_max_bytes; the two memory limits are additive."
          ),
         status="prototype",
     )
@@ -576,7 +576,7 @@ class MultimodalConfig(StrictBaseModel):
          "Cache entries are per multimodal item, but reuse is all-or-nothing for each request: "
          "every item in the request must hit the cache before cached embeddings are reused. "
          "Only single-modality requests are cacheable for the time being. "
-         "For the time being, this is incompatible with encoder_side_stream_max_ahead > 0. "
+         "Can be combined with encoder_side_stream_max_ahead. "
          "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
          ),
         status="prototype",
@@ -607,14 +607,6 @@ class MultimodalConfig(StrictBaseModel):
                 "multimodal_config.encoder_side_stream_max_ahead > 0 are "
                 "mutually exclusive. Disable side-stream MM prefetch or "
                 "disable MM encoder CUDA graphs.")
-        # TODO(TRTLLM-14034): Make encoder side-stream read and write from the cache.
-        if (self.encoder_cache_max_bytes > 0
-                and self.encoder_side_stream_max_ahead > 0):
-            raise ValueError(
-                "multimodal_config.encoder_cache_max_bytes > 0 and "
-                "multimodal_config.encoder_side_stream_max_ahead > 0 are "
-                "mutually exclusive. Disable side-stream MM prefetch or set "
-                "the MM encoder cache capacity to 0.")
         return self
 
 

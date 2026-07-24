@@ -749,10 +749,9 @@ class TestMultimodalConfig:
     def test_torch_llm_args_with_encoder_side_stream_max_ahead(self):
         args = TorchLlmArgs(model=llama_model_path,
                             multimodal_config=MultimodalConfig(
-                                encoder_side_stream_max_ahead=2,
-                                encoder_cache_max_bytes=0,
-                            ))
+                                encoder_side_stream_max_ahead=2, ))
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
+        assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
 
     def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
         args = TorchLlmArgs(
@@ -813,12 +812,14 @@ class TestMultimodalConfig:
                 },
             )
 
-    def test_encoder_cache_and_side_stream_max_ahead_are_exclusive(self):
-        with pytest.raises(ValidationError, match="mutually exclusive"):
-            MultimodalConfig(
-                encoder_cache_max_bytes="1MiB",
-                encoder_side_stream_max_ahead=1,
-            )
+    def test_encoder_cache_and_side_stream_max_ahead_can_be_combined(self):
+        config = MultimodalConfig(
+            encoder_cache_max_bytes="1MiB",
+            encoder_side_stream_max_ahead=1,
+        )
+
+        assert config.encoder_cache_max_bytes == 1024**2
+        assert config.encoder_side_stream_max_ahead == 1
 
 
 @pytest.mark.parametrize("kwargs", [

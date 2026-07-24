@@ -6251,10 +6251,10 @@ class PyExecutor:
             )
         except Exception:
             # Speculative prefetch is best-effort and must never crash the
-            # executor loop. On failure, `py_mm_encoder_event` is not stamped,
-            # so the next iteration's `_prepare_inputs` falls back to the
-            # standard in-iter encode path (which re-runs `to_device` and the
-            # encoder unconditionally when no cached embedding is present).
+            # executor loop. The dispatch helper stamps an event when it queued
+            # any auxiliary-stream work, even on a partial failure, so the next
+            # iteration can safely inspect the request-local data and fall back
+            # to the standard in-iter encode path for any missing embedding.
             logger.warning(
                 f"Cross-iter MM encoder prefetch failed; falling back to "
                 f"in-iter encode.\n{traceback.format_exc()}")

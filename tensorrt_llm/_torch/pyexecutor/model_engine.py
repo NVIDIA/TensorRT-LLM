@@ -22,7 +22,7 @@ from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
                                  trace_func)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
-from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
+from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
@@ -54,7 +54,8 @@ from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
+                                                _build_request_multimodal_input)
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
@@ -161,25 +162,6 @@ def _filter_piecewise_capture_num_tokens(
         if max_capturable_num_tokens < i <= max_num_tokens
     })
     return kept, unrecordable
-
-
-def _build_request_multimodal_input(
-        request: LlmRequest, cache_enabled: bool) -> Optional[MultimodalInput]:
-    # Skip building this input (and its `from_components` validation) when the cache is disabled.
-    if not cache_enabled or request.multimodal_hashes is None:
-        return None
-    # `multimodal_input` is consumed only by the encoder-cache key path
-    # (`MultimodalModelMixin._encoder_cache_keys`), which uses UUID-aware multimodal hashes
-    # internally. Although the `multimodal_uuids` are not exposed as an attribute, they remain in
-    # the backing C++ request for KV-cache block keys and cache events.
-    return MultimodalInput.from_components(
-        request.multimodal_hashes,
-        request.multimodal_positions,
-        request.multimodal_lengths,
-        mm_item_run_cu_offsets=request.multimodal_item_run_cu_offsets,
-        mm_run_positions=request.multimodal_run_positions,
-        mm_run_lengths=request.multimodal_run_lengths,
-    )
 
 
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
@@ -894,9 +876,9 @@ class PyTorchModelEngine(ModelEngine):
     @functools.cached_property
     def _mm_encoder_cache_enabled(self) -> bool:
         """Whether the multimodal encoder cache is active for this model."""
-        multimodal_config = self.model.model_config.multimodal_config
-        return (multimodal_config is not None
-                and multimodal_config.encoder_cache_max_bytes > 0)
+        model = self.model
+        return (isinstance(model, MultimodalModelMixin)
+                and model.encoder_cache_active)
 
     @property
     def is_warmup(self):

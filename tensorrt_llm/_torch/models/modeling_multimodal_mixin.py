@@ -33,11 +33,11 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
 from tensorrt_llm.logger import logger
 
 from .modeling_multimodal_utils import (
-    _cache_multimodal_embeddings,
+    _store_chunked_prefill_embeddings,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
@@ -50,6 +50,26 @@ if TYPE_CHECKING:
 _MM_DATA_INPUT_MODALITY_KEYS = frozenset({"audio", "image", "video"})
 _MM_AUX_STREAM: Optional[tuple[int, torch.cuda.Stream]] = None
 _MM_ENCODER_CACHE_LOG_NAME = "mm_encoder_cache"
+
+
+def _build_request_multimodal_input(
+    request: "LlmRequest", cache_enabled: bool
+) -> Optional[MultimodalInput]:
+    """Build the encoder-cache key metadata carried by one request."""
+    # Skip construction (and `from_components` validation) when no persistent cache consumes it.
+    if not cache_enabled or request.multimodal_hashes is None:
+        return None
+    # `MultimodalModelMixin._encoder_cache_keys` uses UUID-aware multimodal hashes internally.
+    # Although the UUIDs are not exposed as an attribute, they remain in the backing C++ request
+    # for KV-cache block keys and cache events.
+    return MultimodalInput.from_components(
+        request.multimodal_hashes,
+        request.multimodal_positions,
+        request.multimodal_lengths,
+        mm_item_run_cu_offsets=request.multimodal_item_run_cu_offsets,
+        mm_run_positions=request.multimodal_run_positions,
+        mm_run_lengths=request.multimodal_run_lengths,
+    )
 
 
 def _get_mm_aux_stream(max_prefetch_ahead: int = 0) -> Optional[torch.cuda.Stream]:
@@ -190,6 +210,25 @@ class MultimodalModelMixin:
         """Return the dtype of each cached multimodal embedding row."""
         raise NotImplementedError
 
+    @property
+    def encoder_cache_active(self) -> bool:
+        """Whether the persistent encoder cache is active for this model.
+
+        Single source of truth shared by:
+
+        * the in-iter consume path
+        * the side-stream prefetch dispatch
+        * the engine's cache-related gate
+        * the KV-cache memory reservation.
+
+        The cache is only active when the model opts in via `supports_encoder_cache` and configures
+        a positive capacity.
+        """
+        if not self.supports_encoder_cache:
+            return False
+        multimodal_config = self.model_config.multimodal_config
+        return multimodal_config is not None and multimodal_config.encoder_cache_max_bytes > 0
+
     def select_multimodal_params(
         self,
         multimodal_params: Sequence[MultimodalParams],
@@ -310,14 +349,22 @@ class MultimodalModelMixin:
 
         Delegates cache lookup and gather behavior to `get_multimodal_embeddings`, then validates
         the single tensor contract for both encoded and cached-only paths.
+
+        During side-stream prefetch, this runs with the auxiliary stream current, so the H2D copies,
+        the encoder, and every persistent-cache `put()` are issued on that stream. `TensorLRUCache`
+        records each entry's producer event on the issuing (aux) stream; the next iteration's
+        main-stream consumer waits on the request-level `encoder_event` for ordering.
         """
         encoder_cache = self._get_multimodal_encoder_cache()
         cache_misses = []
         if encoder_cache is not None:
             for param in multimodal_params:
                 if param.multimodal_data.get("multimodal_embedding") is not None:
-                    # The forward that attached this request-local embedding already populated the
-                    # persistent cache.
+                    # A present embedding means either an earlier forward already wrote the
+                    # persistent cache, or a prefetch hit attached a cache-owned tensor. Either
+                    # way, skip re-lookup and re-write. `get_multimodal_embeddings` waits on the
+                    # request event and records the attached tensor on the consuming stream before
+                    # gathering it (see `_attach_encoder_cache_hit`).
                     continue
                 if not self._attach_encoder_cache_hit(param, encoder_cache):
                     cache_misses.append(param)
@@ -341,19 +388,16 @@ class MultimodalModelMixin:
         The cache stores per-item embeddings for params that can be represented by one modality.
         See `_encoder_cache_keys` for the mixed-modality skip path and its technical limitation.
         """
-        multimodal_config = self.model_config.multimodal_config
-        if multimodal_config is None:
-            return None
-
-        max_bytes = multimodal_config.encoder_cache_max_bytes
-        if max_bytes <= 0:
+        if not self.encoder_cache_active:
             logger.debug_once(
-                f"{_MM_ENCODER_CACHE_LOG_NAME}: disabled because "
-                "multimodal_config.encoder_cache_max_bytes=0.",
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: disabled because the model does not opt in via "
+                "supports_encoder_cache or multimodal_config.encoder_cache_max_bytes=0.",
                 key="mm_encoder_cache_disabled",
             )
             return None
 
+        multimodal_config = self.model_config.multimodal_config
+        max_bytes = multimodal_config.encoder_cache_max_bytes
         if self._multimodal_encoder_cache is None:
             # Per-item embeddings are views produced by splitting a request-level encoder output.
             # Clone them so a cached item neither aliases mutable caller output nor retains the
@@ -363,6 +407,7 @@ class MultimodalModelMixin:
             self._multimodal_encoder_cache = TensorLRUCache(
                 max_bytes,
                 name=_MM_ENCODER_CACHE_LOG_NAME,
+                cuda_stream_aware=multimodal_config.encoder_side_stream_max_ahead > 0,
             )
             try:
                 embedding_dim = self.embedding_dim
@@ -508,6 +553,10 @@ class MultimodalModelMixin:
                 return False
             cached_embeddings.append(cached_embedding)
 
+        # On a side-stream prefetch, this attaches a cache-owned (aliased) tensor while the aux
+        # stream is current. `TensorLRUCache.get` protects the aux gather below. The next
+        # iteration's `get_multimodal_embeddings` call separately waits on the request event and
+        # records the attached tensor on the main consuming stream before gathering it.
         if len(cached_embeddings) == 1:
             param.multimodal_data["multimodal_embedding"] = cached_embeddings[0]
         else:
@@ -711,8 +760,10 @@ def _dispatch_cross_iter_prefetch(
     The event covers all work queued in the aux-stream block, so the same
     event object is shared across all candidates.
     """
+    encoder_cache_enabled = model.encoder_cache_active
     params_list = [
         MultimodalParams(
+            multimodal_input=_build_request_multimodal_input(req, encoder_cache_enabled),
             multimodal_data=mm_data,
             multimodal_runtime=MultimodalRuntimeData(
                 past_seen_token_num=0,
@@ -720,7 +771,7 @@ def _dispatch_cross_iter_prefetch(
                 embed_mask_cumsum=cumsum,
             ),
         )
-        for _, mm_data, cumsum in candidates
+        for req, mm_data, cumsum in candidates
     ]
 
     # Prefetch targets requests outside the current iteration, so their
@@ -728,9 +779,10 @@ def _dispatch_cross_iter_prefetch(
     # this after the iteration's LLM kernels so aux-stream H2D copies and
     # encoder work can overlap them.
     #
-    # Ordering is handled by `encoder_event`, and tensor lifetime is anchored
-    # by `req.py_multimodal_data` until the request is consumed or terminated.
-    # Keeping `record_stream` out also keeps this path modality-neutral.
+    # Request-local ordering is handled by `encoder_event`; the consume path also `record_stream`s
+    # attached embeddings before gathering them so post-prefill request cleanup cannot release
+    # storage while main-stream work is pending. Persistent-cache clones use their own producer
+    # events and consumer `record_stream` calls inside `TensorLRUCache`.
     encoder_event = None
     try:
         with _run_on_aux_stream(aux_stream) as encoder_event:
@@ -748,8 +800,11 @@ def _dispatch_cross_iter_prefetch(
             # model_engine._prepare_inputs.
             for (req, _, _), p in zip(candidates, params_list):
                 req.py_multimodal_data = p.multimodal_data
-            encoder_output = model.encode_multimodal_inputs(params_list)
-            _cache_multimodal_embeddings(params_list, [encoder_output])
+            if encoder_cache_enabled:
+                model._get_or_encode_multimodal_embeddings(params_list)
+            else:
+                encoder_output = model.encode_multimodal_inputs(params_list)
+                _store_chunked_prefill_embeddings(params_list, [encoder_output])
     finally:
         # Stash the event on every candidate's durable LlmRequest (not the
         # per-iter `MultimodalParams`), since `_prepare_inputs` rebuilds the
