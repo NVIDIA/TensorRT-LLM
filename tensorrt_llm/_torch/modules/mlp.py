@@ -269,16 +269,13 @@ class MLP(nn.Module):
         assert lora_params is not None
 
         assert self.layer_idx is not None, "layer_idx is required for lora"
-        x_up, (x_up_lora,) = LoraLayer.forward_with_base(
+        x_up = LoraLayer.forward_with_base(
             lambda: self.up_proj(x),
             (self.up_lora,),
             x,
             lora_params,
             self.layer_idx,
         )
-
-        if x_up_lora is not None:
-            x_up = x_up + x_up_lora
 
         x_act = self.activation(x_up)
         x_down = self.down_proj(x_act,
