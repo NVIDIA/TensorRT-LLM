@@ -31,7 +31,6 @@ The public ``trtllm::kda_prefill`` operator returns only the KDA output and
 final recurrent state. Intermediate matrices remain private runner workspace.
 """
 
-import os
 from typing import Optional, Tuple
 
 import weakref
@@ -42,7 +41,6 @@ from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 
 if IS_CUTLASS_DSL_AVAILABLE and IS_FLASHINFER_AVAILABLE:
-    import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -71,22 +69,6 @@ def _ct(t, etype):
     r = from_dlpack(t, assumed_align=16)
     r.element_type = etype
     return r
-
-
-def _current_cu_stream(device):
-    """CUstream handle of torch's CURRENT stream, queried per call.
-
-    The executor runs the model on a dedicated non-blocking
-    ``torch.cuda.Stream`` (``py_executor.execution_stream``), not the default
-    stream. Every kernel launch must go to this stream: launching on the DSL
-    default stream (what ``.launch()`` does without a ``stream`` argument)
-    races with the projections that produce q/k/v/g/beta and with the
-    consumers of O/final_state — silent, intermittent corruption in the
-    runtime while single-stream unit tests pass. This is also why the value
-    must never be cached alongside the scratch buffers: the buffers may be
-    created under a different stream (e.g. warmup) than later forwards.
-    """
-    return cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
 
 # Cached eqlen dummy cu/ci cute wrappers — shared by K123 and akk_inv.
@@ -332,39 +314,19 @@ def _get_padded_input_buffers(B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta,
     return e
 
 
-def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT,
-                 varlen=False):
+def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT):
     """All beta fusion lives in akk_inv kernel epilogue (post-inv column-scale)."""
-    key = (dev.index or 0, B, T, H, K_dim, V_dim, NT, N_seqs, varlen)
+    key = (dev.index or 0, B, T, H, K_dim, V_dim, NT, N_seqs)
     if key not in _buf_cache:
         bf16 = cutlass.BFloat16
         fp32 = cutlass.Float32
-        # Varlen chunk-tile kernels (akk_inv's Stage-0 cp.async A-tile load,
-        # K4's A-tile loads) transfer the full BT-row tile of every chunk
-        # and neutralize invalid rows only after the access; when the
-        # batch's FINAL chunk is partial they read up to BT-1 rows past the
-        # logical T. These are driver-owned scratch buffers, so honor the
-        # kernel's boundary-at-the-data contract by allocating one chunk of
-        # zeroed slack past T (the eqlen path gets the same guarantee from
-        # its 256-multiple input padding). The slack rows are never
-        # consumed — OOB rows are zeroed in SMEM or masked at stores.
-        # Input tensors (beta) get the opposite treatment: the K123 kernel
-        # bounds-checks those loads, since the driver doesn't own them.
-        if varlen:
-            assert B == 1, f"varlen expects packed B=1 input, got B={B}"
-        T_alloc = T + BT if varlen else T
-
-        def _with_slack(ctor, *shape, dtype):
-            full = ctor(*shape, device=dev, dtype=dtype)
-            return full[:, :T]
-
-        k_scaled = _with_slack(torch.empty, B, T_alloc, H, K_dim, dtype=dtype_k)  # raw, no beta
-        kg = _with_slack(torch.empty, B, T_alloc, H, K_dim, dtype=dtype_k)
-        q_scaled = _with_slack(torch.empty, B, T_alloc, H, K_dim, dtype=dtype_k)
+        k_scaled = torch.empty(B, T, H, K_dim, device=dev, dtype=dtype_k)  # raw, no beta
+        kg = torch.empty(B, T, H, K_dim, device=dev, dtype=dtype_k)
+        q_scaled = torch.empty(B, T, H, K_dim, device=dev, dtype=dtype_k)
         gk_last_exp = torch.empty(B, NT, H, K_dim, device=dev, dtype=torch.float32)
-        A_qk = _with_slack(torch.zeros, B, T_alloc, H, BT, dtype=dtype_k)
-        A_kk = _with_slack(torch.zeros, B, T_alloc, H, BT, dtype=dtype_k)
-        O_flat = _with_slack(torch.empty, B, T_alloc, H, V_dim, dtype=dtype_k)
+        A_qk = torch.zeros(B, T, H, BT, device=dev, dtype=dtype_k)
+        A_kk = torch.zeros(B, T, H, BT, device=dev, dtype=dtype_k)
+        O_flat = torch.empty(B, T, H, V_dim, device=dev, dtype=dtype_k)
         # K4 reads initial state from S_out (caller copies it in) and writes
         # the final state back into the same buffer — no separate s_4d, no
         # extra D2D memcpy at the end of the K4 launcher. Layout matches
@@ -407,12 +369,11 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT,
         co_eqlen_ct.element_type = cutlass.Int32
 
         # akk_inv views: bf16 storage reinterpreted as fp32 (packed 2x bf16 -> 1x fp32).
-        # Layout-dynamic so the single compiled akk_inv (shape-independent
-        # key) accepts them regardless of T; the host rebuilds its own
-        # runtime-shaped views from the iterator anyway.
-        akk_in_view = from_dlpack(A_kk, assumed_align=16).mark_layout_dynamic()
+        # Built without mark_layout_dynamic to match per-call wrapper type signature
+        # (akk_inv kernel was compiled against this layout — must stay identical).
+        akk_in_view = from_dlpack(A_kk, assumed_align=16)
         akk_in_view.element_type = fp32
-        akk_out_view = from_dlpack(A_kk, assumed_align=16).mark_layout_dynamic()
+        akk_out_view = from_dlpack(A_kk, assumed_align=16)
         akk_out_view.element_type = fp32
 
         # K4 state wrapper points directly at S_out — K4 reads/writes in place.
@@ -421,10 +382,9 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT,
         s_ct = from_dlpack(S_out, assumed_align=16)
         s_ct.element_type = fp32
 
-        # Side stream is process-long, safe to cache. The MAIN stream must
-        # NOT be cached here: the executor creates the buffers under one
-        # stream (warmup) and calls under another (execution_stream), so it
-        # is re-queried per call in _chunk_kda_fwd.
+        # Cache PyTorch streams once per buf_cache entry — torch.cuda.current_stream
+        # is a torch C call that costs ~2us each invocation.
+        main_stream_cached = torch.cuda.current_stream(dev)
         side_stream_cached = _get_side_stream(dev)
 
         cute_wrappers = dict(
@@ -440,6 +400,7 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT,
             akk_in_view=akk_in_view,
             akk_out_view=akk_out_view,
             s_ct=s_ct,
+            main_stream=main_stream_cached,
             side_stream=side_stream_cached,
             # Filled lazily on first launch — saves cache_key tuple build +
             # outer dict lookup on subsequent calls.
@@ -527,9 +488,6 @@ def _launch_k4_persistent(
     else:
         tm_ws_t, tm_ct = _k4p_tm_ws[tm_key]
 
-    # Launch on torch's CURRENT stream — see _current_cu_stream.
-    stream = _current_cu_stream(dev)
-
     k4_fn = cute_wrappers.get("_k4_fn")
     if k4_fn is None:
         cache_key = (dev_idx, nsm, N_seqs, H)
@@ -550,13 +508,11 @@ def _launch_k4_persistent(
                 cu_ct,
                 co_ct,
                 tm_ct,
-                stream,
             )
             _k4p_cache[cache_key] = k4_fn
         cute_wrappers["_k4_fn"] = k4_fn
 
-    args = (a_ct, b_ct, v_ct, q_ct, aqc_ct, kg_ct, o_ct, gk_ct, s_ct, cu_ct, co_ct, tm_ct,
-            stream)
+    args = (a_ct, b_ct, v_ct, q_ct, aqc_ct, kg_ct, o_ct, gk_ct, s_ct, cu_ct, co_ct, tm_ct)
     k4_fn(*args)
 
 
@@ -583,7 +539,6 @@ def _launch_fused_k123_inv(
     akk_in_view=None,
     akk_out_view=None,
     cute_wrappers=None,
-    varlen_pure_override=False,
 ):
     """Persistent K1+K2 (writes A_kk in I+L format with diag=1) chained with
     BF16 akk_inv (in-place inversion). Final A_kk_inv = (I+L)^-1."""
@@ -604,34 +559,14 @@ def _launch_fused_k123_inv(
     # calls with the same tensor object are a dict lookup (~100 ns).
     varlen_pure = False
     if is_varlen and cu_seqlens is not None:
-        if varlen_pure_override:
-            # Caller (Phase 2.1 single-seq path) sentinel-padded the data for
-            # this call; the cached per-object verdict stays untouched.
-            varlen_pure = True
-        else:
-            _vp_key = id(cu_seqlens)
-            if _vp_key not in _varlen_pure_cache:
-                cu_cpu = cu_seqlens.cpu().tolist()
-                seq_lens = [cu_cpu[i + 1] - cu_cpu[i] for i in range(len(cu_cpu) - 1)]
-                _varlen_pure_cache[_vp_key] = all((sl % BT) == 0 for sl in seq_lens)
-                _prune_on_gc(_varlen_pure_cache, _vp_key, cu_seqlens)
-            varlen_pure = _varlen_pure_cache[_vp_key]
-    # Shape-independent compile key: B/NT/T are runtime args of the compiled
-    # host_fn (see make_host_function), NOT specializers. Baking them meant a
-    # fresh ~100 s DSL compile per distinct batch shape — at eval traffic
-    # (unique total T per prefill batch) the executor never finished its
-    # first iterations (GSM8K "hang", 0/1319 responses).
-    #
-    # cu/ci DTYPE must be part of the key: the kernel reads
-    # mCuSeqlens/mChunkIndices with the element type baked at compile time
-    # (int64 elements are addressed with stride 8, int32 with stride 4).
-    # Reusing an int64-compiled kernel on int32 tensors (or vice versa)
-    # misaddresses every cu/ci element — garbage seq ids/chunk starts ->
-    # OOB reads (cudaErrorIllegalAddress) or silent corruption. Observed as
-    # a crash when a dump-replay batch (int64 cu/ci) preceded a synthetic
-    # batch (int32 cu/ci) in one process (jobs 2664196/2664197/2664337).
-    cu_ci_dtypes = (cu_seqlens.dtype, chunk_indices.dtype) if is_varlen else None
-    cache_key = (H, is_varlen, dev, has_bias, safe_gate, varlen_pure, cu_ci_dtypes)
+        _vp_key = id(cu_seqlens)
+        if _vp_key not in _varlen_pure_cache:
+            cu_cpu = cu_seqlens.cpu().tolist()
+            seq_lens = [cu_cpu[i + 1] - cu_cpu[i] for i in range(len(cu_cpu) - 1)]
+            _varlen_pure_cache[_vp_key] = all((sl % BT) == 0 for sl in seq_lens)
+            _prune_on_gc(_varlen_pure_cache, _vp_key, cu_seqlens)
+        varlen_pure = _varlen_pure_cache[_vp_key]
+    cache_key = (B, NT, H, is_varlen, T_padded, dev, has_bias, safe_gate, varlen_pure)
 
     # Inputs are guaranteed contiguous by upstream linear projections.
     # A_log is fp32 model param; .float() is no-op when dtype already matches.
@@ -663,9 +598,6 @@ def _launch_fused_k123_inv(
         bias_ct = _get_empty_bias_ct(q.device)
     lb_val = float(lower_bound) if lower_bound is not None else 0.0
 
-    # Launch on torch's CURRENT stream — see _current_cu_stream.
-    stream = _current_cu_stream(q.device)
-
     ct_args = (
         q_ct,
         k_ct,
@@ -683,11 +615,6 @@ def _launch_fused_k123_inv(
         ci_ct,
         bias_ct,
         lb_val,
-        # Runtime shape scalars (rt_nt / rt_b / rt_t_total in host_fn).
-        NT,
-        B,
-        B * (T_padded if is_varlen else NT * BT),
-        stream,
     )
 
     if cache_key not in _fused_k123_cache:
@@ -706,13 +633,10 @@ def _launch_fused_k123_inv(
     k123_fn(*ct_args)
 
     # ===== Chained BF16 akk_inv (in-place: A_kk_inv = (I+L)^-1) =====
-    # Views are layout-dynamic so one compiled akk_inv serves every batch
-    # shape (the host builds its own runtime-shaped views from the iterator;
-    # the wrapper layout only matters for the call signature).
     if akk_in_view is None:
-        akk_in_view = from_dlpack(A_kk_inv, assumed_align=16).mark_layout_dynamic()
+        akk_in_view = from_dlpack(A_kk_inv, assumed_align=16)
         akk_in_view.element_type = cutlass.Float32
-        akk_out_view = from_dlpack(A_kk_inv, assumed_align=16).mark_layout_dynamic()
+        akk_out_view = from_dlpack(A_kk_inv, assumed_align=16)
         akk_out_view.element_type = cutlass.Float32
 
     if is_varlen:
@@ -726,14 +650,7 @@ def _launch_fused_k123_inv(
         is_varlen_int = 0
         T_val = NT * BT
 
-    # Shape-independent key: B/NT/T_val are runtime args of akk_inv_host.
-    # cu/ci dtype is a specializer for the same reason as in the K123 key
-    # above (element type baked into the compiled reader).
-    # WAR flag (debug escape hatch): TRTLLM_KDA_AKK_USE_NEUMANN=1 re-enables
-    # the legacy BF16 Neumann diagonal inversion, which diverges on real
-    # weights. Default 0 = exact forward substitution.
-    use_neumann = int(os.environ.get("TRTLLM_KDA_AKK_USE_NEUMANN", "0"))
-    akk_cache_key = (H, is_varlen, dev, use_neumann, cu_ci_dtypes)
+    akk_cache_key = (B, NT, H, is_varlen, dev, T_val)
     if akk_cache_key not in _akk_inv_cache:
         _akk_inv_cache[akk_cache_key] = cute.compile(
             _akk_inv_host,
@@ -747,12 +664,9 @@ def _launch_fused_k123_inv(
             akk_ci_ct,
             is_varlen_int,
             T_val,
-            stream,
-            use_neumann,
         )
     akk_fn = _akk_inv_cache[akk_cache_key]
-    akk_args = (akk_in_view, akk_out_view, beta_ct, B, NT, akk_cu_ct,
-                akk_ci_ct, T_val, stream)
+    akk_args = (akk_in_view, akk_out_view, beta_ct, akk_cu_ct, akk_ci_ct)
     akk_fn(*akk_args)
 
 
@@ -822,8 +736,6 @@ def _launch_fused_k1234(
         NC,
         H,
         B,
-        # Launch on torch's CURRENT stream — see _current_cu_stream.
-        _current_cu_stream(device),
     )
 
     if cache_key not in _fused_k1234_cache:
@@ -977,27 +889,17 @@ def _chunk_kda_fwd(
         if not _varlen_pure_cache[_vl_key]:
             real_T = _varlen_single_seqlen_cache[_vl_key]
             needs_varlen_single_pad = True
-    varlen_pure_override = False
     if needs_varlen_single_pad:
         # q/k/v/beta already zero-padded by caller (FLA convention). Re-build g
         # with -1000 sentinel in the tail so VARLEN_PURE=1 path is correct.
         # Cache the resulting g buffer so repeated calls with same input ids
         # don't re-allocate.
         cur_T = q.shape[1]  # caller's padded T
-        assert cur_T % BT == 0 and cur_T >= real_T, (
-            f"varlen single-seq path expects caller-padded input "
-            f"(T={cur_T}, seqlen={real_T}); see "
-            "KDAKernelDispatch.prefill_chunk_kda")
         g_pad = _get_g_sentinel_buffer(B, cur_T, H, K, g.dtype, g.device, real_T)
         g_pad[:, :real_T].copy_(g[:, :real_T])
         g = g_pad
-        # Force VARLEN_PURE=1 for THIS call only (the data is sentinel-padded
-        # now). Never write the override into _varlen_pure_cache: the cached
-        # verdict must keep saying "not pure" so a later call with the SAME
-        # cu_seqlens object re-runs this sentinel pad — poisoning the cache
-        # made the second call skip the pad while still compiling the
-        # mask-free variant (silent tail corruption).
-        varlen_pure_override = True
+        # Force VARLEN_PURE=1 — caller's cu_seqlens is reused as-is.
+        _varlen_pure_cache[id(cu_seqlens)] = True
 
     # Phase 2.2 (multi-seq via host repack) was attempted but isn't net positive:
     # the scatter/gather memcpy cost (~800us GPU bandwidth per call) exceeds
@@ -1038,8 +940,7 @@ def _chunk_kda_fwd(
         cu_eqlen,
         co_eqlen,
         cute_wrappers,
-    ) = _get_buffers(device, k.dtype, B, T, H, K, V_dim, NT, N_seqs, BT,
-                     varlen=is_varlen)
+    ) = _get_buffers(device, k.dtype, B, T, H, K, V_dim, NT, N_seqs, BT)
 
     # ===== State copy on side stream, parallel with K123 =====
     # K4 needs S_out populated with initial_state. By doing this copy on a
@@ -1050,10 +951,7 @@ def _chunk_kda_fwd(
         S_in = torch.zeros(N_seqs, H, K, V_dim, dtype=torch.float32, device=device)
     else:
         S_in = initial_state
-    # Current stream per call — never the buffer-creation-time stream (the
-    # executor creates buffers under warmup's stream and calls under
-    # execution_stream; syncing against a stale stream un-orders the copy).
-    main_stream = torch.cuda.current_stream(device)
+    main_stream = cute_wrappers["main_stream"]
     side_stream = cute_wrappers["side_stream"]
     needs_copy = S_in.data_ptr() != S_out.data_ptr()
     if needs_copy:
@@ -1086,7 +984,6 @@ def _chunk_kda_fwd(
         akk_in_view=cute_wrappers["akk_in_view"],
         akk_out_view=cute_wrappers["akk_out_view"],
         cute_wrappers=cute_wrappers,
-        varlen_pure_override=varlen_pure_override,
     )
 
     # ===== K4: persistent kernel (eqlen + varlen via cu_seqlens) =====

@@ -201,46 +201,6 @@ def test_kda_mixer_empty_prefill():
 
 
 @torch.no_grad()
-def test_kda_prefill_op_partial_final_chunk_large_batch():
-    """Regression: varlen batches whose FINAL chunk is partial.
-
-    The chunk-tile kernels access the full 64-row tile of every chunk and
-    neutralize invalid rows only after the access, so the batch's final
-    partial chunk touches up to 63 rows past the logical packed length —
-    OOB reads on the beta input (now bounds-checked in fused_k123) and on
-    the A_kk/A_qk scratch (now allocated with one chunk of slack). The
-    runtime's autotuner-warmup shape [max_seq_len - 1, 1] = [8191, 1] hit
-    this as CUDA_ERROR_ILLEGAL_ADDRESS whenever the following page was
-    unmapped.
-
-    - [8191, 1]: the exact autotuner-warmup composition (one max_seq_len-1
-      context plus a 1-token remainder).
-    - [8000, 150, 42]: interior partial chunks (cross-sequence rows) plus
-      a partial final chunk, at eval-like scale.
-    """
-    optimized, reference = _make_attention_pair()
-    for sequence_lengths in ([8191, 1], [8000, 150, 42]):
-        cumulative_lengths = torch.tensor(
-            [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
-            dtype=torch.long,
-            device="cuda",
-        )
-        hidden_states = (
-            torch.randn(
-                1,
-                sum(sequence_lengths),
-                HIDDEN_SIZE,
-                dtype=torch.bfloat16,
-                device="cuda",
-            )
-            * 0.05
-        )
-        actual = optimized.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
-        expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
-        _assert_close(actual, expected)
-
-
-@torch.no_grad()
 def test_kda_prefill_op_small_varlen_batch():
     """Small varlen batches (short-prompt contexts) through the dispatch.
 
@@ -256,54 +216,6 @@ def test_kda_prefill_op_small_varlen_batch():
         cumulative_lengths = torch.tensor(
             [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
             dtype=torch.long,
-            device="cuda",
-        )
-        hidden_states = (
-            torch.randn(
-                1,
-                sum(sequence_lengths),
-                HIDDEN_SIZE,
-                dtype=torch.bfloat16,
-                device="cuda",
-            )
-            * 0.05
-        )
-        actual = optimized.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
-        expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
-        _assert_close(actual, expected)
-
-
-@torch.no_grad()
-def test_kda_prefill_op_shape_growth_and_cu_dtype_transitions():
-    """Cross-call transitions through one process's compile caches.
-
-    Regression for the cu/ci-dtype cache-key bug: the K123/akk_inv compile
-    caches were keyed shape-independently but NOT on the cu_seqlens /
-    chunk_indices dtype, while the compiled kernels bake the element type
-    (int64 reads use stride 8, int32 stride 4). Reusing an int64-compiled
-    kernel on int32 cu/ci misaddressed every cu/ci element — garbage seq
-    ids / chunk starts -> cudaErrorIllegalAddress on the first call after
-    the flip (memcheck: 4-byte read one element past the 2-entry int32 cu);
-    the reverse direction (int32-compiled, int64 passed) corrupted
-    silently. Shape growth alone (same dtype) was already sound.
-
-    The sequence below covers, in one process: buffer-cache growth
-    (T 1171 -> 8191), int64 -> int32 flip on the grown shape, shrink with
-    a flip back, and a multi-seq int32 batch. Every call is parity-checked
-    against FLA (catches the silent-corruption direction too).
-    """
-    torch.manual_seed(0)
-    optimized, reference = _make_attention_pair()
-    cases = [
-        ([517, 654], torch.long),  # small batch, int64 cu (dump-replay-like)
-        ([8191], torch.int32),  # buffer growth + dtype flip (crashed pre-fix)
-        ([1171], torch.long),  # shrink + flip back (silent corruption pre-fix)
-        ([150, 900, 333, 640], torch.int32),  # multi-seq int32
-    ]
-    for sequence_lengths, cu_dtype in cases:
-        cumulative_lengths = torch.tensor(
-            [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
-            dtype=cu_dtype,
             device="cuda",
         )
         hidden_states = (

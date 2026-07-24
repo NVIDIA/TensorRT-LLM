@@ -547,80 +547,6 @@ def _kda_split_conv_sections(
             cs[:, 2 * d:].contiguous())
 
 
-# ---------------------------------------------------------------------------
-# DEBUG TOOLING — env-gated shadow parity for the optimized KDA kernels.
-#
-# KIMI_K3_PREFILL_SHADOW=1: after every optimized prefill call, replay the
-# SAME gathered inputs through the FLA reference dispatch and log per-batch
-# rel_l2/cos for the output and final state, with the batch signature
-# (n_seqs, seq_lens, initial-state count) whenever rel_l2 exceeds
-# KIMI_K3_SHADOW_REL_TOL (default 1e-2).
-# KIMI_K3_DECODE_SHADOW=1: same for the fused decode vs fused_recurrent_kda.
-#
-# Zero cost when the env vars are unset (a falsy module-level flag check).
-# ---------------------------------------------------------------------------
-
-_KDA_SHADOW_PREFILL = os.environ.get("KIMI_K3_PREFILL_SHADOW", "0") == "1"
-_KDA_SHADOW_DECODE = os.environ.get("KIMI_K3_DECODE_SHADOW", "0") == "1"
-_KDA_SHADOW_REL_TOL = float(os.environ.get("KIMI_K3_SHADOW_REL_TOL", "1e-2"))
-_KDA_SHADOW_MAX_WARN = 500
-# Directory for op-input dumps on catastrophic prefill divergence
-# (rel > 1e3); at most one dump per layer, max 6 total. Loadable by an
-# offline repro to replay the exact failing call.
-_KDA_SHADOW_DUMP_DIR = os.environ.get("KIMI_K3_SHADOW_DUMP_DIR", "")
-_kda_shadow_dumped_layers = set()
-_kda_shadow_ref_dispatch = None
-_kda_shadow_stats = {
-    "prefill_calls": 0,
-    "prefill_divergent": 0,
-    "prefill_max_rel": 0.0,
-    "decode_calls": 0,
-    "decode_divergent": 0,
-    "decode_max_rel": 0.0,
-    "warns": 0,
-}
-
-
-def _kda_shadow_get_ref_dispatch():
-    global _kda_shadow_ref_dispatch
-    if _kda_shadow_ref_dispatch is None:
-        from ..modules.kimi_kda._kda_kernels import KDAKernelDispatch
-        _kda_shadow_ref_dispatch = KDAKernelDispatch(
-            use_optimized_prefill=False,
-            use_optimized_decode=False,
-            use_optimized_verify=False,
-        )
-    return _kda_shadow_ref_dispatch
-
-
-def _kda_shadow_rel(actual: torch.Tensor, ref: torch.Tensor) -> Tuple[float, float]:
-    a = actual.float().flatten()
-    r = ref.float().flatten()
-    rel = ((a - r).norm() / (r.norm() + 1e-12)).item()
-    cos = torch.nn.functional.cosine_similarity(a, r, dim=0).item()
-    return rel, cos
-
-
-def _kda_shadow_report(kind: str, layer_idx: int, rel_o: float, cos_o: float,
-                       rel_s: float, cos_s: float, signature: str) -> None:
-    s = _kda_shadow_stats
-    s[f"{kind}_calls"] += 1
-    s[f"{kind}_max_rel"] = max(s[f"{kind}_max_rel"], rel_o, rel_s)
-    if max(rel_o, rel_s) > _KDA_SHADOW_REL_TOL:
-        s[f"{kind}_divergent"] += 1
-        if s["warns"] < _KDA_SHADOW_MAX_WARN:
-            s["warns"] += 1
-            logger.warning(
-                f"[KDA-SHADOW] {kind} DIVERGENT layer={layer_idx} "
-                f"rel_o={rel_o:.3e} cos_o={cos_o:.6f} rel_state={rel_s:.3e} "
-                f"cos_state={cos_s:.6f} {signature}")
-    if s[f"{kind}_calls"] % 500 == 0:
-        logger.info(
-            f"[KDA-SHADOW] {kind} summary: calls={s[f'{kind}_calls']} "
-            f"divergent={s[f'{kind}_divergent']} "
-            f"max_rel={s[f'{kind}_max_rel']:.3e}")
-
-
 class KimiKDARuntime(nn.Module):
     """Wraps the parity-tested ``KimiKDALinearAttention`` parameters with a
     cache-pool-aware forward for the executor flow.
@@ -813,67 +739,6 @@ class KimiKDARuntime(nn.Module):
             cu_seqlens=cu_seqlens,
         )
 
-        # DEBUG TOOLING (env-gated, see _KDA_SHADOW_PREFILL above): replay
-        # the same gathered inputs through the FLA reference and log
-        # divergence with the batch signature.
-        if _KDA_SHADOW_PREFILL and \
-                mixer._dispatch.prefill_kernel_path == "optimized" and \
-                not torch.cuda.is_current_stream_capturing():
-            o_ref, fs_ref = _kda_shadow_get_ref_dispatch().prefill_chunk_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=mixer.A_log,
-                dt_bias=mixer.dt_bias,
-                scale=mixer.head_k_dim**-0.5,
-                initial_state=(recurrent_in.clone()
-                               if recurrent_in is not None else None),
-                safe_gate=lower_bound is not None,
-                lower_bound=lower_bound,
-                cu_seqlens=cu_seqlens,
-            )
-            rel_o, cos_o = _kda_shadow_rel(o, o_ref)
-            rel_s, cos_s = _kda_shadow_rel(final_state, fs_ref)
-            seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-            n_init = (int(mamba_metadata.has_initial_states[:num_prefills]
-                          .sum().item())
-                      if mamba_metadata.use_initial_states else 0)
-            _kda_shadow_report(
-                "prefill", self.layer_idx, rel_o, cos_o, rel_s, cos_s,
-                f"n_seqs={len(seq_lens)} lens={seq_lens} n_init={n_init}")
-            if (_KDA_SHADOW_DUMP_DIR and max(rel_o, rel_s) > 1e3
-                    and self.layer_idx not in _kda_shadow_dumped_layers
-                    and len(_kda_shadow_dumped_layers) < 6):
-                _kda_shadow_dumped_layers.add(self.layer_idx)
-                os.makedirs(_KDA_SHADOW_DUMP_DIR, exist_ok=True)
-                rank = os.environ.get("SLURM_PROCID", "0")
-                path = os.path.join(
-                    _KDA_SHADOW_DUMP_DIR,
-                    f"kda_prefill_diverge_rank{rank}_"
-                    f"layer{self.layer_idx}.pt")
-                torch.save(
-                    {
-                        "q": q.cpu(), "k": k.cpu(), "v": v.cpu(),
-                        "g": g.cpu(), "beta": beta.cpu(),
-                        "A_log": mixer.A_log.detach().cpu(),
-                        "dt_bias": mixer.dt_bias.detach().cpu(),
-                        "scale": mixer.head_k_dim**-0.5,
-                        "lower_bound": lower_bound,
-                        "cu_seqlens": cu_seqlens.cpu(),
-                        "initial_state": (recurrent_in.cpu()
-                                          if recurrent_in is not None
-                                          else None),
-                        "o_opt": o.cpu(), "o_ref": o_ref.cpu(),
-                        "fs_opt": final_state.cpu(),
-                        "fs_ref": fs_ref.cpu(),
-                        "layer_idx": self.layer_idx,
-                        "rel_o": rel_o, "rel_state": rel_s,
-                    }, path)
-                logger.warning(
-                    f"[KDA-SHADOW] dumped failing inputs: {path}")
-
         # Persist per-request states into the pools.
         conv_pool.index_copy_(
             0, slot_indices,
@@ -903,34 +768,7 @@ class KimiKDARuntime(nn.Module):
             conv_state_v=conv_v,
             recurrent_state=ssm_pool.index_select(0, slot_indices),
         )
-
-        # DEBUG TOOLING (env-gated, see _KDA_SHADOW_DECODE above): snapshot
-        # the cache BEFORE the optimized call (which may update state
-        # in place) so the FLA reference consumes identical inputs. Never
-        # under CUDA-graph capture — the comparison's .item() syncs
-        # invalidate the capture (cudaErrorStreamCaptureInvalidated at
-        # executor warmup); disable cuda_graph_config in the shadow eval to
-        # cover every decode step instead.
-        shadow_cache = None
-        if _KDA_SHADOW_DECODE and mixer.decode_kernel_path == "optimized" \
-                and not torch.cuda.is_current_stream_capturing():
-            shadow_cache = KimiKDACachedState(
-                conv_state_q=conv_q.clone(),
-                conv_state_k=conv_k.clone(),
-                conv_state_v=conv_v.clone(),
-                recurrent_state=cache.recurrent_state.clone(),
-            )
-
         out, new_cache = mixer.forward_decode(x, cache)
-
-        if shadow_cache is not None:
-            out_ref, ref_cache = mixer._decode_via_fla(
-                x, shadow_cache, x.shape[0])
-            rel_o, cos_o = _kda_shadow_rel(out, out_ref)
-            rel_s, cos_s = _kda_shadow_rel(new_cache.recurrent_state,
-                                           ref_cache.recurrent_state)
-            _kda_shadow_report("decode", self.layer_idx, rel_o, cos_o,
-                               rel_s, cos_s, f"batch={x.shape[0]}")
 
         conv_pool.index_copy_(
             0,
