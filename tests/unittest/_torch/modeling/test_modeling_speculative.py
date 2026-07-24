@@ -24,7 +24,9 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_speculative import (
-    Eagle3ForCausalLM, SpecDecOneEngineForCausalLM)
+    Eagle3ForCausalLM,
+    SpecDecOneEngineForCausalLM,
+)
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
 
@@ -155,17 +157,16 @@ def test_apply_eagle3_fc_with_fc_norm(num_capture_layers):
 # SpecDecOneEngineForCausalLM: optional hidden_size / vocab_size
 # ---------------------------------------------------------------------------
 
-_SUPER_PATH = (
-    "tensorrt_llm._torch.models.modeling_utils.DecoderModelForCausalLM.__init__"
-)
+_SUPER_PATH = "tensorrt_llm._torch.models.modeling_utils.DecoderModelForCausalLM.__init__"
 
 
 def test_specdec_one_engine_reads_from_pretrained_config() -> None:
     """Default path: hidden_size/vocab_size come from pretrained_config."""
     hidden_size = 4096
     vocab_size = 32000
-    model_config = ModelConfig(pretrained_config=PretrainedConfig(
-        hidden_size=hidden_size, vocab_size=vocab_size))
+    model_config = ModelConfig(
+        pretrained_config=PretrainedConfig(hidden_size=hidden_size, vocab_size=vocab_size)
+    )
 
     with patch(_SUPER_PATH, return_value=None) as mock_super:
         SpecDecOneEngineForCausalLM(MagicMock(), model_config)
@@ -184,10 +185,9 @@ def test_specdec_one_engine_accepts_explicit_sizes() -> None:
     model_config = ModelConfig(pretrained_config=PretrainedConfig())
 
     with patch(_SUPER_PATH, return_value=None) as mock_super:
-        SpecDecOneEngineForCausalLM(MagicMock(),
-                                    model_config,
-                                    hidden_size=hidden_size,
-                                    vocab_size=vocab_size)
+        SpecDecOneEngineForCausalLM(
+            MagicMock(), model_config, hidden_size=hidden_size, vocab_size=vocab_size
+        )
 
     _, kwargs = mock_super.call_args
     assert kwargs["hidden_size"] == hidden_size
@@ -198,14 +198,14 @@ def test_specdec_one_engine_explicit_overrides_pretrained_config() -> None:
     """Explicit args take precedence over pretrained_config when both present."""
     hidden_size = 2048
     vocab_size = 64000
-    model_config = ModelConfig(pretrained_config=PretrainedConfig(
-        hidden_size=4096, vocab_size=32000))
+    model_config = ModelConfig(
+        pretrained_config=PretrainedConfig(hidden_size=4096, vocab_size=32000)
+    )
 
     with patch(_SUPER_PATH, return_value=None) as mock_super:
-        SpecDecOneEngineForCausalLM(MagicMock(),
-                                    model_config,
-                                    hidden_size=hidden_size,
-                                    vocab_size=vocab_size)
+        SpecDecOneEngineForCausalLM(
+            MagicMock(), model_config, hidden_size=hidden_size, vocab_size=vocab_size
+        )
 
     _, kwargs = mock_super.call_args
     assert kwargs["hidden_size"] == hidden_size
