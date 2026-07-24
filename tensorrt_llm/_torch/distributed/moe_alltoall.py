@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 MoE All-to-All Operations
 
@@ -276,6 +290,61 @@ class MoeAlltoAll:
         if not sys.is_finalizing():
             self.destroy()
 
+    def _require_mapped(self) -> None:
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError(
+                "Native MoE All-to-All workspace handles are unmapped")
+
+    def checkpoint_prepare(self) -> None:
+        """Collectively detach handles after the caller globally quiesces all owners.
+
+        The local phase and watchdog checks are defense-in-depth only; they do
+        not prove that every wrapper sharing this workspace is quiescent.
+        """
+        if self._state.phase != "idle":
+            raise RuntimeError(
+                "Cannot checkpoint during an active MoE All-to-All phase")
+        if self._alltoall_watchdog is not None:
+            raise RuntimeError(
+                "Checkpointing native MoE All-to-All with the watchdog enabled "
+                "is not supported")
+        self.mnnvl_mem.checkpoint_prepare()
+
+    def checkpoint_restore(self, comm) -> None:
+        """Collectively restore handles after caller-proven global quiescence.
+
+        The low-level remap is idempotent, so every shared owner may call this
+        method to reset its own protocol state.
+        """
+        self.mnnvl_mem.checkpoint_restore(comm)
+        refreshed_metainfo = torch.ops.trtllm.moe_a2a_initialize(
+            self.workspace,
+            self.ep_rank,
+            self.ep_size,
+            self.max_num_tokens,
+            self.eplb_stats_num_experts,
+        )
+        if not torch.equal(refreshed_metainfo, self.metainfo):
+            raise RuntimeError(
+                "MoE All-to-All metainfo changed during MNNVL restore; "
+                "captured CUDA graphs cannot be replayed safely")
+        self.metainfo = refreshed_metainfo
+        assert self._WORKSPACE is not None
+        self._WORKSPACE["metainfo"] = refreshed_metainfo
+        metainfo_index = self._METAINFO_INDEX
+        assert metainfo_index is not None
+        self._watchdog_coordinator = AlltoAllWatchdogCoordinator(
+            workspace_state=self._WORKSPACE,
+            workspace=self.workspace,
+            metainfo=refreshed_metainfo,
+            metainfo_index=metainfo_index,
+            ep_rank=self.ep_rank,
+            health=self.ep_group_health,
+        )
+        torch.cuda.synchronize()
+        comm.barrier()
+        self.reset_state()
+
     def dispatch(self,
                  token_selected_experts: torch.Tensor,
                  input_payloads: list[torch.Tensor],
@@ -302,6 +371,7 @@ class MoeAlltoAll:
         Returns:
             recv_tensors: List of tensors received, each has shape [ep_size, max_tokens_per_rank, payload_num_elements_per_token]
         """
+        self._require_mapped()
         assert self._state.phase == "idle", "dispatch called twice without an intervening combine"
         reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
@@ -385,6 +455,7 @@ class MoeAlltoAll:
         Returns:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
         """
+        self._require_mapped()
         assert self._state.phase == "dispatched", "combine called before a successful dispatch"
         reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
@@ -429,6 +500,7 @@ class MoeAlltoAll:
         Return the combine payload tensor in the workspace, which could be used as the output of MoE kernel to avoid extra copy.
         See "payload_in_workspace" in combine method.
         """
+        self._require_mapped()
         if self._state.phase != "dispatched":
             raise RuntimeError(
                 "get_combine_payload_tensor_in_workspace called before a successful dispatch"
