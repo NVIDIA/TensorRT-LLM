@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -192,10 +192,11 @@ __device__ __forceinline__ PackedType add128(PackedType const& a, PackedType con
     return c;
 }
 
-template <AllReduceFusionPattern Pattern, typename DType>
+template <AllReduceFusionPattern Pattern, typename DType, bool UseParallelClusterReduce>
 class FusedOp
 {
     static constexpr int kMathCount = sizeof(float4) / sizeof(DType);
+    static constexpr int kMaxClusterSize = 8;
 
 public:
     __device__ __forceinline__ FusedOp(AllReduceFusionParams const& params, int access_id, int access_id_in_token)
@@ -288,7 +289,7 @@ public:
 protected:
     __device__ __forceinline__ float4 rms_norm(float4 const& residual, float4 const& gamma)
     {
-        __shared__ float s_val;
+        __shared__ float scale;
         float4 norm_out;
         float acc = 0.f;
 #pragma unroll
@@ -302,32 +303,58 @@ protected:
         cg::cluster_group cluster = cg::this_cluster();
         if (cluster.num_blocks() > 1)
         {
-            if (threadIdx.x == 0)
+            if constexpr (UseParallelClusterReduce)
             {
-                s_val = acc;
-                acc = 0.f;
-            }
-            cluster.sync();
-            if (threadIdx.x == 0)
-            {
-                for (int i = 0; i < cluster.num_blocks(); ++i)
+                __shared__ float blockAcc[kMaxClusterSize];
+                int const blockRank = cluster.block_rank();
+                int const blockNum = cluster.num_blocks();
+                // DSM access requires every block in the cluster to exist concurrently.
+                cluster.sync();
+                // blockReduceSumV2 broadcasts the block total to every lane in warp 0.
+                if (threadIdx.x < blockNum)
                 {
-                    acc += *cluster.map_shared_rank(&s_val, i);
+                    cluster.map_shared_rank(&blockAcc[0], threadIdx.x)[blockRank] = acc;
+                }
+                // Complete remote stores before any destination block can exit.
+                cluster.sync();
+                if (threadIdx.x == 0)
+                {
+                    acc = 0.f;
+                    for (int i = 0; i < blockNum; ++i)
+                    {
+                        acc += blockAcc[i];
+                    }
                 }
             }
-            cluster.sync();
+            else
+            {
+                if (threadIdx.x == 0)
+                {
+                    scale = acc;
+                    acc = 0.f;
+                }
+                cluster.sync();
+                if (threadIdx.x == 0)
+                {
+                    for (int i = 0; i < cluster.num_blocks(); ++i)
+                    {
+                        acc += *cluster.map_shared_rank(&scale, i);
+                    }
+                }
+                cluster.sync();
+            }
         }
 #endif
         if (threadIdx.x == 0)
         {
-            s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
+            scale = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
         }
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < kMathCount; ++i)
         {
             reinterpret_cast<DType*>(&norm_out)[i]
-                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * s_val
+                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * scale
                     * static_cast<float>(reinterpret_cast<DType const*>(&gamma)[i]));
         }
         return norm_out;
@@ -455,7 +482,7 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
     int access_stride = index_helper.access_stride;
     int tot_access = index_helper.tot_access;
     float4 clear_vec = get_neg_zero();
-    FusedOp<Pattern, DType> fused_op(params, access_id, access_id_in_token);
+    FusedOp<Pattern, DType, false> fused_op(params, access_id, access_id_in_token);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
@@ -535,7 +562,7 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_twoshot_sync(
     int access_id = index_helper.access_id;
     int access_stride = index_helper.access_stride;
     int tot_access = index_helper.tot_access;
-    FusedOp<Pattern, DType> fused_op(params, access_id, access_id_in_token);
+    FusedOp<Pattern, DType, true> fused_op(params, access_id, access_id_in_token);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
