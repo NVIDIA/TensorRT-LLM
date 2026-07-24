@@ -1,5 +1,17 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -496,3 +508,19 @@ def test_per_conversation_policy_ignores_overlapping_request(
         _free_if_active(manager, request_old_prompt)
         _free_if_active(manager, request_b)
         _free_if_active(manager, request_a)
+
+
+def test_disagg_role_mapper_kinds_default_to_indexed():
+    from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+
+    manager = object.__new__(KVCacheManagerV2)
+
+    # K/V default to the TRTLLM head-major layout; the index-key side cache
+    # defaults to REPLICATED (every shipped index-K — DSA V1, MiniMax M3 —
+    # is TP-replicated). The INDEX_KEY entry is inert unless a subclass
+    # registers such buffers.
+    assert manager.get_disagg_role_mapper_kinds() == {
+        Role.ALL: MapperKind.INDEXED,
+        Role.INDEX_KEY: MapperKind.REPLICATED,
+    }

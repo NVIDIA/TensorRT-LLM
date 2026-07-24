@@ -250,6 +250,7 @@ def make_deepseek_v4_sparse_metadata_params(
         ),
         enable_indexer_skip=sparse_attention_config.skip_indexer_for_short_seqs,
         enable_heuristic_topk=sparse_attention_config.enable_heuristic_topk,
+        use_cute_dsl_topk=sparse_attention_config.use_cute_dsl_topk,
         use_cute_dsl_paged_mqa_logits=(sparse_attention_config.use_cute_dsl_paged_mqa_logits),
         q_split_threshold=sparse_attention_config.q_split_threshold,
         compress_ratios=sparse_attention_config.compress_ratios,
