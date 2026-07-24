@@ -5045,11 +5045,6 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 2, 4, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 3, 4, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 4, 4, 4],
-        // Split bumped 2 -> 3 in the gen_only/ctx_only follow-up: the 4 DeepSeek-V4-Pro
-        // ctx_only tests were added here (8 -> 12 active), and #16540 deferred them due to
-        // a cross-test cleanup OOM cascade on a shared stage (con4301 ctx_only passed in
-        // isolation). A third shard keeps ~4 tests/shard so the heavyweight DSv4-Pro
-        // ctx_only cases get more per-node isolation rather than accumulating with 5 peers.
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 3, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 3, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 3, 4],
@@ -5232,10 +5227,6 @@ def launchTestJobs(pipeline, testFilter)
         36,
         9
     )
-    // GB300 DeepSeek-V4-Pro disaggregated (4 shapes: single-user latency +
-    // throughput sweep). Each yaml is registered with two active tests
-    // (gen_only + e2e), so testCount=2 per shape. The gen_only variants were
-    // enabled in a follow-up PR after gen_only runtime characterization.
     // 9 Nodes: ctx1 (1 node, 4 GPUs) + gen4 (2 nodes, 8 GPUs each) = 36 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-Post-Merge",
