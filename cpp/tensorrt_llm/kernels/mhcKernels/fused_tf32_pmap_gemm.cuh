@@ -99,63 +99,53 @@ __device__ __forceinline__ uint32_t get_swizzled_smem_offset(uint32_t const& off
     return row * 128 + col * kSwizzleBase;
 }
 
-__device__ __forceinline__ uint64_t float2ToBits(float2 const& value)
+// Packed fp32x2 helpers (sm_100 f32x2 ALU). Per-lane IEEE fp32, identical
+// numerics to scalar fmaf/mul chains, at half the instruction count.
+__device__ __forceinline__ unsigned long long mhc_f2ll(float2 v)
 {
-    return *reinterpret_cast<uint64_t const*>(&value);
+    unsigned long long r;
+    memcpy(&r, &v, sizeof(r));
+    return r;
 }
 
-__device__ __forceinline__ float2 bitsToFloat2(uint64_t const value)
+__device__ __forceinline__ float2 mhc_ll2f(unsigned long long v)
 {
-    return *reinterpret_cast<float2 const*>(&value);
+    float2 r;
+    memcpy(&r, &v, sizeof(r));
+    return r;
 }
 
-__device__ __forceinline__ float2 multiplyFloat2(float const scalar, float2 const value)
+__device__ __forceinline__ float2 mhc_mul2(float a, float2 b)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
-    uint64_t result;
-    float2 const scalar2{scalar, scalar};
-    asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(result) : "l"(float2ToBits(scalar2)), "l"(float2ToBits(value)));
-    return bitsToFloat2(result);
+    unsigned long long d;
+    asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(d) : "l"(mhc_f2ll(float2{a, a})), "l"(mhc_f2ll(b)));
+    return mhc_ll2f(d);
 #else
-    return float2{scalar * value.x, scalar * value.y};
+    return float2{a * b.x, a * b.y};
 #endif
 }
 
-__device__ __forceinline__ float2 fmaFloat2(float const scalar, float2 const value, float2 const accumulator)
+__device__ __forceinline__ float2 mhc_fma2(float a, float2 b, float2 c)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
-    uint64_t result;
-    float2 const scalar2{scalar, scalar};
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(result)
-        : "l"(float2ToBits(scalar2)), "l"(float2ToBits(value)), "l"(float2ToBits(accumulator)));
-    return bitsToFloat2(result);
+    unsigned long long d;
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(d) : "l"(mhc_f2ll(float2{a, a})), "l"(mhc_f2ll(b)), "l"(mhc_f2ll(c)));
+    return mhc_ll2f(d);
 #else
-    return float2{fmaf(scalar, value.x, accumulator.x), fmaf(scalar, value.y, accumulator.y)};
+    return float2{fmaf(a, b.x, c.x), fmaf(a, b.y, c.y)};
 #endif
 }
 
-__device__ __forceinline__ float2 fmaFloat2(float2 const lhs, float2 const rhs, float2 const accumulator)
+__device__ __forceinline__ float2 mhc_fma2v(float2 a, float2 b, float2 c)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
-    uint64_t result;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(result)
-        : "l"(float2ToBits(lhs)), "l"(float2ToBits(rhs)), "l"(float2ToBits(accumulator)));
-    return bitsToFloat2(result);
+    unsigned long long d;
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(d) : "l"(mhc_f2ll(a)), "l"(mhc_f2ll(b)), "l"(mhc_f2ll(c)));
+    return mhc_ll2f(d);
 #else
-    return float2{fmaf(lhs.x, rhs.x, accumulator.x), fmaf(lhs.y, rhs.y, accumulator.y)};
+    return float2{fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y)};
 #endif
-}
-
-__device__ __forceinline__ float4 loadCoefficientRow(
-    float const* base, uint32_t const row, uint32_t const rowStride, uint32_t const vectorIndex, bool const valid)
-{
-    if (!valid)
-    {
-        return float4{0.0F, 0.0F, 0.0F, 0.0F};
-    }
-    return __ldg(reinterpret_cast<float4 const*>(base + row * rowStride) + vectorIndex);
 }
 
 __device__ __forceinline__ void stsm_x4_b16_rout(void* smem_dst, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
@@ -237,7 +227,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     auto smem_x_stg = PatternVisitor(
         [&, base = cursor](uint32_t const& i) { return reinterpret_cast<nv_bfloat16*>(base + i * SMEM_X_PER_ISTG); });
     cursor += N_INPUT_STAGES * SMEM_X_PER_ISTG;
-    cursor += SMEM_POST_SIZE + SMEM_COMB_SIZE;
+    auto smem_post = reinterpret_cast<float*>(cursor);
+    cursor += SMEM_POST_SIZE;
+    auto smem_comb = reinterpret_cast<float*>(cursor);
+    cursor += SMEM_COMB_SIZE;
     auto smem_rc = reinterpret_cast<nv_bfloat16*>(cursor); // [HC_MULT][BLOCK_M][BLOCK_K] bf16, single-buffered
     cursor += SMEM_RC_SIZE;
 
@@ -293,6 +286,9 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     const uint32_t h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
     constexpr uint32_t num_total_stages = H_TILES_PER_SPLIT * HC_MULT;
 
+    // Prologue removed: pmap threads load their own post_mix/comb_mix rows
+    // directly into registers below, so the MMA/TMA warps never wait on those
+    // global loads and the TMA pipeline starts immediately.
     if (warp_idx < kNumMMAThreads / 32)
     {
         // ----- TMA warp (warp 0) -----
@@ -441,25 +437,29 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         float pm_u[HC_MULT], pm_l[HC_MULT];
         float cm_u[HC_MULT][HC_MULT], cm_l[HC_MULT][HC_MULT];
         {
-            static_assert(HC_MULT == 4, "float4 row loads require HC_MULT == 4");
-            uint32_t const globalUpperRow = m_offset + upper_row;
-            uint32_t const globalLowerRow = m_offset + lower_row;
-            bool const upperRowValid = globalUpperRow < shape_m;
-            bool const lowerRowValid = globalLowerRow < shape_m;
-            *reinterpret_cast<float4*>(pm_u) = loadCoefficientRow(post_mix, globalUpperRow, HC_MULT, 0, upperRowValid);
-            *reinterpret_cast<float4*>(pm_l) = loadCoefficientRow(post_mix, globalLowerRow, HC_MULT, 0, lowerRowValid);
+            static_assert(HC_MULT == 4, "float4 row loads assume HC_MULT == 4");
+            const uint32_t gm_u = m_offset + upper_row;
+            const uint32_t gm_l = m_offset + lower_row;
+            auto load_row4 = [](float const* base, uint32_t row, uint32_t row_floats, uint32_t vec_idx,
+                                 bool valid) -> float4
+            {
+                if (!valid)
+                    return float4{0.f, 0.f, 0.f, 0.f};
+                return __ldg(reinterpret_cast<float4 const*>(base + row * row_floats) + vec_idx);
+            };
+            const bool valid_u = gm_u < shape_m;
+            const bool valid_l = gm_l < shape_m;
+            *reinterpret_cast<float4*>(pm_u) = load_row4(post_mix, gm_u, HC_MULT, 0, valid_u);
+            *reinterpret_cast<float4*>(pm_l) = load_row4(post_mix, gm_l, HC_MULT, 0, valid_l);
 #pragma unroll
             for (uint32_t j = 0; j < HC_MULT; ++j)
             {
-                *reinterpret_cast<float4*>(cm_u[j])
-                    = loadCoefficientRow(comb_mix, globalUpperRow, HC_MULT * HC_MULT, j, upperRowValid);
-                *reinterpret_cast<float4*>(cm_l[j])
-                    = loadCoefficientRow(comb_mix, globalLowerRow, HC_MULT * HC_MULT, j, lowerRowValid);
+                *reinterpret_cast<float4*>(cm_u[j]) = load_row4(comb_mix, gm_u, HC_MULT * HC_MULT, j, valid_u);
+                *reinterpret_cast<float4*>(cm_l[j]) = load_row4(comb_mix, gm_l, HC_MULT * HC_MULT, j, valid_l);
             }
         }
 
-        float2 squareSumUpper{0.0F, 0.0F};
-        float2 squareSumLower{0.0F, 0.0F};
+        float2 sqr2_u{0.f, 0.f}, sqr2_l{0.f, 0.f};
         constexpr uint32_t kNumBankGroupBytes = 16;
         constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(nv_bfloat16);
         constexpr uint32_t kNumLoads = BLOCK_K / kNumElemsPerBankGroup;
@@ -518,16 +518,21 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                 empty_input[i_stage]->arrive();
             }
 
-            // All four cast stages share the same phase at a tile boundary.
-            static_assert(kNumCastStages == HC_MULT, "The tile-batched cast protocol requires one stage per HC");
+            // ---- tile-batched f32x2 post-mapping ----
+            // s is a multiple of kNumCastStages at tile start and all four cast
+            // stages share one phase parity, so claim them all up front, then
+            // process column pairs with hc innermost: residual bf16->f32
+            // conversion happens once per (j, column) instead of once per
+            // (j, column, hc).
+            static_assert(kNumCastStages == HC_MULT, "tile-batched cast protocol expects one stage per hc");
 #pragma unroll
-            for (uint32_t castStage = 0; castStage < kNumCastStages; ++castStage)
+            for (uint32_t c = 0; c < kNumCastStages; ++c)
             {
-                empty_cast[castStage]->wait(((s / kNumCastStages) & 1) ^ 1);
+                empty_cast[c]->wait(((s / kNumCastStages) & 1) ^ 1);
             }
 
-            // smem_rc is single-buffered, so the previous tile's stores must
-            // complete before this tile overwrites it.
+            // smem_rc is single-buffered: previous tile's residual_cur TMA
+            // stores must drain before this tile overwrites it.
             if (ht > 0)
             {
                 cute::tma_store_wait<0>();
@@ -536,71 +541,64 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 #pragma unroll
             for (uint32_t i = 0; i < kNumLoads; i += 2)
             {
-                float2 residualUpper[HC_MULT][2];
-                float2 residualLower[HC_MULT][2];
+                float2 r_u[HC_MULT][2], r_l[HC_MULT][2];
 #pragma unroll
                 for (uint32_t j = 0; j < HC_MULT; ++j)
                 {
-                    residualUpper[j][0] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][0][i]));
-                    residualUpper[j][1] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][0][i + 1]));
-                    residualLower[j][0] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][1][i]));
-                    residualLower[j][1] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][1][i + 1]));
+                    r_u[j][0] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][0][i + 0]));
+                    r_u[j][1] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][0][i + 1]));
+                    r_l[j][0] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][1][i + 0]));
+                    r_l[j][1] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][1][i + 1]));
                 }
 #pragma unroll
                 for (uint32_t hc = 0; hc < HC_MULT; ++hc)
                 {
-                    float2 newUpper0 = multiplyFloat2(pm_u[hc], xf[0][i]);
-                    float2 newUpper1 = multiplyFloat2(pm_u[hc], xf[0][i + 1]);
-                    float2 newLower0 = multiplyFloat2(pm_l[hc], xf[1][i]);
-                    float2 newLower1 = multiplyFloat2(pm_l[hc], xf[1][i + 1]);
+                    float2 nu0 = mhc_mul2(pm_u[hc], xf[0][i + 0]);
+                    float2 nu1 = mhc_mul2(pm_u[hc], xf[0][i + 1]);
+                    float2 nl0 = mhc_mul2(pm_l[hc], xf[1][i + 0]);
+                    float2 nl1 = mhc_mul2(pm_l[hc], xf[1][i + 1]);
 #pragma unroll
                     for (uint32_t j = 0; j < HC_MULT; ++j)
                     {
-                        newUpper0 = fmaFloat2(cm_u[j][hc], residualUpper[j][0], newUpper0);
-                        newUpper1 = fmaFloat2(cm_u[j][hc], residualUpper[j][1], newUpper1);
-                        newLower0 = fmaFloat2(cm_l[j][hc], residualLower[j][0], newLower0);
-                        newLower1 = fmaFloat2(cm_l[j][hc], residualLower[j][1], newLower1);
+                        nu0 = mhc_fma2(cm_u[j][hc], r_u[j][0], nu0);
+                        nu1 = mhc_fma2(cm_u[j][hc], r_u[j][1], nu1);
+                        nl0 = mhc_fma2(cm_l[j][hc], r_l[j][0], nl0);
+                        nl1 = mhc_fma2(cm_l[j][hc], r_l[j][1], nl1);
                     }
-
-                    nv_bfloat162 const bf16Upper0 = __float22bfloat162_rn(newUpper0);
-                    nv_bfloat162 const bf16Upper1 = __float22bfloat162_rn(newUpper1);
-                    nv_bfloat162 const bf16Lower0 = __float22bfloat162_rn(newLower0);
-                    nv_bfloat162 const bf16Lower1 = __float22bfloat162_rn(newLower1);
-                    float2 const roundedUpper0 = __bfloat1622float2(bf16Upper0);
-                    float2 const roundedUpper1 = __bfloat1622float2(bf16Upper1);
-                    float2 const roundedLower0 = __bfloat1622float2(bf16Lower0);
-                    float2 const roundedLower1 = __bfloat1622float2(bf16Lower1);
-                    squareSumUpper = fmaFloat2(roundedUpper0, roundedUpper0, squareSumUpper);
-                    squareSumUpper = fmaFloat2(roundedUpper1, roundedUpper1, squareSumUpper);
-                    squareSumLower = fmaFloat2(roundedLower0, roundedLower0, squareSumLower);
-                    squareSumLower = fmaFloat2(roundedLower1, roundedLower1, squareSumLower);
-
-                    cute::SM100_TMEM_STORE_16dp256b1x::copy(*reinterpret_cast<uint32_t const*>(&roundedUpper0.x),
-                        *reinterpret_cast<uint32_t const*>(&roundedUpper0.y),
-                        *reinterpret_cast<uint32_t const*>(&roundedLower0.x),
-                        *reinterpret_cast<uint32_t const*>(&roundedLower0.y), hc * BLOCK_K + i * 8);
-                    cute::SM100_TMEM_STORE_16dp256b1x::copy(*reinterpret_cast<uint32_t const*>(&roundedUpper1.x),
-                        *reinterpret_cast<uint32_t const*>(&roundedUpper1.y),
-                        *reinterpret_cast<uint32_t const*>(&roundedLower1.x),
-                        *reinterpret_cast<uint32_t const*>(&roundedLower1.y), hc * BLOCK_K + (i + 1) * 8);
+                    nv_bfloat162 b_u0 = __float22bfloat162_rn(nu0);
+                    nv_bfloat162 b_u1 = __float22bfloat162_rn(nu1);
+                    nv_bfloat162 b_l0 = __float22bfloat162_rn(nl0);
+                    nv_bfloat162 b_l1 = __float22bfloat162_rn(nl1);
+                    float2 ru0 = __bfloat1622float2(b_u0);
+                    float2 ru1 = __bfloat1622float2(b_u1);
+                    float2 rl0 = __bfloat1622float2(b_l0);
+                    float2 rl1 = __bfloat1622float2(b_l1);
+                    sqr2_u = mhc_fma2v(ru0, ru0, sqr2_u);
+                    sqr2_u = mhc_fma2v(ru1, ru1, sqr2_u);
+                    sqr2_l = mhc_fma2v(rl0, rl0, sqr2_l);
+                    sqr2_l = mhc_fma2v(rl1, rl1, sqr2_l);
+                    cute::SM100_TMEM_STORE_16dp256b1x::copy(*reinterpret_cast<uint32_t*>(&ru0.x),
+                        *reinterpret_cast<uint32_t*>(&ru0.y), *reinterpret_cast<uint32_t*>(&rl0.x),
+                        *reinterpret_cast<uint32_t*>(&rl0.y), hc * BLOCK_K + (i + 0) * 8);
+                    cute::SM100_TMEM_STORE_16dp256b1x::copy(*reinterpret_cast<uint32_t*>(&ru1.x),
+                        *reinterpret_cast<uint32_t*>(&ru1.y), *reinterpret_cast<uint32_t*>(&rl1.x),
+                        *reinterpret_cast<uint32_t*>(&rl1.y), hc * BLOCK_K + (i + 1) * 8);
 
                     uint8_t* rc_base = reinterpret_cast<uint8_t*>(smem_rc) + hc * SMEM_RC_PER_HC
                         + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleRoutMode;
                     auto smem_ptr
                         = rc_base + get_swizzled_smem_offset<kSwizzleRoutMode>(i + lane_idx / 16, lane_idx % 16);
-                    stsm_x4_b16_rout(smem_ptr, *reinterpret_cast<uint32_t const*>(&bf16Upper0),
-                        *reinterpret_cast<uint32_t const*>(&bf16Lower0),
-                        *reinterpret_cast<uint32_t const*>(&bf16Upper1),
-                        *reinterpret_cast<uint32_t const*>(&bf16Lower1));
+                    stsm_x4_b16_rout(smem_ptr, *reinterpret_cast<uint32_t*>(&b_u0), *reinterpret_cast<uint32_t*>(&b_l0),
+                        *reinterpret_cast<uint32_t*>(&b_u1), *reinterpret_cast<uint32_t*>(&b_l1));
                 }
             }
 
             cutlass::arch::fence_view_async_tmem_store();
             tcgen05_before_thread_sync();
 #pragma unroll
-            for (uint32_t castStage = 0; castStage < kNumCastStages; ++castStage)
+            for (uint32_t c = 0; c < kNumCastStages; ++c)
             {
-                full_cast[castStage]->arrive();
+                full_cast[c]->arrive();
             }
             s += kNumCastStages;
 
@@ -629,8 +627,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         cute::tma_store_wait<0>();
 
         // Warp-reduce sqr across 4 col_lanes then atomicAdd to global.
-        float sqr_u = squareSumUpper.x + squareSumUpper.y;
-        float sqr_l = squareSumLower.x + squareSumLower.y;
+        float sqr_u = sqr2_u.x + sqr2_u.y;
+        float sqr_l = sqr2_l.x + sqr2_l.y;
         sqr_u += __shfl_xor_sync(0xffffffff, sqr_u, 1);
         sqr_u += __shfl_xor_sync(0xffffffff, sqr_u, 2);
         sqr_l += __shfl_xor_sync(0xffffffff, sqr_l, 1);
