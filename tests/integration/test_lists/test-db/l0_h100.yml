@@ -109,6 +109,7 @@ l0_h100:
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_dsa_indexer
   - unittest/disaggregated/test_cache_transceiver_harness_report.py
   - unittest/disaggregated/test_cache_transceiver_harness.py
+  - unittest/disaggregated/test_cache_transceiver_precheck_e2e.py
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
   - unittest/llmapi/test_llm_telemetry.py

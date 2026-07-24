@@ -6,9 +6,24 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime
 
 import yaml
+
+
+def _import_precheck_config(llm_src):
+    """Import the pure-stdlib precheck config module from the repo tree.
+
+    It is the single owner of the gate's enable policy and timeout formulas.
+    """
+    path = os.path.join(llm_src, "tests", "scripts", "perf-sanity", "cache_transceiver_precheck")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import precheck_config
+
+    return precheck_config
+
 
 AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
 DISAGG_CONFIG_FOLDER = os.environ.get(
@@ -890,6 +905,24 @@ def main():
             ]
         )
 
+        # Cache-transceiver network precheck (same wiring as jenkins/scripts/
+        # perf/submit.py): reuses the exact ucx_tls_cmd + worker env strings
+        # of the real worker steps; enable policy and timeouts come from
+        # precheck_config (single owner).
+        pcfg = _import_precheck_config(llm_src)
+        script_prefix_lines.extend(
+            pcfg.precheck_prefix_lines(
+                config,
+                benchmark_mode,
+                config_path_expr="$configYamlPath",
+                ucx_tls_cmd=ucx_tls_cmd,
+                max_world=max(
+                    hardware_config.get("gpus_per_ctx_server", 0) or 0,
+                    hardware_config.get("gpus_per_gen_server", 0) or 0,
+                ),
+            )
+        )
+
         # Add srun args for disagg
         srun_args_lines.extend(
             [
@@ -986,9 +1019,15 @@ def main():
     draft_launch_lines = remove_whitespace_lines(draft_launch_lines)
     draft_launch_content = "\n".join(draft_launch_lines)
 
+    # The disagg draft calls run_cache_transceiver_precheck; splice in the gate
+    # function library ahead of it (single owner: precheck_config).
+    gate_content = ""
+    if runtime_mode == "disaggregated":
+        gate_content = pcfg.gate_library_content(draft_launch_sh, llm_src)
+
     # Combine and write launch script
     script_prefix = "\n".join(script_prefix_lines)
-    final_script = f"{script_prefix}\n\n{srun_args}\n\n{draft_launch_content}"
+    final_script = f"{script_prefix}\n\n{srun_args}\n\n{gate_content}{draft_launch_content}"
 
     with open(launch_sh, "w") as f:
         f.write(final_script)
