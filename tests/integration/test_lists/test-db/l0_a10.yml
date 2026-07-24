@@ -72,6 +72,7 @@ l0_a10:
   - unittest/disaggregated/test_cluster_storage.py
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_peer.py
+  - unittest/disaggregated/test_cache_reuse_adapter.py
   - unittest/disaggregated/test_bounce.py
   - unittest/disaggregated/region/test_block.py
   - unittest/disaggregated/test_mamba_transfer.py
@@ -104,6 +105,8 @@ l0_a10:
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer[False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer_missing_blocks[False-TinyLlama-1.1B-Chat-v1.0]
   - test_e2e.py::test_get_ci_container_port
   - test_e2e.py::test_openai_chat_multimodal_example ISOLATION
   - test_e2e.py::test_openai_mmencoder_example

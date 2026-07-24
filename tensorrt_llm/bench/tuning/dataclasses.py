@@ -1,40 +1,42 @@
-from typing import Optional, Literal
-from pydantic import AliasPath, BaseModel, Field, AliasChoices, model_validator
+import json
+import os
+import struct
+from typing import Literal, Optional
+
 import huggingface_hub
 from huggingface_hub.constants import (
     SAFETENSORS_INDEX_FILE,
     SAFETENSORS_MAX_HEADER_LENGTH,
     SAFETENSORS_SINGLE_FILE,
 )
-from huggingface_hub.utils import SafetensorsRepoMetadata, SafetensorsFileMetadata, TensorInfo
+from huggingface_hub.utils import SafetensorsFileMetadata, SafetensorsRepoMetadata, TensorInfo
 from huggingface_hub.utils import tqdm as hf_tqdm
+from pydantic import AliasChoices, AliasPath, BaseModel, Field, model_validator
 from tqdm.contrib.concurrent import thread_map
-import os
-import json
-import struct
 
 from tensorrt_llm._torch.pyexecutor.config_utils import (
-    load_pretrained_config, get_qwen3_hybrid_layer_types)
+    get_qwen3_hybrid_layer_types,
+    load_pretrained_config,
+)
 
 # Mapping from safetensors dtype strings to bytes per element.
 # Used to compute checkpoint size from per-dtype element counts.
 SAFETENSORS_DTYPE_BYTES = {
-    'F64': 8,
-    'F32': 4,
-    'F16': 2,
-    'BF16': 2,
-    'I64': 8,
-    'I32': 4,
-    'I16': 2,
-    'I8': 1,
-    'U8': 1,
-    'BOOL': 1,
-    'F8_E4M3': 1,
+    "F64": 8,
+    "F32": 4,
+    "F16": 2,
+    "BF16": 2,
+    "I64": 8,
+    "I32": 4,
+    "I16": 2,
+    "I8": 1,
+    "U8": 1,
+    "BOOL": 1,
+    "F8_E4M3": 1,
 }
 
 
 def parse_safetensors_file_metadata(model_path, filename):
-
     with open(os.path.join(model_path, filename), "rb") as f:
         metadata_size = f.read(8)
         metadata_size = struct.unpack("<Q", metadata_size)[0]
@@ -43,7 +45,8 @@ def parse_safetensors_file_metadata(model_path, filename):
             raise RuntimeError(
                 f"Failed to parse safetensors header for '{filename}' (model_path '{model_path}'): "
                 f"safetensors header is too big. Maximum supported size is "
-                f"{SAFETENSORS_MAX_HEADER_LENGTH} bytes (got {metadata_size}).")
+                f"{SAFETENSORS_MAX_HEADER_LENGTH} bytes (got {metadata_size})."
+            )
 
         metadata_as_bytes = f.read(metadata_size)
 
@@ -59,8 +62,7 @@ def parse_safetensors_file_metadata(model_path, filename):
         return SafetensorsFileMetadata(
             metadata=metadata_as_dict.get("__metadata__", {}),
             tensors={
-                key:
-                TensorInfo(
+                key: TensorInfo(
                     dtype=tensor["dtype"],
                     shape=tensor["shape"],
                     data_offsets=tuple(tensor["data_offsets"]),  # type: ignore
@@ -77,12 +79,12 @@ def parse_safetensors_file_metadata(model_path, filename):
 
 
 def get_safetensors_metadata(model_name_or_path):
-    """ Read the safetensors metadata from HF model. """
+    """Read the safetensors metadata from HF model."""
     if os.path.isdir(model_name_or_path):
-        if os.path.exists(
-                os.path.join(model_name_or_path, SAFETENSORS_SINGLE_FILE)):
+        if os.path.exists(os.path.join(model_name_or_path, SAFETENSORS_SINGLE_FILE)):
             file_metadata = parse_safetensors_file_metadata(
-                model_path=model_name_or_path, filename=SAFETENSORS_SINGLE_FILE)
+                model_path=model_name_or_path, filename=SAFETENSORS_SINGLE_FILE
+            )
             return SafetensorsRepoMetadata(
                 metadata=None,
                 sharded=False,
@@ -92,10 +94,8 @@ def get_safetensors_metadata(model_name_or_path):
                 },
                 files_metadata={SAFETENSORS_SINGLE_FILE: file_metadata},
             )
-        elif os.path.exists(
-                os.path.join(model_name_or_path, SAFETENSORS_INDEX_FILE)):
-            with open(os.path.join(model_name_or_path,
-                                   SAFETENSORS_INDEX_FILE)) as f:
+        elif os.path.exists(os.path.join(model_name_or_path, SAFETENSORS_INDEX_FILE)):
+            with open(os.path.join(model_name_or_path, SAFETENSORS_INDEX_FILE)) as f:
                 index = json.load(f)
 
             weight_map = index.get("weight_map", {})
@@ -105,7 +105,8 @@ def get_safetensors_metadata(model_name_or_path):
 
             def _parse(filename: str) -> None:
                 files_metadata[filename] = parse_safetensors_file_metadata(
-                    model_path=model_name_or_path, filename=filename)
+                    model_path=model_name_or_path, filename=filename
+                )
 
             thread_map(
                 _parse,
@@ -123,7 +124,8 @@ def get_safetensors_metadata(model_name_or_path):
         else:
             # Not a safetensors repo
             raise RuntimeError(
-                f"'{model_name_or_path}' is not a safetensors repo. Couldn't find '{SAFETENSORS_INDEX_FILE}' or '{SAFETENSORS_SINGLE_FILE}' files."
+                f"'{model_name_or_path}' is not a safetensors repo. Couldn't find "
+                f"'{SAFETENSORS_INDEX_FILE}' or '{SAFETENSORS_SINGLE_FILE}' files."
             )
     else:
         return huggingface_hub.get_safetensors_metadata(model_name_or_path)
@@ -134,23 +136,28 @@ class ModelConfig(BaseModel):
 
     The parameters are needed in engine setting calculation.
     """
+
     name: str
     model_type: str
     param_count: int
     checkpoint_size_in_gb: float = Field(default=0.0)
-    num_hidden_layers: int = Field(validation_alias=AliasChoices(
-        "num_hidden_layers",
-        "n_layer",
-        AliasPath("text_config", "num_hidden_layers"),
-        AliasPath("language_config", "num_hidden_layers"),
-    ))
+    num_hidden_layers: int = Field(
+        validation_alias=AliasChoices(
+            "num_hidden_layers",
+            "n_layer",
+            AliasPath("text_config", "num_hidden_layers"),
+            AliasPath("language_config", "num_hidden_layers"),
+        )
+    )
     num_attention_layers: Optional[int] = Field(default=None)
-    num_attention_heads: int = Field(validation_alias=AliasChoices(
-        "num_attention_heads",
-        "n_head",
-        AliasPath("text_config", "num_attention_heads"),
-        AliasPath("language_config", "num_attention_heads"),
-    ))
+    num_attention_heads: int = Field(
+        validation_alias=AliasChoices(
+            "num_attention_heads",
+            "n_head",
+            AliasPath("text_config", "num_attention_heads"),
+            AliasPath("language_config", "num_attention_heads"),
+        )
+    )
     num_key_value_heads: Optional[int] = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -160,33 +167,37 @@ class ModelConfig(BaseModel):
             AliasPath("language_config", "num_key_value_heads"),
         ),
     )
-    hidden_size: int = Field(validation_alias=AliasChoices(
-        "hidden_size",
-        "n_embd",
-        AliasPath("text_config", "hidden_size"),
-    ))
-    head_size: Optional[int] = Field(default=None,
-                                     validation_alias=AliasChoices(
-                                         "head_size",
-                                         "head_dim",
-                                         "attention_head_dim",
-                                         AliasPath("text_config", "head_dim"),
-                                     ))
+    hidden_size: int = Field(
+        validation_alias=AliasChoices(
+            "hidden_size",
+            "n_embd",
+            AliasPath("text_config", "hidden_size"),
+        )
+    )
+    head_size: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "head_size",
+            "head_dim",
+            "attention_head_dim",
+            AliasPath("text_config", "head_dim"),
+        ),
+    )
     max_position_embeddings: Optional[int] = Field(
         default=None,
         validation_alias=AliasChoices(
             "max_position_embeddings",
             "n_positions",
             AliasPath("text_config", "max_position_embeddings"),
-        ))
-    dtype: Literal["float16", "bfloat16", "float32",
-                   None] = Field(default="float16",
-                                 validation_alias=AliasChoices(
-                                     "dtype", "torch_dtype"))
+        ),
+    )
+    dtype: Literal["float16", "bfloat16", "float32", None] = Field(
+        default="float16", validation_alias=AliasChoices("dtype", "torch_dtype")
+    )
 
     @model_validator(mode="after")
     def set_values_if_none(self):
-        """ Set the values if cannot get values from HF config.json. """
+        """Set the values if cannot get values from HF config.json."""
         if not self.dtype:  # for GPT-J
             self.dtype = "float16"
         if self.num_key_value_heads is None:
@@ -222,28 +233,32 @@ class ModelConfig(BaseModel):
             # BF16 for non-quantized layers, F8_E4M3 for scales, etc.).
             checkpoint_size_in_bytes = sum(
                 count * SAFETENSORS_DTYPE_BYTES.get(dtype, 1)
-                for dtype, count in metadata.parameter_count.items())
+                for dtype, count in metadata.parameter_count.items()
+            )
             checkpoint_size_in_gb = checkpoint_size_in_bytes / (1024**3)
         if not param_count:
-            raise ValueError(f"Can't get valid parameter count for model: "
-                             f"{hf_model_path or model_hf_name}.")
+            raise ValueError(
+                f"Can't get valid parameter count for model: {hf_model_path or model_hf_name}."
+            )
 
         return param_count, checkpoint_size_in_gb
 
     @classmethod
     def from_hf(cls, model_hf_name, hf_model_path):
-        pretrained_config = load_pretrained_config(hf_model_path
-                                                   or model_hf_name,
-                                                   trust_remote_code=True)
+        pretrained_config = load_pretrained_config(
+            hf_model_path or model_hf_name, trust_remote_code=True
+        )
         hf_config = pretrained_config.to_dict()
-        param_count, checkpoint_size_in_gb = (
-            cls.get_param_count_and_checkpoint_size(model_hf_name,
-                                                    hf_model_path))
+        param_count, checkpoint_size_in_gb = cls.get_param_count_and_checkpoint_size(
+            model_hf_name, hf_model_path
+        )
 
-        return cls(name=model_hf_name,
-                   param_count=param_count,
-                   checkpoint_size_in_gb=checkpoint_size_in_gb,
-                   **hf_config)
+        return cls(
+            name=model_hf_name,
+            param_count=param_count,
+            checkpoint_size_in_gb=checkpoint_size_in_gb,
+            **hf_config,
+        )
 
     def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
         return 0
@@ -253,27 +268,35 @@ class ModelConfig(BaseModel):
 
 
 class NemotronHybridConfig(ModelConfig):
-    hybrid_override_pattern: str = Field(validation_alias=AliasChoices(
-        "hybrid_override_pattern",
-        AliasPath("text_config", "hybrid_override_pattern"),
-        AliasPath("language_config", "hybrid_override_pattern"),
-    ))
-    num_hidden_layers: int = Field(validation_alias=AliasChoices(
-        "num_hidden_layers",
-        "n_layer",
-        AliasPath("text_config", "num_hidden_layers"),
-        AliasPath("language_config", "num_hidden_layers"),
-    ))
-    d_state: int = Field(validation_alias=AliasChoices(
-        "d_state",
-        "mamba_d_state",
-        "ssm_state_size",
-    ))
-    d_conv: int = Field(validation_alias=AliasChoices(
-        "d_conv",
-        "mamba_d_conv",
-        "conv_kernel",
-    ))
+    hybrid_override_pattern: str = Field(
+        validation_alias=AliasChoices(
+            "hybrid_override_pattern",
+            AliasPath("text_config", "hybrid_override_pattern"),
+            AliasPath("language_config", "hybrid_override_pattern"),
+        )
+    )
+    num_hidden_layers: int = Field(
+        validation_alias=AliasChoices(
+            "num_hidden_layers",
+            "n_layer",
+            AliasPath("text_config", "num_hidden_layers"),
+            AliasPath("language_config", "num_hidden_layers"),
+        )
+    )
+    d_state: int = Field(
+        validation_alias=AliasChoices(
+            "d_state",
+            "mamba_d_state",
+            "ssm_state_size",
+        )
+    )
+    d_conv: int = Field(
+        validation_alias=AliasChoices(
+            "d_conv",
+            "mamba_d_conv",
+            "conv_kernel",
+        )
+    )
     mamba_num_heads: int
     n_groups: int
     mamba_head_dim: int
@@ -283,7 +306,7 @@ class NemotronHybridConfig(ModelConfig):
 
     @model_validator(mode="after")
     def set_values_if_none(self):
-        """ Set the values if cannot get values from HF config.json. """
+        """Set the values if cannot get values from HF config.json."""
         if not self.d_inner:
             self.d_inner = self.mamba_num_heads * self.mamba_head_dim
         if self.num_mamba_layers is None:
@@ -298,12 +321,17 @@ class NemotronHybridConfig(ModelConfig):
         conv_dim = self.d_inner + 2 * self.n_groups * self.d_state
         conv_state_elems = conv_dim * (self.d_conv - 1)
         ssm_state_elems = self.mamba_num_heads * self.mamba_head_dim * self.d_state
-        gb_per_mamba_cache = bytes_per_elem * self.num_mamba_layers * (
-            conv_state_elems + ssm_state_elems) / (1024**3)
+        gb_per_mamba_cache = (
+            bytes_per_elem
+            * self.num_mamba_layers
+            * (conv_state_elems + ssm_state_elems)
+            / (1024**3)
+        )
         return gb_per_mamba_cache
 
     def cache_memory_fraction(self, cache_memory_fraction):
-        # Each mamba cache entry is pretty large (~50MB for 8B model), so we are more conservative when estimating the max batch size
+        # Each mamba cache entry is pretty large (~50MB for 8B model), so we are
+        # more conservative when estimating the max batch size
         return cache_memory_fraction**2
 
     def set_mamba_ssm_cache_dtype(self, mamba_ssm_cache_dtype: str):
@@ -311,13 +339,13 @@ class NemotronHybridConfig(ModelConfig):
 
     @classmethod
     def from_hf(cls, model_hf_name, hf_model_path):
-        pretrained_config = load_pretrained_config(hf_model_path
-                                                   or model_hf_name,
-                                                   trust_remote_code=True)
+        pretrained_config = load_pretrained_config(
+            hf_model_path or model_hf_name, trust_remote_code=True
+        )
         hf_config = pretrained_config.to_dict()
-        param_count, checkpoint_size_in_gb = (
-            cls.get_param_count_and_checkpoint_size(model_hf_name,
-                                                    hf_model_path))
+        param_count, checkpoint_size_in_gb = cls.get_param_count_and_checkpoint_size(
+            model_hf_name, hf_model_path
+        )
 
         # HuggingFace PretrainedConfig.to_dict() only serializes attributes known to
         # the base class; custom configs (e.g. NemotronHConfig) have num_hidden_layers
@@ -326,8 +354,8 @@ class NemotronHybridConfig(ModelConfig):
         text_config = getattr(pretrained_config, "text_config", None)
         language_config = getattr(pretrained_config, "language_config", None)
         for key in (
-                "num_hidden_layers",
-                "hybrid_override_pattern",
+            "num_hidden_layers",
+            "hybrid_override_pattern",
         ):
             if hf_config.get(key) is None:
                 value = None
@@ -342,10 +370,12 @@ class NemotronHybridConfig(ModelConfig):
                 if value is not None:
                     hf_config[key] = value
 
-        return cls(name=model_hf_name,
-                   param_count=param_count,
-                   checkpoint_size_in_gb=checkpoint_size_in_gb,
-                   **hf_config)
+        return cls(
+            name=model_hf_name,
+            param_count=param_count,
+            checkpoint_size_in_gb=checkpoint_size_in_gb,
+            **hf_config,
+        )
 
 
 class Qwen3HybridConfig(ModelConfig):
@@ -354,6 +384,7 @@ class Qwen3HybridConfig(ModelConfig):
     Maps Qwen3.5 linear-attention parameters to the same cache estimation
     formulas used by NemotronHybridConfig.
     """
+
     linear_key_head_dim: int  # d_state
     linear_conv_kernel_dim: int  # d_conv
     linear_num_value_heads: int  # num_heads (mamba_num_heads)
@@ -364,34 +395,38 @@ class Qwen3HybridConfig(ModelConfig):
 
     @classmethod
     def from_hf(cls, model_hf_name, hf_model_path):
-        pretrained_config = load_pretrained_config(hf_model_path
-                                                   or model_hf_name,
-                                                   trust_remote_code=True)
+        pretrained_config = load_pretrained_config(
+            hf_model_path or model_hf_name, trust_remote_code=True
+        )
         hf_config = pretrained_config.to_dict()
-        param_count, checkpoint_size_in_gb = (
-            cls.get_param_count_and_checkpoint_size(model_hf_name,
-                                                    hf_model_path))
+        param_count, checkpoint_size_in_gb = cls.get_param_count_and_checkpoint_size(
+            model_hf_name, hf_model_path
+        )
 
         layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
-        hf_config.setdefault("num_attention_layers",
-                             layer_types.count("full_attention"))
-        hf_config.setdefault("num_linear_attention_layers",
-                             layer_types.count("linear_attention"))
+        hf_config.setdefault("num_attention_layers", layer_types.count("full_attention"))
+        hf_config.setdefault("num_linear_attention_layers", layer_types.count("linear_attention"))
 
-        return cls(name=model_hf_name,
-                   param_count=param_count,
-                   checkpoint_size_in_gb=checkpoint_size_in_gb,
-                   **hf_config)
+        return cls(
+            name=model_hf_name,
+            param_count=param_count,
+            checkpoint_size_in_gb=checkpoint_size_in_gb,
+            **hf_config,
+        )
 
     def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
         d_inner = self.linear_value_head_dim * self.linear_num_value_heads
         conv_dim = d_inner + 2 * self.linear_num_key_heads * self.linear_key_head_dim
         conv_state_elems = conv_dim * (self.linear_conv_kernel_dim - 1)
-        ssm_state_elems = (self.linear_num_value_heads *
-                           self.linear_value_head_dim *
-                           self.linear_key_head_dim)
-        gb_per_cache = bytes_per_elem * self.num_linear_attention_layers * (
-            conv_state_elems + ssm_state_elems) / (1024**3)
+        ssm_state_elems = (
+            self.linear_num_value_heads * self.linear_value_head_dim * self.linear_key_head_dim
+        )
+        gb_per_cache = (
+            bytes_per_elem
+            * self.num_linear_attention_layers
+            * (conv_state_elems + ssm_state_elems)
+            / (1024**3)
+        )
         return gb_per_cache
 
     def cache_memory_fraction(self, cache_memory_fraction):
