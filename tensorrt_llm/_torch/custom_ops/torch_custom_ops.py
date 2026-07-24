@@ -37,7 +37,7 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          TuningConfig)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, is_pdl_enabled
 from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
@@ -2699,7 +2699,7 @@ def _fp4_quantize_dispatch(input: torch.Tensor, input_scale: torch.Tensor,
             input_scale,
             do_shuffle=is_sf_swizzled_layout,
             sf_vec_size=scaling_vector_size,
-            enable_pdl=get_env_enable_pdl(),
+            enable_pdl=is_pdl_enabled(),
         )
         # FlashInfer returns 2D act_sf [M_padded, sf_cols] but downstream
         # (nvfp4_gemm) and the TRTLLM kernel expect 1D flat. Reshape to match.

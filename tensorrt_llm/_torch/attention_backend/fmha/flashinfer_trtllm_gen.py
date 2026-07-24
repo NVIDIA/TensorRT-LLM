@@ -44,7 +44,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, is_pdl_enabled
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -415,7 +415,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         super().__init__(attn)
         self._layout = self.DEFAULT_KV_LAYOUT
         # Read once so the hot path is not sensitive to later environment changes.
-        self._enable_pdl = get_env_enable_pdl()
+        self._enable_pdl = is_pdl_enabled()
 
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
