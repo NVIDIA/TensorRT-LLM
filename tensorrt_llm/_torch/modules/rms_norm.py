@@ -29,6 +29,11 @@ from ..utils import Fp4QuantizedTensor, is_nvfp4_marlin_enabled
 # (cpp/tensorrt_llm/thop/fusedAddRMSNormQuant.cpp).
 _WS_MIN_N = 2048
 _WS_MAX_N = 16384
+# The reduce_fusion kernels stage one row in dynamic shared memory; without a
+# cudaFuncSetAttribute opt-in the launch is limited to the default 48KB (minus
+# the kernel's small static buffers). Stay safely below it and fall back to
+# the unfused path for larger hidden sizes.
+_REDUCE_FUSION_MAX_N_BYTES = 46 * 1024
 # Row-count crossover for the layer-boundary add+RMSNorm+quant edge: below this
 # the one-CTA-per-row reduce_fusion kernel (fused_add_rmsnorm_fp4_quantize) is
 # faster; at/above it the warp-specialized kernel's DMA-ahead pipeline wins.
@@ -264,10 +269,18 @@ class RMSNorm(nn.Module):
             return self._fused_nvfp4_quant_ws(hidden_states, residual, sf_scale,
                                               return_norm_out)
 
+        # The reduce_fusion kernels stage one row in dynamic shared memory;
+        # hidden sizes beyond the default launch limit cannot use them (see
+        # _REDUCE_FUSION_MAX_N_BYTES). Take a same-arity unfused slow path.
+        n_bytes = hidden_states.shape[-1] * hidden_states.element_size()
+        if n_bytes > _REDUCE_FUSION_MAX_N_BYTES:
+            return self._unfused_nvfp4_quant(hidden_states, residual, sf_scale,
+                                             return_norm_out)
+
         if residual is not None:
             results = torch.ops.trtllm.fused_add_rmsnorm_fp4_quantize(
-                hidden_states,
-                residual,
+                hidden_states.contiguous(),
+                residual.contiguous(),
                 self.weight,
                 sf_scale,
                 float(self.variance_epsilon),
@@ -352,6 +365,60 @@ class RMSNorm(nn.Module):
         if self.return_hp_output:
             outputs.append(bf16_hs)
         return tuple(outputs)
+
+    def _unfused_nvfp4_quant(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        sf_scale: torch.Tensor,
+        return_norm_out: bool,
+    ):
+        """Unfused slow path with the same return arity as _fused_nvfp4_quant,
+        for hidden sizes the fused kernels cannot launch (see
+        _REDUCE_FUSION_MAX_N_BYTES): the production unfused kernels — the
+        flashinfer (add+)RMSNorm forward() itself uses, then the standalone
+        fp4_quantize the fusion replaces."""
+        use_flashinfer = IS_FLASHINFER_AVAILABLE and hidden_states.dtype in (
+            torch.float16, torch.bfloat16)
+        if use_flashinfer:
+            from ..custom_ops import (flashinfer_fused_add_rmsnorm,
+                                      flashinfer_rmsnorm)
+            if residual is not None:
+                # flashinfer_fused_add_rmsnorm mutates both args in place
+                # (input -> normed, residual -> input+residual); clone so the
+                # caller's tensors keep the no-mutation contract of the fused
+                # path.
+                normed = hidden_states.contiguous().clone()
+                residual_out = residual.contiguous().clone()
+                flashinfer_fused_add_rmsnorm(normed, residual_out, self.weight,
+                                             self.variance_epsilon)
+            else:
+                residual_out = hidden_states
+                normed = flashinfer_rmsnorm(hidden_states.contiguous(),
+                                            self.weight, self.variance_epsilon)
+        else:
+            if residual is not None:
+                residual_out = (hidden_states + residual).contiguous()
+            else:
+                residual_out = hidden_states
+            normed = residual_out.to(torch.float32)
+            variance = normed.pow(2).mean(-1, keepdim=True)
+            normed = normed * torch.rsqrt(variance + self.variance_epsilon)
+            normed = (self.weight * normed.to(hidden_states.dtype)).contiguous()
+
+        act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(normed, sf_scale, 16,
+                                                        False)
+        want_norm = return_norm_out or self.return_hp_output
+        norm_out = normed if want_norm else None
+        fp4 = Fp4QuantizedTensor(act_fp4,
+                                 act_sf,
+                                 unquantized_hidden_states=norm_out)
+        if residual is not None:
+            outputs = [fp4, residual_out]
+            if self.return_hp_output:
+                outputs.append(norm_out)
+            return tuple(outputs)
+        return (fp4, norm_out) if return_norm_out else fp4
 
     def skip_forward(
         self,

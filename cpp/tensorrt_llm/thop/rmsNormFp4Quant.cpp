@@ -74,6 +74,14 @@ std::vector<at::Tensor> fused_add_rmsnorm_fp4_quantize(at::Tensor const& hidden_
     auto const k = input_shape[rank - 1];
     int64_t const sf_vec_size = 16;
     TORCH_CHECK(k % sf_vec_size == 0, "hidden_size must be divisible by 16");
+    // Rows larger than one CTA-pass are staged in dynamic shared memory
+    // (rmsNormFp4QuantKernels.cu); without a cudaFuncSetAttribute opt-in the
+    // launch is limited to the default 48KB. Reject with a clear error instead
+    // of failing inside cudaLaunchKernelEx; callers must use the unfused path
+    // (see RMSNorm._unfused_nvfp4_quant).
+    TORCH_CHECK(k * hidden_states.element_size() <= 46 * 1024,
+        "hidden_size too large for the fused RMSNorm+NVFP4 kernel's shared-memory staging: ", k,
+        " elements; use the unfused RMSNorm + fp4_quantize path");
 
     std::vector<int64_t> quant_shape(input_shape.begin(), input_shape.end());
     quant_shape[rank - 1] = k / 2;
@@ -181,6 +189,14 @@ std::vector<at::Tensor> fused_rmsnorm_fp4_quantize(at::Tensor const& hidden_stat
     auto const k = input_shape[rank - 1];
     int64_t const sf_vec_size = 16;
     TORCH_CHECK(k % sf_vec_size == 0, "hidden_size must be divisible by 16");
+    // Rows larger than one CTA-pass are staged in dynamic shared memory
+    // (rmsNormFp4QuantKernels.cu); without a cudaFuncSetAttribute opt-in the
+    // launch is limited to the default 48KB. Reject with a clear error instead
+    // of failing inside cudaLaunchKernelEx; callers must use the unfused path
+    // (see RMSNorm._unfused_nvfp4_quant).
+    TORCH_CHECK(k * hidden_states.element_size() <= 46 * 1024,
+        "hidden_size too large for the fused RMSNorm+NVFP4 kernel's shared-memory staging: ", k,
+        " elements; use the unfused RMSNorm + fp4_quantize path");
     // Element stride between consecutive logical rows. For a contiguous tensor
     // this equals k, so input_row_stride==0 (packed) and behavior is identical.
     int64_t const row_stride = hidden_states.stride(rank - 2);

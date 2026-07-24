@@ -37,7 +37,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._torch.utils import ceil_div, pad_up, unswizzle_sf
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, ceil_div, pad_up, unswizzle_sf
 from tests.unittest.utils.util import getSMVersion
 
 
@@ -211,7 +211,7 @@ def assert_fp4_bitexact_from_norm(
 # --------------------------------------------------------------------------- #
 @skip_unless_add_rmsnorm
 @pytest.mark.parametrize("m", [1, 16, 64, 128])
-@pytest.mark.parametrize("n", [32, 128, 512, 7168])
+@pytest.mark.parametrize("n", [32, 128, 512, 7168, 12288])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_add_rmsnorm_fp4_quantize_vs_separate(m, n, dtype):
     torch.manual_seed(42)
@@ -464,3 +464,45 @@ def test_rmsnorm_ws_kernel_gate(m, n, residual, contiguous, expect_ws):
         hs = torch.empty((m, n + 32), dtype=torch.bfloat16, device="meta")[:, :n]
         assert not hs.is_contiguous()
     assert norm._ws_kernel_eligible(hs, res) is expect_ws
+
+
+# --------------------------------------------------------------------------- #
+# Oversized hidden dim: fused kernels reject; RMSNorm falls back unfused.      #
+# --------------------------------------------------------------------------- #
+_HUGE_N = 24576  # > 46KB/2B of bf16 -> beyond the kernels' smem staging limit
+
+
+@skip_unless_add_rmsnorm
+def test_fused_ops_reject_oversized_hidden():
+    m = 4
+    hs = torch.randn(m, _HUGE_N, dtype=torch.bfloat16, device="cuda")
+    res = torch.randn_like(hs)
+    w = torch.randn(_HUGE_N, dtype=torch.bfloat16, device="cuda")
+    sf_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    with pytest.raises(RuntimeError, match="shared-memory staging"):
+        torch.ops.trtllm.fused_add_rmsnorm_fp4_quantize(hs, res, w, sf_scale, 1e-6, False)
+    with pytest.raises(RuntimeError, match="shared-memory staging"):
+        torch.ops.trtllm.fused_rmsnorm_fp4_quantize(hs, w, sf_scale, 1e-6, False)
+
+
+@skip_unless_add_rmsnorm
+def test_rmsnorm_oversized_hidden_falls_back_unfused():
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+    m = 4
+    norm = RMSNorm(
+        hidden_size=_HUGE_N, eps=1e-6, dtype=torch.bfloat16, device="cuda", quantize_type="nvfp4"
+    )
+    hs = torch.randn(m, _HUGE_N, dtype=torch.bfloat16, device="cuda")
+    res = torch.randn_like(hs)
+    norm_ref = rms_norm_ref(
+        (hs.float() + res.float()).to(torch.bfloat16), norm.weight, norm.variance_epsilon
+    )
+    norm.nvfp4_scale = make_sf_scale(norm_ref)
+
+    fp4, residual_out = norm(hs, res)
+    assert isinstance(fp4, Fp4QuantizedTensor)
+    assert torch.equal(residual_out, (hs + res))
+    fp4_ref, _ = fp4_quantize_ref(norm_ref, norm.nvfp4_scale)
+    match = (fp4.fp4_tensor.view(torch.uint8) == fp4_ref.view(torch.uint8)).float().mean().item()
+    assert match > _FP4_MATCH_THRESHOLD
