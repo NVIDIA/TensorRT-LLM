@@ -491,6 +491,11 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     beam_width_out = _get_beam_width_out(request)
     beam_width_in = _get_beam_width_in(request)
     use_beam_search = _get_max_beam_width(request) > 1
+    length_penalty = _unwrap_singleton(cast(Optional[list[float]], sampling_config.length_penalty))
+    beam_search_diversity_rate = _unwrap_singleton(
+        cast(Optional[list[float]], sampling_config.beam_search_diversity_rate)
+    )
+    early_stopping = _unwrap_singleton(cast(Optional[list[int]], sampling_config.early_stopping))
 
     return UtilsSamplingParams(
         temperature=temperature,
@@ -502,6 +507,9 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
         top_p_decay=top_p_decay,
         top_p_min=top_p_min,
         top_p_reset_ids=top_p_reset_ids,
+        length_penalty=length_penalty,
+        beam_search_diversity_rate=beam_search_diversity_rate,
+        early_stopping=early_stopping,
     )
 
 
@@ -2239,6 +2247,38 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """Shape: (max_beam_width,), dtype int32
            Usage: Cached `arange(max_beam_width)` used as the scatter source in the
            per-step ``cache_indirection.scatter_``."""
+        beam_gen_lengths: torch.Tensor
+        """Shape: batch_size, beam_width
+           Usage: Number of generated tokens per beam (frozen once a beam finishes).
+           Only maintained for requests with a non-zero beam-search length_penalty."""
+        prompt_lens: torch.Tensor
+        """Shape: (max_num_sequences,), dtype int32
+           Usage: Per-slot prompt length; used by the CBA path (early_stopping != 1)
+           to derive generated lengths and snapshot positions."""
+        cba_tokens: torch.Tensor
+        """Shape: batch_size, beam_width, max_seq_len
+           Usage: Candidate-beams-array path snapshots (generated tokens,
+           BEAM_SEARCH_PAD_TOKEN padded). Only maintained for early_stopping != 1."""
+        cba_cum_log_probs: torch.Tensor
+        """Shape: batch_size, beam_width — raw cumulative log-probs of CBA entries."""
+        cba_normed_scores: torch.Tensor
+        """Shape: batch_size, beam_width — length-normalized CBA scores (-inf: empty)."""
+        cba_lengths: torch.Tensor
+        """Shape: batch_size, beam_width — generated lengths of CBA entries."""
+        batch_dones: torch.Tensor
+        """Shape: (max_num_sequences,), dtype bool — CBA-mode termination verdicts."""
+        original_log_probs: torch.Tensor
+        """Shape: batch_size, beam_width, max_seq_len
+           Usage: Uncorrected per-slot sampled log-prob at each step (the
+           log-prob analog of original_tokens, mirroring the C++
+           logProbsTiled workspace). Only written by the CBA path."""
+        cba_log_probs: torch.Tensor
+        """Shape: batch_size, beam_width, max_seq_len
+           Usage: Per-token log-probs of the CBA path snapshots (the C++
+           logProbsCBA analog). Only maintained for early_stopping != 1."""
+        cba_caps: torch.Tensor
+        """Shape: (max_num_sequences,), dtype int32 — per-slot CBA capacity
+           (the request's maximum beam width; C++ nBM)."""
 
     @dataclass(kw_only=True)
     class LogProbsStore:
@@ -2386,6 +2426,27 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 * self.max_beam_width
             )
             beam_idx_arange = torch.arange(self.max_beam_width, device="cuda", dtype=torch.int32)
+            beam_gen_lengths = int_tensor(self.CACHE_INDIRECTION_SHAPE[:-1])
+            prompt_lens = int_tensor((self.max_num_sequences,))
+            cba_tokens = int_tensor(self.CACHE_INDIRECTION_SHAPE)
+            cba_cum_log_probs = torch.zeros(
+                self.CACHE_INDIRECTION_SHAPE[:-1], device="cuda", dtype=torch.float32
+            )
+            cba_normed_scores = torch.full(
+                self.CACHE_INDIRECTION_SHAPE[:-1],
+                float("-inf"),
+                device="cuda",
+                dtype=torch.float32,
+            )
+            cba_lengths = int_tensor(self.CACHE_INDIRECTION_SHAPE[:-1])
+            batch_dones = torch.zeros((self.max_num_sequences,), device="cuda", dtype=torch.bool)
+            original_log_probs = torch.zeros(
+                self.CACHE_INDIRECTION_SHAPE, device="cuda", dtype=torch.float32
+            )
+            cba_log_probs = torch.zeros(
+                self.CACHE_INDIRECTION_SHAPE, device="cuda", dtype=torch.float32
+            )
+            cba_caps = int_tensor((self.max_num_sequences,))
             beam_search_store = self.BeamSearchStore(
                 cache_indirection=cache_indirection,
                 cache_indirection_buffer=cache_indirection_buffer,
@@ -2395,6 +2456,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 first_finish_reasons=first_finish_reasons,
                 seq_offsets=seq_offsets,
                 beam_idx_arange=beam_idx_arange,
+                beam_gen_lengths=beam_gen_lengths,
+                prompt_lens=prompt_lens,
+                cba_tokens=cba_tokens,
+                cba_cum_log_probs=cba_cum_log_probs,
+                cba_normed_scores=cba_normed_scores,
+                cba_lengths=cba_lengths,
+                batch_dones=batch_dones,
+                original_log_probs=original_log_probs,
+                cba_log_probs=cba_log_probs,
+                cba_caps=cba_caps,
             )
         # Per-slot Top-P Decay runtime state (FlashInfer path). Allocated for all
         # sampler instances; only slots in self._top_p_decay_slots are ever read.
@@ -3077,6 +3148,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     raise ValueError(
                         "Beam search only supports returning the sampled logprob per token"
                     )
+            # early_stopping == 1 (default) is served by the frozen-slot path
+            # (stopping once all beam slots hold finished beams is equivalent);
+            # the exhaustive modes by the candidate-beams-array path (see
+            # beam_search_sampling_batch_cba).
 
     @override
     @nvtx_range("setup_sampler_step")
@@ -3118,8 +3193,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         max_lens = self._finish_reasons_handler.new_max_lens
         end_ids = self._finish_reasons_handler.new_end_ids
+        prompt_lens = [request.py_prompt_len for request in new_requests]
+        beam_caps = [request.py_beam_width for request in new_requests]
         # Perform updates to the stores
-        full_list = [seq_slots, max_lens, end_ids]
+        full_list = [seq_slots, max_lens, end_ids, prompt_lens, beam_caps]
         # perform only a single copy
         full_list_tensor_host = torch.tensor(
             full_list, device="cpu", dtype=torch.int32, pin_memory=prefer_pinned()
@@ -3129,6 +3206,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_slots_tensor_cuda = full_list_tensor_cuda[0]
         max_lens_tensor_cuda = full_list_tensor_cuda[1]
         end_ids_tensor_cuda = full_list_tensor_cuda[2]
+        prompt_lens_tensor_cuda = full_list_tensor_cuda[3]
+        beam_caps_tensor_cuda = full_list_tensor_cuda[4]
 
         # Cast to int64 once for downstream ``index_copy_`` / ``index_fill_`` calls.
         seq_slots_tensor_cuda_long = seq_slots_tensor_cuda.long()
@@ -3153,6 +3232,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self.store.log_probs_store,
                 seq_slots_long=seq_slots_tensor_cuda_long,
                 max_prompt_len=max_prompt_len,
+                prompt_lens_cuda=prompt_lens_tensor_cuda,
+                beam_caps_cuda=beam_caps_tensor_cuda,
             )
 
     def _setup_top_p_decay_for_new_requests(
@@ -3261,6 +3342,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         log_probs_store: LogProbsStore,
         seq_slots_long: torch.Tensor,
         max_prompt_len: int,
+        prompt_lens_cuda: torch.Tensor,
+        beam_caps_cuda: torch.Tensor,
     ) -> None:
         """Prepare the beam search buffers for the requests
 
@@ -3280,6 +3363,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             0, seq_slots_long, FinishReason.NOT_FINISHED.value
         )
         beam_search_store.original_tokens.index_fill_(0, seq_slots_long, 0)
+        beam_search_store.beam_gen_lengths.index_fill_(0, seq_slots_long, 0)
+        beam_search_store.prompt_lens.index_copy_(0, seq_slots_long, prompt_lens_cuda)
+        beam_search_store.cba_tokens.index_fill_(0, seq_slots_long, BEAM_SEARCH_PAD_TOKEN)
+        beam_search_store.cba_cum_log_probs.index_fill_(0, seq_slots_long, 0)
+        beam_search_store.cba_normed_scores.index_fill_(0, seq_slots_long, float("-inf"))
+        beam_search_store.cba_lengths.index_fill_(0, seq_slots_long, 0)
+        beam_search_store.batch_dones.index_fill_(0, seq_slots_long, False)
+        beam_search_store.original_log_probs.index_fill_(0, seq_slots_long, 0)
+        beam_search_store.cba_log_probs.index_fill_(0, seq_slots_long, 0)
+        beam_search_store.cba_caps.index_copy_(0, seq_slots_long, beam_caps_cuda)
 
     @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
@@ -3474,12 +3567,130 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                             logprobs_indices_tensor[beam_idx, token_idx, value.rank - 1] = key
         return logprobs_tensor_full, logprobs_indices_tensor_full
 
+    @staticmethod
+    def _request_uses_cba(request: LlmRequest) -> bool:
+        """Whether this beam-search request runs on the candidate-beams-array
+        path (exhaustive early_stopping modes)."""
+        early_stopping = _unwrap_singleton(
+            cast(Optional[list[int]], request.sampling_config.early_stopping)
+        )
+        return early_stopping is not None and early_stopping != 1
+
+    def _prepare_beam_history_cba(
+        self,
+        request: LlmRequest,
+        *,
+        cba_group: dict[str, Any],
+    ) -> BeamHistoryBuilder | None:
+        """CBA-mode variant of ``_prepare_beam_history``.
+
+        The final beams are the top ``beam_width`` of (CBA finished paths |
+        current active slot paths) ranked by length-normalized score,
+        mirroring the C++ finalize kernel (which inserts the unfinished paths
+        into the CBA and ranks everything by normed score). All device state
+        arrives through the group-level host snapshot (``cba_group``, see
+        _prepare_cba_group_host); this function only slices host rows.
+        """
+        num_tokens = request.max_beam_num_tokens + 1  # last token is not yet added
+        prompt_length = request.py_prompt_len
+        num_generated_tokens = num_tokens - prompt_length
+        num_beams = request.py_beam_width
+
+        if num_generated_tokens == 0 or request.state == LlmRequestState.GENERATION_COMPLETE:
+            return None
+
+        slot = request.py_seq_slot
+        assert slot is not None
+        row = cba_group["pos"][slot]
+        # Active beams currently in the slots: the input width of the current
+        # step (== num_beams except for variable-beam-width requests).
+        active_width = _get_beam_width_in(request)
+        return_log_probs = request.py_return_log_probs
+
+        length_penalty = (
+            _unwrap_singleton(cast(Optional[list[float]], request.sampling_config.length_penalty))
+            or 0.0
+        )
+
+        def _builder() -> BeamHistory | None:
+            if not cba_group["should_stop"][row].item():
+                return None
+
+            cache_indirection = cba_group["cache_indirection"][
+                row, :active_width, prompt_length:num_tokens
+            ]
+            current_path = cba_group["original_tokens"][
+                row, :active_width, prompt_length:num_tokens
+            ]
+            active_cum = cba_group["cum"][row, :active_width]
+            cba_tokens = cba_group["cba_tokens"][row]
+            cba_cum = cba_group["cba_cum"][row]
+            cba_normed = cba_group["cba_normed"][row]
+            cba_lengths = cba_group["cba_lengths"][row]
+
+            active_path = _gather_beam_path(
+                current_path=current_path, cache_indirection=cache_indirection
+            )
+            active_normed = active_cum
+            if length_penalty != 0.0:
+                active_normed = active_cum / float(num_generated_tokens) ** length_penalty
+            active_lp_path: torch.Tensor | None = None
+            cba_log_probs: torch.Tensor | None = None
+            if return_log_probs:
+                cba_log_probs = cba_group["cba_log_probs"][row]
+                current_lp_path = cba_group["original_log_probs"][
+                    row, :active_width, prompt_length:num_tokens
+                ]
+                active_lp_path = _gather_beam_path(
+                    current_path=current_lp_path, cache_indirection=cache_indirection
+                )
+
+            pool_width = cba_normed.size(0)
+            all_normed = torch.cat([cba_normed, active_normed])
+            order = torch.argsort(all_normed, descending=True)[:num_beams]
+
+            width = max(num_generated_tokens, int(cba_lengths.max().item()))
+            tokens = torch.full((num_beams, width), BEAM_SEARCH_PAD_TOKEN, dtype=torch.int32)
+            cum_logprobs = torch.zeros((num_beams,), dtype=torch.float32)
+            log_probs: torch.Tensor | None = None
+            if return_log_probs:
+                log_probs = torch.zeros((num_beams, width), dtype=torch.float32)
+            for out_idx, merged_idx in enumerate(order.tolist()):
+                if not torch.isfinite(all_normed[merged_idx]):
+                    continue  # unreachable unless fewer finite candidates than
+                    # output beams (early termination edge); leaves a padded row
+                if merged_idx < pool_width:  # CBA entry
+                    entry_len = int(cba_lengths[merged_idx].item())
+                    tokens[out_idx, :entry_len] = cba_tokens[merged_idx, :entry_len]
+                    cum_logprobs[out_idx] = cba_cum[merged_idx]
+                    if log_probs is not None:
+                        assert cba_log_probs is not None
+                        log_probs[out_idx, :entry_len] = cba_log_probs[merged_idx, :entry_len]
+                else:
+                    active_idx = merged_idx - pool_width
+                    tokens[out_idx, :num_generated_tokens] = active_path[active_idx]
+                    cum_logprobs[out_idx] = active_cum[active_idx]
+                    if log_probs is not None:
+                        assert active_lp_path is not None
+                        log_probs[out_idx, :num_generated_tokens] = active_lp_path[active_idx]
+            return BeamHistory(
+                tokens=tokens,
+                # [beam, tokens, 1]: the sampled token's logprob per position,
+                # matching the shape contract of _convert_logprobs_tensor_to_list.
+                logprobs=log_probs.unsqueeze(-1) if log_probs is not None else None,
+                logprobs_indices=tokens.unsqueeze(-1) if return_log_probs else None,
+                cum_logprobs=cum_logprobs,
+            )
+
+        return _builder
+
     def _prepare_beam_history(
         self,
         request: LlmRequest,
         *,
         finish_reasons: torch.Tensor,
         d2h_copier: Callable[[torch.Tensor], torch.Tensor],
+        cba_group: Optional[dict[str, Any]] = None,
     ) -> BeamHistoryBuilder | None:
         """Correct the stored tokens for each beam and return it as a BeamHistory object.
 
@@ -3506,6 +3717,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                             Shape: (max_tokens, max_beam_width)
             d2h_copier: Callable performing the D2H copy.
         """
+        if self._request_uses_cba(request):
+            assert cba_group is not None
+            return self._prepare_beam_history_cba(request, cba_group=cba_group)
 
         # Gather data used for skipping beam history processing
         need_finalize_due_to_stop_words = self._check_stop_words_length(request)
@@ -3778,6 +3992,27 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     predecessor_beams=beam_search_store.predecessor_beams,
                     seq_offsets=beam_search_store.seq_offsets,
                     beam_idx_arange=beam_search_store.beam_idx_arange,
+                    beam_gen_lengths=beam_search_store.beam_gen_lengths,
+                    end_ids=self._finish_reasons_handler.store.end_ids_cuda,
+                    prompt_lens=beam_search_store.prompt_lens,
+                    original_tokens=beam_search_store.original_tokens,
+                    cba_tokens=beam_search_store.cba_tokens,
+                    cba_cum_log_probs=beam_search_store.cba_cum_log_probs,
+                    cba_normed_scores=beam_search_store.cba_normed_scores,
+                    cba_lengths=beam_search_store.cba_lengths,
+                    batch_dones=beam_search_store.batch_dones,
+                    stop_past_tokens=self._finish_reasons_handler.store.past_tokens_cuda,
+                    original_log_probs=beam_search_store.original_log_probs,
+                    cba_log_probs=beam_search_store.cba_log_probs,
+                    cba_caps=beam_search_store.cba_caps,
+                    max_seq_len=self.max_seq_len,
+                    max_gen_len=max(
+                        (
+                            requests[i].max_beam_num_tokens + 2 - requests[i].py_prompt_len
+                            for i in value.indices.tolist()
+                        ),
+                        default=0,
+                    ),
                 )
             elif metadata_type is TopPDecayMetadata:
                 metadata = self._build_top_p_decay_metadata(
@@ -3855,7 +4090,68 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return True
         return False
 
-    @nvtx_range("maybe_create_beam_histories")
+    @nvtx_range("_prepare_cba_group_host")
+    def _prepare_cba_group_host(
+        self,
+        requests: list[LlmRequest],
+        finish_reasons: torch.Tensor,
+        d2h_copier: Callable[[torch.Tensor], torch.Tensor],
+    ) -> Optional[dict[str, Any]]:
+        """Batch the per-step D2H state needed to finalize CBA-mode requests.
+
+        The per-request variant issued ~8 small copies per request per step,
+        which is host-call-count bound; one batched copy per tensor for the
+        whole group replaces them (the builders slice the host rows).
+        """
+        cba_requests = [request for request in requests if self._request_uses_cba(request)]
+        if not cba_requests:
+            return None
+        store = self.store.beam_search_store
+        assert store is not None
+        slots = [request.py_seq_slot for request in cba_requests]
+        widths = [request.py_beam_width for request in cba_requests]
+        both_host = torch.tensor([slots, widths], dtype=torch.int64, pin_memory=prefer_pinned())
+        both_cuda = both_host.to(device="cuda", non_blocking=True)
+        slots_cuda, widths_cuda = both_cuda[0], both_cuda[1]
+        num_tokens_max = max(request.max_beam_num_tokens + 1 for request in cba_requests)
+        attn_width = min(store.cache_indirection.size(-1), num_tokens_max)
+        snap_width = min(
+            store.cba_tokens.size(-1),
+            max(
+                request.max_beam_num_tokens + 2 - request.py_prompt_len for request in cba_requests
+            ),
+        )
+        group_reasons = finish_reasons[slots_cuda]
+        should_stop = (
+            (group_reasons > 0)
+            | (
+                torch.arange(group_reasons.size(1), device=group_reasons.device).view(1, -1)
+                >= widths_cuda.view(-1, 1)
+            )
+        ).all(dim=1)
+        return_log_probs = any(request.py_return_log_probs for request in cba_requests)
+        return {
+            "pos": {slot: i for i, slot in enumerate(slots)},
+            "should_stop": d2h_copier(should_stop),
+            "cache_indirection": d2h_copier(store.cache_indirection[slots_cuda, :, :attn_width]),
+            "original_tokens": d2h_copier(store.original_tokens[slots_cuda, :, :attn_width]),
+            "cum": d2h_copier(store.cum_log_probs[slots_cuda]),
+            "cba_tokens": d2h_copier(store.cba_tokens[slots_cuda, :, :snap_width]),
+            "cba_cum": d2h_copier(store.cba_cum_log_probs[slots_cuda]),
+            "cba_normed": d2h_copier(store.cba_normed_scores[slots_cuda]),
+            "cba_lengths": d2h_copier(store.cba_lengths[slots_cuda]),
+            "original_log_probs": (
+                d2h_copier(store.original_log_probs[slots_cuda, :, :attn_width])
+                if return_log_probs
+                else None
+            ),
+            "cba_log_probs": (
+                d2h_copier(store.cba_log_probs[slots_cuda, :, :snap_width])
+                if return_log_probs
+                else None
+            ),
+        }
+
     def _prepare_beam_histories(
         self,
         requests: list[LlmRequest],
@@ -3881,11 +4177,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             d2h_copier: Callable[[torch.Tensor], torch.Tensor] = (
                 copier.stage_copy_to_host if copier is not None else self._copy_to_host
             )
+            cba_group = self._prepare_cba_group_host(requests, finish_reasons, d2h_copier)
             builders = [
                 self._prepare_beam_history(
                     req,
                     finish_reasons=finish_reasons[req.py_seq_slot],
                     d2h_copier=d2h_copier,
+                    cba_group=cba_group,
                 )
                 for req in requests
             ]

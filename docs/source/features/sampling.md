@@ -143,6 +143,23 @@ Parameter Configuration:
 - `n`: Controls the number of output sequences returned (can be less than `best_of`)
 - If `best_of` is omitted, the number of beams processed defaults to `n`
 - `max_beam_width` in the `LLM` class must equal `best_of` in `SamplingParams`
+- `length_penalty`: Controls how beams of different lengths are compared. Candidate beams are
+  ranked by `cum_log_prob / length**length_penalty`, where `length` is the number of generated
+  tokens. The default (`0.0`) ranks beams by their raw cumulative log-probability, which favors
+  shorter sequences; values above `0.0` favor longer sequences. The `cumulative_logprob` values
+  returned with the outputs remain unnormalized.
+- `beam_search_diversity_rate`: Encourages beams to diverge from each other. During beam
+  expansion, `diversity_rate * source_beam_index` is added to each candidate's ranking score,
+  boosting candidates that expand from lower-ranked beams so that the selected beams do not all
+  descend from the single strongest beam. Here `source_beam_index` is the rank of the beam a
+  candidate expands from among the current step's input beams, ordered by their cumulative
+  log-probability (`0` for the strongest beam, `1` for the next, and so on). The default (`0.0`)
+  disables the adjustment.
+- `early_stopping`: Controls when beam search stops. With the default (`1`), generation ends as
+  soon as `best_of` finished candidates exist. The exhaustive modes (`0`, and other values for
+  intermediate heuristics) keep a pool of finished candidates and continue searching while an
+  unfinished beam could still outscore the worst of them (`0` bounds attainability with the
+  current length; other values with the maximum length when `length_penalty > 0`).
 
 The following example demonstrates beam search with a beam width of 4, returning the top 3 sequences:
 
