@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/groupGemm.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/kernels/splitkGroupGemm.h"
@@ -48,8 +49,9 @@ void _getProblemParams(cublasOperation_t& transa, cublasOperation_t& transb, int
 
 // TODO should reuse the function in gemmPlugin
 void _runGemm(int const M, int const N, int const K, bool const transA, bool const transB,
-    nvinfer1::DataType const type, CublasGemmWrapperPtr const& cublasWrapperPtr, void const* act, void const* weight,
-    void* output, std::optional<cublasLtMatmulHeuristicResult_t> const& heuristic, void* workspace, cudaStream_t stream)
+    tensorrt_llm::DataType const type, CublasGemmWrapperPtr const& cublasWrapperPtr, void const* act,
+    void const* weight, void* output, std::optional<cublasLtMatmulHeuristicResult_t> const& heuristic, void* workspace,
+    cudaStream_t stream)
 {
     cublasWrapperPtr->setStream(stream);
     cublasWrapperPtr->setWorkspace(workspace);
@@ -65,7 +67,8 @@ void _runGemm(int const M, int const N, int const K, bool const transA, bool con
 }
 
 LoraImpl::LoraImpl(int in_hidden_size, std::vector<int> out_hidden_sizes, bool transA, bool transB,
-    int num_lora_modules, nvinfer1::DataType type, int max_low_rank, std::shared_ptr<CublasGemmWrapper> cublasWrapper)
+    int num_lora_modules, tensorrt_llm::DataType type, int max_low_rank,
+    std::shared_ptr<CublasGemmWrapper> cublasWrapper)
     : mInHiddenSize(in_hidden_size)
     , mTransA(transA)
     , mTransB(transB)
@@ -82,16 +85,16 @@ LoraImpl::LoraImpl(int in_hidden_size, std::vector<int> out_hidden_sizes, bool t
 void LoraImpl::setGemmConfig()
 {
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
-    if (mType == nvinfer1::DataType::kHALF)
+    if (mType == tensorrt_llm::DataType::kHALF)
     {
         mCublasWrapper->setFP16GemmConfig();
     }
-    else if (mType == nvinfer1::DataType::kFLOAT)
+    else if (mType == tensorrt_llm::DataType::kFLOAT)
     {
         mCublasWrapper->setFP32GemmConfig();
     }
 #ifdef ENABLE_BF16
-    else if (mType == nvinfer1::DataType::kBF16)
+    else if (mType == tensorrt_llm::DataType::kBF16)
     {
         mCublasWrapper->setBF16GemmConfig();
     }
@@ -121,7 +124,7 @@ int64_t getGemmWorkSpaceSize(int64_t numTokens, int64_t maxLoraModuleNum, int64_
 }
 
 size_t LoraImpl::getWorkspaceSize(
-    int64_t const numTokens, int64_t const numReqs, nvinfer1::DataType const type) const noexcept
+    int64_t const numTokens, int64_t const numReqs, tensorrt_llm::DataType const type) const noexcept
 {
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
     auto const typeSize = tensorrt_llm::common::getDTypeSize(type);

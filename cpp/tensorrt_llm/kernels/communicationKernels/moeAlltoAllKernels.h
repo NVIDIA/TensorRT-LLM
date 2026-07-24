@@ -16,7 +16,7 @@
 
 #pragma once
 #include "tensorrt_llm/common/config.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -174,8 +174,8 @@ struct MoeA2ACombineParams
     // Output tensor
     void* output_data; // Output buffer [local_num_tokens, elements_per_token]
     // Payload information
-    int elements_per_token;   // Number of elements per token
-    nvinfer1::DataType dtype; // Data type of the payload (used for combine kernel dispatch)
+    int elements_per_token;       // Number of elements per token
+    tensorrt_llm::DataType dtype; // Data type of the payload (used for combine kernel dispatch)
     bool
         use_low_precision; // If true, prepare kernel quantizes payload→FP8; combine kernel accumulates FP8→output dtype
 
