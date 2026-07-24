@@ -106,6 +106,19 @@ inline uint32_t getKernelMTileSize(
     return gemmM < 16 ? 16 : 32;
 };
 
+inline uint32_t getSpecDecHmmaMTileSize(uint32_t headGrpSize, uint32_t qSeqLen)
+{
+    return getKernelMTileSize(headGrpSize, /*isSpecDec=*/true, qSeqLen, /*supportQGMMA=*/false, /*supportMLA=*/false);
+}
+
+inline uint32_t getSpecDecHmmaTokenBlocksPerGroup(uint32_t headGrpSize, uint32_t qSeqLen)
+{
+    uint32_t const mTileSize = getSpecDecHmmaMTileSize(headGrpSize, qSeqLen);
+    TLLM_CHECK_WITH_INFO(mTileSize > 0U, "Spec-dec HMMA M tile size must be positive.");
+    uint32_t const headTokens = qSeqLen * headGrpSize;
+    return (headTokens + mTileSize - 1U) / mTileSize;
+}
+
 inline XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams, int SM)
 {
     unsigned int headSize = xqaParams.head_size;

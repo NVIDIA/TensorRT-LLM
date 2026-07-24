@@ -40,9 +40,24 @@ def update_quant_config_from_compressed_tensors(
     weights_quant_config = group_config["weights"]
     inputs_quant_config = group_config["input_activations"]
     weights_quant_strategy = weights_quant_config["strategy"]
-    inputs_quant_strategy = inputs_quant_config["strategy"]
 
-    if weights_quant_config["num_bits"] == 8:
+    if inputs_quant_config is None:
+        is_w4a16_nvfp4 = (
+            hf_quant_config.get("format") == "nvfp4-pack-quantized"
+            and weights_quant_config["num_bits"] == 4
+            and weights_quant_config.get("type") == "float"
+            and weights_quant_strategy == "tensor_group"
+            and weights_quant_config.get("group_size") == 16
+        )
+        if not is_w4a16_nvfp4:
+            raise ValueError(
+                "input_activations=None is only supported for W4A16 NVFP4 "
+                "with 4-bit float weights and group_size=16."
+            )
+        quant_config.quant_algo = QuantAlgo.W4A16_NVFP4
+        quant_config.group_size = 16
+    elif weights_quant_config["num_bits"] == 8:
+        inputs_quant_strategy = inputs_quant_config["strategy"]
         if weights_quant_strategy == "channel":
             if inputs_quant_strategy != "token":
                 raise ValueError(f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}.")
@@ -68,6 +83,7 @@ def update_quant_config_from_compressed_tensors(
         and weights_quant_config.get("type") == "float"
         and weights_quant_strategy == "tensor_group"
     ):
+        inputs_quant_strategy = inputs_quant_config["strategy"]
         # llm-compressor NVFP4: weights FP4 with FP8 per-group scales
         # (group_size=16), scaled by an FP32 global scale.
         if inputs_quant_strategy != "tensor_group":

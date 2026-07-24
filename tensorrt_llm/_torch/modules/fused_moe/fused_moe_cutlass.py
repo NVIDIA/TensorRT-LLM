@@ -914,6 +914,8 @@ class CutlassFusedMoE(MoE):
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
+            elif self.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+                return W4A16NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(

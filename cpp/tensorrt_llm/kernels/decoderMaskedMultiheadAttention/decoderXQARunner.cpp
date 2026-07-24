@@ -423,10 +423,8 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
         // MultiQueryTokens (generation_input_length > 1) need extra parameters (like qSeqLen, headGrpSize, and
         // mask). Input parameters for MultiQueryTokens kernels.
         unsigned int headGrpSize = numQHeadsOverKV;
-        // Use mTileSize = 16 kernels when qSeqLen <= 16.
         unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
-        unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
-        unsigned int nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, mTileSize);
+        unsigned int nbTokenBlocksPerGrp = getSpecDecHmmaTokenBlocksPerGroup(headGrpSize, qSeqLen);
         unsigned int maxQSeqLen = xqaParams.spec_decoding_is_generation_length_variable ? // true for ReDrafter
             xqaParams.spec_decoding_max_generation_length
                                                                                         : qSeqLen;

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -2552,6 +2552,7 @@ CUBIN_EXPORT __global__
 
         // merge results from different warp groups
         SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(outTile, inputElemSize == 2 && cacheElemSize == 1);
+        bool writeOutput = !isMultiBlock;
         if (isMultiBlock)
         {
             static_assert(ctaShapeInWarps.y == 1, "not implemented");
@@ -2626,6 +2627,7 @@ CUBIN_EXPORT __global__
             bool const isLastCta = mbsmem.isLastCta;
             if (isLastCta)
             {
+                writeOutput = true;
                 MultiBlockSMem::MBBuf& mbbuf = mbsmem.storage[warpIdx.y];
                 SMemWarpRowMax& smemRowMax = reinterpret_cast<SMemWarpRowMax&>(smem);
                 // get row max.
@@ -2714,7 +2716,7 @@ CUBIN_EXPORT __global__
                 smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
             }
         }
-        if (warpGrpIdx == 0)
+        if (warpGrpIdx == 0 && writeOutput)
         {
 #if SPEC_DEC
             copyOutputToGlobalMem(warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize,

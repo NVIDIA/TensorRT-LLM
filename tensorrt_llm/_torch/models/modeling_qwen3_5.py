@@ -391,12 +391,11 @@ def _lm_head_nvfp4_enabled(model_config):
     """Whether the checkpoint's quantized lm_head should stay quantized.
 
     ModelOpt MIXED_PRECISION exports for Qwen3.5/3.6 quantize lm_head to
-    W4A16_NVFP4 (packed FP4 weight + per-group FP8 scales).  On SM100/103 the
-    NVFP4 (W4A4) Linear path can consume it directly, cutting the lm_head
-    GEMM's weight traffic 4x vs the bf16 dequant fallback -- the decode
-    lm_head is purely weight-bandwidth-bound.  Conditions mirror what the
-    quantized LMHead supports (see LMHead.__init__ guards) plus the paths
-    that bypass the Linear machinery entirely:
+    W4A16_NVFP4 (packed FP4 weight + per-group FP8 scales). On SM100/103 the
+    NVFP4 (W4A4) Linear path consumes it; on SM120/121 the W4A16 Linear path
+    consumes it directly. Both avoid the bf16 dequant fallback and cut lm_head
+    weight traffic 4x. Conditions mirror what the quantized LMHead supports
+    (see LMHead.__init__ guards) plus paths that bypass Linear entirely:
 
     - tie_word_embeddings shares the weight with the embedding lookup, which
       needs a dense bf16 weight;
@@ -415,7 +414,7 @@ def _lm_head_nvfp4_enabled(model_config):
     return (
         cfg is not None
         and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
-        and get_sm_version() in (100, 103)
+        and get_sm_version() in (100, 103, 120, 121)
         and not getattr(pretrained, "tie_word_embeddings", False)
         and not mapping.enable_attention_dp
         and getattr(pretrained, "vocab_size", 0) % mapping.tp_size == 0
@@ -507,10 +506,11 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
     shared scale (_requantize_linear_attn_fp8_qkvz).  Incomplete or non-FP8
     sets get no fused entry, and the mapper dequantizes them to bf16 instead.
 
-    The ``lm_head`` entry is promoted W4A16_NVFP4 -> NVFP4 when
-    ``keep_lm_head_quant`` (see _lm_head_nvfp4_enabled) and dropped otherwise:
-    a leftover entry would make DecoderModelForCausalLM build a quantized
-    LMHead whose weights the mapper had already dequantized to bf16.
+    When ``keep_lm_head_quant`` is true (see _lm_head_nvfp4_enabled), the
+    ``lm_head`` entry is promoted W4A16_NVFP4 -> NVFP4 on SM100/103 and remains
+    W4A16_NVFP4 on SM120/121. It is dropped otherwise: a leftover entry would
+    make DecoderModelForCausalLM build a quantized LMHead whose weights the
+    mapper had already dequantized to bf16.
     """
     qcd = getattr(model_config, "quant_config_dict", None)
     if not qcd:
@@ -528,7 +528,9 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
             continue
         if name == "lm_head":
             if keep_lm_head_quant:
-                normalized[name] = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
+                if convert_to_nvfp4:
+                    cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
+                normalized[name] = cfg
             else:
                 # Make the fallback visible: the checkpoint quantizes lm_head
                 # but this configuration can't keep it quantized (see
@@ -536,7 +538,7 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
                 logger.info(
                     f"lm_head quant entry ({cfg.quant_algo}) dropped: "
                     "unsupported configuration for quantized LMHead "
-                    "(requires SM100/103, untied embeddings, no attention-DP, "
+                    "(requires SM100/103/120/121, untied embeddings, no attention-DP, "
                     "vocab divisible by tp_size); lm_head runs bf16"
                 )
             continue

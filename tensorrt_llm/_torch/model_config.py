@@ -330,9 +330,11 @@ class ModelConfig(Generic[TConfig]):
         # once ModelType is used in pytorch flow.
 
     @staticmethod
-    def resolve_moe_backend(moe_backend: str,
-                            architecture: str,
-                            quant_config: Optional[QuantConfig] = None) -> str:
+    def resolve_moe_backend(
+            moe_backend: str,
+            architecture: str,
+            quant_config: Optional[QuantConfig] = None,
+            layer_quant_config: Optional[Dict[str, QuantConfig]] = None) -> str:
         """Resolve AUTO moe_backend to a specific backend based on model architecture.
 
         Args:
@@ -346,6 +348,15 @@ class ModelConfig(Generic[TConfig]):
         """
         if moe_backend.upper() != "AUTO":
             return moe_backend
+
+        is_w4a16_nvfp4 = (quant_config is not None and quant_config.quant_algo
+                          in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4"))
+        if not is_w4a16_nvfp4 and layer_quant_config is not None:
+            is_w4a16_nvfp4 = any(config.quant_algo in (QuantAlgo.W4A16_NVFP4,
+                                                       "W4A16_NVFP4")
+                                 for config in layer_quant_config.values())
+        if is_w4a16_nvfp4 and get_sm_version() in (120, 121):
+            return "CUTEDSL"
 
         if architecture in _DEEPSEEK_V4_ARCHITECTURES:
             sm_version = get_sm_version()
@@ -441,12 +452,15 @@ class ModelConfig(Generic[TConfig]):
             quant_config.exclude_modules = json_quant_configs.get(
                 'exclude_modules', quant_config.exclude_modules)
 
+            w4a16_nvfp4_group_size = None
             for layer in mixed_quant_configs:
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
                 config.quant_algo = QuantAlgo(layer_cfg['quant_algo'])
                 config.group_size = layer_cfg.get('group_size', None)
+                if config.quant_algo == QuantAlgo.W4A16_NVFP4:
+                    w4a16_nvfp4_group_size = config.group_size or 16
                 # AWQ-specific extras emitted by modelopt per-layer.
                 if 'has_zero_point' in layer_cfg:
                     config.has_zero_point = layer_cfg['has_zero_point']
@@ -454,6 +468,9 @@ class ModelConfig(Generic[TConfig]):
                     config.pre_quant_scale = layer_cfg['pre_quant_scale']
                 mixed_quant_configs[layer] = config
             layer_quant_config = mixed_quant_configs
+            if w4a16_nvfp4_group_size is not None:
+                quant_config.quant_algo = None
+                quant_config.group_size = w4a16_nvfp4_group_size
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:
                 quant_config.group_size = 128
@@ -1179,7 +1196,7 @@ class ModelConfig(Generic[TConfig]):
             requested_moe_backend,
             architecture,
             quant_config=quant_config,
-        )
+            layer_quant_config=layer_quant_config)
 
         if architecture in _DEEPSEEK_V4_ARCHITECTURES:
             layer_quant_config = cls._set_deepseek_v4_routed_moe_quant_config(

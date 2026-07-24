@@ -1165,6 +1165,16 @@ def _register_fake():
         n = mat_b.shape[0]
         return mat_a.new_empty((m, n), dtype=out_dtype)
 
+    @torch.library.register_fake("trtllm::w4a16_nvfp4_gemm")
+    def _(act: torch.Tensor,
+          weight: torch.Tensor,
+          weight_scale: torch.Tensor,
+          weight_scale_2: torch.Tensor,
+          out_dtype: Optional[torch.dtype],
+          bias: Optional[torch.Tensor] = None):
+        del weight_scale, weight_scale_2, bias
+        return act.new_empty((act.shape[0], weight.shape[0]), dtype=out_dtype)
+
     @torch.library.register_fake("trtllm::marlin_nvfp4_gemm")
     def _(mat_a: torch.Tensor,
           mat_b: torch.Tensor,

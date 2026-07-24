@@ -118,6 +118,25 @@ inline const AlgoListType fp8_algo_list = {
     // Llama-3.3-70B TP4 (this is the default algo on B200. Here we aim to use the same algo on GB200.)
     // [-algo66 -m_tile393 -m_stages36 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom1 -m_mma0 -m_cga4 -m_scheduling1]
     {{8, 8192, 14336}, {66, 393, 36, 1, 0, 1, 1, 4}},
+
+    // Qwen3.6-35B-A3B-NVFP4 on GB10 (sm_121), FP8 per-tensor projections. Output is BF16; the FP8
+    // branch of find_special_algo is output-dtype-agnostic so these match. Shapes are the ACTUAL
+    // runtime cuBLASLt inventory from the DEBUG log (1330 calls, all previously missing) -- NOT
+    // derived from weight headers (TRT-LLM FUSES qkv+z and gate+up, so derived dims were wrong).
+    // NVJET algos chosen via cublasTest matmulFind + -T200 -Tme20p retime, validated at M=1/4/8.
+    // Swept against the RUNTIME cuBLASLt (CUDA 13.1, libcublasLt.so.13.2.1.1) -- NVJET tile/custom
+    // configs are version-specific, valid only for that cuBLASLt generation. Qwen3.6-specific keys.
+    // [-algo67 -m_tile6 -m_stages38 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom16 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 2048, 12288},
+        {67, 6, 38, 1, 0, 0, 16, 0}}, // GDN in_proj qkv+z fused (x210 in log): heur 61.5->51.3us (robust across M)
+    // [-algo67 -m_tile3 -m_stages38 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom114 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 2048, 256}, {67, 3, 38, 1, 0, 0, 114, 0}}, // k/v proj n=256 (x280 in log): heur 8.35->6.08us (M1)
+    // [-algo67 -m_tile10 -m_stages37 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom28 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 2048, 9216},
+        {67, 10, 37, 1, 0, 0, 28, 0}}, // shared_expert gate+up fused (x70 in log): heur 49/110->24.8us (M1/-80% M4)
+    // [-algo67 -m_tile10 -m_stages36 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom29 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 4096, 2048},
+        {67, 10, 36, 1, 0, 0, 29, 0}}, // out_proj/down_proj K=4096 (x280 in log): heur 22.5->12.3us (-45%)
 };
 
 } // namespace cublas_lut

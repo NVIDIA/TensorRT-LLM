@@ -23,6 +23,8 @@ correctness of the b12x kernel is covered by end-to-end model tests on
 SM120/SM121 hardware.
 """
 
+import sys
+import types
 from unittest.mock import patch
 
 import pytest
@@ -33,6 +35,12 @@ from tensorrt_llm._torch.modules.fused_moe.create_moe import get_moe_cls
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.quantization import (
+    NVFP4CuteDslB12xFusedMoEMethod,
+    NVFP4CutlassFusedMoEMethod,
+)
+from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 _FUSED_MOE_MODULE = "tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x"
@@ -51,6 +59,14 @@ def test_can_implement_rejects_unsupported_sm(sm_version):
 def test_can_implement_accepts_supported_sm_with_nvfp4(sm_version):
     with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=sm_version):
         ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.NVFP4)
+    assert ok
+    assert reason is None
+
+
+@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
+def test_can_implement_accepts_supported_sm_with_w4a16_nvfp4(sm_version):
+    with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=sm_version):
+        ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.W4A16_NVFP4)
     assert ok
     assert reason is None
 
@@ -130,6 +146,16 @@ def test_get_moe_cls_cutedsl_returns_plain_cutedsl_on_unsupported_sm():
     assert cls is CuteDslFusedMoE
 
 
+def test_get_moe_cls_cutedsl_returns_cutlass_for_w4a16_nvfp4_on_unsupported_sm():
+    """CUTEDSL + W4A16_NVFP4 + non-SM120/121 → CutlassFusedMoE."""
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTEDSL"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+    with patch("tensorrt_llm._utils.get_sm_version", return_value=100):
+        cls = get_moe_cls(cfg)
+    assert cls is CutlassFusedMoE
+
+
 @pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
 def test_get_moe_cls_cutedsl_selects_b12x_on_supported_sm(sm_version):
     """CUTEDSL + NVFP4 + SM120/121 + flashinfer importable → CuteDslB12xFusedMoE."""
@@ -139,6 +165,57 @@ def test_get_moe_cls_cutedsl_selects_b12x_on_supported_sm(sm_version):
     with patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version):
         cls = get_moe_cls(cfg)
     assert cls is CuteDslB12xFusedMoE
+
+
+@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
+def test_get_moe_cls_cutedsl_selects_b12x_for_w4a16_nvfp4_on_supported_sm(sm_version):
+    """CUTEDSL + W4A16_NVFP4 + SM120/121 + flashinfer importable → CuteDslB12xFusedMoE."""
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTEDSL"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+    with patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version):
+        cls = get_moe_cls(cfg)
+    assert cls is CuteDslB12xFusedMoE
+
+
+@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
+def test_get_moe_cls_cutedsl_selects_b12x_for_layer_w4a16_nvfp4_on_supported_sm(sm_version):
+    """MIXED_PRECISION per-layer W4A16 must select the same backend that the
+    layer will use after apply_layerwise_quant_config().
+    """
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTEDSL"
+    cfg.quant_config = QuantConfig()
+    cfg.quant_config_dict = {
+        "model.layers.0.mlp.experts": QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16),
+    }
+    with patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version):
+        cls = get_moe_cls(cfg, layer_idx=0)
+    assert cls is CuteDslB12xFusedMoE
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        Mapping(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2),
+        Mapping(
+            world_size=2,
+            tp_size=2,
+            enable_attention_dp=True,
+            dwdp_size=2,
+            dwdp_rank=0,
+        ),
+    ],
+)
+def test_get_moe_cls_cutedsl_falls_back_to_cutlass_for_distributed_b12x(mapping):
+    cfg = ModelConfig(mapping=mapping)
+    cfg.moe_backend = "CUTEDSL"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+
+    with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
+        cls = get_moe_cls(cfg)
+
+    assert cls is CutlassFusedMoE
 
 
 def test_get_moe_cls_cutedsl_falls_back_to_plain_cutedsl_when_flashinfer_missing(monkeypatch):
@@ -198,6 +275,114 @@ def test_dispatch_decode_shape_takes_b12x():
     stub = _RoutePredicateStub()
     x = torch.empty(1, 1024)
     assert stub._route_to_cutlass(x) is False
+
+
+def test_w4a16_nvfp4_prefill_quantize_input_stays_on_b12x():
+    moe = object.__new__(CuteDslB12xFusedMoE)
+    moe.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+    x = torch.empty(CuteDslB12xFusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD, 1024)
+
+    with patch.object(
+        CutlassFusedMoE,
+        "quantize_input",
+        side_effect=AssertionError("W4A16_NVFP4 prefill must not route through CUTLASS"),
+    ):
+        out, out_sf = CuteDslB12xFusedMoE.quantize_input(moe, x)
+
+    assert out is x
+    assert out_sf is None
+
+
+def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
+    class _RoutingMethod:
+        experts_per_token = 4
+
+    class _FakeB12xWrapper:
+        calls = []
+
+        def __init__(self, **kwargs):
+            self._moe_output = None
+            self.calls.append(kwargs)
+
+    def _convert_sf_to_mma_layout(scales, *, m, k, num_groups):
+        return scales
+
+    flashinfer = types.ModuleType("flashinfer")
+    flashinfer.B12xMoEWrapper = _FakeB12xWrapper
+    cute_dsl = types.ModuleType("flashinfer.cute_dsl")
+    utils = types.ModuleType("flashinfer.cute_dsl.utils")
+    utils.convert_sf_to_mma_layout = _convert_sf_to_mma_layout
+    monkeypatch.setitem(sys.modules, "flashinfer", flashinfer)
+    monkeypatch.setitem(sys.modules, "flashinfer.cute_dsl", cute_dsl)
+    monkeypatch.setitem(sys.modules, "flashinfer.cute_dsl.utils", utils)
+
+    num_experts = 2
+    hidden_size = 128
+    logical_intermediate_size = 1856
+    padded_intermediate_size = 1920
+    module = torch.nn.Module()
+    module.num_experts = num_experts
+    module.hidden_size = hidden_size
+    module.intermediate_size_per_partition = logical_intermediate_size
+    module.moe_max_num_tokens = 8
+    module.routing_method = _RoutingMethod()
+    module.activation_type = ActivationType.Swiglu
+    module.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+    module.w3_w1_weight = torch.empty(
+        num_experts,
+        2 * padded_intermediate_size,
+        hidden_size // 16,
+        dtype=torch.int64,
+    )
+    module.w2_weight = torch.empty(
+        num_experts,
+        hidden_size,
+        padded_intermediate_size // 16,
+        dtype=torch.int64,
+    )
+    w3_w1_weight_scale = torch.ones(
+        num_experts,
+        2 * padded_intermediate_size,
+        hidden_size // 16,
+        dtype=torch.float8_e4m3fn,
+    )
+    w2_weight_scale = torch.ones(
+        num_experts,
+        hidden_size,
+        padded_intermediate_size // 16,
+        dtype=torch.float8_e4m3fn,
+    )
+    module.w3_w1_weight_scale = w3_w1_weight_scale.clone()
+    module.w2_weight_scale = w2_weight_scale.clone()
+    module.fc31_alpha = torch.tensor([0.25, 0.5], dtype=torch.float32)
+    module.fc2_alpha = torch.tensor([0.125, 0.25], dtype=torch.float32)
+    module.fc31_input_scale = torch.tensor(2.0, dtype=torch.float32)
+    module.fc2_input_scale = torch.tensor(4.0, dtype=torch.float32)
+
+    with patch.object(NVFP4CutlassFusedMoEMethod, "transform_weights", return_value=None):
+        NVFP4CuteDslB12xFusedMoEMethod().transform_weights(module)
+
+    assert _FakeB12xWrapper.calls
+    wrapper_kwargs = _FakeB12xWrapper.calls[0]
+    assert wrapper_kwargs.get("quant_mode") == "w4a16", wrapper_kwargs
+    assert wrapper_kwargs["intermediate_size"] == padded_intermediate_size
+    assert module._b12x_weights["fc2_input_scale"] is None
+    assert torch.equal(
+        module._b12x_weights["w1_weight_sf"].float(),
+        w3_w1_weight_scale.float(),
+    )
+    assert torch.equal(
+        module._b12x_weights["w2_weight_sf"].float(),
+        w2_weight_scale.float(),
+    )
+    assert torch.allclose(
+        module._b12x_weights["w1_alpha"],
+        torch.tensor([0.5, 1.0], dtype=torch.float32),
+    )
+    assert torch.allclose(
+        module._b12x_weights["w2_alpha"],
+        torch.tensor([0.5, 1.0], dtype=torch.float32),
+    )
 
 
 def test_dispatch_rejects_non_tensor():

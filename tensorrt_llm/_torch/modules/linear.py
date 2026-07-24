@@ -400,6 +400,9 @@ class LinearMethodBase(ABC):
     def transform_weights(self, module: Linear) -> None:
         return None
 
+    def cache_derived_state(self, module: Linear) -> None:
+        return None
+
     def post_load_weights(self, module: Linear) -> None:
         self.transform_weights(module)
 
@@ -1961,33 +1964,115 @@ class NVFP4LinearMethod(LinearMethodBase):
 
 
 class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
-    """W4A16 dequant fallback for NVFP4 on SM<100. Only used by
-    modeling_nemotron_h.  ``apply_linear_allreduce`` is inherited unchanged:
-    its fused path is SM>=100-gated upstream.
-    """
+    """W4A16 NVFP4 linear with a small-M CUDA-core fast path."""
+
+    CUDA_CORE_MAX_M: ClassVar[int] = 16
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        module.scaling_vector_size = 16
+        assert in_features % module.scaling_vector_size == 0, (
+            f"in_features {in_features} must be divisible by scaling_vector_size "
+            f"{module.scaling_vector_size}")
+
+        module.weight = Parameter(torch.empty([out_features, in_features // 2],
+                                              dtype=fp4_utils.float4_e2m1x2),
+                                  requires_grad=False)
+
+        nrows = fp4_utils.pad_up(out_features, 128)
+        ncols = fp4_utils.pad_up(in_features // module.scaling_vector_size, 4)
+        module.weight_scale = Parameter(torch.empty(
+            [nrows * ncols], dtype=fp4_utils.float4_sf_dtype),
+                                        requires_grad=False)
+        module.weight_scale_2 = Parameter(torch.empty([1], dtype=torch.float32),
+                                          requires_grad=False)
+
+        module.input_scale = None
+        module.inv_input_scale = None
+        module.alpha = None
+        module.pre_quant_scale = None
+        module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                     requires_grad=False)
+        module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
+
+        if bias:
+            module.bias = Parameter(torch.empty((out_features), dtype=dtype),
+                                    requires_grad=False)
+        else:
+            module.register_parameter("bias", None)
+
+    def _process_weights_without_static_activation_scale(
+            self, module: Linear, process_fn):
+        original_input_scale = module.input_scale
+        original_inv_input_scale = module.inv_input_scale
+        original_alpha = module.alpha
+        had_scalar_alpha = hasattr(module, "scalar_alpha")
+        original_scalar_alpha = getattr(module, "scalar_alpha", None)
+
+        device = module.weight_scale_2.device
+        module.input_scale = Parameter(torch.empty([1],
+                                                   dtype=torch.float32,
+                                                   device=device),
+                                       requires_grad=False)
+        module.inv_input_scale = Parameter(torch.empty([1],
+                                                       dtype=torch.float32,
+                                                       device=device),
+                                           requires_grad=False)
+        module.alpha = Parameter(torch.empty([1],
+                                             dtype=torch.float32,
+                                             device=device),
+                                 requires_grad=False)
+        try:
+            process_fn(module)
+        finally:
+            module.input_scale = original_input_scale
+            module.inv_input_scale = original_inv_input_scale
+            module.alpha = original_alpha
+            if had_scalar_alpha:
+                module.scalar_alpha = original_scalar_alpha
+            elif hasattr(module, "scalar_alpha"):
+                delattr(module, "scalar_alpha")
+
+    def process_weights_after_loading_vanilla(self, module: Linear):
+        self._process_weights_without_static_activation_scale(
+            module,
+            super().process_weights_after_loading_vanilla)
+
+    def process_weights_after_loading_fused_qkv_linear(self, module: Linear):
+        self._process_weights_without_static_activation_scale(
+            module,
+            super().process_weights_after_loading_fused_qkv_linear)
+
+    def process_weights_after_loading_fused_gate_up_linear(
+            self, module: Linear):
+        self._process_weights_without_static_activation_scale(
+            module,
+            super().process_weights_after_loading_fused_gate_up_linear)
 
     def transform_weights(self, module: Linear) -> None:
-        # Skip parent's 32x16 weight padding (apply() accepts [N, K/2] as-is)
-        # and un-swizzle per-block scale once at load.
+        # Keep the checkpoint layout for the CUDA-core path and materialize the
+        # much smaller linear scale view once for Triton dequantization.
         LinearMethodBase.transform_weights(self, module)
+        self.cache_derived_state(module)
+
+    def cache_derived_state(self, module: Linear) -> None:
         pad_rows = fp4_utils.pad_up(module.out_features, 128)
         pad_cols = fp4_utils.pad_up(
             module.in_features // module.scaling_vector_size, 4)
         scale_swizzled = module.weight_scale.data.view(
             fp4_utils.float4_sf_dtype).reshape(pad_rows, pad_cols)
-        scale_linear = torch.ops.trtllm.block_scale_interleave_reverse(
-            scale_swizzled)
-        module.weight_scale.data.view(fp4_utils.float4_sf_dtype).copy_(
-            scale_linear.reshape(-1))
+        module._w4a16_weight_scale_linear = (
+            torch.ops.trtllm.block_scale_interleave_reverse(
+                scale_swizzled).reshape(-1))
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    @staticmethod
+    def _prepare_input(module: Linear, input: torch.Tensor):
         if isinstance(input, (Fp4QuantizedTensor, tuple)):
             raise RuntimeError(
-                "W4A16NVFP4LinearMethod: hp input required; disable upstream "
-                "FP4 fusion (e.g. TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0)")
+                "W4A16NVFP4LinearMethod requires a high-precision input; "
+                "disable upstream FP4 fusion")
 
-        ## FP8 input from upstream FMHA pre-quant: invert by / module.inv_input_scale.
         if input.dtype == torch.float8_e4m3fn:
             assert module.inv_input_scale is not None, \
                 "W4A16NVFP4LinearMethod: FP8 input requires static inv_input_scale"
@@ -1999,32 +2084,67 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
             original_shape = input.shape
             input = input.reshape(-1, input.shape[-1])
 
-        # NVFP4_AWQ pre_quant_scale (mirrors parent's _input_prepare branch).
         if module.pre_quant_scale is not None:
-            assert input.dtype == module.pre_quant_scale.dtype, (
-                "Input dtype and pre_quant_scale dtype must match")
+            assert input.dtype == module.pre_quant_scale.dtype, \
+                "Input dtype and pre_quant_scale dtype must match"
             input = input * module.pre_quant_scale
+        return input, original_shape
+
+    @classmethod
+    def _can_use_cuda_core(cls, module: Linear, input: torch.Tensor) -> bool:
+        return (input.dim() == 2 and 0 < input.shape[0] <= cls.CUDA_CORE_MAX_M
+                and get_sm_version() in (120, 121)
+                and input.dtype in (torch.float16, torch.bfloat16)
+                and module.dtype in (torch.float16, torch.bfloat16)
+                and input.is_contiguous() and input.shape[1] % 32 == 0
+                and module.weight.shape[0] % 2 == 0
+                and module.weight.shape[1] * 2 == input.shape[1]
+                and hasattr(torch.ops.trtllm, "w4a16_nvfp4_gemm"))
+
+    @staticmethod
+    def _restore_output(output: torch.Tensor, original_shape,
+                        bias: Optional[torch.Tensor]):
+        if original_shape is not None:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        input, original_shape = self._prepare_input(module, input)
+        if self._can_use_cuda_core(module, input):
+            output = torch.ops.trtllm.w4a16_nvfp4_gemm(
+                input,
+                module.weight,
+                module.weight_scale,
+                module.weight_scale_2,
+                module.dtype,
+                bias=None,
+            )
+            return self._restore_output(output, original_shape, bias)
 
         from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import \
             dequant_nvfp4_2d_triton
         weight_deq = dequant_nvfp4_2d_triton(
             module.weight.view(torch.uint8),
-            module.weight_scale,
+            module._w4a16_weight_scale_linear,
             module.weight_scale_2,
             target_dtype=module.dtype,
             sf_vec_size=module.scaling_vector_size,
         )
 
-        if module.use_custom_cublas_mm:
+        if getattr(module, "use_custom_cublas_mm", False):
             output_buffer_kind = (
                 int(BufferKind.NCCL_WINDOW)
                 if self.supports_nccl_symmetric_memory_window_output
-                and module.all_reduce is not None
+                and getattr(module, "all_reduce", None) is not None
                 and module.all_reduce.uses_nccl_symmetric_memory_window() else
                 int(BufferKind.DEFAULT))
-            group = (module.mapping.tp_group
+            mapping = getattr(module, "mapping", None)
+            group = (mapping.tp_group
                      if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
-                     and module.mapping is not None else None)
+                     and mapping is not None else None)
             output = torch.ops.trtllm.cublas_mm(
                 input,
                 weight_deq.t(),
@@ -2035,10 +2155,122 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
             )
         else:
             output = F.linear(input, weight_deq, bias)
+        return self._restore_output(output, original_shape, bias=None)
 
-        if original_shape is not None:
-            output = output.reshape(*original_shape[:-1], output.shape[-1])
-        return output
+
+class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
+    """W4A16 NVFP4 linear backed by Marlin."""
+
+    @staticmethod
+    def is_supported(module: Linear) -> bool:
+        return (get_sm_version() in (120, 121)
+                and getattr(module, "dtype", None) == torch.bfloat16
+                and not getattr(module, "use_fused_gemm_allreduce", False)
+                and hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
+                and hasattr(torch.ops.trtllm, "gptq_marlin_repack"))
+
+    def transform_weights(self, module: Linear) -> None:
+        from tensorrt_llm.quantization.utils import marlin_utils
+
+        weight = module.weight.data
+        weight_scale = module.weight_scale.data
+        size_n = module.out_features
+        size_k = module.in_features
+        group_size = module.scaling_vector_size
+
+        assert size_k % group_size == 0, (
+            f"size_k {size_k} must be divisible by group_size {group_size}")
+
+        size_k_pad = fp4_utils.pad_up(size_k, 64)
+        size_n_pad = fp4_utils.pad_up(size_n, 128)
+        num_groups = size_k // group_size
+        scale_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+            weight_scale.view(size_n_pad, -1))
+        scale_2d = scale_unswizzled[:size_n, :num_groups]
+
+        if size_k_pad != size_k or size_n_pad != size_n:
+            num_groups_pad = size_k_pad // group_size
+            weight = F.pad(weight,
+                           (0,
+                            (size_k_pad - size_k) // 2, 0, size_n_pad - size_n))
+            # Marlin's S0E5M3 fast dequantization requires a non-zero scale for
+            # zero-weight K padding. 0x08 is the smallest normal E4M3 value.
+            scale_2d = F.pad(scale_2d, (0, num_groups_pad - num_groups),
+                             value=0x08)
+            scale_2d = F.pad(scale_2d, (0, 0, 0, size_n_pad - size_n), value=0)
+
+        qweight_int32 = weight.view(torch.int32).T.contiguous()
+        perm = torch.empty(0, dtype=torch.int32, device=weight.device)
+        marlin_weight = torch.ops.trtllm.gptq_marlin_repack(
+            b_q_weight=qweight_int32,
+            perm=perm,
+            size_k=size_k_pad,
+            size_n=size_n_pad,
+            num_bits=4,
+            is_a_8bit=False,
+        )
+
+        scale_2d = scale_2d.view(torch.float8_e4m3fn).T.contiguous()
+        marlin_scale = marlin_utils.marlin_permute_scales(scale_2d.to(
+            torch.half),
+                                                          size_k_pad,
+                                                          size_n_pad,
+                                                          group_size=group_size)
+        marlin_scale = marlin_utils.nvfp4_marlin_process_scales(marlin_scale)
+
+        weight_scale_2 = module.weight_scale_2.data
+        if (weight_scale_2.numel() == 0
+                or not torch.isfinite(weight_scale_2).all()
+                or weight_scale_2.item() == 0):
+            weight_scale_2 = torch.tensor([1.0],
+                                          dtype=torch.float32,
+                                          device=weight.device)
+        weight_global_scale = marlin_utils.nvfp4_marlin_process_global_scale(
+            weight_scale_2.to(torch.bfloat16))
+
+        module.weight = Parameter(marlin_weight, requires_grad=False)
+        module.weight_scale = Parameter(marlin_scale, requires_grad=False)
+        module.weight_global_scale = Parameter(weight_global_scale,
+                                               requires_grad=False)
+        self.cache_derived_state(module)
+
+    def cache_derived_state(self, module: Linear) -> None:
+        module._marlin_size_k = fp4_utils.pad_up(module.in_features, 64)
+        module._marlin_size_n = fp4_utils.pad_up(module.out_features, 128)
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        input, original_shape = self._prepare_input(module, input)
+        size_k = module.in_features
+        size_n = module.out_features
+        size_k_pad = getattr(module, "_marlin_size_k", size_k)
+        size_n_pad = getattr(module, "_marlin_size_n", size_n)
+
+        input_bf16 = input.bfloat16()
+        if size_k_pad != size_k:
+            input_bf16 = F.pad(input_bf16, (0, size_k_pad - size_k))
+        output = torch.ops.trtllm.marlin_nvfp4_gemm(
+            input_bf16,
+            module.weight,
+            scale_a=None,
+            scale_b=module.weight_scale,
+            alpha=None,
+            weight_global_scale=module.weight_global_scale,
+            bias=None,
+            out_dtype=module.dtype,
+            size_n=size_n_pad,
+            size_k=size_k_pad,
+            output_buffer_kind=int(BufferKind.DEFAULT),
+        )
+        if size_n_pad != size_n:
+            output = output[..., :size_n].contiguous()
+        return self._restore_output(output, original_shape, bias)
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int]):
+        raise RuntimeError(
+            "MarlinNVFP4LinearMethod does not support apply_linear_allreduce")
 
 
 class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
@@ -2895,124 +3127,6 @@ class W4A8MXFP4MXFP8LinearMethod(W4A8MXFP4FP8LinearMethod):
         return output
 
 
-class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
-    """NVFP4 Linear method backed by the Marlin W4A16 kernel (Hopper only)."""
-
-    def transform_weights(self, module: Linear) -> None:
-        from tensorrt_llm.quantization.utils import marlin_utils
-
-        weight = module.weight.data
-        weight_scale = module.weight_scale.data
-        size_n = module.out_features
-        size_k = module.in_features
-        group_size = module.scaling_vector_size  # 16
-
-        assert size_k % group_size == 0, (
-            f"size_k {size_k} must be divisible by group_size {group_size}")
-
-        size_k_pad = fp4_utils.pad_up(size_k, 64)
-        size_n_pad = fp4_utils.pad_up(size_n, 128)
-
-        num_groups = size_k // group_size
-        n_padded = size_n_pad
-        scale_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-            weight_scale.view(n_padded, -1))
-        # [size_n, num_groups] block scales; uint8 storage (reverse interleave),
-        # reinterpreted as E4M3 after any padding. Pad in uint8 since F.pad does
-        # not support float8.
-        scale_2d = scale_unswizzled[:size_n, :num_groups]
-
-        if size_k_pad != size_k or size_n_pad != size_n:
-            num_groups_pad = size_k_pad // group_size
-            # weight: [N, K/2] uint8 -> [N_pad, K_pad/2] (FP4 zero == 0.0)
-            weight = F.pad(weight,
-                           (0,
-                            (size_k_pad - size_k) // 2, 0, size_n_pad - size_n))
-            # scales: [N, num_groups] -> [N_pad, num_groups_pad].
-            # The Marlin S0E5M3 fast-dequant is NOT zero-safe: a zero scale on
-            # a (zero-weight) padded K-group still corrupts that tile's output.
-            # Since K is the contraction dim, one bad group-scale poisons every
-            # output row, so padded K-groups must carry a valid non-zero fp8
-            # scale -- use the smallest-normal e4m3 value (0x08), matching the
-            # quantizer's own zero-block scale. N-row padding is sliced off in
-            # ``apply`` and can stay zero.
-            scale_2d = F.pad(scale_2d, (0, num_groups_pad - num_groups),
-                             value=0x08)
-            scale_2d = F.pad(scale_2d, (0, 0, 0, size_n_pad - size_n), value=0)
-
-        qweight_int32 = weight.view(
-            torch.int32).T.contiguous()  # [K_pad/4, N_pad]
-        perm = torch.empty(0, dtype=torch.int32, device=weight.device)
-        marlin_weight = torch.ops.trtllm.gptq_marlin_repack(
-            b_q_weight=qweight_int32,
-            perm=perm,
-            size_k=size_k_pad,
-            size_n=size_n_pad,
-            num_bits=4,
-            is_a_8bit=False,
-        )
-
-        scale_2d = scale_2d.view(
-            torch.float8_e4m3fn).T.contiguous()  # [num_groups_pad, N_pad]
-        marlin_scale = marlin_utils.marlin_permute_scales(scale_2d.to(
-            torch.half),
-                                                          size_k_pad,
-                                                          size_n_pad,
-                                                          group_size=group_size)
-        marlin_scale = marlin_utils.nvfp4_marlin_process_scales(marlin_scale)
-
-        ws2 = module.weight_scale_2.data
-        if ws2.numel() == 0 or not torch.isfinite(ws2).all() or ws2.item() == 0:
-            ws2 = torch.tensor([1.0], dtype=torch.float32, device=weight.device)
-        weight_global_scale = marlin_utils.nvfp4_marlin_process_global_scale(
-            ws2.to(torch.bfloat16))
-
-        module.weight = Parameter(marlin_weight, requires_grad=False)
-        module.weight_scale = Parameter(marlin_scale, requires_grad=False)
-        module.weight_global_scale = Parameter(weight_global_scale,
-                                               requires_grad=False)
-        # Padded GEMM dims consumed by ``apply``; default to the real sizes.
-        module._marlin_size_k = size_k_pad
-        module._marlin_size_n = size_n_pad
-
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
-        assert is_nvfp4_marlin_enabled()
-        size_k = module.in_features
-        size_n = module.out_features
-        # Set by transform_weights; equal to size_k/size_n when 64-aligned.
-        size_k_pad = getattr(module, "_marlin_size_k", size_k)
-        size_n_pad = getattr(module, "_marlin_size_n", size_n)
-
-        x = input.bfloat16()
-        if size_k_pad != size_k:
-            x = F.pad(x, (0, size_k_pad - size_k))
-        output = torch.ops.trtllm.marlin_nvfp4_gemm(
-            x,
-            module.weight,
-            scale_a=None,
-            scale_b=module.weight_scale,
-            alpha=None,
-            weight_global_scale=module.weight_global_scale,
-            bias=None,
-            out_dtype=module.dtype,
-            size_n=size_n_pad,
-            size_k=size_k_pad,
-            output_buffer_kind=int(BufferKind.DEFAULT),
-        )
-        if size_n_pad != size_n:
-            output = output[..., :size_n].contiguous()
-        if bias is not None:
-            output = output + bias
-        return output
-
-    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
-                               bias: Optional[torch.Tensor], tp_rank: int,
-                               tp_group: List[int]):
-        raise RuntimeError(
-            "MarlinNVFP4LinearMethod does not support apply_linear_allreduce")
-
-
 def _mxfp8_cutlass_op_available() -> bool:
     """Cached check for whether the CUTLASS MXFP8xMXFP8 GEMM op is compiled in.
 
@@ -3206,6 +3320,8 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
         return FP8RowwiseLinearMethod()
     if quant_config.layer_quant_mode.has_fp8_block_scales():
         return FP8BlockScalesLinearMethod()
+    if quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+        return W4A16NVFP4LinearMethod()
     if quant_config.layer_quant_mode.has_nvfp4():
         if quant_config.quant_algo == QuantAlgo.NVFP4_ARC:
             return NVFP4ARCLinearMethod()
@@ -3381,7 +3497,11 @@ class Linear(nn.Module):
             self.create_weights()
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
-        return get_quant_method(quant_config)
+        quant_method = get_quant_method(quant_config)
+        if (type(quant_method) is W4A16NVFP4LinearMethod
+                and MarlinNVFP4LinearMethod.is_supported(self)):
+            return MarlinNVFP4LinearMethod()
+        return quant_method
 
     @staticmethod
     def _calc_shard(total, tp_size, rank):
@@ -3738,6 +3858,7 @@ class Linear(nn.Module):
         self._weights_transformed = True
 
     def cache_derived_state(self) -> None:
+        self.quant_method.cache_derived_state(self)
         self._weights_transformed = True
 
     def post_load_weights(self) -> None:

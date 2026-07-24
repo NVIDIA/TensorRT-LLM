@@ -25,6 +25,7 @@ from torch import nn
 
 from tensorrt_llm._utils import get_sm_version, is_device_integrated, is_sm_100f
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.utils.fp4_utils import (
@@ -3293,6 +3294,10 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         # layers across the model share one wrapper-owned output buffer.
         from .fused_moe_cute_dsl_b12x import _SHARED_MOE_OUTPUT_BUF
 
+        quant_config = getattr(module, "quant_config", None)
+        is_w4a16_nvfp4 = (quant_config is not None
+                          and quant_config.quant_algo == QuantAlgo.W4A16_NVFP4)
+
         num_local_experts = module.w3_w1_weight.shape[0]
         # Tensor shapes use the *padded* per-rank dims because TP partitions
         # may pad ``intermediate_size`` up to a kernel-friendly boundary.
@@ -3322,16 +3327,20 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         w2_w_scale_2 = (module.fc2_alpha * module.fc2_input_scale).to(
             torch.float32)
 
-        w1_sf_fp8_norm = module.w3_w1_weight_scale.view(
-            torch.float8_e4m3fn).float()
-        w2_sf_fp8_norm = module.w2_weight_scale.view(
-            torch.float8_e4m3fn).float()
+        w1_sf_fp8_src = module.w3_w1_weight_scale.view(torch.float8_e4m3fn)
+        w2_sf_fp8_src = module.w2_weight_scale.view(torch.float8_e4m3fn)
+        w1_sf_fp8_norm = w1_sf_fp8_src.float()
+        w2_sf_fp8_norm = w2_sf_fp8_src.float()
 
-        # Broadcast per-expert scalar over the trailing dims (E, *).
-        bcast1 = w1_w_scale_2.view(-1, *([1] * (w1_sf_fp8_norm.dim() - 1)))
-        bcast2 = w2_w_scale_2.view(-1, *([1] * (w2_sf_fp8_norm.dim() - 1)))
-        w1_sf_fp8 = (w1_sf_fp8_norm * bcast1).to(torch.float8_e4m3fn)
-        w2_sf_fp8 = (w2_sf_fp8_norm * bcast2).to(torch.float8_e4m3fn)
+        if is_w4a16_nvfp4:
+            w1_sf_fp8 = w1_sf_fp8_src
+            w2_sf_fp8 = w2_sf_fp8_src
+        else:
+            # Broadcast per-expert scalar over the trailing dims (E, *).
+            bcast1 = w1_w_scale_2.view(-1, *([1] * (w1_sf_fp8_norm.dim() - 1)))
+            bcast2 = w2_w_scale_2.view(-1, *([1] * (w2_sf_fp8_norm.dim() - 1)))
+            w1_sf_fp8 = (w1_sf_fp8_norm * bcast1).to(torch.float8_e4m3fn)
+            w2_sf_fp8 = (w2_sf_fp8_norm * bcast2).to(torch.float8_e4m3fn)
 
         w1_sf_b12x = convert_sf_to_mma_layout(w1_sf_fp8,
                                               m=w3w1_out_dim,
@@ -3342,11 +3351,20 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                                               k=w2_in_dim,
                                               num_groups=num_local_experts)
 
-        w1_alpha_b12x = ((1.0 / module.fc31_input_scale).expand(
-            module.num_experts).to(torch.float32).contiguous())
-        w2_alpha_b12x = ((1.0 / module.fc2_input_scale).expand(
-            module.num_experts).to(torch.float32).contiguous())
-        fc2_input_scale_b12x = (1.0 / module.fc2_input_scale).to(torch.float32)
+        if is_w4a16_nvfp4:
+            # W4A16 path: BF16/FP16 activations multiplied by FP4 weights.
+            # FlashInfer's W4A16 packer expects the ModelOpt scale contract:
+            # normalized FP8 block scales plus per-expert ``weight_global_scale``.
+            w1_alpha_b12x = w1_w_scale_2.to(torch.float32).contiguous()
+            w2_alpha_b12x = w2_w_scale_2.to(torch.float32).contiguous()
+            fc2_input_scale_b12x = None
+        else:
+            w1_alpha_b12x = ((1.0 / module.fc31_input_scale).expand(
+                module.num_experts).to(torch.float32).contiguous())
+            w2_alpha_b12x = ((1.0 / module.fc2_input_scale).expand(
+                module.num_experts).to(torch.float32).contiguous())
+            fc2_input_scale_b12x = (1.0 / module.fc2_input_scale).to(
+                torch.float32)
 
         # TRT-LLM packs 16 FP4 values per int64. flashinfer's internal
         # ``view(torch.float4_e2m1fn_x2)`` requires byte-contiguous storage
@@ -3369,14 +3387,20 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                 f"{ActivationType(module.activation_type).name}; "
                 f"supported: {supported}.")
 
+        # The model config may carry the logical intermediate size while the
+        # NVFP4 weight tensors are padded for kernel alignment. FlashInfer's
+        # CUDA-graph workspace must match the stored tensors.
+        b12x_intermediate_size = w2_in_dim
+
         module.b12x_wrapper = B12xMoEWrapper(
             num_experts=module.num_experts,
             top_k=module.routing_method.experts_per_token,
             hidden_size=module.hidden_size,
-            intermediate_size=module.intermediate_size_per_partition,
+            intermediate_size=b12x_intermediate_size,
             use_cuda_graph=getattr(module, "_b12x_use_cuda_graph", False),
             max_num_tokens=module.moe_max_num_tokens,
             activation=self._ACTIVATION_MAP[module.activation_type],
+            quant_mode="w4a16" if is_w4a16_nvfp4 else "nvfp4",
         )
 
         # Replace the wrapper's per-instance output buffer with a shared one.
@@ -3397,10 +3421,11 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
 
         logger.info_once(
             f"NVFP4CuteDslB12xFusedMoEMethod active: hidden={module.hidden_size}, "
-            f"intermediate={module.intermediate_size_per_partition}, "
+            f"intermediate={b12x_intermediate_size}, "
             f"experts={module.num_experts}, top_k="
             f"{module.routing_method.experts_per_token}, "
-            f"activation={self._ACTIVATION_MAP[module.activation_type]}.",
+            f"activation={self._ACTIVATION_MAP[module.activation_type]}, "
+            f"quant_mode={'w4a16' if is_w4a16_nvfp4 else 'nvfp4'}.",
             key="cute_dsl_b12x_moe_active",
         )
 

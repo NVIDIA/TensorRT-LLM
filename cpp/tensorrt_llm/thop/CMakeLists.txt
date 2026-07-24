@@ -57,6 +57,7 @@ add_library(
   marlinNvfp4MoeMM.cpp
   marlinRepack.cpp
   cudaScaledMM.cpp
+  w4a16Nvfp4Gemm.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
