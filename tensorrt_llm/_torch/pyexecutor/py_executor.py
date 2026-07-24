@@ -735,9 +735,21 @@ class PyExecutor:
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
 
+        # Sample-state relay mode. "1": a background thread relays them,
+        # overlapping with forward, but it needs the GIL and can be starved
+        # into a PP deadlock by GIL-holding native calls. "0": relay inline.
+        self.pp_async_broadcast_sample_state = os.environ.get(
+            "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "0") == "1"
+
         # list of requests in each PP micro batch
-        self.num_micro_batches = max(self.dist.pp_size,
-                                     self.MIN_ASYNC_MICRO_BATCH_NUM)
+        # The synchronous relay retires each microbatch within its own
+        # iteration, so pipeline-depth many slots suffice; the async relay
+        # thread needs a large window to absorb its delivery lag.
+        if self.pp_async_broadcast_sample_state:
+            self.num_micro_batches = max(self.dist.pp_size,
+                                         self.MIN_ASYNC_MICRO_BATCH_NUM)
+        else:
+            self.num_micro_batches = self.dist.pp_size
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
@@ -954,13 +966,6 @@ class PyExecutor:
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
-            # `TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE` controls whether to broadcast the sample state asynchronously.
-            # If true, the executor loop can broadcast and handle sample states asynchronously to achieve best perf.
-            # If false, the executor loop can only broadcast and handle each sample state in a pre-defined iteration.
-            # It is only for debugging purposes.
-            # Some tests can disable it to get a deterministic behavior.
-            self.pp_async_broadcast_sample_state = os.environ.get(
-                "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "1") == "1"
         else:
             self.event_loop = self._executor_loop if self.disable_overlap_scheduler else self._executor_loop_overlap
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
@@ -2598,6 +2603,13 @@ class PyExecutor:
                 else:
                     logger.debug(f"microbatch {microbatch_id} can be queued")
 
+                    if not self.pp_async_broadcast_sample_state:
+                        # Drain pending relay isends before forward: rendezvous
+                        # sends need this rank to keep entering MPI, and a forward
+                        # blocked in a native call would starve the receiving rank.
+                        for mb in range(self.num_micro_batches):
+                            self.wait_on_pp_send_handles(self.send_handles, mb)
+
                     self._add_inflight_ids(scheduled_batch)
 
                     if self.kv_cache_transceiver:
@@ -2730,7 +2742,16 @@ class PyExecutor:
                                           offset) % self.num_micro_batches
                 executed_batch = self.micro_batches[executed_microbatch_id]
                 if executed_batch is not None:
-                    self.executed_batch_queue.put(executed_batch)
+                    if self.pp_async_broadcast_sample_state:
+                        self.executed_batch_queue.put(executed_batch)
+                    else:
+                        # Relay inline on the executor thread; unlike the
+                        # background thread, delivery cannot be starved by the
+                        # GIL when a forward blocks inside a native call.
+                        # Requires the pre-forward drain above: the isend
+                        # completes via rendezvous only while this rank keeps
+                        # entering MPI calls.
+                        self._ring_broadcast_sample_state(executed_batch)
                     self.unhandled_batch_counter += 1
                 self.micro_batches[executed_microbatch_id] = None
 
