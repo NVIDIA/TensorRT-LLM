@@ -209,6 +209,38 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
 
     return {valueE4M3.slice(0, 0, m), packedScale};
 }
+
+std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_cutedsl_ue8m0(at::Tensor const& self)
+{
+    CHECK_TH_CUDA(self);
+    CHECK_CONTIGUOUS(self);
+
+    TORCH_CHECK(self.scalar_type() == at::ScalarType::BFloat16, "Input matrix dtype must be BF16.");
+    TORCH_CHECK(self.dim() == 2, "input must be a matrix");
+    TORCH_CHECK(tensorrt_llm::common::isSM100Family(),
+        "fp8_quantize_1x128_cutedsl_ue8m0 currently only supports SM100 (Blackwell).");
+
+    auto const m = self.sizes()[0];
+    auto const k = self.sizes()[1];
+    TORCH_CHECK(m <= std::numeric_limits<int32_t>::max(), "M must be within int32");
+    TORCH_CHECK(k <= std::numeric_limits<int32_t>::max(), "K must be within int32");
+    TORCH_CHECK(k % 128 == 0, "K must be divisible by the production FP8 block size 128, but got ", k);
+
+    at::Tensor valueE4M3
+        = at::detail::empty_cuda({m, k}, at::ScalarType::Float8_e4m3fn, self.device(), /* stride */ std::nullopt);
+    auto const paddedM = (m + 127) / 128 * 128;
+    auto const sfCols = (k / 32 + 3) / 4 * 4;
+    at::Tensor scaleE8M0
+        = at::detail::empty_cuda({paddedM * sfCols}, at::ScalarType::Byte, self.device(), /* stride */ std::nullopt);
+
+    auto stream = at::cuda::getCurrentCUDAStream(self.get_device());
+    tensorrt_llm::kernels::fp8_blockscale_gemm::launch_fp8_quantize_1x128_cutedsl_bf16_e4m3(
+        reinterpret_cast<__nv_fp8_e4m3*>(valueE4M3.data_ptr()), scaleE8M0.data_ptr<uint8_t>(),
+        reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), static_cast<int>(m), static_cast<int>(k),
+        static_cast<int>(paddedM), stream);
+
+    return {valueE4M3, scaleE8M0};
+}
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -218,6 +250,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("fp8_quantize_1x128(Tensor input, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("fp8_batched_quantize_1x128_permute102(Tensor input) -> (Tensor, Tensor)");
     m.def("fp8_quantize_1x128_packed_ue8m0(Tensor input) -> (Tensor, Tensor)");
+    m.def("fp8_quantize_1x128_cutedsl_ue8m0(Tensor input) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -225,4 +258,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("fp8_quantize_1x128", &tensorrt_llm::torch_ext::fp8_quantize_1x128);
     m.impl("fp8_batched_quantize_1x128_permute102", &tensorrt_llm::torch_ext::fp8_batched_quantize_1x128_permute102);
     m.impl("fp8_quantize_1x128_packed_ue8m0", &tensorrt_llm::torch_ext::fp8_quantize_1x128_packed_ue8m0);
+    m.impl("fp8_quantize_1x128_cutedsl_ue8m0", &tensorrt_llm::torch_ext::fp8_quantize_1x128_cutedsl_ue8m0);
 }
