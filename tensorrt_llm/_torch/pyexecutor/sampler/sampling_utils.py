@@ -1078,16 +1078,21 @@ def compute_probs_from_logits(
     temperatures: torch.Tensor,
     top_k: Optional[torch.Tensor],
     top_p: Optional[torch.Tensor],
+    min_p: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute filtered+normalized probs via flashinfer (hard dependency).
 
-    ``temperatures``, ``top_k``, ``top_p`` are per-request tensors matching the
-    spec-decoding call site in interface.py.
+    ``temperatures``, ``top_k``, ``top_p``, ``min_p`` are per-request tensors
+    matching the spec-decoding call sites in interface.py. min_p is applied as a
+    final ``min_p_renorm_probs`` stage (a no-op when 0); pass ``None`` to skip it.
     """
     if top_k is not None:
         top_k = sanitize_top_k(top_k, logits.shape[-1])
 
-    return flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
+    probs = flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
+    if min_p is not None:
+        probs = min_p_renorm_probs(probs, min_p)
+    return probs
 
 
 @torch.compile(options={"max-autotune": True})
@@ -1096,23 +1101,22 @@ def sampling_batch_spec_dec_one_model(
     temperatures: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
+    min_p: Optional[torch.Tensor] = None,
     seed: Optional[torch.Tensor] = None,
     offset: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CUDA-graph compatible sampling; supports mixed sampling params. Returns sampled tokens."""
-    top_k = sanitize_top_k(top_k, logits.shape[-1])
     # Greedy rows (temperature <= threshold) must return the argmax token, not a
     # sample from the temperature-scaled distribution. Capture the argmax from the
-    # *original* logits up front; safely_apply_temperature_inplace then guards the division
-    # against the greedy sentinel, and torch.where restores the greedy rows below.
-    # All ops are branch-free (no data-dependent control flow), so this stays
-    # CUDA-graph safe.
+    # *original* logits up front and restore those rows via torch.where below.
+    # flashinfer has no fused top_k+top_p+min_p kernel, so route through the probs
+    # pipeline (stable softmax + top_k/top_p/min_p renorm) shared with the rejection
+    # path; min_p=0 makes the min-p stage a no-op. All ops are branch-free, so this
+    # stays CUDA-graph safe.
     is_greedy = temperatures <= vanilla.GREEDY_TEMPERATURE_THRESHOLD
     greedy_tokens = logits.argmax(dim=-1)
-    logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
-    sampled = flashinfer.top_k_top_p_sampling_from_logits_op(
-        logits, top_k, top_p, seed=seed, offset=offset
-    )
+    probs = compute_probs_from_logits(logits, temperatures, top_k, top_p, min_p)
+    sampled = flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
     # argmax yields int64; cast so torch.where preserves the sampler's dtype
     # (flashinfer returns int32) instead of promoting the result to int64.
     return torch.where(is_greedy, greedy_tokens.to(sampled.dtype), sampled)
@@ -1124,12 +1128,13 @@ def sampling_batch_spec_dec_one_model_for_rejection(
     temperatures: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
+    min_p: Optional[torch.Tensor] = None,
     seed: Optional[torch.Tensor] = None,
     offset: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Draft sampler returning tokens AND probs for the downstream rejection-sampling path."""
     # Rejection sampling relies on flashinfer's seed/offset support for
     # determinism and cross-rank consistency.
-    probs = compute_probs_from_logits(logits, temperatures, top_k, top_p)
+    probs = compute_probs_from_logits(logits, temperatures, top_k, top_p, min_p)
     tokens = flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
     return tokens, probs

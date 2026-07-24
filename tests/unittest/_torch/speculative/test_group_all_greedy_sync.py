@@ -20,12 +20,13 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
 
-def _fake_request(temperature=None, top_k=None, top_p=None, slot=0):
+def _fake_request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
     return types.SimpleNamespace(
         sampling_config=types.SimpleNamespace(
             temperature=[temperature] if temperature is not None else None,
             top_k=[top_k] if top_k is not None else None,
             top_p=[top_p] if top_p is not None else None,
+            min_p=[min_p] if min_p is not None else None,
         ),
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         py_seq_slot=slot,
@@ -86,3 +87,24 @@ def test_capture_override_composes_with_group_sync():
     meta = _fake_meta(group_all_greedy_sample=False, force_capture=True)
     _scan(meta, [_fake_request()])
     assert meta.is_all_greedy_sample is False
+
+
+def test_min_p_only_request_is_not_greedy():
+    # A min_p-only request (no temperature/top_k/top_p) must take the advanced
+    # sampling path, not the argmax greedy fast-path, and enable the min_p filter
+    # while the other filters stay disabled.
+    meta = _fake_meta(group_all_greedy_sample=None)
+    _scan(meta, [_fake_request(min_p=0.1)])
+    assert meta.is_all_greedy_sample is False
+    assert meta.skip_min_p is False
+    assert meta.skip_temperature is True
+    assert meta.skip_top_k is True
+    assert meta.skip_top_p is True
+
+
+def test_min_p_zero_stays_greedy():
+    # min_p == 0 disables min_p; an otherwise-unset request stays greedy.
+    meta = _fake_meta(group_all_greedy_sample=None)
+    _scan(meta, [_fake_request(min_p=0.0)])
+    assert meta.is_all_greedy_sample is True
+    assert meta.skip_min_p is True

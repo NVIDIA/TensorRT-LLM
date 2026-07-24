@@ -263,9 +263,13 @@ def compute_probs_from_logits_op(
 ) -> torch.Tensor:
     """FlashInfer fast path for compute_probs_from_logits with per-request tensors.
 
-    Used by the spec-decoding path where each request may have different
-    temperature / top-k / top-p values.  Note: temperature is applied AFTER
-    optional top-k masking (via fused flashinfer softmax+temp).
+    Covers temperature + optional top-k / top-p only. min_p is intentionally
+    absent here: flashinfer exposes no min-p renorm kernel, so the
+    ``compute_probs_from_logits`` wrapper (sampling_utils.py) applies min_p as a
+    separate ``min_p_renorm_probs`` stage on the probs this op returns. Used by
+    the spec-decoding path where each request may have different temperature /
+    top-k / top-p values. Note: temperature is applied AFTER optional top-k
+    masking (via fused flashinfer softmax+temp).
     """
     if top_k is not None:
         logits = flashinfer.sampling.top_k_mask_logits(logits, top_k)
