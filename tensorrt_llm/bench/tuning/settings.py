@@ -3,21 +3,28 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Tuple
 
-from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
-                                                         is_qwen3_hybrid,
-                                                         load_pretrained_config)
-from tensorrt_llm.bench.build.dataclasses import (ModelConfig,
-                                                  NemotronHybridConfig,
-                                                  Qwen3HybridConfig)
-from tensorrt_llm.bench.build.tuning import calc_engine_setting
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    is_nemotron_hybrid,
+    is_qwen3_hybrid,
+    load_pretrained_config,
+)
+from tensorrt_llm.bench.tuning.dataclasses import (
+    ModelConfig,
+    NemotronHybridConfig,
+    Qwen3HybridConfig,
+)
+from tensorrt_llm.bench.tuning.heuristics import calc_engine_setting
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 TUNED_QUANTS = {
-    QuantAlgo.NVFP4, QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES,
-    QuantAlgo.NO_QUANT, None
+    QuantAlgo.NVFP4,
+    QuantAlgo.FP8,
+    QuantAlgo.FP8_BLOCK_SCALES,
+    QuantAlgo.NO_QUANT,
+    None,
 }
 # Sourced from TorchLlmArgs so the bench defaults track the args-class field
 # defaults and can't drift.
@@ -35,7 +42,7 @@ def get_benchmark_engine_settings(
     kv_cache_gpu_mem_fraction: float = 0.95,
     enable_attention_dp: bool = False,
 ) -> Tuple[int, int]:
-    """ Retrieve benchmark settings for a specific model + configuration.
+    """Retrieve benchmark settings for a specific model + configuration.
 
     Args:
         model_config (ModelConfig): Model specific configurations.
@@ -77,13 +84,14 @@ def get_benchmark_engine_settings(
         )
 
     if max_batch_size <= 0 or max_num_tokens <= 0:
-        raise RuntimeError(f"Unable to obtain correct settings for benchmark.")
+        raise RuntimeError("Unable to obtain correct settings for benchmark.")
 
     return max_batch_size, max_num_tokens
 
 
 def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
-    """ Obtain the model-related parameters from Hugging Face.
+    """Obtain the model-related parameters from Hugging Face.
+
     Args:
         model_name (str): Huggingface model name.
         model_path (Path): Path to a local Huggingface checkpoint.
@@ -91,8 +99,7 @@ def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
     Raises:
         ValueError: When model is not supported.
     """
-    pretrained_config = load_pretrained_config(model_path or model_name,
-                                               trust_remote_code=True)
+    pretrained_config = load_pretrained_config(model_path or model_name, trust_remote_code=True)
     if is_nemotron_hybrid(pretrained_config):
         return NemotronHybridConfig.from_hf(model_name, model_path)
     if is_qwen3_hybrid(pretrained_config):
