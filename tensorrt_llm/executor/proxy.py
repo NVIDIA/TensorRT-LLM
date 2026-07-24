@@ -736,8 +736,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         Unlinking ipc socket paths does not disturb established zmq
         connections; it only prevents new connects.
         """
-        if self._multi_frontend_ipc_dir is not None:
-            shutil.rmtree(self._multi_frontend_ipc_dir, ignore_errors=True)
+        ipc_dir = getattr(self, "_multi_frontend_ipc_dir", None)
+        if ipc_dir is not None:
+            shutil.rmtree(ipc_dir, ignore_errors=True)
             self._multi_frontend_ipc_dir = None
 
     def shutdown(self):

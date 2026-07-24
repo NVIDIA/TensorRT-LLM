@@ -18,6 +18,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -718,8 +719,12 @@ def setup_disagg_cluster(
                     gen_servers.get("context_parallel_size", 1))
 
     # Build worker configs
+    internal_request_auth_key = config.get(
+        "internal_request_auth_key") or secrets.token_hex(32)
     ctx_worker_config = build_worker_config(config, ctx_servers, disagg_cluster)
     gen_worker_config = build_worker_config(config, gen_servers, disagg_cluster)
+    ctx_worker_config["internal_request_auth_key"] = internal_request_auth_key
+    gen_worker_config["internal_request_auth_key"] = internal_request_auth_key
 
     # Launch workers
     model = model_name or config.get("model")
@@ -792,6 +797,8 @@ def setup_disagg_cluster(
             config.get("conditional_disagg_config", None),
             "perf_metrics_max_requests":
             config.get("perf_metrics_max_requests", 0),
+            "internal_request_auth_key":
+            internal_request_auth_key,
         }
         if schedule_style:
             server_config["schedule_style"] = schedule_style

@@ -1646,10 +1646,12 @@ class Receiver(ReceiverBase):
         return
 
     @staticmethod
-    def _extract_info_endpoint(params: DisaggregatedParams) -> Optional[str]:
+    def _extract_info_endpoint(params: DisaggregatedParams) -> str:
         ep = params.ctx_info_endpoint
         if isinstance(ep, list):
-            return ep[0] if ep else None
+            ep = ep[0] if ep else None
+        if ep is None:
+            raise ValueError("ctx_info_endpoint is required")
         return ep  # str (backward compat)
 
     def _should_register_peer(self, params: DisaggregatedParams) -> bool:

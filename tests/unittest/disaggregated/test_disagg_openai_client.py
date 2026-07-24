@@ -18,6 +18,7 @@ import aiohttp
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.serve.disagg_auth import INTERNAL_DISAGG_AUTH_HEADER
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
@@ -27,6 +28,13 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 from tensorrt_llm.serve.router import Router
+
+
+def _reset_prometheus_registry():
+    from prometheus_client.registry import REGISTRY
+
+    REGISTRY._names_to_collectors = {}
+    REGISTRY._collector_to_names = {}
 
 
 @pytest.fixture
@@ -49,10 +57,7 @@ def mock_session():
 def openai_client(mock_router, mock_session):
     """Create an OpenAIHttpClient instance."""
     # uninitialize the prometheus metrics collector or it will raise a duplicate metric error
-    from prometheus_client.registry import REGISTRY
-
-    REGISTRY._names_to_collectors = {}
-    REGISTRY._collector_to_names = {}
+    _reset_prometheus_registry()
     return OpenAIHttpClient(
         router=mock_router,
         role=ServerRole.CONTEXT,
@@ -115,6 +120,75 @@ class TestOpenAIHttpClient:
         assert client._role == ServerRole.GENERATION
         assert client._session == mock_session
         assert client._max_retries == 5
+
+    @pytest.mark.asyncio
+    async def test_generation_request_with_opaque_state_is_signed(self, mock_router, mock_session):
+        """Opaque state forwarded to generation workers gets internal auth."""
+        from prometheus_client.registry import REGISTRY
+
+        REGISTRY._names_to_collectors = {}
+        REGISTRY._collector_to_names = {}
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            timeout_secs=300,
+            max_retries=0,
+            session=mock_session,
+            internal_disagg_auth_key="secret",
+        )
+        mock_response = self.dummy_response()
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 200
+        mock_http_response.headers = {"Content-Type": "application/json"}
+        mock_http_response.json = AsyncMock(return_value=mock_response.model_dump())
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = mock_http_response
+
+        request = CompletionRequest(
+            model="test-model",
+            prompt="Hello, world!",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                encoded_opaque_state="b3BhcXVl",
+            ),
+        )
+
+        await client.send_request(request)
+
+        headers = mock_session.post.call_args.kwargs["headers"]
+        assert headers[INTERNAL_DISAGG_AUTH_HEADER].startswith("sha256=")
+
+    @pytest.mark.asyncio
+    async def test_generation_request_with_opaque_state_requires_key(
+        self, mock_router, mock_session
+    ):
+        """The proxy refuses to forward opaque state without auth configured."""
+        from prometheus_client.registry import REGISTRY
+
+        REGISTRY._names_to_collectors = {}
+        REGISTRY._collector_to_names = {}
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            timeout_secs=300,
+            max_retries=0,
+            session=mock_session,
+        )
+        request = CompletionRequest(
+            model="test-model",
+            prompt="Hello, world!",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                encoded_opaque_state="b3BhcXVl",
+            ),
+        )
+
+        with pytest.raises(ValueError, match="authentication key"):
+            await client.send_request(request)
+        mock_session.post.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_streaming_completion_request(
@@ -276,6 +350,53 @@ class TestOpenAIHttpClient:
         """Test handling of invalid request type."""
         with pytest.raises(ValueError, match="Invalid request type"):
             await openai_client.send_request("invalid_request")
+
+    def test_generation_request_with_ctx_info_endpoint_is_signed(self, mock_router, mock_session):
+        _reset_prometheus_registry()
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            session=mock_session,
+            internal_disagg_auth_key="secret",
+        )
+        request = CompletionRequest(
+            model="test-model",
+            prompt="Hello, world!",
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                ctx_request_id=1,
+                disagg_request_id=2,
+                ctx_info_endpoint="tcp://10.0.0.1:5000",
+            ),
+        )
+
+        headers = client._get_request_headers(request)
+
+        assert headers is not None
+        assert INTERNAL_DISAGG_AUTH_HEADER in headers
+
+    def test_generation_request_with_ctx_info_endpoint_requires_key(
+        self, mock_router, mock_session
+    ):
+        _reset_prometheus_registry()
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            session=mock_session,
+        )
+        request = CompletionRequest(
+            model="test-model",
+            prompt="Hello, world!",
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                ctx_request_id=1,
+                disagg_request_id=2,
+                ctx_info_endpoint="tcp://10.0.0.1:5000",
+            ),
+        )
+
+        with pytest.raises(ValueError, match="authentication key is required"):
+            client._get_request_headers(request)
 
 
 class TestHttpErrorBodyPreservation:
