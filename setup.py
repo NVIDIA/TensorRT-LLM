@@ -181,8 +181,6 @@ else:
 package_data += [
     'bindings/*.pyi',
     'bindings/**/*.pyi',
-    'tools/plugin_gen/templates/*',
-    'bench/build/benchmark_config.yml',
     'evaluate/lm_eval_tasks/**/*',
     "_torch/auto_deploy/config/*.yaml",
     # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels

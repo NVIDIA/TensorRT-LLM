@@ -685,6 +685,7 @@ accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp_custom_op
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_nvfp4_marlin_multi_gpus[tp_size=8]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_marlin_multi_gpus[tp_size=8]
+accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_marlin_adp_4gpus[mtp_nextn=3]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_marlin_8gpus
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TEP4_PP2]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TEP8_PP1]
@@ -882,6 +883,8 @@ disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp
 disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer[False-TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer_missing_blocks[False-TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context_capacity[False-False-DeepSeek-V3-Lite-fp8/fp8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-TinyLlama-1.1B-Chat-v1.0]
