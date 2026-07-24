@@ -30,7 +30,7 @@ import itertools
 import logging
 import os
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from unittest.mock import MagicMock
 
 import pytest
@@ -1179,12 +1179,12 @@ class _AppendSharedExpertsRouting:
     always-selected entries (ids [num_experts, num_experts+n_fused), weight
     1.0 after routed scaling) to the wrapped routing method's output."""
 
-    def __init__(self, routing_method, num_experts: int, n_fused: int):
+    def __init__(self, routing_method, num_experts: int, n_fused: int) -> None:
         self._routing_method = routing_method
         self._num_experts = num_experts
         self._n_fused = n_fused
 
-    def apply(self, router_logits):
+    def apply(self, router_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         ids, weights = self._routing_method.apply(router_logits)
         num_tokens = ids.shape[0]
         shared_ids = torch.arange(
@@ -1199,7 +1199,9 @@ class _AppendSharedExpertsRouting:
         return torch.cat([ids, shared_ids], dim=1), torch.cat([weights, shared_weights], dim=1)
 
 
-def _write_fused_shared_expert_slots(backend, weights, num_experts: int, n_fused: int):
+def _write_fused_shared_expert_slots(
+    backend: MoE, weights: dict, num_experts: int, n_fused: int
+) -> None:
     """Copy the shared experts' quantized tensors into the trailing weight
     slots, mirroring DeepSeekFP8BlockScalesFusedMoEMethod's routed-slot layout
     (w3_w1 slot = [w3; w1] along dim 0; scales likewise)."""

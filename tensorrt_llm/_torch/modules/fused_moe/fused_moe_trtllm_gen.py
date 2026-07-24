@@ -340,7 +340,11 @@ class TRTLLMGenFusedMoE(MoE):
                                         "0") == "1"
         # Only the trtllm op backend implements fused shared experts
         on_trtllm_backend = isinstance(self.op_backend, TRTLLMOpBackend)
-        if fusion_enabled and on_trtllm_backend and model_config.mapping.dp_size == 1 and self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(
+        # Expert parallelism (moe_ep_size > 1) is not supported by the fused path yet
+        # (the routing kernel's shared-expert append assumes the full expert set is
+        # local); gate it out here so EP configs fall back to the unfused path instead
+        # of tripping the runtime EP check in the TRTLLM-Gen runner.
+        if fusion_enabled and on_trtllm_backend and model_config.mapping.dp_size == 1 and model_config.mapping.moe_ep_size == 1 and self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(
         ):
             # Not all models that use this backend define shared experts (e.g. non-DeepSeek
             # MoEs), so fall back to 0 when the config has no `n_shared_experts`.

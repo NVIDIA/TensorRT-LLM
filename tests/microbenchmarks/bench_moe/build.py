@@ -25,7 +25,7 @@ small set of introspection helpers (``actual_backend`` / ``scheduler_kind``
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -123,7 +123,7 @@ class _UnfusedSharedMoE(torch.nn.Module):
         moe: torch.nn.Module,
         shared_mlp: torch.nn.Module,
         use_cuda_graph: bool = False,
-    ):
+    ) -> None:
         super().__init__()
         self.moe = moe
         self.shared_mlp = shared_mlp
@@ -134,7 +134,7 @@ class _UnfusedSharedMoE(torch.nn.Module):
         self.event_main = torch.cuda.Event()
         self.event_shared = torch.cuda.Event()
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         # nn.Module.__getattr__ resolves registered submodules/params/buffers
         # (incl. ``moe``/``shared_mlp``); anything else (routing_method, backend,
         # comm, scheduler, ...) is delegated to the wrapped MoE for introspection.
@@ -143,7 +143,7 @@ class _UnfusedSharedMoE(torch.nn.Module):
         except AttributeError:
             return getattr(super().__getattr__("moe"), name)
 
-    def forward(self, x, router_logits, **kwargs):
+    def forward(self, x: torch.Tensor, router_logits: torch.Tensor, **kwargs) -> torch.Tensor:
         from tensorrt_llm._torch.modules.multi_stream_utils import (
             maybe_execute_in_parallel,
             with_multi_stream,
@@ -191,6 +191,19 @@ def _build_moe_module(
             f"moe_ep_size={mapping.moe_ep_size}. Re-run with --parallel_mode TTP "
             f"(or drop --n_shared_experts)."
         )
+
+    # Fusion is TRTLLM-Gen specific and only activates for FP8_BLOCK_SCALES; any other
+    # backend/quant would silently drop the shared experts and mislabel the benchmark.
+    # Reject fused candidates up front (unfused runs a separate GatedMLP, so it is fine
+    # on any backend and preserved here).
+    if model.n_shared_experts > 0 and model.shared_expert_mode != "unfused":
+        if moe_backend.upper() != "TRTLLM" or model.quant_algo_enum != QuantAlgo.FP8_BLOCK_SCALES:
+            raise NotImplementedError(
+                f"bench_moe fused shared experts require --backend TRTLLM with "
+                f"--quant FP8_BLOCK_SCALES (fusion is TRTLLM-Gen specific). Got "
+                f"backend={moe_backend!r}, quant={model.quant_algo!r}. Use "
+                f"--shared_expert_mode unfused to benchmark other backends."
+            )
 
     if enable_perfect_router:
         os.environ["ENABLE_PERFECT_ROUTER"] = "1"
