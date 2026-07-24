@@ -176,6 +176,8 @@ full:B300/disaggregated/test_auto_scaling.py::test_service_discovery[http-kv_cac
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6322073)
 full:B300/test_e2e.py::test_qwen_e2e_cpprunner_large_new_tokens[DeepSeek-R1-Distill-Qwen-1.5B-DeepSeek-R1-Distill-Qwen-1.5B] SKIP (https://nvbugs/6414760)
 full:DGX_B200/accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=True] SKIP (https://nvbugs/6501837)
+full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm SKIP (https://nvbugs/6506920)
+full:DGX_H100/unittest/_torch/multi_gpu/test_linear.py::test_column_linear[2-unbalanced] SKIP (https://nvbugs/6506918)
 full:DGX_H200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[disable_skip_indexer] SKIP (https://nvbugs/6476233)
 full:DGX_H200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[latency_default] SKIP (https://nvbugs/6476233)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy SKIP (https://nvbugs/6276923)
