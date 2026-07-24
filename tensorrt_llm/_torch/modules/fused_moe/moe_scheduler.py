@@ -641,9 +641,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     x_list[idx_chunk] = x_list[0]
                     router_logits_list[idx_chunk] = router_logits_list[0]
                     input_ids_list[idx_chunk] = input_ids_list[0]
-                    all_rank_num_tokens_list[idx_chunk][moe.mapping.tp_rank] = (
-                        all_rank_num_tokens_list[0][moe.mapping.tp_rank]
-                    )
+            # Mirror the empty-chunk substitution above into the work list:
+            # all_rank_num_tokens_list feeds the varsize collectives, so every
+            # rank must patch EVERY empty entry, not just its own -- the size
+            # vectors have to be identical on all ranks. all_rank_chunk_size_list
+            # is the untouched ground truth used to detect the empty chunks.
+            for idx_chunk in range(num_chunks):
+                vec = all_rank_num_tokens_list[idx_chunk]
+                for j in range(len(vec)):
+                    if all_rank_chunk_size_list[j][idx_chunk] == 0:
+                        vec[j] = all_rank_chunk_size_list[j][0]
             x_list = tuple(x_list)
             router_logits_list = tuple(router_logits_list)
             input_ids_list = tuple(input_ids_list)
