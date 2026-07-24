@@ -27,7 +27,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
                                             strip_mm_data_for_generation)
-from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
+                                          BaseMultimodalInputProcessor,
                                           create_input_processor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
@@ -2516,13 +2517,23 @@ class PyTorchModelEngine(ModelEngine):
         Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
         by inheriting `MultimodalEncoderMixin`, and the engine drives the construction
         so the sizes match ``llm_args.get_encoder_runtime_sizes()`` rather
-        than being hardcoded inside each encoder's ``__init__``.
+        than being hardcoded inside each encoder's ``__init__``. The optional
+        per-segment capacity combines the encoder token budget with the input
+        processor's largest supported item.
         """
+        max_seq_len = self.encoder_max_num_tokens
+        if isinstance(self.input_processor, BaseMultimodalDummyInputsBuilder):
+            max_tokens_per_item = (
+                self.input_processor.get_mm_max_tokens_per_item())
+            max_seq_len = max(max_seq_len,
+                              max(max_tokens_per_item.values(), default=0))
+
         for module in self.model.modules():
             if isinstance(module, MultimodalEncoderMixin):
                 module.setup_attn_metadata(
                     max_num_requests=self.encoder_batch_size,
                     max_num_tokens=self.encoder_max_num_tokens)
+                module.set_attn_max_seq_len(max_seq_len)
 
     def _set_up_spec_metadata(
             self,
