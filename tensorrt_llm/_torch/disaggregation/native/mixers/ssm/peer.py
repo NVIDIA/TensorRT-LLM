@@ -322,6 +322,105 @@ class MambaPolicy:
     """
 
     @staticmethod
+    def _find_mamba_layer_group(
+        page_table: Optional[KVCachePageTable],
+    ) -> Optional[MambaLayerGroup]:
+        if page_table is None:
+            return None
+        return next(
+            (lg for lg in page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
+            None,
+        )
+
+    @staticmethod
+    def validate_peer_compatible(
+        self_ri: RankInfo,
+        peer_ri: RankInfo,
+        self_page_table: Optional[KVCachePageTable],
+        peer_page_table: Optional[KVCachePageTable],
+    ) -> None:
+        """Validate recurrent-state (Mamba/KDA) layout compatibility with a peer.
+
+        Analogue of the C++ ``rnnCacheFormatter inquireSupport`` gate for the
+        V2 path: reject at peer-registration time instead of corrupting
+        memory at transfer time. Raises ``ValueError`` naming the mismatched
+        field.
+
+        The core invariant checked is *global* (TP-aggregated) state size:
+        for a TP-sharded state, ``per_rank_bytes * mamba_tp`` is
+        TP-invariant, so it must match between peers even when their TP
+        sizes differ. Models with *replicated* recurrent state (e.g. Kimi K3
+        KDA, whose per-rank state is pre-scaled to full size when
+        attention-DP is off) violate this invariant under heterogeneous TP —
+        exactly the configuration where the TP-mismatch mappers would
+        compute shard offsets past the end of the slot, silently corrupting
+        the replicated state — and are therefore rejected here.
+        """
+        self_mlg = MambaPolicy._find_mamba_layer_group(self_page_table)
+        peer_mlg = MambaPolicy._find_mamba_layer_group(peer_page_table)
+        if self_mlg is None and peer_mlg is None:
+            return
+        if (self_mlg is None) != (peer_mlg is None):
+            raise ValueError(
+                "MambaPolicy.validate_peer_compatible: one side has "
+                f"recurrent-state pools and the other does not (local={self_mlg is not None}, "
+                f"peer={peer_mlg is not None})"
+            )
+
+        if set(self_mlg.mamba_layer_offsets.keys()) != set(peer_mlg.mamba_layer_offsets.keys()):
+            raise ValueError(
+                "MambaPolicy.validate_peer_compatible: mamba layer sets differ "
+                f"(local={sorted(self_mlg.mamba_layer_offsets)}, "
+                f"peer={sorted(peer_mlg.mamba_layer_offsets)})"
+            )
+
+        if (
+            self_mlg.ssm_bytes_per_head is not None
+            and peer_mlg.ssm_bytes_per_head is not None
+            and self_mlg.ssm_bytes_per_head != peer_mlg.ssm_bytes_per_head
+        ):
+            # TP-invariant: head_dim * d_state * element_size. A mismatch
+            # means different state shape or SSM cache dtype.
+            raise ValueError(
+                "MambaPolicy.validate_peer_compatible: ssm_bytes_per_head differs "
+                f"(local={self_mlg.ssm_bytes_per_head}, peer={peer_mlg.ssm_bytes_per_head}); "
+                "check head_dim / d_state / mamba_ssm_cache_dtype"
+            )
+
+        self_tp, _ = MambaPolicy._mamba_tp(self_ri)
+        peer_tp, _ = MambaPolicy._mamba_tp(peer_ri)
+
+        def _check_global(field: str, self_bytes: int, peer_bytes: int) -> None:
+            if self_bytes * self_tp != peer_bytes * peer_tp:
+                raise ValueError(
+                    f"MambaPolicy.validate_peer_compatible: global (TP-aggregated) {field} "
+                    f"differs: local {self_bytes} bytes/rank x mamba_tp={self_tp} vs "
+                    f"peer {peer_bytes} bytes/rank x mamba_tp={peer_tp}. Per-rank state "
+                    "sizes are inconsistent with a TP-sharded layout across the two "
+                    "sides; either the state shape/dtype differs, or the model keeps a "
+                    "replicated (non-TP-sharded) recurrent state (e.g. Kimi K3 KDA), "
+                    "which supports heterogeneous ctx/gen TP only with attention-DP "
+                    "enabled on both sides."
+                )
+
+        _check_global("ssm slot_bytes", self_mlg.ssm_states.slot_bytes, peer_mlg.ssm_states.slot_bytes)
+        _check_global(
+            "conv slot_bytes", self_mlg.conv_states.slot_bytes, peer_mlg.conv_states.slot_bytes
+        )
+
+        if self_mlg.conv_section_bytes is not None and peer_mlg.conv_section_bytes is not None:
+            if len(self_mlg.conv_section_bytes) != len(peer_mlg.conv_section_bytes):
+                raise ValueError(
+                    "MambaPolicy.validate_peer_compatible: conv section count differs "
+                    f"(local={len(self_mlg.conv_section_bytes)}, "
+                    f"peer={len(peer_mlg.conv_section_bytes)})"
+                )
+            for i, (s, p) in enumerate(
+                zip(self_mlg.conv_section_bytes, peer_mlg.conv_section_bytes)
+            ):
+                _check_global(f"conv_section_bytes[{i}]", s, p)
+
+    @staticmethod
     def _mamba_tp(ri: RankInfo) -> Tuple[int, int]:
         """Return (mamba_effective_tp_size, mamba_effective_tp_rank).
 

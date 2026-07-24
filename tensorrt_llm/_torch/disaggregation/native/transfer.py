@@ -1648,6 +1648,19 @@ class Receiver(ReceiverBase):
             finally:
                 messenger.stop()
 
+            # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
+            # The sender-side check (PeerRegistrar.register) runs in the
+            # sender's listener thread, where exceptions are only logged, so
+            # reject here — before REGISTER_RANK_INFO is even sent — to fail
+            # the first gen request loudly instead of hanging on a transfer
+            # the sender will never serve.
+            MambaPolicy.validate_peer_compatible(
+                self._registrar.self_rank_info,
+                sender_info,
+                self._registrar.self_extractor.page_table,
+                sender_info.page_table,
+            )
+
             for endpoint in sender_info.sender_endpoints:
                 dealer = self._get_or_connect_dealer(endpoint)
                 rank_info = self._registrar.self_rank_info
