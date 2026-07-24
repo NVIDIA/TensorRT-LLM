@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -67,6 +67,15 @@ public:
     static size_t preAllocBufferSize(std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
         SizeType32 tokensPerBlock,
         std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig = std::nullopt);
+
+    /// @brief Index of the first pool that carries regular KV data for disagg transport.
+    /// @details Hybrid (Mamba/linear-attention) models host a recurrent-states pool whose sentinel
+    /// window sorts first, making it pool 0. Its contents travel through RnnCacheTransBufferManager
+    /// and may use a different dtype than the KV pools (e.g. BF16 SSM state alongside FP8 KV), so
+    /// it must not define the canonical wire dtype or per-token sizing of KV transfers.
+    /// Block-scale companion pools are skipped for the same reason. Falls back to pool 0 when
+    /// every pool is filtered out.
+    [[nodiscard]] static SizeType32 kvTransportPoolIdx(KVCacheManager::BaseKVCacheManager* cacheManager);
 
     /// @brief Get the KV cache manager.
     [[nodiscard]] KVCacheManager::BaseKVCacheManager* getCacheManager() const noexcept
