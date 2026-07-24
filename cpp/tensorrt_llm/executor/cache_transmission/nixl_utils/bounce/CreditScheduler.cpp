@@ -71,9 +71,11 @@ void CreditScheduler::dropFromRing(std::string const& flow)
         mRing.erase(it);
         if (mRing.empty())
         {
+            // Erased the LAST flow: the modulo below would divide by zero (SIGFPE), so reset and bail.
             mCursor = 0;
+            return;
         }
-        else if (idx < mCursor)
+        if (idx < mCursor)
         {
             --mCursor;
         }
