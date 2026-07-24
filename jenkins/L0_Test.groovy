@@ -5923,7 +5923,7 @@ pipeline {
                         // Move approval-exempt multi-GPU stages into singleGpuJobs so they
                         // run without waiting for the multi-GPU dispatch (which requires
                         // the 'ci: full pre-merge approved' label).
-                        def exemptJobs = dgxJobs.findAll { stageName, _ ->
+                        def exemptJobs = dgxJobs.findAll { stageName, stageValue ->
                             MULTI_GPU_RUN_WITH_SINGLE.any { pattern ->
                                 stageMatchesPattern(stageName, pattern)
                             }
@@ -5937,6 +5937,17 @@ pipeline {
 
                     if (env.JOB_NAME ==~ /.*Single-GPU.*/) {
                         echo "Only run single-GPU tests."
+                        // [TEST-ONLY] Force multi-GPU marker to test label gate.
+                        // Remove this block after testing.
+                        if (true) {
+                            if (globalVars[ACTION_INFO]['parents'].size() > 0) {
+                                def parentJob = globalVars[ACTION_INFO]['parents'][-2]
+                                def archStr = (env.targetArch == X86_64_TRIPLE) ? "x86_64" : (env.targetArch == AARCH64_TRIPLE ? "SBSA" : "Unknown")
+                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require ${archStr} Multi-GPU Testing====<br/>")
+                                echo "[TEST-ONLY] Forced multi-GPU marker for label gate testing. Skipping actual single-GPU tests."
+                            }
+                            return
+                        }
                         if (dgxJobs.size() > 0) {
                             if (globalVars[ACTION_INFO]['parents'].size() > 0) {
                                 // We add a special marker to the parent job's description.

@@ -647,6 +647,7 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
 // Gate multi-GPU stages behind 'ci: full pre-merge approved' label.
 // Uses trtllm_utils.validatePRLabelApproval() from the shared lib to verify
 // both label existence and that the labeler is an active team member.
+// Returns true if the stage should be BLOCKED, false if it may proceed.
 // Exempt: PostMerge pipelines and GitLab MR builds (no GITHUB_PR_API_URL).
 def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
     if (!globalVars[GITHUB_PR_API_URL]) {
@@ -675,6 +676,8 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
         return false
     }
 
+    // Label missing or unauthorized — write description marker for wrapper
+    // to surface in PR comment, and return true to signal the caller to block.
     def existingDesc = currentBuild.description ?: ""
     currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
         "<span data-multi-gpu-label-required='true'>" +
@@ -683,9 +686,9 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
     def reason = !result.labelExists
         ? "label not present"
         : "label applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
-    error "${arch} Multi-GPU tests blocked: ${reason}. " +
-          "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, " +
-          "then re-trigger CI."
+    echo "[requireMultiGpuApprovalLabel] ${arch} Multi-GPU tests blocked: ${reason}. " +
+         "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, then re-trigger CI."
+    return true
 }
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
@@ -1611,13 +1614,22 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
+                // Label gate: check before entering the Remote Run stage so a
+                // missing/unauthorized label shows as "Blocked" (not a Remote Run
+                // failure) and does not trigger fail-fast.
+                if (requireMultiGpuApprovalLabel(pipeline, globalVars, "x86_64")) {
+                    stage("[Test-x86_64-Multi-GPU] Blocked") {
+                        error "x86_64 Multi-GPU tests blocked: missing or unauthorized 'ci: full pre-merge approved' label."
+                    }
+                    return
+                }
+
                 testStageName = "[Test-x86_64-Multi-GPU] Remote Run"
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "x86_64 test job is skipped due to Jenkins configuration"
                         return
                     }
-                    requireMultiGpuApprovalLabel(pipeline, globalVars, "x86_64")
                     try {
                         def testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
@@ -1728,13 +1740,19 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
+                if (requireMultiGpuApprovalLabel(pipeline, globalVars, "SBSA")) {
+                    stage("[Test-SBSA-Multi-GPU] Blocked") {
+                        error "SBSA Multi-GPU tests blocked: missing or unauthorized 'ci: full pre-merge approved' label."
+                    }
+                    return
+                }
+
                 testStageName = "[Test-SBSA-Multi-GPU] Remote Run"
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "SBSA test job is skipped due to Jenkins configuration"
                         return
                     }
-                    requireMultiGpuApprovalLabel(pipeline, globalVars, "SBSA")
                     try {
                         def testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
