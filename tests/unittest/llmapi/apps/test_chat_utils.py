@@ -608,7 +608,7 @@ class TestMmItemOrderReturn:
             ),
         ],
     )
-    def test_item_order(self, messages, expected):
+    def test_item_order(self, messages: list, expected: list) -> None:
         class _StubConfig:
             model_type = _MM_MODEL_TYPE
 
