@@ -15,6 +15,7 @@
 import copy
 import json
 import os
+from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -50,6 +51,98 @@ from .interface import (Evaluator, dump_inference_results,
 # https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L25
 LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER = "<image>"
 
+# Interval (in completed responses) for logging running metric estimates
+# during long evals; see _RunningScoreTracker. 0/unset disables the feature.
+PARTIAL_SCORES_ENV_VAR = "TLLM_EVAL_PARTIAL_SCORES_EVERY"
+
+
+class _RunningScoreTracker:
+    """Best-effort running metric estimates over completed eval responses.
+
+    lm-eval computes metrics only after every response is collected, so a
+    multi-hour eval gives no quality signal until the very end. This tracker
+    scores each response as it completes — applying the owning task's filter
+    ensembles and ``process_results`` to a throwaway copy of the instance —
+    and logs a running aggregate every ``interval`` responses, so an operator
+    can tell whether a long job is on track or should be killed early.
+
+    The running numbers are estimates: per-sample filtering happens outside
+    the harness's batch path, and only per-sample-decomposable metrics (e.g.
+    exact_match) aggregate meaningfully as a mean. The final score reported
+    by lm-eval is unaffected — scoring here happens on copies. Any failure
+    (exotic task/filter/metric shapes) permanently disables the tracker for
+    the run and never fails the eval itself.
+    """
+
+    def __init__(self, task_dict: dict, interval: int) -> None:
+        self.interval = interval
+        self.tasks = {}
+        self._collect_tasks(task_dict)
+        self.metric_sums = defaultdict(float)
+        self.metric_counts = defaultdict(int)
+        self.disabled = False
+
+    def _collect_tasks(self, task_dict: dict) -> None:
+        for name, obj in task_dict.items():
+            if isinstance(obj, dict):  # task group
+                self._collect_tasks(obj)
+            else:
+                self.tasks[name] = obj
+
+    def update(self, instance: Any, text: str) -> None:
+        if self.disabled:
+            return
+        try:
+            task = self.tasks.get(instance.task_name)
+            if task is None or not getattr(task, "_filters", None):
+                raise ValueError(f"no scorable task for {instance.task_name!r}")
+            # Score a shallow copy: the harness appends resps / applies
+            # filters to the real instance later, and must see it untouched.
+            probe = copy.copy(instance)
+            probe.resps = [text]
+            probe.filtered_resps = {}
+            for ensemble in task._filters:
+                ensemble.apply([probe])
+                # lm-eval evaluator passes a list of filtered responses (one
+                # per repeat/request), so process_results does results[0] to
+                # get the prediction.  Match that contract here — wrapping in
+                # a list gives the same calling convention.
+                metrics = task.process_results(
+                    probe.doc, [probe.filtered_resps[ensemble.name]])
+                for metric, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        key = f"{instance.task_name},{metric},{ensemble.name}"
+                        self.metric_sums[key] += value
+                        self.metric_counts[key] += 1
+        except Exception as e:
+            logger.info(
+                f"Partial scoring disabled for this run ({type(e).__name__}: {e})"
+            )
+            self.disabled = True
+
+    def maybe_log(self, done: int, total: int) -> None:
+        if self.disabled or not self.metric_counts:
+            return
+        if done % self.interval != 0 and done != total:
+            return
+        stats = " | ".join(f"{key} ~ {100 * self.metric_sums[key] / count:.2f}"
+                           for key, count in self.metric_counts.items())
+        logger.info(f"Partial scores after {done}/{total} responses "
+                    f"(estimate, 0~100): {stats}")
+
+
+def _parse_partial_scores_env() -> Optional[int]:
+    """Parse TLLM_EVAL_PARTIAL_SCORES_EVERY and return the logging interval or None."""
+    env_interval = os.environ.get(PARTIAL_SCORES_ENV_VAR)
+    if not env_interval:
+        return None
+    try:
+        value = int(env_interval)
+    except ValueError:
+        raise ValueError(f"{PARTIAL_SCORES_ENV_VAR} must be an integer, got "
+                         f"{env_interval!r}") from None
+    return value if value > 0 else None
+
 
 class LmEvalWrapper(TemplateLM):
 
@@ -62,7 +155,9 @@ class LmEvalWrapper(TemplateLM):
                  is_force_single_image: bool = False,
                  output_dir: Optional[str] = None,
                  sampling_override: bool = False,
-                 preserve_caller_max_tokens: bool = False):
+                 preserve_caller_max_tokens: bool = False,
+                 partial_scores_every: Optional[int] = None,
+                 partial_scoring_task_dict: Optional[dict] = None):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
@@ -77,6 +172,11 @@ class LmEvalWrapper(TemplateLM):
         # task yaml's max_gen_toks. Opt-in for thinking models (e.g. Kimi K2.5)
         # whose chain-of-thought output exceeds lm-eval's default (~512).
         self.preserve_caller_max_tokens = preserve_caller_max_tokens
+        # When set (with the task_dict), log running metric estimates every
+        # N completed responses during generate_until — a liveness/quality
+        # signal for long evals. See _RunningScoreTracker.
+        self.partial_scores_every = partial_scores_every
+        self.partial_scoring_task_dict = partial_scoring_task_dict
 
     @property
     def eot_token_id(self) -> int:
@@ -171,11 +271,19 @@ class LmEvalWrapper(TemplateLM):
                                              streaming=self.streaming)
             results.append(output)
 
+        scorer = None
+        if self.partial_scores_every and self.partial_scoring_task_dict:
+            scorer = _RunningScoreTracker(self.partial_scoring_task_dict,
+                                          self.partial_scores_every)
+
         outputs = []
-        for output in tqdm(results,
-                           desc="Fetching responses",
-                           disable=disable_tqdm):
+        for output, request in zip(
+                tqdm(results, desc="Fetching responses", disable=disable_tqdm),
+                requests):
             outputs.append(output.result())
+            if scorer is not None:
+                scorer.update(request, outputs[-1].outputs[0].text)
+                scorer.maybe_log(len(outputs), len(requests))
 
         if self.output_dir:
             dump_inference_results(self.output_dir, outputs,
@@ -208,7 +316,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  output_dir: Optional[str] = None,
                  sampling_override: bool = False,
                  preserve_caller_max_tokens: bool = False,
-                 post_process_fn: Optional[Callable[[str], str]] = None):
+                 post_process_fn: Optional[Callable[[str], str]] = None,
+                 partial_scores_every: Optional[int] = None,
+                 partial_scoring_task_dict: Optional[dict] = None):
         """
         Initialize the multimodal wrapper.
 
@@ -227,6 +337,10 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                 to model outputs before scoring. Used by Kimi K2.5 to strip
                 ``<think>...</think>`` and extract the final answer (see
                 ``tensorrt_llm.evaluate.post_processing``).
+            partial_scores_every: Accepted for interface parity with
+                LmEvalWrapper; the multimodal generate_until override does
+                not implement partial scoring yet.
+            partial_scoring_task_dict: See partial_scores_every.
         """
         super().__init__(
             llm,
@@ -238,6 +352,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             output_dir=output_dir,
             sampling_override=sampling_override,
             preserve_caller_max_tokens=preserve_caller_max_tokens,
+            partial_scores_every=partial_scores_every,
+            partial_scoring_task_dict=partial_scoring_task_dict,
         )
 
         # NOTE: Required by lm_eval to identify this as a multimodal model
@@ -611,6 +727,12 @@ class LmEvalEvaluator(Evaluator):
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
 
+        # Opt-in running metric estimates for long evals: log a partial
+        # score every N completed responses (see _RunningScoreTracker).
+        # Env-var driven so it uniformly covers every lm-eval-backed task
+        # without per-task CLI plumbing.
+        partial_scores_every = _parse_partial_scores_env()
+
         lm_kwargs: Dict[str, Any] = dict(
             sampling_params=sampling_params,
             streaming=streaming,
@@ -619,6 +741,9 @@ class LmEvalEvaluator(Evaluator):
             is_force_single_image=is_force_single_image,
             output_dir=self.output_dir,
             sampling_override=sampling_override,
+            partial_scores_every=partial_scores_every,
+            partial_scoring_task_dict=self.task_dict
+            if partial_scores_every else None,
         )
         # post_process_fn / preserve_caller_max_tokens only consumed by multimodal.
         if self.MULTIMODAL:
