@@ -432,6 +432,371 @@ def test_cpp_lifecycle_and_remaining_work_use_same_domain_completion():
     assert lifecycle["reap_to_decode_start"]["duration_s"]["p50"] == pytest.approx(0.05)
 
 
+def test_deadline_is_nonterminal_and_classified_by_sender_phase():
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][ctx-transfer] t=0.00 clock=local_steady host=ctx "
+            "rank=0 action=timer-start request=42",
+            "[DISAGG_DIAG][ctx-transfer] t=0.01 clock=local_steady host=ctx "
+            "rank=0 action=queued request=42",
+            "[DISAGG_DIAG][sender-transfer] t=0.20 clock=local_steady host=ctx "
+            "rank=0 action=credit-received request=42",
+            "[DISAGG_DIAG][python-transfer] t=0.30 clock=local_steady host=ctx "
+            "rank=0 role=ctx source=native action=first-write-submitted request=42",
+            "[DISAGG_DIAG][ctx-transfer] t=0.60 clock=local_steady host=ctx "
+            "rank=0 action=deadline-observed request=42",
+            "[DISAGG_DIAG][ctx-transfer] t=0.65 clock=local_steady host=ctx "
+            "rank=0 action=cancel-result request=42 result=retry",
+            "[DISAGG_DIAG][python-transfer] t=0.80 clock=local_steady host=ctx "
+            "rank=0 role=ctx source=native action=kv-physical-complete request=42",
+            "[DISAGG_DIAG][ctx-transfer] t=0.90 clock=local_steady host=ctx "
+            "rank=0 action=reaped request=42 outcome=completed",
+        ]
+    )
+
+    result = analyze_events(events)
+    lifecycle = result["lifecycle"]
+    record = next(
+        request
+        for request in lifecycle["requests"]
+        if request["request"] == "42" and request["role"] == "ctx"
+    )
+
+    assert result["schema_version"] == 3
+    assert lifecycle["deadline_phase_counts"] == {"kv-transfer-service": 1}
+    assert record["deadline_phase"] == "kv-transfer-service"
+    assert record["intervals"]["ctx_timer_to_deadline"]["duration_s"] == pytest.approx(0.6)
+    assert record["intervals"]["ctx_deadline_to_kv_physical_complete"][
+        "duration_s"
+    ] == pytest.approx(0.2)
+    assert record["intervals"]["ctx_deadline_to_cancel_result"]["duration_s"] == pytest.approx(0.05)
+    assert _TELEMETRY._collect_unsuccessful_requests(events) == set()
+
+
+def test_cross_host_wall_clock_joins_ctx_deadline_to_gen_deferral():
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][ctx-transfer] t=100.0 clock=local_steady "
+            "wall_t=1000.0 wall_clock=unix wall_semantics=boundary-sampled "
+            "host=ctx rank=0 action=timer-start request=42",
+            "[DISAGG_DIAG][gate1] t=1.0 clock=local_steady "
+            "wall_t=1005.0 wall_clock=unix wall_semantics=boundary-sampled "
+            "host=gen rank=0 action=fitting request=42",
+            "[DISAGG_DIAG][gate2] t=2.0 clock=local_steady "
+            "wall_t=1006.0 wall_clock=unix wall_semantics=boundary-sampled "
+            "host=gen rank=0 action=deferred request=42",
+            "[DISAGG_DIAG][ctx-transfer] t=160.0 clock=local_steady "
+            "wall_t=1060.0 wall_clock=unix wall_semantics=boundary-sampled "
+            "host=ctx rank=0 action=deadline-observed request=42",
+            "[DISAGG_DIAG][gate2] t=62.0 clock=local_steady "
+            "wall_t=1062.0 wall_clock=unix wall_semantics=boundary-sampled "
+            "host=gen rank=0 action=admitted request=42",
+        ]
+    )
+
+    correlation = analyze_events(events)["cross_host_correlation"]
+    record = correlation["requests"][0]
+
+    assert correlation["joined_ctx_gen_request_count"] == 1
+    assert correlation["ctx_deadline_relationship_counts"] == {"during-gate2-deferral": 1}
+    assert record["ctx_deadline_relationship"] == "during-gate2-deferral"
+    assert record["wall_intervals_s"]["ctx_timer_to_gate2_admit"] == pytest.approx(62.0)
+    assert record["wall_intervals_s"]["gate2_defer_to_ctx_deadline"] == pytest.approx(54.0)
+
+
+def test_cross_host_partial_gate2_admission_is_not_labeled_before_gate1():
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][ctx-transfer] t=0 wall_t=0 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=ctx rank=0 "
+            "action=timer-start request=42",
+            "[DISAGG_DIAG][gate2] t=2 wall_t=50 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen rank=0 "
+            "action=admitted request=42",
+            "[DISAGG_DIAG][gate2] t=3 wall_t=70 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen rank=1 "
+            "action=admitted request=42",
+            "[DISAGG_DIAG][ctx-transfer] t=60 wall_t=60 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=ctx rank=0 "
+            "action=deadline-observed request=42",
+        ]
+    )
+
+    record = analyze_events(events)["cross_host_correlation"]["requests"][0]
+
+    assert record["points"]["gate2-state-at-ctx-deadline"]["state"] == "admitted"
+    assert record["ctx_deadline_relationship"] == "partial-gate2-admission-before-global-admission"
+
+
+def test_cross_host_progress_uses_latest_observed_rank():
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][ctx-transfer] t=0 wall_t=0 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=ctx rank=0 "
+            "action=timer-start request=42",
+            "[DISAGG_DIAG][gate2] t=1 wall_t=10 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen rank=0 "
+            "action=deferred request=42",
+            "[DISAGG_DIAG][gate2] t=2 wall_t=50 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen rank=0 "
+            "action=admitted request=42",
+            "[DISAGG_DIAG][gate2] t=3 wall_t=70 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen rank=1 "
+            "action=admitted request=42",
+            "[DISAGG_DIAG][ctx-transfer] t=60 wall_t=60 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=ctx rank=0 "
+            "action=deadline-observed request=42",
+        ]
+    )
+
+    record = analyze_events(events)["cross_host_correlation"]["requests"][0]
+    admission = record["points"]["gate2-admitted"]
+
+    assert admission["wall_t"] == pytest.approx(70.0)
+    assert admission["selection"] == "latest"
+    assert admission["observed_emitter_count"] == 2
+    assert record["ctx_deadline_relationship"] == "partial-gate2-admission-before-global-admission"
+
+
+def test_cross_host_gate2_ineligible_closes_deferral_episode():
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][ctx-transfer] t=0 wall_t=0 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=ctx rank=0 "
+            "action=timer-start request=42",
+            "[DISAGG_DIAG][gate1] t=1 wall_t=5 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen rank=0 "
+            "action=fitting request=42",
+            "[DISAGG_DIAG][gate2] t=2 wall_t=10 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen rank=0 "
+            "action=deferred request=42",
+            "[DISAGG_DIAG][gate1] t=3 wall_t=20 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen rank=0 "
+            "action=blocked request=42",
+            "[DISAGG_DIAG][gate2] t=3 wall_t=20 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen rank=0 "
+            "action=ineligible request=42",
+            "[DISAGG_DIAG][ctx-transfer] t=60 wall_t=60 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=ctx rank=0 "
+            "action=deadline-observed request=42",
+        ]
+    )
+
+    record = analyze_events(events)["cross_host_correlation"]["requests"][0]
+
+    assert record["points"]["gate2-state-at-ctx-deadline"]["state"] == "ineligible"
+    assert record["ctx_deadline_relationship"] == "gate2-ineligible-at-deadline"
+
+
+def test_cross_host_phase_uses_furthest_milestone_with_missing_credit():
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][ctx-transfer] t=0 wall_t=0 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=ctx rank=0 "
+            "action=timer-start request=42",
+            "[DISAGG_DIAG][gate2] t=1 wall_t=10 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen rank=0 "
+            "action=admitted request=42",
+            "[DISAGG_DIAG][submit] t=2 wall_t=20 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen rank=0 request=42",
+            "[DISAGG_DIAG][python-transfer] t=3 wall_t=30 wall_clock=unix "
+            "wall_semantics=emission host=ctx rank=0 role=ctx "
+            "action=first-write-submitted request=42",
+            "[DISAGG_DIAG][ctx-transfer] t=40 wall_t=40 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=ctx rank=0 "
+            "action=deadline-observed request=42",
+        ]
+    )
+
+    record = analyze_events(events)["cross_host_correlation"]["requests"][0]
+
+    assert record["ctx_deadline_relationship"] == "during-kv-physical-transfer"
+    assert record["ctx_deadline_phase_coverage"]["missing_before_furthest"] == [
+        "ctx-receiver-credit"
+    ]
+
+
+def test_uncapped_gate_transitions_cover_every_request():
+    events = _parse_lines(
+        [
+            event
+            for request_id in range(1, 71)
+            for event in (
+                f"[DISAGG_DIAG][gen-arrival] t=0.0 rank=0 request={request_id}",
+                f"[DISAGG_DIAG][gate1] t=0.1 rank=0 action=fitting "
+                f"request={request_id} blocks=1 sequence=1",
+                f"[DISAGG_DIAG][gate2] t=0.2 rank=0 action=deferred "
+                f"request={request_id} blocks=1 sequence=1",
+            )
+        ]
+    )
+
+    lifecycle = analyze_events(events)["lifecycle"]
+
+    assert lifecycle["request_count"] == 70
+    assert lifecycle["interval_coverage"]["gen_arrival_to_first_gate1"]["observed_requests"] == 70
+    assert lifecycle["interval_coverage"]["gen_arrival_to_first_gate2"]["observed_requests"] == 70
+    assert _TELEMETRY._collect_global_request_blocks(events)["70"] == 1
+
+
+def test_versioned_candidate_snapshot_reconstructs_unchanged_decisions():
+    prefix = ",".join(f"{request}:1" for request in range(1, 65))
+    tail = ",".join(f"{request}:1" for request in range(65, 71))
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][decision-members] t=1 rank=0 role=gen "
+            "instance=gen sequence=1 snapshot_version=1 membership=candidate "
+            f"chunk_index=1 chunk_count=1 requests={tail}",
+            "[DISAGG_DIAG][decision] t=1 rank=0 instance=gen sequence=1 "
+            "candidate_snapshot=1 active_snapshot=1 active_requests=- "
+            "active_requests_omitted=0 "
+            f"candidate_requests={prefix} candidate_requests_omitted=6 "
+            "admitted=0 admitted_requests=- admitted_requests_omitted=0 "
+            f"deferred=70 deferred_requests={prefix} "
+            "deferred_requests_omitted=6 budget=1",
+            "[DISAGG_DIAG][decision] t=2 rank=0 instance=gen sequence=2 "
+            "candidate_snapshot=1 active_snapshot=1 active_requests=- "
+            "active_requests_omitted=0 "
+            f"candidate_requests={prefix} candidate_requests_omitted=6 "
+            "admitted=0 admitted_requests=- admitted_requests_omitted=0 "
+            f"deferred=70 deferred_requests={prefix} "
+            "deferred_requests_omitted=6 budget=1",
+        ]
+    )
+
+    admissions, _ = _TELEMETRY._collect_admissions(events)
+
+    assert len(admissions) == 2
+    assert all(len(admission.candidate_requests) == 70 for admission in admissions)
+    assert all(len(admission.deferred_requests) == 70 for admission in admissions)
+    assert all(admission.candidate_requests_omitted == 0 for admission in admissions)
+    assert admissions[1].deferred_requests[-1] == "70"
+
+
+def test_remaining_work_ignores_gate_transition_and_reports_incomplete_tail():
+    prefix = ",".join(f"{request}:1" for request in range(1, 65))
+    partial_tail = ",".join(f"{request}:1" for request in range(65, 68))
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][gate2] t=0.9 rank=0 instance=gen sequence=1 "
+            "action=deferred request=99 blocks=1",
+            "[DISAGG_DIAG][decision-members] t=1 rank=0 role=gen "
+            "instance=gen sequence=1 snapshot_version=1 membership=active "
+            f"chunk_index=1 chunk_count=2 requests={partial_tail}",
+            "[DISAGG_DIAG][decision] t=1 rank=0 instance=gen sequence=1 "
+            "active_snapshot=1 candidate_snapshot=1 "
+            f"active_requests={prefix} active_requests_omitted=6 "
+            "candidate_requests=- candidate_requests_omitted=0 "
+            "admitted=0 deferred=0 budget=1",
+        ]
+    )
+
+    remaining = _TELEMETRY._analyze_remaining_work_ground_truth(events)
+
+    assert remaining["active_decision_samples"] == 64
+    assert remaining["active_request_ids_recovered_from_overflow"] == 0
+    assert remaining["active_request_ids_omitted"] == 6
+    assert remaining["identity_coverage"]["fraction"] == pytest.approx(64 / 70)
+
+
+def test_membership_snapshots_do_not_cross_instances_or_ranks():
+    prefix = ",".join(f"{request}:1" for request in range(1, 65))
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][decision-members] t=1 rank=0 role=gen "
+            "instance=gen-a snapshot_version=1 membership=candidate "
+            "chunk_index=1 chunk_count=1 requests=65:1",
+            "[DISAGG_DIAG][decision] t=1 rank=0 instance=gen-a sequence=1 "
+            "candidate_snapshot=1 active_snapshot=1 active_requests=- "
+            "active_requests_omitted=0 "
+            f"candidate_requests={prefix} candidate_requests_omitted=1 "
+            "admitted=0 deferred=65 budget=1",
+            "[DISAGG_DIAG][decision-members] t=1 rank=1 role=gen "
+            "instance=gen-b snapshot_version=1 membership=candidate "
+            "chunk_index=1 chunk_count=1 requests=165:1",
+            "[DISAGG_DIAG][decision] t=1 rank=1 instance=gen-b sequence=1 "
+            "candidate_snapshot=1 active_snapshot=1 active_requests=- "
+            "active_requests_omitted=0 "
+            f"candidate_requests={prefix} candidate_requests_omitted=1 "
+            "admitted=0 deferred=65 budget=1",
+        ]
+    )
+
+    admissions, _ = _TELEMETRY._collect_admissions(events)
+
+    assert {admission.candidate_requests[-1][0] for admission in admissions} == {
+        "65",
+        "165",
+    }
+
+
+def test_single_log_same_rank_is_namespaced_by_instance():
+    events = [
+        _parse_source_line(
+            "[DISAGG_DIAG][decision] t=1 host=node instance=gen-a rank=0 "
+            "sequence=1 active_blocks=0 candidate_requests=1:1 admitted=1 "
+            "admitted_requests=1:1 deferred=0 budget=1",
+            "combined.log",
+        ),
+        _parse_source_line(
+            "[DISAGG_DIAG][decision] t=1 host=node instance=gen-b rank=0 "
+            "sequence=1 active_blocks=0 candidate_requests=101:1 admitted=1 "
+            "admitted_requests=101:1 deferred=0 budget=1",
+            "combined.log",
+        ),
+    ]
+
+    result = analyze_events(events)
+
+    assert sorted(result["ranks"]) == [
+        "0::host=node::instance=gen-a::role=gen",
+        "0::host=node::instance=gen-b::role=gen",
+    ]
+    assert result["rank_namespace"] == "source-path::rank[::host::instance::role]"
+
+
+def test_missing_native_instance_aliases_to_single_known_instance():
+    events = [
+        _parse_source_line(
+            "[DISAGG_DIAG][submit] t=1 host=node instance=gen rank=0 request=1 blocks=4",
+            "worker.log",
+        ),
+        _parse_source_line(
+            "[DISAGG_DIAG][python-transfer] t=2 host=node rank=0 role=gen "
+            "action=local-ready request=1 outcome=completed",
+            "worker.log",
+        ),
+        _parse_source_line(
+            "[DISAGG_DIAG][reap] t=3 host=node instance=gen rank=0 "
+            "request=1 blocks=4 outcome=completed",
+            "worker.log",
+        ),
+    ]
+
+    result = analyze_events(events)
+
+    assert list(result["ranks"]) == ["0"]
+    assert result["ranks"]["0"]["service"]["latency_s"]["p50"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("deadline_action", ["timeout", "timed-out"])
+def test_legacy_timeout_action_is_an_observation_not_a_terminal_outcome(
+    deadline_action,
+):
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][ctx-transfer] t=0.0 rank=0 action=timer-start request=42",
+            f"[DISAGG_DIAG][ctx-transfer] t=1.0 rank=0 action={deadline_action} request=42",
+            "[DISAGG_DIAG][ctx-transfer] t=2.0 rank=0 action=reaped request=42 outcome=completed",
+        ]
+    )
+
+    result = analyze_events(events)
+
+    assert result["lifecycle"]["deadline_phase_counts"] == {"pre-credit": 1}
+    assert _TELEMETRY._collect_unsuccessful_requests(events) == set()
+
+
 def test_remaining_work_censors_cross_source_endpoints():
     events = [
         _parse_source_line(

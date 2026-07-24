@@ -91,18 +91,29 @@ def _log_python_transfer_diagnostic(
     role: str,
     action: str,
     request: int,
+    instance: str = "-",
     timestamp_s: Optional[float] = None,
+    wall_timestamp_s: Optional[float] = None,
+    wall_semantics: str = "emission",
     **fields: object,
 ) -> None:
     if not _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
         return
     if timestamp_s is None:
         timestamp_s = _diagnostic_now_s()
+    if wall_timestamp_s is None:
+        wall_timestamp_s = time.time()
+    host = os.getenv("HOSTNAME", "unknown").replace(" ", "_")
+    instance = instance.replace(" ", "_")
     encoded_fields = " ".join(f"{key}={value}" for key, value in fields.items())
     logger.info(
         "[DISAGG_DIAG][python-transfer] "
-        f"t={timestamp_s:.9f} clock=local_steady runtime=Python rank={rank} "
-        f"role={role} source=native action={action} request={request} {encoded_fields}"
+        f"t={timestamp_s:.9f} clock=local_steady "
+        f"wall_t={wall_timestamp_s:.9f} wall_clock=unix "
+        f"wall_semantics={wall_semantics} runtime=Python "
+        f"host={host} instance={instance} rank={rank} role={role} "
+        f"source=native action={action} "
+        f"request={request} {encoded_fields}"
     )
 
 
@@ -291,6 +302,8 @@ class KVSendTask(SendTaskBase):
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
+        self.kv_physical_complete_time_s: Optional[float] = None
+        self.kv_physical_complete_wall_time_s: Optional[float] = None
         self._slice = kv_slice
         self._prompt_len = prompt_len
         self._beam_width = beam_width
@@ -424,12 +437,18 @@ class Sender(SenderBase):
                 with tx_session.lock:
                     became_ready = not tx_session.receiver_ready
                     tx_session.receiver_ready = True
-                if became_ready:
+                if became_ready and _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    receiver_ready_time_s = _diagnostic_now_s()
+                    receiver_ready_wall_time_s = time.time()
                     _log_python_transfer_diagnostic(
                         rank=self._instance_rank,
                         role="ctx",
                         action="receiver-info-ready",
                         request=unique_rid,
+                        instance=self._registrar.self_rank_info.instance_name,
+                        timestamp_s=receiver_ready_time_s,
+                        wall_timestamp_s=receiver_ready_wall_time_s,
+                        wall_semantics="boundary-sampled",
                         local_request=tx_session.request_id,
                         received=expected_count,
                         expected=expected_count,
@@ -603,6 +622,9 @@ class Sender(SenderBase):
 
         agent_result = AgentResult.SUCCESS
         send_slot_id = None
+        first_write_boundary = None
+        agent_wait_complete_time_s = None
+        agent_wait_complete_wall_time_s = None
         if write_meta.src_ptrs.size > 0:
             try:
                 request, send_slot_id = build_send_request(
@@ -631,21 +653,18 @@ class Sender(SenderBase):
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
             try:
+                status = self._agent.submit_transfer_requests(request)
                 if _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                     first_write_submit_time_s = _diagnostic_now_s()
-                    if session.mark_first_write_submitted(first_write_submit_time_s):
-                        _log_python_transfer_diagnostic(
-                            rank=self._instance_rank,
-                            role="ctx",
-                            action="first-write-submitted",
-                            request=write_meta.unique_rid,
-                            timestamp_s=first_write_submit_time_s,
-                            local_request=session.request_id,
-                            peer_rank=write_meta.peer_rank,
-                            slice=write_meta.slice_id,
-                            bytes=int(write_meta.sizes.sum()),
+                    first_write_submit_wall_time_s = time.time()
+                    if session.mark_first_write_submitted(
+                        first_write_submit_time_s,
+                        first_write_submit_wall_time_s,
+                    ):
+                        first_write_boundary = (
+                            first_write_submit_time_s,
+                            first_write_submit_wall_time_s,
                         )
-                status = self._agent.submit_transfer_requests(request)
                 if not status.wait():
                     agent_result = AgentResult.FAILED
                     last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
@@ -664,9 +683,31 @@ class Sender(SenderBase):
                     )
                     logger.error(detail)
                     task.fail(RuntimeError(detail))
+                elif _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    agent_wait_complete_time_s = _diagnostic_now_s()
+                    agent_wait_complete_wall_time_s = time.time()
             finally:
                 if send_slot_id is not None:
                     self._bounce.release_send(send_slot_id)
+        elif _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            agent_wait_complete_time_s = _diagnostic_now_s()
+            agent_wait_complete_wall_time_s = time.time()
+
+        if first_write_boundary is not None:
+            _log_python_transfer_diagnostic(
+                rank=self._instance_rank,
+                role="ctx",
+                action="first-write-submitted",
+                request=write_meta.unique_rid,
+                instance=self._registrar.self_rank_info.instance_name,
+                timestamp_s=first_write_boundary[0],
+                wall_timestamp_s=first_write_boundary[1],
+                wall_semantics="boundary-sampled",
+                local_request=session.request_id,
+                peer_rank=write_meta.peer_rank,
+                slice=write_meta.slice_id,
+                bytes=int(write_meta.sizes.sum()),
+            )
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
@@ -694,6 +735,16 @@ class Sender(SenderBase):
         task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
 
         with task.lock:
+            if (
+                agent_result == AgentResult.SUCCESS
+                and agent_wait_complete_time_s is not None
+                and (
+                    task.kv_physical_complete_time_s is None
+                    or agent_wait_complete_time_s > task.kv_physical_complete_time_s
+                )
+            ):
+                task.kv_physical_complete_time_s = agent_wait_complete_time_s
+                task.kv_physical_complete_wall_time_s = agent_wait_complete_wall_time_s
             task.transferred_count += 1
             count = task.transferred_count
 
@@ -711,6 +762,54 @@ class Sender(SenderBase):
                 task.complete()
                 if all(t.status == TaskStatus.TRANSFERRED for t in session.kv_tasks):
                     session.transfer_end_time = tensorrt_llm.bindings.global_steady_clock_now()
+                    if _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        task_boundaries = []
+                        for kv_task in session.kv_tasks:
+                            with kv_task.lock:
+                                task_boundaries.append(
+                                    (
+                                        kv_task.kv_physical_complete_time_s,
+                                        kv_task.kv_physical_complete_wall_time_s,
+                                    )
+                                )
+                        if all(
+                            steady_time is not None and wall_time is not None
+                            for steady_time, wall_time in task_boundaries
+                        ):
+                            kv_physical_complete_time_s, (kv_physical_complete_wall_time_s) = max(
+                                task_boundaries, key=lambda boundary: boundary[0]
+                            )
+                        else:
+                            kv_physical_complete_time_s = None
+                            kv_physical_complete_wall_time_s = None
+                        if (
+                            kv_physical_complete_time_s is not None
+                            and session.mark_kv_physical_complete(kv_physical_complete_time_s)
+                        ):
+                            first_write_time_s = session.first_write_submit_time_s
+                            kv_physical_service_ms = (
+                                (kv_physical_complete_time_s - first_write_time_s) * 1000
+                                if first_write_time_s is not None
+                                else -1.0
+                            )
+                            _log_python_transfer_diagnostic(
+                                rank=self._instance_rank,
+                                role="ctx",
+                                action="kv-physical-complete",
+                                request=write_meta.unique_rid,
+                                instance=self._registrar.self_rank_info.instance_name,
+                                timestamp_s=kv_physical_complete_time_s,
+                                wall_timestamp_s=kv_physical_complete_wall_time_s,
+                                wall_semantics="boundary-sampled",
+                                local_request=session.request_id,
+                                slices=len(session.kv_tasks),
+                                first_write_t=(
+                                    f"{first_write_time_s:.9f}"
+                                    if first_write_time_s is not None
+                                    else "-1"
+                                ),
+                                kv_physical_service_ms=(f"{kv_physical_service_ms:.6f}"),
+                            )
 
         logger.debug(
             f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
@@ -1152,15 +1251,22 @@ class Sender(SenderBase):
             session = self._get_session(req_info.unique_rid)
             if session is not None and not session.receiver_ready:
                 session.receiver_ready = True
-                _log_python_transfer_diagnostic(
-                    rank=self._instance_rank,
-                    role="ctx",
-                    action="receiver-info-ready",
-                    request=req_info.unique_rid,
-                    local_request=session.request_id,
-                    received=expected_transfers,
-                    expected=expected_transfers,
-                )
+                if _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    receiver_ready_time_s = _diagnostic_now_s()
+                    receiver_ready_wall_time_s = time.time()
+                    _log_python_transfer_diagnostic(
+                        rank=self._instance_rank,
+                        role="ctx",
+                        action="receiver-info-ready",
+                        request=req_info.unique_rid,
+                        instance=self._registrar.self_rank_info.instance_name,
+                        timestamp_s=receiver_ready_time_s,
+                        wall_timestamp_s=receiver_ready_wall_time_s,
+                        wall_semantics="boundary-sampled",
+                        local_request=session.request_id,
+                        received=expected_transfers,
+                        expected=expected_transfers,
+                    )
 
     def has_all_peer_req_infos(self, unique_rid: int) -> bool:
         req_info = self._get_first_req_info(unique_rid)
@@ -1274,11 +1380,14 @@ class TxSession(TxSessionBase):
         self.transfer_start_time = None
         self.transfer_end_time = None
         self._first_write_submit_time_s: Optional[float] = None
+        self._first_write_submit_wall_time_s: Optional[float] = None
+        self._kv_physical_complete_time_s: Optional[float] = None
         _log_python_transfer_diagnostic(
             rank=self._sender._instance_rank,
             role="ctx",
             action="session-created",
             request=self.disagg_request_id,
+            instance=self._sender._registrar.self_rank_info.instance_name,
             local_request=self.request_id,
         )
         # Must be last: makes session visible to listener thread,
@@ -1317,7 +1426,14 @@ class TxSession(TxSessionBase):
         with self.lock:
             return self._first_write_submit_time_s
 
-    def mark_first_write_submitted(self, timestamp_s: float) -> bool:
+    @property
+    def kv_physical_complete_time_s(self) -> Optional[float]:
+        with self.lock:
+            return self._kv_physical_complete_time_s
+
+    def mark_first_write_submitted(
+        self, timestamp_s: float, wall_timestamp_s: Optional[float] = None
+    ) -> bool:
         """Record the first transfer-agent submission exactly once."""
         if not _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
             return False
@@ -1325,6 +1441,17 @@ class TxSession(TxSessionBase):
             if self._first_write_submit_time_s is not None:
                 return False
             self._first_write_submit_time_s = timestamp_s
+            self._first_write_submit_wall_time_s = wall_timestamp_s
+            return True
+
+    def mark_kv_physical_complete(self, timestamp_s: float) -> bool:
+        """Record sender-side KV physical completion exactly once."""
+        if not _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            return False
+        with self.lock:
+            if self._kv_physical_complete_time_s is not None:
+                return False
+            self._kv_physical_complete_time_s = timestamp_s
             return True
 
     def send(self, slice: KVSlice) -> None:
@@ -1348,6 +1475,7 @@ class TxSession(TxSessionBase):
             role="ctx",
             action="send-queued",
             request=self.disagg_request_id,
+            instance=self._sender._registrar.self_rank_info.instance_name,
             local_request=self.request_id,
             slice=slice_id,
         )
@@ -1405,8 +1533,9 @@ class TxSession(TxSessionBase):
         _log_python_transfer_diagnostic(
             rank=self._sender._instance_rank,
             role="ctx",
-            action="cancelled",
+            action="cancel-requested",
             request=self.disagg_request_id,
+            instance=self._sender._registrar.self_rank_info.instance_name,
             local_request=self.request_id,
         )
         # Send outside the lock to avoid holding it during I/O.
@@ -1743,13 +1872,17 @@ class Receiver(ReceiverBase):
             )
         if _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
             capacity_prepared_time_s = _diagnostic_now_s()
+            capacity_prepared_wall_time_s = time.time()
             if session.mark_capacity_prepared(capacity_prepared_time_s):
                 _log_python_transfer_diagnostic(
                     rank=self._registrar.self_rank_info.instance_rank,
                     role="gen",
                     action="capacity-prepared",
                     request=receiver_req.unique_rid,
+                    instance=self._registrar.self_rank_info.instance_name,
                     timestamp_s=capacity_prepared_time_s,
+                    wall_timestamp_s=capacity_prepared_wall_time_s,
+                    wall_semantics="boundary-sampled",
                     local_request=session.request_id,
                     slice=task.slice_id,
                     expected=task.expected_transfers,
@@ -1773,13 +1906,17 @@ class Receiver(ReceiverBase):
             self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
         if _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
             request_info_sent_time_s = _diagnostic_now_s()
+            request_info_sent_wall_time_s = time.time()
             if session.mark_request_info_sent(request_info_sent_time_s):
                 _log_python_transfer_diagnostic(
                     rank=self._registrar.self_rank_info.instance_rank,
                     role="gen",
                     action="request-info-sent",
                     request=receiver_req.unique_rid,
+                    instance=self._registrar.self_rank_info.instance_name,
                     timestamp_s=request_info_sent_time_s,
+                    wall_timestamp_s=request_info_sent_wall_time_s,
+                    wall_semantics="boundary-sampled",
                     local_request=session.request_id,
                     slice=task.slice_id,
                     sent=len(peer_overlap.ranks),
@@ -1978,6 +2115,7 @@ class RxSession(RxSessionBase):
             role="gen",
             action="session-created",
             request=self.disagg_request_id,
+            instance=self._receiver._registrar.self_rank_info.instance_name,
             local_request=self.request_id,
         )
         self._receiver.setup_session(self)
@@ -2269,8 +2407,9 @@ class RxSession(RxSessionBase):
         _log_python_transfer_diagnostic(
             rank=self._receiver._registrar.self_rank_info.instance_rank,
             role="gen",
-            action="cancelled",
+            action="cancel-requested",
             request=self.disagg_request_id,
+            instance=self._receiver._registrar.self_rank_info.instance_name,
             local_request=self.request_id,
         )
         # Send outside the lock to avoid holding it during I/O.

@@ -99,6 +99,56 @@ def test_unsupported_transceiver_warns_once(monkeypatch):
     warning.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("cancelled", "expected_result"),
+    [(True, "accepted"), (False, "retry")],
+)
+def test_cancel_result_diagnostic_distinguishes_accept_and_retry(
+    monkeypatch, cancelled, expected_result
+):
+    monkeypatch.setattr(executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    log_info = Mock()
+    monkeypatch.setattr(executor_module.logger, "info", log_info)
+    request = _make_timeout_request()
+    request.is_context_only_request = True
+    request.py_disaggregated_params = None
+    executor = object.__new__(PyExecutor)
+    executor.dist = SimpleNamespace(rank=0)
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.cancel_request.return_value = cancelled
+
+    result = PyExecutor._request_kv_transfer_cancellation(executor, request, reason="deadline")
+
+    assert result is cancelled
+    message = log_info.call_args.args[0]
+    assert "[DISAGG_DIAG][ctx-transfer]" in message
+    assert "action=cancel-result" in message
+    assert "reason=deadline" in message
+    assert f"result={expected_result}" in message
+
+
+def test_cancel_result_diagnostic_records_exception(monkeypatch):
+    monkeypatch.setattr(executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    log_info = Mock()
+    monkeypatch.setattr(executor_module.logger, "info", log_info)
+    request = _make_timeout_request()
+    request.is_context_only_request = False
+    request.py_disaggregated_params = None
+    executor = object.__new__(PyExecutor)
+    executor.dist = SimpleNamespace(rank=0)
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.cancel_request.side_effect = RuntimeError("cancel failed")
+
+    result = PyExecutor._request_kv_transfer_cancellation(executor, request, reason="deadline")
+
+    assert not result
+    message = log_info.call_args.args[0]
+    assert "[DISAGG_DIAG][gen-transfer]" in message
+    assert "action=cancel-result" in message
+    assert "result=exception" in message
+    assert "exception=RuntimeError" in message
+
+
 def test_flag_unset_generation_timeout_uses_rank_uniform_cleanup():
     request = _make_timeout_request()
     executor = _make_response_handler_stub([request], [True, False])

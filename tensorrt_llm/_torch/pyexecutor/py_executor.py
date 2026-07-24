@@ -3438,11 +3438,23 @@ class PyExecutor:
         timestamp = fields.pop("t", None)
         if timestamp is None:
             timestamp = get_steady_clock_now_in_seconds()
+        wall_timestamp = fields.pop("wall_t", None)
+        wall_semantics = fields.pop("wall_semantics", "emission")
+        if wall_timestamp is None:
+            wall_timestamp = time.time()
         rank = getattr(getattr(self, "dist", None), "rank", -1)
+        host = os.getenv("HOSTNAME", "unknown").replace(" ", "_")
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        instance = getattr(transceiver, "_instance_name", "-")
+        if not isinstance(instance, str):
+            instance = "-"
         encoded_fields = " ".join(f"{key}={value}"
                                   for key, value in fields.items())
         logger.info(f"[DISAGG_DIAG][{category}] t={timestamp:.9f} "
-                    f"rank={rank} {encoded_fields}")
+                    f"clock=local_steady wall_t={wall_timestamp:.9f} "
+                    f"wall_clock=unix wall_semantics={wall_semantics} "
+                    f"source=pyexecutor host={host} "
+                    f"instance={instance} rank={rank} {encoded_fields}")
 
     @staticmethod
     def _disagg_diag_request_id(request: LlmRequest) -> int:
@@ -3451,7 +3463,196 @@ class PyExecutor:
                                     None) if params is not None else None
         if isinstance(disagg_request_id, int):
             return disagg_request_id
+        ctx_request_id = getattr(params, "ctx_request_id",
+                                 None) if params is not None else None
+        if isinstance(ctx_request_id, int):
+            return ctx_request_id
         return request.py_request_id
+
+    @staticmethod
+    def _disagg_diag_schedule_style(request: LlmRequest) -> str:
+        params = getattr(request, "py_disaggregated_params", None)
+        schedule_style = getattr(params, "schedule_style",
+                                 None) if params is not None else None
+        if schedule_style is None:
+            return "unknown"
+        return getattr(schedule_style, "name", str(schedule_style))
+
+    def _log_disagg_effective_config_once(self, request: LlmRequest,
+                                          role: str) -> None:
+        if not _is_disagg_transfer_diagnostics_enabled():
+            return
+        logged_roles = getattr(self, "_disagg_diag_config_logged_roles", None)
+        if logged_roles is None:
+            logged_roles = set()
+            self._disagg_diag_config_logged_roles = logged_roles
+        if role in logged_roles:
+            return
+        logged_roles.add(role)
+
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        controller = self._get_disagg_transfer_admission_controller()
+        cache_config = getattr(getattr(self, "llm_args", None),
+                               "cache_transceiver_config", None)
+        transfer_worker = getattr(transceiver, "_transfer_worker", None)
+        sender = getattr(transfer_worker, "_sender", None)
+        transfer_threads = getattr(sender, "_num_threads", None)
+        if not isinstance(transfer_threads, int):
+            transfer_threads = -1
+        timeout_ms = getattr(transceiver, "kv_transfer_timeout_ms", None)
+        poll_interval_ms = getattr(transceiver, "kv_transfer_poll_interval_ms",
+                                   None)
+        sender_future_timeout_ms = getattr(
+            cache_config, "kv_transfer_sender_future_timeout_ms", None)
+        dist = getattr(self, "dist", None)
+
+        def topology_size(name: str) -> int:
+            value = getattr(dist, name, None)
+            return value if isinstance(value, int) else -1
+
+        self._log_disagg_transfer_diagnostic(
+            "config",
+            action="effective",
+            role=role,
+            runtime=type(transceiver).__name__,
+            requested_runtime=getattr(cache_config, "transceiver_runtime", "-"),
+            backend=getattr(cache_config, "backend", "-"),
+            schedule_style=self._disagg_diag_schedule_style(request),
+            max_tokens_in_buffer=getattr(cache_config, "max_tokens_in_buffer",
+                                         None),
+            gate2_enabled=int(controller.enabled()),
+            budget_blocks=controller.max_transfer_blocks,
+            tokens_per_block=controller.tokens_per_block,
+            timeout_ms=timeout_ms,
+            sender_future_timeout_ms=sender_future_timeout_ms,
+            poll_interval_ms=poll_interval_ms,
+            transfer_threads=transfer_threads,
+            world_size=topology_size("world_size"),
+            tp_size=topology_size("tp_size"),
+            pp_size=topology_size("pp_size"),
+            cp_size=topology_size("cp_size"),
+            attention_dp=int(getattr(self, "enable_attention_dp", False)),
+            participant_coverage="observed-only",
+            async_transfer=int(self._uses_async_disagg_gen_transfer()),
+            inflight_cancel_requested=int(is_disagg_inflight_cancel_enabled()),
+            overlap_scheduler=int(
+                not getattr(self, "disable_overlap_scheduler", False)))
+
+    def _capture_disagg_transfer_timer(
+            self, request: LlmRequest) -> Optional[Tuple[float, float, float]]:
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        timeout_ms = getattr(transceiver, "kv_transfer_timeout_ms", None)
+        if timeout_ms is None:
+            return None
+
+        timer_start = time.monotonic()
+        timer_wall_time = time.time()
+        request.py_kv_transfer_start_time = timer_start
+        return timer_start, timer_wall_time, float(timeout_ms)
+
+    def _log_disagg_transfer_timer_start(
+            self, request: LlmRequest, role: str,
+            timer_capture: Optional[Tuple[float, float, float]]) -> None:
+        if not _is_disagg_transfer_diagnostics_enabled():
+            return
+
+        self._log_disagg_effective_config_once(request, role)
+        if timer_capture is None:
+            return
+        timer_start, timer_wall_time, timeout_ms = timer_capture
+        category = "ctx-transfer" if role == "ctx" else "gen-transfer"
+        self._log_disagg_transfer_diagnostic(
+            category,
+            t=timer_start,
+            wall_t=timer_wall_time,
+            wall_semantics="boundary-sampled",
+            action="timer-start",
+            request=self._disagg_diag_request_id(request),
+            local_request=request.py_request_id,
+            timer_start_t=f"{timer_start:.9f}",
+            deadline_t=f"{timer_start + timeout_ms / 1000.0:.9f}",
+            timer_clock="python_monotonic",
+            timeout_ms=timeout_ms,
+            anchor=("after-respond-and-send-async" if role == "ctx" else
+                    "after-request-and-receive-async-batch"),
+            schedule_style=self._disagg_diag_schedule_style(request),
+            state=getattr(request.state, "name", str(request.state)))
+
+    def _start_disagg_transfer_timer(self, request: LlmRequest,
+                                     role: str) -> None:
+        timer_capture = self._capture_disagg_transfer_timer(request)
+        self._log_disagg_transfer_timer_start(request, role, timer_capture)
+
+    def _log_disagg_gate_transition(self, request: LlmRequest, gate: int,
+                                    state: str, blocks: int,
+                                    decision_time: float,
+                                    decision_wall_time: float,
+                                    decision_sequence: int) -> None:
+        state_attr = f"py_disagg_diag_gate{gate}_state"
+        previous = getattr(request, state_attr, None)
+        if previous == state:
+            return
+        setattr(request, state_attr, state)
+
+        fields = {
+            "action":
+            state,
+            "request":
+            self._disagg_diag_request_id(request),
+            "local_request":
+            request.py_request_id,
+            "blocks":
+            blocks,
+            "sequence":
+            decision_sequence,
+            "previous":
+            previous or "-",
+            "reason":
+            (f"capacity-scheduler-{'selected' if state == 'fitting' else 'not-selected'}"
+             if gate == 1 else "transport-window"),
+        }
+        activation_time = getattr(request,
+                                  "py_disagg_gen_executor_activation_time_s",
+                                  None)
+        if isinstance(activation_time, (int, float)):
+            fields["activation_to_transition_ms"] = (
+                f"{(decision_time - activation_time) * 1000:.6f}")
+
+        if gate == 2 and state == "deferred":
+            first_defer_time = getattr(
+                request, "py_disagg_diag_gate2_first_defer_time_s", None)
+            if not isinstance(first_defer_time, (int, float)):
+                request.py_disagg_diag_gate2_first_defer_time_s = decision_time
+                fields["first_defer"] = 1
+            else:
+                fields["first_defer"] = 0
+        elif gate == 2 and state == "admitted":
+            first_defer_time = getattr(
+                request, "py_disagg_diag_gate2_first_defer_time_s", None)
+            fields["deferral_ms"] = (
+                f"{(decision_time - first_defer_time) * 1000:.6f}"
+                if isinstance(first_defer_time, (int, float)) else "0.000000")
+
+        self._log_disagg_transfer_diagnostic(f"gate{gate}",
+                                             t=decision_time,
+                                             wall_t=decision_wall_time,
+                                             wall_semantics="boundary-sampled",
+                                             **fields)
+        if gate == 1 and state == "blocked":
+            previous_gate2 = getattr(request, "py_disagg_diag_gate2_state",
+                                     None)
+            if previous_gate2 not in {None, "ineligible"}:
+                self._log_disagg_gate_transition(
+                    request,
+                    gate=2,
+                    state="ineligible",
+                    blocks=blocks,
+                    decision_time=decision_time,
+                    decision_wall_time=decision_wall_time,
+                    decision_sequence=decision_sequence)
+            else:
+                request.py_disagg_diag_gate2_state = "ineligible"
+            request.py_disagg_diag_gate2_first_defer_time_s = None
 
     def _log_disagg_gen_ingress(
             self, request_items: Iterable[RequestQueueItem]) -> None:
@@ -3459,6 +3660,7 @@ class PyExecutor:
             return
 
         ingress_time = get_steady_clock_now_in_seconds()
+        ingress_wall_time = time.time()
         for item in request_items:
             request = item.request
             if (request is None or request.request_type
@@ -3468,6 +3670,8 @@ class PyExecutor:
             self._log_disagg_transfer_diagnostic(
                 "gen-arrival",
                 t=ingress_time,
+                wall_t=ingress_wall_time,
+                wall_semantics="boundary-sampled",
                 request=item.id,
                 boundary="executor-queue-to-waiting-queue")
 
@@ -3477,6 +3681,7 @@ class PyExecutor:
             return
 
         activation_time = get_steady_clock_now_in_seconds()
+        activation_wall_time = time.time()
         for request in requests:
             if (getattr(request, "state", None)
                     != LlmRequestState.DISAGG_GENERATION_INIT):
@@ -3488,6 +3693,8 @@ class PyExecutor:
             self._log_disagg_transfer_diagnostic(
                 "gen-activation",
                 t=activation_time,
+                wall_t=activation_wall_time,
+                wall_semantics="boundary-sampled",
                 request=self._disagg_diag_request_id(request),
                 local_request=request.py_request_id,
                 ingress_to_activation_ms=(
@@ -3502,6 +3709,50 @@ class PyExecutor:
         return [(self._disagg_diag_request_id(request),
                  controller._estimate_request_blocks(request))
                 for request in requests]
+
+    def _log_disagg_membership_snapshot(self, membership: str,
+                                        request_blocks: List[Tuple[int, int]],
+                                        decision_time: float,
+                                        decision_wall_time: float,
+                                        decision_sequence: int) -> int:
+        snapshots = getattr(self, "_disagg_diag_membership_snapshots", None)
+        if snapshots is None:
+            snapshots = {}
+            self._disagg_diag_membership_snapshots = snapshots
+        request_snapshot = tuple(request_blocks)
+        previous = snapshots.get(membership)
+        changed = previous is None or previous[1] != request_snapshot
+        if changed:
+            snapshot_version = 1 if previous is None else previous[0] + 1
+            snapshots[membership] = (snapshot_version, request_snapshot)
+        else:
+            snapshot_version = previous[0]
+
+        limit = _DISAGG_DIAGNOSTIC_REQUEST_LIST_LIMIT
+        overflow = request_blocks[limit:]
+        if not overflow or (not changed and decision_sequence % 100 != 0):
+            return snapshot_version
+        chunk_count = (len(overflow) + limit - 1) // limit
+        for chunk_index, offset in enumerate(range(0, len(overflow), limit),
+                                             start=1):
+            chunk = overflow[offset:offset + limit]
+            self._log_disagg_transfer_diagnostic(
+                "decision-members",
+                t=decision_time,
+                wall_t=decision_wall_time,
+                wall_semantics="boundary-sampled",
+                role="gen",
+                sequence=decision_sequence,
+                snapshot_version=snapshot_version,
+                membership=membership,
+                chunk_index=chunk_index,
+                chunk_count=chunk_count,
+                total_requests=len(request_blocks),
+                total_blocks=sum(blocks for _, blocks in request_blocks),
+                requests=_format_disagg_diag_request_blocks(chunk),
+                request_count=len(chunk),
+                request_blocks=sum(blocks for _, blocks in chunk))
+        return snapshot_version
 
     def _apply_disagg_transfer_admission(
         self, fitting_disagg_gen_init_requests: List[LlmRequest]
@@ -3526,11 +3777,13 @@ class PyExecutor:
             return fitting_disagg_gen_init_requests, False
 
         decision_time = 0.0
+        decision_wall_time = 0.0
         decision_sequence = 0
         candidate_request_blocks = []
         active_request_blocks = []
         if diagnostics_enabled:
             decision_time = get_steady_clock_now_in_seconds()
+            decision_wall_time = time.time()
             decision_sequence = getattr(
                 self, "_disagg_diag_admission_decision_sequence", 0) + 1
             self._disagg_diag_admission_decision_sequence = decision_sequence
@@ -3561,6 +3814,18 @@ class PyExecutor:
                 request_id
                 for request_id, _ in candidate_request_blocks
             }
+            for request in waiting_requests:
+                request_id = self._disagg_diag_request_id(request)
+                state = ("fitting"
+                         if request_id in candidate_request_ids else "blocked")
+                self._log_disagg_gate_transition(
+                    request,
+                    gate=1,
+                    state=state,
+                    blocks=controller._estimate_request_blocks(request),
+                    decision_time=decision_time,
+                    decision_wall_time=decision_wall_time,
+                    decision_sequence=decision_sequence)
             blocked_count = sum(
                 self._disagg_diag_request_id(request) not in
                 candidate_request_ids for request in waiting_requests)
@@ -3580,6 +3845,8 @@ class PyExecutor:
                 self._log_disagg_transfer_diagnostic(
                     "gate1",
                     t=decision_time,
+                    wall_t=decision_wall_time,
+                    wall_semantics="boundary-sampled",
                     sequence=decision_sequence,
                     waiting=len(waiting_request_blocks),
                     waiting_blocks=sum(blocks
@@ -3625,14 +3892,36 @@ class PyExecutor:
                 request_block for request_block in candidate_request_blocks
                 if request_block[0] not in admitted_request_ids
             ]
+            for request in fitting_disagg_gen_init_requests:
+                request_id = self._disagg_diag_request_id(request)
+                state = ("admitted"
+                         if request_id in admitted_request_ids else "deferred")
+                self._log_disagg_gate_transition(
+                    request,
+                    gate=2,
+                    state=state,
+                    blocks=controller._estimate_request_blocks(request),
+                    decision_time=decision_time,
+                    decision_wall_time=decision_wall_time,
+                    decision_sequence=decision_sequence)
             candidate_transfer_blocks = sum(
                 blocks for _, blocks in candidate_request_blocks)
             deferred_transfer_blocks = sum(
                 blocks for _, blocks in deferred_request_blocks)
+            active_snapshot = self._log_disagg_membership_snapshot(
+                "active", active_request_blocks, decision_time,
+                decision_wall_time, decision_sequence)
+            candidate_snapshot = self._log_disagg_membership_snapshot(
+                "candidate", candidate_request_blocks, decision_time,
+                decision_wall_time, decision_sequence)
             self._log_disagg_transfer_diagnostic(
                 "decision",
                 t=decision_time,
+                wall_t=decision_wall_time,
+                wall_semantics="boundary-sampled",
                 sequence=decision_sequence,
+                active_snapshot=active_snapshot,
+                candidate_snapshot=candidate_snapshot,
                 runtime=type(self.kv_cache_transceiver).__name__,
                 active=len(active_request_blocks),
                 active_blocks=admission_result.active_transfer_blocks,
@@ -3675,7 +3964,11 @@ class PyExecutor:
                 self._log_disagg_transfer_diagnostic(
                     "admission",
                     t=decision_time,
+                    wall_t=decision_wall_time,
+                    wall_semantics="boundary-sampled",
                     sequence=decision_sequence,
+                    active_snapshot=active_snapshot,
+                    candidate_snapshot=candidate_snapshot,
                     runtime=type(self.kv_cache_transceiver).__name__,
                     active=len(active_request_blocks),
                     active_blocks=admission_result.active_transfer_blocks,
@@ -5780,14 +6073,39 @@ class PyExecutor:
             self._disagg_inflight_cancel_unsupported_logged = True
         return False
 
-    def _request_kv_transfer_cancellation(self, request: LlmRequest) -> bool:
+    def _request_kv_transfer_cancellation(self,
+                                          request: LlmRequest,
+                                          reason: str = "user") -> bool:
         """Best-effort cancellation that leaves ownership intact on errors."""
+        role = ("ctx" if getattr(request, "is_context_only_request", False)
+                is True else "gen")
+        category = "ctx-transfer" if role == "ctx" else "gen-transfer"
         try:
-            return self.kv_cache_transceiver.cancel_request(request)
+            is_cancelled = self.kv_cache_transceiver.cancel_request(request)
         except Exception as error:
             logger.error(f"KV transfer cancellation failed for request "
                          f"{request.py_request_id}; will retry: {error}")
+            if _is_disagg_transfer_diagnostics_enabled():
+                self._log_disagg_transfer_diagnostic(
+                    category,
+                    action="cancel-result",
+                    request=self._disagg_diag_request_id(request),
+                    local_request=request.py_request_id,
+                    reason=reason,
+                    result="exception",
+                    exception=type(error).__name__,
+                    state=getattr(request.state, "name", str(request.state)))
             return False
+        if _is_disagg_transfer_diagnostics_enabled():
+            self._log_disagg_transfer_diagnostic(
+                category,
+                action="cancel-result",
+                request=self._disagg_diag_request_id(request),
+                local_request=request.py_request_id,
+                reason=reason,
+                result="accepted" if is_cancelled else "retry",
+                state=getattr(request.state, "name", str(request.state)))
+        return is_cancelled
 
     @nvtx_range("_cancel_timed_out_gen_transfers")
     def _cancel_timed_out_gen_transfers(self) -> None:
@@ -5809,6 +6127,7 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_in_progress
         }
         current_time = time.monotonic()
+        current_wall_time = time.time()
         for request in requests_in_transfer.values():
             if request.py_kv_transfer_start_time is None:
                 continue
@@ -5820,6 +6139,23 @@ class PyExecutor:
                     f"Requesting cancellation for generation request "
                     f"{request.py_request_id} due to KV cache transfer timeout")
                 request.py_kv_transfer_timed_out = True
+                if _is_disagg_transfer_diagnostics_enabled():
+                    self._log_disagg_transfer_diagnostic(
+                        "gen-transfer",
+                        t=current_time,
+                        wall_t=current_wall_time,
+                        wall_semantics="boundary-sampled",
+                        action="deadline-observed",
+                        request=self._disagg_diag_request_id(request),
+                        local_request=request.py_request_id,
+                        timer_start_t=(
+                            f"{request.py_kv_transfer_start_time:.9f}"),
+                        timer_clock="python_monotonic",
+                        elapsed_ms=f"{elapsed_time:.3f}",
+                        timeout_ms=timeout_ms,
+                        cancel_mode="inflight",
+                        state=getattr(request.state, "name",
+                                      str(request.state)))
 
         user_canceled_ids = set(self.canceled_req_ids)
         local_timed_out_ids = sorted(
@@ -5856,7 +6192,8 @@ class PyExecutor:
             if request_id in self._disagg_timed_out_gen_cancelled_ids:
                 continue
 
-            is_cancelled = self._request_kv_transfer_cancellation(request)
+            is_cancelled = self._request_kv_transfer_cancellation(
+                request, reason="deadline")
             if is_cancelled:
                 self._disagg_timed_out_gen_cancelled_ids.add(request_id)
                 logger.warning(
@@ -5896,13 +6233,15 @@ class PyExecutor:
 
         def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
             current_time = time.monotonic()
+            current_wall_time = time.time()
             if req.py_kv_transfer_start_time is None:
                 return
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
+                inflight_cancel_active = (
+                    self._is_disagg_inflight_cancel_active())
                 verb = ("Requesting cancellation for"
-                        if self._is_disagg_inflight_cancel_active() else
-                        "Observed timeout on")
+                        if inflight_cancel_active else "Observed timeout on")
                 logger.warning(
                     f"{verb} {type} request {req.py_request_id} due to KV "
                     f"cache transfer timeout: elapsed {elapsed_time:.0f}ms > "
@@ -5913,11 +6252,18 @@ class PyExecutor:
                                 if type == "context" else "gen-transfer")
                     self._log_disagg_transfer_diagnostic(
                         category,
-                        action="timeout",
+                        t=current_time,
+                        wall_t=current_wall_time,
+                        wall_semantics="boundary-sampled",
+                        action="deadline-observed",
                         request=self._disagg_diag_request_id(req),
                         local_request=req.py_request_id,
+                        timer_start_t=(f"{req.py_kv_transfer_start_time:.9f}"),
+                        timer_clock="python_monotonic",
                         elapsed_ms=f"{elapsed_time:.3f}",
                         timeout_ms=timeout_ms,
+                        cancel_mode=("inflight"
+                                     if inflight_cancel_active else "legacy"),
                         state=getattr(req.state, "name", str(req.state)))
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
@@ -6383,16 +6729,32 @@ class PyExecutor:
         diagnostics_enabled = _is_disagg_transfer_diagnostics_enabled()
         controller = (self._get_disagg_transfer_admission_controller()
                       if diagnostics_enabled else None)
+        submit_diagnostics = []
         for req in new_gen_reqs:
             if diagnostics_enabled:
                 submit_start = get_steady_clock_now_in_seconds()
             self.kv_cache_transceiver.request_and_receive_async(req)
             if diagnostics_enabled:
                 submit_end = get_steady_clock_now_in_seconds()
-                assert controller is not None
+                submit_wall_time = time.time()
+                submit_diagnostics.append(
+                    (req, submit_start, submit_end, submit_wall_time))
+
+        timer_captures = []
+        for req in new_gen_reqs:
+            if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                timer_captures.append(
+                    (req, self._capture_disagg_transfer_timer(req)))
+
+        if diagnostics_enabled:
+            assert controller is not None
+            for (req, submit_start, submit_end,
+                 submit_wall_time) in submit_diagnostics:
                 self._log_disagg_transfer_diagnostic(
                     "submit",
                     t=submit_end,
+                    wall_t=submit_wall_time,
+                    wall_semantics="boundary-sampled",
                     runtime=type(self.kv_cache_transceiver).__name__,
                     request=self._disagg_diag_request_id(req),
                     blocks=controller._estimate_request_blocks(req),
@@ -6401,11 +6763,8 @@ class PyExecutor:
                     submit_call_ms=(
                         f"{(submit_end - submit_start) * 1000:.6f}"),
                     state=getattr(req.state, "name", str(req.state)))
-
-        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-            for req in new_gen_reqs:
-                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
-                    req.py_kv_transfer_start_time = time.monotonic()
+            for req, timer_capture in timer_captures:
+                self._log_disagg_transfer_timer_start(req, "gen", timer_capture)
 
         self._check_disagg_gen_cache_transfer_status(0)
 
@@ -6446,10 +6805,15 @@ class PyExecutor:
                     self.kv_cache_transceiver.respond_and_send_async(req)
                     if diagnostics_enabled:
                         queued_time = get_steady_clock_now_in_seconds()
+                        queued_wall_time = time.time()
+                    timer_capture = self._capture_disagg_transfer_timer(req)
+                    if diagnostics_enabled:
                         req.py_disagg_ctx_send_queued_time_s = queued_time
                         self._log_disagg_transfer_diagnostic(
                             "ctx-transfer",
                             t=queued_time,
+                            wall_t=queued_wall_time,
+                            wall_semantics="boundary-sampled",
                             action="queued",
                             runtime=type(self.kv_cache_transceiver).__name__,
                             request=self._disagg_diag_request_id(req),
@@ -6458,9 +6822,8 @@ class PyExecutor:
                             submit_call_ms=(
                                 f"{(queued_time - submit_start) * 1000:.6f}"),
                             state=getattr(req.state, "name", str(req.state)))
-
-                    if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-                        req.py_kv_transfer_start_time = time.monotonic()
+                        self._log_disagg_transfer_timer_start(
+                            req, "ctx", timer_capture)
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
@@ -6562,6 +6925,8 @@ class PyExecutor:
                     request=self._disagg_diag_request_id(request),
                     local_request=request.py_request_id,
                     outcome=outcome,
+                    deadline_observed=int(
+                        getattr(request, "py_kv_transfer_timed_out", False)),
                     queued_t=(f"{queued_time:.9f}" if isinstance(
                         queued_time, (int, float)) else "-1"),
                     queued_to_reap_ms=f"{queued_to_reap_ms:.6f}",
@@ -6579,7 +6944,8 @@ class PyExecutor:
                     or request_id in self._disagg_timed_out_ctx_cancelled_ids):
                 continue
 
-            is_cancelled = self._request_kv_transfer_cancellation(request)
+            is_cancelled = self._request_kv_transfer_cancellation(
+                request, reason="deadline")
             if not is_cancelled:
                 continue
 
@@ -7312,7 +7678,8 @@ class PyExecutor:
                         timed_out_requests.append(request)
                     continue
 
-                is_cancelled = self._request_kv_transfer_cancellation(request)
+                is_cancelled = self._request_kv_transfer_cancellation(
+                    request, reason="deadline")
                 if is_cancelled:
                     # _handle_errors enters response collectives under ADP.
                     # Defer it until the rank-uniform vote below.

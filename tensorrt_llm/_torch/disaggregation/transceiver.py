@@ -141,12 +141,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return
         if timestamp_s is None:
             timestamp_s = _diagnostic_now_s()
+        wall_timestamp_s = time.time()
         rank = getattr(getattr(self, "_dist", None), "rank", -1)
+        host = os.getenv("HOSTNAME", "unknown").replace(" ", "_")
+        instance = getattr(self, "_instance_name", "-")
         encoded_fields = " ".join(f"{key}={value}" for key, value in fields.items())
         logger.info(
             "[DISAGG_DIAG][python-transfer] "
-            f"t={timestamp_s:.9f} clock=local_steady runtime=Python rank={rank} "
-            f"role={role} source=transceiver action={action} request={request} "
+            f"t={timestamp_s:.9f} clock=local_steady "
+            f"wall_t={wall_timestamp_s:.9f} wall_clock=unix "
+            f"wall_semantics=emission runtime=Python "
+            f"host={host} instance={instance} rank={rank} role={role} "
+            f"source=transceiver action={action} request={request} "
             f"{encoded_fields}"
         )
 
@@ -177,10 +183,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         }
         if role == "ctx":
             first_write_time_s = getattr(session, "first_write_submit_time_s", None)
+            kv_physical_complete_time_s = getattr(session, "kv_physical_complete_time_s", None)
             if first_write_time_s is not None:
                 fields["first_write_t"] = f"{first_write_time_s:.9f}"
                 fields["elapsed_from_first_write_ms"] = (
                     f"{(timestamp_s - first_write_time_s) * 1000:.6f}"
+                )
+            if kv_physical_complete_time_s is not None:
+                fields["kv_physical_complete_t"] = f"{kv_physical_complete_time_s:.9f}"
+                fields["kv_physical_complete_to_terminal_ms"] = (
+                    f"{(timestamp_s - kv_physical_complete_time_s) * 1000:.6f}"
                 )
         else:
             request_info_sent_time_s = getattr(session, "request_info_sent_time_s", None)
@@ -1008,20 +1020,38 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         has_transferring = False
 
         if rid in self._send_sessions:
-            self._send_sessions[rid].cancel()
-            if self._send_sessions[rid].has_transferring_tasks():
+            session = self._send_sessions[rid]
+            req = self._send_reqs[rid]
+            session.cancel()
+            if session.has_transferring_tasks():
                 has_transferring = True
             else:
-                self._send_sessions[rid].close()
+                self._log_transfer_terminal(
+                    role="ctx",
+                    action="cancelled",
+                    rid=rid,
+                    session=session,
+                    req=req,
+                )
+                session.close()
                 del self._send_reqs[rid]
                 del self._send_sessions[rid]
 
         if rid in self._recv_sessions:
-            self._recv_sessions[rid].cancel()
-            if self._recv_sessions[rid].has_transferring_tasks():
+            session = self._recv_sessions[rid]
+            req = self._recv_reqs[rid]
+            session.cancel()
+            if session.has_transferring_tasks():
                 has_transferring = True
             else:
-                self._recv_sessions[rid].close()
+                self._log_transfer_terminal(
+                    role="gen",
+                    action="cancelled",
+                    rid=rid,
+                    session=session,
+                    req=req,
+                )
+                session.close()
                 del self._recv_reqs[rid]
                 del self._recv_sessions[rid]
 

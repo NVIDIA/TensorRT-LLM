@@ -434,6 +434,10 @@ def _make_disagg_transfer_request(
     req.py_prompt_len = prompt_len
     req.total_input_len_cp = prompt_len if total_input_len_cp is None else total_input_len_cp
     req.is_disagg_generation_transmission_in_progress = in_progress
+    req.py_disaggregated_params = None
+    req.py_disagg_diag_gate1_state = None
+    req.py_disagg_diag_gate2_state = None
+    req.py_disagg_diag_gate2_first_defer_time_s = None
     return req
 
 
@@ -447,6 +451,15 @@ def _clear_disagg_transfer_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferAdmissionController:
+    def test_diagnostic_request_id_falls_back_to_context_request_id(self):
+        request = _make_disagg_transfer_request(7, 64)
+        request.py_disaggregated_params = types.SimpleNamespace(
+            disagg_request_id=None,
+            ctx_request_id=701,
+        )
+
+        assert PyExecutor._disagg_diag_request_id(request) == 701
+
     def test_disabled_preserves_candidates(self):
         controller = DisaggTransferAdmissionController(
             max_tokens_in_buffer=None, tokens_per_block=32
@@ -547,15 +560,30 @@ class TestDisaggTransferAdmissionController:
         PyExecutor._apply_disagg_transfer_admission(executor, [candidate])
         PyExecutor._apply_disagg_transfer_admission(executor, [candidate])
 
-        assert log_info.call_count == 4
-        gate1_messages = [
+        assert log_info.call_count == 6
+        gate1_summary_messages = [
             call.args[0]
             for call in log_info.call_args_list
-            if "[DISAGG_DIAG][gate1]" in call.args[0]
+            if "[DISAGG_DIAG][gate1]" in call.args[0] and "waiting_requests=" in call.args[0]
         ]
-        assert len(gate1_messages) == 1
-        assert "sequence=1" in gate1_messages[0]
-        assert "fitting_requests=2:1" in gate1_messages[0]
+        assert len(gate1_summary_messages) == 1
+        assert "sequence=1" in gate1_summary_messages[0]
+        assert "fitting_requests=2:1" in gate1_summary_messages[0]
+        gate1_transition = next(
+            call.args[0]
+            for call in log_info.call_args_list
+            if "[DISAGG_DIAG][gate1]" in call.args[0] and "action=fitting" in call.args[0]
+        )
+        assert "request=2" in gate1_transition
+        assert "previous=-" in gate1_transition
+        gate2_transition = next(
+            call.args[0]
+            for call in log_info.call_args_list
+            if "[DISAGG_DIAG][gate2]" in call.args[0]
+        )
+        assert "action=deferred" in gate2_transition
+        assert "request=2" in gate2_transition
+        assert "first_defer=1" in gate2_transition
         decision_messages = [
             call.args[0]
             for call in log_info.call_args_list
@@ -601,11 +629,92 @@ class TestDisaggTransferAdmissionController:
         gate1_message = next(
             call.args[0]
             for call in log_info.call_args_list
-            if "[DISAGG_DIAG][gate1]" in call.args[0]
+            if "[DISAGG_DIAG][gate1]" in call.args[0] and "waiting_requests=" in call.args[0]
         )
         assert "waiting_requests=4:2" in gate1_message
         assert "fitting_requests=-" in gate1_message
         assert "blocked_requests=4:2" in gate1_message
+        transition_message = next(
+            call.args[0]
+            for call in log_info.call_args_list
+            if "[DISAGG_DIAG][gate1]" in call.args[0] and "action=blocked" in call.args[0]
+        )
+        assert "request=4" in transition_message
+
+    def test_gate2_transitions_are_not_truncated(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+        monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+        log_info = Mock()
+        monkeypatch.setattr(py_executor_module.logger, "info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=0)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = False
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        candidates = [_make_disagg_transfer_request(request_id, 32) for request_id in range(2, 72)]
+
+        PyExecutor._apply_disagg_transfer_admission(executor, candidates)
+        PyExecutor._apply_disagg_transfer_admission(executor, candidates)
+
+        transition_messages = [
+            call.args[0]
+            for call in log_info.call_args_list
+            if "[DISAGG_DIAG][gate2]" in call.args[0] and "action=deferred" in call.args[0]
+        ]
+        assert len(transition_messages) == 70
+        assert any("request=71 " in message for message in transition_messages)
+        membership_messages = [
+            call.args[0]
+            for call in log_info.call_args_list
+            if "[DISAGG_DIAG][decision-members]" in call.args[0]
+        ]
+        assert len(membership_messages) == 1
+        assert "membership=candidate" in membership_messages[0]
+        assert "snapshot_version=1" in membership_messages[0]
+        assert "71:1" in membership_messages[0]
+
+    def test_gate2_deferral_episode_resets_when_gate1_blocks(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+        monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+        decision_times = iter((1.0, 2.0, 3.0))
+        monkeypatch.setattr(
+            py_executor_module,
+            "get_steady_clock_now_in_seconds",
+            lambda: next(decision_times),
+        )
+        log_info = Mock()
+        monkeypatch.setattr(py_executor_module.logger, "info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=0)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = False
+        active = _make_disagg_transfer_request(1, 32, in_progress=True)
+        candidate = _make_disagg_transfer_request(2, 32)
+        candidate.state = LlmRequestState.DISAGG_GENERATION_INIT
+        executor.active_requests = [active]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+
+        PyExecutor._apply_disagg_transfer_admission(executor, [candidate])
+        executor.active_requests = [active, candidate]
+        PyExecutor._apply_disagg_transfer_admission(executor, [])
+        executor.active_requests = []
+        PyExecutor._apply_disagg_transfer_admission(executor, [candidate])
+
+        gate2_messages = [
+            call.args[0]
+            for call in log_info.call_args_list
+            if "[DISAGG_DIAG][gate2]" in call.args[0]
+        ]
+        assert any("action=deferred" in message for message in gate2_messages)
+        assert any("action=ineligible" in message for message in gate2_messages)
+        readmitted = next(message for message in gate2_messages if "action=admitted" in message)
+        assert "previous=ineligible" in readmitted
+        assert "deferral_ms=0.000000" in readmitted
 
     def test_apply_missing_controller_preserves_candidates(self):
         executor = object.__new__(PyExecutor)
@@ -808,7 +917,7 @@ class TestDisaggTransferIdleProgress:
         monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
         log_info = Mock()
         monkeypatch.setattr(py_executor_module.logger, "info", log_info)
-        timestamps = iter((10.0, 10.002))
+        timestamps = iter((10.0, 10.002, 10.003))
         monkeypatch.setattr(
             py_executor_module, "get_steady_clock_now_in_seconds", lambda: next(timestamps)
         )
@@ -830,17 +939,87 @@ class TestDisaggTransferIdleProgress:
 
         PyExecutor._recv_disagg_gen_cache(executor, [request])
 
-        message = log_info.call_args.args[0]
+        message = next(
+            call.args[0]
+            for call in log_info.call_args_list
+            if "[DISAGG_DIAG][submit]" in call.args[0]
+        )
         assert "[DISAGG_DIAG][submit]" in message
         assert "request=7" in message
         assert "blocks=2" in message
         assert "bytes=4096" in message
         assert "submit_call_ms=2.000000" in message
 
+    @pytest.mark.parametrize(
+        ("role", "category"),
+        [("ctx", "ctx-transfer"), ("gen", "gen-transfer")],
+    )
+    def test_transfer_timer_records_exact_start_and_effective_config(
+        self, monkeypatch, role, category
+    ):
+        monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+        monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+        monkeypatch.setattr(py_executor_module.time, "monotonic", lambda: 12.345)
+        log_info = Mock()
+        monkeypatch.setattr(py_executor_module.logger, "info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=0)
+        executor.disable_overlap_scheduler = False
+        executor.kv_cache_transceiver = Mock(
+            kv_transfer_timeout_ms=60_000,
+            kv_transfer_poll_interval_ms=5,
+        )
+        executor.llm_args = types.SimpleNamespace(
+            cache_transceiver_config=types.SimpleNamespace(
+                transceiver_runtime="Python",
+                backend="NIXL",
+                max_tokens_in_buffer=9216,
+                kv_transfer_sender_future_timeout_ms=60_000,
+            )
+        )
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=9216, tokens_per_block=32
+        )
+        request = _make_disagg_transfer_request(7, 8192)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        request.py_disaggregated_params = types.SimpleNamespace(
+            disagg_request_id=701,
+            schedule_style=types.SimpleNamespace(name="CONTEXT_FIRST"),
+        )
+
+        PyExecutor._start_disagg_transfer_timer(executor, request, role)
+
+        assert request.py_kv_transfer_start_time == 12.345
+        config_message = next(
+            call.args[0]
+            for call in log_info.call_args_list
+            if "[DISAGG_DIAG][config]" in call.args[0]
+        )
+        assert "gate2_enabled=1" in config_message
+        assert "budget_blocks=288" in config_message
+        assert "timeout_ms=60000" in config_message
+        assert "schedule_style=CONTEXT_FIRST" in config_message
+        timer_message = next(
+            call.args[0]
+            for call in log_info.call_args_list
+            if f"[DISAGG_DIAG][{category}]" in call.args[0] and "action=timer-start" in call.args[0]
+        )
+        assert "t=12.345000000" in timer_message
+        assert "request=701" in timer_message
+        assert "timer_start_t=12.345000000" in timer_message
+        assert "deadline_t=72.345000000" in timer_message
+        assert "timer_clock=python_monotonic" in timer_message
+        expected_anchor = (
+            "after-respond-and-send-async"
+            if role == "ctx"
+            else "after-request-and-receive-async-batch"
+        )
+        assert f"anchor={expected_anchor}" in timer_message
+
     def test_context_send_emits_queued_boundary(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
         monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
-        timestamps = iter((10.0, 10.002))
+        timestamps = iter((10.0, 10.002, 10.003))
         monkeypatch.setattr(
             py_executor_module,
             "get_steady_clock_now_in_seconds",
@@ -866,7 +1045,11 @@ class TestDisaggTransferIdleProgress:
 
         executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(request)
         assert request.py_disagg_ctx_send_queued_time_s == 10.002
-        message = log_info.call_args.args[0]
+        message = next(
+            call.args[0]
+            for call in log_info.call_args_list
+            if "[DISAGG_DIAG][ctx-transfer]" in call.args[0] and "action=queued" in call.args[0]
+        )
         assert "[DISAGG_DIAG][ctx-transfer]" in message
         assert "action=queued" in message
         assert "request=17" in message
@@ -908,7 +1091,7 @@ class TestDisaggTransferIdleProgress:
         assert "queued_to_reap_ms=103.000000" in message
         assert "poll_call_ms=2.000000" in message
 
-    def test_transfer_timeout_emits_terminal_boundary(self, monkeypatch):
+    def test_transfer_timeout_emits_nonterminal_deadline_boundary(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
         monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
         monkeypatch.setattr(py_executor_module.time, "monotonic", lambda: 20.050)
@@ -931,7 +1114,7 @@ class TestDisaggTransferIdleProgress:
         assert request.py_kv_transfer_timed_out
         message = log_info.call_args.args[0]
         assert "[DISAGG_DIAG][gen-transfer]" in message
-        assert "action=timeout" in message
+        assert "action=deadline-observed" in message
         assert "request=19" in message
         assert "timeout_ms=10" in message
 

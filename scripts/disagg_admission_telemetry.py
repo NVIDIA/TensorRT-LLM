@@ -142,14 +142,25 @@ class _LifecycleMark:
 _CTX_ACTIONS = {
     "queued",
     "send-queued",
+    "timer-start",
+    "deadline-observed",
+    "cancel-requested",
+    "cancel-result",
     "receiver-info-ready",
     "credit-received",
     "request-info-complete",
     "first-write",
     "first-write-submitted",
     "service-start",
+    "local-complete",
+    "physical-complete",
+    "kv-physical-complete",
 }
 _GEN_ACTIONS = {
+    "timer-start",
+    "deadline-observed",
+    "cancel-requested",
+    "cancel-result",
     "capacity-prepared",
     "request-info-sent",
     "request-info-submitted",
@@ -165,11 +176,29 @@ _TERMINAL_ACTIONS = {
     "failure",
     "cancelled",
     "canceled",
-    "timeout",
-    "timed-out",
 }
 _SUCCESS_TERMINAL_ACTIONS = {"completed", "complete", "reaped"}
 _LIFECYCLE_INTERVALS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "ctx_timer_to_credit": (
+        ("ctx-timer-start",),
+        ("sender-credit",),
+    ),
+    "ctx_timer_to_deadline": (
+        ("ctx-timer-start",),
+        ("ctx-deadline",),
+    ),
+    "ctx_deadline_to_credit": (
+        ("ctx-deadline",),
+        ("sender-credit",),
+    ),
+    "ctx_deadline_to_cancel_result": (
+        ("ctx-deadline",),
+        ("ctx-cancel-result",),
+    ),
+    "ctx_deadline_to_terminal": (
+        ("ctx-deadline",),
+        ("sender-terminal", "ctx-terminal"),
+    ),
     "ctx_queued_to_credit": (
         ("ctx-queued", "sender-queued"),
         ("sender-credit",),
@@ -181,6 +210,38 @@ _LIFECYCLE_INTERVALS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "ctx_first_write_to_terminal": (
         ("sender-first-write",),
         ("sender-terminal", "ctx-terminal"),
+    ),
+    "ctx_first_write_to_kv_physical_complete": (
+        ("sender-first-write",),
+        ("sender-kv-physical-complete",),
+    ),
+    "ctx_kv_physical_complete_to_terminal": (
+        ("sender-kv-physical-complete",),
+        ("sender-terminal", "ctx-terminal"),
+    ),
+    "ctx_deadline_to_kv_physical_complete": (
+        ("ctx-deadline",),
+        ("sender-kv-physical-complete",),
+    ),
+    "gate1_blocked_to_fitting": (
+        ("gate1-blocked",),
+        ("gate1-fitting",),
+    ),
+    "gen_arrival_to_first_gate1": (
+        ("gen-arrival",),
+        ("gate1-fitting", "gate1-blocked"),
+    ),
+    "gen_timer_to_deadline": (
+        ("gen-timer-start",),
+        ("gen-deadline",),
+    ),
+    "gen_deadline_to_cancel_result": (
+        ("gen-deadline",),
+        ("gen-cancel-result",),
+    ),
+    "gen_deadline_to_terminal": (
+        ("gen-deadline",),
+        ("receiver-terminal",),
     ),
     "gen_arrival_to_first_gate2": (
         ("gen-arrival",),
@@ -309,18 +370,73 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
     sources = {event.source for event in sorted_events if event.source is not None}
     namespace_by_source = len(sources) > 1
     category_counts = Counter(event.category for event in sorted_events)
+    known_instances: dict[tuple[str | None, str, str, str], set[str]] = defaultdict(set)
+    for event in sorted_events:
+        instance = event.fields.get("instance", "-")
+        if instance in {"-", "unknown"}:
+            continue
+        category = _normalize_diag_token(event.category)
+        action = _normalize_diag_token(event.fields.get("action", ""))
+        known_instances[
+            (
+                event.source,
+                _event_host(event),
+                _event_role(event, category, action),
+                event.rank,
+            )
+        ].add(instance)
+
+    def resolved_instance(event: DiagnosticEvent) -> str:
+        instance = event.fields.get("instance", "-")
+        if instance not in {"-", "unknown"}:
+            return instance
+        category = _normalize_diag_token(event.category)
+        action = _normalize_diag_token(event.fields.get("action", ""))
+        candidates = known_instances.get(
+            (
+                event.source,
+                _event_host(event),
+                _event_role(event, category, action),
+                event.rank,
+            ),
+            set(),
+        )
+        return next(iter(candidates)) if len(candidates) == 1 else instance
+
+    emitters_by_legacy_rank: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
+    for event in sorted_events:
+        legacy_rank = f"{event.source}::rank={event.rank}" if namespace_by_source else event.rank
+        category = _normalize_diag_token(event.category)
+        action = _normalize_diag_token(event.fields.get("action", ""))
+        emitters_by_legacy_rank[legacy_rank].add(
+            (
+                _event_host(event),
+                resolved_instance(event),
+                _event_role(event, category, action),
+            )
+        )
+    split_legacy_ranks = {
+        legacy_rank
+        for legacy_rank, emitters in emitters_by_legacy_rank.items()
+        if len(emitters) > 1
+        and any(
+            host != "<unspecified>" or instance not in {"-", "unknown"}
+            for host, instance, _ in emitters
+        )
+    }
     events_by_rank: dict[str, list[DiagnosticEvent]] = defaultdict(list)
     for event in sorted_events:
         rank_key = f"{event.source}::rank={event.rank}" if namespace_by_source else event.rank
+        if rank_key in split_legacy_ranks:
+            category = _normalize_diag_token(event.category)
+            action = _normalize_diag_token(event.fields.get("action", ""))
+            rank_key = (
+                f"{rank_key}::host={_event_host(event)}"
+                f"::instance={resolved_instance(event)}"
+                f"::role={_event_role(event, category, action)}"
+            )
         events_by_rank[rank_key].append(event)
 
-    global_blocks = _collect_global_request_blocks(sorted_events)
-    blocks_by_source = {
-        source: _collect_global_request_blocks(
-            [event for event in sorted_events if event.source == source]
-        )
-        for source in sources
-    }
     ranks: dict[str, object] = {}
     aggregate_service_intervals: list[ServiceInterval] = []
     aggregate_selected_gaps: list[dict[str, object]] = []
@@ -339,9 +455,32 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
 
     for rank in sorted(events_by_rank, key=_rank_sort_key):
         rank_events = events_by_rank[rank]
-        request_blocks = global_blocks
-        if namespace_by_source and rank_events:
-            request_blocks = blocks_by_source.get(rank_events[0].source, {})
+        block_scope = sorted_events
+        if rank_events:
+            representative = rank_events[0]
+            instance = resolved_instance(representative)
+            if instance not in {"-", "unknown"}:
+                category = _normalize_diag_token(representative.category)
+                action = _normalize_diag_token(representative.fields.get("action", ""))
+                role = _event_role(representative, category, action)
+                block_scope = [
+                    event
+                    for event in sorted_events
+                    if event.source == representative.source
+                    and _event_host(event) == _event_host(representative)
+                    and resolved_instance(event) == instance
+                    and _event_role(
+                        event,
+                        _normalize_diag_token(event.category),
+                        _normalize_diag_token(event.fields.get("action", "")),
+                    )
+                    == role
+                ]
+            elif namespace_by_source:
+                block_scope = [
+                    event for event in sorted_events if event.source == representative.source
+                ]
+        request_blocks = _collect_global_request_blocks(block_scope)
         rank_analysis, rank_intervals, selected_gaps = _analyze_rank(rank_events, request_blocks)
         ranks[rank] = rank_analysis
         aggregate_service_intervals.extend(rank_intervals)
@@ -437,17 +576,23 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
         for source, samples in sorted(aggregate_gaps_by_source.items())
     }
     lifecycle = _analyze_request_lifecycles(sorted_events)
+    cross_host_correlation = _analyze_cross_host_correlation(sorted_events)
     remaining_work_ground_truth = _analyze_remaining_work_ground_truth(sorted_events)
     known_backlog_release = _known_backlog_release_analysis(ranks)
 
     return {
-        "schema_version": 2,
-        "rank_namespace": "source-path::rank" if namespace_by_source else "rank",
+        "schema_version": 3,
+        "rank_namespace": (
+            "source-path::rank[::host::instance::role]"
+            if split_legacy_ranks
+            else ("source-path::rank" if namespace_by_source else "rank")
+        ),
         "aggregate_scope": "all-input-sources" if namespace_by_source else "single-source",
         "parsed_event_count": len(sorted_events),
         "event_counts": dict(sorted(category_counts.items())),
         "ranks": ranks,
         "lifecycle": lifecycle,
+        "cross_host_correlation": cross_host_correlation,
         "remaining_work_ground_truth": remaining_work_ground_truth,
         "known_backlog_release": known_backlog_release,
         "aggregate": {
@@ -861,10 +1006,16 @@ def _analyze_request_lifecycles(events: list[DiagnosticEvent]) -> dict[str, obje
                 "clock_domain": _clock_domain_label(domain),
                 "emitter_sources": emitter_sources,
                 "first_timestamps": first_timestamps,
+                "deadline_phase": _classify_deadline_phase(marks_by_tag),
                 "intervals": intervals,
             }
         )
 
+    deadline_phase_counts = Counter(
+        str(record["deadline_phase"])
+        for record in request_records
+        if record["deadline_phase"] is not None
+    )
     return {
         "clock_domain_policy": (
             "Durations require the same input log source, host, role, rank, and clock. "
@@ -876,6 +1027,7 @@ def _analyze_request_lifecycles(events: list[DiagnosticEvent]) -> dict[str, obje
         ),
         "request_count": len({mark.request for mark in marks}),
         "clock_domain_request_count": len(request_records),
+        "deadline_phase_counts": dict(sorted(deadline_phase_counts.items())),
         "requests": request_records,
         "interval_coverage": _lifecycle_interval_coverage(
             request_records,
@@ -941,6 +1093,10 @@ def _collect_lifecycle_marks(events: list[DiagnosticEvent]) -> list[_LifecycleMa
             ):
                 for request in _parse_request_ids(event.fields.get(field)):
                     add(tag, request=request, detail=field)
+            if action in {"fitting", "fit"}:
+                add("gate1-fitting")
+            elif action in {"blocked", "deferred"}:
+                add("gate1-blocked")
 
         if category in {"decision", "admission", "gate2", "gate-2"}:
             for field, tag in (
@@ -985,8 +1141,26 @@ def _collect_lifecycle_marks(events: list[DiagnosticEvent]) -> list[_LifecycleMa
         if category == "ctx-transfer":
             if action in {"queued", "send-queued"}:
                 add("ctx-queued")
+            if action == "timer-start":
+                add("ctx-timer-start")
+            elif action in {"deadline-observed", "timeout", "timed-out"}:
+                add("ctx-deadline")
+            elif action == "cancel-requested":
+                add("ctx-cancel-requested")
+            elif action == "cancel-result":
+                add("ctx-cancel-result")
             if action in _TERMINAL_ACTIONS:
                 add("ctx-terminal")
+
+        if category == "gen-transfer":
+            if action == "timer-start":
+                add("gen-timer-start")
+            elif action in {"deadline-observed", "timeout", "timed-out"}:
+                add("gen-deadline")
+            elif action == "cancel-requested":
+                add("gen-cancel-requested")
+            elif action == "cancel-result":
+                add("gen-cancel-result")
 
         if category == "sender-transfer":
             if action in {"queued", "send-queued"}:
@@ -1000,6 +1174,12 @@ def _collect_lifecycle_marks(events: list[DiagnosticEvent]) -> list[_LifecycleMa
                 add("sender-credit")
             if action in {"service-start", "first-write", "first-write-submitted"}:
                 add("sender-first-write")
+            if action in {
+                "local-complete",
+                "physical-complete",
+                "kv-physical-complete",
+            }:
+                add("sender-kv-physical-complete")
             if action in _TERMINAL_ACTIONS:
                 add("sender-terminal")
 
@@ -1037,6 +1217,12 @@ def _collect_lifecycle_marks(events: list[DiagnosticEvent]) -> list[_LifecycleMa
                     "first-write-submitted",
                 }:
                     add("sender-first-write")
+                if action in {
+                    "local-complete",
+                    "physical-complete",
+                    "kv-physical-complete",
+                }:
+                    add("sender-kv-physical-complete")
                 if action in _TERMINAL_ACTIONS:
                     add("sender-terminal")
                     add("ctx-terminal")
@@ -1064,6 +1250,429 @@ def _collect_lifecycle_marks(events: list[DiagnosticEvent]) -> list[_LifecycleMa
             mark.tag,
         ),
     )
+
+
+def _analyze_cross_host_correlation(
+    events: list[DiagnosticEvent],
+) -> dict[str, object]:
+    """Join CTX and GEN causal points using diagnostic Unix timestamps."""
+    points: dict[str, dict[str, list[dict[str, object]]]] = defaultdict(lambda: defaultdict(list))
+
+    def add(
+        event: DiagnosticEvent,
+        tag: str,
+        request: str | None = None,
+    ) -> None:
+        wall_time_s = _event_wall_time(event)
+        request = request or _event_correlation_request(event)
+        if wall_time_s is None or request is None:
+            return
+        points[request][tag].append(
+            {
+                "wall_t": wall_time_s,
+                "wall_semantics": event.fields.get("wall_semantics", "unknown"),
+                "local_t": event.time_s,
+                "local_clock": _event_clock(event),
+                "host": _event_host(event),
+                "instance": event.fields.get("instance", "-"),
+                "role": _event_role(
+                    event,
+                    _normalize_diag_token(event.category),
+                    _normalize_diag_token(event.fields.get("action", "")),
+                ),
+                "rank": event.rank,
+                "log_source": event.source or "<in-memory>",
+                "category": _normalize_diag_token(event.category),
+                "action": _normalize_diag_token(event.fields.get("action", "")),
+                "sequence": event.fields.get("sequence"),
+                "previous": event.fields.get("previous"),
+            }
+        )
+
+    for event in events:
+        category = _normalize_diag_token(event.category)
+        action = _normalize_diag_token(event.fields.get("action", ""))
+        role = _event_role(event, category, action)
+
+        if category == "gen-arrival":
+            add(event, "gen-arrival")
+        elif category == "gen-activation":
+            add(event, "gen-activation")
+        elif category in {"gate1", "gate-1"}:
+            if action in {"fitting", "fit"}:
+                add(event, "gate1-fitting")
+            elif action in {"blocked", "deferred"}:
+                add(event, "gate1-blocked")
+            for field, tag in (
+                ("fitting_requests", "gate1-fitting"),
+                ("blocked_requests", "gate1-blocked"),
+            ):
+                for request in _parse_request_ids(event.fields.get(field)):
+                    add(event, tag, request)
+        elif category in {"decision", "admission", "gate2", "gate-2"}:
+            if action in {"admit", "admitted"}:
+                add(event, "gate2-admitted")
+            elif action in {"defer", "deferred"}:
+                add(event, "gate2-deferred")
+            elif action == "ineligible":
+                add(event, "gate2-ineligible")
+            for field, tag in (
+                ("admitted_requests", "gate2-admitted"),
+                ("deferred_requests", "gate2-deferred"),
+            ):
+                for request in _parse_request_ids(event.fields.get(field)):
+                    add(event, tag, request)
+        elif category == "submit":
+            add(event, "gen-submit")
+        elif category == "gen-service" and action == "decode-start-proxy":
+            add(event, "gen-service-start")
+        elif category == "ctx-transfer":
+            if action in {"queued", "send-queued"}:
+                add(event, "ctx-queued")
+            elif action == "timer-start":
+                add(event, "ctx-timer-start")
+            elif action in {"deadline-observed", "timeout", "timed-out"}:
+                add(event, "ctx-deadline")
+            elif action == "cancel-result":
+                add(event, "ctx-cancel-result")
+            elif action in _TERMINAL_ACTIONS:
+                add(event, "ctx-terminal")
+        elif category == "gen-transfer":
+            if action == "timer-start":
+                add(event, "gen-timer-start")
+            elif action in {"deadline-observed", "timeout", "timed-out"}:
+                add(event, "gen-deadline")
+            elif action == "cancel-result":
+                add(event, "gen-cancel-result")
+        elif category in {"sender-transfer", "python-transfer"} and role == "ctx":
+            if action in {
+                "credit-received",
+                "receiver-info-ready",
+                "request-info-complete",
+            }:
+                add(event, "ctx-receiver-credit")
+            elif action in {
+                "service-start",
+                "first-write",
+                "first-write-submitted",
+            }:
+                add(event, "ctx-first-write")
+            elif action in {
+                "local-complete",
+                "physical-complete",
+                "kv-physical-complete",
+            }:
+                add(event, "ctx-kv-physical-complete")
+            elif action in _TERMINAL_ACTIONS:
+                add(event, "ctx-terminal")
+        elif category in {"receiver-transfer", "python-transfer"} and role == "gen":
+            if action in {"request-info-sent", "request-info-submitted"}:
+                add(event, "gen-request-info")
+            elif action == "local-ready":
+                add(event, "gen-local-ready")
+            elif action in _TERMINAL_ACTIONS:
+                add(event, "gen-terminal")
+
+    records: list[dict[str, object]] = []
+    relationship_counts: Counter[str] = Counter()
+    joined_request_count = 0
+    for request, tags in sorted(points.items()):
+        selected_points = {
+            tag: _select_cross_host_point(tag, tag_points)
+            for tag, tag_points in sorted(tags.items())
+            if tag_points
+        }
+        first_gate1_points = tags.get("gate1-fitting", []) + tags.get("gate1-blocked", [])
+        if first_gate1_points:
+            selected_points["gate1-first"] = _select_cross_host_point(
+                "gate1-first", first_gate1_points
+            )
+        deadline_point = selected_points.get("ctx-deadline")
+        if deadline_point is not None:
+            gate2_state = _gate2_state_at_deadline(tags, float(deadline_point["wall_t"]))
+            if gate2_state is not None:
+                selected_points["gate2-state-at-ctx-deadline"] = gate2_state
+        has_ctx = any(tag.startswith("ctx-") for tag in selected_points)
+        has_gen = any(tag.startswith("gen-") or tag.startswith("gate") for tag in selected_points)
+        if has_ctx and has_gen:
+            joined_request_count += 1
+
+        deadline_relationship = _classify_cross_host_deadline(selected_points)
+        if deadline_relationship is not None:
+            relationship_counts[deadline_relationship] += 1
+
+        records.append(
+            {
+                "request": request,
+                "joined_ctx_gen": has_ctx and has_gen,
+                "points": selected_points,
+                "wall_intervals_s": {
+                    name: _wall_interval(selected_points, start_tag, end_tag)
+                    for name, start_tag, end_tag in (
+                        ("ctx_timer_to_gen_arrival", "ctx-timer-start", "gen-arrival"),
+                        ("ctx_timer_to_first_gate1", "ctx-timer-start", "gate1-first"),
+                        ("ctx_timer_to_first_gate2_defer", "ctx-timer-start", "gate2-deferred"),
+                        ("ctx_timer_to_gate2_admit", "ctx-timer-start", "gate2-admitted"),
+                        ("ctx_timer_to_gen_submit", "ctx-timer-start", "gen-submit"),
+                        ("ctx_timer_to_deadline", "ctx-timer-start", "ctx-deadline"),
+                        ("gate2_defer_to_ctx_deadline", "gate2-deferred", "ctx-deadline"),
+                    )
+                },
+                "ctx_deadline_relationship": deadline_relationship,
+                "ctx_deadline_phase_coverage": _cross_host_phase_coverage(selected_points),
+                "wall_clock_anomalies": _cross_host_wall_anomalies(selected_points),
+            }
+        )
+
+    return {
+        "clock_policy": (
+            "Unix wall timestamps permit CTX/GEN request correlation across "
+            "hosts but depend on cluster clock synchronization and may step. "
+            "Boundary-sampled points are preferred; emission points include "
+            "logger and polling delay. Cross-rank progress boundaries select "
+            "the latest observed emitter while deadline/defer triggers select "
+            "the earliest. Emitter coverage is observed, not proof that every "
+            "required rank logged. Use this view for causal classification and "
+            "long queue delays, not sub-millisecond service or throughput "
+            "estimation."
+        ),
+        "request_count": len(records),
+        "joined_ctx_gen_request_count": joined_request_count,
+        "ctx_deadline_relationship_counts": dict(sorted(relationship_counts.items())),
+        "requests": records,
+    }
+
+
+def _select_cross_host_point(
+    tag: str,
+    tag_points: list[dict[str, object]],
+) -> dict[str, object]:
+    """Select an earliest trigger or conservative latest progress boundary."""
+    points_by_emitter: dict[tuple[object, ...], list[dict[str, object]]] = defaultdict(list)
+    select_earliest = tag in {
+        "ctx-queued",
+        "ctx-timer-start",
+        "ctx-deadline",
+        "gate2-deferred",
+        "gate1-first",
+    }
+    for point in tag_points:
+        emitter = (
+            point["log_source"],
+            point["host"],
+            point["instance"],
+            point["role"],
+            point["rank"],
+        )
+        points_by_emitter[emitter].append(point)
+
+    selector = min if select_earliest else max
+    emitter_points = []
+    for emitter_candidates in points_by_emitter.values():
+        boundary_candidates = [
+            point for point in emitter_candidates if point["wall_semantics"] == "boundary-sampled"
+        ]
+        preferred = boundary_candidates or emitter_candidates
+        emitter_points.append(selector(preferred, key=lambda point: float(point["wall_t"])))
+    selected = dict(selector(emitter_points, key=lambda point: float(point["wall_t"])))
+    selected["selection"] = "earliest" if select_earliest else "latest"
+    selected["observed_emitter_count"] = len(emitter_points)
+    selected["observed_hosts"] = sorted({str(point["host"]) for point in emitter_points})
+    selected["observed_ranks"] = sorted(
+        {str(point["rank"]) for point in emitter_points},
+        key=_rank_sort_key,
+    )
+    selected["wall_semantics_seen"] = sorted({str(point["wall_semantics"]) for point in tag_points})
+    return selected
+
+
+def _event_wall_time(event: DiagnosticEvent) -> float | None:
+    if _normalize_diag_token(event.fields.get("wall_clock", "")) != "unix":
+        return None
+    wall_time_s = _as_float(event.fields.get("wall_t"))
+    if wall_time_s is None or not math.isfinite(wall_time_s):
+        return None
+    return wall_time_s
+
+
+def _gate2_state_at_deadline(
+    tags: dict[str, list[dict[str, object]]],
+    deadline_t: float,
+) -> dict[str, object] | None:
+    transitions_by_emitter: dict[tuple[object, ...], list[tuple[str, dict[str, object]]]] = (
+        defaultdict(list)
+    )
+    for state, tag in (
+        ("deferred", "gate2-deferred"),
+        ("ineligible", "gate2-ineligible"),
+        ("admitted", "gate2-admitted"),
+    ):
+        for point in tags.get(tag, ()):
+            if float(point["wall_t"]) > deadline_t:
+                continue
+            emitter = (
+                point["log_source"],
+                point["host"],
+                point["instance"],
+                point["role"],
+                point["rank"],
+            )
+            transitions_by_emitter[emitter].append((state, point))
+    if not transitions_by_emitter:
+        return None
+
+    emitter_states = [
+        max(
+            transitions,
+            key=lambda item: (
+                float(item[1]["wall_t"]),
+                {"deferred": 0, "ineligible": 1, "admitted": 2}[item[0]],
+            ),
+        )
+        for transitions in transitions_by_emitter.values()
+    ]
+    observed_states = {state for state, _ in emitter_states}
+    if len(observed_states) == 1:
+        state = next(iter(observed_states))
+    elif "admitted" in observed_states:
+        state = "partial-admission"
+    elif "ineligible" in observed_states:
+        state = "ineligible"
+    else:
+        state = "deferred"
+    _, point = max(emitter_states, key=lambda item: float(item[1]["wall_t"]))
+    result = dict(point)
+    result["state"] = state
+    result["observed_emitter_count"] = len(emitter_states)
+    result["observed_emitter_state_counts"] = dict(
+        sorted(Counter(emitter_state for emitter_state, _ in emitter_states).items())
+    )
+    result["selection"] = "latest-transition-at-or-before-deadline"
+    return result
+
+
+def _wall_interval(
+    points: dict[str, dict[str, object]],
+    start_tag: str,
+    end_tag: str,
+) -> float | None:
+    start = points.get(start_tag)
+    end = points.get(end_tag)
+    if start is None or end is None:
+        return None
+    interval_s = float(end["wall_t"]) - float(start["wall_t"])
+    return interval_s if interval_s >= 0.0 else None
+
+
+def _classify_cross_host_deadline(
+    points: dict[str, dict[str, object]],
+) -> str | None:
+    deadline = points.get("ctx-deadline")
+    if deadline is None:
+        return None
+    deadline_t = float(deadline["wall_t"])
+    timer_start = points.get("ctx-timer-start")
+    if timer_start is not None and deadline_t < float(timer_start["wall_t"]):
+        return "wall-clock-order-uncertain"
+    phase_coverage = _cross_host_phase_coverage(points)
+    if phase_coverage is not None and phase_coverage["timestamp_inversions"]:
+        return "wall-clock-order-uncertain"
+
+    gate2_admitted = points.get("gate2-admitted")
+    if gate2_admitted is None or float(gate2_admitted["wall_t"]) > deadline_t:
+        gate2_state = points.get("gate2-state-at-ctx-deadline")
+        if gate2_state is not None and gate2_state.get("state") in {
+            "admitted",
+            "partial-admission",
+        }:
+            return "partial-gate2-admission-before-global-admission"
+        if gate2_state is not None and gate2_state.get("state") == "deferred":
+            return "during-gate2-deferral"
+        if gate2_state is not None and gate2_state.get("state") == "ineligible":
+            return "gate2-ineligible-at-deadline"
+        gate1 = points.get("gate1-first")
+        if gate1 is None or float(gate1["wall_t"]) > deadline_t:
+            return "before-gen-gate1"
+        return "before-gen-gate2-admission"
+
+    ordered_milestones = (
+        ("gate2-admitted", "after-gen-admission-before-submit"),
+        ("gen-submit", "after-gen-submit-before-ctx-credit"),
+        ("ctx-receiver-credit", "after-ctx-credit-before-first-write"),
+        ("ctx-first-write", "during-kv-physical-transfer"),
+        (
+            "ctx-kv-physical-complete",
+            "after-kv-physical-complete-before-terminal",
+        ),
+        ("ctx-terminal", "after-terminal"),
+    )
+    furthest_phase = "after-gen-admission-before-submit"
+    for tag, phase in ordered_milestones:
+        milestone = points.get(tag)
+        if milestone is not None and float(milestone["wall_t"]) <= deadline_t:
+            furthest_phase = phase
+    return furthest_phase
+
+
+def _cross_host_phase_coverage(
+    points: dict[str, dict[str, object]],
+) -> dict[str, object] | None:
+    deadline = points.get("ctx-deadline")
+    if deadline is None:
+        return None
+    deadline_t = float(deadline["wall_t"])
+    ordered_tags = (
+        "gate2-admitted",
+        "gen-submit",
+        "ctx-receiver-credit",
+        "ctx-first-write",
+        "ctx-kv-physical-complete",
+        "ctx-terminal",
+    )
+    observed = [
+        tag for tag in ordered_tags if tag in points and float(points[tag]["wall_t"]) <= deadline_t
+    ]
+    if not observed:
+        return {
+            "observed_at_or_before_deadline": [],
+            "missing_before_furthest": [],
+            "timestamp_inversions": [],
+        }
+    furthest_index = max(ordered_tags.index(tag) for tag in observed)
+    missing = [tag for tag in ordered_tags[:furthest_index] if tag not in observed]
+    inversions = []
+    prior_tag = None
+    prior_time = None
+    for tag in observed:
+        tag_time = float(points[tag]["wall_t"])
+        if prior_time is not None and tag_time < prior_time:
+            inversions.append(f"{prior_tag}->{tag}")
+        prior_tag = tag
+        prior_time = tag_time
+    return {
+        "observed_at_or_before_deadline": observed,
+        "missing_before_furthest": missing,
+        "timestamp_inversions": inversions,
+    }
+
+
+def _cross_host_wall_anomalies(
+    points: dict[str, dict[str, object]],
+) -> list[str]:
+    anomalies: list[str] = []
+    for start_tag, end_tag in (
+        ("ctx-timer-start", "ctx-deadline"),
+        ("gate2-admitted", "gen-submit"),
+        ("gen-submit", "ctx-receiver-credit"),
+        ("ctx-receiver-credit", "ctx-first-write"),
+        ("ctx-first-write", "ctx-kv-physical-complete"),
+        ("ctx-kv-physical-complete", "ctx-terminal"),
+    ):
+        start = points.get(start_tag)
+        end = points.get(end_tag)
+        if start is not None and end is not None and float(end["wall_t"]) < float(start["wall_t"]):
+            anomalies.append(f"negative:{start_tag}->{end_tag}")
+    return anomalies
 
 
 def _evaluate_lifecycle_interval(
@@ -1139,6 +1748,28 @@ def _evaluate_lifecycle_interval(
         "end_t": None,
         "censor_reason": reason,
     }
+
+
+def _classify_deadline_phase(
+    marks_by_tag: dict[str, list[_LifecycleMark]],
+) -> str | None:
+    """Locate a CTX deadline in the sender-side transfer lifecycle."""
+    deadlines = marks_by_tag.get("ctx-deadline", ())
+    if not deadlines:
+        return None
+    deadline_t = deadlines[0].time_s
+
+    phase_boundaries = (
+        ("pre-credit", "sender-credit"),
+        ("sender-queue", "sender-first-write"),
+        ("kv-transfer-service", "sender-kv-physical-complete"),
+        ("completion-visibility", "ctx-terminal"),
+    )
+    for phase, boundary_tag in phase_boundaries:
+        boundaries = marks_by_tag.get(boundary_tag, ())
+        if not boundaries or boundaries[0].time_s > deadline_t:
+            return phase
+    return "after-terminal"
 
 
 def _cross_domain_endpoint_reason(
@@ -1245,20 +1876,31 @@ def _analyze_remaining_work_ground_truth(
     samples: list[dict[str, object]] = []
     seen: set[tuple[object, ...]] = set()
     omission_seen: set[tuple[object, ...]] = set()
+    membership_overflow = _collect_membership_overflow(events)
     active_request_ids_omitted = 0
+    active_request_ids_recovered_from_overflow = 0
     for event in events:
         category = _normalize_diag_token(event.category)
-        if category not in {"decision", "admission", "gate2", "gate-2"}:
+        if category not in {"decision", "admission"}:
             continue
-        active_pairs = _parse_request_blocks(event.fields.get("active_requests"))
-        active_blocks = dict(active_pairs)
-        active_requests = _parse_request_ids(event.fields.get("active_requests"))
-        domain = _event_domain(event)
+        if "active_requests" not in event.fields and "active_requests_omitted" not in event.fields:
+            continue
         sequence = event.fields.get("sequence")
+        domain = _event_domain(event)
+        active_overflow = _membership_overflow_for_event(event, "active", membership_overflow)
+        active_pairs = _parse_request_blocks(event.fields.get("active_requests")) + active_overflow
+        active_blocks = dict(active_pairs)
+        active_requests = [request for request, _ in active_pairs]
         omitted = _as_int(event.fields.get("active_requests_omitted")) or 0
-        omission_identity = (domain, sequence or event.time_s)
-        if omitted > 0 and omission_identity not in omission_seen:
-            active_request_ids_omitted += omitted
+        omission_identity = (
+            domain,
+            event.fields.get("instance", "-"),
+            sequence or event.time_s,
+        )
+        if omission_identity not in omission_seen:
+            recovered = min(omitted, len(active_overflow))
+            active_request_ids_recovered_from_overflow += recovered
+            active_request_ids_omitted += max(0, omitted - recovered)
             omission_seen.add(omission_identity)
         if not active_requests:
             continue
@@ -1372,6 +2014,7 @@ def _analyze_remaining_work_ground_truth(
         ),
         "active_decision_samples": len(samples),
         "active_request_ids_omitted": active_request_ids_omitted,
+        "active_request_ids_recovered_from_overflow": (active_request_ids_recovered_from_overflow),
         "identity_coverage": {
             "observed": len(samples),
             "omitted": active_request_ids_omitted,
@@ -1567,6 +2210,7 @@ def _event_role(event: DiagnosticEvent, category: str, action: str) -> str:
     if category in {
         "gen-arrival",
         "gen-activation",
+        "gen-transfer",
         "gate1",
         "gate-1",
         "decision",
@@ -1574,6 +2218,7 @@ def _event_role(event: DiagnosticEvent, category: str, action: str) -> str:
         "gate2",
         "gate-2",
         "submit",
+        "decision-members",
         "receiver-transfer",
         "receiver-slot",
         "reap",
@@ -1632,20 +2277,95 @@ def _active_age_bucket(active_age_s: float | None) -> str:
     return "unknown"
 
 
+def _membership_snapshot_key(
+    event: DiagnosticEvent, membership: str, *, definition: bool = False
+) -> tuple[tuple[str, str, str, str, str], str, str, str] | None:
+    reference_field = "snapshot_version" if definition else f"{membership}_snapshot"
+    reference = event.fields.get(reference_field) or event.fields.get("sequence")
+    if reference is None:
+        return None
+    return (
+        _event_domain(event),
+        event.fields.get("instance", "-"),
+        reference,
+        membership,
+    )
+
+
+def _membership_overflow_for_event(
+    event: DiagnosticEvent,
+    membership: str,
+    overflow: dict[
+        tuple[tuple[str, str, str, str, str], str, str, str],
+        list[tuple[str, float]],
+    ],
+) -> list[tuple[str, float]]:
+    key = _membership_snapshot_key(event, membership)
+    if key is None:
+        return []
+    tail = overflow.get(key, [])
+    omitted = _as_int(event.fields.get(f"{membership}_requests_omitted"))
+    if omitted is not None and omitted != len(tail):
+        return []
+    return tail
+
+
 def _collect_admissions(events: list[DiagnosticEvent]) -> tuple[list[Admission], dict[str, float]]:
     admissions: list[Admission] = []
     request_blocks: dict[str, float] = {}
+    membership_overflow = _collect_membership_overflow(events)
+    decision_keys = {
+        (
+            _event_domain(event),
+            event.fields.get("instance", "-"),
+            event.fields.get("sequence"),
+        )
+        for event in events
+        if _normalize_diag_token(event.category) == "decision"
+        and event.fields.get("sequence") is not None
+    }
+    compatibility_admissions = {
+        (
+            _event_domain(event),
+            event.fields.get("instance", "-"),
+            event.fields.get("sequence"),
+        ): event
+        for event in events
+        if _normalize_diag_token(event.category) == "admission"
+        and event.fields.get("sequence") is not None
+    }
     for event in events:
-        if event.category != "admission":
+        category = _normalize_diag_token(event.category)
+        if category not in {"decision", "admission"}:
             continue
-        candidate_requests = _parse_request_blocks(event.fields.get("candidate_requests"))
-        admitted_request_blocks = _parse_request_blocks(event.fields.get("admitted_requests"))
-        deferred_request_blocks = _parse_request_blocks(event.fields.get("deferred_requests"))
-        for request, blocks in (
-            candidate_requests + admitted_request_blocks + deferred_request_blocks
-        ):
-            request_blocks[request] = blocks
-
+        event_key = (
+            _event_domain(event),
+            event.fields.get("instance", "-"),
+            event.fields.get("sequence"),
+        )
+        if category == "admission" and event_key in decision_keys:
+            continue
+        if category == "decision" and event_key in compatibility_admissions:
+            compatibility_event = compatibility_admissions[event_key]
+            event = DiagnosticEvent(
+                category=event.category,
+                time_s=event.time_s,
+                rank=event.rank,
+                fields={**compatibility_event.fields, **event.fields},
+                source=event.source,
+            )
+        candidate_overflow = _membership_overflow_for_event(event, "candidate", membership_overflow)
+        admitted_overflow = _membership_overflow_for_event(event, "admitted", membership_overflow)
+        deferred_overflow = _membership_overflow_for_event(event, "deferred", membership_overflow)
+        candidate_requests = (
+            _parse_request_blocks(event.fields.get("candidate_requests")) + candidate_overflow
+        )
+        admitted_request_blocks = (
+            _parse_request_blocks(event.fields.get("admitted_requests")) + admitted_overflow
+        )
+        deferred_request_blocks = (
+            _parse_request_blocks(event.fields.get("deferred_requests")) + deferred_overflow
+        )
         admitted = _as_int(event.fields.get("admitted"))
         deferred = _as_int(event.fields.get("deferred"))
         if admitted is None:
@@ -1654,6 +2374,35 @@ def _collect_admissions(events: list[DiagnosticEvent]) -> tuple[list[Admission],
             deferred = len(deferred_request_blocks)
         if admitted < 0 or deferred < 0:
             continue
+        candidate_omitted = max(
+            0,
+            (_as_int(event.fields.get("candidate_requests_omitted")) or 0)
+            - len(candidate_overflow),
+        )
+        if (
+            event.fields.get("candidate_snapshot") is not None
+            and candidate_omitted == 0
+            and len(candidate_requests) >= admitted + deferred
+        ):
+            admitted_request_blocks = candidate_requests[:admitted]
+            deferred_request_blocks = candidate_requests[admitted : admitted + deferred]
+            admitted_omitted = 0
+            deferred_omitted = 0
+        else:
+            admitted_omitted = max(
+                0,
+                (_as_int(event.fields.get("admitted_requests_omitted")) or 0)
+                - len(admitted_overflow),
+            )
+            deferred_omitted = max(
+                0,
+                (_as_int(event.fields.get("deferred_requests_omitted")) or 0)
+                - len(deferred_overflow),
+            )
+        for request, blocks in (
+            candidate_requests + admitted_request_blocks + deferred_request_blocks
+        ):
+            request_blocks[request] = blocks
         budget = _as_float(event.fields.get("budget"))
         if budget is not None and budget <= 0.0:
             budget = None
@@ -1669,22 +2418,75 @@ def _collect_admissions(events: list[DiagnosticEvent]) -> tuple[list[Admission],
                 candidate_requests=tuple(candidate_requests),
                 admitted_requests=tuple(request for request, _ in admitted_request_blocks),
                 deferred_requests=tuple(request for request, _ in deferred_request_blocks),
-                candidate_requests_omitted=max(
-                    0,
-                    _as_int(event.fields.get("candidate_requests_omitted")) or 0,
-                ),
-                admitted_requests_omitted=max(
-                    0,
-                    _as_int(event.fields.get("admitted_requests_omitted")) or 0,
-                ),
-                deferred_requests_omitted=max(
-                    0,
-                    _as_int(event.fields.get("deferred_requests_omitted")) or 0,
-                ),
+                candidate_requests_omitted=candidate_omitted,
+                admitted_requests_omitted=admitted_omitted,
+                deferred_requests_omitted=deferred_omitted,
             )
         )
     admissions.sort(key=lambda admission: admission.time_s)
     return admissions, request_blocks
+
+
+def _collect_membership_overflow(
+    events: list[DiagnosticEvent],
+) -> dict[
+    tuple[tuple[str, str, str, str, str], str, str, str],
+    list[tuple[str, float]],
+]:
+    chunks: dict[
+        tuple[tuple[str, str, str, str, str], str, str, str],
+        dict[int, list[tuple[str, float]]],
+    ] = defaultdict(dict)
+    expected_chunk_counts: dict[tuple[tuple[str, str, str, str, str], str, str, str], int] = {}
+    conflicts: set[tuple[tuple[str, str, str, str, str], str, str, str]] = set()
+    for event in events:
+        if _normalize_diag_token(event.category) != "decision-members":
+            continue
+        membership = _normalize_diag_token(event.fields.get("membership", ""))
+        if membership not in {"active", "candidate", "admitted", "deferred"}:
+            continue
+        chunk_index = _as_int(event.fields.get("chunk_index"))
+        chunk_count = _as_int(event.fields.get("chunk_count"))
+        if (
+            chunk_index is None
+            or chunk_index <= 0
+            or chunk_count is None
+            or chunk_count <= 0
+            or chunk_index > chunk_count
+        ):
+            continue
+        key = _membership_snapshot_key(event, membership, definition=True)
+        if key is None:
+            continue
+        previous_count = expected_chunk_counts.setdefault(key, chunk_count)
+        if previous_count != chunk_count:
+            conflicts.add(key)
+            continue
+        request_blocks = _parse_request_blocks(event.fields.get("requests"))
+        previous_chunk = chunks[key].get(chunk_index)
+        if previous_chunk is not None and previous_chunk != request_blocks:
+            conflicts.add(key)
+            continue
+        chunks[key][chunk_index] = request_blocks
+
+    overflow: dict[
+        tuple[tuple[str, str, str, str, str], str, str, str],
+        list[tuple[str, float]],
+    ] = {}
+    for key, key_chunks in chunks.items():
+        expected = expected_chunk_counts[key]
+        if key in conflicts or set(key_chunks) != set(range(1, expected + 1)):
+            continue
+        request_blocks = [
+            request_block
+            for chunk_index in range(1, expected + 1)
+            for request_block in key_chunks[chunk_index]
+        ]
+        request_ids = [request for request, _ in request_blocks]
+        if len(request_ids) != len(set(request_ids)):
+            continue
+        overflow[key] = request_blocks
+    return overflow
 
 
 def _collect_decisions(
@@ -1729,10 +2531,18 @@ def _collect_global_request_blocks(events: list[DiagnosticEvent]) -> dict[str, f
     conflicts: set[str] = set()
     for event in events:
         pairs: list[tuple[str, float]] = []
-        if event.category == "admission":
+        category = _normalize_diag_token(event.category)
+        if category in {"decision", "admission"}:
             for field in ("candidate_requests", "admitted_requests", "deferred_requests"):
                 pairs.extend(_parse_request_blocks(event.fields.get(field)))
-        elif event.category in {"submit", "reap"}:
+        elif category == "decision-members":
+            pairs.extend(_parse_request_blocks(event.fields.get("requests")))
+        elif category in {"gate1", "gate-1", "gate2", "gate-2"}:
+            request = _event_correlation_request(event)
+            blocks = _as_float(event.fields.get("blocks"))
+            if request is not None and blocks is not None and blocks >= 0.0:
+                pairs.append((request, blocks))
+        elif category in {"submit", "reap"}:
             request = event.fields.get("request")
             blocks = _as_float(event.fields.get("blocks"))
             if request is not None and blocks is not None and blocks >= 0.0:
@@ -1831,8 +2641,6 @@ def _event_outcome(event: DiagnosticEvent) -> bool | None:
         "cancelled",
         "canceled",
         "aborted",
-        "timeout",
-        "timed-out",
     }:
         return False
     if event.category in transfer_categories and action in {

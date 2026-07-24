@@ -459,6 +459,7 @@ def test_native_session_boundaries_are_recorded_once(
     tx_session = object.__new__(TxSession)
     tx_session.lock = threading.Lock()
     tx_session._first_write_submit_time_s = None
+    tx_session._kv_physical_complete_time_s = None
     rx_session = object.__new__(RxSession)
     rx_session.lock = threading.Lock()
     rx_session._request_info_sent_time_s = None
@@ -466,9 +467,51 @@ def test_native_session_boundaries_are_recorded_once(
     assert tx_session.mark_first_write_submitted(3.0)
     assert not tx_session.mark_first_write_submitted(4.0)
     assert tx_session.first_write_submit_time_s == 3.0
+    assert tx_session.mark_kv_physical_complete(4.0)
+    assert not tx_session.mark_kv_physical_complete(5.0)
+    assert tx_session.kv_physical_complete_time_s == 4.0
     assert rx_session.mark_request_info_sent(5.0)
     assert not rx_session.mark_request_info_sent(6.0)
     assert rx_session.request_info_sent_time_s == 5.0
+
+
+@pytest.mark.parametrize("has_transferring_tasks", [False, True])
+def test_cancel_request_separates_request_from_terminal_diagnostic(
+    has_transferring_tasks: bool,
+) -> None:
+    request = Mock(
+        request_id=7,
+        py_request_id=7,
+        py_disaggregated_params=None,
+    )
+    session = Mock(status=SessionStatus.CANCELLED)
+    session.has_transferring_tasks.return_value = has_transferring_tasks
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._wait_reqs = {}
+    transceiver._send_sessions = {7: session}
+    transceiver._send_reqs = {7: request}
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._log_transfer_terminal = Mock()
+
+    result = transceiver.cancel_request(request)
+
+    session.cancel.assert_called_once()
+    if has_transferring_tasks:
+        assert not result
+        assert 7 in transceiver._send_sessions
+        transceiver._log_transfer_terminal.assert_not_called()
+    else:
+        assert result
+        assert 7 not in transceiver._send_sessions
+        transceiver._log_transfer_terminal.assert_called_once_with(
+            role="ctx",
+            action="cancelled",
+            rid=7,
+            session=session,
+            req=request,
+        )
+        session.close.assert_called_once()
 
 
 def test_tx_session_wait_complete_nonblocking_returns_none_without_waiting() -> None:
