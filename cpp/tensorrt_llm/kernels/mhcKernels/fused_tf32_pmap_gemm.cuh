@@ -99,6 +99,55 @@ __device__ __forceinline__ uint32_t get_swizzled_smem_offset(uint32_t const& off
     return row * 128 + col * kSwizzleBase;
 }
 
+// Packed fp32x2 helpers (sm_100 f32x2 ALU). Per-lane IEEE fp32, identical
+// numerics to scalar fmaf/mul chains, at half the instruction count.
+__device__ __forceinline__ unsigned long long mhc_f2ll(float2 v)
+{
+    unsigned long long r;
+    memcpy(&r, &v, sizeof(r));
+    return r;
+}
+
+__device__ __forceinline__ float2 mhc_ll2f(unsigned long long v)
+{
+    float2 r;
+    memcpy(&r, &v, sizeof(r));
+    return r;
+}
+
+__device__ __forceinline__ float2 mhc_mul2(float a, float2 b)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
+    unsigned long long d;
+    asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(d) : "l"(mhc_f2ll(float2{a, a})), "l"(mhc_f2ll(b)));
+    return mhc_ll2f(d);
+#else
+    return float2{a * b.x, a * b.y};
+#endif
+}
+
+__device__ __forceinline__ float2 mhc_fma2(float a, float2 b, float2 c)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
+    unsigned long long d;
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(d) : "l"(mhc_f2ll(float2{a, a})), "l"(mhc_f2ll(b)), "l"(mhc_f2ll(c)));
+    return mhc_ll2f(d);
+#else
+    return float2{fmaf(a, b.x, c.x), fmaf(a, b.y, c.y)};
+#endif
+}
+
+__device__ __forceinline__ float2 mhc_fma2v(float2 a, float2 b, float2 c)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
+    unsigned long long d;
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(d) : "l"(mhc_f2ll(a)), "l"(mhc_f2ll(b)), "l"(mhc_f2ll(c)));
+    return mhc_ll2f(d);
+#else
+    return float2{fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y)};
+#endif
+}
+
 __device__ __forceinline__ void stsm_x4_b16_rout(void* smem_dst, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
 {
     asm volatile(
@@ -237,39 +286,9 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     const uint32_t h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
     constexpr uint32_t num_total_stages = H_TILES_PER_SPLIT * HC_MULT;
 
-    // Prologue: pmap warp group loads post_mix, comb_mix into SMEM
-    if (warp_idx >= kNumMMAThreads / 32)
-    {
-        const uint32_t pmap_tid = threadIdx.x - kNumMMAThreads;
-#pragma unroll
-        for (uint32_t t = 0; t < 2; ++t)
-        {
-            uint32_t idx = pmap_tid + t * kNumPmapThreads;
-            if (idx < BLOCK_M * HC_MULT)
-            {
-                uint32_t m = idx / HC_MULT;
-                uint32_t hc = idx % HC_MULT;
-                uint32_t gmem_m = m_offset + m;
-                float v = (gmem_m < shape_m) ? post_mix[gmem_m * HC_MULT + hc] : 0.f;
-                smem_post[idx] = v;
-            }
-        }
-#pragma unroll
-        for (uint32_t t = 0; t < 8; ++t)
-        {
-            uint32_t idx = pmap_tid + t * kNumPmapThreads;
-            if (idx < BLOCK_M * HC_MULT * HC_MULT)
-            {
-                uint32_t m = idx / (HC_MULT * HC_MULT);
-                uint32_t jk = idx % (HC_MULT * HC_MULT);
-                uint32_t gmem_m = m_offset + m;
-                float v = (gmem_m < shape_m) ? comb_mix[gmem_m * HC_MULT * HC_MULT + jk] : 0.f;
-                smem_comb[idx] = v;
-            }
-        }
-    }
-    __syncthreads();
-
+    // Prologue removed: pmap threads load their own post_mix/comb_mix rows
+    // directly into registers below, so the MMA/TMA warps never wait on those
+    // global loads and the TMA pipeline starts immediately.
     if (warp_idx < kNumMMAThreads / 32)
     {
         // ----- TMA warp (warp 0) -----
@@ -417,24 +436,30 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 
         float pm_u[HC_MULT], pm_l[HC_MULT];
         float cm_u[HC_MULT][HC_MULT], cm_l[HC_MULT][HC_MULT];
-#pragma unroll
-        for (uint32_t hc = 0; hc < HC_MULT; ++hc)
         {
-            pm_u[hc] = smem_post[upper_row * HC_MULT + hc];
-            pm_l[hc] = smem_post[lower_row * HC_MULT + hc];
-        }
-#pragma unroll
-        for (uint32_t j = 0; j < HC_MULT; ++j)
-        {
-#pragma unroll
-            for (uint32_t hc = 0; hc < HC_MULT; ++hc)
+            static_assert(HC_MULT == 4, "float4 row loads assume HC_MULT == 4");
+            const uint32_t gm_u = m_offset + upper_row;
+            const uint32_t gm_l = m_offset + lower_row;
+            auto load_row4 = [](float const* base, uint32_t row, uint32_t row_floats, uint32_t vec_idx,
+                                 bool valid) -> float4
             {
-                cm_u[j][hc] = smem_comb[upper_row * HC_MULT * HC_MULT + j * HC_MULT + hc];
-                cm_l[j][hc] = smem_comb[lower_row * HC_MULT * HC_MULT + j * HC_MULT + hc];
+                if (!valid)
+                    return float4{0.f, 0.f, 0.f, 0.f};
+                return __ldg(reinterpret_cast<float4 const*>(base + row * row_floats) + vec_idx);
+            };
+            const bool valid_u = gm_u < shape_m;
+            const bool valid_l = gm_l < shape_m;
+            *reinterpret_cast<float4*>(pm_u) = load_row4(post_mix, gm_u, HC_MULT, 0, valid_u);
+            *reinterpret_cast<float4*>(pm_l) = load_row4(post_mix, gm_l, HC_MULT, 0, valid_l);
+#pragma unroll
+            for (uint32_t j = 0; j < HC_MULT; ++j)
+            {
+                *reinterpret_cast<float4*>(cm_u[j]) = load_row4(comb_mix, gm_u, HC_MULT * HC_MULT, j, valid_u);
+                *reinterpret_cast<float4*>(cm_l[j]) = load_row4(comb_mix, gm_l, HC_MULT * HC_MULT, j, valid_l);
             }
         }
 
-        float sqr_u = 0.f, sqr_l = 0.f;
+        float2 sqr2_u{0.f, 0.f}, sqr2_l{0.f, 0.f};
         constexpr uint32_t kNumBankGroupBytes = 16;
         constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(nv_bfloat16);
         constexpr uint32_t kNumLoads = BLOCK_K / kNumElemsPerBankGroup;
@@ -493,71 +518,89 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                 empty_input[i_stage]->arrive();
             }
 
-            // Wait for previous ht's residual_out TMA_STOREs to drain before we
-            // overwrite single-buffered smem_rc with new hc values.
+            // ---- tile-batched f32x2 post-mapping ----
+            // s is a multiple of kNumCastStages at tile start and all four cast
+            // stages share one phase parity, so claim them all up front, then
+            // process column pairs with hc innermost: residual bf16->f32
+            // conversion happens once per (j, column) instead of once per
+            // (j, column, hc).
+            static_assert(kNumCastStages == HC_MULT, "tile-batched cast protocol expects one stage per hc");
+#pragma unroll
+            for (uint32_t c = 0; c < kNumCastStages; ++c)
+            {
+                empty_cast[c]->wait(((s / kNumCastStages) & 1) ^ 1);
+            }
+
+            // smem_rc is single-buffered: previous tile's residual_cur TMA
+            // stores must drain before this tile overwrites it.
             if (ht > 0)
             {
                 cute::tma_store_wait<0>();
             }
 
 #pragma unroll
-            for (uint32_t hc = 0; hc < HC_MULT; ++hc)
+            for (uint32_t i = 0; i < kNumLoads; i += 2)
             {
-                const uint32_t cast_stage_idx = s % kNumCastStages;
-                empty_cast[cast_stage_idx]->wait(((s / kNumCastStages) & 1) ^ 1);
-
-                uint32_t rc_u_buf[kNumLoads], rc_l_buf[kNumLoads];
+                float2 r_u[HC_MULT][2], r_l[HC_MULT][2];
 #pragma unroll
-                for (uint32_t i = 0; i < kNumLoads; ++i)
+                for (uint32_t j = 0; j < HC_MULT; ++j)
                 {
-                    float2 nu{pm_u[hc] * xf[0][i].x, pm_u[hc] * xf[0][i].y};
-                    float2 nl{pm_l[hc] * xf[1][i].x, pm_l[hc] * xf[1][i].y};
+                    r_u[j][0] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][0][i + 0]));
+                    r_u[j][1] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][0][i + 1]));
+                    r_l[j][0] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][1][i + 0]));
+                    r_l[j][1] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][1][i + 1]));
+                }
+#pragma unroll
+                for (uint32_t hc = 0; hc < HC_MULT; ++hc)
+                {
+                    float2 nu0 = mhc_mul2(pm_u[hc], xf[0][i + 0]);
+                    float2 nu1 = mhc_mul2(pm_u[hc], xf[0][i + 1]);
+                    float2 nl0 = mhc_mul2(pm_l[hc], xf[1][i + 0]);
+                    float2 nl1 = mhc_mul2(pm_l[hc], xf[1][i + 1]);
 #pragma unroll
                     for (uint32_t j = 0; j < HC_MULT; ++j)
                     {
-                        float2 ruj = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][0][i]));
-                        float2 rlj = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][1][i]));
-                        nu.x = fmaf(cm_u[j][hc], ruj.x, nu.x);
-                        nu.y = fmaf(cm_u[j][hc], ruj.y, nu.y);
-                        nl.x = fmaf(cm_l[j][hc], rlj.x, nl.x);
-                        nl.y = fmaf(cm_l[j][hc], rlj.y, nl.y);
+                        nu0 = mhc_fma2(cm_u[j][hc], r_u[j][0], nu0);
+                        nu1 = mhc_fma2(cm_u[j][hc], r_u[j][1], nu1);
+                        nl0 = mhc_fma2(cm_l[j][hc], r_l[j][0], nl0);
+                        nl1 = mhc_fma2(cm_l[j][hc], r_l[j][1], nl1);
                     }
-                    nv_bfloat162 b_up = __float22bfloat162_rn(nu);
-                    nv_bfloat162 b_lo = __float22bfloat162_rn(nl);
-                    uint32_t b_up_bits = *reinterpret_cast<uint32_t*>(&b_up);
-                    uint32_t b_lo_bits = *reinterpret_cast<uint32_t*>(&b_lo);
-                    rc_u_buf[i] = b_up_bits;
-                    rc_l_buf[i] = b_lo_bits;
-                    float2 ru = __bfloat1622float2(b_up);
-                    float2 rl = __bfloat1622float2(b_lo);
-                    sqr_u = fmaf(ru.x, ru.x, sqr_u);
-                    sqr_u = fmaf(ru.y, ru.y, sqr_u);
-                    sqr_l = fmaf(rl.x, rl.x, sqr_l);
-                    sqr_l = fmaf(rl.y, rl.y, sqr_l);
-                    cute::SM100_TMEM_STORE_16dp256b1x::copy(*reinterpret_cast<uint32_t*>(&ru.x),
-                        *reinterpret_cast<uint32_t*>(&ru.y), *reinterpret_cast<uint32_t*>(&rl.x),
-                        *reinterpret_cast<uint32_t*>(&rl.y), cast_stage_idx * BLOCK_K + i * 8);
-                }
-                cutlass::arch::fence_view_async_tmem_store();
-                tcgen05_before_thread_sync();
-                full_cast[cast_stage_idx]->arrive();
-                ++s;
+                    nv_bfloat162 b_u0 = __float22bfloat162_rn(nu0);
+                    nv_bfloat162 b_u1 = __float22bfloat162_rn(nu1);
+                    nv_bfloat162 b_l0 = __float22bfloat162_rn(nl0);
+                    nv_bfloat162 b_l1 = __float22bfloat162_rn(nl1);
+                    float2 ru0 = __bfloat1622float2(b_u0);
+                    float2 ru1 = __bfloat1622float2(b_u1);
+                    float2 rl0 = __bfloat1622float2(b_l0);
+                    float2 rl1 = __bfloat1622float2(b_l1);
+                    sqr2_u = mhc_fma2v(ru0, ru0, sqr2_u);
+                    sqr2_u = mhc_fma2v(ru1, ru1, sqr2_u);
+                    sqr2_l = mhc_fma2v(rl0, rl0, sqr2_l);
+                    sqr2_l = mhc_fma2v(rl1, rl1, sqr2_l);
+                    cute::SM100_TMEM_STORE_16dp256b1x::copy(*reinterpret_cast<uint32_t*>(&ru0.x),
+                        *reinterpret_cast<uint32_t*>(&ru0.y), *reinterpret_cast<uint32_t*>(&rl0.x),
+                        *reinterpret_cast<uint32_t*>(&rl0.y), hc * BLOCK_K + (i + 0) * 8);
+                    cute::SM100_TMEM_STORE_16dp256b1x::copy(*reinterpret_cast<uint32_t*>(&ru1.x),
+                        *reinterpret_cast<uint32_t*>(&ru1.y), *reinterpret_cast<uint32_t*>(&rl1.x),
+                        *reinterpret_cast<uint32_t*>(&rl1.y), hc * BLOCK_K + (i + 1) * 8);
 
-                // STSM bf16 new_r values into smem_rc[hc] sub-region for this warp.
-                uint8_t* rc_base = reinterpret_cast<uint8_t*>(smem_rc) + hc * SMEM_RC_PER_HC
-                    + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleRoutMode;
-#pragma unroll
-                for (uint32_t i = 0; i < kNumLoads; i += 2)
-                {
+                    uint8_t* rc_base = reinterpret_cast<uint8_t*>(smem_rc) + hc * SMEM_RC_PER_HC
+                        + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleRoutMode;
                     auto smem_ptr
                         = rc_base + get_swizzled_smem_offset<kSwizzleRoutMode>(i + lane_idx / 16, lane_idx % 16);
-                    stsm_x4_b16_rout(smem_ptr, rc_u_buf[i + 0], rc_l_buf[i + 0], rc_u_buf[i + 1], rc_l_buf[i + 1]);
+                    stsm_x4_b16_rout(smem_ptr, *reinterpret_cast<uint32_t*>(&b_u0), *reinterpret_cast<uint32_t*>(&b_l0),
+                        *reinterpret_cast<uint32_t*>(&b_u1), *reinterpret_cast<uint32_t*>(&b_l1));
                 }
             }
-            if constexpr (!kEarlyRelease)
+
+            cutlass::arch::fence_view_async_tmem_store();
+            tcgen05_before_thread_sync();
+#pragma unroll
+            for (uint32_t c = 0; c < kNumCastStages; ++c)
             {
-                empty_input[i_stage]->arrive();
+                full_cast[c]->arrive();
             }
+            s += kNumCastStages;
 
             // Emit HC_MULT TMA_STOREs of residual_cur: one per hc slice, per-warp rows.
             cute::tma_store_fence();
@@ -574,12 +617,18 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                     cute::tma_store_arrive();
                 }
             }
+            if constexpr (!kEarlyRelease)
+            {
+                empty_input[i_stage]->arrive();
+            }
         }
 
         // Drain any in-flight residual_out TMA stores before exit.
         cute::tma_store_wait<0>();
 
         // Warp-reduce sqr across 4 col_lanes then atomicAdd to global.
+        float sqr_u = sqr2_u.x + sqr2_u.y;
+        float sqr_l = sqr2_l.x + sqr2_l.y;
         sqr_u += __shfl_xor_sync(0xffffffff, sqr_u, 1);
         sqr_u += __shfl_xor_sync(0xffffffff, sqr_u, 2);
         sqr_l += __shfl_xor_sync(0xffffffff, sqr_l, 1);
