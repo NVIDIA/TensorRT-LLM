@@ -39,7 +39,10 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
 )
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
+from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+    AuxBuffer,
+    compute_aux_transfer_descs,
+)
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
@@ -912,9 +915,14 @@ class Sender(SenderBase):
             peer_slot = req_info.aux_slot
             assert peer_slot is not None, f"aux_slot is None for request {req_info.unique_rid}"
             assert task._slot is not None
-            src_ptrs = src_aux_meta.ptrs + src_aux_meta.item_sizes * task._slot
-            dst_ptrs = peer_aux_meta.ptrs + peer_aux_meta.item_sizes * peer_slot
-            sizes = src_aux_meta.item_sizes.astype(np.int64, copy=False)
+            # Per-buffer descriptors with each side's own slot stride, sizes
+            # clamped to min(src, dst) and zero-size entries dropped: the two
+            # sides may run different speculative configs (ctx/gen spec
+            # split), so per-slot item sizes can differ per buffer (e.g. the
+            # max_draft_len-sized draft-token buffer).
+            src_ptrs, dst_ptrs, sizes = compute_aux_transfer_descs(
+                src_aux_meta, peer_aux_meta, task._slot, peer_slot
+            )
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
