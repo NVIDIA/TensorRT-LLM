@@ -242,9 +242,9 @@ class FluxPipeline(BasePipeline):
                 )
             )
 
-            # TeaCache or Cache-DiT
+            # TeaCache or Cache-DiT: resolve coefficients here; the loader enables
+            # cache acceleration after torch.compile (see PipelineLoader.load).
             self._apply_teacache_coefficients(FLUX_TEACACHE_COEFFICIENTS)
-            self._setup_cache_acceleration()
 
     @property
     def default_generation_params(self):
