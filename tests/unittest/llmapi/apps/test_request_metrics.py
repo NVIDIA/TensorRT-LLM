@@ -77,7 +77,7 @@ def _record(status="complete"):
 
 
 def test_metrics_headers_use_metric_list_syntax():
-    headers = build_metrics_headers(_record())
+    headers = build_metrics_headers([_record()])
 
     assert "server_queue;dur=10.000000" in headers[SERVER_TIMING_HEADER]
     assert "server_ttft;dur=20.000000" in headers[SERVER_TIMING_HEADER]
@@ -115,13 +115,13 @@ def test_combine_disagg_metrics_is_request_local():
     assert record["disagg_request_id"] == 7
     assert record["phases"]["ctx"]["request_id"] == "ctx-7"
     assert record["phases"]["gen"]["ctx_request_id"] == 7
-    headers = build_metrics_headers(record)
+    headers = build_metrics_headers([record])
     assert "ctx-ctx-chunk-0-forward;dur=4.000000" in headers[CTX_CHUNK_METRICS_HEADER]
     assert "gen-step-3-forward;dur=2.000000" in headers[STEP_METRICS_HEADER]
 
 
 def test_time_breakdown_parser_accepts_header_derived_disagg_record():
-    headers = build_metrics_headers(_record())
+    headers = build_metrics_headers([_record()])
     ctx = build_metrics_record_from_headers(headers, "ctx", request_id="42")
     gen = build_metrics_record_from_headers(headers, "gen", request_id="42")
     record = combine_disagg_metrics(
@@ -141,6 +141,7 @@ def test_time_breakdown_parser_accepts_header_derived_disagg_record():
     )
 
     parsed = RequestDataParser().parse_request(_jsonl_record(record), 0)
+    combined_headers = build_metrics_headers([record])
 
     assert parsed["ctx_arrival_time"] == pytest.approx(1.0)
     assert parsed["ctx_first_scheduled_time"] == pytest.approx(1.01)
@@ -153,6 +154,8 @@ def test_time_breakdown_parser_accepts_header_derived_disagg_record():
     assert parsed["gen_server_arrival_time"] == pytest.approx(1.0)
     assert parsed["gen_server_first_token_time"] == pytest.approx(1.05)
     assert parsed["disagg_server_arrival_time"] == pytest.approx(0.99)
+    assert combined_headers[START_END_TIME_HEADER].count("ctx-start;") == 1
+    assert combined_headers[SERVER_TIMING_HEADER].count("ctx_queue;") == 1
 
 
 @pytest.mark.asyncio
@@ -168,7 +171,7 @@ async def test_middleware_controls_public_headers(expose_headers, request_metric
     sent = []
 
     async def app(scope, receive, send):
-        scope["state"]["perf_metrics_record"] = _record()
+        scope["state"]["perf_metrics_records"].extend([_record(), _record()])
         await send(
             {
                 "type": "http.response.start",
@@ -197,6 +200,9 @@ async def test_middleware_controls_public_headers(expose_headers, request_metric
     assert (SERVER_TIMING_HEADER.lower().encode() in header_names) is expected
     assert (STEP_METRICS_HEADER.lower().encode() in header_names) is expected
     assert (CTX_CHUNK_METRICS_HEADER.lower().encode() in header_names) is expected
+    if expected:
+        headers = dict(sent[0]["headers"])
+        assert headers[SERVER_TIMING_HEADER.encode()].count(b"server_queue;") == 2
 
 
 @pytest.mark.asyncio
@@ -208,7 +214,7 @@ async def test_middleware_limits_non_streaming_metrics_headers():
         breakdown = record["phases"]["server"]["time_breakdown_metrics"]
         breakdown["step_metrics"] *= 2000
         breakdown["ctx_chunk_metrics"] *= 2000
-        scope["state"]["perf_metrics_record"] = record
+        scope["state"]["perf_metrics_records"].append(record)
         await send(
             {
                 "type": "http.response.start",
@@ -272,7 +278,7 @@ async def test_stream_metrics_follow_done(expose_headers, request_metrics, expec
                 "more_body": True,
             }
         )
-        scope["state"]["perf_metrics_record"] = _record()
+        scope["state"]["perf_metrics_records"].append(_record())
         await send(
             {
                 "type": "http.response.body",
@@ -310,7 +316,7 @@ async def test_disconnect_after_done_is_ignored():
                 "more_body": True,
             }
         )
-        scope["state"]["perf_metrics_record"] = _record()
+        scope["state"]["perf_metrics_records"].append(_record())
         await send(
             {
                 "type": "http.response.body",
@@ -341,9 +347,10 @@ async def test_file_middleware_intercepts_detail_headers(tmp_path):
     await writer.start()
 
     async def app(scope, receive, send):
-        record = _record()
-        record["disagg_request_id"] = 17
-        scope["state"]["perf_metrics_record"] = record
+        records = [_record(), _record()]
+        records[0]["disagg_request_id"] = 17
+        records[1]["disagg_request_id"] = 18
+        scope["state"]["perf_metrics_records"].extend(records)
         await send(
             {
                 "type": "http.response.start",
@@ -373,10 +380,10 @@ async def test_file_middleware_intercepts_detail_headers(tmp_path):
     assert CTX_CHUNK_METRICS_HEADER.lower().encode() not in header_names
 
     output_file = next(tmp_path.glob("perf_metrics-test-*.jsonl"))
-    saved = json.loads(output_file.read_text())
-    assert saved["disagg_request_id"] == 17
-    assert saved["time_breakdown_metrics"]["step_metrics"]
-    assert saved["time_breakdown_metrics"]["ctx_chunk_metrics"]
+    saved = [json.loads(line) for line in output_file.read_text().splitlines()]
+    assert [record["disagg_request_id"] for record in saved] == [17, 18]
+    assert saved[0]["time_breakdown_metrics"]["step_metrics"]
+    assert saved[0]["time_breakdown_metrics"]["ctx_chunk_metrics"]
 
 
 @pytest.mark.asyncio
