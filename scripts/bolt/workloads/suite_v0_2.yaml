@@ -1,0 +1,175 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# TensorRT-LLM BOLT profiling workload suite (v0.2).
+#
+# This is the NVIDIA reference set used to generate the generalized BOLT
+# profiles shipped with TRT-LLM (the "TRTLLM Typical Cases for BOLT" selection).
+# The goal is to cover the hot code paths a representative mix of deployments
+# exercises, so the merged profile generalizes well.
+#
+# CUSTOMERS: you are encouraged to REPLACE this suite with workloads that match
+# your own deployment. BOLT prioritizes the hot paths it sees during profiling,
+# so the closer this set is to your production traffic, the better the result.
+# Point run_local.sh at your own file with: --workloads /path/to/your_suite.yaml
+#
+# The driver (run_workloads.sh) runs each enabled workload's `command`. If a
+# workload has no `command`, the driver logs it as a placeholder and skips it
+# (so this file doubles as documentation of the reference selection without
+# hard-coding cluster-specific benchmark invocations).
+#
+# CI FAN-OUT NOTE: the multi-node CI profile-gen (jenkins/BoltProfileGen.groovy)
+# currently drives its runnable set from the hardcoded BOLT_WORKLOADS list there
+# -- initial scope is the GB200 single-node AGGREGATE workloads below. Disagg and
+# B200 entries remain documentation-only for now (Disagg needs a ctx/gen split
+# launcher; B200 a different cluster). A follow-up could have BoltProfileGen read
+# its runnable set from this suite so it becomes the single source of truth.
+
+defaults:
+  precision: FP4
+  # Per-workload `command` is run with these env vars exported:
+  #   WL_MODEL WL_GPU WL_ISL WL_OSL WL_CONC WL_MTP WL_MODE
+  #   WL_CTX_PARALLEL WL_GEN_BACKEND WL_GEN_PARALLEL WL_NODES
+  # so a single reusable command template can read them.
+
+workloads:
+  - name: dsr1_gb200_agg_1k1k_c2
+    model: DeepSeek-R1
+    gpu: GB200
+    isl_osl: 1k/1k
+    concurrency: 2
+    mtp: 3
+    mode: Agg
+    gen_backend: trtllm
+    gen_parallel: TP4
+    nodes: 1
+    reason: GB200 single-node low conc baseline (MaaS typical)
+    enabled: true
+    # Representative single-node run. Set model_path to your DS R1 FP4 checkpoint.
+    # MTP/advanced settings need an extra config passed via BENCH_EXTRA_ARGS
+    # (--extra_llm_api_options cfg.yaml); the baseline run below omits them.
+    model_path: /lustre/fsw/portfolios/coreai/projects/coreai_tensorrt_ci/llm-models/DeepSeek-R1/DeepSeek-R1-FP4
+    tp: 4
+    command: bash "$BOLT_WORKLOADS_DIR/run_bench.sh"
+
+  - name: dsr1_b200_agg_1k1k_c2
+    model: DeepSeek-R1
+    gpu: B200
+    isl_osl: 1k/1k
+    concurrency: 2
+    mtp: 3
+    mode: Agg
+    gen_backend: trtllm
+    gen_parallel: TP4
+    nodes: 1
+    reason: B200 comparison for purchasing decisions
+    enabled: true
+
+  - name: dsr1_gb200_agg_8k1k_c2
+    model: DeepSeek-R1
+    gpu: GB200
+    isl_osl: 8k/1k
+    concurrency: 2
+    mtp: 3
+    mode: Agg
+    gen_backend: trtllm
+    gen_parallel: TP4
+    nodes: 1
+    reason: GB200 medium ctx low conc (inferencemax)
+    enabled: true
+
+  - name: dsr1_b200_agg_8k1k_c4
+    model: DeepSeek-R1
+    gpu: B200
+    isl_osl: 8k/1k
+    concurrency: 4
+    mtp: 3
+    mode: Agg
+    gen_backend: trtllm
+    gen_parallel: TP4
+    nodes: 1
+    reason: B200 medium ctx comparison
+    enabled: true
+
+  - name: dsr1_gb200_agg_1k1k_c1024_cutlass
+    model: DeepSeek-R1
+    gpu: GB200
+    isl_osl: 1k/1k
+    concurrency: 1024
+    mtp: 1
+    mode: Agg
+    gen_backend: cutlass
+    gen_parallel: DEP4
+    nodes: 1
+    reason: GB200 single-node throughput ref + cutlass coverage
+    enabled: true
+
+  - name: dsr1_gb200_disagg_128k8k_c1
+    model: DeepSeek-R1
+    gpu: GB200
+    isl_osl: 128k/8k
+    concurrency: 1
+    mtp: 3
+    mode: Disagg
+    ctx_parallel: pp8
+    gen_backend: trtllm
+    gen_parallel: tep8
+    nodes: 4
+    reason: Long ctx MaaS representative (80k-160k avg)
+    enabled: true
+
+  - name: dsr1_gb200_disagg_128k8k_c128_cutedsl
+    model: DeepSeek-R1
+    gpu: GB200
+    isl_osl: 128k/8k
+    concurrency: 128
+    mtp: 2
+    mode: Disagg
+    ctx_parallel: pp8
+    gen_backend: cutedsl
+    gen_parallel: dep16
+    nodes: 6
+    reason: Long ctx medium conc + cutedsl coverage
+    enabled: true
+
+  - name: dsr1_gb200_disagg_1k1k_c1
+    model: DeepSeek-R1
+    gpu: GB200
+    isl_osl: 1k/1k
+    concurrency: 1
+    mtp: 3
+    mode: Disagg
+    ctx_parallel: dep4
+    gen_backend: trtllm
+    gen_parallel: tep8
+    nodes: 3
+    reason: Disagg low concurrency representative case
+    enabled: true
+
+  - name: dsv32_gb200_disagg_32k4k_c1
+    model: DeepSeek-V3.2
+    gpu: GB200
+    isl_osl: 32k/4k
+    concurrency: 1
+    mtp: 3
+    mode: Disagg
+    ctx_parallel: dep4
+    gen_backend: trtllm
+    gen_parallel: tep8
+    nodes: 3
+    reason: Different model + long ctx + TPS baseline (25)
+    enabled: true
+
+  - name: k2_gb200_disagg_1k1k_c4
+    model: Kimi-K2
+    gpu: GB200
+    isl_osl: 1k/1k
+    concurrency: 4
+    mtp: 0
+    mode: Disagg
+    ctx_parallel: dep4
+    gen_backend: trtllm
+    gen_parallel: tep4
+    nodes: 2
+    reason: K2 low conc + TPS baseline (135)
+    enabled: true
