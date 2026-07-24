@@ -777,7 +777,16 @@ class TestRequestValidation:
 
         # Valid values pass.
         _validate({"condition_video_latent_indexes": [0, 1], "condition_video_keep": "last"})
-        _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.uint8)})
+        # ``video`` carries encoded MP4/AVI bytes: a video signature passes,
+        # empty / non-video bytes are client errors, and anything that is not
+        # bytes (e.g. a decoded tensor) fails the type check.
+        _validate({"video": b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00"})
+        with pytest.raises(ValueError, match="empty"):
+            _validate({"video": b""})
+        with pytest.raises(ValueError, match="not a recognized video container"):
+            _validate({"video": b"\x89PNG\r\n\x1a\n and not a video"})
+        with pytest.raises(ValueError, match="expected type 'bytes'"):
+            _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.uint8)})
 
         with pytest.raises(ValueError, match="non-negative"):
             _validate({"condition_video_latent_indexes": [0, -1]})
@@ -794,12 +803,6 @@ class TestRequestValidation:
         with pytest.raises(ValueError, match="output_type"):
             _validate({"output_type": "gif"})
         _validate({"output_type": "image"})
-        with pytest.raises(ValueError, match=r"\[T, H, W, C\]"):
-            _validate({"video": torch.zeros(4, 4, 3, dtype=torch.uint8)})  # 3-D
-        with pytest.raises(ValueError, match="uint8"):
-            _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.float32)})
-        with pytest.raises(ValueError, match="CPU tensor"):
-            _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.uint8, device="meta")})
 
     def test_validator_type_errors_become_client_errors(self):
         """A validator raising TypeError (wrong-shaped value it didn't guard)
@@ -820,71 +823,17 @@ class TestRequestValidation:
 
     def test_spec_validators_survive_pickling(self):
         """Specs travel worker -> coordinator in the READY handshake (pickled
-        over ZMQ); validators/reducers must be module-level functions so they
-        serialize by reference — a lambda/closure here would crash worker
-        startup."""
+        over ZMQ); validators must be module-level functions so they serialize
+        by reference — a lambda/closure here would crash worker startup."""
         import pickle
-
-        import torch
 
         from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
 
         specs = pickle.loads(pickle.dumps(COSMOS3_EXTRA_SPECS))
         with pytest.raises(ValueError, match="first or last"):
             specs["condition_video_keep"].validator("middle")
-        reduced = specs["video"].reducer(torch.zeros(20, 4, 4, 3, dtype=torch.uint8), {})
-        assert reduced.shape[0] == 5
-
-    def test_video_transport_reducer_crops_to_conditioning_window(self):
-        """The coordinator-side reducer ships only the conditioning window —
-        never the full clip — and the payload owns its storage (a bare slice
-        would pickle the entire original tensor)."""
-        import torch
-
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import _crop_video_frames
-
-        # Frame k is solid value k, so window position is observable.
-        full = torch.arange(189, dtype=torch.uint8).view(189, 1, 1, 1).expand(189, 4, 4, 3)
-        full = full.contiguous()
-
-        first = _crop_video_frames(full, {})
-        assert first.shape[0] == 5  # default indexes (0, 1) -> 1*4+1
-        assert int(first[0, 0, 0, 0]) == 0 and int(first[-1, 0, 0, 0]) == 4
-        # Owns its storage: pickling must carry the window, not the clip.
-        assert first.untyped_storage().size() < full.untyped_storage().size()
-
-        last = _crop_video_frames(full, {"condition_video_keep": "last"})
-        assert last.shape[0] == 5 and int(last[-1, 0, 0, 0]) == 188
-
-        wider = _crop_video_frames(full, {"condition_video_latent_indexes": [0, 2]})
-        assert wider.shape[0] == 9  # 2*4+1
-
-        # Short-enough inputs and invalid context pass through unchanged.
-        short = torch.zeros(3, 4, 4, 3, dtype=torch.uint8)
-        assert _crop_video_frames(short, {}) is short
-        assert _crop_video_frames(full, {"condition_video_latent_indexes": [-1]}) is full
-        assert _crop_video_frames("not a tensor", {}) == "not a tensor"
-
-    def test_reduce_visual_gen_params_is_non_mutating(self):
-        """generate_async reduces before the deep copy; the caller's params
-        object and tensor must be untouched."""
-        import torch
-
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
-        from tensorrt_llm.visual_gen.params import VisualGenParams, reduce_visual_gen_params
-
-        full = torch.zeros(189, 4, 4, 3, dtype=torch.uint8)
-        params = VisualGenParams(extra_params={"video": full, "flow_shift": 10.0})
-        out = reduce_visual_gen_params(params, COSMOS3_EXTRA_SPECS)
-
-        assert out is not params
-        assert params.extra_params["video"] is full  # caller untouched
-        assert out.extra_params["video"].shape[0] == 5
-        assert out.extra_params["flow_shift"] == 10.0  # non-reduced keys intact
-
-        # Nothing to reduce -> same object back, zero copies.
-        plain = VisualGenParams(extra_params={"flow_shift": 10.0})
-        assert reduce_visual_gen_params(plain, COSMOS3_EXTRA_SPECS) is plain
+        with pytest.raises(ValueError, match="not a recognized video container"):
+            specs["video"].validator(b"garbage bytes")
 
     # --- unsupported universal fields ---
 

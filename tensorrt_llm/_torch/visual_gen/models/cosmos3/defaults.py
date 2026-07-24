@@ -19,9 +19,8 @@ Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
 
 from typing import Dict, Iterable
 
-import torch
-
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+from tensorrt_llm.inputs.media_io import sniff_media_kind
 
 # ---------------------------------------------------------------------------
 # Constant tables
@@ -86,53 +85,19 @@ def _normalize_condition_video_keep(keep: str | None) -> str:
     return normalized
 
 
-def _crop_video_frames(video, extra_params) -> torch.Tensor:
-    """Crop the V2V reference to the conditioning window before transport.
-
-    Runs once in the coordinator (spec ``reducer``) before the request is
-    deep-copied, pickled over ZMQ, and broadcast per rank: a full 189-frame
-    720p reference is ~520 MiB while the default conditioning window is 5
-    frames (~14 MiB). Semantics-preserving — the worker's own first/last crop
-    is idempotent, so reduced and unreduced tensors generate identically.
-    Anything invalid is returned unchanged for the validators to reject.
-    """
-    if not isinstance(video, torch.Tensor) or video.ndim != 4:
-        return video
-    try:
-        indexes = _normalize_condition_video_latent_indexes(
-            extra_params.get("condition_video_latent_indexes")
-        )
-        keep = _normalize_condition_video_keep(extra_params.get("condition_video_keep"))
-    except (TypeError, ValueError):
-        return video
-    # 4 = Cosmos3 VAE temporal compression; if a future VAE changes it, the
-    # worker pads/crops the window itself, so a mismatch degrades gracefully.
-    window = max(indexes) * 4 + 1
-    if video.shape[0] <= window:
-        return video
-    sliced = video[-window:] if keep == "last" else video[:window]
-    # A slice is a view over the full storage and would pickle all of it;
-    # clone so the transport payload owns only the window.
-    return sliced.clone()
-
-
 def _validate_output_type(output_type: str) -> None:
     if output_type not in ("video", "image"):
         raise ValueError(f"Cosmos3 output_type must be 'video' or 'image', got {output_type!r}.")
 
 
-def _validate_video_reference_tensor(video: torch.Tensor) -> None:
-    if video.ndim != 4 or video.shape[-1] != 3:
+def _validate_video_reference(video) -> None:
+    """Preflight for the ``video`` extra param: encoded MP4/AVI bytes."""
+    if not video:
+        raise ValueError("Cosmos3 video reference bytes are empty.")
+    if sniff_media_kind(video) != "video":
         raise ValueError(
-            f"Cosmos3 video reference must be a uint8 [T, H, W, C] RGB tensor, "
-            f"got shape {tuple(video.shape)}."
-        )
-    if video.dtype != torch.uint8:
-        raise ValueError(f"Cosmos3 video reference must have dtype uint8, got {video.dtype}.")
-    if video.device.type != "cpu":
-        raise ValueError(
-            f"Cosmos3 video reference must be a CPU tensor, got device '{video.device}' "
-            "(it is pickled to the workers; keep decoded references on the host)."
+            "Cosmos3 video reference bytes are not a recognized video "
+            "container (supported: MP4/AVI)."
         )
 
 
@@ -217,18 +182,15 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         description="Optional scheduler flow shift override. Uses the Cosmos3 mode default when omitted.",
     ),
     "video": ExtraParamSchema(
-        type="tensor",
+        type="bytes",
         default=None,
         description=(
-            "V2V reference: decoded video frames as a uint8 [T, H, W, C] RGB "
-            "torch.Tensor (build one from a file with "
-            "tensorrt_llm.inputs.media_io.load_video_frames_tensor). The "
-            "coordinator crops it to the conditioning window per "
-            "condition_video_latent_indexes / condition_video_keep before "
-            "dispatch; the worker VAE-encodes it. Media is always decoded "
-            "by the producer."
+            "V2V reference: encoded MP4/AVI bytes (e.g. "
+            "Path(video).read_bytes()). Each worker rank demuxes them from "
+            "memory and NVDEC-decodes only the conditioning window per "
+            "condition_video_latent_indexes / condition_video_keep, resized "
+            "to the output resolution, then VAE-encodes it."
         ),
-        validator=_validate_video_reference_tensor,
-        reducer=_crop_video_frames,
+        validator=_validate_video_reference,
     ),
 }

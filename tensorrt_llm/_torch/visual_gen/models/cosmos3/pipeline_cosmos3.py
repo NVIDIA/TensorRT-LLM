@@ -26,6 +26,11 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
 
+from tensorrt_llm._torch.visual_gen.media_decode import (
+    MediaDecodeError,
+    decode_video_reference_window,
+    synchronize_media_prepare_status,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
@@ -39,12 +44,12 @@ from .defaults import (
     COSMOS3_EXTRA_SPECS,
     COSMOS3_PIPELINE_DEFAULTS,
     COSMOS3_T2I_PARAMS,
+    _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transformer_cosmos3 import Cosmos3VFMTransformer
-from .utils import pil_to_rgb
 
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
 # NOTE: Intentional typo in "give" instead of "given" to match training setup.
@@ -278,7 +283,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def infer(self, req):
         extra_params = req.params.extra_params or {}
         output_type = extra_params.get("output_type", "video")
-        video = extra_params.get("video")  # Tensor[T, H, W, C, dtype=uint8]
+        video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
 
         return self.forward(
             prompt=req.prompt,
@@ -596,20 +601,17 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         """
         return self.audio_tokenizer.decode(latent).float()  # [B, audio_channels, N_samples]
 
-    def _preprocess_condition_video(
-        self, frames: List[Any], target_h: int, target_w: int
-    ) -> torch.Tensor:
-        if not frames:
-            raise ValueError("Cosmos3 condition video input must contain at least one frame.")
-        processed = [
-            self.video_processor.preprocess(
-                self._resize_and_center_crop_image(pil_to_rgb(frame), target_h, target_w),
-                height=target_h,
-                width=target_w,
-            ).squeeze(0)
-            for frame in frames
-        ]
-        return torch.stack(processed, dim=1).unsqueeze(0).contiguous()
+    def _condition_frames_to_video_tensor(self, frames: torch.Tensor) -> torch.Tensor:
+        """Normalize uint8 ``[T, H, W, C]`` device frames to ``[1, 3, T, H, W]``.
+
+        Same value mapping as ``VideoProcessor.preprocess`` (``[0, 255]`` →
+        ``[-1, 1]``), applied to the target-resolution frames the worker
+        decode (``decode_video_reference_window``) retains.
+        """
+        if frames.shape[0] < 1:
+            raise MediaDecodeError("Cosmos3 condition video must contain at least one frame.")
+        x = frames.to(torch.float32).div_(255.0).mul_(2.0).sub_(1.0)
+        return x.permute(3, 0, 1, 2).unsqueeze(0).contiguous()
 
     def _encode_video_tensor(self, video_tensor: torch.Tensor) -> torch.Tensor:
         """VAE-encode a preprocessed pixel video [1, 3, T, H, W]."""
@@ -670,7 +672,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         indexes = _normalize_condition_video_latent_indexes(condition_video_latent_indexes)
         out_of_range = [index for index in indexes if index >= T_lat]
         if out_of_range:
-            raise ValueError(
+            # Mode-aware bound (num_frames may be a mode-deferred default, so
+            # this cannot run at coordinator preflight); client error class.
+            raise MediaDecodeError(
                 "Cosmos3 condition_video_latent_indexes contains indexes outside the latent video: "
                 f"indexes={indexes}, latent_frames={T_lat}."
             )
@@ -739,7 +743,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         use_guardrails: bool = COSMOS3_EXTRA_SPECS["use_guardrails"].default,
         enable_audio: bool = COSMOS3_EXTRA_SPECS["enable_audio"].default,
         output_type: str = COSMOS3_EXTRA_SPECS["output_type"].default,
-        video: torch.Tensor | None = None,  # [T, H, W, C, dtype=uint8]
+        video: bytes | None = None,  # encoded MP4/AVI reference (V2V)
         condition_video_latent_indexes: Iterable[int] | None = None,
         condition_video_keep: str | None = None,
         flow_shift: Optional[float] = None,
@@ -933,30 +937,65 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 image, height=height, width=width, num_frames=num_frames, generator=generator
             )
         elif video is not None:
-            condition_video_latent_indexes = _normalize_condition_video_latent_indexes(
-                condition_video_latent_indexes
-            )
-            if not isinstance(video, torch.Tensor) or video.ndim != 4:
-                raise ValueError(
-                    "Cosmos3 V2V reference must be a uint8 [T, H, W, C] tensor "
-                    f"(the 'video' extra-param contract), got {type(video).__name__}"
-                    f"{' of shape ' + str(tuple(video.shape)) if isinstance(video, torch.Tensor) else ''}."
+            prepare_error: Optional[Exception] = None
+            try:
+                condition_video_latent_indexes = _normalize_condition_video_latent_indexes(
+                    condition_video_latent_indexes
                 )
-            # video is already the conditioning window: the coordinator crops it
-            frames = [PIL.Image.fromarray(frame.cpu().numpy()) for frame in video]
-            video = self._preprocess_condition_video(frames, height, width)
+                # Bound-check the indexes against the OUTPUT latent length
+                # before any window math: an out-of-range index would
+                # otherwise size the decode ring (keep="last" decodes to EOF
+                # through it) from a request that is deterministically
+                # invalid.
+                num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+                out_of_range = [i for i in condition_video_latent_indexes if i >= num_latent_frames]
+                if out_of_range:
+                    raise MediaDecodeError(
+                        f"Cosmos3 condition_video_latent_indexes {out_of_range} are out "
+                        f"of range for a {num_frames}-frame output "
+                        f"({num_latent_frames} latent frames)."
+                    )
+                if isinstance(video, bytes):
+                    window = _condition_pixel_frame_count(
+                        condition_video_latent_indexes, self.vae_scale_factor_temporal
+                    )
+                    frames_u8 = decode_video_reference_window(
+                        video,
+                        window=window,
+                        keep=_normalize_condition_video_keep(condition_video_keep),
+                        target_h=height,
+                        target_w=width,
+                        device=self.device,
+                    )
+                else:
+                    raise MediaDecodeError(
+                        "Cosmos3 V2V reference must be encoded MP4/AVI bytes "
+                        f"(the 'video' extra-param contract), got "
+                        f"{type(video).__name__}."
+                    )
+                condition_pixels = self._condition_frames_to_video_tensor(frames_u8)
+                del frames_u8
 
-            if self.rank == 0:
-                logger.info(
-                    f"Cosmos3 V2V conditioning: frames={video.shape[2]}, "
-                    f"latent_indexes={condition_video_latent_indexes}"
+                if self.rank == 0:
+                    logger.info(
+                        f"Cosmos3 V2V conditioning: frames={condition_pixels.shape[2]}, "
+                        f"latent_indexes={condition_video_latent_indexes}"
+                    )
+                latents, velocity_mask, condition_latents = self._prepare_latents_v2v(
+                    condition_pixels,
+                    num_frames=num_frames,
+                    generator=generator,
+                    condition_video_latent_indexes=condition_video_latent_indexes,
                 )
-            latents, velocity_mask, condition_latents = self._prepare_latents_v2v(
-                video,
-                num_frames=num_frames,
-                generator=generator,
-                condition_video_latent_indexes=condition_video_latent_indexes,
-            )
+                # The VAE-encoded condition latents are all the denoise loop
+                # needs; drop the decoded pixels before the long generation.
+                del condition_pixels
+            except Exception as exc:
+                prepare_error = exc
+            # Per-rank decode/prepare can fail non-uniformly (NVDEC init,
+            # corrupt stream, allocation); converge all ranks on one outcome
+            # before any model collective so healthy ranks cannot hang.
+            synchronize_media_prepare_status(prepare_error)
         else:
             latents = self._prepare_latents(height, width, num_frames, generator)
 
