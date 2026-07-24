@@ -3824,12 +3824,14 @@ class Linear(nn.Module):
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
         if self.lora is not None and bool(lora_params):
-            output, lora_result = self.lora.execute_with_base(
+            output, (lora_result,) = LoraLayer.forward_with_base(
                 lambda: self.quant_method.apply(self, input, bias),
-                lambda: self.lora(input, lora_params, layer_idx),
+                (self.lora,),
+                input,
                 lora_params,
                 layer_idx,
             )
+
             if lora_result is not None:
                 output = output + lora_result
         else:
