@@ -724,6 +724,22 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_orig_prompt_len = self.orig_prompt_len
         self.py_max_new_tokens = self.max_new_tokens
         self.py_min_length = self.sampling_config.min_length
+        # Cached per-request greedy flag. Sampling params are immutable
+        # after admission, so this classification is invariant across all
+        # generation steps for the request; caching it here lets the
+        # one-model spec-dec sampler take an O(1) batch reduce every step
+        # (see `_scan_one_model_sampling`) instead of a per-step Python
+        # loop over the batch.
+        _sc = self.sampling_config
+        _temp = _sc.temperature[0] if _sc.temperature is not None and len(
+            _sc.temperature) > 0 else None
+        _top_k = _sc.top_k[0] if _sc.top_k is not None and len(
+            _sc.top_k) > 0 else None
+        _top_p = _sc.top_p[0] if _sc.top_p is not None and len(
+            _sc.top_p) > 0 else None
+        self.py_is_greedy_sample: bool = ((_temp is None and _top_p is None
+                                           and _top_k is None) or _top_k == 1
+                                          or _top_p == 0.0 or _temp == 0)
         # `seqlen_this_rank_cp`, `total_input_len_cp`, and `py_helix_is_inactive_rank` are relevant to helix parallelism.
         self.seqlen_this_rank_cp = self.prompt_len
         self.total_input_len_cp = self.prompt_len
