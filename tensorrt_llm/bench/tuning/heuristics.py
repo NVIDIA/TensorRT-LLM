@@ -1,20 +1,25 @@
+import math
 from typing import Tuple
 
 import torch
 
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.bench.tuning.dataclasses import (
+    ModelConfig,
+    NemotronHybridConfig,
+    Qwen3HybridConfig,
+)
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig, Qwen3HybridConfig
+
 from .utils import get_device_memory
-import math
 
 BYTES_PER_ELEM = {
     QuantAlgo.NO_QUANT: 2.0,
     QuantAlgo.FP8: 1.0,
     QuantAlgo.FP8_BLOCK_SCALES: 1.0,
-    QuantAlgo.NVFP4: .5,
+    QuantAlgo.NVFP4: 0.5,
 }
 
 
@@ -28,13 +33,14 @@ def calc_engine_setting(
     kv_cache_gpu_mem_fraction: float = 0.95,
     enable_attention_dp: bool = False,
 ) -> Tuple[int, int]:
-    """ Calculate the engine build settings (max batch size and max num tokens)
-        for a specific model + parallelism mapping + dataset configuration.
-        trtllm-bench sets a slightly optimistic upper bound for max batch size
-        and max num tokens to avoid over-allocation of memory in activation,
-        runtime, and decoder buffers. In runtime, TRT-LLM relies on its runtime
-        tuning features to adjust the runtime max batch size according to
-        incoming traffic.
+    """Calculate the engine build settings (max batch size and max num tokens).
+
+    For a specific model + parallelism mapping + dataset configuration,
+    trtllm-bench sets a slightly optimistic upper bound for max batch size
+    and max num tokens to avoid over-allocation of memory in activation,
+    runtime, and decoder buffers. In runtime, TRT-LLM relies on its runtime
+    tuning features to adjust the runtime max batch size according to
+    incoming traffic.
 
     Args:
         model_config (ModelConfig): Model specific configurations.
@@ -63,11 +69,16 @@ def calc_engine_setting(
     # Each GPU in TP group has at least 1 kv head
     adjusted_num_kv_heads = max(tp_size, model_config.num_key_value_heads)
 
-    logger.info(
-        f"Number of attention layers: {model_config.num_attention_layers}")
+    logger.info(f"Number of attention layers: {model_config.num_attention_layers}")
 
-    gb_per_token = 2 * model_config.num_attention_layers * adjusted_num_kv_heads \
-        * model_config.head_size * byte_per_kv_elem / (1024 ** 3)
+    gb_per_token = (
+        2
+        * model_config.num_attention_layers
+        * adjusted_num_kv_heads
+        * model_config.head_size
+        * byte_per_kv_elem
+        / (1024**3)
+    )
 
     # Number of GPU used for this run.
     n_gpus = tp_size * pp_size
@@ -92,13 +103,11 @@ def calc_engine_setting(
     # Available memory to allocate KV cache.
     available_memory = total_gpu_memory - engine_size
     logger.info(f"Estimated engine size: {engine_size:.2f} GB")
-    logger.info("Estimated total available memory for KV cache: "
-                f"{available_memory:.2f} GB")
+    logger.info(f"Estimated total available memory for KV cache: {available_memory:.2f} GB")
 
     # Calculate max requests in KV cache based on target ISL and OSL.
     target_seq_len = target_input_len + target_output_len
-    cache_memory = available_memory * model_config.cache_memory_fraction(
-        kv_cache_gpu_mem_fraction)
+    cache_memory = available_memory * model_config.cache_memory_fraction(kv_cache_gpu_mem_fraction)
 
     bytes_per_elem = BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT)
     if isinstance(model_config, (NemotronHybridConfig, Qwen3HybridConfig)):
@@ -107,30 +116,31 @@ def calc_engine_setting(
             if str_dtype_to_torch(mamba_ssm_cache_dtype) == torch.float32:
                 bytes_per_elem = 4.0
 
-    gb_per_extra_cache = model_config.extra_model_cache_in_gb(
-        bytes_per_elem, target_seq_len)
-    kv_cache_max_requests = cache_memory / (gb_per_token * target_seq_len +
-                                            gb_per_extra_cache)
+    gb_per_extra_cache = model_config.extra_model_cache_in_gb(bytes_per_elem, target_seq_len)
+    kv_cache_max_requests = cache_memory / (gb_per_token * target_seq_len + gb_per_extra_cache)
     extra_cache_memory = gb_per_extra_cache * kv_cache_max_requests
     kv_cache_memory = cache_memory - extra_cache_memory
     kv_cache_max_tokens = kv_cache_memory / gb_per_token
 
     logger.info(
-        f"Estimated total cache memory: {cache_memory:.2f} GB. KV cache: {kv_cache_memory:.2f} GB, Extra cache: {extra_cache_memory:.2f} GB"
+        f"Estimated total cache memory: {cache_memory:.2f} GB. "
+        f"KV cache: {kv_cache_memory:.2f} GB, Extra cache: {extra_cache_memory:.2f} GB"
     )
     logger.info(f"Estimated kv cache max tokens: {kv_cache_max_tokens:.2f}")
-    logger.info("Estimated max number of requests in KV cache memory: "
-                f"{kv_cache_max_requests:.2f}")
+    logger.info(f"Estimated max number of requests in KV cache memory: {kv_cache_max_requests:.2f}")
 
     # Fine-tune the max batch size and num token setting for performance.
-    # For mamba-attn hybrid models, we disable optimistic tuning because the mamba cache leaves less memory for the KV cache
+    # For mamba-attn hybrid models, we disable optimistic tuning because the
+    # mamba cache leaves less memory for the KV cache
     max_batch_size, max_num_tokens = finetune_setting(
         kv_cache_max_requests,
         target_input_len,
         target_output_len,
         pp_size,
         disable_optimistic_tuning=isinstance(
-            model_config, (NemotronHybridConfig, Qwen3HybridConfig)))
+            model_config, (NemotronHybridConfig, Qwen3HybridConfig)
+        ),
+    )
 
     # Functional and performance
     if total_gpu_memory < engine_size:
@@ -151,21 +161,26 @@ def calc_engine_setting(
             f"Number of Tensor Parallel Shards: {tp_size}\n"
             f"Number of Pipeline Parallel Stages: {pp_size}\n"
             f"KV Cache GPU Memory Fraction: {kv_cache_gpu_mem_fraction}\n"
-            "----------------------------------------------------------\n")
+            "----------------------------------------------------------\n"
+        )
     if kv_cache_max_requests < 1:
-        raise RuntimeError("The amount of KV cache memory is insufficient to "
-                           "run this model. Please try with more GPUs.")
+        raise RuntimeError(
+            "The amount of KV cache memory is insufficient to "
+            "run this model. Please try with more GPUs."
+        )
     warning_gpu_count = pp_size if enable_attention_dp else n_gpus
     if cache_memory / warning_gpu_count < 10.0:
         logger.warning(
-            f"The KV cache memory per GPU is less than 10 GB. "
+            "The KV cache memory per GPU is less than 10 GB. "
             "Performance may be undesirable. Please consider using a different "
-            "mapping or more GPUs.")
+            "mapping or more GPUs."
+        )
     if kv_cache_max_requests < 32:
         logger.warning(
-            f"The maximum number of requests in the KV cache is too "
+            "The maximum number of requests in the KV cache is too "
             "small. Performance may be undesirable. Please consider using more "
-            "GPUs or a different mapping to process more concurrent requests.")
+            "GPUs or a different mapping to process more concurrent requests."
+        )
 
     return max_batch_size, max_num_tokens
 
@@ -177,9 +192,10 @@ def finetune_setting(
     pp_size: int,
     disable_optimistic_tuning: bool = False,
 ) -> Tuple[int, int]:
-    """ Calculate and fine-tune the engine build settings (max batch size and
-        max num tokens). Both max batch size and max num tokens are fine-tuned
-        to be slightly optimistic.
+    """Calculate and fine-tune the engine build settings.
+
+    Both max batch size and max num tokens are fine-tuned to be slightly
+    optimistic.
 
     Args:
         kv_cache_max_requests (float): Max number of requests that can fits in
@@ -219,11 +235,12 @@ def finetune_setting(
     else:
         max_token = 1024 * math.ceil(raw_token / 1024)
 
-    logger.debug(f"Estimated max batch size (before fine-tune): "
-                 f"{kv_cache_max_requests / pp_size:.2f}")
+    logger.debug(
+        f"Estimated max batch size (before fine-tune): {kv_cache_max_requests / pp_size:.2f}"
+    )
     logger.debug(
         f"Estimated max num tokens (before fine-tune): "
-        f"{kv_cache_max_requests / pp_size * (1 + input_len / output_len) :.2f}"
+        f"{kv_cache_max_requests / pp_size * (1 + input_len / output_len):.2f}"
     )
     logger.info(f"Estimated max batch size (after fine-tune): {max_bs}")
     logger.info(f"Estimated max num tokens (after fine-tune): {max_token}")

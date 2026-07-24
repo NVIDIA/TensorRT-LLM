@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
 
 import cache_dit
+import torch
 import torch.nn as nn
 from cache_dit import (
     BlockAdapter,
@@ -39,6 +40,20 @@ class CacheDiTEnableResult:
     refresh: Callable[[int], None]
     disable_target: Any
     summary_modules: List[nn.Module]
+
+
+def _has_compiled_blocks(*block_lists: Any) -> bool:
+    """True when any transformer block is a torch.compile OptimizedModule wrapper.
+
+    torch.compile'd blocks expose a ``(*args, **kwargs)`` forward signature, so
+    cache_dit's inspect-based forward-pattern checks cannot match them and must
+    be skipped (the underlying blocks still follow the declared pattern).
+    """
+    return any(
+        isinstance(block, torch._dynamo.OptimizedModule)
+        for blocks in block_lists
+        for block in blocks
+    )
 
 
 def _resolved_enable_separate_cfg(cfg: CacheDiTConfig, default: bool) -> bool:
@@ -258,12 +273,18 @@ def enable_cache_dit_for_flux(
         forward_pattern = [ForwardPattern.Pattern_1, ForwardPattern.Pattern_1]
         tag = "FLUX.1"
 
+    compiled_blocks = _has_compiled_blocks(*block_lists)
+    if compiled_blocks:
+        logger.info(
+            f"Cache-DiT: {tag} blocks are torch.compile'd; skipping forward-pattern checks."
+        )
     adapter = BlockAdapter(
         transformer=pipeline.transformer,
         blocks=block_lists,
         forward_pattern=forward_pattern,
         params_modifiers=[modifier],
-        check_forward_pattern=True,
+        check_forward_pattern=not compiled_blocks,
+        check_num_outputs=not compiled_blocks,
     )
 
     logger.info(

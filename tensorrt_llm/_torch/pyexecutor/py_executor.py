@@ -1276,6 +1276,21 @@ class PyExecutor:
     def _set_global_steady_clock_offset(self):
         assert self.global_rank >= 0, "rank should be >= 0"
 
+        # First calibration wins (mirrors the C++ guard in CacheTransceiver).
+        # PyExecutor is constructed twice per process (memory-profiling dry run,
+        # then the real executor), so this method runs twice. Recalibration is
+        # idempotent as long as the measurement below reads the raw
+        # steady_clock, but skipping it avoids a redundant barrier+allgather
+        # and protects the offset if the measurement path ever becomes
+        # offset-aware (which would make a second pass observe ~zero skew and
+        # wipe the correct value).
+        if LlmRequest.global_steady_clock_offset is not None:
+            logger.info(
+                f"global_steady_clock_offset already set "
+                f"({LlmRequest.global_steady_clock_offset}); skipping recalibration "
+                f"for rank {self.global_rank}")
+            return
+
         # Sync all ranks
         self.dist.barrier()
         # Immediately take the local steady clock timestamp
@@ -3259,6 +3274,7 @@ class PyExecutor:
                 if spec_config is not None and spec_config.is_linear_tree else
                 self.model_engine.max_total_draft_tokens)
 
+    @nvtx_range("_can_queue")
     def _can_queue(self, scheduled_batch):
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
@@ -3863,6 +3879,7 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    @nvtx_range("_handle_disagg_cache_errors_synced")
     def _handle_disagg_cache_errors_synced(self):
         """Rank-safe disagg cache error and poison handler.
 

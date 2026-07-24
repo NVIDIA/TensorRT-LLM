@@ -3343,24 +3343,34 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,enable_heuristic_topk",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,enable_heuristic_topk,use_cute_dsl_topk",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT", False, False),
-            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, False),
-            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT", False, False),
-            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False, False),
-            (8, 1, 8, 3, False, False, True, True, 1, "_DEFAULT", False, False),
-            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", True, False),
-            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, True),
+            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT", False, False,
+             False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, False,
+             False),
+            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT", False, False,
+             False),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False, False,
+             False),
+            (8, 1, 8, 3, False, False, True, True, 1, "_DEFAULT", False, False,
+             False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", True, False,
+             False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, True,
+             False),
+            (8, 1, 8, 3, False, True, True, True, 24, "_DEFAULT", False, True,
+             True),
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "latency_default", "disable_skip_indexer", "heuristic_topk_mtp1"
+            "latency_default", "disable_skip_indexer", "heuristic_topk_mtp1",
+            "cute_dsl_gvr_mtp3"
         ])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend, disable_skip_indexer,
-                            enable_heuristic_topk):
+                            enable_heuristic_topk, use_cute_dsl_topk):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
@@ -3387,16 +3397,19 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 )
             kv_cache_config.dtype = "fp8"
 
-        if enable_heuristic_topk and get_sm_version() < 100:
+        if (enable_heuristic_topk
+                or use_cute_dsl_topk) and get_sm_version() < 100:
             pytest.skip("Heuristic TopK requires Blackwell (SM >= 100)")
 
-        dsa_config = None
+        dsa_kwargs = {}
         if disable_skip_indexer:
-            dsa_config = DeepSeekSparseAttentionConfig(
-                skip_indexer_for_short_seqs=False)
+            dsa_kwargs["skip_indexer_for_short_seqs"] = False
         if enable_heuristic_topk:
-            dsa_config = DeepSeekSparseAttentionConfig(
-                enable_heuristic_topk=True)
+            dsa_kwargs["enable_heuristic_topk"] = enable_heuristic_topk
+        if use_cute_dsl_topk:
+            dsa_kwargs["use_cute_dsl_topk"] = use_cute_dsl_topk
+        dsa_config = DeepSeekSparseAttentionConfig(
+            **dsa_kwargs) if dsa_kwargs else None
 
         mtp_config = None
         if mtp_nextn > 0:
@@ -7018,6 +7031,46 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                  nvfp4_gemm_config={"allowed_backends": ["marlin"]}) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
+    @skip_post_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @parametrize_with_ids("mtp_nextn", [3])
+    def test_nvfp4_marlin_adp_4gpus(self, mtp_nextn):
+        """Accuracy guard for MARLIN under attention DP + EP with MTP.
+
+        The NVFP4 checkpoint is MIXED_PRECISION with deliberately-unquantized
+        MTP draft layers, so this also guards the per-layer
+        MARLIN -> Cutlass fallback in ``create_moe.get_moe_cls`` while the
+        main-model expert layers stay on MARLIN. Attention DP exercises the
+        external-comm dispatch path with scheduler-precomputed routing.
+        """
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn,
+                                       mtp_eagle_one_model=True)
+        with LLM(model_path,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="MARLIN"),
+                 kv_cache_config=KvCacheConfig(
+                     enable_block_reuse=False,
+                     mamba_ssm_cache_dtype="float16",
+                     free_gpu_memory_fraction=0.8,
+                 ),
+                 max_batch_size=32,
+                 cuda_graph_config=CudaGraphConfig(max_batch_size=32,
+                                                   enable_padding=True),
+                 speculative_config=mtp_config,
+                 nvfp4_gemm_config={"allowed_backends": ["marlin"]}) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
