@@ -1758,40 +1758,17 @@ void invokeUpdateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
 
 #ifdef ENABLE_BF16
 
-// Pipelined bf16 compaction kernels, ported from Fanrong Li's optimized
-// compact kernels (snapshot 2026-07-19). The port keeps the double-buffered
-// cp.async pipeline intact and adapts only the addressing to this
-// repository's KVCacheManagerV2 ABI:
-//  (a) the per-layer page-table pointer array became one flat int32 V2
-//      K-plane block-offset table shared by all layers (entries encode
-//      2 * page + plane with plane == 0, so >> 1 recovers the page), strided
-//      per request;
-//  (b) the host-scalar destination base became per-request device bases, read
-//      once per CTA (one launch covers a cohort with mixed prompt lengths);
-//  (c) the head-row stride of the move-source indices is an explicit
-//      parameter instead of being derived from sourceOffsets[batchSize] on
-//      device: the move buffers are allocation-wide, so a device-derived
-//      stride would silently read the wrong plane for every KV head above
-//      head 0.
-// The original kernels were written for 128-token pages and Dh = 64; the port
-// additionally parameterizes the page and head-vector math so 32-token pages
-// and Dh = 128 (the production geometry here) take the same pipeline.
+// Pipelined bf16 compaction kernels: double-buffered cp.async copies that
+// compact paged KV pools in place through the V2 block-offset table.
 
 namespace compact_detail
 {
-// Vendored cp.async wrappers, equivalent to the ones in
-// cpp/kernels/xqa/ldgsts.cuh. That header cannot be included from this
-// widely-included template header because it drags in xqa's cuda_hint.cuh /
-// barriers.cuh, whose macros and helpers would leak into every translation
-// unit that includes this file.
+// Vendored cp.async wrappers (xqa's ldgsts.cuh cannot be included here).
 template <uint32_t size>
 __device__ __forceinline__ void copyAsync(void* dst, void const* src, uint32_t srcSize = size)
 {
     static_assert(size == 16, "only the 16B cp.async variant is vendored");
-    // srcSize == 0 turns the copy into a shared-memory zero fill; predicated
-    // lanes use it so ragged tiles never touch global memory. Nulling src is
-    // the same workaround as the xqa original, which observed speculative
-    // global reads without it.
+    // srcSize == 0 zero-fills shared memory instead of reading global.
     if (srcSize == 0)
     {
         src = nullptr;
@@ -1835,11 +1812,8 @@ struct SparseKvCacheCompactBf16Params
     size_t bytesPerPage;
 };
 
-//! Double-buffered cp.async pipeline: while the current 32-token tile drains
-//! from shared memory into its destination pages, the next tile's K/V vectors
-//! are already streaming global -> shared into the other buffer. One CTA per
-//! (layer, KV head, request); threadIdx.x walks the 16B vectors of one head,
-//! threadIdx.y walks the tokens of a tile.
+//! Double-buffered cp.async pipeline: the next tile streams in while the
+//! current tile drains. One CTA per (layer, KV head, request).
 template <typename T, int32_t HeadDim, int32_t TokensPerBlock>
 __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
     * kSparseKvCompactTokensPerTile) void sparseKvCacheCompactV2Bf16PipelineKernel(SparseKvCacheCompactBf16Params
@@ -1850,8 +1824,6 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
     // 128-token pages are the geometry the kernel was written for; 32-token
     // pages cover the supported production configuration (one tile == one page).
     static_assert(TokensPerBlock == 32 || TokensPerBlock == 128);
-    // 16B vectors per head: Dh64 -> 8 lanes (block 8x32 = 256 threads),
-    // Dh128 -> 16 lanes (block 16x32 = 512 threads).
     constexpr int32_t kVectorsPerHead = HeadDim * sizeof(T) / sizeof(uint4);
     constexpr int32_t kTokensPerTile = kSparseKvCompactTokensPerTile;
     constexpr int32_t kVectorsPerTile = kTokensPerTile * kVectorsPerHead;
@@ -1869,22 +1841,13 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
         return;
     }
 
-    // Layer resolution rule shared with the packed move-source layout:
-    // without an explicit map, launch layer i reads source plane i (the flat
-    // layout passes sourceLayerStride == 0, which collapses the term).
+    // Without an explicit layer map, launch layer i reads source plane i.
     int32_t const sourceLayer = params.sourceLayerIndices == nullptr ? layerIdx : params.sourceLayerIndices[layerIdx];
-    // ABI adaptation (c) -- see the port note above the compact_detail
-    // namespace: head rows are strided by the allocation width
-    // of the move buffers; this request's range within a plane starts at
-    // moveBegin.
     int64_t const sourceMoveBase = static_cast<int64_t>(sourceLayer) * params.sourceLayerStride
         + static_cast<int64_t>(kvHeadIdx) * params.sourceHeadStride + moveBegin;
-    // ABI adaptation (b) -- see the port note above the compact_detail namespace: per-request landing position.
     int32_t const destinationBase = params.destinationBases[batchIdx];
     auto* const pool = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params.poolPointers[layerIdx]));
-    // ABI adaptation (a) -- see the port note above the compact_detail namespace: flat V2 K-plane block-offset table;
-    // each lookup below decodes an entry to a page with >> 1. TokensPerBlock is a compile-time power of two, so / and %
-    // lower to shifts and masks.
+    // Block-offset entries decode to a page with >> 1.
     int32_t const* const pageTable = params.pageTable + static_cast<int64_t>(batchIdx) * params.pageTableRequestStride;
 
     extern __shared__ uint4 sharedVectors[];
@@ -1945,10 +1908,8 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
         compact_detail::copyAsync<sizeof(uint4)>(&nextSharedV[sharedVector], nextSourceVVector, nextSourceBytes);
         compact_detail::commitGroup();
 
-        // The compaction contract provides strictly increasing sources per request/head and
-        // dst(i) = destinationBase + i <= src(i). For current i and future j, i < j implies
-        // dst(i) < destinationBase + j <= src(j), so current stores cannot alias future prefetch sources.
-        // The current tile itself completed its wait and CTA barrier before reaching this store phase.
+        // In-place safety: sources are strictly increasing with dst(i) <= src(i),
+        // so current stores never alias future prefetch sources.
         int32_t const destinationToken = destinationBase + currentRequestMove;
         if (currentValid && currentSourceToken != destinationToken)
         {
@@ -1963,8 +1924,7 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
             destinationV[localVector] = currentSharedV[sharedVector];
         }
 
-        // commitGroup only closes the group; waitGroup<0> completes this thread's next-tile copies. The CTA
-        // barrier then makes the ping-pong buffer visible to all threads before it becomes current.
+        // waitGroup<0> completes the next tile's copies before the buffer swap.
         compact_detail::waitGroup<0>();
         __syncthreads();
         currentRequestMove = nextRequestMove;
@@ -1989,21 +1949,14 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
     }
 }
 
-// A destination-page-staging variant (needs a host-side proof that every
-// destination base is tile-aligned) is parked on branch
-// tr-parked-destination-page-kernel pending compaction.py alignment-flag plumbing.
 template <typename T, int32_t HeadDim, int32_t TokensPerBlock>
 void launchSparseKvCacheCompactV2Bf16Pipeline(SparseKvCacheCompactBf16Params const& params, cudaStream_t stream)
 {
     constexpr int32_t kVectorsPerHead = HeadDim * sizeof(T) / sizeof(uint4);
     dim3 const block(kVectorsPerHead, kSparseKvCompactTokensPerTile);
     dim3 const grid(params.numLayers, params.numKvHeads, params.batchSize);
-    // Two ping-pong buffers x (K tile + V tile) of 32 tokens x kVectorsPerHead
-    // 16B vectors:
-    //   Dh64:  4 * 32 * 8 * 16 B  = 16 KiB
-    //   Dh128: 4 * 32 * 16 * 16 B = 32 KiB
-    // Both fit the 48 KiB per-CTA dynamic shared memory default, so no
-    // cudaFuncSetAttribute opt-in is required.
+    // Two ping-pong buffers of (K + V) tiles; both geometries fit the 48 KiB
+    // per-CTA dynamic shared memory default.
     size_t const sharedBytes = 4 * kSparseKvCompactTokensPerTile * kVectorsPerHead * sizeof(uint4);
     sparseKvCacheCompactV2Bf16PipelineKernel<T, HeadDim, TokensPerBlock><<<grid, block, sharedBytes, stream>>>(params);
 }
@@ -2142,11 +2095,6 @@ void invokeSparseKvCacheCompactLayers(int64_t const* poolPointers, int32_t const
 #ifdef ENABLE_BF16
     if constexpr (std::is_same_v<T, __nv_bfloat16>)
     {
-        // The pipelined kernels are the only shipped path: they won the A/B
-        // comparison against the retired register-staging kernel everywhere
-        // (verified 2026-07-20: 1.47x at batch 1, 1.09-1.30x at batch 32,
-        // 1.09-1.13x at batch 256, byte-identical outputs). Unsupported pool
-        // dtypes and geometries fail the check below instead of falling back.
         if ((headDim == 64 || headDim == 128) && (tokensPerBlock == 32 || tokensPerBlock == 128))
         {
             SparseKvCacheCompactBf16Params fastParams{};
