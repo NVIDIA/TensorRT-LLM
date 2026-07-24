@@ -112,11 +112,15 @@ The sweep used the following controlled setup:
 | Model | [Wan 2.2 T2V-A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers), dual transformer |
 | Hardware | One NVIDIA B200 per request |
 | Output | 1280×720, 81 frames at 16 FPS, 50 denoising steps |
-| Guidance | 5.0 / 4.0, maximum text sequence length 512 |
+| Guidance | 5.0 for the high-noise expert and 4.0 for the low-noise expert; maximum text sequence length 512 |
 | Prompts | Seven prompts, one fixed seed each |
 | Runtime | TensorRT-LLM release image `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19` |
 | Checkpoint | ModelOpt 0.45.0.dev89 calibrated export with Skip Softmax metadata |
 | Compilation | `torch.compile` enabled; autotuning and CUDA graphs disabled; one exact-shape warmup before timing |
+
+Both guidance values enable classifier-free guidance (CFG) for all 50 denoising steps. CFG evaluates
+the positive-prompt and negative-prompt branches for each step; this single-GPU configuration
+processes the two inference branches together as a batch of two rather than with CFG parallelism.
 
 The grid was
 
