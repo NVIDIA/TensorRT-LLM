@@ -66,6 +66,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     )
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
+    from kv_cache_manager_v2._life_cycle_registry import AttnLifeCycle
     from kv_cache_manager_v2._storage._core import CacheLevelStorage, PoolGroupBase, SlotAllocator
     from kv_cache_manager_v2._storage_manager import StorageManager
     from kv_cache_manager_v2._utils import (
@@ -120,6 +121,7 @@ else:
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
+    from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import AttnLifeCycle
     from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import (
         CacheLevelStorage,
         PoolGroupBase,
@@ -2441,6 +2443,80 @@ class TestInitRatioConfig(unittest.TestCase):
         # Windowed layers need fewer blocks than non-windowed at history=2048.
         self.assertLess(ratio[0], ratio[1])
         manager.shutdown()
+
+    def test_sliding_window_floor_blocks_and_straddle(self):
+        """The straddle floor lifts decode requests to the peak but preserves prefill.
+
+        sliding_window_floor_blocks reports the straddle-inclusive window span; flooring
+        the single-history snapshot with it (capped at the sequence's blocks) provisions
+        decode requests for the straddle while leaving prefill-shaped and full-attention
+        requests unchanged.
+
+        A sliding window straddles one extra block at each block-boundary crossing, so
+        its resident count oscillates between an aligned minimum M-1 and a straddle peak
+        M = num_sink_blocks + ceil((window - 1) / tpb) + 1. A bare
+        `div_up(capacity, tpb) - len(get_stale_range(history, tpb))` snapshot samples one
+        alignment and can return M-1, starving small-window pools (a window-11 DSA indexer
+        got 1 block instead of 2 -- a 2x under-count).
+        """
+        tpb = 128
+
+        def div_up(a: int, b: int) -> int:
+            return (a + b - 1) // b
+
+        # (window, sink_tokens, expected straddle peak = sink + ceil((w-1)/tpb) + 1)
+        peak_cases = [
+            (11, 0, 2),  # DSA indexer window: aligned min 1, straddle peak 2 (2x under)
+            (131, 0, 3),  # SWA window under MTP3: aligned min 2, straddle peak 3
+            (128, 0, 2),  # exactly one block still straddles to 2
+            (256, 0, 3),  # two blocks straddle to 3
+            (1, 0, 1),  # single-token window
+            (131, 128, 4),  # a sink block adds to the peak
+        ]
+        for window, sink, expected_peak in peak_cases:
+            lc = AttnLifeCycle.make(window, sink, tpb)
+            self.assertEqual(
+                lc.sliding_window_floor_blocks(tpb), expected_peak, f"window={window} sink={sink}"
+            )
+        # Full attention has no window, hence no straddle floor.
+        self.assertEqual(AttnLifeCycle.make(None, None, tpb).sliding_window_floor_blocks(tpb), 0)
+
+        # The call-site composition: non_stale = max(snapshot, min(total_blocks, floor)).
+        def resident_blocks(lc, history: int, capacity: int) -> int:
+            total = div_up(capacity, tpb)
+            snapshot = total - len(lc.get_stale_range(history, tpb))
+            floor = min(total, lc.sliding_window_floor_blocks(tpb))
+            return max(snapshot, floor)
+
+        indexer = AttnLifeCycle.make(11, 0, tpb)  # window < one block
+        swa = AttnLifeCycle.make(131, 0, tpb)
+        full = AttnLifeCycle.make(None, None, tpb)
+        cap = 100 * tpb
+
+        # (a) Decode request whose snapshot lands on the aligned minimum -> floored to peak.
+        self.assertEqual(resident_blocks(indexer, cap - 4, cap), 2)  # snapshot 1 -> 2
+        self.assertEqual(resident_blocks(swa, cap - 4, cap), 3)  # snapshot 2 -> 3
+
+        # (b) Prefill-shaped request (history 0) keeps its in-flight input blocks and is
+        #     NOT collapsed to the window. This is what lets the typical_step's context
+        #     request provision the windowed pools; a bare min(total, floor) would starve
+        #     them (and drive the scratch-reuse subtraction negative).
+        prefill_cap = 64 * tpb
+        self.assertEqual(resident_blocks(indexer, 0, prefill_cap), 64)
+        self.assertEqual(resident_blocks(swa, 0, prefill_cap), 64)
+        self.assertEqual(resident_blocks(full, 0, prefill_cap), 64)
+
+        # (c) The straddle floor is the tight peak of the pure-window residency: it equals
+        #     the maximum snapshot over a full block of decode, never more.
+        for lc, expected_peak in ((indexer, 2), (swa, 3)):
+            snaps = [
+                div_up(h, tpb) - len(lc.get_stale_range(h, tpb))  # capacity == history
+                for h in range(cap - 2 * tpb, cap)
+            ]
+            self.assertEqual(min(lc.sliding_window_floor_blocks(tpb), div_up(cap, tpb)), max(snaps))
+
+        # (d) Full attention is never inflated: floor 0 -> exactly the snapshot (all blocks).
+        self.assertEqual(resident_blocks(full, 10 * tpb - 1, 10 * tpb), 10)
 
     def test_typical_step_short_sequences(self):
         """typical_step with short sequences: ratio reflects buffer size difference."""

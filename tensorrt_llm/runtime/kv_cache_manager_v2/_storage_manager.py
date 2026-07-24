@@ -84,7 +84,6 @@ from ._utils import (
     typed_len,
     typed_map,
     typed_range,
-    unwrap_optional,
 )
 
 if TYPE_CHECKING:
@@ -875,18 +874,24 @@ class StorageManager:
         if capacity < history_length:
             warnings.warn("Bad sampling for capacity and history_length")
             capacity = history_length
-        num_blocks = div_up(capacity, tokens_per_block)
         num_bytes = filled_list(0.0, self.num_pool_groups)
-        ssm_lc_idx = self._life_cycles.ssm_life_cycle_id
         for lc_idx, lc in typed_enumerate(self._life_cycles.get()):
             pg_idx = self.get_pool_group_index(lc_idx)
             slot_size = self.slot_size(pg_idx)
             num_required_blocks: int
-            if lc_idx == ssm_lc_idx:
-                num_required_blocks = 1
+            if isinstance(lc, AttnLifeCycle):
+                # Floor the single-history snapshot by the sliding-window straddle peak:
+                # a window transiently spans one extra block at each block-boundary
+                # crossing, which a bare `num_blocks - len(get_stale_range(...))` snapshot
+                # misses -- under-provisioning small-window pools. Prefill-shaped lengths
+                # keep the larger snapshot (their in-flight input blocks).
+                num_blocks = div_up(capacity, tokens_per_block)
+                snapshot = num_blocks - len(lc.get_stale_range(history_length, tokens_per_block))
+                floor = min(num_blocks, lc.sliding_window_floor_blocks(tokens_per_block))
+                num_required_blocks = max(snapshot, floor, 1)
             else:
-                stale = lc.get_stale_range(history_length, tokens_per_block)
-                num_required_blocks = max(num_blocks - len(stale), 1)
+                # SSM: one dedicated block per request.
+                num_required_blocks = 1
             num_bytes[pg_idx] += num_required_blocks * sum(slot_size)
         total = sum(num_bytes)
         assert total > 0
@@ -920,24 +925,23 @@ class StorageManager:
         """
         max_slots = filled_list(0, self.num_pool_groups)
 
-        def swa_floor_blocks(lc: AttnLifeCycle) -> int:
-            window = unwrap_optional(lc.window_size)
-            # Handle oscillation of slot count required by SWA while the window slides.
-            return lc.num_sink_blocks + (window + tokens_per_block - 2) // tokens_per_block + 1
-
         # Full-attention lifecycles share the largest SWA floor: all attention
-        # lifecycles see the same seq_len, so this is a valid lower bound.
+        # lifecycles see the same seq_len, so this is a valid lower bound. The floor
+        # handles the oscillation of the slot count required while the window slides
+        # (see AttnLifeCycle.sliding_window_floor_blocks).
         floor_num_blocks = 1
         for _, lc in self.life_cycles.attention_life_cycles():
             if lc.window_size is not None:
-                floor_num_blocks = max(floor_num_blocks, swa_floor_blocks(lc))
+                floor_num_blocks = max(
+                    floor_num_blocks, lc.sliding_window_floor_blocks(tokens_per_block)
+                )
         for lc_idx, lc in self.life_cycles.items():
             pg_idx = self.get_pool_group_index(lc_idx)
             if not isinstance(lc, AttnLifeCycle):
                 # SSM / non-attention: 1 slot floor per life cycle.
                 max_slots[pg_idx] += 1
             elif lc.window_size is not None:
-                max_slots[pg_idx] += swa_floor_blocks(lc)
+                max_slots[pg_idx] += lc.sliding_window_floor_blocks(tokens_per_block)
             else:
                 max_slots[pg_idx] += floor_num_blocks
         for batch in constraints:
@@ -963,6 +967,8 @@ class StorageManager:
                 # SSM: always 1 dedicated block per request, never shared.
                 num_slots[pg_idx] += len(batch.kv_caches)
                 continue
+            # Every non-SSM life cycle is an attention life cycle.
+            assert isinstance(lc, AttnLifeCycle)
             # Shared sys blocks (counted once): union of non-stale sys blocks across all requests.
             # A sys block needs memory if it's non-stale for ANY request.
             # = sys_blocks - (blocks stale for ALL requests within [0, sys_blocks))
@@ -975,9 +981,14 @@ class StorageManager:
             num_slots[pg_idx] += sys_blocks - len(stale_intersection)
             # Per-request unique blocks (excluding shared sys blocks already counted above).
             for kv in batch.kv_caches:
-                total_blocks = div_up(kv.capacity, tokens_per_block)
                 stale = lc.get_stale_range(kv.history_length, tokens_per_block)
-                non_stale = total_blocks - len(stale)
+                total_blocks = div_up(kv.capacity, tokens_per_block)
+                # Floor the single-history snapshot by the sliding-window straddle peak
+                # (see AttnLifeCycle.sliding_window_floor_blocks): a window transiently
+                # spans one extra block at each boundary crossing, which the bare snapshot
+                # misses. Prefill-shaped requests keep the larger snapshot (input blocks).
+                floor = min(total_blocks, lc.sliding_window_floor_blocks(tokens_per_block))
+                non_stale = max(total_blocks - len(stale), floor)
                 # Non-stale sys blocks for this request.
                 non_stale_sys = sys_blocks - len(intersect(stale, sys_range))
                 unique_non_stale = max(0, non_stale - non_stale_sys)
