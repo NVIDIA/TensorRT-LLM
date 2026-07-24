@@ -4193,7 +4193,16 @@ std::tuple<uint64_t, uint64_t> BaseKVCacheManager::calculateFreeMemBytes(
     TLLM_CHECK_WITH_INFO(finalFreeMem <= totalMem, "Free memory cannot exceed total memory");
 
     auto const freePrimaryMemBytes = static_cast<uint64_t>(finalFreeMem * freeMemFraction);
-    auto const freeSecondaryMemBytes = config.getHostCacheSize().value_or(0);
+    auto freeSecondaryMemBytes = config.getHostCacheSize().value_or(0);
+
+    // Integrated GPUs do not have a separate host-memory tier for KV offload.
+    if (tc::isUnifiedMemorySystem() && freeSecondaryMemBytes > 0)
+    {
+        TLLM_LOG_INFO("Unified memory detected: ignoring host_cache_size (%" PRIu64
+                      " bytes) because there is no separate host-memory tier.",
+            static_cast<uint64_t>(freeSecondaryMemBytes));
+        freeSecondaryMemBytes = 0;
+    }
 
     TLLM_LOG_DEBUG("Calculated free memory: {.freePrimaryMemBytes=%" PRIu64 ", .freeSecondaryMemBytes=%" PRIu64 "}",
         freePrimaryMemBytes, freeSecondaryMemBytes);

@@ -585,7 +585,9 @@ class TestModelDefaults:
         assert "enable_block_reuse" in error_str or "max_tokens" in error_str
 
 
-def test_KvCacheConfig_declaration():
+def test_KvCacheConfig_declaration(monkeypatch):
+    monkeypatch.setattr(llm_args_mod, "is_device_integrated", lambda: False)
+
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig().block_reuse_policy == "all_reusable"
     assert KvCacheConfig().enable_swa_scratch_reuse is False
@@ -654,6 +656,22 @@ def test_KvCacheConfig_declaration():
             block_reuse_policy == "per_conversation")
     with pytest.raises(ValidationError):
         KvCacheConfig(block_reuse_policy="invalid")
+
+
+def test_KvCacheConfig_unified_memory_forces_host_cache_size_zero(monkeypatch):
+    monkeypatch.setattr(llm_args_mod, "is_device_integrated", lambda: True)
+
+    config = KvCacheConfig(host_cache_size=1024)
+
+    assert config.host_cache_size == 0
+
+
+def test_KvCacheConfig_discrete_memory_preserves_host_cache_size(monkeypatch):
+    monkeypatch.setattr(llm_args_mod, "is_device_integrated", lambda: False)
+
+    config = KvCacheConfig(host_cache_size=1024)
+
+    assert config.host_cache_size == 1024
 
 
 def test_KvCacheConfig_disk_cache_validation(tmp_path):

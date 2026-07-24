@@ -47,8 +47,8 @@ from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
-from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
-                      prefer_pinned)
+from .._utils import (_str_to_torch_dtype_dict, is_device_integrated,
+                      is_sm_100f, mpi_rank, prefer_pinned)
 
 # yapf: disable
 # isort: off
@@ -3916,6 +3916,22 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.pool_ratio values must sum to 1.0")
         return v
+
+    @model_validator(mode='after')
+    def apply_unified_memory_defaults(self) -> 'KvCacheConfig':
+        """Disable host KV cache on integrated GPUs."""
+        try:
+            unified_memory_detected = is_device_integrated()
+        except RuntimeError:
+            logger.debug("Unified-memory auto-detection failed; "
+                         "defaulting to disabled")
+            unified_memory_detected = False
+
+        if unified_memory_detected and self.host_cache_size and self.host_cache_size > 0:
+            logger.info("Unified memory detected: setting host_cache_size to 0 "
+                        "(secondary pool is meaningless on unified memory)")
+            object.__setattr__(self, "host_cache_size", 0)
+        return self
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
