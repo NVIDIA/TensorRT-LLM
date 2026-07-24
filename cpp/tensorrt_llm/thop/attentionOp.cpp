@@ -39,7 +39,7 @@ namespace torch_ext
 {
 using tensorrt_llm::common::op::AttentionOp;
 using tensorrt_llm::common::op::AttentionWorkspaceManager;
-using tensorrt_llm::common::op::hash;
+using tensorrt_llm::common::op::OpCustomHash;
 using tensorrt_llm::runtime::RequestType;
 
 namespace
@@ -1307,8 +1307,10 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
     auto cache_key = std::make_tuple(op->data(), runner->data());
     using CacheKey = decltype(cache_key);
-    static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, hash<CacheKey>> op_cache;
-    if (auto it = op_cache.find(cache_key); it != op_cache.end())
+    static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, OpCustomHash<CacheKey>> op_cache;
+    static std::shared_mutex op_cache_mutex;
+    if (auto it = (static_cast<void>(std::shared_lock<std::shared_mutex>{op_cache_mutex}), op_cache.find(cache_key));
+        it != op_cache.end())
     {
         TLLM_LOG_TRACE("Attention op for layer %d is cached", local_layer_idx);
         op = it->second;
@@ -1319,7 +1321,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             to_string(cache_key).c_str());
         op->initialize();
         runner->prepare(*op);
-        op_cache[cache_key] = op;
+        std::unique_lock<std::shared_mutex> lock{op_cache_mutex};
+        auto [iter, _] = op_cache.try_emplace(cache_key, op);
+        op = iter->second;
     }
 
     int32_t const num_seqs = host_context_lengths.size(0);
@@ -1449,7 +1453,7 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
 
     auto cache_key = op->data();
     using CacheKey = decltype(cache_key);
-    static std::unordered_map<CacheKey, bool, hash<CacheKey>> op_cache;
+    static std::unordered_map<CacheKey, bool, OpCustomHash<CacheKey>> op_cache;
     if (auto it = op_cache.find(cache_key); it != op_cache.end())
     {
         TLLM_LOG_TRACE("Attention op runtime check is cached");

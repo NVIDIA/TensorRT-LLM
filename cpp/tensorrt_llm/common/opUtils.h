@@ -108,21 +108,20 @@ namespace
 {
 
 template <typename T>
-struct hash_helper;
-
-// Base case: use std::hash for basic types
-template <typename T>
-struct hash_helper
+struct OpCustomHash : public std::hash<T>
 {
-    size_t operator()(T const& v) const
-    {
-        return std::hash<T>{}(v);
-    }
 };
 
-// Specialization for std::set
+template <class T>
+inline size_t hash_combine(size_t hash, T const& value)
+{
+    static constexpr size_t seed = 0x9e3779b9ULL;
+    using RemoveCVRefT = std::remove_cv_t<std::remove_reference_t<T>>;
+    return OpCustomHash<RemoveCVRefT>{}(value) + seed + (hash << 6) + (hash >> 2);
+}
+
 template <typename T>
-struct hash_helper<std::set<T>>
+struct OpCustomHash<std::set<T>>
 {
     size_t operator()(std::set<T> const& s) const
     {
@@ -130,56 +129,29 @@ struct hash_helper<std::set<T>>
         for (auto const& item : s)
         {
             // Recursively hash each element
-            hash_value ^= hash_helper<T>{}(item) + 0x9e3779b9 + (hash_value << 6) + (hash_value >> 2);
+            hash_value ^= hash_combine(hash_value, item);
         }
         return hash_value;
     }
 };
 
-// Helper for tuple hashing
-template <typename Tuple, size_t Index = std::tuple_size<Tuple>::value - 1>
-struct tuple_hash_helper
+template <class... Args>
+class OpCustomHash<std::tuple<Args...>>
 {
-    static size_t hash(Tuple const& tuple)
+    template <std::size_t... Idx>
+    static size_t hash_impl(std::tuple<Args...> const& t, std::integer_sequence<std::size_t, Idx...>)
     {
-        size_t hash_value = tuple_hash_helper<Tuple, Index - 1>::hash(tuple);
-        return hash_value
-            ^ (hash_helper<typename std::tuple_element<Index, Tuple>::type>{}(std::get<Index>(tuple)) + 0x9e3779b9
-                + (hash_value << 6) + (hash_value >> 2));
+        size_t value = 0;
+        return ((value ^= hash_combine(value, std::get<Idx>(t))), ...);
     }
-};
 
-// Base case for tuple hashing
-template <typename Tuple>
-struct tuple_hash_helper<Tuple, 0>
-{
-    static size_t hash(Tuple const& tuple)
-    {
-        return hash_helper<typename std::tuple_element<0, Tuple>::type>{}(std::get<0>(tuple));
-    }
-};
-
-// Specialization for std::tuple
-template <typename... Args>
-struct hash_helper<std::tuple<Args...>>
-{
+public:
     size_t operator()(std::tuple<Args...> const& t) const
     {
-        return tuple_hash_helper<std::tuple<Args...>>::hash(t);
+        return hash_impl(t, std::make_index_sequence<sizeof...(Args)>{});
     }
 };
-
 } // namespace
-
-// Main hash struct to be used
-template <typename T>
-struct hash
-{
-    size_t operator()(T const& v) const
-    {
-        return hash_helper<T>{}(v);
-    }
-};
 
 // for testing only
 void const* getCommSessionHandle();
