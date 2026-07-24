@@ -124,6 +124,11 @@ class WorkerExtension:
                     self.engine.model_engine.model, weights, allow_partial_loading=True
                 )
                 del weights
+                # ipc_collect only reclaims mappings whose Python refs are
+                # already gone; force GC so cudaIpcOpenMemHandle storages are
+                # released before the sweep, or the IPC handle table saturates
+                # across repeated RPCs.
+                gc.collect()
                 torch.cuda.ipc_collect()
             else:
                 logger.info("Finalize update weights")
