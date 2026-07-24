@@ -114,6 +114,20 @@ QWEN_IMAGE_LAYERED_LPIPS_LAYERS = 4
 QWEN_IMAGE_LAYERED_LPIPS_RESOLUTION = 640
 QWEN_IMAGE_LAYERED_LPIPS_SEED = 777
 QWEN_IMAGE_LAYERED_LPIPS_THRESHOLD = 0.05
+QWEN_IMAGE_LAYERED_BF16_CONFIG = os.path.join(
+    REPO_ROOT,
+    "examples",
+    "visual_gen",
+    "configs",
+    "qwen-image-layered-1gpu.yaml",
+)
+QWEN_IMAGE_LAYERED_FP8_CONFIG = os.path.join(
+    REPO_ROOT,
+    "examples",
+    "visual_gen",
+    "configs",
+    "qwen-image-layered-fp8-1gpu.yaml",
+)
 
 # Cosmos3-Nano (text-to-video + text-to-image) — default-setting LPIPS golden.
 # Params are the Cosmos3 720P defaults (cosmos3/defaults.py:COSMOS3_720P_PARAMS).
@@ -939,7 +953,12 @@ def _flatten_qwen_image_layered_lpips_image(input_path, output_path):
         background.convert("RGB").save(output_path)
 
 
-def _generate_qwen_image_layered_lpips_image(model_path, input_path, output_path):
+def _generate_qwen_image_layered_lpips_image(
+    model_path,
+    input_path,
+    output_path,
+    visual_gen_args_path,
+):
     """Generate the Qwen-Image-Layered LPIPS sample (default setting, compile-off)."""
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
@@ -947,31 +966,61 @@ def _generate_qwen_image_layered_lpips_image(model_path, input_path, output_path
 
     _skip_if_missing(model_path, "Qwen-Image-Layered checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
-    args = VisualGenArgs(
+    args = VisualGenArgs.from_yaml(
+        visual_gen_args_path,
         model=model_path,
         torch_compile_config=TorchCompileConfig(enable=False),
     )
-    pipeline = PipelineLoader(args).load(skip_warmup=True)
-    try:
-        with torch.no_grad():
-            result = pipeline.forward(
-                image=str(input_path),
-                prompt=QWEN_IMAGE_LAYERED_LPIPS_PROMPT,
-                negative_prompt=QWEN_IMAGE_LAYERED_LPIPS_NEGATIVE_PROMPT,
-                num_inference_steps=QWEN_IMAGE_LAYERED_LPIPS_NUM_INFERENCE_STEPS,
-                true_cfg_scale=QWEN_IMAGE_LAYERED_LPIPS_TRUE_CFG_SCALE,
-                layers=QWEN_IMAGE_LAYERED_LPIPS_LAYERS,
-                resolution=QWEN_IMAGE_LAYERED_LPIPS_RESOLUTION,
-                cfg_normalize=True,
-                use_en_prompt=True,
-                seed=QWEN_IMAGE_LAYERED_LPIPS_SEED,
-            )
-        generated_image = result.image[0].detach().cpu()
-    finally:
-        del pipeline
-        _cleanup_cuda()
+    with _lpips_deterministic_algorithms():
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        try:
+            with torch.no_grad():
+                result = pipeline.forward(
+                    image=str(input_path),
+                    prompt=QWEN_IMAGE_LAYERED_LPIPS_PROMPT,
+                    negative_prompt=QWEN_IMAGE_LAYERED_LPIPS_NEGATIVE_PROMPT,
+                    num_inference_steps=QWEN_IMAGE_LAYERED_LPIPS_NUM_INFERENCE_STEPS,
+                    true_cfg_scale=QWEN_IMAGE_LAYERED_LPIPS_TRUE_CFG_SCALE,
+                    layers=QWEN_IMAGE_LAYERED_LPIPS_LAYERS,
+                    resolution=QWEN_IMAGE_LAYERED_LPIPS_RESOLUTION,
+                    cfg_normalize=True,
+                    use_en_prompt=True,
+                    seed=QWEN_IMAGE_LAYERED_LPIPS_SEED,
+                )
+            generated_image = result.image[0].detach().cpu()
+        finally:
+            del pipeline
+            _cleanup_cuda()
 
     save_image(generated_image, output_path)
+
+
+def _run_qwen_image_layered_lpips_case(tmp_path, test_name, visual_gen_args_path):
+    input_path = tmp_path / f"{test_name}_input.png"
+    generated_path = tmp_path / f"{test_name}_generated.png"
+    golden_path = tmp_path / f"{test_name}_golden_grid.png"
+    generated_lpips_path = tmp_path / f"{test_name}_generated_lpips.png"
+    golden_lpips_path = tmp_path / f"{test_name}_golden_grid_lpips.png"
+    _copy_qwen_image_layered_lpips_input(tmp_path, input_path)
+    _write_qwen_image_layered_lpips_golden_grid(tmp_path, golden_path)
+    _generate_qwen_image_layered_lpips_image(
+        _lpips_model_path(QWEN_IMAGE_LAYERED_MODEL_SUBPATH),
+        input_path,
+        generated_path,
+        visual_gen_args_path=visual_gen_args_path,
+    )
+    # Ignore invisible RGB values under transparent pixels while preserving
+    # partially transparent layer edges.
+    _flatten_qwen_image_layered_lpips_image(generated_path, generated_lpips_path)
+    _flatten_qwen_image_layered_lpips_image(golden_path, golden_lpips_path)
+    return _run_lpips_eval(
+        tmp_path,
+        test_name,
+        "image",
+        QWEN_IMAGE_LAYERED_LPIPS_PROMPT,
+        golden_lpips_path,
+        generated_lpips_path,
+    )
 
 
 def _run_cosmos3_lpips_pipeline(num_frames):
@@ -1237,29 +1286,20 @@ def test_qwenimage_cuda_graph_lpips_against_golden(tmp_path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_qwen_image_layered_lpips_against_golden(tmp_path):
-    input_path = tmp_path / "qwen_image_layered_input.png"
-    generated_path = tmp_path / "qwen_image_layered_generated.png"
-    golden_path = tmp_path / "qwen_image_layered_golden_grid.png"
-    generated_lpips_path = tmp_path / "qwen_image_layered_generated_lpips.png"
-    golden_lpips_path = tmp_path / "qwen_image_layered_golden_grid_lpips.png"
-    _copy_qwen_image_layered_lpips_input(tmp_path, input_path)
-    _write_qwen_image_layered_lpips_golden_grid(tmp_path, golden_path)
-    _generate_qwen_image_layered_lpips_image(
-        _lpips_model_path(QWEN_IMAGE_LAYERED_MODEL_SUBPATH),
-        input_path,
-        generated_path,
-    )
-    # Ignore invisible RGB values under transparent pixels while preserving
-    # partially transparent layer edges.
-    _flatten_qwen_image_layered_lpips_image(generated_path, generated_lpips_path)
-    _flatten_qwen_image_layered_lpips_image(golden_path, golden_lpips_path)
-    score = _run_lpips_eval(
+    score = _run_qwen_image_layered_lpips_case(
         tmp_path,
         "qwen_image_layered",
-        "image",
-        QWEN_IMAGE_LAYERED_LPIPS_PROMPT,
-        golden_lpips_path,
-        generated_lpips_path,
+        visual_gen_args_path=QWEN_IMAGE_LAYERED_BF16_CONFIG,
+    )
+    _assert_lpips_below_threshold(score, QWEN_IMAGE_LAYERED_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_qwen_image_layered_fp8_sage_lpips_against_golden(tmp_path):
+    score = _run_qwen_image_layered_lpips_case(
+        tmp_path,
+        "qwen_image_layered_fp8_sage",
+        visual_gen_args_path=QWEN_IMAGE_LAYERED_FP8_CONFIG,
     )
     _assert_lpips_below_threshold(score, QWEN_IMAGE_LAYERED_LPIPS_THRESHOLD)
 

@@ -17,6 +17,7 @@
 import json
 import sys
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -31,9 +32,13 @@ from tensorrt_llm._torch.visual_gen.config import (
 )
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImagePipeline
+from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
+    QwenJointAttention,
+)
 from tensorrt_llm._torch.visual_gen.models.qwen_image_layered import QwenImageLayeredPipeline
 from tensorrt_llm._torch.visual_gen.models.qwen_image_layered.transformer_qwen_image_layered import (
     QwenEmbedLayer3DRope,
+    QwenImageLayeredJointAttention,
     QwenImageLayeredTransformer2DModel,
 )
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
@@ -186,6 +191,57 @@ def test_transformer_constructs_with_layered_config():
     assert isinstance(model.pos_embed, QwenEmbedLayer3DRope)
     assert model.time_text_embed.use_additional_t_cond is True
     assert hasattr(model.time_text_embed, "addition_t_embedding")
+    assert all(isinstance(block.attn, QwenJointAttention) for block in model.transformer_blocks)
+    assert all(
+        not isinstance(block.attn, QwenImageLayeredJointAttention)
+        for block in model.transformer_blocks
+    )
+
+
+def test_layered_e8m0_quantization_only_for_repacking_backends():
+    module = SimpleNamespace(
+        use_cute_dsl_blockscaling_mm=False,
+        disable_deep_gemm=False,
+    )
+    module_path = (
+        "tensorrt_llm._torch.visual_gen.models.qwen_image_layered.transformer_qwen_image_layered"
+    )
+    with (
+        mock.patch(f"{module_path}.is_sm_100f", return_value=True),
+        mock.patch(f"{module_path}.get_sm_version", return_value=100),
+    ):
+        assert QwenImageLayeredTransformer2DModel._uses_e8m0_post_load_repack(module)
+
+    module.use_cute_dsl_blockscaling_mm = True
+    with (
+        mock.patch(f"{module_path}.is_sm_100f", return_value=True),
+        mock.patch(f"{module_path}.get_sm_version", return_value=100),
+    ):
+        assert not QwenImageLayeredTransformer2DModel._uses_e8m0_post_load_repack(module)
+
+
+def test_layered_joint_attention_routes_trtllm_bf16():
+    """Layered joint self-attention supports the unquantized TRTLLM backend."""
+    model_config = DiffusionModelConfig(
+        attention=AttentionConfig(backend="TRTLLM"),
+        skip_create_weights_in_init=True,
+    )
+    model = QwenImageLayeredTransformer2DModel(
+        model_config=model_config,
+        patch_size=1,
+        in_channels=16,
+        out_channels=16,
+        num_layers=1,
+        attention_head_dim=16,
+        num_attention_heads=1,
+        joint_attention_dim=16,
+        axes_dims_rope=(4, 6, 6),
+    )
+
+    attention = model.transformer_blocks[0].attn
+    assert isinstance(attention, QwenImageLayeredJointAttention)
+    assert attention.attn_backend == "TRTLLM"
+    assert attention.attn.quant_attention_config is None
 
 
 def test_transformer_from_config_dict_preserves_layered_fields():
