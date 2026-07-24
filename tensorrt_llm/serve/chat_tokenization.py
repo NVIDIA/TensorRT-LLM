@@ -30,7 +30,6 @@ ToolDict = dict[str, object]
 
 def resolve_model_type_from_config(model_name_or_path: str) -> Optional[str]:
     """Return the checkpoint's declared model type from its config metadata."""
-
     config_dict, _ = PretrainedConfig.get_config_dict(model_name_or_path)
     model_type = config_dict.get("model_type")
     return model_type if isinstance(model_type, str) else None

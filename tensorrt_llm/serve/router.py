@@ -806,7 +806,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  **kwargs) -> None:
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._init_block_hashing(tokens_per_block, custom_tokenizer,
+        self._init_block_hashing(tokens_per_block,
+                                 custom_tokenizer,
                                  tokenizer_dir,
                                  use_harmony=use_harmony,
                                  model_path=model_path)
