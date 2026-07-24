@@ -2621,11 +2621,13 @@ legacy-files: &legacy_files |
 static-analysis-files: &static_analysis_files |
     (?x)^(
         tensorrt_llm/_torch/pyexecutor/sampler/sampler.py |
+        tensorrt_llm/_torch/pyexecutor/sampler/token_ban.py |
         tensorrt_llm/_torch/pyexecutor/sampler/sampling_utils.py |
         tensorrt_llm/_torch/pyexecutor/sampler/ops/interface.py |
         tensorrt_llm/_torch/pyexecutor/sampler/ops/flashinfer.py |
         tensorrt_llm/_torch/pyexecutor/sampler/ops/vanilla.py |
         tests/unittest/_torch/sampler/test_torch_sampler.py |
+        tests/unittest/_torch/sampler/test_token_ban.py |
         tests/unittest/_torch/sampler/test_beam_search.py |
         tests/unittest/_torch/sampler/test_beam_search_util.py |
     )$

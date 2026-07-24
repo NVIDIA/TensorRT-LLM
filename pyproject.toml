@@ -1468,6 +1468,7 @@ module = [
     "tests.*",
     "_torch.*",  # tests/unittest/_torch/*, cf. mypy_path
     "test_torch_sampler",  # tests/unittest/_torch/sampler/..., cf. mypy_path
+    "test_token_ban",  # tests/unittest/_torch/sampler/..., cf. mypy_path
     "test_beam_search",  # tests/unittest/_torch/sampler/..., cf. mypy_path
     "test_beam_search_util",  # tests/unittest/_torch/sampler/..., cf. mypy_path
 ]
