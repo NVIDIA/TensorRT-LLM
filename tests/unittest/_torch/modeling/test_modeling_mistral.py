@@ -19,7 +19,7 @@ from tensorrt_llm._torch import metadata as metadata_lib
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_mistral
-from tensorrt_llm._torch.models.modeling_mistral import Mistral3InputProcessor
+from tensorrt_llm._torch.models.modeling_mistral import MistralHFInputProcessor
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm.bindings import executor as executor_lib
@@ -540,7 +540,7 @@ def test_processor_get_num_tokens_per_image(
     with mock.patch(
         "tensorrt_llm._torch.models.modeling_mistral.AutoProcessor"
     ) as mocked_auto_processor:
-        input_processor = modeling_mistral.Mistral3InputProcessor(
+        input_processor = modeling_mistral.MistralHFInputProcessor(
             model_path=str(tmp_path),
             config=mistral_3_config,
             tokenizer=mock.MagicMock(),
@@ -637,7 +637,7 @@ def test_mistral_attention_swa_layer_types():
 # Deterministic dummy-input sizing (Mistral3 / Pixtral input processor).
 #
 # CPU-only unit tests for the encoder-profiling dummy contract: reach into
-# Mistral3InputProcessor directly (no model load) and stub the geometry the
+# MistralHFInputProcessor directly (no model load) and stub the geometry the
 # dummy math reads. The ViT token unit is the pre-merge patch count
 # ``(h//patch)*(w//patch)`` -- deliberately *not* the hashing path's LLM-side
 # Pixtral count with framing tokens.
@@ -649,7 +649,7 @@ def _make_dummy_processor(*, patch_size=14, spatial_merge_size=2, image_size=154
     ``_processor`` forces ``_vision_geometry`` to fall back to ``vision_config``
     (the HF ``mistral3`` path).
     """
-    instance = Mistral3InputProcessor.__new__(Mistral3InputProcessor)
+    instance = MistralHFInputProcessor.__new__(MistralHFInputProcessor)
     instance._config = SimpleNamespace(
         vision_config=SimpleNamespace(
             patch_size=patch_size, image_size=image_size, num_channels=num_channels
