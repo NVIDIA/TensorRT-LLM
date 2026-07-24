@@ -27,6 +27,7 @@ import sys
 import time
 import urllib.request
 import zipfile
+from typing import Any
 
 import pytest
 import torch
@@ -96,6 +97,7 @@ WAN22_LPIPS_FRAME_RATE = 16.0
 # NOTE: QwenImage's forward CFG knob is ``true_cfg_scale`` (not ``guidance_scale``),
 # and real-CFG only engages when a negative prompt is supplied.
 QWENIMAGE_MODEL_SUBPATH = "qwen-image"
+QWEN_IMAGE_EDIT_MODEL_SUBPATH = "Qwen-Image-Edit-2511"
 QWENIMAGE_LPIPS_PROMPT = "a tiny astronaut hatching from an egg on the moon"
 QWENIMAGE_LPIPS_NEGATIVE_PROMPT = ""
 QWENIMAGE_LPIPS_HEIGHT = 1328
@@ -1835,6 +1837,57 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
             model_path,
             "--visual_gen_args",
             config_path,
+            "--output_path",
+            output_path,
+        ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+
+
+def test_qwen_image_edit_example(_visual_gen_deps: Any, llm_root: str, llm_venv: Any) -> None:
+    """Run examples/visual_gen/models/qwen_image_edit.py end-to-end.
+
+    Validates that the Qwen-Image-Edit example script and
+    ``configs/qwen-image-edit-2511-fp8-1gpu.yaml`` work together as documented.
+    """
+    model_path = os.environ.get("QWEN_IMAGE_EDIT_MODEL_PATH") or os.path.join(
+        _llm_models_root(), QWEN_IMAGE_EDIT_MODEL_SUBPATH
+    )
+    _skip_if_missing(model_path, "Qwen-Image-Edit-2511 checkpoint", is_dir=True)
+    model_index_path = os.path.join(model_path, "model_index.json")
+    if not os.path.isfile(model_index_path):
+        pytest.skip(
+            f"Qwen-Image-Edit-2511 checkpoint is incomplete: {model_path} "
+            f"(missing {model_index_path})"
+        )
+
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", "qwen_image_edit_example"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "qwen_image_edit_output.png")
+
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "qwen_image_edit.py")
+    config_path = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "qwen-image-edit-2511-fp8-1gpu.yaml"
+    )
+    image_path = os.path.join(llm_root, "examples", "visual_gen", "cat_piano.png")
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+    assert os.path.isfile(config_path), f"Config not found: {config_path}"
+    assert os.path.isfile(image_path), f"Input image not found: {image_path}"
+
+    _venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--image",
+            image_path,
+            "--prompt",
+            "Add a small red wizard hat to the cat while preserving the source image.",
             "--output_path",
             output_path,
         ],
