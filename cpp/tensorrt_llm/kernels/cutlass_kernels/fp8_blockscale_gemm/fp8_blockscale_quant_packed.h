@@ -47,6 +47,12 @@ namespace kernels::fp8_blockscale_gemm
 void launch_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, int32_t* packed_scale_output,
     __nv_bfloat16 const* input, int m, int k, int scale_leading_dim_uint32, cudaStream_t stream);
 
+// Quantizes with the same 1x128 scale as above, but replicates each UE8M0
+// scale over four 32-wide groups and writes the native SM100 CuTe/CUTLASS
+// 128x4 swizzled scale layout.
+void launch_fp8_quantize_1x128_cutedsl_bf16_e4m3(__nv_fp8_e4m3* fp8_output, uint8_t* swizzled_scale_output,
+    __nv_bfloat16 const* input, int m, int k, int padded_m, cudaStream_t stream);
+
 } // namespace kernels::fp8_blockscale_gemm
 
 TRTLLM_NAMESPACE_END
