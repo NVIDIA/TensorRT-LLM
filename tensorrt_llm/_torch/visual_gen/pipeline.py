@@ -1,3 +1,4 @@
+import contextlib
 import itertools
 import os
 import time
@@ -205,6 +206,18 @@ class BasePipeline(nn.Module):
             logger.info(f"CUDA graph runner: wrapping {name}.forward{compile_note}")
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
+
+    @contextlib.contextmanager
+    def no_cuda_graph_capture(self):
+        """Run wrapped forwards eagerly instead of capturing new CUDA graphs."""
+        prev = {name: r.capture_enabled for name, r in self._cuda_graph_runners.items()}
+        for r in self._cuda_graph_runners.values():
+            r.capture_enabled = False
+        try:
+            yield
+        finally:
+            for name, r in self._cuda_graph_runners.items():
+                r.capture_enabled = prev[name]
 
     @property
     def rank(self):

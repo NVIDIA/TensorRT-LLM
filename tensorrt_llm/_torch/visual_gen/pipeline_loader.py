@@ -22,18 +22,39 @@ import torch
 import torch.distributed as dist
 
 from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.distributed.communicator import Distributed, TorchDist
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
     CUTE_AVAILABLE,
 )
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
 from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
+
+
+class _VisualGenAutotuneDist(TorchDist):
+    """Autotuner communicator whose collective spans the whole world.
+
+    VisualGen's device mesh has no TP axis over the tuned GEMMs (its parallelism
+    is on cfg/ulysses), so the mesh's tp group would gather a single rank. Gather
+    over the default world group instead, since every rank runs the transformer.
+    """
+
+    def __init__(self, mapping: Mapping):
+        Distributed.__init__(self, mapping)
+        assert dist.is_initialized()
+
+    def tp_cp_allgather(self, obj: object) -> list[object]:
+        gathered: list[object] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, obj)
+        return gathered
+
 
 if TYPE_CHECKING:
     from .models import BasePipeline
@@ -305,10 +326,32 @@ class PipelineLoader:
 
         if not skip_warmup:
             if config.torch_compile.enable_autotune:
-                with autotune(
-                    cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH"),
-                    skip_dynamic_tuning_buckets=True,
-                ):
+                cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
+                post_tune_merge_dist = None
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    amap = config.visual_gen_mapping.to_autotuner_mapping()
+                    post_tune_merge_dist = _VisualGenAutotuneDist(amap)
+
+                if post_tune_merge_dist is None:
+                    # Single rank: no cross-rank merge, so tune and capture in one
+                    # pass (the graph runner captures only after its own warmup
+                    # steps have finalized the tactic).
+                    with autotune(cache_path=cache_path, skip_dynamic_tuning_buckets=True):
+                        pipeline.warmup()
+                else:
+                    # Multi rank: capture graphs only AFTER tactics are merged
+                    # across ranks, otherwise each rank bakes its own pre-merge
+                    # tactic. Phase 1 tunes with capture off; the autotuner merges
+                    # at autotune() exit; phase 2 captures the merged tactics.
+                    with (
+                        pipeline.no_cuda_graph_capture(),
+                        autotune(
+                            cache_path=cache_path,
+                            skip_dynamic_tuning_buckets=True,
+                            post_tune_merge_dist=post_tune_merge_dist,
+                        ),
+                    ):
+                        pipeline.warmup()
                     pipeline.warmup()
             else:
                 pipeline.warmup()

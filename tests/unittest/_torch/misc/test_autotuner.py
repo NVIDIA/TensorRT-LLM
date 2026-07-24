@@ -1,3 +1,4 @@
+import enum
 import itertools
 import json
 import math
@@ -1265,3 +1266,90 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
         f"CuteDSL heuristic kernel ({heuristic_us:.2f} us) is "
         f">{cublas_tolerance:.2f}x slower than cuBLAS NVFP4 "
         f"({cublas_us:.2f} us) for M={m}, N={n}, K={k}")
+
+
+def test_post_tune_merge_tactics_min_time_and_subset_kept():
+    tuner = autotuner.AutoTuner()
+    tuner.mapping = Mapping(world_size=2, rank=0, tp_size=2)
+
+    r0 = {
+        ("gemm", "X"): (0, ("cutlass", 10), 1.0),
+        ("q", "A"): (0, ("trtllm", ), 1.0)
+    }
+    r1 = {
+        ("gemm", "X"): (0, ("cublaslt", 0), 0.5),
+        ("vae", "B"): (0, ("cutlass", 2), 1.0)
+    }
+
+    class _FakeDist:
+
+        def tp_cp_allgather(self, obj):
+            return [r0, r1]
+
+    tuner._dist = _FakeDist()
+    tuner.profiling_cache.cache = dict(r0)
+    tuner.post_tune_merge_tactics()
+
+    cache = tuner.profiling_cache.cache
+    assert cache[("gemm", "X")] == (0, ("cublaslt", 0), 0.5)
+    assert cache[("q", "A")] == r0[("q", "A")]
+    assert cache[("vae", "B")] == r1[("vae", "B")]
+
+
+def test_post_tune_merge_tactics_single_rank_noop():
+    tuner = autotuner.AutoTuner()
+    tuner.mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    tuner._dist = None
+    original = {("gemm", "X"): (0, ("cutlass", 10), 1.0)}
+    tuner.profiling_cache.cache = dict(original)
+    tuner.post_tune_merge_tactics()
+    assert tuner.profiling_cache.cache == original
+
+
+def test_profiling_cache_enum_tactic_roundtrip(tmp_path):
+    # An enum tactic must survive save -> load: repr("<Enum.X: v>") isn't
+    # ast.literal_eval-parsable, so the cache serializes tactic.value instead.
+    class _Tac(enum.IntEnum):
+        TRTLLM = -1
+
+    key = ("op::x", "Runner", "(1,)")
+    src = autotuner.AutoTuner().profiling_cache
+    src.cache[key] = (0, _Tac.TRTLLM, 1.0)
+    path = str(tmp_path / "cache.json")
+    src.save_cache(path, rank=0)  # must not raise
+
+    dst = autotuner.AutoTuner().profiling_cache
+    dst.load_cache(path, rank=0)
+    assert dst.cache[key][1] == _Tac.TRTLLM  # IntEnum compares equal to -1
+
+
+def test_autotune_post_tune_merge_before_save(tmp_path):
+    # autotune(post_tune_merge_dist=...) must merge across ranks and persist the
+    # merged winner, then restore the singleton's prior distributed state.
+    tuner = AutoTuner.get()
+    tuner.profiling_cache.cache.clear()
+    r0 = {("gemm", "X"): (0, ("cutlass", 10), 1.0)}
+    r1 = {("gemm", "X"): (0, ("cublaslt", 0), 0.5)}
+    tuner.profiling_cache.cache = dict(r0)
+
+    class _FakeDist:
+        mapping = Mapping(world_size=2, rank=0, tp_size=2)
+
+        def tp_cp_allgather(self, obj):
+            return [r0, r1]
+
+    prev_mapping, prev_dist = tuner.mapping, tuner._dist
+    path = str(tmp_path / "cache.json")
+    with autotune(cache_path=path, post_tune_merge_dist=_FakeDist()):
+        pass
+
+    # Merged in memory (fastest tactic won) and persisted before the context
+    # exits (the saved file carries the merged winner).
+    assert tuner.profiling_cache.cache[("gemm", "X")] == (0, ("cublaslt", 0),
+                                                          0.5)
+    persisted = autotuner.AutoTuner().profiling_cache
+    persisted.load_cache(path, rank=0)
+    assert persisted.cache[("gemm", "X")][1] == ("cublaslt", 0)
+    # The temporary full-world distributed state was restored.
+    assert tuner.mapping is prev_mapping
+    assert tuner._dist is prev_dist
