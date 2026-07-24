@@ -1549,7 +1549,22 @@ class PyTorchModelEngine(ModelEngine):
             with self.cuda_graph_runner.allow_capture():
                 self.cuda_graph_runner.is_warmup_only = True
                 try:
-                    self._run_cuda_graph_warmup(resource_manager)
+                    cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH",
+                                                None)
+                    lora_autotuner_enabled = (
+                        self.llm_args.enable_autotuner
+                        and self.cuda_graph_lora_manager is not None)
+                    autotune_ctx = (autotune(cache_path=cache_path)
+                                    if lora_autotuner_enabled else
+                                    contextlib.nullcontext())
+                    with autotune_ctx:
+                        self._run_cuda_graph_warmup(resource_manager)
+                        if lora_autotuner_enabled:
+                            # Complete the PP cache hand-off even on ranks
+                            # without a CUDA-graph-only tunable op.
+                            AutoTuner.get().cache_pp_recv()
+                            AutoTuner.get().cache_pp_send()
+                            AutoTuner.get().clean_pp_flag()
                 finally:
                     self.cuda_graph_runner.is_warmup_only = False
                 self.cuda_graph_runner.padding_dummy_requests = {}
