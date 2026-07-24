@@ -86,6 +86,21 @@ class KimiK3MoEGate(nn.Module):
             return logits.sigmoid()
         return logits.softmax(dim=1)
 
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Routing logits ``[num_tokens, num_experts]``, fp32, pre-sigmoid.
+
+        Used when the MoE block is hosted under ``ConfigurableMoE``: the
+        post-linear gate math (sigmoid, bias-for-selection, renormalize,
+        ``routed_scaling_factor``) runs inside the wrapper's routing method
+        per chunk; only the fp32 gate GEMM stays here, keeping the
+        checkpoint parameter mapping identity.
+        """
+        return torch.nn.functional.linear(
+            hidden_states.reshape(-1, self.gating_dim).type(torch.float32),
+            self.weight.type(torch.float32),
+            None,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         bsz, seq_len, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)

@@ -207,6 +207,13 @@ class CommunicationFactory:
 
             # Try DeepEPLowLatency as fallback when DeepEP is not available
             try:
+                if top_k > DeepEPLowLatency.MAX_TOP_K:
+                    raise ValueError(
+                        f"top_k={top_k} exceeds the low-latency kernels' "
+                        f"compile-time cap MAX_TOP_K={DeepEPLowLatency.MAX_TOP_K} "
+                        "(kNumMaxTopK in internode_ll.cu); the kernel-side "
+                        "EP_HOST_ASSERT would abort on the first dispatch/combine"
+                    )
                 strategy = DeepEPLowLatency(
                     mapping,
                     num_slots,
