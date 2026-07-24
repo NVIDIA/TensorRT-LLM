@@ -948,5 +948,5 @@ def test_generate_until_invokes_partial_scorer():
     ):
         wrapper.generate_until([fake_request], disable_tqdm=True)
 
-    mock_update.assert_called_once()
+    mock_update.assert_called_once_with(fake_request, "42")
     mock_log.assert_called_once_with(1, 1)
