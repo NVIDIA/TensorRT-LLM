@@ -106,6 +106,28 @@ class TestPerfLogManager:
                 assert "12.345" in lines[1]
                 assert "1024" in lines[1]
 
+    def test_cpp_env_takes_priority_over_legacy_for_log(self) -> None:
+        """With both C++ and legacy env vars set, log() uses the C++ naming."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            legacy_base = os.path.join(tmpdir, "legacy")
+            with patch.dict(
+                "os.environ",
+                {
+                    "TRTLLM_KVCACHE_TIME_OUTPUT_PATH": tmpdir,
+                    "TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO": "1",
+                    "TLLM_KV_TRANSFER_PERF_LOG_FILE": legacy_base,
+                },
+                clear=False,
+            ):
+                from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfLogManager
+
+                mgr = PerfLogManager()
+                mgr.log("test_inst", 0, "csv_line", "info_msg")
+                cpp_path = os.path.join(tmpdir, "test_inst_0.csv")
+                legacy_path = f"{legacy_base}_test_inst_0.csv"
+                assert os.path.exists(cpp_path), f"C++-style CSV not created at {cpp_path}"
+                assert not os.path.exists(legacy_path), "legacy-style CSV should not be used"
+
     @patch.dict("os.environ", {}, clear=False)
     def test_log_gen_transfer_summary_disabled_without_env(self) -> None:
         os.environ.pop("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", None)
