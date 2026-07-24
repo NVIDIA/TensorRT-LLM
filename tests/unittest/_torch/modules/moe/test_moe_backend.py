@@ -734,13 +734,16 @@ def generate_element_wise_test_params() -> List:
             SEQ_LENS_TO_TEST,
             DTYPES_TO_TEST,
             [MoeBackendType.CUTLASS, MoeBackendType.TRTLLM],
-            [None, QuantAlgo.NVFP4],
+            [None, QuantAlgo.NVFP4, QuantAlgo.W8A16],
         ):
             if skip_reason:
                 continue
             if backend_type == MoeBackendType.CUTLASS and activation_type == ActivationType.Silu:
                 continue
             if backend_type == MoeBackendType.TRTLLM and quant_algo is None:
+                continue
+            # INT8 weight-only per-channel non-gated MoE is CUTLASS-path only.
+            if quant_algo == QuantAlgo.W8A16 and backend_type != MoeBackendType.CUTLASS:
                 continue
             test_id = f"act={activation_type.name}-{base_test_id}"
             param_values = (
@@ -760,6 +763,75 @@ def generate_element_wise_test_params() -> List:
 
 
 TEST_PARAMS += generate_element_wise_test_params()
+
+# INT8 weight-only per-channel packs mixed-GEMM weights in row tiles of 64
+# (preprocess_weights_for_mixed_gemm: rows_per_tile = 128 * 8 // BITS_PER_ELT_A,
+# BITS_PER_ELT_A = 16 for W8A16; also num_rows % B_ROWS_PER_MMA == 0, = 16).
+# Every intermediate_size in MOE_MODEL_CONFIGS is a multiple of 64, so the path
+# that pads a non-aligned per-partition intermediate is otherwise uncovered.
+# 200 is a multiple of neither 16 nor 64 and rounds up to 256.
+W8A16_NON_ALIGNED_MOE_MODEL_CONFIGS = [
+    MoeModelConfig(4, 2, 512, 200),
+]
+
+
+def generate_int8_woq_non_aligned_test_params() -> List:
+    """W8A16 CUTLASS coverage for a non-64-aligned intermediate size."""
+    params: List = []
+    # Cover both the non-gated (single up-projection) and gated (gate+up
+    # concatenated) layouts: the gated path pads w3 as well as w1 before the
+    # concatenation, so it exercises a branch the non-gated case does not.
+    for activation_type in (ActivationType.Relu2, ActivationType.Swiglu):
+        for (
+            _,  # swiglu_alpha  (ignored)
+            _,  # swiglu_beta   (ignored)
+            _,  # swiglu_limit  (ignored)
+            model_config,
+            seq_len,
+            dtype,
+            backend_type,
+            quant_algo,
+            routing_method_cls,
+            skip_reason,
+            base_test_id,
+        ) in iter_base_test_configs(
+            [(1, 0, float("inf"))],  # swiglu parameters are irrelevant
+            W8A16_NON_ALIGNED_MOE_MODEL_CONFIGS,
+            SEQ_LENS_TO_TEST,
+            DTYPES_TO_TEST,
+            [MoeBackendType.CUTLASS],
+            [QuantAlgo.W8A16],
+        ):
+            # get_quick_skip_reason() rejects every quantized config whose sizes are
+            # not 128-aligned. That gate is exactly what this case exists to cover:
+            # the INT8-woq path must pad a non-64-aligned per-partition intermediate
+            # up to 64. Honour every other skip reason.
+            if skip_reason and "Non-128-aligned" not in skip_reason:
+                continue
+            test_id = f"act={activation_type.name}-nonaligned-{base_test_id}"
+            gated = is_gated_activation(activation_type)
+            param_values = (
+                dtype,
+                backend_type,
+                quant_algo,
+                seq_len,
+                model_config,
+                routing_method_cls,
+                activation_type,
+                # Gated activations read these; None would be misread as
+                # gptoss-style SwiGLU. Non-gated ignores them.
+                1 if gated else None,
+                0 if gated else None,
+                float("inf") if gated else None,
+            )
+            params.append(create_test_param(param_values, test_id))
+    # Guard against the 128-alignment skip message being reworded upstream,
+    # which would otherwise silently generate zero cases.
+    assert params, "non-aligned W8A16 coverage generated no test cases"
+    return params
+
+
+TEST_PARAMS += generate_int8_woq_non_aligned_test_params()
 
 
 # ============================================================================
