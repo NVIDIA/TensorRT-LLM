@@ -236,9 +236,31 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
         # one synthesized buffer entry per local layer: the slot packs the
         # layers equal-sized in local-layer order.
         if getattr(kv_cache_manager, "enable_indexer_k_cache", False):
+            local_indexer_mask = getattr(kv_cache_manager, "indexer_k_cache_local_layer_mask", None)
+            if local_indexer_mask is not None and not all(
+                local_indexer_mask[lid] for lid in local_layer_ids
+            ):
+                raise NotImplementedError(
+                    "The Python KV transceiver runtime does not support a "
+                    "per-layer masked indexer k-cache pool yet: "
+                    f"{sum(local_indexer_mask[lid] for lid in local_layer_ids)}"
+                    f" of {len(local_layer_ids)} layers in this layer group "
+                    "own an indexer k-cache. Use the C++ cache transceiver "
+                    "for models with cross-layer indexer sharing (e.g. "
+                    "GLM 5.2)."
+                )
             indexer_pool = kv_cache_manager.impl.get_indexer_k_cache_pool()
             # indexer_pool shape: (numBlocks, numLayers, kvFactor, blockSize), dtype=UINT8
             # slot_bytes = numLayers * kvFactor * blockSize * element_size
+            if indexer_pool.shape[1] != len(local_layer_ids):
+                raise NotImplementedError(
+                    "Disaggregated KV transfer does not support a per-layer "
+                    "masked indexer k-cache pool yet: the indexer "
+                    f"pool holds {indexer_pool.shape[1]} layer rows but the "
+                    f"layer group has {len(local_layer_ids)} layers. Disable "
+                    "disaggregated serving for models with cross-layer "
+                    "indexer sharing."
+                )
             per_block_elems = 1
             for d in indexer_pool.shape[1:]:  # skip numBlocks dim
                 per_block_elems *= d

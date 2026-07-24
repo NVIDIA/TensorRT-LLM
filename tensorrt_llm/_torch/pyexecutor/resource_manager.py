@@ -291,6 +291,8 @@ class KVCacheManager(BaseResourceManager):
         indexer_k_cache_quant_block_size: int = 128,
         indexer_k_cache_index_head_dim: int = 0,
         indexer_k_cache_use_fp4: bool = False,
+        # Boolean array indicating whether each layer has an indexer K cache.
+        indexer_k_cache_layer_mask: Optional[List[bool]] = None,
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         linear_attention_metadata: Optional[LinearAttentionMetadata] = None,
@@ -323,6 +325,17 @@ class KVCacheManager(BaseResourceManager):
             idx: offset
             for offset, idx in enumerate(self.pp_layers)
         }
+
+        if indexer_k_cache_layer_mask is not None:
+            assert len(indexer_k_cache_layer_mask) >= max(self.pp_layers) + 1, (
+                f"indexer_k_cache_layer_mask covers "
+                f"{len(indexer_k_cache_layer_mask)} layers but this rank "
+                f"manages global layer {max(self.pp_layers)}")
+            self.indexer_k_cache_local_layer_mask: Optional[List[bool]] = [
+                bool(indexer_k_cache_layer_mask[i]) for i in self.pp_layers
+            ]
+        else:
+            self.indexer_k_cache_local_layer_mask = None
 
         self.kv_connector_manager = kv_connector_manager
 
@@ -617,6 +630,7 @@ class KVCacheManager(BaseResourceManager):
             indexer_k_cache_quant_block_size,
             'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim,
             'indexer_k_cache_use_fp4': indexer_k_cache_use_fp4,
+            'indexer_k_cache_layer_mask': self.indexer_k_cache_local_layer_mask,
             'linear_attention_metadata': linear_attention_metadata,
             # Forward the (possibly remapped) per-pool configurations.
             # window_size values are aligned with the post-clamp sizes.

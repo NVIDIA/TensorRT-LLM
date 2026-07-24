@@ -282,6 +282,21 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
             _is_disagg_inflight_cancel_config_supported(
                 cache_transceiver_config))
 
+        # Per-PP indexer k-cache layer counts. With a masked indexer pool
+        # (per-layer indexer mask, e.g. GLM 5.2 cross-layer indexer sharing)
+        # only full-indexer layers own a pool row, so the counts can be
+        # smaller than the attention layer counts.
+        indexer_layer_num_per_pp_rank = []
+        if getattr(kv_cache_manager, "enable_indexer_k_cache", False):
+            local_indexer_mask = getattr(kv_cache_manager,
+                                         "indexer_k_cache_local_layer_mask",
+                                         None)
+            local_indexer_layer_num = (sum(local_indexer_mask)
+                                       if local_indexer_mask is not None else
+                                       pp_layer_num)
+            indexer_layer_num_per_pp_rank = dist.pp_allgather(
+                local_indexer_layer_num)
+
         # Get RNN layer distribution if mamba_cache_manager is provided.
         rnn_layer_num_per_pp_rank = []
         if mamba_cache_manager is not None:
@@ -298,13 +313,12 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                     f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
                 )
 
-        self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
-                                        total_num_kv_heads_per_layer, head_dim,
-                                        tokens_per_block, world_config,
-                                        pp_layer_num_per_pp_rank, dtype,
-                                        attention_type,
-                                        cache_transceiver_config._to_pybind(),
-                                        rnn_layer_num_per_pp_rank)
+        self.impl = CacheTransceiverCpp(
+            kv_cache_manager.impl, total_num_kv_heads_per_layer, head_dim,
+            tokens_per_block, world_config,
+            pp_layer_num_per_pp_rank, dtype, attention_type,
+            cache_transceiver_config._to_pybind(), rnn_layer_num_per_pp_rank,
+            indexer_layer_num_per_pp_rank)
 
     def respond_and_send_async(self, req: LlmRequest):
         return self.impl.respond_and_send_async(req)
