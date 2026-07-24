@@ -1622,22 +1622,10 @@ class KvCacheCreator:
                                        if draft_kv_cache_config is not None else
                                        self_kv_cache_config)
 
-        # Shared-target-KV drafters still need a small draft manager for
-        # request/slot bookkeeping, but they neither reserve a second full-size
-        # cache nor reduce the target manager's GPU/host cache budget.
-        if draft_shares_target_kv_cache:
-            draft_build_kv_cache_config = copy.deepcopy(
-                draft_build_kv_cache_config)
-            draft_build_kv_cache_config.max_gpu_total_bytes = 0
-            draft_build_kv_cache_config.free_gpu_memory_fraction = None
-            draft_build_kv_cache_config.host_cache_size = 0
-            draft_build_kv_cache_config.max_tokens = max(
-                self._max_num_tokens,
-                self._max_seq_len * self._max_batch_size,
-            )
-
-        # Two-model speculative decoding: draft model has separate engine
-        if self._draft_model_engine is not None:
+        # Two-model speculative decoding with an independent draft KV cache.
+        # Shared-target-KV draft engines use the primary manager instead.
+        if (self._draft_model_engine is not None
+                and not draft_shares_target_kv_cache):
             if self._is_kv_cache_manager_v2:
                 assert draft_kv_cache_config is None, (
                     "KVCacheManagerV2 does not support two-model speculative "
