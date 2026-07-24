@@ -1232,6 +1232,7 @@ def getPytestBaseCommandLine(
         "--periodic-junit-xmlpath ${outputPath}/results.xml",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
+        "--periodic-hang-traceback",
     ]
 
     if (perfMode) {
