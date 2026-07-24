@@ -56,6 +56,7 @@ The following is a table of supported models for the PyTorch backend:
 | `SkyworkR1V2ForConditionalGeneration` [^5] | Skywork R1V2, Skywork SWE    | `Skywork/Skywork-R1V2-38B`                   |
 | `SmolLM3ForCausalLM` [^5]            | SmolLM3                            | `HuggingFaceTB/SmolLM3-3B`                   |
 | `Step3p7ForConditionalGeneration` [^8]| Step-3.7-Flash                    | `stepfun-ai/Step-3.7-Flash`                  |
+| `WhisperForConditionalGeneration` [^14] | Whisper (ASR)                   | `openai/whisper-large-v3`                    |
 
 
 ## Model-Feature Support Matrix (Key Models)
@@ -92,6 +93,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^11]: DeepSeek-V4 is only supported on Blackwell GPUs (`SM100+`). See the [DeepSeek-V4 example README](../../../examples/models/core/deepseek_v4/README.md) for setup and parallelism.
 [^12]: Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.
 [^13]: The Cosmos 3 family also supports visual generation through the VisualGen API. See [Visual Generation Models](#visual-generation-models).
+[^14]: Audio encoder-decoder ASR model (speech transcription/translation, one clip of up to 30 s per request at 16 kHz). Audio is passed via `multi_modal_data["audio"]`; an empty text prompt selects English transcription, and a non-empty prompt overrides the decoder task prompt (e.g. `<|startoftranscript|><|de|><|transcribe|><|notimestamps|>`). Requires `kv_cache_config.cross_kv_cache_fraction` (e.g. 0.5) and `max_input_len >= 1500`; keep KV-cache block reuse, CUDA graphs, the overlap scheduler, and chunked prefill disabled (encoder-decoder runtime constraints). Greedy and beam search are supported.
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
 
@@ -117,6 +119,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Cosmos3ForConditionalGeneration` [^13] | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Untested              | Untested                  | L + I + V |
 | `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Yes              | No             | Untested              | Yes                       | L + I + V |
 | `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | Yes              | No             | Untested              | Yes                       | L + I + V |
+| `WhisperForConditionalGeneration` [^14] | No             | No         | No              | Yes           | Untested         | No             | Yes                   | No                        | A         |
 
 Note:
 - L: Language
