@@ -670,12 +670,11 @@ class GenerationExecutorProxy(GenerationExecutor):
         """Register identities returned by locally spawned MPI workers.
 
         Test session reuse replaces this module's ``MpiPoolSession`` class
-        reference with a factory, so identify pool-backed sessions by excluding
-        the external communication session types.
+        reference with a factory, so use the polymorphic ``is_comm_session``
+        predicate rather than ``isinstance`` — the module-level symbol may be
+        rebound to a factory at runtime, breaking ``isinstance``.
         """
-        if not isinstance(
-                self.mpi_session,
-            (MpiCommSession, RemoteMpiCommSessionClient)) and len(status) == 3:
+        if not self.mpi_session.is_comm_session() and len(status) == 3:
             worker_process_identities: List[WorkerProcessIdentity] = status[2]
             self._worker_process_monitor.register(worker_process_identities)
 
