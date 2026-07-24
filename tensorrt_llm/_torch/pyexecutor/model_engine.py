@@ -1317,6 +1317,7 @@ class PyTorchModelEngine(ModelEngine):
                 getattr(module, "_use_flashinfer_mxfp8_decode_graph_default",
                         False) for module in self.model.modules()))
         flashinfer_mxfp8_methods = []
+        native_mxfp8_methods = []
         for module in self.model.modules():
             quant_method = getattr(module, "quant_method", None)
             if not isinstance(quant_method, MXFP8LinearMethod):
@@ -1325,7 +1326,12 @@ class PyTorchModelEngine(ModelEngine):
                 quant_method.enable_flashinfer_auto()
             if quant_method.needs_flashinfer_autotune:
                 flashinfer_mxfp8_methods.append(quant_method)
+            if enable_trtllm_autotuner and quant_method.needs_native_autotune:
+                native_mxfp8_methods.append(quant_method)
+            elif not enable_trtllm_autotuner:
+                quant_method.disable_native_autotune()
         enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
+        enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
 
         if not enable_trtllm_autotuner and not enable_flashinfer_mxfp8_autotuner:
             return
@@ -1333,6 +1339,7 @@ class PyTorchModelEngine(ModelEngine):
             AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         logger.info(
             f"Running autotuner warmup (TRT-LLM={enable_trtllm_autotuner}, "
+            f"native MXFP8={enable_native_mxfp8_autotuner}, "
             f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -1402,6 +1409,15 @@ class PyTorchModelEngine(ModelEngine):
                 logger.warning(
                     "FlashInfer MXFP8 autotuning could not run; using the native "
                     "TensorRT-LLM GEMM backend.")
+
+        if enable_native_mxfp8_autotuner:
+            if ran_forward:
+                for method in native_mxfp8_methods:
+                    method.mark_native_autotuned()
+            else:
+                logger.warning(
+                    "Native MXFP8 autotuning had no runnable warmup batch; "
+                    "leaving tuning pending for a later warmup.")
 
         if enable_trtllm_autotuner:
             logger.info(
