@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 # Continuous Integration Overview
 
 This page explains how TensorRT‑LLM's CI is organized and how individual tests map to Jenkins stages. Most stages execute integration tests defined in YAML files, while unit tests run as part of a merge‑request pipeline. The sections below describe how to locate a test and trigger the stage that runs it.
@@ -9,7 +26,8 @@ This page explains how TensorRT‑LLM's CI is organized and how individual tests
 4. [Jenkins stage names](#jenkins-stage-names)
 5. [Finding the stage for a test](#finding-the-stage-for-a-test)
 6. [Waiving tests](#waiving-tests)
-7. [Triggering CI Best Practices](#triggering-ci-best-practices)
+7. [Multi-GPU Tests](#multi-gpu-tests)
+8. [Triggering CI Best Practices](#triggering-ci-best-practices)
 
 ## CI pipelines
 
@@ -104,6 +122,30 @@ full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_a
 
 Changes to `waives.txt` should include a bug link or brief explanation so other
 developers understand why the test is disabled.
+
+## Multi-GPU Tests
+
+Running multi-GPU tests (`--add-multi-gpu-test`, `--only-multi-gpu-test`) requires the
+`ci: full pre-merge approved` label on the PR. Without this label the
+`[Test-x86_64-Multi-GPU] Remote Run` and `[Test-SBSA-Multi-GPU] Remote Run` stages will
+fail with an explanatory error.
+
+To obtain the label, ask a member of `NVIDIA/trt-llm-ci-approvers` to apply it. Only
+members of that team can add the label; unauthorized additions are automatically removed
+by the `Guard Full Pre-Merge Approval Label` GitHub Actions workflow.
+
+Once the label is present, re-trigger CI with the same command you used
+originally. For example:
+
+```bash
+# Run the normal pipeline plus multi-GPU stages
+/bot run --add-multi-gpu-test
+
+# Run only multi-GPU stages
+/bot run --only-multi-gpu-test
+```
+
+Post-merge pipelines and GitLab MR builds are exempt from this label check.
 
 ## Triggering CI Best Practices
 
