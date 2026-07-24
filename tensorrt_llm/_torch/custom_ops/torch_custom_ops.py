@@ -552,6 +552,124 @@ def _(
     return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
 
 
+_MXFP8_LARGE_M_BUCKETS = (8192, 16384, 32768)
+_MXFP8_LARGE_M_BANDS = ((6553, 8192), (13106, 16384), (19659, 32768))
+_MXFP8_AUTOTUNED_OP = "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm"
+
+
+def _map_to_mxfp8_large_m_bucket(num_tokens: int) -> int:
+    for (lower_bound, upper_bound), bucket in zip(_MXFP8_LARGE_M_BANDS,
+                                                  _MXFP8_LARGE_M_BUCKETS):
+        if lower_bound <= num_tokens <= upper_bound:
+            return bucket
+    return num_tokens
+
+
+def _get_mxfp8_large_m_tuning_buckets(max_num_tokens: int) -> tuple[int, ...]:
+    mapped_max = _map_to_mxfp8_large_m_bucket(max_num_tokens)
+    return tuple(bucket for bucket in _MXFP8_LARGE_M_BUCKETS
+                 if bucket <= mapped_max)
+
+
+def _mxfp8_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+    _, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0], sf_vec_size=32)
+    return scale_shape
+
+
+class MXFP8GemmRunner(TunableRunner):
+    runner_dict = dict()
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, _get_mxfp8_large_m_tuning_buckets,
+        _map_to_mxfp8_large_m_bucket), ),
+                                 constraint_specs=(ConstraintSpec(
+                                     1, 0, _mxfp8_scale_infer_shape), ),
+                                 use_cuda_graph=False)
+
+    def __init__(self, output_dtype: torch.dtype):
+        self.output_dtype = output_dtype
+        self.sm_version = get_sm_version()
+        instance_key = (output_dtype, self.sm_version)
+        if instance_key not in MXFP8GemmRunner.runner_dict:
+            MXFP8GemmRunner.runner_dict[
+                instance_key] = torch.classes.trtllm.MXFP8GemmRunner(
+                    output_dtype)
+        self.mxfp8_gemm_runner = MXFP8GemmRunner.runner_dict[instance_key]
+
+    def unique_id(self):
+        return (self.output_dtype, self.sm_version)
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return [-1, *range(self.mxfp8_gemm_runner.get_num_configs())]
+
+    def sync_tactic_cache(self, tuner: AutoTuner) -> None:
+        runner_name = self.__class__.__name__
+        unique_id = str(self.unique_id())
+        cache = tuner.profiling_cache.get_specific_custom_op(
+            _MXFP8_AUTOTUNED_OP)
+        for cache_key, (_runner_id, tactic, _min_time) in cache.items():
+            _, cached_runner_name, cached_unique_id, profile = cache_key
+            if cached_runner_name != runner_name or cached_unique_id != unique_id:
+                continue
+            m, k = profile[0]
+            n, weight_k = profile[2]
+            if k != weight_k:
+                raise ValueError(
+                    f"MXFP8 autotuner cache has mismatched K dimensions: "
+                    f"activation K={k}, weight K={weight_k}")
+            self.mxfp8_gemm_runner.register_tactic(m, n, k, tactic)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        act, act_scale, weight, weight_scale, global_scale = inputs
+        return self.mxfp8_gemm_runner.run_gemm(
+            act,
+            act_scale,
+            weight,
+            weight_scale,
+            global_scale,
+            tactic,
+        )
+
+
+@torch.library.custom_op("trtllm::mxfp8_mxfp8_gemm_autotuned", mutates_args=())
+def mxfp8_mxfp8_gemm_autotuned(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    tuner = AutoTuner.get()
+    runner = MXFP8GemmRunner(output_dtype)
+    inputs = [act, act_scale, weight, weight_scale, global_scale]
+    _, best_tactic = tuner.choose_one(
+        _MXFP8_AUTOTUNED_OP,
+        [runner],
+        MXFP8GemmRunner.tuning_config,
+        inputs,
+    )
+    if tuner.is_tuning_mode:
+        runner.sync_tactic_cache(tuner)
+    return runner(inputs=inputs, tactic=best_tactic)
+
+
+@mxfp8_mxfp8_gemm_autotuned.register_fake
+def _(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
+
+
 class FP4GemmRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
