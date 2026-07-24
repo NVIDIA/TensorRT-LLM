@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Multi-GPU integration tests for VisualGen LPIPS quality checks."""
+"""Multi-GPU integration tests for VisualGen models."""
 
 import glob
 import os
@@ -69,6 +69,17 @@ WAN22_LPIPS_TP_VARIANTS = [
     ("tp3", {"tp_size": 3}),
     ("cfg2_tp2", {"cfg_size": 2, "tp_size": 2}),
     ("tp2_ulysses2", {"tp_size": 2, "ulysses_size": 2}),
+]
+
+QWEN_IMAGE_ATTENTION_PARALLEL_VARIANTS = [
+    ("tp2", {"tp_size": 2}, "VANILLA", "tp"),
+    ("ring2_ulysses2", {"ring_size": 2, "ulysses_size": 2}, "FA4", "ring"),
+    (
+        "attn2d_2x1_ulysses2",
+        {"attn2d_size": (2, 1), "ulysses_size": 2},
+        "FA4",
+        "attn2d",
+    ),
 ]
 
 
@@ -172,6 +183,93 @@ def _skip_if_insufficient_gpus_for_parallel(parallel):
         pytest.skip(
             f"Insufficient GPUs for parallel={parallel}: requires {required}, available {available}"
         )
+
+
+def _qwen_image_attention_distributed_worker(rank: int, world_size: int, **kwargs) -> None:
+    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+        Attention2DAttention,
+        RingAttention,
+        UlyssesAttention,
+    )
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+    from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenJointAttention
+    from tensorrt_llm.visual_gen.args import AttentionConfig
+
+    parallel_cfg = _parallel_config(**kwargs["parallel"])
+    parallel_cfg.validate_world_size(world_size)
+    attn2d_row_size, attn2d_col_size = parallel_cfg.attn2d_size
+    visual_gen_mapping = VisualGenMapping(
+        world_size=world_size,
+        rank=rank,
+        tp_size=parallel_cfg.tp_size,
+        ring_size=parallel_cfg.ring_size,
+        ulysses_size=parallel_cfg.ulysses_size,
+        attn2d_row_size=attn2d_row_size,
+        attn2d_col_size=attn2d_col_size,
+    )
+    config = DiffusionModelConfig(
+        mapping=visual_gen_mapping.to_llm_mapping(),
+        visual_gen_mapping=visual_gen_mapping,
+        attention=AttentionConfig(backend=kwargs["backend"]),
+        parallel=parallel_cfg,
+    )
+    attention = QwenJointAttention(
+        dim=256,
+        num_attention_heads=4,
+        attention_head_dim=64,
+        config=config,
+    ).cuda()
+
+    torch.manual_seed(11)
+    with torch.no_grad():
+        for name, parameter in attention.named_parameters():
+            if name.endswith("bias"):
+                parameter.zero_()
+            elif "norm" in name and name.endswith("weight"):
+                parameter.fill_(1)
+            else:
+                parameter.normal_(mean=0.0, std=0.02)
+
+    topology = kwargs["topology"]
+    if topology == "tp":
+        assert not isinstance(attention.attn, UlyssesAttention)
+    else:
+        assert isinstance(attention.attn, UlyssesAttention)
+        if topology == "ring":
+            assert isinstance(attention.attn.inner_backend, RingAttention)
+        else:
+            assert isinstance(attention.attn.inner_backend, Attention2DAttention)
+
+    hidden_states = torch.randn(1, 8, 256, device="cuda", dtype=torch.bfloat16)
+    encoder_hidden_states = torch.randn(1, 4, 256, device="cuda", dtype=torch.bfloat16)
+    image_output, text_output = attention(
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+    )
+
+    assert image_output.shape == hidden_states.shape
+    assert text_output.shape == encoder_hidden_states.shape
+    assert torch.isfinite(image_output).all()
+    assert torch.isfinite(text_output).all()
+    dist.barrier()
+
+
+@pytest.mark.parametrize(
+    "variant_name,parallel,backend,topology",
+    QWEN_IMAGE_ATTENTION_PARALLEL_VARIANTS,
+    ids=[name for name, *_ in QWEN_IMAGE_ATTENTION_PARALLEL_VARIANTS],
+)
+def test_qwen_image_attention_parallel_topologies(variant_name, parallel, backend, topology):
+    _skip_if_insufficient_gpus_for_parallel(parallel)
+    parallel_cfg = _parallel_config(**parallel)
+    run_test_in_distributed(
+        world_size=parallel_cfg.n_workers,
+        test_fn=_qwen_image_attention_distributed_worker,
+        parallel=parallel,
+        backend=backend,
+        topology=topology,
+    )
 
 
 def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> None:

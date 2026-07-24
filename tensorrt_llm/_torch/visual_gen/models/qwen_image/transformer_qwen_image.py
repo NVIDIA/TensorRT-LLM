@@ -325,17 +325,13 @@ def qwen_complex_freqs_to_cos_sin(freqs_cis: torch.Tensor) -> Tuple[torch.Tensor
 
 def qwen_joint_freqs_to_cos_sin(
     image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
-    batch_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Convert and concatenate Qwen text/image RoPE frequencies once per model forward."""
+    """Convert and concatenate shared Qwen text/image RoPE frequencies."""
     img_freqs, txt_freqs = image_rotary_emb
     txt_cos, txt_sin = qwen_complex_freqs_to_cos_sin(txt_freqs)
     img_cos, img_sin = qwen_complex_freqs_to_cos_sin(img_freqs)
     freqs_cos = torch.cat([txt_cos, img_cos], dim=0).squeeze(1)
     freqs_sin = torch.cat([txt_sin, img_sin], dim=0).squeeze(1)
-    if batch_size > 1:
-        freqs_cos = freqs_cos.repeat(batch_size, 1)
-        freqs_sin = freqs_sin.repeat(batch_size, 1)
     return freqs_cos, freqs_sin
 
 
@@ -614,7 +610,7 @@ class QwenJointAttention(Attention):
         qkv = torch.cat([txt_qkv, img_qkv], dim=1)
 
         if fused_rotary_emb is None:
-            fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb, qkv.shape[0])
+            fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb)
         freqs_cos, freqs_sin = fused_rotary_emb
 
         self.apply_packed_qk_norm_rope(
@@ -1318,7 +1314,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         if first_block_attn is not None and first_block_attn._use_fused_qk_norm_rope(
             hidden_states, image_rotary_emb
         ):
-            fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb, hidden_states.shape[0])
+            fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(

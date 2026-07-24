@@ -462,8 +462,8 @@ def test_qwen_joint_attention_fused_rope_passes_2d_freqs_to_kernel(monkeypatch):
     attention._prepare_qkv_fused(hidden_states, encoder_hidden_states, image_rotary_emb)
 
     assert captured == {
-        "cos_shape": (batch_size * (txt_seq + img_seq), head_dim),
-        "sin_shape": (batch_size * (txt_seq + img_seq), head_dim),
+        "cos_shape": (txt_seq + img_seq, head_dim),
+        "sin_shape": (txt_seq + img_seq, head_dim),
     }
 
 
@@ -484,7 +484,7 @@ def test_qwen_joint_attention_reuses_precomputed_fused_rope(monkeypatch):
         torch.polar(torch.ones(7, 4), torch.randn(7, 4)),
         torch.polar(torch.ones(5, 4), torch.randn(5, 4)),
     )
-    fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb, batch_size=2)
+    fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb)
     captured = {}
 
     def fake_apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin, **kwargs):

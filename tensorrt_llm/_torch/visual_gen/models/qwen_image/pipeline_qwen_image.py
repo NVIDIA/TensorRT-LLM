@@ -507,9 +507,6 @@ class QwenImagePipeline(BasePipeline):
                 noise_pred = noise_pred.clone()
 
             if do_true_cfg:
-                if self._cuda_graph_runners:
-                    # Graph outputs alias reusable pool memory and must survive the negative replay.
-                    noise_pred = noise_pred.clone()
                 neg_noise_pred = self.transformer(
                     hidden_states=latents,
                     timestep=timestep / 1000,
