@@ -23,24 +23,21 @@ reviews:
   auto_title_instructions: 'Format: "[<category>] <title>". Category must be one of: fix, feat, doc, infra, style, refactor, perf, test, chore, revert. Enclose the category in square brackets. Title should be concise (<= 60 chars). Example: "[feat] Add logit_bias support".'
   commit_status: false
   high_level_summary_instructions: |
-    Always produce two review sections in the summary:
+    Produce two sections:
 
     **Dev Engineer Review**
-    Review all changes for correctness and consistency, including:
-    - Code changes: correctness, performance, API consistency (CODING_GUIDELINES.md), error handling, regressions.
-    - Config files: valid values, no typos, consistency with related configs, no unintended scope changes.
-    - Test list files (test-db/, qa/, waives.txt): correct format, valid test paths, appropriate bug references, no duplicates.
+    Correctness, performance, API consistency (CODING_GUIDELINES.md), error handling, regressions.
 
     **QA Engineer Review**
-    Always include this section when any files under tests/ are touched.
-    For test-list-only changes (only tests/integration/test_lists/ files):
-      - List which test-db/ or qa/ files were modified and what entries were added or removed.
-      - Verdict: "needs follow-up" if CBTS coverage data is unavailable, otherwise "sufficient" or "insufficient".
-    For test-code changes (files outside tests/integration/test_lists/):
-      - List test functions added, modified, or removed.
-      - State whether each is covered in tests/integration/test_lists/ (test-db/ for CI, qa/ for manual QA).
-      - Verdict: sufficient, insufficient, or needs follow-up.
+    Test coverage verdict: sufficient, insufficient, or needs follow-up.
     If no test files are touched, write "No test changes."
+  walkthrough_instructions: |
+    For each changed file, include a concise QA perspective:
+    - For test files (tests/**): note what the test covers and whether it is listed in
+      tests/integration/test_lists/test-db/ (CI) or tests/integration/test_lists/qa/ (manual QA).
+    - For source files: note any observable behavior changes a QA engineer should verify
+      (new code paths, changed APIs, altered defaults, removed functionality).
+    Keep each entry to 1-2 sentences; omit if no QA-relevant impact.
   collapse_walkthrough: false
   assess_linked_issues: true
   related_issues: true
