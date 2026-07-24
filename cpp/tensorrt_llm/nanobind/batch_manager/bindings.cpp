@@ -101,6 +101,34 @@ void initBindings(nb::module_& m)
         .def("get_token", &GenLlmReq::getToken, nb::arg("beam"), nb::arg("pos"))
         .def("get_tokens", nb::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getTokens, nb::const_), nb::arg("beam"))
         .def("get_tokens", nb::overload_cast<>(&GenLlmReq::getTokens, nb::const_))
+        // Copies only [begin, end) -> O(end-begin), vs get_tokens(beam) which
+        // marshals the whole O(seq_len) VecTokens into a Python list.
+        .def(
+            "get_tokens_range",
+            [](GenLlmReq const& self, GenLlmReq::SizeType32 beam, GenLlmReq::SizeType32 begin,
+                GenLlmReq::SizeType32 end)
+            {
+                auto const& tokens = self.getTokens(beam);
+                auto const n = static_cast<GenLlmReq::SizeType32>(tokens.size());
+                if (begin < 0)
+                {
+                    begin = 0;
+                }
+                if (begin > n)
+                {
+                    begin = n;
+                }
+                if (end < begin)
+                {
+                    end = begin;
+                }
+                if (end > n)
+                {
+                    end = n;
+                }
+                return GenLlmReq::VecTokens(tokens.begin() + begin, tokens.begin() + end);
+            },
+            nb::arg("beam"), nb::arg("begin"), nb::arg("end"))
         .def("get_last_tokens", nb::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getLastTokens), nb::arg("beam"))
         .def("get_last_tokens", nb::overload_cast<>(&GenLlmReq::getLastTokens))
         .def("get_beam_width_by_iter", &GenLlmReq::getBeamWidthByIter, nb::arg("for_next_iteration") = false)

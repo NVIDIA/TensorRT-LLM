@@ -3938,11 +3938,16 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
-            all_prompt_tokens = request.get_tokens(0)
             draft_lens.append(0)
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
-            prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
+            # Fetch only the current chunk. get_tokens(0) marshals the whole
+            # O(seq_len) VecTokens into a Python list of boxed ints; chunked
+            # prefill re-enters this loop for every chunk of the same prompt, so
+            # that is O(L) per chunk = O(L^2/chunk) over the prefill.
+            # get_tokens_range copies only [begin, end) -> O(chunk).
+            prompt_tokens = request.get_tokens_range(0, begin_compute,
+                                                     end_compute)
             position_ids.extend(
                 range(begin_compute, begin_compute + len(prompt_tokens)))
 
@@ -3987,7 +3992,7 @@ class PyTorchModelEngine(ModelEngine):
                 request.py_multimodal_data,
                 begin_compute=past_seen_token_num,
                 end_compute=end_compute,
-                prompt_len=len(all_prompt_tokens),
+                prompt_len=request.get_num_tokens(0),
             )
             mm_data = request.py_multimodal_data or {}
             cumsum = mm_data.get('multimodal_embed_mask_cumsum')
@@ -4209,12 +4214,16 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in first_draft_requests:
             request_ids.append(request.py_request_id)
-            all_prompt_tokens = request.get_tokens(0)
             draft_lens.append(0)
-            begin_compute = len(
-                all_prompt_tokens) - self.original_max_draft_len - 1
+            # Only the length and the last (original_max_draft_len+1) tokens are
+            # needed here; get_num_tokens is O(1) and get_tokens_range copies only
+            # the requested window, whereas get_tokens(0) marshals the whole
+            # O(seq_len) VecTokens into a Python list.
+            _num_tokens = request.get_num_tokens(0)
+            begin_compute = _num_tokens - self.original_max_draft_len - 1
             end_compute = begin_compute + self.original_max_draft_len + 1
-            prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
+            prompt_tokens = request.get_tokens_range(0, begin_compute,
+                                                     end_compute)
             position_ids.extend(
                 range(begin_compute, begin_compute + len(prompt_tokens)))
 
