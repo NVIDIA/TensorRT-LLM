@@ -142,6 +142,98 @@ def test_transformer_applies_quant_config_ignore_list() -> None:
     assert isinstance(model.transformer_blocks[1].attn.add_q_proj.quant_method, NVFP4LinearMethod)
 
 
+@pytest.mark.parametrize(
+    "quant_algo",
+    [QuantAlgo.NVFP4, QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES],
+    ids=["nvfp4", "fp8", "fp8-block"],
+)
+def test_dynamic_quant_load_rejects_missing_serialized_parameters(
+    quant_algo: QuantAlgo,
+) -> None:
+    """Dynamic loading still rejects missing real checkpoint tensors."""
+    group_size = {
+        QuantAlgo.NVFP4: 16,
+        QuantAlgo.FP8_BLOCK_SCALES: 128,
+    }.get(quant_algo)
+    model_config = DiffusionModelConfig(
+        quant_config=QuantConfig(
+            quant_algo=quant_algo,
+            group_size=group_size,
+            exclude_modules=[
+                "transformer_blocks.0*",
+                "img_in",
+                "proj_out",
+            ],
+        ),
+        dynamic_weight_quant=True,
+        force_dynamic_quantization=quant_algo == QuantAlgo.NVFP4,
+    )
+    model = QwenImageTransformer2DModel(
+        model_config=model_config,
+        patch_size=1,
+        in_channels=16,
+        out_channels=16,
+        num_layers=2,
+        attention_head_dim=16,
+        num_attention_heads=1,
+        joint_attention_dim=16,
+        axes_dims_rope=(4, 6, 6),
+    )
+    expected = dict(model.named_parameters())
+    quantized_modules = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, Linear)
+        and module.quant_config is not None
+        and module.quant_config.quant_algo == quant_algo
+    }
+    omitted_dynamic_suffixes = {
+        "alpha",
+        "input_scale",
+        "inv_input_scale",
+        "weight_scale",
+        "weight_scale_2",
+        "kv_scales",
+        "inv_kv_scales",
+    }
+    omitted_dynamic_params = set()
+
+    checkpoint = {}
+    for name, param in expected.items():
+        module_name, _, param_name = name.rpartition(".")
+        if module_name in quantized_modules and param_name in omitted_dynamic_suffixes:
+            omitted_dynamic_params.add(name)
+            continue
+        if module_name in quantized_modules and param_name == "weight":
+            module = quantized_modules[module_name]
+            checkpoint[name] = torch.zeros(
+                (module.out_features, module.in_features), dtype=torch.bfloat16
+            )
+        else:
+            checkpoint[name] = param.detach()
+
+    non_serialized = model._allowed_missing_checkpoint_parameter_names(checkpoint)
+    assert omitted_dynamic_params == non_serialized
+    required_key = "transformer_blocks.0.attn.to_q.weight"
+    quantized_required_key = "transformer_blocks.1.attn.to_q.weight"
+    assert required_key in expected
+    assert required_key not in non_serialized
+    assert quantized_required_key in expected
+    assert quantized_required_key not in non_serialized
+    model._validate_checkpoint_keys(checkpoint)
+
+    checkpoint.pop(required_key)
+    with pytest.raises(RuntimeError, match="Missing keys") as exc_info:
+        model._validate_checkpoint_keys(checkpoint)
+    assert required_key in str(exc_info.value)
+
+    quantized_checkpoint = checkpoint.copy()
+    quantized_checkpoint[required_key] = expected[required_key].detach()
+    quantized_checkpoint[quantized_required_key] = expected[quantized_required_key].detach()
+    with pytest.raises(RuntimeError, match="Missing keys"):
+        model._validate_checkpoint_keys(quantized_checkpoint)
+
+
 @pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8], ids=["nvfp4", "fp8"])
 def test_static_quant_excludes_high_precision_layers(quant_algo: QuantAlgo) -> None:
     """Layers in the checkpoint's ``ignore`` list build as unquantized.
@@ -229,7 +321,7 @@ def test_static_quant_load_allows_only_missing_non_serialized_parameters(
         for module_name in quantized_module_names
         for suffix in non_serialized_suffixes
     }
-    assert model._non_serialized_quant_parameter_names() == non_serialized
+    assert model._allowed_missing_checkpoint_parameter_names() == non_serialized
     assert non_serialized <= expected.keys()
     if quant_algo == QuantAlgo.FP8:
         assert not any(name.endswith(".alpha") for name in expected)
@@ -268,7 +360,7 @@ def test_static_fp8_loads_serialized_weights_and_derives_inverse_scale() -> None
     """Static FP8 loading copies checkpoint tensors and derives inverse input scales."""
     model = _tiny_static_quant_model(QuantAlgo.FP8)
     expected = dict(model.named_parameters())
-    non_serialized = model._non_serialized_quant_parameter_names()
+    non_serialized = model._allowed_missing_checkpoint_parameter_names()
     checkpoint = {
         name: torch.zeros_like(param)
         for name, param in expected.items()
