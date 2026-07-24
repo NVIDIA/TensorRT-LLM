@@ -28,14 +28,6 @@ import triton
 import triton.language as tl
 
 
-@dataclass
-class CompactionParams:
-    decision_rows: int = 0
-    pack_args: Tuple[Optional[torch.Tensor], ...] = ()
-    pack_constexprs: Dict[str, object] = field(default_factory=dict)
-    compact_args: List[Tuple[object, ...]] = field(default_factory=list)
-
-
 @triton.jit
 def _pack_move_sources_kernel(
     kept_ordinal_rows,
@@ -111,6 +103,14 @@ def _pack_move_sources_kernel(
                     swa_source,
                     mask=swa_mask,
                 )
+
+
+@dataclass
+class CompactionParams:
+    decision_rows: int = 0
+    pack_args: Tuple[Optional[torch.Tensor], ...] = ()
+    pack_constexprs: Dict[str, object] = field(default_factory=dict)
+    compact_args: List[Tuple[object, ...]] = field(default_factory=list)
 
 
 def build_compaction_params(

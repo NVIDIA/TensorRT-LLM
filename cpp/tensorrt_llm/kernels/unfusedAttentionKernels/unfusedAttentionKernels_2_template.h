@@ -2021,7 +2021,6 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
     int const batch_idx = blockIdx.z;
     int const kv_head_idx = blockIdx.y;
 
-    // Head-row stride of the packed indices.
     int const total_num_sparse_kv_tokens = params.sparse_kv_offsets[params.batch_size];
 
     int const sparse_start_idx = params.sparse_kv_offsets[batch_idx];
@@ -2043,6 +2042,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
         {
             int const global_sparse_idx = sparse_start_idx + sparse_token_offset;
             int const sparse_idx_offset = kv_head_idx * total_num_sparse_kv_tokens + global_sparse_idx;
+
             int const src_token_idx = params.sparse_kv_indices[sparse_idx_offset];
 
             void* src_k_ptr = params.kv_cache_buffer.getKBlockPtr(batch_idx, src_token_idx);
@@ -2056,6 +2056,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
                     = params.kv_cache_buffer.getKVLocalIdx(src_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
                 auto const src_v_vec_idx
                     = params.kv_cache_buffer.getKVLocalIdx(src_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
+
                 k_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx] = src_k_block_ptr[src_k_vec_idx];
                 v_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx] = src_v_block_ptr[src_v_vec_idx];
             }
@@ -2066,6 +2067,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
         {
             int const global_sparse_idx = sparse_start_idx + sparse_token_offset;
             int const sparse_idx_offset = kv_head_idx * total_num_sparse_kv_tokens + global_sparse_idx;
+
             int const src_token_idx = params.sparse_kv_indices[sparse_idx_offset];
             int const dst_token_idx = sparse_token_offset;
 
