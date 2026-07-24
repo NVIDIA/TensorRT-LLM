@@ -29,6 +29,7 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm._torch.models.modeling_llama": [
         "Eagle3LlamaForCausalLM",
         "LlamaForCausalLM",
+        "LlamaForSequenceClassification",
         "Llama4ForCausalLM",
         "Llama4ForConditionalGeneration",
     ],
