@@ -16,11 +16,9 @@ from . import utils
 from .mode import (KV_CACHE_QUANT_ALGO_LIST, MODELOPT_FLOW_QUANTIZATIONS,
                    QUANT_ALGO_LIST, W8A8_SQ_PLUGIN_LIST, GroupwiseQuantAlgo,
                    QuantAlgo, QuantMode)
-from .quantize_by_modelopt import quantize_and_export, quantize_nemo_and_export
 
 __all__ = [
     'QUANT_ALGO_LIST', 'KV_CACHE_QUANT_ALGO_LIST', 'W8A8_SQ_PLUGIN_LIST',
     'MODELOPT_FLOW_QUANTIZATIONS', 'QuantAlgo', 'QuantMode',
-    'GroupwiseQuantAlgo', 'quantize_and_export', 'quantize_nemo_and_export',
-    'utils'
+    'GroupwiseQuantAlgo', 'utils'
 ]

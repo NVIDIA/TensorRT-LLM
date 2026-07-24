@@ -449,6 +449,50 @@ def test_mixed_context_generation_position_ids_follow_compact_output():
     assert actual_position_ids == [0, 4, 4, 4]
 
 
+@pytest.mark.parametrize(
+    "compress_ratio,cached_tokens,kv_lens",
+    [
+        pytest.param(1, [0], [4096], id="cr1_single"),
+        pytest.param(4, [0, 75, 4000], [4096, 4171, 8096], id="cr4_multi_boundary"),
+        pytest.param(128, [0], [64], id="cr128_empty_output"),
+        pytest.param(128, [973632, 8064], [990016, 8192], id="cr128_chunked_long_ctx"),
+    ],
+)
+def test_ctx_position_ids_host_sizes_match_device_scalar_fallback(
+    compress_ratio, cached_tokens, kv_lens
+):
+    """Host-int ctx_output_sizes must reproduce the device-scalar fallback exactly.
+
+    prepare() threads host-computed ctx compressed-token counts into
+    _compute_ctx_compressed_position_ids so the arange size and slice bound
+    are Python ints (no implicit D2H + stream sync). Both paths must produce
+    identical position IDs, including the untouched padding tail.
+    """
+    num_contexts = len(kv_lens)
+    cached = torch.tensor(cached_tokens, dtype=torch.int32, device=DEVICE)
+    kv = torch.tensor(kv_lens, dtype=torch.int32, device=DEVICE)
+    past = (cached // compress_ratio).to(torch.int32)
+    new_comp = (kv // compress_ratio).to(torch.int32) - past
+    cu = F.pad(torch.cumsum(new_comp, dim=0), (1, 0)).to(torch.int32)
+    total = int(cu[num_contexts].item())
+
+    def _run(ctx_output_sizes):
+        out = torch.full((total + 8,), -1, dtype=torch.int32, device=DEVICE)
+        DeepseekV4TrtllmAttentionMetadata._compute_ctx_compressed_position_ids(
+            {compress_ratio: past},
+            {compress_ratio: cu},
+            {compress_ratio: out},
+            num_contexts,
+            [compress_ratio],
+            ctx_output_sizes,
+        )
+        return out
+
+    golden = _run(None)
+    fast = _run({compress_ratio: total})
+    assert torch.equal(golden, fast)
+
+
 def precompute_freqs_cis(
     dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow
 ) -> torch.Tensor:
