@@ -3457,7 +3457,8 @@ class PyExecutor:
                     f"instance={instance} rank={rank} {encoded_fields}")
 
     @staticmethod
-    def _disagg_diag_request_id(request: LlmRequest) -> int:
+    def _disagg_diag_request_id(request: LlmRequest | ExecutorRequest,
+                                fallback_request_id: int | None = None) -> int:
         params = getattr(request, "py_disaggregated_params", None)
         disagg_request_id = getattr(params, "disagg_request_id",
                                     None) if params is not None else None
@@ -3467,7 +3468,12 @@ class PyExecutor:
                                  None) if params is not None else None
         if isinstance(ctx_request_id, int):
             return ctx_request_id
-        return request.py_request_id
+        py_request_id = getattr(request, "py_request_id", None)
+        if isinstance(py_request_id, int):
+            return py_request_id
+        if isinstance(fallback_request_id, int):
+            return fallback_request_id
+        raise ValueError("A diagnostic request ID is required")
 
     @staticmethod
     def _disagg_diag_schedule_style(request: LlmRequest) -> str:
@@ -3672,7 +3678,8 @@ class PyExecutor:
                 t=ingress_time,
                 wall_t=ingress_wall_time,
                 wall_semantics="boundary-sampled",
-                request=item.id,
+                request=self._disagg_diag_request_id(request, item.id),
+                local_request=item.id,
                 boundary="executor-queue-to-waiting-queue")
 
     def _log_disagg_gen_activations(self,

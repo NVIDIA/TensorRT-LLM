@@ -35,6 +35,8 @@ _CATEGORY_PATTERN = re.compile(r"\[DISAGG_DIAG\]\[([^]]+)]")
 _FIELD_PATTERN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)")
 _RANK_PATTERN = re.compile(r"\[RANK\s+(\d+)]")
 
+_ClockDomain = tuple[str, str, str, str, str, str]
+
 
 @dataclass(frozen=True)
 class DiagnosticEvent:
@@ -134,6 +136,7 @@ class _LifecycleMark:
     log_source: str
     emitter_source: str | None
     host: str
+    instance: str
     role: str
     rank: str
     clock: str
@@ -402,6 +405,22 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
             set(),
         )
         return next(iter(candidates)) if len(candidates) == 1 else instance
+
+    sorted_events = [
+        event
+        if resolved_instance(event) == event.fields.get("instance", "-")
+        else DiagnosticEvent(
+            event.category,
+            event.time_s,
+            event.rank,
+            {
+                **event.fields,
+                "instance": resolved_instance(event),
+            },
+            event.source,
+        )
+        for event in sorted_events
+    ]
 
     emitters_by_legacy_rank: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
     for event in sorted_events:
@@ -955,10 +974,8 @@ def _analyze_rank(
 
 def _analyze_request_lifecycles(events: list[DiagnosticEvent]) -> dict[str, object]:
     marks = _collect_lifecycle_marks(events)
-    timelines: dict[tuple[tuple[str, str, str, str, str], str], list[_LifecycleMark]] = defaultdict(
-        list
-    )
-    tag_domains: dict[tuple[str, str], set[tuple[str, str, str, str, str]]] = defaultdict(set)
+    timelines: dict[tuple[_ClockDomain, str], list[_LifecycleMark]] = defaultdict(list)
+    tag_domains: dict[tuple[str, str], set[_ClockDomain]] = defaultdict(set)
     for mark in marks:
         domain = _lifecycle_domain(mark)
         timelines[(domain, mark.request)].append(mark)
@@ -1003,6 +1020,7 @@ def _analyze_request_lifecycles(events: list[DiagnosticEvent]) -> dict[str, obje
                 "role": domain[2],
                 "rank": domain[3],
                 "clock": domain[4],
+                "instance": domain[5],
                 "clock_domain": _clock_domain_label(domain),
                 "emitter_sources": emitter_sources,
                 "first_timestamps": first_timestamps,
@@ -1018,9 +1036,9 @@ def _analyze_request_lifecycles(events: list[DiagnosticEvent]) -> dict[str, obje
     )
     return {
         "clock_domain_policy": (
-            "Durations require the same input log source, host, role, rank, and clock. "
-            "Matching request IDs in another source or clock domain are correlated only "
-            "for censoring; their raw timestamps are never subtracted."
+            "Durations require the same input log source, host, instance, role, rank, "
+            "and clock. Matching request IDs in another source or clock domain are "
+            "correlated only for censoring; their raw timestamps are never subtracted."
         ),
         "correlation_request_policy": (
             "Prefer a nonzero context_request/disaggregated request ID; otherwise use request."
@@ -1064,6 +1082,7 @@ def _collect_lifecycle_marks(events: list[DiagnosticEvent]) -> list[_LifecycleMa
                 log_source=event.source or "<in-memory>",
                 emitter_source=event.fields.get("source"),
                 host=_event_host(event),
+                instance=event.fields.get("instance", "-"),
                 role=role,
                 rank=event.rank,
                 clock=_event_clock(event),
@@ -1671,17 +1690,37 @@ def _cross_host_wall_anomalies(
         start = points.get(start_tag)
         end = points.get(end_tag)
         if start is not None and end is not None and float(end["wall_t"]) < float(start["wall_t"]):
-            anomalies.append(f"negative:{start_tag}->{end_tag}")
+            used_multi_emitter_selection = (
+                int(start.get("observed_emitter_count", 1)) > 1
+                or int(end.get("observed_emitter_count", 1)) > 1
+            )
+            selected_different_emitters = _cross_host_emitter(start) != _cross_host_emitter(end)
+            prefix = (
+                "cross-emitter-selection"
+                if used_multi_emitter_selection and selected_different_emitters
+                else "negative"
+            )
+            anomalies.append(f"{prefix}:{start_tag}->{end_tag}")
     return anomalies
+
+
+def _cross_host_emitter(point: dict[str, object]) -> tuple[object, ...]:
+    return (
+        point.get("log_source"),
+        point.get("host"),
+        point.get("instance"),
+        point.get("role"),
+        point.get("rank"),
+    )
 
 
 def _evaluate_lifecycle_interval(
     request: str,
-    domain: tuple[str, str, str, str, str],
+    domain: _ClockDomain,
     marks_by_tag: dict[str, list[_LifecycleMark]],
     start_tags: tuple[str, ...],
     end_tags: tuple[str, ...],
-    tag_domains: dict[tuple[str, str], set[tuple[str, str, str, str, str]]],
+    tag_domains: dict[tuple[str, str], set[_ClockDomain]],
 ) -> dict[str, object]:
     starts = [mark for tag in start_tags for mark in marks_by_tag.get(tag, ())]
     ends = [mark for tag in end_tags for mark in marks_by_tag.get(tag, ())]
@@ -1775,9 +1814,9 @@ def _classify_deadline_phase(
 def _cross_domain_endpoint_reason(
     endpoint: str,
     request: str,
-    domain: tuple[str, str, str, str, str],
+    domain: _ClockDomain,
     tags: tuple[str, ...],
-    tag_domains: dict[tuple[str, str], set[tuple[str, str, str, str, str]]],
+    tag_domains: dict[tuple[str, str], set[_ClockDomain]],
 ) -> str | None:
     other_domains = {
         candidate
@@ -1799,7 +1838,7 @@ def _lifecycle_interval_coverage(
     records_by_request: dict[str, list[dict[str, object]]] = defaultdict(list)
     for record in request_records:
         records_by_request[str(record["request"])].append(record)
-    mark_domains: dict[tuple[str, str], set[tuple[str, str, str, str, str]]] = defaultdict(set)
+    mark_domains: dict[tuple[str, str], set[_ClockDomain]] = defaultdict(set)
     for mark in marks:
         mark_domains[(mark.request, mark.tag)].add(_lifecycle_domain(mark))
 
@@ -1861,10 +1900,10 @@ def _analyze_remaining_work_ground_truth(
     events: list[DiagnosticEvent],
 ) -> dict[str, object]:
     marks = _collect_lifecycle_marks(events)
-    timelines: dict[tuple[tuple[str, str, str, str, str], str], dict[str, list[_LifecycleMark]]] = (
-        defaultdict(lambda: defaultdict(list))
+    timelines: dict[tuple[_ClockDomain, str], dict[str, list[_LifecycleMark]]] = defaultdict(
+        lambda: defaultdict(list)
     )
-    tag_domains: dict[tuple[str, str], set[tuple[str, str, str, str, str]]] = defaultdict(set)
+    tag_domains: dict[tuple[str, str], set[_ClockDomain]] = defaultdict(set)
     for mark in marks:
         domain = _lifecycle_domain(mark)
         timelines[(domain, mark.request)][mark.tag].append(mark)
@@ -1894,7 +1933,6 @@ def _analyze_remaining_work_ground_truth(
         omitted = _as_int(event.fields.get("active_requests_omitted")) or 0
         omission_identity = (
             domain,
-            event.fields.get("instance", "-"),
             sequence or event.time_s,
         )
         if omission_identity not in omission_seen:
@@ -1953,6 +1991,7 @@ def _analyze_remaining_work_ground_truth(
                     "role": domain[2],
                     "rank": domain[3],
                     "clock": domain[4],
+                    "instance": domain[5],
                     "clock_domain": _clock_domain_label(domain),
                     "active_age_s": active_age_s,
                     "active_age_bucket": _active_age_bucket(active_age_s),
@@ -2009,8 +2048,8 @@ def _analyze_remaining_work_ground_truth(
     return {
         "definition": (
             "For each Gate-2 admission snapshot and active request, residual_ready_s and "
-            "residual_reap_s use only later GEN events in the identical input source and "
-            "clock domain. CTX timestamps are never used."
+            "residual_reap_s use only later GEN events in the identical input source, "
+            "instance, and clock domain. CTX timestamps are never used."
         ),
         "active_decision_samples": len(samples),
         "active_request_ids_omitted": active_request_ids_omitted,
@@ -2054,11 +2093,11 @@ def _analyze_remaining_work_ground_truth(
 
 def _remaining_endpoint_censor_reason(
     request: str,
-    domain: tuple[str, str, str, str, str],
+    domain: _ClockDomain,
     tag: str | tuple[str, ...],
     decision_time_s: float,
     tags: dict[str, list[_LifecycleMark]],
-    tag_domains: dict[tuple[str, str], set[tuple[str, str, str, str, str]]],
+    tag_domains: dict[tuple[str, str], set[_ClockDomain]],
 ) -> str:
     endpoint_tags = (tag,) if isinstance(tag, str) else tag
     endpoint_name = tag if isinstance(tag, str) else "ready"
@@ -2247,7 +2286,7 @@ def _event_clock(event: DiagnosticEvent) -> str:
     return event.fields.get("clock_domain") or event.fields.get("clock") or "local_steady"
 
 
-def _event_domain(event: DiagnosticEvent) -> tuple[str, str, str, str, str]:
+def _event_domain(event: DiagnosticEvent) -> _ClockDomain:
     category = _normalize_diag_token(event.category)
     action = _normalize_diag_token(event.fields.get("action", ""))
     return (
@@ -2256,16 +2295,17 @@ def _event_domain(event: DiagnosticEvent) -> tuple[str, str, str, str, str]:
         _event_role(event, category, action),
         event.rank,
         _event_clock(event),
+        event.fields.get("instance", "-"),
     )
 
 
-def _lifecycle_domain(mark: _LifecycleMark) -> tuple[str, str, str, str, str]:
-    return mark.log_source, mark.host, mark.role, mark.rank, mark.clock
+def _lifecycle_domain(mark: _LifecycleMark) -> _ClockDomain:
+    return mark.log_source, mark.host, mark.role, mark.rank, mark.clock, mark.instance
 
 
-def _clock_domain_label(domain: tuple[str, str, str, str, str]) -> str:
-    source, host, role, rank, clock = domain
-    return f"{source}::host={host}::role={role}::rank={rank}::clock={clock}"
+def _clock_domain_label(domain: _ClockDomain) -> str:
+    source, host, role, rank, clock, instance = domain
+    return f"{source}::host={host}::role={role}::rank={rank}::clock={clock}::instance={instance}"
 
 
 def _active_age_bucket(active_age_s: float | None) -> str:
@@ -2279,7 +2319,7 @@ def _active_age_bucket(active_age_s: float | None) -> str:
 
 def _membership_snapshot_key(
     event: DiagnosticEvent, membership: str, *, definition: bool = False
-) -> tuple[tuple[str, str, str, str, str], str, str, str] | None:
+) -> tuple[_ClockDomain, str, str, str] | None:
     reference_field = "snapshot_version" if definition else f"{membership}_snapshot"
     reference = event.fields.get(reference_field) or event.fields.get("sequence")
     if reference is None:
@@ -2296,7 +2336,7 @@ def _membership_overflow_for_event(
     event: DiagnosticEvent,
     membership: str,
     overflow: dict[
-        tuple[tuple[str, str, str, str, str], str, str, str],
+        tuple[_ClockDomain, str, str, str],
         list[tuple[str, float]],
     ],
 ) -> list[tuple[str, float]]:
@@ -2430,15 +2470,15 @@ def _collect_admissions(events: list[DiagnosticEvent]) -> tuple[list[Admission],
 def _collect_membership_overflow(
     events: list[DiagnosticEvent],
 ) -> dict[
-    tuple[tuple[str, str, str, str, str], str, str, str],
+    tuple[_ClockDomain, str, str, str],
     list[tuple[str, float]],
 ]:
     chunks: dict[
-        tuple[tuple[str, str, str, str, str], str, str, str],
+        tuple[_ClockDomain, str, str, str],
         dict[int, list[tuple[str, float]]],
     ] = defaultdict(dict)
-    expected_chunk_counts: dict[tuple[tuple[str, str, str, str, str], str, str, str], int] = {}
-    conflicts: set[tuple[tuple[str, str, str, str, str], str, str, str]] = set()
+    expected_chunk_counts: dict[tuple[_ClockDomain, str, str, str], int] = {}
+    conflicts: set[tuple[_ClockDomain, str, str, str]] = set()
     for event in events:
         if _normalize_diag_token(event.category) != "decision-members":
             continue
@@ -2470,7 +2510,7 @@ def _collect_membership_overflow(
         chunks[key][chunk_index] = request_blocks
 
     overflow: dict[
-        tuple[tuple[str, str, str, str, str], str, str, str],
+        tuple[_ClockDomain, str, str, str],
         list[tuple[str, float]],
     ] = {}
     for key, key_chunks in chunks.items():

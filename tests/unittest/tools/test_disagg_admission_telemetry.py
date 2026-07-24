@@ -516,6 +516,8 @@ def test_cross_host_partial_gate2_admission_is_not_labeled_before_gate1():
             "[DISAGG_DIAG][gate2] t=3 wall_t=70 wall_clock=unix "
             "wall_semantics=boundary-sampled host=gen rank=1 "
             "action=admitted request=42",
+            "[DISAGG_DIAG][submit] t=4 wall_t=55 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen rank=0 request=42",
             "[DISAGG_DIAG][ctx-transfer] t=60 wall_t=60 wall_clock=unix "
             "wall_semantics=boundary-sampled host=ctx rank=0 "
             "action=deadline-observed request=42",
@@ -526,6 +528,65 @@ def test_cross_host_partial_gate2_admission_is_not_labeled_before_gate1():
 
     assert record["points"]["gate2-state-at-ctx-deadline"]["state"] == "admitted"
     assert record["ctx_deadline_relationship"] == "partial-gate2-admission-before-global-admission"
+    assert "negative:gate2-admitted->gen-submit" not in record["wall_clock_anomalies"]
+    assert "cross-emitter-selection:gate2-admitted->gen-submit" in record["wall_clock_anomalies"]
+
+
+def test_cross_host_wall_clock_preserves_same_emitter_negative_order():
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][ctx-transfer] t=10 wall_t=10 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=ctx instance=ctx rank=0 "
+            "action=timer-start request=42",
+            "[DISAGG_DIAG][ctx-transfer] t=5 wall_t=5 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=ctx instance=ctx rank=0 "
+            "action=deadline-observed request=42",
+        ]
+    )
+
+    record = analyze_events(events)["cross_host_correlation"]["requests"][0]
+
+    assert "negative:ctx-timer-start->ctx-deadline" in record["wall_clock_anomalies"]
+
+
+def test_cross_host_wall_clock_preserves_single_cross_emitter_inversion():
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][submit] t=10 wall_t=10 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen instance=gen rank=0 "
+            "request=42",
+            "[DISAGG_DIAG][sender-transfer] t=9 wall_t=9 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=ctx instance=ctx rank=0 "
+            "role=ctx action=receiver-info-ready request=42",
+        ]
+    )
+
+    record = analyze_events(events)["cross_host_correlation"]["requests"][0]
+
+    assert "negative:gen-submit->ctx-receiver-credit" in record["wall_clock_anomalies"]
+
+
+def test_cross_host_wall_clock_preserves_multi_rank_same_emitter_inversion():
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][gate2] t=70 wall_t=70 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen instance=gen rank=0 "
+            "action=admitted request=42",
+            "[DISAGG_DIAG][gate2] t=60 wall_t=60 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen instance=gen rank=1 "
+            "action=admitted request=42",
+            "[DISAGG_DIAG][submit] t=55 wall_t=55 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen instance=gen rank=0 "
+            "request=42",
+            "[DISAGG_DIAG][submit] t=50 wall_t=50 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen instance=gen rank=1 "
+            "request=42",
+        ]
+    )
+
+    record = analyze_events(events)["cross_host_correlation"]["requests"][0]
+
+    assert "negative:gate2-admitted->gen-submit" in record["wall_clock_anomalies"]
 
 
 def test_cross_host_progress_uses_latest_observed_rank():
@@ -648,14 +709,14 @@ def test_versioned_candidate_snapshot_reconstructs_unchanged_decisions():
             "instance=gen sequence=1 snapshot_version=1 membership=candidate "
             f"chunk_index=1 chunk_count=1 requests={tail}",
             "[DISAGG_DIAG][decision] t=1 rank=0 instance=gen sequence=1 "
-            "candidate_snapshot=1 active_snapshot=1 active_requests=- "
+            "candidate_snapshot=1 active_snapshot=1 active_blocks=0 active_requests=- "
             "active_requests_omitted=0 "
             f"candidate_requests={prefix} candidate_requests_omitted=6 "
             "admitted=0 admitted_requests=- admitted_requests_omitted=0 "
             f"deferred=70 deferred_requests={prefix} "
             "deferred_requests_omitted=6 budget=1",
             "[DISAGG_DIAG][decision] t=2 rank=0 instance=gen sequence=2 "
-            "candidate_snapshot=1 active_snapshot=1 active_requests=- "
+            "candidate_snapshot=1 active_snapshot=1 active_blocks=0 active_requests=- "
             "active_requests_omitted=0 "
             f"candidate_requests={prefix} candidate_requests_omitted=6 "
             "admitted=0 admitted_requests=- admitted_requests_omitted=0 "
@@ -671,6 +732,10 @@ def test_versioned_candidate_snapshot_reconstructs_unchanged_decisions():
     assert all(len(admission.deferred_requests) == 70 for admission in admissions)
     assert all(admission.candidate_requests_omitted == 0 for admission in admissions)
     assert admissions[1].deferred_requests[-1] == "70"
+    fixed = analyze_events(events)["ranks"]["0"]["fixed_multiplier_counterfactual"]
+    assert len(fixed["samples"]) == 2
+    assert fixed["next_deferred_required_multiplier"]["count"] == 2
+    assert [sample["next_deferred_request"] for sample in fixed["samples"]] == ["1", "1"]
 
 
 def test_remaining_work_ignores_gate_transition_and_reports_incomplete_tail():
@@ -697,6 +762,43 @@ def test_remaining_work_ignores_gate_transition_and_reports_incomplete_tail():
     assert remaining["active_request_ids_recovered_from_overflow"] == 0
     assert remaining["active_request_ids_omitted"] == 6
     assert remaining["identity_coverage"]["fraction"] == pytest.approx(64 / 70)
+
+
+def test_remaining_work_recovers_complete_active_snapshot_overflow():
+    prefix = ",".join(f"{request}:1" for request in range(1, 65))
+    tail = ",".join(f"{request}:1" for request in range(65, 71))
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][decision-members] t=1 rank=0 role=gen "
+            "instance=gen sequence=1 snapshot_version=1 membership=active "
+            f"chunk_index=1 chunk_count=1 requests={tail}",
+            "[DISAGG_DIAG][decision] t=1 rank=0 instance=gen sequence=1 "
+            "active_snapshot=1 candidate_snapshot=1 "
+            f"active_requests={prefix} active_requests_omitted=6 "
+            "candidate_requests=- candidate_requests_omitted=0 "
+            "admitted=0 deferred=0 budget=1",
+            *[
+                "[DISAGG_DIAG][python-transfer] t=2 rank=0 role=gen "
+                f"instance=gen action=local-ready request={request} outcome=completed"
+                for request in range(1, 71)
+            ],
+        ]
+    )
+
+    remaining = _TELEMETRY._analyze_remaining_work_ground_truth(events)
+
+    assert remaining["active_decision_samples"] == 70
+    assert remaining["active_request_ids_recovered_from_overflow"] == 6
+    assert remaining["active_request_ids_omitted"] == 0
+    assert remaining["identity_coverage"]["fraction"] == 1.0
+    assert remaining["ready_coverage"] == {
+        "eligible": 70,
+        "observed": 70,
+        "censored": 0,
+        "censor_reasons": {},
+    }
+    assert remaining["residual_ready_s"]["count"] == 70
+    assert remaining["residual_ready_s"]["p50"] == pytest.approx(1.0)
 
 
 def test_membership_snapshots_do_not_cross_instances_or_ranks():
@@ -755,10 +857,72 @@ def test_single_log_same_rank_is_namespaced_by_instance():
     assert result["rank_namespace"] == "source-path::rank[::host::instance::role]"
 
 
+def test_lifecycle_and_remaining_work_are_namespaced_by_instance():
+    events = [
+        _parse_source_line(line, "combined.log")
+        for line in [
+            "[DISAGG_DIAG][gen-arrival] t=0 host=node instance=gen-a rank=0 request=42",
+            "[DISAGG_DIAG][gen-activation] t=0.5 host=node instance=gen-a rank=0 request=42",
+            "[DISAGG_DIAG][decision] t=1 host=node instance=gen-a rank=0 "
+            "sequence=1 active_requests=42:1 active_requests_omitted=0 "
+            "candidate_requests=- admitted=0 deferred=0 budget=1",
+            "[DISAGG_DIAG][python-transfer] t=2 host=node instance=gen-a "
+            "rank=0 role=gen action=local-ready request=42 outcome=completed",
+            "[DISAGG_DIAG][gen-arrival] t=10 host=node instance=gen-b rank=0 request=42",
+            "[DISAGG_DIAG][gen-activation] t=11 host=node instance=gen-b rank=0 request=42",
+            "[DISAGG_DIAG][decision] t=11 host=node instance=gen-b rank=0 "
+            "sequence=1 active_requests=42:1 active_requests_omitted=0 "
+            "candidate_requests=- admitted=0 deferred=0 budget=1",
+            "[DISAGG_DIAG][python-transfer] t=20 host=node instance=gen-b "
+            "rank=0 role=gen action=local-ready request=42 outcome=completed",
+        ]
+    ]
+
+    result = analyze_events(events)
+    lifecycle = result["lifecycle"]
+    remaining = result["remaining_work_ground_truth"]
+
+    assert lifecycle["clock_domain_request_count"] == 2
+    assert {record["instance"] for record in lifecycle["requests"]} == {
+        "gen-a",
+        "gen-b",
+    }
+    activation_coverage = lifecycle["interval_coverage"]["gen_arrival_to_activation"]
+    assert activation_coverage["observed_samples"] == 2
+    assert sorted(
+        record["intervals"]["gen_arrival_to_activation"]["duration_s"]
+        for record in lifecycle["requests"]
+        if record["intervals"]["gen_arrival_to_activation"]["status"] == "observed"
+    ) == [0.5, 1.0]
+    assert remaining["active_decision_samples"] == 2
+    assert {sample["instance"] for sample in remaining["samples"]} == {
+        "gen-a",
+        "gen-b",
+    }
+    assert sorted(sample["residual_ready_s"] for sample in remaining["samples"]) == [
+        1.0,
+        9.0,
+    ]
+
+
 def test_missing_native_instance_aliases_to_single_known_instance():
     events = [
         _parse_source_line(
+            "[DISAGG_DIAG][gen-arrival] t=0 host=node instance=gen rank=0 request=1",
+            "worker.log",
+        ),
+        _parse_source_line(
+            "[DISAGG_DIAG][gen-activation] t=0.5 host=node rank=0 request=1",
+            "worker.log",
+        ),
+        _parse_source_line(
             "[DISAGG_DIAG][submit] t=1 host=node instance=gen rank=0 request=1 blocks=4",
+            "worker.log",
+        ),
+        _parse_source_line(
+            "[DISAGG_DIAG][decision] t=1.5 host=node instance=gen rank=0 "
+            "sequence=1 active_requests=1:4 active_requests_omitted=0 "
+            "candidate_requests=- admitted=0 deferred=0 budget=4",
             "worker.log",
         ),
         _parse_source_line(
@@ -777,6 +941,14 @@ def test_missing_native_instance_aliases_to_single_known_instance():
 
     assert list(result["ranks"]) == ["0"]
     assert result["ranks"]["0"]["service"]["latency_s"]["p50"] == pytest.approx(1.0)
+    lifecycle_interval = result["lifecycle"]["requests"][0]["intervals"][
+        "gen_arrival_to_activation"
+    ]
+    assert lifecycle_interval["status"] == "observed"
+    assert lifecycle_interval["duration_s"] == pytest.approx(0.5)
+    remaining = result["remaining_work_ground_truth"]
+    assert remaining["active_decision_samples"] == 1
+    assert remaining["residual_ready_s"]["p50"] == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize("deadline_action", ["timeout", "timed-out"])

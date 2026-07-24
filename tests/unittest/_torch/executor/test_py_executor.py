@@ -823,7 +823,10 @@ class TestDisaggTransferIdleProgress:
         monkeypatch.setattr(py_executor_module.logger, "info", log_info)
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(rank=2)
-        request = Mock(request_type=py_executor_module.RequestType.REQUEST_TYPE_GENERATION_ONLY)
+        request = types.SimpleNamespace(
+            request_type=py_executor_module.RequestType.REQUEST_TYPE_GENERATION_ONLY,
+            py_disaggregated_params=None,
+        )
         item = RequestQueueItem(701, request)
 
         PyExecutor._log_disagg_gen_ingress(executor, [item])
@@ -833,7 +836,34 @@ class TestDisaggTransferIdleProgress:
         assert "[DISAGG_DIAG][gen-arrival]" in message
         assert "rank=2" in message
         assert "request=701" in message
+        assert "local_request=701" in message
         assert "boundary=executor-queue-to-waiting-queue" in message
+
+    def test_generation_ingress_uses_context_request_id_for_correlation(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+        monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+        monkeypatch.setattr(
+            py_executor_module,
+            "get_steady_clock_now_in_seconds",
+            lambda: 12.0,
+        )
+        log_info = Mock()
+        monkeypatch.setattr(py_executor_module.logger, "info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=2)
+        request = types.SimpleNamespace(
+            request_type=py_executor_module.RequestType.REQUEST_TYPE_GENERATION_ONLY,
+            py_disaggregated_params=types.SimpleNamespace(
+                disagg_request_id=None,
+                ctx_request_id=1701,
+            ),
+        )
+
+        PyExecutor._log_disagg_gen_ingress(executor, [RequestQueueItem(701, request)])
+
+        message = log_info.call_args.args[0]
+        assert "request=1701" in message
+        assert "local_request=701" in message
 
     def test_logs_generation_executor_activation_with_common_id(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
