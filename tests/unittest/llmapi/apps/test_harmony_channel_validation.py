@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,9 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from unittest.mock import patch
 
 import pytest
+from utils.llm_data import llm_datasets_root
 
 # Try to import the private function for direct testing
 try:
@@ -27,6 +29,15 @@ except (ImportError, AttributeError):
 
 # Always import the public API
 from tensorrt_llm.serve.harmony_adapter import HarmonyAdapter
+
+pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(autouse=True)
+def _tiktoken_local_cache(monkeypatch):
+    cache_dir = os.path.join(llm_datasets_root(), "tiktoken_vocab")
+    monkeypatch.setenv("TIKTOKEN_RS_CACHE_DIR", cache_dir)
+    monkeypatch.setenv("TIKTOKEN_ENCODINGS_BASE", cache_dir)
 
 
 @pytest.mark.skipif(

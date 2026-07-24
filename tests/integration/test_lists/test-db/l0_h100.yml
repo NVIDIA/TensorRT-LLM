@@ -250,7 +250,6 @@ l0_h100:
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-TinyLlama-1.1B-Chat-v1.0]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
     - unittest/_torch/executor/test_overlap_scheduler.py
-    - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part0"
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part1"
@@ -292,7 +291,6 @@ l0_h100:
       stage: pre_merge
       backend: pytorch
   tests:
-  - unittest/llmapi/test_llm_quant.py # 5.5 mins on H100
   - examples/visual_gen/test_visual_gen.py::test_visual_gen_quickstart
   - examples/visual_gen/test_visual_gen.py::test_visual_gen_api_walkthrough
 - condition:
@@ -341,7 +339,6 @@ l0_h100:
   - unittest/bindings # 8 mins on H100
   - unittest/kv_cache_manager_v2_tests # 4 min
   # ------------- KV Cache Iteration Stats ---------------
-  - unittest/executor/test_stats_serializer.py
   - unittest/metrics/test_collector.py
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse

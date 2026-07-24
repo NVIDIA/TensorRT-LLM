@@ -23,6 +23,9 @@ from tensorrt_llm._torch.weight_sharing import (
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 
+pytestmark = pytest.mark.cpu_only
+
+
 _SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
     format_version=SOURCE_IDENTITY_FORMAT_VERSION,
     artifact_identity=ArtifactIdentity(

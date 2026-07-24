@@ -179,7 +179,6 @@ l0_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_chunked_prefill
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_eviction
   # ------------- KV Cache Iteration Stats ---------------
-  - unittest/executor/test_stats_serializer.py
   - unittest/metrics/test_collector.py
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse
@@ -261,7 +260,6 @@ l0_b200:
       stage: post_merge
       backend: pytorch
   tests:
-  - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
   - unittest/disaggregated/test_openai_server_info.py
 - condition:
     ranges:

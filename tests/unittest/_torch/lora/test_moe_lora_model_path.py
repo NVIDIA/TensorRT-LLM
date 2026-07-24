@@ -30,6 +30,9 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFus
 from tensorrt_llm._torch.modules.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 
+pytestmark = pytest.mark.cpu_only
+
+
 # A unique sentinel so the assertions can verify object identity rather than
 # mere truthiness; any drop/replace along the chain fails the identity check.
 _LORA_PARAMS_SENTINEL = {"num_seqs": 1, "_marker": object()}

@@ -19,6 +19,8 @@ from tensorrt_llm.inputs.registry import (
     maybe_compute_mm_embed_cumsum,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
     """Producer writes a flat int64 cumsum tensor at py_multimodal_data[multimodal_embed_mask_cumsum]."""

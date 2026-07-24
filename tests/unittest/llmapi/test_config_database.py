@@ -37,6 +37,9 @@ from .yaml_validation_harness import (
     validate_torch_llm_args_config,
 )
 
+pytestmark = pytest.mark.cpu_only
+
+
 CONFIG_ROOT = Path(__file__).parents[3] / "examples" / "configs"
 REPO_ROOT = CONFIG_ROOT.parent.parent
 CURATED_DIR = CONFIG_ROOT / "curated"

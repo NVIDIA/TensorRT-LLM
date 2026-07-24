@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from tensorrt_llm._torch.peft.lora.adapter_slot_manager import AdapterSlotManager
@@ -27,6 +28,7 @@ def test_cuda_graph_lora_params_handle_missing_peft_table():
     assert layer_params.h_b_prime_ptrs[:, 1].tolist() == [0, 0]
 
 
+@pytest.mark.cpu_only
 def test_adapter_slot_manager_handles_missing_peft_cache_manager():
     manager = AdapterSlotManager(max_num_adapters=2)
     manager.slot2task[0] = 123

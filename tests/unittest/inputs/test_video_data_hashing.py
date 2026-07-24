@@ -9,11 +9,14 @@ Cover both branches:
 Plus sampling-metadata and audio contributions to cache identity.
 """
 
+import pytest
 import torch
 from blake3 import blake3
 
 from tensorrt_llm.inputs import multimodal_data as md
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _hex(video: VideoData) -> str:

@@ -13,8 +13,12 @@ neither GPUs nor models.
 import datetime
 import queue as _stdlib_queue
 
+import pytest
+
 from tensorrt_llm.executor.base_worker import AwaitResponseHelper
 from tensorrt_llm.executor.utils import ErrorResponse
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _EngineStub:

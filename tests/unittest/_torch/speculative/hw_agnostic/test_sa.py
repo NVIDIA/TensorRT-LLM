@@ -216,6 +216,7 @@ def test_llama_sa(
     torch.cuda.synchronize()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("max_matching_ngram_size", [2, 4, -1])
 def test_sa_config_validation(max_matching_ngram_size: int):
     """Test SADecodingConfig validation."""
@@ -227,6 +228,7 @@ def test_sa_config_validation(max_matching_ngram_size: int):
     assert config.max_matching_ngram_size == max_matching_ngram_size
 
 
+@pytest.mark.cpu_only
 def test_sa_config_invalid_zero():
     """Test that max_matching_ngram_size=0 raises error for SA."""
     with pytest.raises(ValueError, match="max_matching_ngram_size must be"):
