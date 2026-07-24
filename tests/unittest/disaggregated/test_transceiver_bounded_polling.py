@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
@@ -39,6 +40,7 @@ from tensorrt_llm.bindings import LlmRequestState
 @dataclass
 class _FakeRequest:
     state: Optional[LlmRequestState] = None
+    py_request_id: Optional[int] = None
 
 
 class _FakeTransferWorker:
@@ -59,6 +61,7 @@ class _FakeSession:
         is_completed: bool = False,
         has_failed: bool = False,
         kv_transfer_start_time_s: Optional[float] = None,
+        request_info_sent_time_s: Optional[float] = None,
         kv_ready_time_s: Optional[float] = None,
     ) -> None:
         self._rid = rid
@@ -67,6 +70,7 @@ class _FakeSession:
         self._is_completed = is_completed
         self._has_failed = has_failed
         self.kv_transfer_start_time_s = kv_transfer_start_time_s
+        self.request_info_sent_time_s = request_info_sent_time_s
         self.kv_ready_time_s = kv_ready_time_s
         self.blocking_calls: list[bool] = []
         self.closed = False
@@ -110,7 +114,7 @@ def _make_transceiver(
 ) -> KvCacheTransceiverV2:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._send_sessions = sessions
-    transceiver._send_reqs = reqs or {rid: _FakeRequest() for rid in sessions}
+    transceiver._send_reqs = reqs or {rid: _FakeRequest(py_request_id=rid) for rid in sessions}
     transceiver._sender_future_timeout_ms = 123
     # Attributes read by check_context_transfer_status before it processes sessions.
     transceiver._ever_had_send_session = True
@@ -162,6 +166,32 @@ def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued() -
     assert 11 in transceiver._send_sessions
     assert 11 in transceiver._send_reqs
     assert transceiver._transfer_worker.sweep_count == 1
+
+
+def test_context_wait_timeout_is_nonterminal_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transceiver_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    session = _FakeSession(rid=14, wait_result=WaitResult.TIMEOUT)
+    transceiver = _make_transceiver({14: session})
+    transceiver._log_python_transfer_diagnostic = Mock()
+    transceiver._log_transfer_terminal = Mock()
+
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=1)
+
+    assert completed == []
+    assert failed == []
+    assert not session.closed
+    assert 14 in transceiver._send_sessions
+    transceiver._log_transfer_terminal.assert_not_called()
+    transceiver._log_python_transfer_diagnostic.assert_called_once_with(
+        role="ctx",
+        action="wait-timeout",
+        request=14,
+        local_request=14,
+        status=SessionStatus.READY.value,
+        timeout_ms=123,
+    )
 
 
 def test_context_transfer_status_block_all_uses_blocking_wait() -> None:
@@ -271,6 +301,7 @@ def test_gen_transfer_status_stamps_first_local_ready_time(
         wait_result=WaitResult.COMPLETED,
         is_completed=True,
         kv_transfer_start_time_s=10.25,
+        request_info_sent_time_s=10.25,
         kv_ready_time_s=12.5,
     )
     request = Mock(
@@ -299,14 +330,17 @@ def test_gen_transfer_status_stamps_first_local_ready_time(
     assert failed == []
     assert cancelled == []
     assert request.py_kv_transfer_service_start_time_s == 10.25
+    assert request.py_kv_request_info_sent_time_s == 10.25
     assert request.py_kv_transfer_ready_time_s == 12.5
-    message = log_info.call_args.args[0]
+    message = next(
+        call.args[0] for call in log_info.call_args_list if "action=local-ready" in call.args[0]
+    )
     assert "[DISAGG_DIAG][python-transfer]" in message
     assert "rank=2" in message
     assert "request=21" in message
     assert "bytes=8192" in message
-    assert "service_start_t=10.250000000" in message
-    assert "service_ms=2250.000" in message
+    assert "request_info_sent_t=10.250000000" in message
+    assert "receive_ms=2250.000" in message
 
 
 def test_kv_recv_task_records_native_transfer_boundaries(
@@ -416,6 +450,25 @@ def test_tx_session_wait_complete_defaults_to_blocking() -> None:
 
     assert session.wait_complete() == WaitResult.TIMEOUT
     assert task.wait_calls == [0.25]
+
+
+def test_native_session_boundaries_are_recorded_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(native_transfer_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    tx_session = object.__new__(TxSession)
+    tx_session.lock = threading.Lock()
+    tx_session._first_write_submit_time_s = None
+    rx_session = object.__new__(RxSession)
+    rx_session.lock = threading.Lock()
+    rx_session._request_info_sent_time_s = None
+
+    assert tx_session.mark_first_write_submitted(3.0)
+    assert not tx_session.mark_first_write_submitted(4.0)
+    assert tx_session.first_write_submit_time_s == 3.0
+    assert rx_session.mark_request_info_sent(5.0)
+    assert not rx_session.mark_request_info_sent(6.0)
+    assert rx_session.request_info_sent_time_s == 5.0
 
 
 def test_tx_session_wait_complete_nonblocking_returns_none_without_waiting() -> None:

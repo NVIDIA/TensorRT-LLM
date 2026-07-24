@@ -60,6 +60,9 @@ class Admission:
     candidate_requests: tuple[tuple[str, float], ...]
     admitted_requests: tuple[str, ...]
     deferred_requests: tuple[str, ...]
+    candidate_requests_omitted: int
+    admitted_requests_omitted: int
+    deferred_requests_omitted: int
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,118 @@ class ReleasePoint:
     time_s: float
     request: str
     source: str
+
+
+@dataclass(frozen=True)
+class _LifecycleMark:
+    """One request-scoped lifecycle point in a single clock domain."""
+
+    time_s: float
+    request: str
+    local_request: str | None
+    tag: str
+    category: str
+    action: str
+    log_source: str
+    emitter_source: str | None
+    host: str
+    role: str
+    rank: str
+    clock: str
+
+
+_CTX_ACTIONS = {
+    "queued",
+    "send-queued",
+    "receiver-info-ready",
+    "credit-received",
+    "request-info-complete",
+    "first-write",
+    "first-write-submitted",
+    "service-start",
+}
+_GEN_ACTIONS = {
+    "capacity-prepared",
+    "request-info-sent",
+    "request-info-submitted",
+    "peer-ready",
+    "ready",
+    "local-ready",
+}
+_TERMINAL_ACTIONS = {
+    "completed",
+    "complete",
+    "reaped",
+    "failed",
+    "failure",
+    "cancelled",
+    "canceled",
+    "timeout",
+    "timed-out",
+}
+_SUCCESS_TERMINAL_ACTIONS = {"completed", "complete", "reaped"}
+_LIFECYCLE_INTERVALS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "ctx_queued_to_credit": (
+        ("ctx-queued", "sender-queued"),
+        ("sender-credit",),
+    ),
+    "ctx_credit_to_first_write": (
+        ("sender-credit",),
+        ("sender-first-write",),
+    ),
+    "ctx_first_write_to_terminal": (
+        ("sender-first-write",),
+        ("sender-terminal", "ctx-terminal"),
+    ),
+    "gen_arrival_to_first_gate2": (
+        ("gen-arrival",),
+        ("gate2-seen",),
+    ),
+    "gen_arrival_to_activation": (
+        ("gen-arrival",),
+        ("gen-activation",),
+    ),
+    "gen_activation_to_first_gate2": (
+        ("gen-activation",),
+        ("gate2-seen",),
+    ),
+    "gate2_defer_to_admit": (
+        ("gate2-deferred",),
+        ("gate2-admitted",),
+    ),
+    "gate2_admit_to_submit": (
+        ("gate2-admitted",),
+        ("submit", "receiver-submitted"),
+    ),
+    "submit_to_request_info": (
+        ("submit", "receiver-submitted"),
+        ("request-info",),
+    ),
+    "ready_to_reap": (
+        ("local-ready", "receiver-completed"),
+        ("reap",),
+    ),
+    "gen_arrival_to_decode_start": (
+        ("gen-arrival",),
+        ("decode-start",),
+    ),
+    "ready_to_decode_start": (
+        ("local-ready", "receiver-completed"),
+        ("decode-start",),
+    ),
+    "reap_to_decode_start": (
+        ("reap",),
+        ("decode-start",),
+    ),
+}
+_ACTIVE_AGE_BUCKETS = (
+    (0.01, "lt_10ms"),
+    (0.1, "10ms_to_100ms"),
+    (1.0, "100ms_to_1s"),
+    (10.0, "1s_to_10s"),
+    (60.0, "10s_to_60s"),
+    (math.inf, "gte_60s"),
+)
 
 
 def parse_diagnostic_line(line: str) -> DiagnosticEvent | None:
@@ -321,14 +436,20 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
         }
         for source, samples in sorted(aggregate_gaps_by_source.items())
     }
+    lifecycle = _analyze_request_lifecycles(sorted_events)
+    remaining_work_ground_truth = _analyze_remaining_work_ground_truth(sorted_events)
+    known_backlog_release = _known_backlog_release_analysis(ranks)
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "rank_namespace": "source-path::rank" if namespace_by_source else "rank",
         "aggregate_scope": "all-input-sources" if namespace_by_source else "single-source",
         "parsed_event_count": len(sorted_events),
         "event_counts": dict(sorted(category_counts.items())),
         "ranks": ranks,
+        "lifecycle": lifecycle,
+        "remaining_work_ground_truth": remaining_work_ground_truth,
+        "known_backlog_release": known_backlog_release,
         "aggregate": {
             "completed_service_intervals": len(aggregate_service_intervals),
             "completed_blocks": aggregate_completed_blocks,
@@ -687,6 +808,830 @@ def _analyze_rank(
     return analysis, service_intervals, selected_gaps
 
 
+def _analyze_request_lifecycles(events: list[DiagnosticEvent]) -> dict[str, object]:
+    marks = _collect_lifecycle_marks(events)
+    timelines: dict[tuple[tuple[str, str, str, str, str], str], list[_LifecycleMark]] = defaultdict(
+        list
+    )
+    tag_domains: dict[tuple[str, str], set[tuple[str, str, str, str, str]]] = defaultdict(set)
+    for mark in marks:
+        domain = _lifecycle_domain(mark)
+        timelines[(domain, mark.request)].append(mark)
+        tag_domains[(mark.request, mark.tag)].add(domain)
+
+    request_records: list[dict[str, object]] = []
+    for (domain, request), request_marks in sorted(
+        timelines.items(),
+        key=lambda item: (item[0][0], item[0][1]),
+    ):
+        request_marks.sort(key=lambda mark: (mark.time_s, mark.tag))
+        marks_by_tag: dict[str, list[_LifecycleMark]] = defaultdict(list)
+        for mark in request_marks:
+            marks_by_tag[mark.tag].append(mark)
+
+        intervals = {
+            name: _evaluate_lifecycle_interval(
+                request,
+                domain,
+                marks_by_tag,
+                start_tags,
+                end_tags,
+                tag_domains,
+            )
+            for name, (start_tags, end_tags) in _LIFECYCLE_INTERVALS.items()
+        }
+        first_timestamps = {
+            tag: tag_marks[0].time_s for tag, tag_marks in sorted(marks_by_tag.items()) if tag_marks
+        }
+        local_requests = sorted(
+            {mark.local_request for mark in request_marks if mark.local_request is not None}
+        )
+        emitter_sources = sorted(
+            {mark.emitter_source for mark in request_marks if mark.emitter_source is not None}
+        )
+        request_records.append(
+            {
+                "request": request,
+                "local_requests": local_requests,
+                "log_source": domain[0],
+                "host": domain[1],
+                "role": domain[2],
+                "rank": domain[3],
+                "clock": domain[4],
+                "clock_domain": _clock_domain_label(domain),
+                "emitter_sources": emitter_sources,
+                "first_timestamps": first_timestamps,
+                "intervals": intervals,
+            }
+        )
+
+    return {
+        "clock_domain_policy": (
+            "Durations require the same input log source, host, role, rank, and clock. "
+            "Matching request IDs in another source or clock domain are correlated only "
+            "for censoring; their raw timestamps are never subtracted."
+        ),
+        "correlation_request_policy": (
+            "Prefer a nonzero context_request/disaggregated request ID; otherwise use request."
+        ),
+        "request_count": len({mark.request for mark in marks}),
+        "clock_domain_request_count": len(request_records),
+        "requests": request_records,
+        "interval_coverage": _lifecycle_interval_coverage(
+            request_records,
+            marks,
+        ),
+    }
+
+
+def _collect_lifecycle_marks(events: list[DiagnosticEvent]) -> list[_LifecycleMark]:
+    marks: list[_LifecycleMark] = []
+    seen: set[tuple[object, ...]] = set()
+    for event in events:
+        category = _normalize_diag_token(event.category)
+        action = _normalize_diag_token(event.fields.get("action", ""))
+        role = _event_role(event, category, action)
+        direct_request = _event_correlation_request(event)
+        local_request = _event_local_request(event)
+
+        def add(
+            tag: str,
+            request: str | None = direct_request,
+            time_s: float = event.time_s,
+            detail: str | None = None,
+        ) -> None:
+            if request is None or not math.isfinite(time_s) or time_s < 0.0:
+                return
+            mark = _LifecycleMark(
+                time_s=time_s,
+                request=request,
+                local_request=local_request if request == direct_request else None,
+                tag=tag,
+                category=category,
+                action=detail or action,
+                log_source=event.source or "<in-memory>",
+                emitter_source=event.fields.get("source"),
+                host=_event_host(event),
+                role=role,
+                rank=event.rank,
+                clock=_event_clock(event),
+            )
+            identity = (
+                _lifecycle_domain(mark),
+                mark.request,
+                mark.tag,
+                mark.time_s,
+                mark.category,
+                mark.action,
+            )
+            if identity not in seen:
+                seen.add(identity)
+                marks.append(mark)
+
+        if category == "gen-arrival":
+            add("gen-arrival")
+        if category == "gen-activation":
+            add("gen-activation")
+
+        if category in {"gate1", "gate-1"}:
+            for field, tag in (
+                ("waiting_requests", "gate1-waiting"),
+                ("fitting_requests", "gate1-fitting"),
+                ("blocked_requests", "gate1-blocked"),
+            ):
+                for request in _parse_request_ids(event.fields.get(field)):
+                    add(tag, request=request, detail=field)
+
+        if category in {"decision", "admission", "gate2", "gate-2"}:
+            for field, tag in (
+                ("active_requests", "gate2-active"),
+                ("candidate_requests", "gate2-seen"),
+                ("waiting_requests", "gate2-seen"),
+                ("fitting_requests", "gate2-seen"),
+                ("admitted_requests", "gate2-admitted"),
+                ("deferred_requests", "gate2-deferred"),
+            ):
+                for request in _parse_request_ids(event.fields.get(field)):
+                    add(tag, request=request, detail=field)
+                    if tag in {"gate2-admitted", "gate2-deferred"}:
+                        add("gate2-seen", request=request, detail=field)
+            if action in {"admit", "admitted"}:
+                add("gate2-admitted")
+                add("gate2-seen")
+            elif action in {"defer", "deferred"}:
+                add("gate2-deferred")
+                add("gate2-seen")
+
+        if category == "submit":
+            submit_time = _as_float(event.fields.get("submit_start_t"))
+            if submit_time is None or submit_time < 0.0 or submit_time > event.time_s:
+                submit_time = event.time_s
+            add("submit", time_s=submit_time)
+
+        if category == "reap":
+            add("reap")
+            ready_time = _as_float(event.fields.get("ready_t"))
+            ready_time_source = event.fields.get("ready_time_source")
+            if (
+                ready_time_source != "cpp-global"
+                and ready_time is not None
+                and 0.0 <= ready_time <= event.time_s
+            ):
+                add("local-ready", time_s=ready_time, detail="ready_t")
+
+        if category == "gen-service" and action == "decode-start-proxy":
+            add("decode-start")
+
+        if category == "ctx-transfer":
+            if action in {"queued", "send-queued"}:
+                add("ctx-queued")
+            if action in _TERMINAL_ACTIONS:
+                add("ctx-terminal")
+
+        if category == "sender-transfer":
+            if action in {"queued", "send-queued"}:
+                add("sender-queued")
+                add("ctx-queued")
+            if action in {
+                "credit-received",
+                "receiver-info-ready",
+                "request-info-complete",
+            }:
+                add("sender-credit")
+            if action in {"service-start", "first-write", "first-write-submitted"}:
+                add("sender-first-write")
+            if action in _TERMINAL_ACTIONS:
+                add("sender-terminal")
+
+        if category == "receiver-transfer":
+            if action in {"submitted", "request-info-submitted"}:
+                add("receiver-submitted")
+            if action in {
+                "request-info-sent",
+                "request-info-submitted",
+            }:
+                add("request-info")
+            if action in {"peer-ready", "ready"}:
+                add("peer-ready")
+            if action == "local-ready":
+                add("local-ready")
+            if action in _TERMINAL_ACTIONS:
+                add("receiver-terminal")
+                if action in _SUCCESS_TERMINAL_ACTIONS:
+                    add("receiver-completed")
+
+        if category == "python-transfer":
+            if role == "ctx":
+                if action in {"queued", "send-queued"}:
+                    add("ctx-queued")
+                    add("sender-queued")
+                if action in {
+                    "credit-received",
+                    "receiver-info-ready",
+                    "request-info-complete",
+                }:
+                    add("sender-credit")
+                if action in {
+                    "service-start",
+                    "first-write",
+                    "first-write-submitted",
+                }:
+                    add("sender-first-write")
+                if action in _TERMINAL_ACTIONS:
+                    add("sender-terminal")
+                    add("ctx-terminal")
+            elif role == "gen":
+                if action in {"submitted", "capacity-prepared"}:
+                    add("receiver-submitted")
+                if action in {"request-info-sent", "request-info-submitted"}:
+                    add("request-info")
+                if action == "local-ready":
+                    add("local-ready")
+                if action in _TERMINAL_ACTIONS:
+                    add("receiver-terminal")
+                    if action in _SUCCESS_TERMINAL_ACTIONS:
+                        add("receiver-completed")
+
+        if category == "receiver-slot" and action in {"release", "released"}:
+            add("physical-release")
+
+    return sorted(
+        marks,
+        key=lambda mark: (
+            _lifecycle_domain(mark),
+            mark.request,
+            mark.time_s,
+            mark.tag,
+        ),
+    )
+
+
+def _evaluate_lifecycle_interval(
+    request: str,
+    domain: tuple[str, str, str, str, str],
+    marks_by_tag: dict[str, list[_LifecycleMark]],
+    start_tags: tuple[str, ...],
+    end_tags: tuple[str, ...],
+    tag_domains: dict[tuple[str, str], set[tuple[str, str, str, str, str]]],
+) -> dict[str, object]:
+    starts = [mark for tag in start_tags for mark in marks_by_tag.get(tag, ())]
+    ends = [mark for tag in end_tags for mark in marks_by_tag.get(tag, ())]
+    starts.sort(key=lambda mark: mark.time_s)
+    ends.sort(key=lambda mark: mark.time_s)
+    if not starts and not ends:
+        return {
+            "status": "not-applicable",
+            "duration_s": None,
+            "censor_reason": None,
+        }
+
+    start = starts[0] if starts else None
+    end = (
+        next((candidate for candidate in ends if candidate.time_s >= start.time_s), None)
+        if start is not None
+        else None
+    )
+    if start is not None and end is not None:
+        return {
+            "status": "observed",
+            "duration_s": end.time_s - start.time_s,
+            "start_t": start.time_s,
+            "start_kind": f"{start.category}:{start.action or start.tag}",
+            "end_t": end.time_s,
+            "end_kind": f"{end.category}:{end.action or end.tag}",
+            "censor_reason": None,
+        }
+
+    if start is None:
+        reason = _cross_domain_endpoint_reason(
+            "start",
+            request,
+            domain,
+            start_tags,
+            tag_domains,
+        )
+        if reason is None:
+            reason = "missing_start"
+        return {
+            "status": "censored",
+            "duration_s": None,
+            "start_t": None,
+            "end_t": ends[0].time_s if ends else None,
+            "censor_reason": reason,
+        }
+
+    if ends:
+        reason = "end_precedes_start"
+    else:
+        reason = _cross_domain_endpoint_reason(
+            "end",
+            request,
+            domain,
+            end_tags,
+            tag_domains,
+        )
+        if reason is None:
+            reason = "missing_end"
+    return {
+        "status": "censored",
+        "duration_s": None,
+        "start_t": start.time_s,
+        "end_t": None,
+        "censor_reason": reason,
+    }
+
+
+def _cross_domain_endpoint_reason(
+    endpoint: str,
+    request: str,
+    domain: tuple[str, str, str, str, str],
+    tags: tuple[str, ...],
+    tag_domains: dict[tuple[str, str], set[tuple[str, str, str, str, str]]],
+) -> str | None:
+    other_domains = {
+        candidate
+        for tag in tags
+        for candidate in tag_domains.get((request, tag), ())
+        if candidate != domain
+    }
+    if not other_domains:
+        return None
+    if any(candidate[0] != domain[0] for candidate in other_domains):
+        return f"{endpoint}_in_other_log_source"
+    return f"{endpoint}_in_other_clock_domain"
+
+
+def _lifecycle_interval_coverage(
+    request_records: list[dict[str, object]],
+    marks: list[_LifecycleMark],
+) -> dict[str, object]:
+    records_by_request: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for record in request_records:
+        records_by_request[str(record["request"])].append(record)
+    mark_domains: dict[tuple[str, str], set[tuple[str, str, str, str, str]]] = defaultdict(set)
+    for mark in marks:
+        mark_domains[(mark.request, mark.tag)].add(_lifecycle_domain(mark))
+
+    coverage: dict[str, object] = {}
+    for name, (start_tags, end_tags) in _LIFECYCLE_INTERVALS.items():
+        durations: list[float] = []
+        eligible_requests = 0
+        observed_requests = 0
+        reasons: Counter[str] = Counter()
+        for request, records in records_by_request.items():
+            start_domains = {
+                domain for tag in start_tags for domain in mark_domains.get((request, tag), ())
+            }
+            end_domains = {
+                domain for tag in end_tags for domain in mark_domains.get((request, tag), ())
+            }
+            if not start_domains and not end_domains:
+                continue
+            eligible_requests += 1
+            request_durations = [
+                float(interval["duration_s"])
+                for record in records
+                if isinstance((interval := record["intervals"][name]), dict)
+                and interval.get("status") == "observed"
+                and interval.get("duration_s") is not None
+            ]
+            if request_durations:
+                observed_requests += 1
+                durations.extend(request_durations)
+                continue
+            if start_domains and end_domains:
+                common_domains = start_domains.intersection(end_domains)
+                if common_domains:
+                    reasons["end_precedes_start"] += 1
+                elif any(
+                    start_domain[0] != end_domain[0]
+                    for start_domain in start_domains
+                    for end_domain in end_domains
+                ):
+                    reasons["cross_log_source_only"] += 1
+                else:
+                    reasons["cross_clock_domain_only"] += 1
+            elif start_domains:
+                reasons["missing_end"] += 1
+            else:
+                reasons["missing_start"] += 1
+        coverage[name] = {
+            "eligible_requests": eligible_requests,
+            "observed_requests": observed_requests,
+            "observed_samples": len(durations),
+            "censored_requests": eligible_requests - observed_requests,
+            "censor_reasons": dict(sorted(reasons.items())),
+            "duration_s": _summary(durations),
+        }
+    return coverage
+
+
+def _analyze_remaining_work_ground_truth(
+    events: list[DiagnosticEvent],
+) -> dict[str, object]:
+    marks = _collect_lifecycle_marks(events)
+    timelines: dict[tuple[tuple[str, str, str, str, str], str], dict[str, list[_LifecycleMark]]] = (
+        defaultdict(lambda: defaultdict(list))
+    )
+    tag_domains: dict[tuple[str, str], set[tuple[str, str, str, str, str]]] = defaultdict(set)
+    for mark in marks:
+        domain = _lifecycle_domain(mark)
+        timelines[(domain, mark.request)][mark.tag].append(mark)
+        tag_domains[(mark.request, mark.tag)].add(domain)
+    for tags in timelines.values():
+        for tag_marks in tags.values():
+            tag_marks.sort(key=lambda mark: mark.time_s)
+
+    samples: list[dict[str, object]] = []
+    seen: set[tuple[object, ...]] = set()
+    omission_seen: set[tuple[object, ...]] = set()
+    active_request_ids_omitted = 0
+    for event in events:
+        category = _normalize_diag_token(event.category)
+        if category not in {"decision", "admission", "gate2", "gate-2"}:
+            continue
+        active_pairs = _parse_request_blocks(event.fields.get("active_requests"))
+        active_blocks = dict(active_pairs)
+        active_requests = _parse_request_ids(event.fields.get("active_requests"))
+        domain = _event_domain(event)
+        sequence = event.fields.get("sequence")
+        omitted = _as_int(event.fields.get("active_requests_omitted")) or 0
+        omission_identity = (domain, sequence or event.time_s)
+        if omitted > 0 and omission_identity not in omission_seen:
+            active_request_ids_omitted += omitted
+            omission_seen.add(omission_identity)
+        if not active_requests:
+            continue
+        for request in active_requests:
+            identity = (domain, sequence or event.time_s, request)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            tags = timelines.get((domain, request), {})
+            ready = min(
+                (
+                    mark
+                    for tag in ("local-ready", "receiver-completed")
+                    for mark in tags.get(tag, ())
+                    if mark.time_s >= event.time_s
+                ),
+                key=lambda mark: mark.time_s,
+                default=None,
+            )
+            reap = next(
+                (mark for mark in tags.get("reap", ()) if mark.time_s >= event.time_s),
+                None,
+            )
+            prior_submits = [mark for mark in tags.get("submit", ()) if mark.time_s <= event.time_s]
+            active_age_s = event.time_s - prior_submits[-1].time_s if prior_submits else None
+            ready_reason = _remaining_endpoint_censor_reason(
+                request,
+                domain,
+                ("local-ready", "receiver-completed"),
+                event.time_s,
+                tags,
+                tag_domains,
+            )
+            reap_reason = _remaining_endpoint_censor_reason(
+                request,
+                domain,
+                "reap",
+                event.time_s,
+                tags,
+                tag_domains,
+            )
+            samples.append(
+                {
+                    "request": request,
+                    "blocks": active_blocks.get(request),
+                    "sequence": sequence,
+                    "decision_t": event.time_s,
+                    "log_source": domain[0],
+                    "host": domain[1],
+                    "role": domain[2],
+                    "rank": domain[3],
+                    "clock": domain[4],
+                    "clock_domain": _clock_domain_label(domain),
+                    "active_age_s": active_age_s,
+                    "active_age_bucket": _active_age_bucket(active_age_s),
+                    "ready_t": ready.time_s if ready is not None else None,
+                    "ready_kind": (
+                        f"{ready.category}:{ready.action or ready.tag}"
+                        if ready is not None
+                        else None
+                    ),
+                    "residual_ready_s": (
+                        ready.time_s - event.time_s if ready is not None else None
+                    ),
+                    "ready_censor_reason": (None if ready is not None else ready_reason),
+                    "reap_t": reap.time_s if reap is not None else None,
+                    "residual_reap_s": (reap.time_s - event.time_s if reap is not None else None),
+                    "reap_censor_reason": (None if reap is not None else reap_reason),
+                }
+            )
+
+    samples.sort(
+        key=lambda sample: (
+            str(sample["log_source"]),
+            str(sample["clock_domain"]),
+            float(sample["decision_t"]),
+            str(sample["request"]),
+        )
+    )
+    by_age_bucket: dict[str, object] = {}
+    bucket_names = [label for _, label in _ACTIVE_AGE_BUCKETS] + ["unknown"]
+    for bucket in bucket_names:
+        bucket_samples = [sample for sample in samples if sample["active_age_bucket"] == bucket]
+        if not bucket_samples:
+            continue
+        by_age_bucket[bucket] = {
+            "samples": len(bucket_samples),
+            "residual_ready_s": _summary(
+                [
+                    float(sample["residual_ready_s"])
+                    for sample in bucket_samples
+                    if sample["residual_ready_s"] is not None
+                ]
+            ),
+            "residual_reap_s": _summary(
+                [
+                    float(sample["residual_reap_s"])
+                    for sample in bucket_samples
+                    if sample["residual_reap_s"] is not None
+                ]
+            ),
+            "ready_coverage": _remaining_coverage(bucket_samples, "ready"),
+            "reap_coverage": _remaining_coverage(bucket_samples, "reap"),
+        }
+
+    return {
+        "definition": (
+            "For each Gate-2 admission snapshot and active request, residual_ready_s and "
+            "residual_reap_s use only later GEN events in the identical input source and "
+            "clock domain. CTX timestamps are never used."
+        ),
+        "active_decision_samples": len(samples),
+        "active_request_ids_omitted": active_request_ids_omitted,
+        "identity_coverage": {
+            "observed": len(samples),
+            "omitted": active_request_ids_omitted,
+            "fraction": _safe_ratio(
+                len(samples),
+                len(samples) + active_request_ids_omitted,
+            ),
+        },
+        "unique_requests": len({str(sample["request"]) for sample in samples}),
+        "samples": samples,
+        "residual_ready_s": _summary(
+            [
+                float(sample["residual_ready_s"])
+                for sample in samples
+                if sample["residual_ready_s"] is not None
+            ]
+        ),
+        "residual_reap_s": _summary(
+            [
+                float(sample["residual_reap_s"])
+                for sample in samples
+                if sample["residual_reap_s"] is not None
+            ]
+        ),
+        "active_age_s": _summary(
+            [
+                float(sample["active_age_s"])
+                for sample in samples
+                if sample["active_age_s"] is not None
+            ]
+        ),
+        "ready_coverage": _remaining_coverage(samples, "ready"),
+        "reap_coverage": _remaining_coverage(samples, "reap"),
+        "by_active_age_bucket": by_age_bucket,
+    }
+
+
+def _remaining_endpoint_censor_reason(
+    request: str,
+    domain: tuple[str, str, str, str, str],
+    tag: str | tuple[str, ...],
+    decision_time_s: float,
+    tags: dict[str, list[_LifecycleMark]],
+    tag_domains: dict[tuple[str, str], set[tuple[str, str, str, str, str]]],
+) -> str:
+    endpoint_tags = (tag,) if isinstance(tag, str) else tag
+    endpoint_name = tag if isinstance(tag, str) else "ready"
+    same_domain = [mark for endpoint_tag in endpoint_tags for mark in tags.get(endpoint_tag, ())]
+    if any(mark.time_s < decision_time_s for mark in same_domain):
+        return f"{endpoint_name}_precedes_decision"
+    other_domains = {
+        candidate
+        for endpoint_tag in endpoint_tags
+        for candidate in tag_domains.get((request, endpoint_tag), ())
+        if candidate != domain
+    }
+    if any(candidate[0] != domain[0] for candidate in other_domains):
+        return f"{endpoint_name}_in_other_log_source"
+    if other_domains:
+        return f"{endpoint_name}_in_other_clock_domain"
+    return f"missing_{endpoint_name}"
+
+
+def _remaining_coverage(
+    samples: list[dict[str, object]],
+    endpoint: str,
+) -> dict[str, object]:
+    residual_field = f"residual_{endpoint}_s"
+    reason_field = f"{endpoint}_censor_reason"
+    observed = sum(sample.get(residual_field) is not None for sample in samples)
+    reasons = Counter(
+        str(sample[reason_field])
+        for sample in samples
+        if sample.get(residual_field) is None and sample.get(reason_field) is not None
+    )
+    return {
+        "eligible": len(samples),
+        "observed": observed,
+        "censored": len(samples) - observed,
+        "censor_reasons": dict(sorted(reasons.items())),
+    }
+
+
+def _known_backlog_release_analysis(ranks: dict[str, object]) -> dict[str, object]:
+    samples: list[dict[str, object]] = []
+    for rank, rank_analysis in ranks.items():
+        if not isinstance(rank_analysis, dict):
+            continue
+        release_analysis = rank_analysis.get("release_to_admission")
+        if not isinstance(release_analysis, dict):
+            continue
+        by_source = release_analysis.get("by_source")
+        if not isinstance(by_source, dict):
+            continue
+        for release_source, source_analysis in by_source.items():
+            if not isinstance(source_analysis, dict):
+                continue
+            source_samples = source_analysis.get("samples")
+            if not isinstance(source_samples, list):
+                continue
+            for sample in source_samples:
+                if isinstance(sample, dict) and not sample.get("backlog_identity_unknown", True):
+                    samples.append(
+                        {
+                            "rank": rank,
+                            "release_source": release_source,
+                            **sample,
+                        }
+                    )
+
+    return {
+        "known_backlog_only": True,
+        "samples": samples,
+        "release_samples": len(samples),
+        "next_decision_coverage": {
+            "observed": sum(sample.get("decision_gap_s") is not None for sample in samples),
+            "censored": sum(sample.get("decision_gap_s") is None for sample in samples),
+        },
+        "successful_admission_coverage": {
+            "observed": sum(
+                sample.get("successful_admission_gap_s") is not None for sample in samples
+            ),
+            "censored": sum(sample.get("successful_admission_gap_s") is None for sample in samples),
+        },
+        "release_to_next_decision_s": _summary(
+            [
+                float(sample["decision_gap_s"])
+                for sample in samples
+                if sample.get("decision_gap_s") is not None
+            ]
+        ),
+        "release_to_successful_admission_s": _summary(
+            [
+                float(sample["successful_admission_gap_s"])
+                for sample in samples
+                if sample.get("successful_admission_gap_s") is not None
+            ]
+        ),
+    }
+
+
+def _parse_request_ids(value: str | None) -> list[str]:
+    if value is None:
+        return []
+    request_ids: list[str] = []
+    for item in value.strip("[](){}").split(","):
+        token = item.strip()
+        if not token or token in {"-", "none", "None", "null"}:
+            continue
+        request = token.split(":", 1)[0].strip()
+        if request and request not in {"-", "none", "None", "null"}:
+            request_ids.append(request)
+    return request_ids
+
+
+def _event_correlation_request(event: DiagnosticEvent) -> str | None:
+    for field in (
+        "context_request",
+        "context_request_id",
+        "disagg_request",
+        "disagg_request_id",
+    ):
+        request = event.fields.get(field)
+        if request not in {None, "", "-", "-1", "0"}:
+            return request
+    for field in ("request", "request_id"):
+        request = event.fields.get(field)
+        if request not in {None, "", "-", "-1"}:
+            return request
+    return None
+
+
+def _event_local_request(event: DiagnosticEvent) -> str | None:
+    for field in ("local_request", "local_request_id", "request", "request_id"):
+        request = event.fields.get(field)
+        if request not in {None, "", "-", "-1"}:
+            return request
+    return None
+
+
+def _normalize_diag_token(value: str) -> str:
+    return value.strip().lower().replace("_", "-")
+
+
+def _event_role(event: DiagnosticEvent, category: str, action: str) -> str:
+    explicit_role = _normalize_diag_token(event.fields.get("role", ""))
+    if explicit_role in {"ctx", "context", "sender"}:
+        return "ctx"
+    if explicit_role in {"gen", "generation", "receiver"}:
+        return "gen"
+    if category in {"ctx-transfer", "sender-transfer"}:
+        return "ctx"
+    if category in {
+        "gen-arrival",
+        "gen-activation",
+        "gate1",
+        "gate-1",
+        "decision",
+        "admission",
+        "gate2",
+        "gate-2",
+        "submit",
+        "receiver-transfer",
+        "receiver-slot",
+        "reap",
+        "gen-service",
+        "status-poll",
+    }:
+        return "gen"
+    if category == "python-transfer":
+        if action in _CTX_ACTIONS:
+            return "ctx"
+        if action in _GEN_ACTIONS or action in _TERMINAL_ACTIONS:
+            return "gen"
+    return "unknown"
+
+
+def _event_host(event: DiagnosticEvent) -> str:
+    return (
+        event.fields.get("host")
+        or event.fields.get("hostname")
+        or event.fields.get("node")
+        or "<unspecified>"
+    )
+
+
+def _event_clock(event: DiagnosticEvent) -> str:
+    return event.fields.get("clock_domain") or event.fields.get("clock") or "local_steady"
+
+
+def _event_domain(event: DiagnosticEvent) -> tuple[str, str, str, str, str]:
+    category = _normalize_diag_token(event.category)
+    action = _normalize_diag_token(event.fields.get("action", ""))
+    return (
+        event.source or "<in-memory>",
+        _event_host(event),
+        _event_role(event, category, action),
+        event.rank,
+        _event_clock(event),
+    )
+
+
+def _lifecycle_domain(mark: _LifecycleMark) -> tuple[str, str, str, str, str]:
+    return mark.log_source, mark.host, mark.role, mark.rank, mark.clock
+
+
+def _clock_domain_label(domain: tuple[str, str, str, str, str]) -> str:
+    source, host, role, rank, clock = domain
+    return f"{source}::host={host}::role={role}::rank={rank}::clock={clock}"
+
+
+def _active_age_bucket(active_age_s: float | None) -> str:
+    if active_age_s is None or active_age_s < 0.0:
+        return "unknown"
+    for upper_bound, label in _ACTIVE_AGE_BUCKETS:
+        if active_age_s < upper_bound:
+            return label
+    return "unknown"
+
+
 def _collect_admissions(events: list[DiagnosticEvent]) -> tuple[list[Admission], dict[str, float]]:
     admissions: list[Admission] = []
     request_blocks: dict[str, float] = {}
@@ -724,6 +1669,18 @@ def _collect_admissions(events: list[DiagnosticEvent]) -> tuple[list[Admission],
                 candidate_requests=tuple(candidate_requests),
                 admitted_requests=tuple(request for request, _ in admitted_request_blocks),
                 deferred_requests=tuple(request for request, _ in deferred_request_blocks),
+                candidate_requests_omitted=max(
+                    0,
+                    _as_int(event.fields.get("candidate_requests_omitted")) or 0,
+                ),
+                admitted_requests_omitted=max(
+                    0,
+                    _as_int(event.fields.get("admitted_requests_omitted")) or 0,
+                ),
+                deferred_requests_omitted=max(
+                    0,
+                    _as_int(event.fields.get("deferred_requests_omitted")) or 0,
+                ),
             )
         )
     admissions.sort(key=lambda admission: admission.time_s)
@@ -839,7 +1796,8 @@ def _collect_unsuccessful_requests(events: list[DiagnosticEvent]) -> set[str]:
     return {
         request
         for event in events
-        if (request := event.fields.get("request")) is not None and _event_outcome(event) is False
+        if (request := _event_correlation_request(event)) is not None
+        and _event_outcome(event) is False
     }
 
 
@@ -860,14 +1818,30 @@ def _event_outcome(event: DiagnosticEvent) -> bool | None:
         return False
 
     action = event.fields.get("action", "").lower()
-    if event.category == "receiver-transfer" and action in {
+    transfer_categories = {
+        "ctx-transfer",
+        "gen-transfer",
+        "sender-transfer",
+        "receiver-transfer",
+        "python-transfer",
+    }
+    if event.category in transfer_categories and action in {
         "failed",
+        "failure",
         "cancelled",
         "canceled",
         "aborted",
         "timeout",
+        "timed-out",
     }:
         return False
+    if event.category in transfer_categories and action in {
+        "completed",
+        "complete",
+        "success",
+        "succeeded",
+    }:
+        return True
 
     state = event.fields.get("state", "").upper()
     if any(marker in state for marker in ("ERROR", "FAIL", "CANCEL", "TIMEOUT")):
@@ -978,7 +1952,7 @@ def _match_slot_intervals(
             if acquired.time_s > event.time_s:
                 unmatched_releases += 1
                 continue
-            request = acquired.fields.get("request") or event.fields.get("request")
+            request = _event_correlation_request(acquired) or _event_correlation_request(event)
             if request is None:
                 continue
             intervals.append(
@@ -1302,7 +2276,7 @@ def _backlog_request_ids_at(admissions: list[Admission], time_s: float) -> set[s
         (candidate for candidate in reversed(admissions) if candidate.time_s <= time_s),
         None,
     )
-    if admission is None or admission.deferred <= 0:
+    if admission is None or admission.deferred <= 0 or admission.deferred_requests_omitted > 0:
         return set()
     return set(admission.deferred_requests)
 
@@ -1387,6 +2361,8 @@ def _fixed_multiplier_counterfactual(
             or admission.active_blocks is None
             or admission.budget_blocks is None
             or not admission.candidate_requests
+            or admission.candidate_requests_omitted > 0
+            or admission.deferred_requests_omitted > 0
         ):
             continue
 

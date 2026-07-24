@@ -31,10 +31,23 @@ _SPEC.loader.exec_module(_TELEMETRY)
 analyze_events = _TELEMETRY.analyze_events
 main = _TELEMETRY.main
 parse_diagnostic_line = _TELEMETRY.parse_diagnostic_line
+DiagnosticEvent = _TELEMETRY.DiagnosticEvent
 
 
 def _parse_lines(lines: list[str]):
     return [event for line in lines if (event := parse_diagnostic_line(line)) is not None]
+
+
+def _parse_source_line(line: str, source: str):
+    event = parse_diagnostic_line(line)
+    assert event is not None
+    return DiagnosticEvent(
+        event.category,
+        event.time_s,
+        event.rank,
+        event.fields,
+        source,
+    )
 
 
 def test_parse_diagnostic_line_accepts_rank_prefix_and_ignores_malformed_lines():
@@ -258,7 +271,8 @@ def test_failed_transfer_contributes_no_service_or_release_samples():
             "manager=0xabc buffer=1",
             "[DISAGG_DIAG][reap] t=0.7 rank=0 request=9 blocks=4 outcome=failed "
             "state=DISAGG_TRANS_ERROR",
-            "[DISAGG_DIAG][receiver-transfer] t=0.8 rank=0 action=failed request=9",
+            "[DISAGG_DIAG][receiver-transfer] t=0.8 rank=0 action=failed "
+            "request=7 context_request=9",
         ]
     )
 
@@ -367,3 +381,95 @@ def test_multi_log_block_lookup_is_scoped_by_source(tmp_path, capsys):
 
     assert output["ranks"][f"{ctx_log}::rank=1"]["service"]["completed_blocks"] == 4
     assert output["ranks"][f"{gen_log}::rank=1"]["service"]["completed_blocks"] == 2
+
+
+def test_cpp_lifecycle_and_remaining_work_use_same_domain_completion():
+    source = "gen-worker.log"
+    events = [
+        _parse_source_line(line, source)
+        for line in [
+            "[DISAGG_DIAG][gen-arrival] t=0.0 rank=0 request=42",
+            "[DISAGG_DIAG][gen-activation] t=0.1 rank=0 request=42",
+            "[DISAGG_DIAG][decision] t=0.2 rank=0 sequence=1 "
+            "active_requests=- candidate_requests=42:8 admitted_requests=42:8 "
+            "deferred_requests=- admitted=1 deferred=0 budget=8",
+            "[DISAGG_DIAG][submit] t=0.25 rank=0 request=42 blocks=8",
+            "[DISAGG_DIAG][receiver-transfer] t=0.3 rank=0 "
+            "action=request-info-submitted request=7 context_request=42",
+            "[DISAGG_DIAG][decision] t=0.4 rank=0 sequence=2 "
+            "active_requests=42:8 candidate_requests=- admitted_requests=- "
+            "deferred_requests=- admitted=0 deferred=0 budget=8",
+            "[DISAGG_DIAG][receiver-transfer] t=0.9 rank=0 "
+            "action=completed request=7 context_request=42",
+            "[DISAGG_DIAG][reap] t=1.0 rank=0 request=42 blocks=8 outcome=completed",
+            "[DISAGG_DIAG][gen-service] t=1.05 rank=0 action=decode-start-proxy request=42",
+        ]
+    ]
+
+    result = analyze_events(events)
+    remaining = result["remaining_work_ground_truth"]
+    sample = remaining["samples"][0]
+
+    assert sample["request"] == "42"
+    assert sample["active_age_s"] == pytest.approx(0.15)
+    assert sample["residual_ready_s"] == pytest.approx(0.5)
+    assert sample["ready_kind"] == "receiver-transfer:completed"
+    assert sample["residual_reap_s"] == pytest.approx(0.6)
+    assert remaining["ready_coverage"] == {
+        "eligible": 1,
+        "observed": 1,
+        "censored": 0,
+        "censor_reasons": {},
+    }
+    lifecycle = result["lifecycle"]["interval_coverage"]
+    assert lifecycle["gen_arrival_to_activation"]["duration_s"]["p50"] == pytest.approx(0.1)
+    assert lifecycle["gen_activation_to_first_gate2"]["duration_s"]["p50"] == pytest.approx(0.1)
+    assert lifecycle["gate2_admit_to_submit"]["duration_s"]["p50"] == pytest.approx(0.05)
+    assert lifecycle["submit_to_request_info"]["duration_s"]["p50"] == pytest.approx(0.05)
+    assert lifecycle["ready_to_reap"]["duration_s"]["p50"] == pytest.approx(0.1)
+    assert lifecycle["gen_arrival_to_decode_start"]["duration_s"]["p50"] == pytest.approx(1.05)
+    assert lifecycle["ready_to_decode_start"]["duration_s"]["p50"] == pytest.approx(0.15)
+    assert lifecycle["reap_to_decode_start"]["duration_s"]["p50"] == pytest.approx(0.05)
+
+
+def test_remaining_work_censors_cross_source_endpoints():
+    events = [
+        _parse_source_line(
+            "[DISAGG_DIAG][decision] t=1.0 rank=0 sequence=1 "
+            "active_requests=42:8 admitted=0 deferred=1 budget=8",
+            "scheduler.log",
+        ),
+        _parse_source_line(
+            "[DISAGG_DIAG][receiver-transfer] t=1.1 rank=0 "
+            "action=completed request=7 context_request=42",
+            "receiver.log",
+        ),
+        _parse_source_line(
+            "[DISAGG_DIAG][reap] t=1.2 rank=0 request=42 outcome=completed",
+            "receiver.log",
+        ),
+    ]
+
+    sample = analyze_events(events)["remaining_work_ground_truth"]["samples"][0]
+
+    assert sample["residual_ready_s"] is None
+    assert sample["ready_censor_reason"] == "ready_in_other_log_source"
+    assert sample["residual_reap_s"] is None
+    assert sample["reap_censor_reason"] == "reap_in_other_log_source"
+
+
+def test_cpp_global_ready_timestamp_is_not_subtracted_from_local_reap_clock():
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][decision] t=0.5 rank=0 sequence=1 "
+            "active_requests=42:8 admitted=0 deferred=1 budget=8",
+            "[DISAGG_DIAG][reap] t=1.0 rank=0 request=42 ready_t=100.0 "
+            "ready_time_source=cpp-global ready_to_reap_ms=2.0 outcome=completed",
+        ]
+    )
+
+    sample = analyze_events(events)["remaining_work_ground_truth"]["samples"][0]
+
+    assert sample["residual_ready_s"] is None
+    assert sample["ready_censor_reason"] == "missing_ready"
+    assert sample["residual_reap_s"] == pytest.approx(0.5)

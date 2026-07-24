@@ -1207,6 +1207,11 @@ def executor_request_to_llm_request(
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)
+    disagg_executor_arrival_time = getattr(
+        executor_request, "py_disagg_gen_executor_arrival_time_s", None)
+    if disagg_executor_arrival_time is not None:
+        llm_request.py_disagg_gen_executor_arrival_time_s = (
+            disagg_executor_arrival_time)
     llm_request.py_conversation_params = getattr(executor_request,
                                                  "py_conversation_params", None)
     if child_req_ids:

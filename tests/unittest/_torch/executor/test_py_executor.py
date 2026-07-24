@@ -547,7 +547,15 @@ class TestDisaggTransferAdmissionController:
         PyExecutor._apply_disagg_transfer_admission(executor, [candidate])
         PyExecutor._apply_disagg_transfer_admission(executor, [candidate])
 
-        assert log_info.call_count == 3
+        assert log_info.call_count == 4
+        gate1_messages = [
+            call.args[0]
+            for call in log_info.call_args_list
+            if "[DISAGG_DIAG][gate1]" in call.args[0]
+        ]
+        assert len(gate1_messages) == 1
+        assert "sequence=1" in gate1_messages[0]
+        assert "fitting_requests=2:1" in gate1_messages[0]
         decision_messages = [
             call.args[0]
             for call in log_info.call_args_list
@@ -556,6 +564,8 @@ class TestDisaggTransferAdmissionController:
         assert len(decision_messages) == 2
         assert "sequence=1" in decision_messages[0]
         assert "sequence=2" in decision_messages[1]
+        assert "active_requests=1:1" in decision_messages[0]
+        assert "deferred_requests=2:1" in decision_messages[0]
         message = next(
             call.args[0]
             for call in log_info.call_args_list
@@ -568,6 +578,34 @@ class TestDisaggTransferAdmissionController:
         assert "candidate_requests=2:1" in message
         assert "deferred_requests=2:1" in message
         assert "budget=1" in message
+
+    def test_apply_logs_gate1_when_no_request_fits(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+        monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+        log_info = Mock()
+        monkeypatch.setattr(py_executor_module.logger, "info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=0)
+        executor.kv_cache_transceiver = Mock()
+        waiting = _make_disagg_transfer_request(4, 64)
+        waiting.state = LlmRequestState.DISAGG_GENERATION_INIT
+        executor.active_requests = [waiting]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=64, tokens_per_block=32
+        )
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(executor, [])
+
+        assert admitted == []
+        assert not wait_for_progress
+        gate1_message = next(
+            call.args[0]
+            for call in log_info.call_args_list
+            if "[DISAGG_DIAG][gate1]" in call.args[0]
+        )
+        assert "waiting_requests=4:2" in gate1_message
+        assert "fitting_requests=-" in gate1_message
+        assert "blocked_requests=4:2" in gate1_message
 
     def test_apply_missing_controller_preserves_candidates(self):
         executor = object.__new__(PyExecutor)
@@ -649,6 +687,113 @@ class TestDisaggTransferAdmissionController:
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferIdleProgress:
+    def test_generation_ingress_diagnostics_off_is_noop(self, monkeypatch):
+        monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False)
+        now = Mock()
+        monkeypatch.setattr(py_executor_module, "get_steady_clock_now_in_seconds", now)
+        executor = object.__new__(PyExecutor)
+        request = Mock(
+            spec=["request_type"],
+            request_type=py_executor_module.RequestType.REQUEST_TYPE_GENERATION_ONLY,
+        )
+
+        PyExecutor._log_disagg_gen_ingress(executor, [RequestQueueItem(701, request)])
+
+        now.assert_not_called()
+        assert not hasattr(request, "py_disagg_gen_executor_arrival_time_s")
+
+    def test_logs_generation_executor_ingress(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+        monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+        monkeypatch.setattr(
+            py_executor_module,
+            "get_steady_clock_now_in_seconds",
+            lambda: 12.0,
+        )
+        log_info = Mock()
+        monkeypatch.setattr(py_executor_module.logger, "info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=2)
+        request = Mock(request_type=py_executor_module.RequestType.REQUEST_TYPE_GENERATION_ONLY)
+        item = RequestQueueItem(701, request)
+
+        PyExecutor._log_disagg_gen_ingress(executor, [item])
+
+        assert request.py_disagg_gen_executor_arrival_time_s == 12.0
+        message = log_info.call_args.args[0]
+        assert "[DISAGG_DIAG][gen-arrival]" in message
+        assert "rank=2" in message
+        assert "request=701" in message
+        assert "boundary=executor-queue-to-waiting-queue" in message
+
+    def test_logs_generation_executor_activation_with_common_id(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+        monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+        monkeypatch.setattr(
+            py_executor_module,
+            "get_steady_clock_now_in_seconds",
+            lambda: 12.5,
+        )
+        log_info = Mock()
+        monkeypatch.setattr(py_executor_module.logger, "info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=2)
+        request = _make_disagg_transfer_request(7, 64)
+        request.state = LlmRequestState.DISAGG_GENERATION_INIT
+        request.py_disaggregated_params = Mock(disagg_request_id=701)
+        request.py_disagg_gen_executor_arrival_time_s = 12.0
+
+        PyExecutor._log_disagg_gen_activations(executor, [request])
+
+        assert request.py_disagg_gen_executor_activation_time_s == 12.5
+        message = log_info.call_args.args[0]
+        assert "[DISAGG_DIAG][gen-activation]" in message
+        assert "rank=2" in message
+        assert "request=701" in message
+        assert "local_request=7" in message
+        assert "ingress_to_activation_ms=500.000000" in message
+        assert "state=DISAGG_GENERATION_INIT" in message
+
+    def test_decode_proxy_uses_global_clock_for_cpp_completion(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+        monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+        monkeypatch.setattr(
+            py_executor_module,
+            "get_steady_clock_now_in_seconds",
+            lambda: 10.0,
+        )
+        monkeypatch.setattr(
+            py_executor_module,
+            "_get_global_steady_clock_now_in_seconds",
+            lambda: 100.003,
+        )
+        log_info = Mock()
+        monkeypatch.setattr(py_executor_module.logger, "info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=2)
+        executor.resource_manager = Mock()
+        executor.resource_manager.resource_managers = {ResourceManagerType.SEQ_SLOT_MANAGER: Mock()}
+        executor._setup_sampler_step = Mock()
+        executor.model_engine = Mock(enable_spec_decode=False)
+        executor.kv_cache_transceiver = None
+        request = _make_disagg_transfer_request(7, 64)
+        request.is_disagg_generation_transmission_complete = True
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        request.py_disagg_gen_executor_arrival_time_s = 9.0
+        request.py_kv_transfer_ready_time_s = None
+        request.kv_cache_transfer_end = Mock(total_seconds=Mock(return_value=100.0))
+        request.context_phase_params = Mock(first_gen_tokens=[], draft_tokens=[])
+        request.prompt_len = 64
+        scheduled_batch = Mock(generation_requests=[request])
+
+        PyExecutor._prepare_disagg_gen_transmission_complete(executor, scheduled_batch)
+
+        message = log_info.call_args.args[0]
+        assert "[DISAGG_DIAG][gen-service]" in message
+        assert "ready_time_source=cpp-global" in message
+        assert "arrival_to_decode_ms=1000.000000" in message
+        assert "ready_to_decode_ms=3.000000" in message
+
     def test_gen_transfer_status_polls_active_transfers(self):
         executor = object.__new__(PyExecutor)
         executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
@@ -692,11 +837,109 @@ class TestDisaggTransferIdleProgress:
         assert "bytes=4096" in message
         assert "submit_call_ms=2.000000" in message
 
+    def test_context_send_emits_queued_boundary(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+        monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+        timestamps = iter((10.0, 10.002))
+        monkeypatch.setattr(
+            py_executor_module,
+            "get_steady_clock_now_in_seconds",
+            lambda: next(timestamps),
+        )
+        log_info = Mock()
+        monkeypatch.setattr(py_executor_module.logger, "info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=0)
+        executor.kv_cache_manager = Mock()
+        executor.async_transfer_manager = Mock()
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=None)
+        executor.kv_connector_manager = None
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        request = _make_disagg_transfer_request(17, 64)
+        request.is_context_only_request = True
+        request.is_context_finished = True
+        request.is_finished_due_to_length = False
+        request.is_finished_due_to_cancellation = False
+        request.state = LlmRequestState.CONTEXT_INIT
+
+        PyExecutor._send_kv_async(executor, [request])
+
+        executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(request)
+        assert request.py_disagg_ctx_send_queued_time_s == 10.002
+        message = log_info.call_args.args[0]
+        assert "[DISAGG_DIAG][ctx-transfer]" in message
+        assert "action=queued" in message
+        assert "request=17" in message
+        assert "submit_call_ms=2.000000" in message
+
+    def test_context_status_emits_completed_reap(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+        monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+        timestamps = iter((10.0, 10.002, 10.003))
+        monkeypatch.setattr(
+            py_executor_module,
+            "get_steady_clock_now_in_seconds",
+            lambda: next(timestamps),
+        )
+        log_info = Mock()
+        monkeypatch.setattr(py_executor_module.logger, "info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=0)
+        request = _make_disagg_transfer_request(17, 64)
+        request.py_disagg_ctx_send_queued_time_s = 9.9
+        request.py_kv_transfer_timed_out = False
+        executor.kv_cache_transceiver = Mock()
+        executor.kv_cache_transceiver.check_context_transfer_status.return_value = (
+            [17],
+            [],
+        )
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.requests_in_transfer.return_value = {17: request}
+        executor._end_transfer_and_maybe_terminate = Mock()
+        executor._check_cache_transfer_errors = Mock()
+        executor._disagg_timed_out_ctx_cancelled_ids = set()
+
+        PyExecutor._check_disagg_ctx_cache_transfer_status(executor, 0)
+
+        message = log_info.call_args.args[0]
+        assert "[DISAGG_DIAG][ctx-transfer]" in message
+        assert "action=reaped" in message
+        assert "outcome=completed" in message
+        assert "queued_to_reap_ms=103.000000" in message
+        assert "poll_call_ms=2.000000" in message
+
+    def test_transfer_timeout_emits_terminal_boundary(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+        monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+        monkeypatch.setattr(py_executor_module.time, "monotonic", lambda: 20.050)
+        log_info = Mock()
+        monkeypatch.setattr(py_executor_module.logger, "info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=0)
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=10)
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.requests_in_transfer.return_value = {}
+        executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        request = _make_disagg_transfer_request(19, 64, in_progress=True)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        request.py_kv_transfer_start_time = 20.0
+        request.py_kv_transfer_timed_out = False
+        executor.active_requests = [request]
+
+        PyExecutor._check_kv_transfer_timeout(executor)
+
+        assert request.py_kv_transfer_timed_out
+        message = log_info.call_args.args[0]
+        assert "[DISAGG_DIAG][gen-transfer]" in message
+        assert "action=timeout" in message
+        assert "request=19" in message
+        assert "timeout_ms=10" in message
+
     @pytest.mark.parametrize(
         ("python_ready_time", "cpp_ready_time", "ready_time_source"),
         [
             (9.5, None, "python-local"),
-            (0.0, 9.5, "cpp-local"),
+            (0.0, 9.5, "cpp-global"),
         ],
     )
     def test_transfer_status_emits_ready_to_reap_delay(
@@ -713,6 +956,11 @@ class TestDisaggTransferIdleProgress:
         timestamps = iter((10.0, 10.1))
         monkeypatch.setattr(
             py_executor_module, "get_steady_clock_now_in_seconds", lambda: next(timestamps)
+        )
+        monkeypatch.setattr(
+            py_executor_module,
+            "_get_global_steady_clock_now_in_seconds",
+            lambda: 10.1,
         )
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(rank=0)
