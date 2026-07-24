@@ -260,6 +260,7 @@ def compact(
 ) -> None:
     """Pack each cache's move sources and fire its native compacts, in order
     (pure mover: the caller owns the decision rows and the round's completion ordering)."""
+    # One launch per (cache, pool group); each launch covers every layer in the group.
     for cache_params in params:
         _pack_move_sources_kernel[(request_count, cache_params.decision_rows)](
             *cache_params.pack_args, **cache_params.pack_constexprs
