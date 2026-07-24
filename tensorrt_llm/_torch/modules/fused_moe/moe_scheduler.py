@@ -374,8 +374,14 @@ class ExternalCommMoEScheduler(MoEScheduler):
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
         # ========== Step 2: Apply routing ==========
+        # External dispatch (Step 5) sends per-token expert/scale payloads, so
+        # routing must be precomputed whenever a comm strategy is active — even
+        # for backends whose run_moe can otherwise route internally from
+        # router_logits (e.g. MarlinFusedMoE under attention-DP + EP).
         requires_separated_routing = (
-            moe.backend._supports_load_balancer() or moe.routing_method.requires_separated_routing
+            moe.backend._supports_load_balancer()
+            or moe.routing_method.requires_separated_routing
+            or moe.comm is not None
         )
         if requires_separated_routing:
             # Separated routing: ConfigurableMoE calls routing_method

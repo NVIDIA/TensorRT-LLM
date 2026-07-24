@@ -125,6 +125,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         vectorized_f32: bool,
         use_prefetch: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
+        indexer_q_fusion: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel with fused activation.
 
@@ -182,19 +183,28 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
 
         self.vectorized_f32 = vectorized_f32
         self.activation_type = activation_type
+        self.indexer_q_fusion = indexer_q_fusion
         self.is_gated = is_gated_activation(activation_type)
         # Precompute per-activation flags as plain Python bools so the epilogue
         # dispatch can use cutlass.const_expr(...) on them (like is_gated). An
         # inline enum comparison inside @cute.jit is not folded as a constant.
         self._act_is_swiglu = activation_type == ActivationType.Swiglu
         self._act_is_gelu = activation_type == ActivationType.Gelu
+        self._act_is_identity = activation_type == ActivationType.Identity
         # Host-side guard (raise is not allowed inside the @cute.kernel epilogue):
         # only SwiGLU and GELU(tanh) are wired in the fused epilogue.
-        if not (self._act_is_swiglu or self._act_is_gelu):
+        if not (self._act_is_swiglu or self._act_is_gelu or self._act_is_identity):
             raise NotImplementedError(
                 f"Fused epilogue activation {activation_type} not implemented "
-                f"(only Swiglu and Gelu are wired)."
+                f"(only Swiglu, Gelu, and the indexer-Q identity epilogue are wired)."
             )
+        if self.indexer_q_fusion:
+            if activation_type != ActivationType.Identity:
+                raise ValueError("indexer_q_fusion requires ActivationType.Identity")
+            if sf_vec_size != 32 or mma_tiler_mn[1] != 128:
+                raise ValueError(
+                    "indexer_q_fusion requires MXF8 sf_vec_size=32 and a 128-column MMA tile"
+                )
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -298,7 +308,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         self.is_b_mcast = self.num_mcast_ctas_b > 1
         self.is_sfb_mcast = self.num_mcast_ctas_sfb > 1
 
-        # SwiGLU: hardcoded epilogue tile matching grouped swiglu variant
+        # SwiGLU: hardcoded epilogue tile matching grouped swiglu variant.
         self.epi_tile = (128, 64)
         self.epi_tile_cnt = (
             self.cta_tile_shape_mnk_c[0] // self.epi_tile[0],
@@ -389,6 +399,9 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         sfc_tensor: Optional[cute.Tensor] = None,
         norm_const_tensor: Optional[cute.Tensor] = None,
         bias_tensor: Optional[cute.Tensor] = None,
+        indexer_scale_tensor: Optional[cute.Tensor] = None,
+        position_ids_tensor: Optional[cute.Tensor] = None,
+        cos_sin_cache_tensor: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation with SwiGLU fusion in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -444,6 +457,20 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
 
         # Setup sfc tensor by filling C tensor to scale factor atom layout
         self.generate_sfc = sfc_tensor is not None and norm_const_tensor is not None
+        if cutlass.const_expr(
+            self.indexer_q_fusion
+            and (
+                not self.generate_sfc
+                or self.c_dtype != cutlass.Float4E2M1FN
+                or indexer_scale_tensor is None
+                or position_ids_tensor is None
+                or cos_sin_cache_tensor is None
+            )
+        ):
+            raise ValueError(
+                "indexer_q_fusion requires FP4 C, SFC generation, contiguous "
+                "output scales, position IDs, and a cos/sin cache"
+            )
         if cutlass.const_expr(self.generate_sfc):
             sfc_layout = blockscaled_utils.tile_atom_to_shape_SF(c_tensor.shape, self.sf_vec_size)
             sfc_tensor = cute.make_tensor(sfc_tensor.iterator, sfc_layout)
@@ -621,6 +648,9 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
             sfc_tensor,
             norm_const_tensor,
             bias_tensor,
+            indexer_scale_tensor,
+            position_ids_tensor,
+            cos_sin_cache_tensor,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -662,6 +692,9 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         mSFC_mnl: Optional[cute.Tensor],
         norm_const_tensor: Optional[cute.Tensor],
         mBias_mnl: Optional[cute.Tensor],
+        mIndexerScale: Optional[cute.Tensor],
+        mPositionIds: Optional[cute.Tensor],
+        mCosSinCache: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1365,6 +1398,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                 tTR_rAcc_up,
                 tTR_rAcc_gate,
                 tTR_gBias_base,
+                tTR_cC,
             ) = self.epilog_tmem_copy_and_partition(
                 epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs, tCgBias
             )
@@ -1503,6 +1537,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                 # up * silu(gate)
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                packed_indexer_scale = cutlass.Uint32(0)
 
                 for subtile_idx in cutlass.range(0, subtile_cnt, 2 if self.is_gated else 1):
                     if cutlass.const_expr(self.is_gated):
@@ -1568,6 +1603,60 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                         self._apply_gelu_epilogue(
                             acc_vec_up, alpha_val, tCompute, bias_vec=bias_vec
                         )
+                    elif cutlass.const_expr(self._act_is_identity):
+                        # Preserve the existing Q-projection contract: the GEMM
+                        # accumulator is rounded to BF16 before RoPE.  The
+                        # indexer-Q block below performs that boundary rounding;
+                        # this copy keeps the accumulator in FP32 until then.
+                        tCompute.store(acc_vec_up)
+
+                    if cutlass.const_expr(self.indexer_q_fusion):
+                        # The legacy path rounds GEMM output to BF16 before
+                        # RoPE, then rounds the rotated values to BF16 again.
+                        tCompute.store(tCompute.load().to(cutlass.BFloat16).to(cutlass.Float32))
+                        subtile_n_for_rope = real_subtile_idx % self.epi_tile_cnt[1]
+                        subtiles_per_head = 128 // self.epi_tile[1]
+                        rotary_subtile_begin = 64 // self.epi_tile[1]
+                        subtile_in_head = subtile_n_for_rope % subtiles_per_head
+                        if subtile_in_head >= rotary_subtile_begin:
+                            subtile_m_for_rope = real_subtile_idx // self.epi_tile_cnt[1]
+                            rope_base_m = (
+                                cur_tile_coord[0] * self.cta_tile_shape_mnk_c[0]
+                                + subtile_m_for_rope * self.epi_tile[0]
+                            )
+                            rope_m_idx = rope_base_m + tTR_cC[0][0]
+                            if rope_m_idx < mPositionIds.shape[0]:
+                                position = mPositionIds[rope_m_idx]
+                                rope_row = mCosSinCache[position, None]
+                                copy_atom_f32x8 = cute.make_copy_atom(
+                                    cute.nvgpu.CopyUniversalOp(),
+                                    cutlass.Float32,
+                                    num_bits_per_copy=256,
+                                )
+                                cos_values = cute.make_rmem_tensor((8,), cutlass.Float32)
+                                sin_values = cute.make_rmem_tensor((8,), cutlass.Float32)
+                                for chunk_idx in cutlass.range_constexpr(4):
+                                    cos_tile = cute.local_tile(rope_row, (8,), (chunk_idx,))
+                                    sin_tile = cute.local_tile(rope_row, (8,), (chunk_idx + 4,))
+                                    cute.copy(
+                                        copy_atom_f32x8,
+                                        cute.coalesce(cos_tile),
+                                        cute.coalesce(cos_values),
+                                    )
+                                    cute.copy(
+                                        copy_atom_f32x8,
+                                        cute.coalesce(sin_tile),
+                                        cute.coalesce(sin_values),
+                                    )
+                                    for pair_in_chunk in cutlass.range_constexpr(8):
+                                        pair_idx = chunk_idx * 8 + pair_in_chunk
+                                        cosine = cos_values[pair_in_chunk]
+                                        sine = sin_values[pair_in_chunk]
+                                        x = tCompute[pair_idx * 2]
+                                        y = tCompute[pair_idx * 2 + 1]
+                                        tCompute[pair_idx * 2] = cosine * x - sine * y
+                                        tCompute[pair_idx * 2 + 1] = cosine * y + sine * x
+                            tCompute.store(tCompute.load().to(cutlass.BFloat16).to(cutlass.Float32))
 
                     if cutlass.const_expr(self.generate_sfc):
                         #
@@ -1639,19 +1728,52 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                                     * norm_const
                                 )
 
-                        # TODO: need to add f32x2 -> f8x2 conversion
-                        tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
+                        # CuTe's packed f32x2 -> UE8M0 conversion currently
+                        # lowers a two-element result through vector<0xi32>.
+                        # MXF8 with sf_vec_size=32 has exactly two output scale
+                        # values per epilogue thread, so keep these conversions
+                        # scalar until that lowering is fixed upstream.
+                        if cutlass.const_expr(self.sf_vec_size == 32):
+                            for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
+                                tCrSFC[vi] = tCrSFC_pvscale[vi].to(self.sf_dtype)
+                        else:
+                            tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
 
                         #
                         # Store SFC to global memory
                         #
-                        cute.autovec_copy(tCrSFC, tCgSFC)
+                        if cutlass.const_expr(self.indexer_q_fusion):
+                            subtile_m = real_subtile_idx // self.epi_tile_cnt[1]
+                            subtile_n = real_subtile_idx % self.epi_tile_cnt[1]
+                            scale_m = (
+                                cur_tile_coord[0] * self.cta_tile_shape_mnk_c[0]
+                                + subtile_m * self.epi_tile[0]
+                                + tTR_cC[0][0]
+                            )
+                            if scale_m < mIndexerScale.shape[0]:
+                                scale_bytes = cute.recast_tensor(tCrSFC, cutlass.Uint8)
+                                for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
+                                    scale_byte_idx = subtile_n * 2 + vi
+                                    packed_indexer_scale = packed_indexer_scale | (
+                                        cutlass.Uint32(scale_bytes[vi])
+                                        << cutlass.Uint32(scale_byte_idx * 8)
+                                    )
+                        else:
+                            cute.autovec_copy(tCrSFC, tCgSFC)
 
                         #
                         # Compute quantized output values and convert to C type
                         #
-                        # TODO: need to add f8x2 -> f32x2 conversion
-                        tCrSFC_qpvscale_up = tCrSFC.load().to(cutlass.Float32)
+                        # Same two-element UE8M0 lowering issue applies in the
+                        # reverse direction.
+                        if cutlass.const_expr(self.sf_vec_size == 32):
+                            tCrSFC_qpvscale_up = cute.make_rmem_tensor(
+                                tCrSFC.shape, cutlass.Float32
+                            )
+                            for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
+                                tCrSFC_qpvscale_up[vi] = cutlass.Float32(tCrSFC[vi])
+                        else:
+                            tCrSFC_qpvscale_up = tCrSFC.load().to(cutlass.Float32)
                         fp32_max = cutlass.Float32(3.40282346638528859812e38)
                         if cutlass.const_expr(self.vectorized_f32):
                             for vi in cutlass.range_constexpr(0, cute.size(tCrSFC), 2):
@@ -1686,6 +1808,30 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
 
                         acc_vec = tiled_copy_r2s.retile(tCompute).load()
                         tRS_rC.store(acc_vec.to(self.c_dtype))
+                        if cutlass.const_expr(self.indexer_q_fusion):
+                            packed_words = cute.recast_tensor(tTR_rC, cutlass.Uint32)
+                            for word_idx in cutlass.range_constexpr(cute.size(packed_words)):
+                                packed = packed_words[word_idx]
+                                midpoint_adjust = cutlass.Uint32(0)
+                                for nibble_idx in cutlass.range_constexpr(8):
+                                    scaled_value = tCompute[word_idx * 8 + nibble_idx]
+                                    abs_value = cute.arch.fmax(scaled_value, -scaled_value)
+                                    nibble_adjust = cutlass.Uint32(1) << (nibble_idx * 4)
+                                    if abs_value == cutlass.Float32(0.75):
+                                        midpoint_adjust = midpoint_adjust | nibble_adjust
+                                    if abs_value == cutlass.Float32(1.75):
+                                        midpoint_adjust = midpoint_adjust | nibble_adjust
+                                    if abs_value == cutlass.Float32(3.5):
+                                        midpoint_adjust = midpoint_adjust | nibble_adjust
+                                packed = packed - midpoint_adjust
+                                magnitude = packed & cutlass.Uint32(0x77777777)
+                                nonzero_sign = (
+                                    (magnitude | (magnitude << 1) | (magnitude << 2))
+                                    & cutlass.Uint32(0x44444444)
+                                ) << 1
+                                packed_words[word_idx] = packed & (
+                                    cutlass.Uint32(0x77777777) | nonzero_sign
+                                )
                     else:
                         #
                         # Convert to C type (non-SFC path)
@@ -1732,6 +1878,10 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=epilog_threads,
                     )
+                if cutlass.const_expr(self.indexer_q_fusion and self.generate_sfc):
+                    scale_m = cur_tile_coord[0] * self.cta_tile_shape_mnk_c[0] + tTR_cC[0][0]
+                    if scale_m < mIndexerScale.shape[0]:
+                        mIndexerScale[scale_m, cur_tile_coord[1], 0] = packed_indexer_scale
 
                 #
                 # Async arrive accumulator buffer empty
@@ -1944,7 +2094,14 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         epi_tile: cute.Tile,
         use_2cta_instrs: Union[cutlass.Boolean, bool],
         tCgBias: Optional[cute.Tensor] = None,
-    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor, Optional[cute.Tensor]]:
+    ) -> Tuple[
+        cute.TiledCopy,
+        cute.Tensor,
+        cute.Tensor,
+        cute.Tensor,
+        Optional[cute.Tensor],
+        cute.Tensor,
+    ]:
         """
         Make tiledCopy for tensor memory load, then use it to partition tensor memory
         (source) and register array (destination).
@@ -2007,6 +2164,8 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         tTR_rAcc_gate = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
+        cC = cute.make_identity_tensor(epi_tile)
+        tTR_cC = thr_copy_t2r.partition_D(cC)
 
         # Partition the per-N bias EXACTLY like C (broadcast over M via stride 0).
         # Same flat_divide + partition_D path -> tTR_gBias has the same layout as
@@ -2018,7 +2177,14 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
             )
             tTR_gBias = thr_copy_t2r.partition_D(gBias_mnl_epi)
 
-        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate, tTR_gBias
+        return (
+            tiled_copy_t2r,
+            tTR_tAcc,
+            tTR_rAcc_up,
+            tTR_rAcc_gate,
+            tTR_gBias,
+            tTR_cC,
+        )
 
     def epilog_smem_copy_and_partition(
         self,
@@ -2604,6 +2770,98 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
             current_stream,
             epilogue_op,
             bias_tensor=bias_tensor,
+        )
+
+    @cute.jit
+    def wrapper_indexer_q(
+        self,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        sf_m: cutlass.Int64,
+        sf_n: cutlass.Int64,
+        sf_k: cutlass.Int64,
+        cos_sin_rows: cutlass.Int64,
+        l: cutlass.Constexpr,  # noqa: E741
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        packed_ptr: cute.Pointer,
+        scale_ptr: cute.Pointer,
+        position_ids_ptr: cute.Pointer,
+        cos_sin_ptr: cute.Pointer,
+        alpha_tensor: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        current_stream: cuda.CUstream,
+    ):
+        """MXF8 GEMM with the DeepSeek-V4 indexer-Q RoPE/MXFP4 epilogue.
+
+        ``packed_ptr`` and ``scale_ptr`` use the indexer's existing contiguous
+        layouts: uint8 [M, N/2] and UE8M0 [M, N/32].  The output tensor is a
+        logical FP4 view so the repository's native FP4 shared-memory layout
+        and TMA store path can be reused.
+        """
+        a_tensor = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)),
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)),
+        )
+        c_tensor = cute.make_tensor(
+            cute.recast_ptr(packed_ptr, dtype=cutlass.Float4E2M1FN),
+            layout=cute.make_ordered_layout((m, n, l), order=(1, 0, 2)),
+        )
+        scale_tensor = cute.make_tensor(
+            cute.recast_ptr(scale_ptr, dtype=cutlass.Uint32),
+            layout=cute.make_ordered_layout((m, n // 128, l), order=(1, 0, 2)),
+        )
+        # generate_sfc needs a scale-factor-shaped tensor to derive its register
+        # partition.  Indexer-Q stores the values through scale_tensor above,
+        # preserving the consumer's contiguous per-head four-byte layout.
+        sfc_tensor = cute.make_tensor(
+            scale_ptr,
+            layout=cute.make_ordered_layout((32, 4, sf_m, 4, sf_n, l), order=(2, 1, 4, 0, 3, 5)),
+        )
+        position_ids_tensor = cute.make_tensor(
+            position_ids_ptr,
+            layout=cute.make_layout((m,)),
+        )
+        cos_sin_cache_tensor = cute.make_tensor(
+            cos_sin_ptr,
+            layout=cute.make_ordered_layout((cos_sin_rows, 64), order=(1, 0)),
+        )
+        sfa_tensor = cute.make_tensor(
+            a_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, sf_m, 4, sf_k, l),
+                order=(2, 1, 4, 0, 3, 5),
+            ),
+        )
+        sfb_tensor = cute.make_tensor(
+            b_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, sf_n, 4, sf_k, l),
+                order=(2, 1, 4, 0, 3, 5),
+            ),
+        )
+
+        self(
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            c_tensor,
+            alpha_tensor,
+            max_active_clusters,
+            current_stream,
+            sfc_tensor=sfc_tensor,
+            norm_const_tensor=alpha_tensor,
+            indexer_scale_tensor=scale_tensor,
+            position_ids_tensor=position_ids_tensor,
+            cos_sin_cache_tensor=cos_sin_cache_tensor,
         )
 
     @cute.jit

@@ -27,6 +27,7 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <cstddef>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -55,6 +56,7 @@ class BaseKVCacheManager;
 
 class CacheSender;
 class CacheReceiver;
+class ContextTransferCoordinator;
 
 class CacheTransceiverComm
 {
@@ -149,6 +151,25 @@ public:
         TLLM_THROW("Input arguments only supported in mpi");
     }
 
+    [[nodiscard]] std::unique_ptr<mpi::MpiRequest> sendAsync(
+        void const* buffer, std::size_t size, mpi::MpiType dtype, int dest, mpi::MpiTag tag) const
+    {
+        TLLM_CHECK_WITH_INFO(isMpi(), "Point-to-point cache-transceiver status messages require MPI.");
+        return mMpiComm->sendAsync(buffer, size, dtype, dest, tag);
+    }
+
+    [[nodiscard]] bool iprobe(int source, mpi::MpiTag tag, MPI_Status* status) const
+    {
+        TLLM_CHECK_WITH_INFO(isMpi(), "Point-to-point cache-transceiver status messages require MPI.");
+        return mMpiComm->iprobe(source, tag, status);
+    }
+
+    void recv(void* buffer, std::size_t size, mpi::MpiType dtype, int source, mpi::MpiTag tag) const
+    {
+        TLLM_CHECK_WITH_INFO(isMpi(), "Point-to-point cache-transceiver status messages require MPI.");
+        static_cast<void>(mMpiComm->recv(buffer, size, dtype, source, tag));
+    }
+
     CacheTransceiverComm split(int color, int key)
     {
         if (isMpi())
@@ -228,6 +249,12 @@ public:
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
+    /// Get the serialized DataTransceiverState (CacheState + CommState) for this transceiver.
+    [[nodiscard]] virtual std::vector<char> getSerializedDataTransceiverState() const
+    {
+        return {};
+    }
+
     [[nodiscard]] virtual bool hasPoisonedTransferBuffer() const
     {
         return false;
@@ -277,6 +304,8 @@ public:
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
+    [[nodiscard]] std::vector<char> getSerializedDataTransceiverState() const override;
+
     [[nodiscard]] bool hasPoisonedTransferBuffer() const override;
 
 private:
@@ -307,6 +336,7 @@ private:
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
     std::shared_ptr<CacheTransceiverComm> mGroupTensorParaComm, mGroupPipeParaComm, mGroupDataComm, mGroupTPInDPComm;
+    std::unique_ptr<ContextTransferCoordinator> mContextTransferCoordinator;
 
     executor::kv_cache::CommState const* mCommState;
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;

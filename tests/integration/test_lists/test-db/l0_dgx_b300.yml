@@ -64,6 +64,8 @@ l0_dgx_b300:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-fp8]
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekR1::test_kv_cache_v2_nixl_python[cache_mgr_v1]
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_kv_cache_v2_nixl_python[cache_mgr_v1]
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_kv_cache_v2_nixl_python
