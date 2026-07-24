@@ -68,6 +68,10 @@ python examples/visual_gen/quickstart_example.py
 Each process writes its trace to a rank-specific path such as
 `/tmp/visual-gen-trace-rank-0.json`.
 
+These ranges use the existing VisualGen CUDA/Nsight boundaries. Text encoding
+happens before those boundaries and is not included; `all` starts at denoising
+and includes subsequent VAE work through pipeline cleanup.
+
 ### Visualize the PyTorch profiler results
 
 Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.

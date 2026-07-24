@@ -10,6 +10,8 @@ true-CFG path (dual cond/uncond forward plus the norm-preserving CFG
 combination) and the non-CFG path, on CPU.
 """
 
+from unittest.mock import MagicMock
+
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImagePipeline
@@ -81,6 +83,14 @@ def _pipeline_with_test_doubles():
     pipe.vae_scale_factor = 8
     pipe.transformer = _RecordingTransformer()
     pipe.scheduler = _RecordingScheduler()
+    pipe._profile_range = None
+    pipe._profiling_active = False
+    pipe._torch_profiler = None
+    pipe._torch_profile_trace_path = None
+    pipe._is_warmup = False
+    pipe._predenoise_pending = False
+    pipe._postdenoise_pending = False
+    pipe.rank = 0
     captured = {"encoded_prompts": []}
 
     def _encode_prompt(prompt, device, max_sequence_length):
@@ -211,3 +221,25 @@ def test_forward_runs_true_cfg_pipeline():
     )
     assert torch.allclose(pipe.scheduler.step_calls[0]["noise_pred"], expected_cfg_noise)
     assert pipe.scheduler.step_calls[0]["return_dict"] is False
+
+
+def test_forward_honors_profile_step_range():
+    pipe, _ = _pipeline_with_test_doubles()
+    pipe._profile_range = (frozenset({0}), frozenset({1}))
+    pipe._cuda_profiler_start = MagicMock()
+    pipe._cuda_profiler_stop = MagicMock()
+
+    pipe.forward(
+        prompt=["a cat"],
+        negative_prompt=None,
+        height=32,
+        width=48,
+        num_inference_steps=2,
+        true_cfg_scale=1.0,
+        seed=123,
+        max_sequence_length=16,
+        sigmas=[1.0, 0.5],
+    )
+
+    pipe._cuda_profiler_start.assert_called_once_with()
+    pipe._cuda_profiler_stop.assert_called_once_with()

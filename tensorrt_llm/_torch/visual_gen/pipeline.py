@@ -58,7 +58,8 @@ def _parse_profile_range():
                            Single-shot.
     * ``postdenoise``    – profile from the end of the last denoise step to
                            pipeline cleanup, covering VAE decode. Single-shot.
-    * ``all``            – profile the full generation forward (denoise + VAE), skip warmup
+    * ``all``            – profile from denoise through pipeline cleanup,
+                           including VAE decode, but not text encoding; skip warmup
     * (unset)            – no profiler API calls; plain ``nsys profile`` captures everything
 
     Returns ``None`` when unset, one of ``"all"`` / ``"predenoise"`` /
@@ -210,6 +211,43 @@ class BasePipeline(nn.Module):
             self._profiling_active = False
             if self.rank == 0:
                 logger.info("CUDA profiler stopped")
+
+    def _start_predenoise_profile(self) -> None:
+        """Start the single-shot pre-denoise profiling window."""
+        if self._predenoise_pending and not self._is_warmup:
+            self._cuda_profiler_start()
+
+    def _start_denoise_profile(self) -> None:
+        """Start all-mode profiling and close the pre-denoise window."""
+        if self._profile_range == "all" and not self._is_warmup:
+            self._cuda_profiler_start()
+        if self._predenoise_pending and not self._is_warmup:
+            self._cuda_profiler_stop()
+            self._predenoise_pending = False
+
+    def _start_step_profile(self, step_index: int) -> None:
+        """Start profiling when the denoise step begins a configured range."""
+        if (
+            isinstance(self._profile_range, tuple)
+            and step_index in self._profile_range[0]
+            and not self._is_warmup
+        ):
+            self._cuda_profiler_start()
+
+    def _stop_step_profile(self, step_index: int) -> None:
+        """Stop profiling when the denoise step ends a configured range."""
+        if (
+            isinstance(self._profile_range, tuple)
+            and step_index in self._profile_range[1]
+            and not self._is_warmup
+        ):
+            self._cuda_profiler_stop()
+
+    def _start_postdenoise_profile(self) -> None:
+        """Start the single-shot post-denoise profiling window."""
+        if self._postdenoise_pending and not self._is_warmup:
+            self._cuda_profiler_start()
+            self._postdenoise_pending = False
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay.
@@ -1097,8 +1135,7 @@ class BasePipeline(nn.Module):
         # TeaCache reset) is captured. The window closes at the first step.
         # Note: hooked here (not at warmup() exit) to avoid leaving the profiler
         # on across the worker's IPC idle, which can interact badly with CUPTI.
-        if self._predenoise_pending and not self._is_warmup:
-            self._cuda_profiler_start()
+        self._start_predenoise_profile()
 
         if timesteps is None:
             timesteps = scheduler.timesteps
@@ -1139,20 +1176,10 @@ class BasePipeline(nn.Module):
 
         # CUDA profiler scoping: "all" starts here (covers denoise + VAE),
         # step ranges start/stop at specific indices. See _parse_profile_range().
-        prof = self._profile_range
-        if prof == "all" and not self._is_warmup:
-            self._cuda_profiler_start()
-        # ``predenoise`` was started in warmup() exit; close the window now,
-        # before the first denoise step kernels run. Single-shot: disarm.
-        if self._predenoise_pending and not self._is_warmup:
-            self._cuda_profiler_stop()
-            self._predenoise_pending = False
-        prof_step_starts = prof[0] if isinstance(prof, tuple) else None
-        prof_step_stops = prof[1] if isinstance(prof, tuple) else None
+        self._start_denoise_profile()
 
         for i, t in enumerate(timesteps):
-            if prof_step_starts is not None and i in prof_step_starts and not self._is_warmup:
-                self._cuda_profiler_start()
+            self._start_step_profile(i)
 
             step_start = time.time()
 
@@ -1230,14 +1257,11 @@ class BasePipeline(nn.Module):
                 )
 
             # Step-level profiler stop
-            if prof_step_stops is not None and i in prof_step_stops and not self._is_warmup:
-                self._cuda_profiler_stop()
+            self._stop_step_profile(i)
 
         # ``postdenoise`` mode: arm the profiler now so the VAE decode (and
         # any post-denoise host work) is captured up to cleanup(). Single-shot.
-        if self._postdenoise_pending and not self._is_warmup:
-            self._cuda_profiler_start()
-            self._postdenoise_pending = False
+        self._start_postdenoise_profile()
 
         if self.rank == 0:
             total_time = time.time() - start_time
