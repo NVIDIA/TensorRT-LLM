@@ -541,6 +541,26 @@ def _parse_binary_byte_string(value: Any) -> Any:
     return amount * multiplier
 
 
+class MultimodalEncoderSchedulingPolicy(StrEnum):
+    """Selects how a model that supports item-level MM encoder scheduling runs its encoder.
+
+    Ignored for models that do not support it (they always use legacy inline
+    encode).
+    """
+
+    DISABLED = "DISABLED"
+    """Legacy inline encode: the encoder runs inside the model forward, not as
+    a separately scheduled step. Item scheduling and its byte budget are off."""
+
+    DEFAULT = "DEFAULT"
+    """Item scheduling (``MultimodalScheduler``): the executor encodes atomic
+    MM items as a separate, budgeted step before prefill."""
+
+    EAGER = "EAGER"
+    """Item scheduling that advances encoder work for active requests before
+    LLM capacity filtering (``MultimodalEagerEncoderScheduler``)."""
+
+
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
@@ -583,12 +603,15 @@ class MultimodalConfig(StrictBaseModel):
         status="prototype",
     )
 
-    enable_eager_encoder_scheduling: bool = Field(
-        default=False,
+    encoder_scheduling_policy: MultimodalEncoderSchedulingPolicy = Field(
+        default=MultimodalEncoderSchedulingPolicy.DEFAULT,
         description=(
-            "Schedule encoder work for active multimodal requests before LLM "
-            "capacity filtering. This may advance encoder work for requests "
-            "that are not selected for the current LLM batch."),
+            "MM encoder scheduling policy for models that support item-level "
+            "encoder scheduling. DISABLED: legacy inline encode (item "
+            "scheduling and its byte budget off). DEFAULT: item scheduling. "
+            "EAGER: item scheduling that advances encoder work for active "
+            "requests before LLM capacity filtering. Ignored for models that "
+            "do not support item scheduling."),
         status="prototype",
     )
 
@@ -5273,16 +5296,17 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_eager_encoder_scheduling_compatibility(self) -> 'TorchLlmArgs':
-        if not self.multimodal_config.enable_eager_encoder_scheduling:
+        if (self.multimodal_config.encoder_scheduling_policy
+                != MultimodalEncoderSchedulingPolicy.EAGER):
             return self
         if self.enable_attention_dp:
             raise ValueError(
-                "multimodal_config.enable_eager_encoder_scheduling does not "
+                "multimodal_config.encoder_scheduling_policy=EAGER does not "
                 "yet support attention DP (enable_attention_dp=True)")
         if (self.cache_transceiver_config is not None
                 and self.cache_transceiver_config.backend is not None):
             raise ValueError(
-                "multimodal_config.enable_eager_encoder_scheduling does not "
+                "multimodal_config.encoder_scheduling_policy=EAGER does not "
                 "yet support disaggregated serving "
                 "(cache_transceiver_config)")
         return self

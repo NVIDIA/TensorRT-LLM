@@ -30,9 +30,10 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
-    KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig, PeftCacheConfig,
-    SamplerType, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
-    TorchLlmArgs, WaitingQueuePolicy)
+    KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig,
+    MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SamplerType,
+    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
+    WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -3129,7 +3130,7 @@ def create_py_executor_instance(
                 reorder_policy_config.policy_args.agent_inflight_seq_num)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
-    if getattr(model_engine, "supports_mm_encoder_item_scheduling", False):
+    if getattr(model_engine, "mm_encoder_item_scheduling_enabled", False):
         # Wrap the LLM scheduler with atomic MM item budgeting. The
         # side-stream conflict is checked here rather than in an args
         # validator because item scheduling is a model capability
@@ -3141,8 +3142,12 @@ def create_py_executor_instance(
                 "MM side-stream prefetch is not yet compatible with "
                 "item-level encoder scheduling; set "
                 "multimodal_config.encoder_side_stream_max_ahead to 0")
+        # `mm_encoder_item_scheduling_enabled` already excludes the DISABLED
+        # policy (a disabled model never reaches here and keeps the base LLM
+        # scheduler), so only the EAGER vs DEFAULT variant is selected here.
         scheduler_cls = MultimodalScheduler
-        if multimodal_config.enable_eager_encoder_scheduling:
+        if (multimodal_config.encoder_scheduling_policy ==
+                MultimodalEncoderSchedulingPolicy.EAGER):
             logger.info("Eager multimodal encoder scheduling is enabled for "
                         "capacity-rejected active requests.")
             scheduler_cls = MultimodalEagerEncoderScheduler
