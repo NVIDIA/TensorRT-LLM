@@ -242,8 +242,8 @@ class LoraLayer(torch.nn.Module):
         x: torch.Tensor,
         lora_params: Dict,
         layer_idx: Optional[int],
-    ) -> tuple[Any, Any]:
-        """Run the base and LoRA branches concurrently during graph capture."""
+    ) -> Any:
+        """Run the base and LoRA branches and merge their outputs."""
         cuda_graph_params = lora_params.get('cuda_graph_params')
         has_lora_layer = bool(cuda_graph_params) and any(
             CudaGraphLoraParams.LoraLayerKey(
@@ -251,7 +251,7 @@ class LoraLayer(torch.nn.Module):
                 module_ids=tuple(layer.lora_module_types),
             ) in cuda_graph_params.layer_info for layer in lora_layers)
 
-        execute_in_parallel = (has_lora_layer
+        execute_in_parallel = (has_lora_layer 
                                and do_multi_stream()
                                and not torch.compiler.is_compiling())
 
@@ -270,7 +270,7 @@ class LoraLayer(torch.nn.Module):
                 lora_layers[0]._par_events = [
                     torch.cuda.Event(), torch.cuda.Event()]
 
-            return maybe_execute_in_parallel(
+            base_output, lora_outputs = maybe_execute_in_parallel(
                 base_forward,
                 lora_forward,
                 lora_layers[0]._par_events[0],
@@ -279,7 +279,17 @@ class LoraLayer(torch.nn.Module):
                 disable_on_compile=True,
             )
         else:
-            return base_forward(), lora_forward()
+            base_output, lora_outputs = base_forward(), lora_forward()
+
+        for lora_output in lora_outputs:
+            if lora_output is None:
+                continue
+            if cuda_graph_params and not torch.compiler.is_compiling():
+                base_output.add_(lora_output)
+            else:
+                base_output = base_output + lora_output
+
+        return base_output
 
     def forward(
         self,
@@ -620,7 +630,8 @@ class LoraLayer(torch.nn.Module):
             output_buffer = output_buffer.to(torch.bfloat16)
 
         # TODO: move to kernel
-        restored_output = torch.zeros_like(output_buffer)
+        # sorted_ids is a permutation, so index_copy_ initializes every row.
+        restored_output = torch.empty_like(output_buffer)
         restored_output.index_copy_(0,
                                     cuda_graph_params.sorted_ids[:batch_size],
                                     output_buffer)
