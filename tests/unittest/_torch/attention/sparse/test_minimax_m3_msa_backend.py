@@ -8,6 +8,8 @@ parity and strided-cache kernel paths. Numerical parity against the Triton
 reference is covered by the SM100 integration accuracy test.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -250,6 +252,67 @@ def test_msa_fp8_cache_converts_live_index_query_before_scoring():
     assert result.shape == (2, 4, 16)
     assert captured["idx_q"].data_ptr() == fused_q.data_ptr()
     assert "write" not in captured
+
+
+@pytest.mark.parametrize(
+    ("num_contexts", "num_generations", "expected_head_major"),
+    [(2, 0, True), (1, 1, False), (0, 2, False)],
+)
+def test_run_indexer_routes_head_major_output_by_batch_mode(
+    num_contexts, num_generations, expected_head_major
+):
+    num_tokens, num_index_heads, sparse_index_dim = 3, 4, 128
+    captured = {}
+
+    class FakeIndexer:
+        def select_blocks(self, *args, **kwargs):
+            del args
+            captured["head_major_output"] = kwargs["head_major_output"]
+            return torch.zeros(num_tokens, 1, 16, dtype=torch.int32)
+
+    class FakeMetadata:
+        msa_decode_proxy_plan = None
+        msa_eager_proxy_plan = ("eager",)
+        msa_eager_all_blocks_empty = False
+        msa_eager_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
+        msa_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
+        msa_qo_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
+        msa_kv_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
+        msa_qo_offset_cpu = torch.tensor([0], dtype=torch.int32)
+
+        def __init__(self):
+            self.num_contexts = num_contexts
+            self.num_generations = num_generations
+            self.idx_k_cache = None
+
+        def msa_write_idx_k(self, layer_idx, idx_k):
+            del layer_idx
+            self.idx_k_cache = idx_k
+
+        def msa_idx_k_cache(self, layer_idx):
+            del layer_idx
+            return self.idx_k_cache
+
+    attention = SimpleNamespace(
+        layer_idx=0,
+        m3_config=SimpleNamespace(
+            sparse_index_dim=sparse_index_dim,
+            num_index_heads=num_index_heads,
+            num_kv_heads=1,
+        ),
+        indexer=FakeIndexer(),
+    )
+    metadata = FakeMetadata()
+
+    result = MiniMaxM3MsaSparseAttention.run_indexer(
+        attention,
+        torch.zeros(num_tokens, num_index_heads * sparse_index_dim),
+        torch.zeros(num_tokens, sparse_index_dim),
+        metadata,
+    )
+
+    assert result.shape == (num_tokens, 1, 16)
+    assert captured["head_major_output"] is expected_head_major
 
 
 def test_msa_proxy_max_score_strided_index_k_matches_packed():
