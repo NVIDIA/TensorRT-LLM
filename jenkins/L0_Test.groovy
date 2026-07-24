@@ -1886,9 +1886,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${progressTar}"
                     def remoteWorkspaceTrk = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
                     def trackCmd = Utils.sshUserCmd(remote, scriptTrackPathNode)
-                    def sshStatCmd = Utils.sshUserCmd(remote, "\"stat -c %Y ${remoteWorkspaceTrk}/results.xml 2>/dev/null || echo 0\"")
+                    // ls flushes the NFS attribute cache on the login node so the
+                    // subsequent stat returns the mtime written by the compute node.
+                    def sshStatCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; stat -c %Y '${remoteWorkspaceTrk}/results.xml' 2>/dev/null || echo 0\"")
                     def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
                     def scpUnfinishedCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/unfinished_test.txt", "${stageName}/")
+                    def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1 || true\"")
                     def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
                     def scpPerfTemplate = scpFromRemoteCmd(remote, "PERF_FOLDER_PLACEHOLDER", "${stageName}/")
                     sh "rm -f ${pytestDoneFile}"
@@ -1931,6 +1934,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                             # ---- immediate final snapshot ----
                             mkdir -p '${WORKSPACE}/${stageName}'
+                            ${sshRefreshCacheCmd}
                             for _attempt in 1 2 3; do
                                 ${scpXmlCmd} && break
                                 [ \$_attempt -lt 3 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp xml failed, retry \$_attempt/3" && sleep 10
