@@ -182,6 +182,8 @@ class AutoPipeline:
                 return "Flux2Pipeline"
             if "Flux" in class_name:
                 return "FluxPipeline"
+            if "QwenImageLayered" in class_name:
+                return "QwenImageLayeredPipeline"
             if "QwenImage" in class_name:
                 return "QwenImagePipeline"
 
