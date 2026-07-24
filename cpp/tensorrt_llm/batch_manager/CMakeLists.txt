@@ -33,11 +33,11 @@ set(SRCS
     contextTransferCoordinator.cpp
     dataTransceiver.cpp
     decoderBuffers.cpp
-    kvCacheManager.cpp
     encoderBuffers.cpp
     guidedDecoder.cpp
     handleContextLogits.cpp
     handleGenerationLogits.cpp
+    kvCacheManager.cpp
     kvCacheEventManager.cpp
     kvCacheTransferManager.cpp
     kvCacheManagerV2Utils.cpp
