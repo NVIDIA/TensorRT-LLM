@@ -165,6 +165,7 @@ def test_qwen35_moe_vl_placeholder_metadata_registered() -> None:
     }
     assert metadata.placeholders_separator == ""
     assert metadata.content_format is ContentFormat.STRING
+    assert metadata.interleave_placeholders
 
 
 # --- Layered parity test scaffold -------------------------------------------
