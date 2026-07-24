@@ -6,16 +6,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from openengine.v1 import (
-    generation_pb2,
-    input_pb2,
-    kv_pb2,
-    lifecycle_pb2,
-    lora_pb2,
-    model_pb2,
-    observability_pb2,
-    server_pb2,
-)
+from openengine.v1 import generation_pb2, kv_pb2, lifecycle_pb2, lora_pb2, model_pb2, server_pb2
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.inputs.registry import MultimodalLoraSpec
@@ -300,7 +291,7 @@ async def test_generate_selects_model_owned_multimodal_lora(monkeypatch, tmp_pat
     )
     request = generation_pb2.GenerateRequest(request_id="audio", model="model", prompt="transcribe")
     request.media.add(
-        modality=input_pb2.MODALITY_AUDIO,
+        modality=generation_pb2.MODALITY_AUDIO,
         raw_bytes=b"audio",
         uuid="0123456789abcdef",
     )
@@ -368,7 +359,7 @@ async def test_context_then_generation_round_trips_handoff(monkeypatch) -> None:
     context_request = generation_pb2.GenerateRequest(
         request_id="request",
         model="model",
-        token_ids=input_pb2.TokenIds(ids=[1, 2]),
+        token_ids=generation_pb2.TokenIds(ids=[1, 2]),
     )
     context_responses = [
         response async for response in context_service.Generate(context_request, _Context())
@@ -376,7 +367,7 @@ async def test_context_then_generation_round_trips_handoff(monkeypatch) -> None:
     assert len(context_responses) == 1
     assert context_responses[0].WhichOneof("event") == "prefill_ready"
     assert len(context_service._kv_session_requests) == 1
-    context_load = await context_service.GetLoad(observability_pb2.GetLoadRequest(), _Context())
+    context_load = await context_service.GetLoad(server_pb2.GetLoadRequest(), _Context())
     assert context_load.active_kv_sessions == 0
 
     decode_llm = _Llm()
@@ -389,7 +380,7 @@ async def test_context_then_generation_round_trips_handoff(monkeypatch) -> None:
     decode_request = generation_pb2.GenerateRequest(
         request_id="decode",
         model="model",
-        token_ids=input_pb2.TokenIds(ids=[1, 2]),
+        token_ids=generation_pb2.TokenIds(ids=[1, 2]),
     )
     decode_request.kv.session.CopyFrom(context_responses[0].prefill_ready.kv_session)
     decode_responses = [
@@ -456,7 +447,7 @@ async def test_prefill_adds_context_endpoint_from_llm_discovery() -> None:
     request = generation_pb2.GenerateRequest(
         request_id="prefill",
         model="model",
-        token_ids=input_pb2.TokenIds(ids=[1, 2]),
+        token_ids=generation_pb2.TokenIds(ids=[1, 2]),
     )
 
     responses = [response async for response in service.Generate(request, _Context())]
@@ -588,14 +579,14 @@ def test_decode_media_is_required_only_for_marked_handoff(monkeypatch) -> None:
         requires_decode_media=True,
     )
     request = generation_pb2.GenerateRequest(
-        request_id="decode", model="model", token_ids=input_pb2.TokenIds(ids=[1, 2])
+        request_id="decode", model="model", token_ids=generation_pb2.TokenIds(ids=[1, 2])
     )
     request.kv.session.CopyFrom(session)
 
     with pytest.raises(ValueError, match="must resend"):
         service._validate_generate(request)
 
-    request.media.add(modality=input_pb2.MODALITY_IMAGE, raw_bytes=b"image")
+    request.media.add(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
     service._validate_generate(request)
 
 
@@ -835,9 +826,7 @@ async def test_discovery_and_load_use_config_and_shared_stats(monkeypatch) -> No
     assert not model_info.generation.guided_decoding.supported
     assert not model_info.supports_lora
 
-    load = await service.GetLoad(
-        observability_pb2.GetLoadRequest(include_per_rank=True), _Context()
-    )
+    load = await service.GetLoad(server_pb2.GetLoadRequest(include_per_rank=True), _Context())
     assert load.running_requests == 3
     assert load.queued_requests == 2
     assert load.used_kv_blocks == 75
@@ -873,7 +862,7 @@ async def test_load_never_undercounts_live_tracker_from_stale_stats() -> None:
         stats_fanout=stats,
     )
 
-    load = await service.GetLoad(observability_pb2.GetLoadRequest(), _Context())
+    load = await service.GetLoad(server_pb2.GetLoadRequest(), _Context())
 
     assert load.running_requests == 1
 

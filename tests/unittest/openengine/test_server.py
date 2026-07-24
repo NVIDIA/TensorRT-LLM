@@ -47,7 +47,7 @@ def test_schema_release_rejects_mutable_or_unknown_identity(release: str) -> Non
 
 
 def test_schema_release_reads_launch_environment(monkeypatch) -> None:
-    commit = "b0cf2a4826d246192dc65b055dab6d2b38d2d67e"
+    commit = "a66ff6f73a65e262a7c3edd5ea6fd0d8701d402f"
     monkeypatch.setenv("OPENENGINE_SCHEMA_RELEASE", commit)
     assert schema_release() == commit
 

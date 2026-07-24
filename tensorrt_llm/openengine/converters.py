@@ -12,7 +12,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from google.protobuf.json_format import MessageToDict
-from openengine.v1 import generation_pb2, input_pb2, kv_pb2
+from openengine.v1 import generation_pb2, kv_pb2
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.executor.request import LoRARequest
@@ -23,10 +23,10 @@ from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
 HANDOFF_ATTRIBUTE = "tensorrt_llm.disaggregated_params.v1"
 _MODALITY_NAMES = {
-    input_pb2.MODALITY_UNSPECIFIED: "image",
-    input_pb2.MODALITY_IMAGE: "image",
-    input_pb2.MODALITY_VIDEO: "video",
-    input_pb2.MODALITY_AUDIO: "audio",
+    generation_pb2.MODALITY_UNSPECIFIED: "image",
+    generation_pb2.MODALITY_IMAGE: "image",
+    generation_pb2.MODALITY_VIDEO: "video",
+    generation_pb2.MODALITY_AUDIO: "audio",
 }
 
 

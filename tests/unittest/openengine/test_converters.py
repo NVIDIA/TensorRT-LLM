@@ -4,7 +4,7 @@
 import json
 
 import pytest
-from openengine.v1 import generation_pb2, input_pb2, kv_pb2
+from openengine.v1 import generation_pb2, kv_pb2
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.executor.result import Logprob
@@ -218,9 +218,9 @@ async def test_media_preserves_per_modality_order_and_merge_inputs(monkeypatch) 
     options.update({"image": {"format": "pil"}})
     config = type("Config", (), {"media_io_kwargs": {"image": {"device": "cpu"}}})()
     media = [
-        input_pb2.MediaItem(modality=input_pb2.MODALITY_IMAGE, raw_bytes=b"one"),
-        input_pb2.MediaItem(modality=input_pb2.MODALITY_VIDEO, raw_bytes=b"video"),
-        input_pb2.MediaItem(modality=input_pb2.MODALITY_IMAGE, raw_bytes=b"two"),
+        generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"one"),
+        generation_pb2.MediaItem(modality=generation_pb2.MODALITY_VIDEO, raw_bytes=b"video"),
+        generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"two"),
     ]
 
     decoded = await load_media(media, options, config)

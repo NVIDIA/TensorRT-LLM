@@ -18,12 +18,10 @@ from openengine import MINIMUM_CLIENT_REVISION, SCHEMA_RELEASE, SCHEMA_REVISION
 from openengine.v1 import (
     error_pb2,
     generation_pb2,
-    input_pb2,
     kv_pb2,
     lifecycle_pb2,
     lora_pb2,
     model_pb2,
-    observability_pb2,
     openengine_pb2_grpc,
     server_pb2,
 )
@@ -649,10 +647,10 @@ class OpenEngineServicer(
             aggregate = self._available_modalities(processor)
             prefill_decode = self._available_modalities(processor, prefill_decode=True)
             names = {
-                input_pb2.MODALITY_UNSPECIFIED: "image",
-                input_pb2.MODALITY_IMAGE: "image",
-                input_pb2.MODALITY_VIDEO: "video",
-                input_pb2.MODALITY_AUDIO: "audio",
+                generation_pb2.MODALITY_UNSPECIFIED: "image",
+                generation_pb2.MODALITY_IMAGE: "image",
+                generation_pb2.MODALITY_VIDEO: "video",
+                generation_pb2.MODALITY_AUDIO: "audio",
             }
             allowed = (
                 aggregate if self.role == server_pb2.ENGINE_ROLE_AGGREGATED else prefill_decode
@@ -733,10 +731,10 @@ class OpenEngineServicer(
         if not isinstance(processor, BaseMultimodalInputProcessor):
             return None
         names = {
-            input_pb2.MODALITY_UNSPECIFIED: "image",
-            input_pb2.MODALITY_IMAGE: "image",
-            input_pb2.MODALITY_VIDEO: "video",
-            input_pb2.MODALITY_AUDIO: "audio",
+            generation_pb2.MODALITY_UNSPECIFIED: "image",
+            generation_pb2.MODALITY_IMAGE: "image",
+            generation_pb2.MODALITY_VIDEO: "video",
+            generation_pb2.MODALITY_AUDIO: "audio",
         }
         modalities = tuple(
             dict.fromkeys(names[item.modality] for item in request.media if item.modality in names)
@@ -907,9 +905,9 @@ class OpenEngineServicer(
         aggregate = self._available_modalities(input_processor)
         prefill_decode = self._available_modalities(input_processor, prefill_decode=True)
         modality_enum = {
-            "image": input_pb2.MODALITY_IMAGE,
-            "video": input_pb2.MODALITY_VIDEO,
-            "audio": input_pb2.MODALITY_AUDIO,
+            "image": generation_pb2.MODALITY_IMAGE,
+            "video": generation_pb2.MODALITY_VIDEO,
+            "audio": generation_pb2.MODALITY_AUDIO,
         }
         args = getattr(self.llm, "args", None)
         guided_backend = getattr(args, "guided_decoding_backend", None)
@@ -965,9 +963,9 @@ class OpenEngineServicer(
                 aggregate_modalities=[modality_enum[name] for name in aggregate],
                 prefill_decode_modalities=[modality_enum[name] for name in prefill_decode],
                 source_types=[
-                    input_pb2.MEDIA_SOURCE_TYPE_URL,
-                    input_pb2.MEDIA_SOURCE_TYPE_DATA_URI,
-                    input_pb2.MEDIA_SOURCE_TYPE_RAW_BYTES,
+                    generation_pb2.MEDIA_SOURCE_TYPE_URL,
+                    generation_pb2.MEDIA_SOURCE_TYPE_DATA_URI,
+                    generation_pb2.MEDIA_SOURCE_TYPE_RAW_BYTES,
                 ],
                 supports_per_request_media_options=True,
             ),
@@ -1003,8 +1001,8 @@ class OpenEngineServicer(
         return capacity
 
     async def GetLoad(
-        self, request: observability_pb2.GetLoadRequest, context: grpc.aio.ServicerContext
-    ) -> observability_pb2.LoadInfo:
+        self, request: server_pb2.GetLoadRequest, context: grpc.aio.ServicerContext
+    ) -> server_pb2.LoadInfo:
         del context
         latest = self.stats.latest_by_rank() if self.stats is not None else {}
         rank_infos = []
@@ -1047,7 +1045,7 @@ class OpenEngineServicer(
             decode_batch_size += rank_decode
             if request.include_per_rank:
                 rank_infos.append(
-                    observability_pb2.RankLoadInfo(
+                    server_pb2.RankLoadInfo(
                         data_parallel_rank=rank,
                         running_requests=rank_running,
                         queued_requests=rank_queued,
@@ -1066,7 +1064,7 @@ class OpenEngineServicer(
                 tokens_per_block.add(capacity["tokensPerBlock"])
         if len(tokens_per_block) == 1:
             attributes["kv_tokens_per_block"] = str(next(iter(tokens_per_block)))
-        response = observability_pb2.LoadInfo(
+        response = server_pb2.LoadInfo(
             instance_id=self.instance_id,
             timestamp_unix_nanos=time.time_ns(),
             running_requests=running_requests,
@@ -1268,12 +1266,6 @@ class OpenEngineServicer(
             bool(getattr(config, "use_kv_cache_manager_v2", False)),
         )
         return effective_hash_algo in (KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2_SHA256_64)
-
-    async def GetKvConnectorInfo(
-        self, request: kv_pb2.GetKvConnectorInfoRequest, context: grpc.aio.ServicerContext
-    ) -> kv_pb2.KvConnectorInfo:
-        del request, context
-        return self._kv_connector_info()
 
     async def GetKvEventSources(
         self, request: kv_pb2.GetKvEventSourcesRequest, context: grpc.aio.ServicerContext
