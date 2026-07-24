@@ -28,11 +28,11 @@ import triton
 import triton.language as tl
 
 
-@dataclass(kw_only=True, frozen=True)
+@dataclass
 class CompactionParams:
-    decision_rows: int
-    pack_args: Tuple[Optional[torch.Tensor], ...]
-    pack_constexprs: Dict[str, object]
+    decision_rows: int = 0
+    pack_args: Tuple[Optional[torch.Tensor], ...] = ()
+    pack_constexprs: Dict[str, object] = field(default_factory=dict)
     compact_args: List[Tuple[object, ...]] = field(default_factory=list)
 
 
@@ -136,14 +136,17 @@ def build_compaction_params(
     token_starts = dense_destination_bases
     protected_tail_capacity = int(protected_tail_capacity)
 
+    params = CompactionParams()
     first_pool = layer_pools[dense_layers[0]]
     device = first_pool.device
     max_requests = int(valid_seq_lens.shape[0])
     keep_count = int(kept_ordinal_rows.shape[1])
-    decision_rows = int(kept_ordinal_rows.shape[0]) // max_requests
+    params.decision_rows = int(kept_ordinal_rows.shape[0]) // max_requests
     # Pool shape [pages, K/V, heads, tokens, dim].
     num_kv_heads = int(first_pool.shape[2])
-    per_layer_sources = len(dense_layers) > 1 and decision_rows == len(dense_layers) * num_kv_heads
+    per_layer_sources = (
+        len(dense_layers) > 1 and params.decision_rows == len(dense_layers) * num_kv_heads
+    )
     dense_index_prefix = (len(dense_layers), num_kv_heads) if per_layer_sources else (num_kv_heads,)
     dense_move_indices = torch.empty(
         (*dense_index_prefix, (keep_count + protected_tail_capacity) * max_requests),
@@ -193,28 +196,23 @@ def build_compaction_params(
     if swa_layers:
         move_capacity = max(move_capacity, swa_window + protected_tail_capacity)
 
-    params = CompactionParams(
-        decision_rows=decision_rows,
-        pack_args=(
-            kept_ordinal_rows,
-            valid_seq_lens,
-            dense_move_offsets,
-            dense_move_indices,
-            swa_move_offsets,
-            swa_move_indices,
-        ),
-        pack_constexprs=dict(
-            KEEP_COUNT=keep_count,
-            DECISION_ROWS=decision_rows,
-            MOVE_CAPACITY=move_capacity,
-            NUM_KV_HEADS=num_kv_heads,
-            PER_LAYER=per_layer_sources,
-            DENSE_TOTAL=int(dense_move_indices.shape[-1]),
-            SWA_TOTAL=int(swa_move_indices.shape[-1]) if swa_move_indices is not None else 0,
-            SWA_WINDOW=swa_window,
-        ),
-        # One positional-args tuple per native compact call, in its op signature order.
-        compact_args=[],
+    params.pack_args = (
+        kept_ordinal_rows,
+        valid_seq_lens,
+        dense_move_offsets,
+        dense_move_indices,
+        swa_move_offsets,
+        swa_move_indices,
+    )
+    params.pack_constexprs = dict(
+        KEEP_COUNT=keep_count,
+        DECISION_ROWS=params.decision_rows,
+        MOVE_CAPACITY=move_capacity,
+        NUM_KV_HEADS=num_kv_heads,
+        PER_LAYER=per_layer_sources,
+        DENSE_TOTAL=int(dense_move_indices.shape[-1]),
+        SWA_TOTAL=int(swa_move_indices.shape[-1]) if swa_move_indices is not None else 0,
+        SWA_WINDOW=swa_window,
     )
     for entries, move_indices, move_offsets, destination_bases, slots in move_groups:
         grouped = {}
