@@ -156,16 +156,99 @@ def params_from_wire(d):
     Uses the maintained DisaggregatedParams converter (keeps us off the raw
     nanobind ctor signature).
     """
-    from tensorrt_llm import DisaggregatedParams
+    return (
+        load_internal_apis()
+        .DisaggregatedParams(
+            ctx_request_id=int(d["req_id"]),
+            first_gen_tokens=list(d["first_gen_tokens"]),
+            opaque_state=base64.b64decode(d["opaque_state"]),
+            draft_tokens=d["draft_tokens"],
+            ctx_dp_rank=d["ctx_dp_rank"],
+            ctx_info_endpoint=d["ctx_info_endpoint"],
+        )
+        .get_context_phase_params()
+    )
 
-    return DisaggregatedParams(
-        ctx_request_id=int(d["req_id"]),
-        first_gen_tokens=list(d["first_gen_tokens"]),
-        opaque_state=base64.b64decode(d["opaque_state"]),
-        draft_tokens=d["draft_tokens"],
-        ctx_dp_rank=d["ctx_dp_rank"],
-        ctx_info_endpoint=d["ctx_info_endpoint"],
-    ).get_context_phase_params()
+
+# --------------------------------------------------------------------------- #
+# TRT-LLM internal API surface (single owner)
+# --------------------------------------------------------------------------- #
+_INTERNAL_APIS = None
+
+
+def load_internal_apis():
+    """Every tensorrt_llm symbol the precheck touches, imported in ONE place.
+
+    The precheck bypasses the serving stack and drives internal APIs directly
+    (_torch.pyexecutor.*, bindings.internal.*, private llm_utils resolvers),
+    none of which carry a stability promise. Centralizing the imports means an
+    upstream rename breaks exactly here, and the contract test
+    (tests/unittest/others/test_cache_transceiver_precheck_run.py) fails in
+    the refactorer's pre-merge CI instead of aborting the SLURM disagg perf
+    pipeline at runtime.
+
+    Deliberately lazy (NOT at module import): --dry-run and the pure-logic
+    unit tests must work without torch / tensorrt_llm installed.
+    """
+    global _INTERNAL_APIS
+    if _INTERNAL_APIS is not None:
+        return _INTERNAL_APIS
+    import types
+
+    import tensorrt_llm
+    import tensorrt_llm._torch.models  # noqa: F401 - populates the model registry
+    import tensorrt_llm.bindings
+    import tensorrt_llm.bindings.executor as trtllm_executor
+    from tensorrt_llm import DisaggregatedParams
+    from tensorrt_llm._torch.distributed import Distributed
+    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+    from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
+    from tensorrt_llm._torch.pyexecutor.llm_request import (
+        LlmRequest,
+        LlmRequestState,
+        LlmRequestType,
+    )
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm.llmapi.llm_args import (
+        CacheTransceiverConfig,
+        KvCacheConfig,
+        MTPDecodingConfig,
+    )
+    from tensorrt_llm.llmapi.llm_utils import (
+        _resolve_kv_cache_manager_v2_auto,
+        _resolve_transceiver_runtime_auto,
+    )
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    _INTERNAL_APIS = types.SimpleNamespace(
+        tensorrt_llm=tensorrt_llm,
+        DataType=tensorrt_llm.bindings.DataType,
+        SamplingConfigCpp=tensorrt_llm.bindings.SamplingConfig,
+        CacheTypeCpp=tensorrt_llm.bindings.internal.batch_manager.CacheType,
+        AttentionTypeCpp=tensorrt_llm.bindings.internal.batch_manager.AttentionType,
+        KvCacheConfigCpp=trtllm_executor.KvCacheConfig,
+        DisaggregatedParams=DisaggregatedParams,
+        Distributed=Distributed,
+        MODEL_CLASS_MAPPING=MODEL_CLASS_MAPPING,
+        HangDetector=HangDetector,
+        KVCacheManager=KVCacheManager,
+        KVCacheManagerV2=KVCacheManagerV2,
+        create_kv_cache_transceiver=create_kv_cache_transceiver,
+        LlmRequest=LlmRequest,
+        LlmRequestState=LlmRequestState,
+        LlmRequestType=LlmRequestType,
+        CacheTransceiverConfig=CacheTransceiverConfig,
+        KvCacheConfig=KvCacheConfig,
+        MTPDecodingConfig=MTPDecodingConfig,
+        resolve_kv_cache_manager_v2_auto=_resolve_kv_cache_manager_v2_auto,
+        resolve_transceiver_runtime_auto=_resolve_transceiver_runtime_auto,
+        Mapping=Mapping,
+        SamplingParams=SamplingParams,
+    )
+    return _INTERNAL_APIS
 
 
 # --------------------------------------------------------------------------- #
@@ -231,10 +314,7 @@ def _lookup_model_cls(model_dir):
     hf_view = type("HFConfigView", (), hf_cfg)  # attribute access for the pref hook
     if not archs:
         return None, hf_view
-    import tensorrt_llm._torch.models  # noqa: F401 - populates the registry
-    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
-
-    return MODEL_CLASS_MAPPING.get(archs[0]), hf_view
+    return load_internal_apis().MODEL_CLASS_MAPPING.get(archs[0]), hf_view
 
 
 def resolve_model_prefs(model_dir, side, cache_cfg):
@@ -251,6 +331,7 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
     """
     import types
 
+    api = load_internal_apis()
     model_cls, hf_view = _lookup_model_cls(model_dir)
 
     setting = side["use_kv_cache_manager_v2"]
@@ -267,12 +348,10 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
         try:
             # The REAL serving resolver, via the same shim pattern as the
             # runtime resolution below -- one owner for the 'auto' semantics.
-            from tensorrt_llm.llmapi.llm_utils import _resolve_kv_cache_manager_v2_auto
-
             shim = types.SimpleNamespace(
                 kv_cache_config=types.SimpleNamespace(use_kv_cache_manager_v2="auto")
             )
-            use_v2 = bool(_resolve_kv_cache_manager_v2_auto(shim, defaults))
+            use_v2 = bool(api.resolve_kv_cache_manager_v2_auto(shim, defaults))
         except Exception as e:  # noqa: BLE001 - fall back like a missing model
             print(
                 f"[precheck] WARNING: V2 'auto' resolution failed ({e!r}); assuming V1", flush=True
@@ -283,10 +362,8 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
 
     if getattr(cache_cfg, "transceiver_runtime", None) == "auto":
         try:
-            from tensorrt_llm.llmapi.llm_utils import _resolve_transceiver_runtime_auto
-
             shim = types.SimpleNamespace(cache_transceiver_config=cache_cfg)
-            _resolve_transceiver_runtime_auto(shim, model_cls, hf_view)
+            api.resolve_transceiver_runtime_auto(shim, model_cls, hf_view)
         except Exception as e:  # noqa: BLE001 - fall back to the create() default (CPP)
             print(
                 f"[precheck] WARNING: transceiver_runtime 'auto' resolution failed "
@@ -297,29 +374,24 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
 
 
 def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len, use_v2):
-    import tensorrt_llm.bindings
-    import tensorrt_llm.bindings.executor as trtllm_executor
-    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-
-    DataType = tensorrt_llm.bindings.DataType
-    CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
+    api = load_internal_apis()
     dtype_map = {
-        "fp8": DataType.FP8,
-        "fp16": DataType.HALF,
-        "half": DataType.HALF,
-        "bf16": DataType.BF16,
+        "fp8": api.DataType.FP8,
+        "fp16": api.DataType.HALF,
+        "half": api.DataType.HALF,
+        "bf16": api.DataType.BF16,
     }
     dtype_str = side["kv_dtype"].lower()
     dtype = dtype_map.get(dtype_str)
     if dtype is None:
         print(f"[precheck] kv dtype {dtype_str!r} not mapped, using BF16", flush=True)
-        dtype = DataType.BF16
+        dtype = api.DataType.BF16
 
     spec_config = None
     if side["num_nextn_predict_layers"] > 0:
-        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
-
-        spec_config = MTPDecodingConfig(num_nextn_predict_layers=side["num_nextn_predict_layers"])
+        spec_config = api.MTPDecodingConfig(
+            num_nextn_predict_layers=side["num_nextn_predict_layers"]
+        )
 
     tpb = plan["tokens_per_block"]
     padded_len = ((max_req_len + tpb - 1) // tpb) * tpb
@@ -328,7 +400,7 @@ def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len, use_v2):
 
     # Real MLA serving uses SELFKONLY (kv_factor=1: one latent plane, no V) —
     # see _torch/pyexecutor/_util.py; SELF would double the per-token bytes.
-    cache_type = CacheTypeCpp.SELFKONLY if kv_shape["is_mla"] else CacheTypeCpp.SELF
+    cache_type = api.CacheTypeCpp.SELFKONLY if kv_shape["is_mla"] else api.CacheTypeCpp.SELF
     common = dict(
         num_layers=kv_shape["num_layers"],
         num_kv_heads=kv_shape["num_kv_heads"],
@@ -341,15 +413,12 @@ def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len, use_v2):
         spec_config=spec_config,
     )
     if use_v2:
-        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-        from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-
         # The REAL pydantic KvCacheConfig (what serving passes): partial reuse
         # is pinned off because its pydantic default is True and block reuse
         # is off here. is_disagg=True doubles the IndexMapper capacity so
         # in-flight transfers (TRANS_IN_PROGRESS) can hold slots.
-        return KVCacheManagerV2(
-            KvCacheConfig(
+        return api.KVCacheManagerV2(
+            api.KvCacheConfig(
                 max_tokens=max_tokens,
                 enable_block_reuse=False,
                 enable_partial_reuse=False,
@@ -361,8 +430,8 @@ def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len, use_v2):
             is_disagg=True,
             **common,
         )
-    return KVCacheManager(
-        trtllm_executor.KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
+    return api.KVCacheManager(
+        api.KvCacheConfigCpp(max_tokens=max_tokens, enable_block_reuse=False),
         cache_type,
         **common,
     )
@@ -370,17 +439,16 @@ def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len, use_v2):
 
 def make_request(is_ctx, rid, req_len, runtime, ctx_params=None):
     """Build a ctx or gen LlmRequest (mirrors the UCX-tuning harness)."""
-    import tensorrt_llm.bindings
-    from tensorrt_llm import DisaggregatedParams
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
-    from tensorrt_llm.sampling_params import SamplingParams
+    api = load_internal_apis()
+    LlmRequest, LlmRequestType = api.LlmRequest, api.LlmRequestType
+    DisaggregatedParams = api.DisaggregatedParams
 
-    sampling = SamplingParams()
+    sampling = api.SamplingParams()
     common = dict(
         request_id=rid,
         max_new_tokens=1,
         input_tokens=list(range(req_len)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(sampling._get_sampling_config()),
+        sampling_config=api.SamplingConfigCpp(sampling._get_sampling_config()),
         is_streaming=False,
     )
     if is_ctx:
@@ -734,17 +802,11 @@ class PrecheckRunner:
 
     # ---- setup -------------------------------------------------------------
     def setup(self, kv_shape, max_req_len):
-        import tensorrt_llm
-        import tensorrt_llm.bindings
-        from tensorrt_llm._torch.distributed import Distributed
-        from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
-        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-        from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
-        from tensorrt_llm.mapping import Mapping
+        api = load_internal_apis()
 
-        self.llm_request_state = LlmRequestState
+        self.llm_request_state = api.LlmRequestState
         par = self.side["parallel"]
-        self.mapping = Mapping(
+        self.mapping = api.Mapping(
             world_size=par["world_size"],
             rank=self.rank,
             gpus_per_node=self.plan["gpus_per_node"],
@@ -764,7 +826,7 @@ class PrecheckRunner:
 
         # Built VERBATIM from the disagg yaml's cache_transceiver_config so
         # backend/max_tokens_in_buffer/timeouts match the real test exactly.
-        cache_cfg = CacheTransceiverConfig(**self.side["cache_transceiver_config"])
+        cache_cfg = api.CacheTransceiverConfig(**self.side["cache_transceiver_config"])
         # Yaml-absent settings resolve against the model's preferences, like
         # serving does (kv manager version + transceiver runtime) -- this holds
         # even for the simplified stand-in pool: only the KV SHAPE is generic;
@@ -789,10 +851,10 @@ class PrecheckRunner:
         self.kvm = build_kv_cache_manager(
             kv_shape, self.plan, self.side, self.mapping, max_req_len, self.use_v2
         )
-        AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
+        AttentionTypeCpp = api.AttentionTypeCpp
         attention_type = AttentionTypeCpp.MLA if kv_shape["is_mla"] else AttentionTypeCpp.DEFAULT
-        dist_obj = Distributed.get(self.mapping)
-        self.xcvr = create_kv_cache_transceiver(
+        dist_obj = api.Distributed.get(self.mapping)
+        self.xcvr = api.create_kv_cache_transceiver(
             self.mapping, dist_obj, self.kvm, attention_type, cache_cfg
         )
         if self.xcvr is None:
@@ -1285,8 +1347,6 @@ def _install_watchdog(runner, plan, rank):
     final shutdown, and the mutable "what phase are we in" marker used by
     failure messages.
     """
-    from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
-
     signal.signal(signal.SIGALRM, _alarm_handler)
     current_cell = {"what": "startup"}
 
@@ -1303,7 +1363,7 @@ def _install_watchdog(runner, plan, rank):
     # The detector must outlast the LONGEST legitimate wait (peer handshakes
     # are serialized across sessions); per-cell alarms are the tighter bound
     # for actual transfer work.
-    hang_detector = HangDetector(
+    hang_detector = load_internal_apis().HangDetector(
         timeout=hello_timeout_s(plan, runner.side["num_peers"]) + plan["wave_timeout_s"] + 60,
         on_detected=_on_hang,
     )
