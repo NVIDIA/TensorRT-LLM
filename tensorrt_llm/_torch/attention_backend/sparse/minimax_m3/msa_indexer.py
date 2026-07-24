@@ -131,6 +131,7 @@ class MsaIndexer:
         proxy_plan: Optional[tuple] = None,
         max_score: Optional[torch.Tensor] = None,
         n_valid_blocks: Optional[torch.Tensor] = None,
+        head_major_output: bool = False,
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
@@ -180,18 +181,25 @@ class MsaIndexer:
             # Empty-selection guard. n_valid_blocks is a host tensor on
             # this path, so the .item() read does not sync the device.
             if n_valid_blocks.numel() == 0 or int(n_valid_blocks.max().item()) <= 0:
-                return torch.full(
-                    (idx_q.shape[0], config.num_kv_heads, MSA_REQUIRED_TOPK),
+                output_shape = (
+                    (config.num_kv_heads, idx_q.shape[0], MSA_REQUIRED_TOPK)
+                    if head_major_output
+                    else (idx_q.shape[0], config.num_kv_heads, MSA_REQUIRED_TOPK)
+                )
+                output = torch.full(
+                    output_shape,
                     -1,
                     dtype=torch.int32,
                     device=idx_q.device,
                 )
+                return output.permute(1, 0, 2) if head_major_output else output
         return select_blocks_from_maxscore(
             max_score_kv,
             topk=MSA_REQUIRED_TOPK,
             n_valid_blocks=n_valid_blocks,
             init_blocks=config.init_blocks,
             local_blocks=config.local_blocks,
+            head_major_output=head_major_output,
         )
 
 
