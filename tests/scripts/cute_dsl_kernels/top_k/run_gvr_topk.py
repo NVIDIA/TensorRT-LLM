@@ -410,6 +410,70 @@ def derive_seed_rungs(
     return torch.stack([prev_thr - d_lo, prev_thr, prev_thr + d], dim=1).contiguous()
 
 
+def emu_cand_bucketed(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seed_thr: torch.Tensor,
+    cap: int,
+    seg_cap: int = 8192,
+    next_n: int = 1,
+    compress_ratio: int = 1,
+    sentinel_pad: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bucketed SoA candidate emission (v5 contract).
+
+    Three fixed segments in one buffer: A = [0, seg_cap) holds >= t2,
+    B = [seg_cap, 2*seg_cap) holds [t1, t2), C = [2*seg_cap, 2*seg_cap
+    + cap) holds [t0, t1). A full segment spills to the next looser one
+    (never drops an entry), so the union always equals the full >= t0
+    set, and a segment group is complete exactly when its line's count
+    fits the acceptance band (seg_cap = B*). Sentinel pads land in C.
+    ctl = {n0 (claimed incl pads), void, n1, n2}.
+    """
+    R, _C = logits.shape
+    dev = logits.device
+    n_eff = _row_n_eff(seq_lens, R, next_n, compress_ratio)
+    lf = logits.to(torch.float32)
+    width = 2 * seg_cap + cap
+    cand_vals = torch.full((R, width), float("-inf"), dtype=torch.float32, device=dev)
+    cand_idx = torch.full((R, width), -1, dtype=torch.int32, device=dev)
+    ctl = torch.zeros((R, 4), dtype=torch.int32, device=dev)
+    for r in range(R):
+        ne = int(n_eff[r])
+        row = lf[r, :ne]
+        hits = torch.nonzero(row >= seed_thr[r, 0], as_tuple=False).flatten()
+        cnt = hits.numel()
+        ctl[r, 2] = int((row >= seed_thr[r, 1]).sum())
+        ctl[r, 3] = int((row >= seed_thr[r, 2]).sum())
+        # emission order is value-blind: shuffle, then classify
+        perm = hits[torch.randperm(cnt, device=dev)]
+        v = row[perm]
+        seg = torch.where(v >= seed_thr[r, 2], 0, torch.where(v >= seed_thr[r, 1], 1, 2))
+        # vectorized spill-to-looser: stream s = native entries + spill
+        # from s-1 (in emission order); ordinal beyond the cap spills on.
+        in_a = seg == 0
+        ord_a = torch.cumsum(in_a.int(), 0)
+        stay_a = in_a & (ord_a <= seg_cap)
+        in_b = (seg == 1) | (in_a & ~stay_a)
+        ord_b = torch.cumsum(in_b.int(), 0)
+        stay_b = in_b & (ord_b <= seg_cap)
+        in_c = (seg == 2) | (in_b & ~stay_b)
+        ord_c = torch.cumsum(in_c.int(), 0)
+        stay_c = in_c & (ord_c <= cap)
+        voided = int(in_c.sum()) > cap
+        slot = torch.full_like(seg, -1)
+        slot[stay_a] = ord_a[stay_a] - 1
+        slot[stay_b] = seg_cap + (ord_b[stay_b] - 1)
+        slot[stay_c] = 2 * seg_cap + (ord_c[stay_c] - 1)
+        live = slot >= 0
+        cand_vals[r, slot[live].long()] = v[live]
+        cand_idx[r, slot[live].long()] = perm[live].int()
+        claimed = cnt + sentinel_pad
+        ctl[r, 0] = claimed
+        ctl[r, 1] = 1 if (voided or claimed > cap) else 0
+    return cand_vals, cand_idx, ctl
+
+
 def derive_seed_lines_v4(
     prev_anchor: torch.Tensor,
     prev_sthr: "torch.Tensor | None" = None,
