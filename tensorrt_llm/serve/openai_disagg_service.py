@@ -181,6 +181,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         else:
             if gen_server:
                 await self._gen_router.finish_request(request, req_id=gen_reservation_id)
+            if hooks:
+                hooks.on_resp_done("", request, ctx_response)
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
                 # make up for this by returning a done generator
