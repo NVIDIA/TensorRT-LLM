@@ -21,7 +21,7 @@ slurm_build_wheel() {
         fi
 
         echo "Building wheel on node ${SLURM_NODEID:-0}, task ${SLURM_LOCALID:-0}"
-        retry_command bash -c "cd $llmSrcNode && rm -rf .venv-3.12 && python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --cuda_architectures '100-real' --clean -c"
+        retry_command bash -c "cd $llmSrcNode && rm -rf .venv-3.12 && python3 ./scripts/build_wheel.py --use_ccache --cuda_architectures '100-real' --clean -c"
 
         cd $jobWorkspace
         echo "(Writing build wheel lock) Lock file: $build_lock_file"
@@ -45,6 +45,8 @@ slurm_install_setup() {
         fi
 
         echo "(Installing TensorRT-LLM and requirements) Install mode: ${INSTALL_MODE:-source}"
+
+        retry_command pip install --retries 10 opencv-python-headless
 
         # Support two installation modes: source (default) and wheel
         if [ "${INSTALL_MODE:-source}" = "wheel" ]; then

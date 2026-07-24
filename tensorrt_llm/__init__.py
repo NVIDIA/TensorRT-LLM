@@ -105,31 +105,23 @@ _setup_vendored_triton_kernels()
 import torch  # noqa
 
 import tensorrt_llm._torch.models as torch_models
-import tensorrt_llm.functional as functional
 import tensorrt_llm.math_utils as math_utils
 import tensorrt_llm.models as models
 import tensorrt_llm.quantization as quantization
 import tensorrt_llm.runtime as runtime
 import tensorrt_llm.tools as tools
 
-from ._common import _init, default_net, default_trtnet, precision
+from ._common import _init
 from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
                      mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
-                     set_mpi_comm, str_dtype_to_torch, str_dtype_to_trt,
-                     torch_dtype_to_trt)
-from .builder import BuildConfig, Builder, BuilderConfig, build
+                     set_mpi_comm, str_dtype_to_torch)
 from .disaggregated_params import DisaggregatedParams
-from .functional import Tensor, constant
 from .llmapi import LLM, AsyncLLM, MultimodalEncoder
-from .llmapi.llm_args import LlmArgs, TorchLlmArgs, TrtLlmArgs
+from .llmapi.llm_args import LlmArgs, TorchLlmArgs
 from .logger import logger
 from .mapping import Mapping
 from .models.automodel import AutoConfig, AutoModelForCausalLM
-from .module import Module
-from .network import Network, net_guard
-from .parameter import Parameter
-from .python_plugin import PluginBase
 from .sampling_params import SamplingParams
 from .version import __version__
 from .visual_gen import (ExtraParamSchema, VisualGen, VisualGenArgs,
@@ -140,8 +132,6 @@ __all__ = [
     'AutoConfig',
     'AutoModelForCausalLM',
     'logger',
-    'str_dtype_to_trt',
-    'torch_dtype_to_trt',
     'str_dtype_to_torch',
     'default_gpus_per_node',
     'local_mpi_rank',
@@ -151,27 +141,12 @@ __all__ = [
     'mpi_rank',
     'set_mpi_comm',
     'mpi_world_size',
-    'constant',
-    'default_net',
-    'default_trtnet',
-    'precision',
-    'net_guard',
     'torch_models',
-    'Network',
     'Mapping',
     'MnnvlMemory',
     'MnnvlMoe',
     'MoEAlltoallInfo',
-    'PluginBase',
-    'Builder',
-    'BuilderConfig',
-    'build',
-    'BuildConfig',
-    'Tensor',
-    'Parameter',
     'runtime',
-    'Module',
-    'functional',
     'models',
     'quantization',
     'tools',
@@ -180,7 +155,6 @@ __all__ = [
     'MultimodalEncoder',
     'LlmArgs',
     'TorchLlmArgs',
-    'TrtLlmArgs',
     'SamplingParams',
     'VisualGenArgs',
     'ExtraParamSchema',

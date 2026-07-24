@@ -90,6 +90,61 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
+        # DeepSeek V4 Flash uses TRTLLM for MXFP4 routed experts.
+        {
+            'patterns': ['deepseek_v4_flash-bench'],
+            'config': {
+                'enable_attention_dp': True,
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+                'max_seq_len': 10240,
+                'max_num_tokens': 4096,
+                'enable_chunked_prefill': True,
+                'kv_cache_config': {
+                    'free_gpu_memory_fraction': 0.5,
+                },
+            }
+        },
+        # DeepSeek V4 Flash-Base uses WIDEEP for FP8 block-scale on Blackwell.
+        {
+            'patterns': ['deepseek_v4_flash_base'],
+            'config': {
+                'enable_attention_dp': True,
+                'moe_config': {
+                    'backend': 'WIDEEP',
+                },
+                'max_seq_len': 10240,
+            }
+        },
+        # DeepSeek V4 Pro DSpark mirrors the upstream 8-GPU accuracy configuration.
+        {
+            'patterns': ['deepseek_v4_pro_dspark'],
+            'config': {
+                'attn_backend': 'TRTLLM',
+                'enable_attention_dp': True,
+                'moe_config': {
+                    'backend': 'MEGAMOE_DEEPGEMM',
+                },
+                'max_seq_len': 10240,
+                'max_num_tokens': 9216,
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                },
+                'enable_chunked_prefill': False,
+                'disable_overlap_scheduler': True,
+                'custom_tokenizer': 'deepseek_v4',
+                'speculative_config': {
+                    'decoding_type':
+                    'DSpark',
+                    'max_draft_len':
+                    5,
+                    'speculative_model':
+                    f'{llm_models_root()}/DeepSeek-V4-Pro-DSpark',
+                },
+            }
+        },
         # DeepSeek R1 models with MTP speculative decoding
         {
             'patterns': [
@@ -251,9 +306,10 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
-        # MiniMax-M2.5 FP8 on 8 GPUs: intermediate_size=1536 with weight_block_size=128
-        # is not divisible under TP=8 (1536/8=192), so route MoE through EP=8 and use
-        # attention DP instead of TP.
+        # MiniMax-M2.5 FP8: route MoE through attention DP.
+        # TP=8: intermediate_size=1536 is not block-scale divisible (1536/8=192, %128!=0).
+        # TP=4: trtllm-gen FP8 block-scale MoE kernel IMAs during CUDA-graph warmup
+        # on the 1536/4=384 N-shard (Blackwell B200/B300).
         {
             'patterns': [
                 'minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-gpus:8',
@@ -263,6 +319,12 @@ def get_model_yaml_config(model_label: str,
                 'minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:1000,2000-ep:8-gpus:8',
                 'minimax_m2.5_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-ep:8-gpus:8',
                 'minimax_m2.5_fp8-bench-pytorch-float8-maxbs:512-input_output_len:1000,1000-con:512-ep:8-gpus:8',
+                'minimax_m2.5_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:128,128-gpus:4',
+                'minimax_m2.5_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:500,2000-gpus:4',
+                'minimax_m2.5_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:2000,500-gpus:4',
+                'minimax_m2.5_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:1000,1000-gpus:4',
+                'minimax_m2.5_fp8-bench-pytorch-float8-maxbs:1-maxnt:2048-input_output_len:1000,1000-reqs:10-con:1-gpus:4',
+                'minimax_m2.5_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:1000,1000-con:256-gpus:4',
             ],
             'config': {
                 'enable_attention_dp': True,

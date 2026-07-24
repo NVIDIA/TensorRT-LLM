@@ -1,8 +1,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=26.04-py3
-ARG TRITON_BASE_TAG=26.04-py3
+ARG BASE_TAG=26.05-py3
+ARG TRITON_BASE_TAG=26.05-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -31,7 +31,6 @@ FROM base AS devel
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
-ARG TRT_VER
 ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER
@@ -45,11 +44,11 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     echo "Using Python version: ${PYTHON_VERSION}" && \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
     PYTHON_VERSION=${PYTHON_VERSION} \
-    TRT_VER=${TRT_VER} CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
+    CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
     NCCL_VER=${NCCL_VER} CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
-         --tensorrt --polygraphy --mpi4py --pytorch --opencv
+         --cuda_libs --polygraphy --mpi4py --pytorch
 
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
@@ -119,7 +118,7 @@ COPY .gitmodules setup.py requirements.txt requirements-dev.txt constraints.txt 
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
 ARG GITHUB_MIRROR=""
-ARG BUILD_WHEEL_ARGS="--clean --benchmarks"
+ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
     GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
@@ -128,7 +127,9 @@ FROM ${DEVEL_IMAGE} AS release
 
 WORKDIR /app/tensorrt_llm
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
-    pip install /tmp/wheel/tensorrt_llm*.whl
+    TRTLLM_WHEEL=$(find /tmp/wheel -maxdepth 1 -name 'tensorrt_llm*.whl' -print -quit) && \
+    test -n "${TRTLLM_WHEEL}" && \
+    pip install "${TRTLLM_WHEEL}[mx]"
 
 RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     --mount=type=bind,source=docs,target=/mnt/ctx/docs \
@@ -136,7 +137,6 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     --mount=type=bind,source=examples,target=/mnt/ctx/examples \
     --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/mnt/wheel \
     --mount=type=bind,from=wheel,source=/src/tensorrt_llm/benchmarks,target=/mnt/benchmarks \
-    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/cpp/build/benchmarks,target=/mnt/cpp_benchmarks \
     # Copy build context files
     cp /mnt/ctx/README.md ./ && \
     cp -r /mnt/ctx/docs ./docs && \
@@ -146,24 +146,12 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     # Copy wheel stage outputs
     cp /mnt/wheel/tensorrt_llm*.whl ./ && \
     cp -r /mnt/benchmarks ./benchmarks && \
-    mkdir -p benchmarks/cpp && \
-    cp /mnt/cpp_benchmarks/bertBenchmark \
-       /mnt/cpp_benchmarks/gptManagerBenchmark \
-       /mnt/cpp_benchmarks/disaggServerBenchmark \
-       benchmarks/cpp/ && \
-    rm -v \
-      benchmarks/cpp/bertBenchmark.cpp \
-      benchmarks/cpp/gptManagerBenchmark.cpp \
-      benchmarks/cpp/disaggServerBenchmark.cpp \
-      benchmarks/cpp/CMakeLists.txt && \
-    # Create symlinks to installed package binaries and libraries
-    ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/bin")') bin && \
-    test -f bin/executorWorker && \
+    # Create a symlink to installed package libraries
     ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
-    test -f lib/libnvinfer_plugin_tensorrt_llm.so && \
+    test -f lib/libtensorrt_llm.so && \
     echo "/app/tensorrt_llm/lib" > /etc/ld.so.conf.d/tensorrt_llm.conf && \
     ldconfig && \
-    ! ( ldd -v bin/executorWorker | grep tensorrt_llm | grep -q "not found" ) && \
+    ! ( ldd -v lib/libth_common.so | grep tensorrt_llm | grep -q "not found" ) && \
     # Clean up caches and CVE workarounds
     rm -rf /root/.cache/uv/archive-v0 && \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2

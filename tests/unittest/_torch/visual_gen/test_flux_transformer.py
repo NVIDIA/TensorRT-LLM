@@ -160,6 +160,21 @@ def test_flux2_single_stream_cute_dsl_guard_requires_interleaved_weights(monkeyp
     assert not attn._can_project_hidden_mlp_with_cute_dsl()
 
 
+def test_flux2_single_stream_cute_dsl_layout_requires_tensor_parallelism():
+    from tensorrt_llm._torch.visual_gen.models.flux.attention import Flux2ParallelSelfAttention
+
+    assert not Flux2ParallelSelfAttention._is_cute_dsl_swiglu_layout_compatible(
+        tp_size=1,
+        gate_up_out_features=256,
+        down_in_features=128,
+    )
+    assert Flux2ParallelSelfAttention._is_cute_dsl_swiglu_layout_compatible(
+        tp_size=2,
+        gate_up_out_features=256,
+        down_in_features=128,
+    )
+
+
 def test_flux2_joint_qkv_mlp_enables_cutedsl_for_mlp_only():
     from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import FluxJointQKVMLPProj
 
@@ -172,6 +187,11 @@ def test_flux2_joint_qkv_mlp_enables_cutedsl_for_mlp_only():
         skip_create_weights_in_init=True,
         use_cute_dsl_blockscaling_mm=True,
         mapping=Mapping(world_size=2, rank=0, tp_size=2),
+        override_qkv_sharding={
+            "q": (0, 128),
+            "k": (0, 128),
+            "v": (0, 128),
+        },
     )
 
     assert not proj.qkv_proj.use_cute_dsl_blockscaling_mm
@@ -354,6 +374,39 @@ class TestFluxTransformer(unittest.TestCase):
 
         self.assertFalse(block.ff.use_cute_dsl_blockscaling_mm)
         self.assertFalse(block.ff_context.use_cute_dsl_blockscaling_mm)
+
+    def test_flux2_dual_stream_ffn_handles_missing_config(self):
+        from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2 import (
+            Flux2TransformerBlock,
+        )
+
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch(
+                "tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2.is_sm_100f",
+                return_value=True,
+            ),
+            mock.patch(
+                "tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2.FluxJointAttention",
+                return_value=torch.nn.Identity(),
+            ),
+            mock.patch(
+                "tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2.GatedMLP",
+                side_effect=lambda **_: torch.nn.Identity(),
+            ) as gated_mlp,
+        ):
+            Flux2TransformerBlock(
+                dim=16,
+                num_attention_heads=2,
+                attention_head_dim=8,
+                mlp_ratio=2.0,
+                config=None,
+                skip_create_weights=True,
+            )
+
+        self.assertEqual(gated_mlp.call_count, 2)
+        for call in gated_mlp.call_args_list:
+            self.assertFalse(call.kwargs["use_cute_dsl_blockscaling_mm"])
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_flux1_forward_sanity(self):

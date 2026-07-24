@@ -1,4 +1,5 @@
 import json
+import math
 import os
 
 import pytest
@@ -17,6 +18,8 @@ from tensorrt_llm._torch.attention_backend.sparse.rocket import (
     RocketVanillaAttentionMetadata,
 )
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._utils import get_size_in_bytes
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -702,6 +705,48 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         assert len(vanilla_sparse_attn_indices_list) == 0, (
             "Both should return None when no sparse attention is needed"
         )
+
+
+@pytest.mark.skipif(getSMVersion() < 100, reason="RocketKV requires SM100 (Blackwell)")
+def test_rocketkv_kt_cache_sized_by_kt_dtype_not_kv_dtype():
+    """get_cache_bytes_per_token() must size the KT (key-landmark) cache from the KT
+    pool's own dtype, matching the pool physically allocated in __init__ -- not the
+    main KV cache dtype. The old code scaled the KT term by the main KV dtype byte
+    width, under-counting the KT pool by 2x when the main KV cache was FP8. Using
+    FP8 main KV + bfloat16 KT makes the two dtypes differ, so this fails without the
+    fix and passes with it.
+    """
+    sparse_attn_config = RocketSparseAttentionConfig(
+        prompt_budget=2048, page_size=4, kt_cache_dtype="bfloat16"
+    )
+    kv_cache_manager = create_rocket_kv_cache_manager(
+        num_layers=4,
+        num_kv_heads=8,
+        head_dim=128,
+        tokens_per_block=64,
+        max_seq_len=4096,
+        max_batch_size=8,
+        dtype=DataType.FP8,
+        sparse_attn_config=sparse_attn_config,
+    )
+    try:
+        # KT contribution: ground truth from the physically allocated KT pool.
+        kt_pool_bytes = sum(
+            t.numel() * t.element_size() for t in kv_cache_manager.kt_cache_pool_per_layer
+        )
+        tokens = kv_cache_manager.num_blocks * kv_cache_manager.tokens_per_block
+        # Main K/V contribution is unchanged (sized at the main KV dtype).
+        main_bytes = get_size_in_bytes(
+            math.ceil(
+                kv_cache_manager.kv_factor
+                * sum(kv_cache_manager.num_kv_heads_per_layer)
+                * kv_cache_manager.head_dim
+            ),
+            kv_cache_manager.dtype,
+        )
+        assert kv_cache_manager.get_cache_bytes_per_token() == main_bytes + kt_pool_bytes // tokens
+    finally:
+        kv_cache_manager.shutdown()
 
 
 if __name__ == "__main__":

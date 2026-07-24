@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import os
@@ -48,12 +63,12 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
-from tensorrt_llm.runtime.generation import CUASSERT
 
 if TYPE_CHECKING:
     from .bounce import Config
@@ -551,11 +566,30 @@ class Sender(SenderBase):
         agent_result = AgentResult.SUCCESS
         send_slot_id = None
         if write_meta.src_ptrs.size > 0:
-            request, send_slot_id = build_send_request(
-                self._bounce,
-                write_meta,
-                lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
-            )
+            try:
+                request, send_slot_id = build_send_request(
+                    self._bounce,
+                    write_meta,
+                    lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
+                )
+            except Exception as e:
+                # Don't let a gather fault escape: without a result the receiver would hang and its
+                # region leak. Tell the receiver it failed and fail the local task instead.
+                logger.error(
+                    f"_deliver_kv_to_agent: failed to build the KV send request for "
+                    f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
+                )
+                task.fail(RuntimeError(f"build_send_request failed: {e}"))
+                self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+                    _make_kv_result_msg(
+                        self._instance_rank,
+                        write_meta.unique_rid,
+                        write_meta.slice_id,
+                        True,  # is_last_slice — ensures receiver resolves its task future
+                        AgentResult.FAILED,
+                    )
+                )
+                return
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
             try:
@@ -748,89 +782,86 @@ class Sender(SenderBase):
         peer_extractor = self._registrar.peer_extractor(
             peer_ri.instance_name, peer_ri.instance_rank
         )
-        if self._registrar.should_send_kv(targets, peer_ri):
-            pool_mapping = self._registrar.get_pool_mapping(peer_ri)
-            dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
-            src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
+        pool_mapping = self._registrar.get_pool_mapping(peer_ri)
+        dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
+        src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
 
-            # Aggregate fragments from all matching pools using numpy concatenation
-            for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
-                src_block_ids = src_block_ids_per_groups[self_lg]
-                dst_block_ids = dst_block_ids_per_groups[peer_lg]
+        # Aggregate fragments from all matching pools using numpy concatenation.
+        # Send ownership is per pool: replicated pools elect one fan-in
+        # owner, sharded pools keep head-duplication routing.
+        for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
+            if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
+                continue
+            src_block_ids = src_block_ids_per_groups[self_lg]
+            dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-                # Speculative decoding: generation may have one extra draft-token block.
-                block_diff = dst_block_ids.size - src_block_ids.size
-                if block_diff == 1:
-                    logger.debug(
-                        f"Trimming 1 extra dst block for draft tokens: "
-                        f"src={src_block_ids.size}, dst={dst_block_ids.size}"
-                    )
-                    dst_block_ids = dst_block_ids[:-1]
-                elif block_diff > 1:
-                    raise ValueError(
-                        f"src/dst block count mismatch: {src_block_ids.size} vs "
-                        f"{dst_block_ids.size} (expected diff <= 1)"
-                    )
-                tpb = extractor.page_table.tokens_per_block
-                token_range = task._slice.token_range
-                lg_info = extractor.page_table.layer_groups[self_lg]
-                window_size = getattr(lg_info, "sliding_window_size", None)
+            # Both sides trim block lists to ceil(prompt_len / tpb) in
+            # _create_kv_slice, so dst must never exceed src. A smaller dst
+            # (generation prefix-cache reuse) is handled via dst_start below.
+            block_diff = dst_block_ids.size - src_block_ids.size
+            if block_diff > 0:
+                raise ValueError(
+                    f"src/dst block count mismatch: {src_block_ids.size} vs "
+                    f"{dst_block_ids.size} (dst must not exceed src)"
+                )
+            tpb = extractor.page_table.tokens_per_block
+            token_range = task._slice.token_range
+            lg_info = extractor.page_table.layer_groups[self_lg]
+            window_size = getattr(lg_info, "sliding_window_size", None)
 
-                # Block lists are the suffix of [..., slice_end); cached prefix
-                # is implicit in their size. token_start = (total_blocks - n) * tpb.
-                slice_end = token_range.end if token_range is not None else 0
-                total_blocks = (slice_end + tpb - 1) // tpb
-                src_beam0_blocks = Sender._beam0_block_count(
-                    src_block_ids, total_blocks, task._beam_width
+            # Block lists are the suffix of [..., slice_end); cached prefix
+            # is implicit in their size. token_start = (total_blocks - n) * tpb.
+            slice_end = token_range.end if token_range is not None else 0
+            total_blocks = (slice_end + tpb - 1) // tpb
+            src_beam0_blocks = Sender._beam0_block_count(
+                src_block_ids, total_blocks, task._beam_width
+            )
+            dst_beam0_blocks = Sender._beam0_block_count(
+                dst_block_ids, total_blocks, task._beam_width
+            )
+            assert src_beam0_blocks <= total_blocks, (
+                f"src beam-0 block list ({src_beam0_blocks}) exceeds total slice "
+                f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
+            )
+            assert dst_beam0_blocks <= total_blocks, (
+                f"dst beam-0 block list ({dst_beam0_blocks}) exceeds total slice "
+                f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
+            )
+            src_start = (total_blocks - src_beam0_blocks) * tpb
+            dst_start = (total_blocks - dst_beam0_blocks) * tpb
+            if req_info.dst_start_token is not None:
+                dst_start = max(dst_start, req_info.dst_start_token)
+            if window_size is not None:
+                # SWA stale_end uses the request prompt_len (not slice_end —
+                # they differ for non-final slices). prompt_len must be plumbed
+                # via the session; falling back to slice_end is wrong on
+                # non-final slices.
+                assert task._prompt_len is not None, (
+                    "SWA layer requires session.prompt_len; "
+                    "set TxSession(prompt_len=request.prompt_len)."
                 )
-                dst_beam0_blocks = Sender._beam0_block_count(
-                    dst_block_ids, total_blocks, task._beam_width
-                )
-                assert src_beam0_blocks <= total_blocks, (
-                    f"src beam-0 block list ({src_beam0_blocks}) exceeds total slice "
-                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
-                )
-                assert dst_beam0_blocks <= total_blocks, (
-                    f"dst beam-0 block list ({dst_beam0_blocks}) exceeds total slice "
-                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
-                )
-                src_start = (total_blocks - src_beam0_blocks) * tpb
-                dst_start = (total_blocks - dst_beam0_blocks) * tpb
-                if req_info.dst_start_token is not None:
-                    dst_start = max(dst_start, req_info.dst_start_token)
-                if window_size is not None:
-                    # SWA stale_end uses the request prompt_len (not slice_end —
-                    # they differ for non-final slices). prompt_len must be plumbed
-                    # via the session; falling back to slice_end is wrong on
-                    # non-final slices.
-                    assert task._prompt_len is not None, (
-                        "SWA layer requires session.prompt_len; "
-                        "set TxSession(prompt_len=request.prompt_len)."
-                    )
-                    stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
-                    src_start = max(stale_end * tpb, src_start)
-                    dst_start = max(stale_end * tpb, dst_start)
-                src_block_ids, dst_block_ids = Sender._align_kv_blocks(
-                    src_block_ids,
-                    dst_block_ids,
-                    src_token_start=src_start,
-                    dst_token_start=dst_start,
-                    tokens_per_block=tpb,
-                )
+                stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
+                src_start = max(stale_end * tpb, src_start)
+                dst_start = max(stale_end * tpb, dst_start)
+            src_block_ids, dst_block_ids = Sender._align_kv_blocks(
+                src_block_ids,
+                dst_block_ids,
+                src_token_start=src_start,
+                dst_token_start=dst_start,
+                tokens_per_block=tpb,
+            )
 
-                src_region = extractor.extract(
-                    src_block_ids, layer_group_id=self_lg, pool_idx=self_pi
-                )
-                dst_region = peer_extractor.extract(
-                    dst_block_ids, layer_group_id=peer_lg, pool_idx=peer_pi
-                )
-                mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
-                region_pair = mapper.map(src_region, dst_region)
-                region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
-                for rp in region_pairs:
-                    src_frag_parts.append(rp.src.memory.ptrs)
-                    dst_frag_parts.append(rp.dst.memory.ptrs)
-                    size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
+            src_region = extractor.extract(src_block_ids, layer_group_id=self_lg, pool_idx=self_pi)
+            dst_region = peer_extractor.extract(
+                dst_block_ids, layer_group_id=peer_lg, pool_idx=peer_pi
+            )
+            mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
+            region_pair = mapper.map(src_region, dst_region)
+            region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
+            for rp in region_pairs:
+                src_frag_parts.append(rp.src.memory.ptrs)
+                dst_frag_parts.append(rp.dst.memory.ptrs)
+                size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
 
         if src_frag_parts:
             src_frags = np.concatenate(src_frag_parts)
@@ -1508,15 +1539,22 @@ class Receiver(ReceiverBase):
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
             list isn't available (shorter than the fan-in degree), be conservative and fall back.
         Otherwise fall back to the per-fragment path (correct, just not coalesced).
-        NOTE: equal layer COUNT == equal BYTES only when per-layer KV is uniform; for mixed layer
-        groups (e.g. differing slot_bytes) reserve()'s `total % num_writers` divisibility guard is the
-        backstop, and a fully size-aware split (per-writer offsets) would be the general fix."""
+        Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
+        the mismatched case, so this only needs the count to split evenly."""
         if overlap.duplicate_head_factor != 1:
             return False
         if overlap.overlap_pp_size > 1:
             lpp = getattr(peer_ri, "layer_num_per_pp", None)
             if not lpp or len(lpp) < overlap.overlap_pp_size or len(set(lpp)) != 1:
                 return False
+        # Replicated pools (e.g. MiniMax M3 index-key) are sent by one elected
+        # fan-in owner only, so with multiple writers their contributions
+        # differ in size and the equal split is invalid.
+        if len(overlap.ranks) > 1 and peer_ri.page_table is not None:
+            for layer_group in peer_ri.page_table.layer_groups:
+                for pool_view in getattr(layer_group, "pool_views", ()):
+                    if pool_view.mapper_kind == MapperKind.REPLICATED:
+                        return False
         return True
 
     def dispatch_task(self, task: KVRecvTask):
@@ -1995,13 +2033,16 @@ class RxSession(RxSessionBase):
             self._terminal_status = SessionStatus.CANCELLED
             exc = RuntimeError(f"RxSession {self.disagg_request_id} cancelled")
             for task in self._kv_tasks:
+                rid_slice = (self.disagg_request_id, task.slice_id)
                 if task.status == TaskStatus.INIT:
                     # INIT = reserved but no write in flight, so freeing its bounce reservation here
-                    # is safe (TRANSFERRING tasks keep running and self-release on SUCCESS/FAILED).
-                    self._receiver._bounce.release_idle_reservation(
-                        (self.disagg_request_id, task.slice_id)
-                    )
+                    # is safe.
+                    self._receiver._bounce.release_idle_reservation(rid_slice)
                     task.fail(exc)
+                elif task.status == TaskStatus.TRANSFERRING:
+                    # A write may still be mid-flight, so quarantine the region rather than freeing
+                    # it; this keeps a cancelled transfer from leaking. No-op when bounce is off.
+                    self._receiver._bounce.orphan_reservation(rid_slice)
         # Send outside the lock to avoid holding it during I/O.
         self._receiver.send_cancel_to_senders(self.disagg_request_id, self._sender_endpoints)
 
@@ -2059,6 +2100,10 @@ class RxSession(RxSessionBase):
             self.aux_slot = None
         # Unregister from Receiver; keep fields alive for in-flight listener messages.
         if self._receiver is not None:
+            # Reclaim any bounce region still live at teardown (closed mid-transfer) so it isn't
+            # leaked; a no-op for finished or non-bounce transfers.
+            for task in self._kv_tasks:
+                self._receiver._bounce.orphan_reservation((self.disagg_request_id, task.slice_id))
             self._receiver.clear_session(self.disagg_request_id)
 
     def __enter__(self):

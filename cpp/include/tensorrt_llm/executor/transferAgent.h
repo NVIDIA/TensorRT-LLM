@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -216,12 +216,20 @@ struct VmmDescSplitter
     /// For non-VRAM or addresses not in the map, descs pass through unchanged.
     [[nodiscard]] static MemoryDescs splitDescsWithRegionMap(MemoryDescs const& descs, VramRegionMap const& regionMap);
 
-    /// @brief Split paired src/dst descs using local and remote region maps.
-    /// src is split by localRegionMap, dst is split by remoteRegionMap.
-    /// The final piece size is min(srcPiece, dstPiece, remaining).
-    [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> splitTransferDescsWithRegionMaps(
-        MemoryDescs const& srcDescs, MemoryDescs const& dstDescs, VramRegionMap const& localRegionMap,
-        VramRegionMap const& remoteRegionMap);
+    /// @brief Split paired src/dst descs at chunk boundaries, then coalesce contiguous pieces.
+    /// src is split by localRegionMap, dst is split by remoteRegionMap; each piece size is
+    /// min(srcPiece, dstPiece, remaining). Pairs are sorted by src address, and adjacent pieces
+    /// whose src AND dst are both contiguous (same deviceId) are merged — but a merged desc never
+    /// crosses a chunk boundary on either side, and never spans two distinct regions, so every
+    /// output desc stays within a single registered memory region. Merging requires region
+    /// metadata: a piece whose address misses the region map on either side is never merged,
+    /// because two unknown regions are indistinguishable and a merge could cross a chunk or
+    /// registration boundary. With no region metadata the result is split-only. Non-kVRAM descs
+    /// pass through unchanged (no region info is available to bound the merge).
+    /// @param enableCoalesce When false, only split at chunk boundaries without merging pieces.
+    [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> splitAndCoalesceTransferDescs(MemoryDescs const& srcDescs,
+        MemoryDescs const& dstDescs, VramRegionMap const& localRegionMap, VramRegionMap const& remoteRegionMap,
+        bool enableCoalesce = true);
 
     /// @brief Split VRAM descs at VMM chunk boundaries detected via cuMemGetAddressRange.
     /// For cudaMalloc memory (single allocation), descs pass through unchanged.
@@ -356,6 +364,13 @@ public:
     virtual ~TransferStatus() = default;
     [[nodiscard]] virtual bool isCompleted() const = 0;
     virtual TransferState wait(int64_t timeout_ms = -1) const = 0;
+
+    /// Release the backend transfer request handle. A true return means the backend accepted the handle release; it
+    /// does not prove remote memory quiescence.
+    [[nodiscard]] virtual bool release()
+    {
+        return false;
+    }
 };
 
 struct BaseAgentConfig

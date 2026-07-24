@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
@@ -561,6 +562,27 @@ class TransformerConfig:
     apply_gated_attention: bool = False
 
 
+class AudioShardMode(Enum):
+    """How the LTX-2 audio stream is distributed across Ulysses ranks.
+
+    NONE — Ulysses inactive (single rank): audio runs full, unsharded.
+    CONDITIONAL — audio replicated (default): full on every rank, only v2a
+        slices its Q per rank.
+    FULL — legacy: audio sequence-sharded across ranks.
+    """
+
+    NONE = "none"
+    CONDITIONAL = "conditional"
+    FULL = "full"
+
+
+# TRTLLM_LTX2_AUDIO_CONDITIONAL_SHARD=true (default) replicates the audio stream
+# (CONDITIONAL); set false/0 to force the legacy full seq-shard (FULL).
+_LTX2_AUDIO_CONDITIONAL_SHARD = os.environ.get(
+    "TRTLLM_LTX2_AUDIO_CONDITIONAL_SHARD", "true"
+).strip().lower() not in ("0", "false", "no")
+
+
 class BasicAVTransformerBlock(nn.Module):
     """Dual-stream (Audio/Video) transformer block using TRT-LLM primitives.
 
@@ -586,7 +608,7 @@ class BasicAVTransformerBlock(nn.Module):
         # is checked once at the root model — skip num_heads here.
         vgm = config.visual_gen_mapping if config is not None else None
         self._sharder = SequenceSharder.from_vgm(vgm)
-        self._audio_is_sharded = False
+        self._audio_conditional_shard = _LTX2_AUDIO_CONDITIONAL_SHARD
 
         # Whether to dispatch AdaLN modulation to the fused CUDA kernels. Resolved
         # once at construction; call sites just consult the flag. The kernels are
@@ -604,6 +626,16 @@ class BasicAVTransformerBlock(nn.Module):
 
         if audio is not None and video is not None:
             self._init_av_cross_modules(video, audio, rope_type, norm_eps, config, idx)
+
+    @property
+    def _audio_shard_mode(self) -> AudioShardMode:
+        # NONE when no sequence parallelism is active. Otherwise audio is replicated
+        # (CONDITIONAL) regardless of the parallelism kind — audio ops run on the full
+        # sequence and only v2a slices the audio Q per rank (+ an output all-gather).
+        # _audio_conditional_shard=False opts into the legacy full seq-shard.
+        if not self._sharder.is_active:
+            return AudioShardMode.NONE
+        return AudioShardMode.CONDITIONAL if self._audio_conditional_shard else AudioShardMode.FULL
 
     @staticmethod
     def _make_mlp(cfg, model_config, idx):
@@ -1096,8 +1128,20 @@ class BasicAVTransformerBlock(nn.Module):
                     a_shift_v2a_ts,
                     self.norm_eps,
                     fuse=self._fuse_adaln,
-                    fp4_input_scale1=get_nvfp4_input_scale(self.audio_to_video_attn.to_k),
-                    fp4_input_scale2=get_nvfp4_input_scale(self.video_to_audio_attn.to_q),
+                    # REPLICATE slices ax_scaled_v2a for v2a's per-rank Q; the fused
+                    # dual kernel requires both fp4 scales present or both absent, so emit
+                    # both audio-cross outputs as bf16 (a2v to_k/to_v and v2a to_q re-quantize
+                    # the tiny audio internally). Same fused kernel, just bf16 out.
+                    fp4_input_scale1=(
+                        None
+                        if self._audio_shard_mode == AudioShardMode.CONDITIONAL
+                        else get_nvfp4_input_scale(self.audio_to_video_attn.to_k)
+                    ),
+                    fp4_input_scale2=(
+                        None
+                        if self._audio_shard_mode == AudioShardMode.CONDITIONAL
+                        else get_nvfp4_input_scale(self.video_to_audio_attn.to_q)
+                    ),
                 )
             else:
                 # Combined-form modulators only needed on the eager fallback; the gate
@@ -1135,7 +1179,7 @@ class BasicAVTransformerBlock(nn.Module):
                 k_a2v, v_a2v = self.audio_to_video_attn.project_kv(
                     ax_scaled_a2v, pe=audio.cross_positional_embeddings
                 )
-                if self._audio_is_sharded:
+                if self._audio_shard_mode == AudioShardMode.FULL:
                     k_a2v = self._sp_all_gather(k_a2v)
                     v_a2v = self._sp_all_gather(v_a2v)
 
@@ -1154,7 +1198,53 @@ class BasicAVTransformerBlock(nn.Module):
                     )
 
             if run_v2a and not skip_v2a:
-                if self._async_ulysses and self.video_to_audio_attn.is_ulysses_active():
+                if self._audio_shard_mode == AudioShardMode.CONDITIONAL:
+                    # Audio is replicated (full seq on every rank). Reuse the unchanged
+                    # v2a Ulysses driver by slicing the audio Q (+ its cross-PE / timestep)
+                    # to this rank's shard (free view — bit-identical to SHARD mode's
+                    # per-rank input), then all-gather the seq-sharded output back to full.
+                    ax_v2a_local = self._sharder.shard(ax_scaled_v2a, dim=1)
+                    # audio cross-PE is full [1, T_a, ...] in REPLICATE (not sharded);
+                    # slice it to match the local Q shard. timestep is a broadcast
+                    # [B, 1, D] (not per-token) so it is passed through unsliced.
+                    a_cross_pe = audio.cross_positional_embeddings
+                    if a_cross_pe is not None:
+                        # Fused PE is 2D [T, H*D] (seq on dim 0); unfused is 4D
+                        # [B, T, H, D] (seq on dim 1). Shard the seq dim to match ax.
+                        pe_dim = 0 if a_cross_pe[0].dim() == 2 else 1
+                        a_cross_pe = (
+                            self._sharder.shard(a_cross_pe[0], dim=pe_dim),
+                            self._sharder.shard(a_cross_pe[1], dim=pe_dim),
+                        )
+                    if self._async_ulysses and self.video_to_audio_attn.is_ulysses_active():
+                        out_local = self.video_to_audio_attn.forward_async(
+                            q_input=ax_v2a_local,
+                            freqs=a_cross_pe,
+                            kv_input=vx_scaled_v2a,
+                            kv_freqs=video.cross_positional_embeddings,
+                            timestep=audio.timesteps,
+                        )
+                    else:
+                        k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
+                            vx_scaled_v2a, pe=video.cross_positional_embeddings
+                        )
+                        if (
+                            not self.video_to_audio_attn.is_ulysses_active()
+                            and self._sharder.is_active
+                        ):
+                            # Wrapper inactive (e.g. Attention2D): all-gather the
+                            # seq-sharded video K/V to full so the plain backend sees
+                            # the whole sequence.
+                            k_v2a = self._sp_all_gather(k_v2a)
+                            v_v2a = self._sp_all_gather(v_v2a)
+                        out_local = self.video_to_audio_attn(
+                            ax_v2a_local,
+                            pre_projected_kv=(k_v2a, v_v2a),
+                            pe=a_cross_pe,
+                            timestep=audio.timesteps,
+                        )
+                    v2a_attn_raw = self._sp_all_gather(out_local, dim=1)
+                elif self._async_ulysses and self.video_to_audio_attn.is_ulysses_active():
                     # Async-Ulysses v2a: compute Q(audio)/K/V(video) inside the async
                     # driver so the video K/V GEMMs overlap the a2a. RoPE-on-K on the local
                     # shard is value-preserving; no key_padding_mask (video K/V unpadded,
@@ -1171,7 +1261,7 @@ class BasicAVTransformerBlock(nn.Module):
                     # seq-sharded and the wrapper does the Q + K|V + output a2a; RoPE-on-K
                     # in project_kv commutes with the seq-dim a2a (value-preserving). When
                     # inactive, all-gather so the plain backend sees full K/V — gate on
-                    # is_ulysses_active(), since _audio_is_sharded can be true under
+                    # is_ulysses_active(), since _audio_shard_mode can be FULL under
                     # Attention2D where no wrapper exists.
                     k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
                         vx_scaled_v2a, pe=video.cross_positional_embeddings
@@ -1483,7 +1573,7 @@ class LTXModel(BaseDiffusionModel):
         if self.model_config.mapping.tp_size > 1:
             raise ValueError("LTX2 does not currently support TP.")
 
-        self._audio_is_sharded = False
+        self._audio_conditional_shard = _LTX2_AUDIO_CONDITIONAL_SHARD
         self._audio_pad = 0  # set by configure_audio_ulysses
         self._cache_dit_video_args: Optional[TransformerArgs] = None
         self._cache_dit_audio_args: Optional[TransformerArgs] = None
@@ -1813,15 +1903,14 @@ class LTXModel(BaseDiffusionModel):
         for the fused kernel or keeps 4D for the eager apply_rotary_emb path.
         LTX-2 SPLIT rope produces 4D PE; INTERLEAVED is not used in prod.
 
-        ``_audio_is_sharded`` (set in ``configure_audio_ulysses``) already
-        encodes whether audio_seq_len is divisible by ulysses_size, so we
-        gate sharding on that flag alone — no second divisibility check.
+        ``_audio_shard_mode == FULL`` encodes whether audio is seq-sharded, so we
+        gate sharding on that alone — no second divisibility check.
         """
         if pe is None:
             return None
         cos, sin = pe
         sh = self._sharder
-        if sh.is_active and (not is_audio or self._audio_is_sharded):
+        if sh.is_active and (not is_audio or self._audio_shard_mode == AudioShardMode.FULL):
             chunk = cos.shape[1] // sh.size
             s = sh.rank * chunk
             e = s + chunk
@@ -1915,6 +2004,16 @@ class LTXModel(BaseDiffusionModel):
             timesteps = audio.timesteps
         return replace(audio, latent=latent, positions=positions, timesteps=timesteps)
 
+    @property
+    def _audio_shard_mode(self) -> AudioShardMode:
+        # NONE when no sequence parallelism is active. Otherwise audio is replicated
+        # (CONDITIONAL) regardless of the parallelism kind — audio ops run on the full
+        # sequence and only v2a slices the audio Q per rank (+ an output all-gather).
+        # _audio_conditional_shard=False opts into the legacy full seq-shard.
+        if not self._sharder.is_active:
+            return AudioShardMode.NONE
+        return AudioShardMode.CONDITIONAL if self._audio_conditional_shard else AudioShardMode.FULL
+
     def configure_audio_ulysses(self, audio_seq_len: int) -> None:
         """Configure audio sharding + padding for Ulysses.
 
@@ -1928,23 +2027,27 @@ class LTXModel(BaseDiffusionModel):
         zeros out pad positions. ``forward`` strips the pad tail on exit.
         """
         if not self._sharder.is_active:
-            self._audio_is_sharded = False
             self._audio_pad = 0
             return
 
         U = self._sharder.size
+        # Pad audio to a multiple of U in BOTH modes: SHARD needs it to split the
+        # sequence; REPLICATE needs it so v2a's per-rank slice is even.
         self._audio_pad = (U - audio_seq_len % U) % U
-        self._audio_is_sharded = True
-
+        # REPLICATE: audio stays full (not seq-sharded) so its latency-bound self/
+        # cross-attn + FFN run local without A2A; only v2a keeps head-sharding, via a
+        # per-rank slice of the replicated Q + an output all-gather (block forward).
         for block in self.transformer_blocks:
             target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
-            target._audio_is_sharded = self._audio_is_sharded
+            target._audio_conditional_shard = self._audio_conditional_shard
             if hasattr(target, "audio_attn1"):
-                target.audio_attn1.set_ulysses_active(self._audio_is_sharded)
-            # v2a cross-attn requires sharded audio Q — gate on
-            # _audio_is_sharded (video K/V is always sharded under Ulysses).
+                # audio_self is Ulysses in SHARD, local in REPLICATE (no A2A).
+                target.audio_attn1.set_ulysses_active(not self._audio_conditional_shard)
+            # v2a needs the Ulysses wrapper in BOTH SHARD and REPLICATE (video K/V
+            # A2A + head-split); the block forward routes REPLICATE through a
+            # slice-in / gather-out around the unchanged driver.
             if hasattr(target, "video_to_audio_attn"):
-                target.video_to_audio_attn.set_ulysses_active(self._audio_is_sharded)
+                target.video_to_audio_attn.set_ulysses_active(True)
 
     def set_ulysses_enabled(self, enabled: bool) -> None:
         """Enable or disable Ulysses parallelism at runtime.
@@ -1962,7 +2065,6 @@ class LTXModel(BaseDiffusionModel):
             self._sharder.enable()
         else:
             self._sharder.disable()
-            self._audio_is_sharded = False
 
         for block in self.transformer_blocks:
             target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
@@ -1970,7 +2072,6 @@ class LTXModel(BaseDiffusionModel):
                 target._sharder.enable()
             else:
                 target._sharder.disable()
-                target._audio_is_sharded = False
             if hasattr(target, "attn1"):
                 target.attn1.set_ulysses_active(enabled)
             if hasattr(target, "audio_attn1") and not enabled:
@@ -2151,12 +2252,11 @@ class LTXModel(BaseDiffusionModel):
             audio_args = replace(audio_args, audio_padding_mask=audio_padding_mask)
 
         # Shard sequences for parallelism (Ulysses head-sharding, ring CP, or Attention2D).
-        # Video is always sharded.  Audio sharding is decided once by
-        # configure_audio_ulysses() and cached in self._audio_is_sharded.
+        # Video is always sharded.  Audio sharding follows self._audio_shard_mode.
         if self._sharder.is_active:
             if video_args is not None:
                 video_args = self._shard_transformer_args(video_args)
-            if self._audio_is_sharded and audio_args is not None:
+            if self._audio_shard_mode == AudioShardMode.FULL and audio_args is not None:
                 audio_args = self._shard_transformer_args(audio_args)
 
         v_kv = text_cache.video_kv
@@ -2212,7 +2312,7 @@ class LTXModel(BaseDiffusionModel):
                     x=gathered_vx,
                     embedded_timestep=v_et,
                 )
-            if self._audio_is_sharded and audio_args is not None:
+            if self._audio_shard_mode == AudioShardMode.FULL and audio_args is not None:
                 gathered_ax = self._gather_sequence(audio_args.x)
                 a_et = audio_args.embedded_timestep
                 if a_et.shape[1] == audio_args.x.shape[1]:

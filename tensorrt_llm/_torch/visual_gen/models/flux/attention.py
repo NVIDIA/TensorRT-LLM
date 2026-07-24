@@ -112,6 +112,11 @@ class FluxJointAttention(Attention):
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 reduce_output=False,
+                override_tp_sharding={
+                    "q": (self.local_q_dim_start, self.local_q_dim_end),
+                    "k": (self.local_kv_dim_start, self.local_kv_dim_end),
+                    "v": (self.local_kv_dim_start, self.local_kv_dim_end),
+                },
             )
 
             # Need not pass any mapping info since this is intra-head normalization
@@ -141,6 +146,7 @@ class FluxJointAttention(Attention):
                 allreduce_strategy=config.allreduce_strategy,
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 reduce_output=True,
+                override_tp_sharding=(self.local_kv_dim_start, self.local_kv_dim_end),
             )
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -364,16 +370,29 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
             config=config,
+            attn_shard=(self.local_q_dim_start, self.local_q_dim_end),
         )
 
     def _init_qkv_proj(self):
         """Override: fused QKV+MLP projection instead of standard QKV."""
         mlp_in_dim = self.mlp_hidden_dim * self.mlp_mult_factor
+        local_mlp_hidden_start = Linear._calc_shard(
+            self.mlp_hidden_dim, self.mapping.tp_size, self.mapping.tp_rank
+        )
+        local_mlp_hidden_end = Linear._calc_shard(
+            self.mlp_hidden_dim, self.mapping.tp_size, self.mapping.tp_rank + 1
+        )
+        self.local_mlp_hidden_dim = local_mlp_hidden_end - local_mlp_hidden_start
         use_cute_dsl_swiglu = (
             torch.cuda.is_available()
             and is_sm_100f()
             and getattr(self.quant_config, "quant_algo", None) == QuantAlgo.NVFP4
             and not self.bias
+            and self._is_cute_dsl_swiglu_layout_compatible(
+                self.mapping.tp_size,
+                self.local_mlp_hidden_dim * self.mlp_mult_factor,
+                self.local_mlp_hidden_dim,
+            )
         )
         self.to_qkv_mlp_proj = FluxJointQKVMLPProj(
             in_dim=self.hidden_size,
@@ -387,6 +406,25 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             force_dynamic_quantization=self.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_swiglu,
             mapping=self.mapping,
+            override_qkv_sharding={
+                "q": (self.local_q_dim_start, self.local_q_dim_end),
+                "k": (self.local_kv_dim_start, self.local_kv_dim_end),
+                "v": (self.local_kv_dim_start, self.local_kv_dim_end),
+            },
+        )
+
+    @staticmethod
+    def _is_cute_dsl_swiglu_layout_compatible(
+        tp_size: int,
+        gate_up_out_features: int,
+        down_in_features: int,
+    ) -> bool:
+        return (
+            tp_size > 1
+            and gate_up_out_features % Flux2ParallelSelfAttention._SWIGLU_WEIGHT_INTERLEAVE_SIZE
+            == 0
+            and down_in_features % 2 == 0
+            and gate_up_out_features // 4 == down_in_features // 2
         )
 
     def _apply_norm_rope_unfused(
@@ -477,11 +515,11 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             gate_up_proj.use_cute_dsl_blockscaling_mm
             and gate_up_proj.has_nvfp4
             and not gate_up_proj.has_bias
-            and gate_up_proj.out_features
-            % Flux2ParallelSelfAttention._SWIGLU_WEIGHT_INTERLEAVE_SIZE
-            == 0
-            and down_proj.in_features % 2 == 0
-            and gate_up_proj.out_features // 4 == down_proj.in_features // 2
+            and self._is_cute_dsl_swiglu_layout_compatible(
+                self.to_qkv_mlp_proj.tp_size,
+                gate_up_proj.out_features,
+                down_proj.in_features,
+            )
         )
 
     def _can_project_hidden_mlp_with_fp4out(self, hidden_states: torch.Tensor) -> bool:

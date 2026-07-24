@@ -253,6 +253,7 @@ class Flux2TransformerBlock(nn.Module):
         use_cute_dsl_swiglu = (
             torch.cuda.is_available()
             and is_sm_100f()
+            and config is not None
             and config.get_quant_config().quant_algo == QuantAlgo.NVFP4
         )
         self.ff = GatedMLP(
