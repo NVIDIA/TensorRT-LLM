@@ -71,8 +71,12 @@ def _is_lock_infra_error(exc: BaseException) -> bool:
     if isinstance(exc, PermissionError):
         return True
     if isinstance(exc, OSError):
+        # EEXIST: filelock's ensure_directory_exists() can lose the
+        # mkdir(exist_ok=True) race on NFS when many ranks start at once
+        # (the post-EEXIST is_dir() recheck sees a stale attribute cache).
+        # An un-creatable lock dir is broken infra, not contention.
         return exc.errno in (errno.EACCES, errno.EPERM, errno.ENOLCK,
-                             errno.ESTALE)
+                             errno.ESTALE, errno.EEXIST)
     return False
 
 
