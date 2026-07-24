@@ -1,0 +1,267 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+from unittest.mock import MagicMock
+
+import pytest
+
+from tensorrt_llm import SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.bench.benchmark.utils.asynchronous import LlmManager
+from tensorrt_llm.bench.dataclasses.general import InferenceRequest
+from tensorrt_llm.executor.postproc_worker import PostprocParams
+
+
+@pytest.mark.asyncio
+async def test_llm_manager_duration():
+    # Mock LLM
+    mock_llm = MagicMock(spec=LLM)
+    mock_llm.args = MagicMock()
+    mock_llm.args.parallel_config = MagicMock()
+    mock_llm.args.parallel_config.world_size = 1
+
+    # Mock generate_async to return a mock output
+    mock_output = MagicMock()
+    mock_output.prompt_token_ids = [1, 2, 3]
+    mock_output.outputs = [MagicMock(token_ids=[4, 5])]
+    mock_output.finished = True
+    mock_output.id = 1
+    mock_output.decoding_iter = 1
+
+    # We need to mock aresult() which is an async method
+    async def mock_aresult():
+        await asyncio.sleep(0.6)  # Make it take time
+        return mock_output
+
+    mock_output.aresult = mock_aresult
+    mock_llm.generate_async.return_value = mock_output
+
+    outbox = asyncio.Queue()
+
+    manager = LlmManager(
+        llm=mock_llm,
+        outbox=outbox,
+        streaming=False,
+        concurrency=1,
+        duration=1,  # 1 second
+    )
+
+    req = InferenceRequest(input_ids=[1, 2, 3], output_tokens=10)
+    sampling_params = SamplingParams()
+    post_proc_params = PostprocParams()
+
+    # Enqueue 3 requests. Each takes 0.6s.
+    # Total time if all processed: 1.8s.
+    # With duration=1, it should stop after processing 2 requests.
+    await manager.enqueue(req, sampling_params, post_proc_params)
+    await manager.enqueue(req, sampling_params, post_proc_params)
+    await manager.enqueue(req, sampling_params, post_proc_params)
+
+    manager.run()
+
+    # Wait for the worker to fully drain: it exits its loop when the duration
+    # elapses and then awaits all in-flight tasks. Asserting after full drain
+    # (rather than sampling mid-flight) ensures requests dispatched past the
+    # deadline were actually skipped, not merely still running.
+    await asyncio.wait_for(manager._backend_task, timeout=10)
+
+    # The worker should have stopped and cleared the inbox.
+    assert manager._inbox.empty()
+
+    # Requests 1 and 2 complete (0.6s + 0.6s); request 3 acquires its
+    # concurrency slot at t=1.2s, past the 1s deadline, and must be skipped.
+    assert outbox.qsize() == 2
+
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_llm_manager_duration_bounds_runtime_with_eager_dispatch():
+    """Regression test for duration enforcement under eager task dispatch.
+
+    The worker dispatches the entire inbox into tasks before any request
+    runs, so the duration must be enforced at execution time; otherwise
+    every dispatched request runs to completion and duration has no
+    effect on runtime.
+    """
+    mock_llm = MagicMock(spec=LLM)
+    mock_llm.args = MagicMock()
+    mock_llm.args.parallel_config = MagicMock()
+    mock_llm.args.parallel_config.world_size = 1
+
+    mock_output = MagicMock()
+    mock_output.prompt_token_ids = [1, 2, 3]
+    mock_output.outputs = [MagicMock(token_ids=[4, 5])]
+    mock_output.finished = True
+    mock_output.id = 1
+    mock_output.decoding_iter = 1
+
+    request_latency = 0.2
+
+    async def mock_aresult():
+        await asyncio.sleep(request_latency)
+        return mock_output
+
+    mock_output.aresult = mock_aresult
+    mock_llm.generate_async.return_value = mock_output
+
+    outbox = asyncio.Queue()
+    num_requests = 20
+    concurrency = 2
+    duration = 1
+
+    manager = LlmManager(
+        llm=mock_llm,
+        outbox=outbox,
+        streaming=False,
+        concurrency=concurrency,
+        duration=duration,
+    )
+
+    req = InferenceRequest(input_ids=[1, 2, 3], output_tokens=10)
+    sampling_params = SamplingParams()
+    post_proc_params = PostprocParams()
+
+    for _ in range(num_requests):
+        await manager.enqueue(req, sampling_params, post_proc_params)
+
+    start = asyncio.get_running_loop().time()
+    manager.run()
+    await asyncio.wait_for(manager._backend_task, timeout=30)
+    elapsed = asyncio.get_running_loop().time() - start
+
+    # Unbounded behavior would process all 20 requests in ~2s
+    # (20 / 2 slots * 0.2s). With enforcement, roughly
+    # duration / request_latency * concurrency = 10 requests complete.
+    # Generous bounds to stay robust on loaded CI machines.
+    assert outbox.qsize() < num_requests, (
+        "Duration limit had no effect: all requests were processed."
+    )
+    # Wall time is duration plus at most one in-flight drain, with slack.
+    assert elapsed < duration + request_latency + 0.5
+
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_llm_manager_duration_not_exceeded():
+    # Mock LLM
+    mock_llm = MagicMock(spec=LLM)
+    mock_llm.args = MagicMock()
+    mock_llm.args.parallel_config = MagicMock()
+    mock_llm.args.parallel_config.world_size = 1
+
+    # Mock generate_async to return a mock output
+    mock_output = MagicMock()
+    mock_output.prompt_token_ids = [1, 2, 3]
+    mock_output.outputs = [MagicMock(token_ids=[4, 5])]
+    mock_output.finished = True
+    mock_output.id = 1
+    mock_output.decoding_iter = 1
+
+    async def mock_aresult():
+        await asyncio.sleep(0.6)
+        return mock_output
+
+    mock_output.aresult = mock_aresult
+    mock_llm.generate_async.return_value = mock_output
+
+    outbox = asyncio.Queue()
+
+    manager = LlmManager(
+        llm=mock_llm,
+        outbox=outbox,
+        streaming=False,
+        concurrency=1,
+        duration=5,  # 5 seconds, plenty of time
+    )
+
+    req = InferenceRequest(input_ids=[1, 2, 3], output_tokens=10)
+    sampling_params = SamplingParams()
+    post_proc_params = PostprocParams()
+
+    # Enqueue 2 requests. Each takes 0.6s.
+    # Total time: 1.2s.
+    # With duration=5, all requests should be processed.
+    await manager.enqueue(req, sampling_params, post_proc_params)
+    await manager.enqueue(req, sampling_params, post_proc_params)
+
+    manager.run()
+
+    # Wait for them to complete
+    await asyncio.sleep(1.5)
+
+    # All 2 requests should have been processed and put into outbox.
+    assert outbox.qsize() == 2
+    assert manager._inbox.empty()
+
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_async_benchmark_duration():
+    from unittest.mock import patch
+
+    from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
+
+    # Mock LLM
+    mock_llm = MagicMock(spec=LLM)
+    mock_llm.args = MagicMock()
+    mock_llm.args.parallel_config = MagicMock()
+    mock_llm.args.parallel_config.world_size = 1
+
+    # Mock generate_async to return a mock output
+    mock_output = MagicMock()
+    mock_output.prompt_token_ids = [1, 2, 3]
+    mock_output.outputs = [MagicMock(token_ids=[4, 5])]
+    mock_output.finished = True
+    mock_output.id = 1
+    mock_output.decoding_iter = 1
+
+    async def mock_aresult():
+        await asyncio.sleep(0.6)  # Make it take time
+        return mock_output
+
+    mock_output.aresult = mock_aresult
+    mock_llm.generate_async.return_value = mock_output
+
+    req = InferenceRequest(input_ids=[1, 2, 3], output_tokens=10)
+    requests = [req, req, req]
+
+    # Patch EnergyMonitor and tqdm so we don't depend on actual NVML / environment
+    with (
+        patch("tensorrt_llm.bench.benchmark.utils.asynchronous.EnergyMonitor") as mock_energy,
+        patch("tensorrt_llm.bench.benchmark.utils.asynchronous.tqdm.tqdm"),
+    ):
+        # Mock the context manager of EnergyMonitor
+        mock_energy.return_value.__enter__.return_value.total_energy = 100.0
+
+        stats = await async_benchmark(
+            llm=mock_llm,
+            sampling_params=SamplingParams(),
+            post_proc_params=PostprocParams(),
+            requests=requests,
+            streaming=False,
+            concurrency=1,
+            duration=1,  # 1 second limit
+        )
+
+    # With concurrency=1, requests run back-to-back (0.6s each): requests 1
+    # and 2 complete at 0.6s and 1.2s; request 3 acquires its slot past the
+    # 1s deadline and is skipped. Without a concurrency limit all three would
+    # start immediately and finish within 0.6s, before the deadline — duration
+    # cannot bound an unbounded-concurrency run (see LlmManager warning).
+    assert len(stats.requests) == 2
