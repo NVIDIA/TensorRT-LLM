@@ -1554,10 +1554,18 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
     assert os.path.isdir(output_path)
-    send_file = os.path.join(output_path, "rank_0_send.csv")
-    recv_file = os.path.join(output_path, "rank_0_recv.csv")
-    assert os.path.exists(send_file)
-    assert os.path.exists(recv_file)
+    # The C++ transceiver names timing files "<instanceId>_<rank>_<tag>.csv"
+    # (instanceId is a runtime UUID that disambiguates instances sharing an
+    # output directory), so match by the "_<tag>.csv" suffix instead of a fixed
+    # "rank_0" prefix.
+    send_files = sorted(f for f in os.listdir(output_path)
+                        if f.endswith("_send.csv"))
+    recv_files = sorted(f for f in os.listdir(output_path)
+                        if f.endswith("_recv.csv"))
+    assert send_files, f"no *_send.csv in {output_path}: {os.listdir(output_path)}"
+    assert recv_files, f"no *_recv.csv in {output_path}: {os.listdir(output_path)}"
+    send_file = os.path.join(output_path, send_files[0])
+    recv_file = os.path.join(output_path, recv_files[0])
     with open(send_file, "r") as f:
         lines = f.readlines()
         assert len(lines) > 1

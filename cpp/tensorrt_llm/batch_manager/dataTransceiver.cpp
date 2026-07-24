@@ -244,7 +244,7 @@ int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
     return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
 }
 
-std::filesystem::path getTransferOutputPath(char const* tag)
+std::filesystem::path getTransferOutputPath(char const* tag, std::string const& instanceId = "")
 {
     namespace fs = std::filesystem;
     auto outputPath = common::getEnvKVCacheTimeOutputPath();
@@ -253,7 +253,9 @@ std::filesystem::path getTransferOutputPath(char const* tag)
         auto rank = mpi::MpiComm::world().getRank();
         auto path = fs::path(outputPath);
         fs::create_directories(path);
-        return path / ("rank_" + std::to_string(rank) + "_" + tag + ".csv");
+        std::string prefix
+            = instanceId.empty() ? "rank_" + std::to_string(rank) : instanceId + "_" + std::to_string(rank);
+        return path / (prefix + "_" + tag + ".csv");
     }
     return {};
 }
@@ -343,11 +345,13 @@ class CacheSender::Impl
 public:
     using RequestIdType = LlmRequest::RequestIdType;
 
-    Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
+    Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer,
+        std::string instanceId = "")
         : mManager{manager}
         , mSelfState{cacheLayer.getCacheState(), executor::kv_cache::CommState{manager->getCommState()}}
         , mCacheTransferLayer{std::move(cacheLayer)}
         , mBufferManager{std::make_shared<runtime::CudaStream>()}
+        , mInstanceId{std::move(instanceId)}
     {
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
@@ -425,7 +429,7 @@ public:
             {
                 if (!mMeasuresFile.is_open())
                 {
-                    auto outputPath = getTransferOutputPath("send");
+                    auto outputPath = getTransferOutputPath("send", mInstanceId);
                     mMeasuresFile.open(outputPath);
                     TLLM_CHECK_WITH_INFO(mMeasuresFile.is_open(), "Failed to open transfer output file: %s",
                         outputPath.string().c_str());
@@ -1112,16 +1116,19 @@ private:
     std::ofstream mMeasuresFile;
     std::mutex mInFlightCancelMutex;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<std::atomic<bool>>> mInFlightCancelFlags;
+    std::string mInstanceId;
 };
 
 class CacheReceiver::Impl
 {
 public:
-    Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
+    Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer,
+        std::string instanceId = "")
         : mManager{manager}
         , mSelfState{cacheLayer.getCacheState(), executor::kv_cache::CommState{manager->getCommState()}}
         , mCacheTransferLayer{std::move(cacheLayer)}
         , mBufferManager{std::make_shared<runtime::CudaStream>()}
+        , mInstanceId{std::move(instanceId)}
     {
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
@@ -1189,7 +1196,7 @@ public:
                 std::unique_lock<std::mutex> lock(mMeasuresFileMutex);
                 if (!mMeasuresFile.is_open())
                 {
-                    auto outputPath = getTransferOutputPath("recv");
+                    auto outputPath = getTransferOutputPath("recv", mInstanceId);
                     mMeasuresFile.open(outputPath);
                     TLLM_CHECK_WITH_INFO(mMeasuresFile.is_open(), "Failed to open transfer output file: %s",
                         outputPath.string().c_str());
@@ -1856,6 +1863,7 @@ private:
     std::atomic<bool> mTerminate{false};
     std::mutex mInFlightCancelMutex;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<std::atomic<bool>>> mInFlightCancelFlags;
+    std::string mInstanceId;
 };
 
 void CacheSender::ImplDeleter::operator()(Impl* ptr)
@@ -1868,9 +1876,10 @@ void CacheReceiver::ImplDeleter::operator()(Impl* ptr)
     delete ptr;
 }
 
-CacheSender::CacheSender(
-    executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
-    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer)))}
+CacheSender::CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex,
+    CacheTransferLayer cacheLayer, std::string instanceId)
+    : mImpl{
+        std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer), std::move(instanceId)))}
 {
 }
 
@@ -1920,9 +1929,10 @@ void CacheSender::setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rn
     mImpl->setRnnConfig(std::move(rnnModelConfig), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType);
 }
 
-CacheReceiver::CacheReceiver(
-    executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
-    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer)))}
+CacheReceiver::CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex,
+    CacheTransferLayer cacheLayer, std::string instanceId)
+    : mImpl{
+        std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer), std::move(instanceId)))}
 {
 }
 
