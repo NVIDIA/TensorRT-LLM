@@ -17,6 +17,7 @@
 - ``torch.ops.trtllm.indexer_k_cache_gather_op``
 - ``torch.ops.trtllm.convert_req_index_to_global``
 - ``torch.ops.trtllm.fused_cat_fp4``
+- ``torch.ops.trtllm.cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell``
 """
 
 import pytest
@@ -488,7 +489,106 @@ def test_convert_req_index_to_global_block_table_padding():
 
 
 # ===================================================================
-# Test 3: fused_cat_fp4 — bit-exact vs DeepGEMM per_token_cast_to_fp4
+# Test 3: native CuTe DSL Indexer-Q projection + RoPE + FP4 fusion
+# ===================================================================
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("num_tokens", [1, 4, 5, 8, 16, 32, 64, 128])
+def test_cute_dsl_fp8_indexer_q_gemm_rope_fp4_matches_unfused(num_tokens):
+    """The CuTe DSL fusion must match the production chain bit for bit."""
+    from _torch.helpers import per_block_cast_to_fp8_e8m0
+
+    from tensorrt_llm._torch.autotuner import DistributedTuningStrategy, OptimizationProfile
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLIndexerQBlackwellRunner
+    from tensorrt_llm.quantization.utils import fp8_utils
+
+    torch.manual_seed(2026)
+    n_heads = 64
+    hidden_size = 1536
+    output_size = n_heads * HEAD_DIM
+    max_position = num_tokens * 2
+
+    qr = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(output_size, hidden_size, device="cuda", dtype=torch.bfloat16)
+    weight_fp8, weight_scale = per_block_cast_to_fp8_e8m0(weight)
+
+    weight_scale_deepgemm = fp8_utils.transform_sf_into_required_layout(
+        weight_scale,
+        mn=output_size,
+        k=hidden_size,
+        recipe=(1, 128, 128),
+        is_sfa=False,
+    )
+    weight_scale_cutedsl = weight_scale.repeat_interleave(128, dim=0)[:output_size]
+    weight_scale_cutedsl = weight_scale_cutedsl.repeat_interleave(4, dim=1)
+    weight_scale_cutedsl = torch.ops.trtllm.block_scale_interleave(
+        weight_scale_cutedsl.to(torch.float8_e8m0fnu).view(torch.uint8)
+    )
+
+    angles = torch.randn(max_position, HEAD_DIM // 4, device="cuda", dtype=torch.float32)
+    cos_sin_cache = torch.stack((angles.cos(), angles.sin()), dim=1).contiguous()
+    position_ids = torch.arange(num_tokens, device="cuda", dtype=torch.int32) * 2
+    alpha = torch.ones(1, device="cuda", dtype=torch.float32)
+
+    runner = CuteDSLIndexerQBlackwellRunner(use_tvm_ffi=False)
+    assert runner.tuning_config.exclude_from_cache
+    assert runner.tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.INDEPENDENT
+    tactics = runner.get_valid_tactics(
+        [
+            qr,
+            weight_fp8,
+            weight_scale_cutedsl,
+            position_ids,
+            cos_sin_cache.view(max_position, HEAD_DIM // 2),
+            alpha,
+        ],
+        OptimizationProfile(),
+    )
+    if num_tokens <= 16:
+        assert all(tactic in tactics for tactic in runner._small_m_tactics)
+    else:
+        assert all(tactic[0] != "swap_ab" for tactic in tactics)
+    assert ("native", (256, 128), (2, 1), False, 0) in tactics
+
+    packed, scale = torch.ops.trtllm.cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell(
+        qr,
+        weight_fp8,
+        weight_scale_cutedsl,
+        position_ids,
+        cos_sin_cache.view(max_position, HEAD_DIM // 2),
+        alpha,
+        use_tvm_ffi=False,
+    )
+
+    q_ref = torch.ops.trtllm.fp8_swap_ab_gemm(
+        qr,
+        weight_fp8,
+        weight_scale_deepgemm,
+        disable_ue8m0_cast=True,
+    ).view(num_tokens, n_heads, HEAD_DIM)
+    torch.ops.trtllm.mla_rope_inplace(
+        q_ref,
+        position_ids,
+        cos_sin_cache,
+        n_heads,
+        HEAD_DIM // 2,
+        HEAD_DIM // 2,
+        False,
+        False,
+    )
+    packed_ref, scale_ref = torch.ops.trtllm.fused_cat_fp4(
+        q_ref[..., : HEAD_DIM // 2], q_ref[..., HEAD_DIM // 2 :]
+    )
+
+    assert packed.shape == (num_tokens, output_size // 2)
+    assert scale.shape == (num_tokens, n_heads)
+    assert torch.equal(packed.view_as(packed_ref), packed_ref)
+    assert torch.equal(scale.view_as(scale_ref), scale_ref)
+
+
+# ===================================================================
+# Test 4: fused_cat_fp4 — bit-exact vs DeepGEMM per_token_cast_to_fp4
 # ===================================================================
 
 

@@ -19,6 +19,7 @@
 #include <fstream>
 #include <future>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -121,7 +122,7 @@ public:
 
     void recv(size_t idx, void* data, size_t size);
 
-    [[nodiscard]] LlmRequest const& getLlmRequest() const;
+    [[nodiscard]] std::optional<LlmRequest const*> getLlmRequest() const;
 
     // in CacheSender, the LlmRequest is not available until the sendSync is called
     void setLlmRequest(LlmRequest const& llmRequest);
@@ -234,6 +235,17 @@ public:
         return mLastBlockKey;
     }
 
+    /// @brief Arbitrary (llmRequest-agnostic) transfer served from the sender's reuse tree.
+    [[nodiscard]] bool isArbitraryTransfer() const noexcept
+    {
+        return mIsArbitraryTransfer;
+    }
+
+    void setIsArbitraryTransfer(bool isArbitraryTransfer) noexcept
+    {
+        mIsArbitraryTransfer = isArbitraryTransfer;
+    }
+
     /// @brief Serialization.
     /// @param requestInfo Request information to be serialized.
     /// @param os The output stream to which the serialization result points.
@@ -257,6 +269,9 @@ private:
     // Last block key, used to derive other block keys on receiver
     BlockKey mLastBlockKey{};
 
+    // True for arbitrary (llmRequest-agnostic) transfers served from the sender's reuse tree.
+    bool mIsArbitraryTransfer{false};
+
     // The state of the data transceiver.
     executor::DataTransceiverState mTransState;
 };
@@ -268,7 +283,8 @@ public:
     /// @param manager The connection manager.
     /// @param selfIndex The sequential index of the current executor process.
     /// @param cacheLayer The cache layer bundling all cache states and formatters.
-    CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
+    CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer,
+        std::string instanceId = "");
 
     CacheSender() = default;
 
@@ -331,7 +347,8 @@ public:
     /// @param manager The connection manager.
     /// @param selfIndex The sequential index of the current executor process.
     /// @param cacheLayer The cache layer bundling all cache states and formatters.
-    CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
+    CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer,
+        std::string instanceId = "");
 
     CacheReceiver() = default;
 
