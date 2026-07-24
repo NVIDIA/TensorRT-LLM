@@ -1433,6 +1433,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.index_share_for_mtp_iteration"
+    },
+    {
+      "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",

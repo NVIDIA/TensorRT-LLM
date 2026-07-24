@@ -1672,9 +1672,10 @@ class MLA(nn.Module):
                 weights,
                 q_scale=q_scale,
             )
-            # Stash for subsequent DSA "shared" layers (full -> shared reuse);
-            # unused by a dense per-layer indexer.
-            attn_metadata.shared_topk_indices = topk_indices
+            # Stash top-k for subsequent DSA "shared" layers; skip inside the
+            # MTP draft loop so the indexer's per-request stash is preserved.
+            if not getattr(attn_metadata, "in_mtp_draft_loop", False):
+                attn_metadata.shared_topk_indices = topk_indices
 
         assert output is not None, "output must be provided"
 

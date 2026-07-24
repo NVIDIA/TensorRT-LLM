@@ -115,6 +115,7 @@ class DSAParams(SparseParams):
     # ("full") or reuses the previous full layer's top-k ("shared"). Always
     # True for a dense per-layer indexer (e.g. DeepSeek-V3.2).
     is_full_indexer_layer: bool = True
+    mtp_index_share: bool = False
 
     @property
     def indices_block_size(self) -> int:
@@ -767,9 +768,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # pool_view cache here so it is recomputed on the next
         # transform_local_topk_and_prepare_pool_view() call.
         self._invalidate_pool_view_cache()
-        # Per-step state for cross-layer indexer sharing; clear at the step
-        # boundary so a "shared" layer never reuses a stale top-k.
-        self.shared_topk_indices = None
+        # Clear per-step cross-layer top-k, but keep it inside the MTP draft
+        # loop so the step-0 stash survives for the reuse branch.
+        if not self.in_mtp_draft_loop:
+            self.shared_topk_indices = None
 
         if self.kv_cache_manager is not None and self.num_tokens > 0:
             seq_lens = self.seq_lens_cuda[:self.num_seqs]
@@ -1163,6 +1165,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     capture_graph=capture_graph,
                 )
 
+        # MTP cross-step indexer Top-K reuse state.
+        self.indexer_skip_topk = False
+        self.in_mtp_draft_loop = False
+        self.mtp_num_accepted = None
+
         # Persistent scratch for the Radix-split-work indexer path. Re-created
         # in update_spec_dec_param when max_draft_tokens changes so it stays
         # large enough for the MTP generation-row count.
@@ -1305,6 +1312,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         pool_indices = pool_indices.clamp(min=0,
                                           max=max_pool_idx).to(torch.int32)
         return pool_indices
+
+    def set_skip_topk(self, skip: bool):
+        self.indexer_skip_topk = skip
+
+    def set_in_mtp_draft_loop(self, active: bool):
+        self.in_mtp_draft_loop = active
+
+    def set_mtp_num_accepted(self, num_accepted):
+        self.mtp_num_accepted = num_accepted
 
     def _invalidate_pool_view_cache(self):
         """Invalidate the cached pool view and related step-invariant values.
@@ -1815,6 +1831,10 @@ class Indexer(nn.Module):
 
         self._enable_heuristic_topk = (sparse_params.enable_heuristic_topk
                                        and get_sm_version() >= 100)
+
+        # Default False for sparse configs that don't define it (e.g. the
+        # DeepSeekV4 path shares this DSA constructor with its own config class).
+        self.mtp_index_share = getattr(sparse_params, "mtp_index_share", False)
 
         if (self.use_cute_dsl_topk
                 or self.use_cute_dsl_paged_mqa_logits) and layer_idx == 0:
@@ -2640,7 +2660,16 @@ class Indexer(nn.Module):
                 local_layer, num_generations:num_generations +
                 num_contexts].copy_(topk_indices_buffer[last_ctx_idx, :])
 
-        if has_decode and not metadata.skip_indexer_for_gen_reqs:
+        reuse_topk = (self.mtp_index_share
+                      and getattr(metadata, "indexer_skip_topk", False)
+                      and getattr(metadata, "shared_topk_indices",
+                                  None) is not None)
+
+        if has_decode and not metadata.skip_indexer_for_gen_reqs and reuse_topk:
+            topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                num_gen_tokens, :] = \
+                metadata.shared_topk_indices[:num_generations, :]
+        elif has_decode and not metadata.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
                                              num_generations]
@@ -2899,7 +2928,46 @@ class Indexer(nn.Module):
             # Fill topk_indices_buffer with pre-defined dense topk indices
             topk_indices_buffer[num_ctx_tokens:num_tokens, :] = \
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
+
+        # MTP Top-K stash: save each request's last accepted Top-K for reuse
+        # by subsequent draft steps.
+        if (self.mtp_index_share
+                and getattr(metadata, "in_mtp_draft_loop", False)
+                and not reuse_topk):
+            rows = None
+            if num_generations > 0:
+                next_n = num_gen_tokens // num_generations
+                gen_topk = topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                               num_gen_tokens]
+                rows = self._mtp_last_accepted_rows(gen_topk, metadata,
+                                                    num_contexts,
+                                                    num_generations, next_n)
+            if num_contexts > 0:
+                ctx_last = torch.cumsum(
+                    metadata.seq_lens_cuda[:num_contexts].to(
+                        torch.long), dim=0) - 1
+                ctx_rows = topk_indices_buffer[ctx_last]
+                rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
+            if rows is not None:
+                metadata.shared_topk_indices = rows.contiguous()
         return topk_indices_buffer
+
+    def _mtp_last_accepted_rows(self, gen_topk, metadata, num_contexts,
+                                num_generations, next_n):
+        """Return each gen request's last accepted Top-K row
+        (base + num_accepted - 1); rows past num_accepted are rejected-branch
+        padding that corrupts partial-accept reuse. CUDA-graph safe; falls back
+        to the last row when accepted counts aren't plumbed in.
+        """
+        num_accepted = getattr(metadata, "mtp_num_accepted", None)
+        if num_accepted is None:
+            return gen_topk[next_n - 1::next_n]
+        gen_num_accepted = num_accepted[num_contexts:num_contexts +
+                                        num_generations]
+        base = torch.arange(
+            num_generations, device=gen_topk.device, dtype=torch.long) * next_n
+        offset = (gen_num_accepted - 1).clamp(0, next_n - 1)
+        return gen_topk[base + offset]
 
     def _weight_scale(self, weights: torch.Tensor,
                       q_scale: torch.Tensor) -> torch.Tensor:
