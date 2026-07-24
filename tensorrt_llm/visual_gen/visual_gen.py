@@ -32,11 +32,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 from tensorrt_llm.visual_gen.output import VisualGenOutput
-from tensorrt_llm.visual_gen.params import (
-    VisualGenParams,
-    reduce_visual_gen_params,
-    validate_visual_gen_params,
-)
+from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
 
 __all__ = [
     "VisualGen",
@@ -160,20 +156,33 @@ class VisualGenResult:
     # ----- internals -----
 
     def _build_resolved(self, response: "DiffusionResponse"):
+        # Failure class travels on the result object, not on the public
+        # ``VisualGenOutput`` — no new public field for an error taxonomy.
+        self._error_type = getattr(response, "error_type", None)
         if self._batch_size is None:
             return to_visual_gen_output(response)
         return split_visual_gen_output(response, self._batch_size)
 
     def _resolved_value(self):
-        # For single prompts, surface engine-side failure as
-        # ``RuntimeError``. Request-parameter validation is enforced
-        # synchronously at :meth:`VisualGen.generate_async` entry, so
-        # anything reaching this point is by definition a runtime
-        # failure from ``pipeline.infer()``. For batches, return the
-        # list as-is so callers iterate per-item ``error``.
+        # For single prompts, surface engine-side failure typed by class:
+        # worker-classified client errors (unusable reference content,
+        # conditioning bounds) raise ``ValueError`` — uniform with the
+        # synchronous parameter validation at ``generate_async`` entry —
+        # and capacity failures raise ``RuntimeError``
+        # (``VisualGenCapacityError``), like any unclassified runtime
+        # failure. For batches, return the list as-is so callers iterate
+        # per-item ``error``.
         if self._batch_size is None and isinstance(self._resolved, VisualGenOutput):
             if self._resolved.error is not None:
-                raise RuntimeError(f"Generation failed: {self._resolved.error}")
+                message = f"Generation failed: {self._resolved.error}"
+                error_type = getattr(self, "_error_type", None)
+                if error_type == "client":
+                    raise ValueError(message)
+                if error_type == "capacity":
+                    from tensorrt_llm._torch.visual_gen.media_decode import VisualGenCapacityError
+
+                    raise VisualGenCapacityError(message)
+                raise RuntimeError(message)
         return self._resolved
 
 
@@ -391,10 +400,6 @@ class VisualGen:
         # from the READY signal) and skip validation — there's nothing
         # user-supplied to validate against.
         if params is not None:
-            # Shrink oversized transport payloads (spec-declared reducers)
-            # before the deep copy, so the copy/pickle/broadcast chain only
-            # ever carries the reduced values. Non-mutating for the caller.
-            params = reduce_visual_gen_params(params, self.executor.extra_param_specs)
             resolved_params = params.model_copy(deep=True)
             # Raising in the caller's process means ``ValueError`` reaches
             # the user as a natural Python exception; the worker only has
