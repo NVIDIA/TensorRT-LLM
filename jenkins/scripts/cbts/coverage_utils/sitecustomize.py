@@ -149,8 +149,8 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     ).start()
 
     if not _skip_daemons:
-        # Coordinator / long-lived non-pytest processes also patch mpi_session and poll the marker
-        # file to switch context; pool workers and the outer pytest need neither (single context).
+        # Coordinator / long-lived non-pytest processes patch mpi_session before they spawn a pool;
+        # pool workers and the outer pytest don't spawn pools, so they skip this.
 
         def _watch_mpi_session():
             # Wait until the host has imported the target modules so this daemon triggers no racing import.
@@ -179,6 +179,10 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             name="cbts-mpi-patcher",
         ).start()
 
+    # Pool workers and long-lived non-pytest processes follow the per-test marker file to switch
+    # context; a pool worker would otherwise record every test it serves under one inherited (often
+    # empty) context. The outer pytest switches context via the plugin instead.
+    if not _is_pytest_main:
         _MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", "/tmp/cbts/current_test.txt")
 
         def _poll_marker():
@@ -188,7 +192,6 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
                     with open(_MARKER_FILE) as f:
                         nodeid = f.read().strip()
                     if nodeid and nodeid != last_seen:
-                        # Long-lived non-pytest processes (e.g. trtllm-serve) switch context on marker change.
                         switch_test_context(nodeid)
                         last_seen = nodeid
                 except (FileNotFoundError, OSError):
