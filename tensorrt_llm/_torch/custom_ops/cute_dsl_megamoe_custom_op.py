@@ -383,14 +383,8 @@ def validate_megamoe_tactic(tactic: Tuple) -> None:
             f"(derived from mma_tiler_mnk[0]={mma_tiler[0]})."
         )
 
-    if (not isinstance(group_hint, int)) or isinstance(group_hint, bool) or group_hint <= 0:
-        raise ValueError(f"group_hint must be a positive int, got {group_hint!r}.")
-    if group_hint < 512:
-        logger.warning_once(
-            f"[MegaMoE] group_hint={group_hint} < 512; group_hint saturates "
-            f"around 512 and smaller values are strictly worse.",
-            key="megamoe_group_hint_lt_512",
-        )
+    if (not isinstance(group_hint, int)) or isinstance(group_hint, bool) or group_hint < 512:
+        raise ValueError(f"group_hint must be an int >= 512, got {group_hint!r}.")
 
     if load_balance_mode not in {"static", "atomic_counter"}:
         raise ValueError(
