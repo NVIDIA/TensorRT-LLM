@@ -151,6 +151,15 @@ GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
 # is not) so the scanner can bucket rows by ngen without silently dropping
 # any line whose states dict is printed before prev_device_step_time. See
 # _scan_gen_worker_device_step_time.
+#
+# num_generation_tokens can legitimately fail to match on a given line: the
+# steady-state `states` dict is a raw repr and, while every current writer
+# stores a bare int, the field can be absent on some prepare paths or on a
+# partially-flushed tail line. When it fails to match on EVERY usable row of a
+# gen worker, the scanner falls back to that worker's un-bucketed all-iter mean
+# rather than dropping the worker (which would collapse a present metric to
+# None and raise a spurious check_test_failure — nvbugs 6487036 / 6487040). See
+# _scan_gen_worker_device_step_time / _mean_at_mode_ngen.
 _DEVICE_STEP_TIME_RE = re.compile(r"iter\s*=\s*(\d+),.*?prev_device_step_time\s*=\s*([\d.]+)\s*ms")
 _NUM_GEN_TOKENS_RE = re.compile(r"'num_generation_tokens':\s*(\d+)")
 
@@ -169,19 +178,35 @@ def gen_worker_log_sizes(output_dir: str, num_gen_servers: int) -> List[int]:
     return sizes
 
 
+# Per-file scan record: (by_ngen, all_iter_count, all_iter_mean).
+#   by_ngen        -> num_generation_tokens -> (count, Welford mean) for rows
+#                     whose num_generation_tokens parsed; the steady-state
+#                     mode-ngen mean is taken from this when it is non-empty.
+#   all_iter_count -> number of iter >= 5 numeric prev_device_step_time rows in
+#                     this file, regardless of whether num_generation_tokens
+#                     parsed.
+#   all_iter_mean  -> Welford mean of prev_device_step_time over those rows.
+# all_iter_* is the fallback used when by_ngen is empty (num_generation_tokens
+# was absent or rendered in an unparsable form on every row) so a file with a
+# perfectly good prev_device_step_time stream is never dropped to None.
+_GenFileScan = Tuple[Dict[int, Tuple[int, float]], int, float]
+
+
 def _scan_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
-) -> Tuple[List[Dict[int, Tuple[int, float]]], int]:
+) -> Tuple[List[_GenFileScan], int]:
     """Single-pass scan of the gen logs.
 
-    Returns (per_file_by_ngen, total_count):
-      - per_file_by_ngen: one dict per file that produced >=1 usable line,
-        mapping num_generation_tokens -> (count, Welford mean of
-        prev_device_step_time) over rows with iter >= 5 and a numeric
-        prev_device_step_time. Rows lacking num_generation_tokens on the same
-        line are skipped for the mean but still counted for settle detection.
+    Returns (per_file_scans, total_count):
+      - per_file_scans: one (by_ngen, all_iter_count, all_iter_mean) tuple per
+        file that produced >=1 usable line (iter >= 5 with a numeric
+        prev_device_step_time). ``by_ngen`` maps num_generation_tokens ->
+        (count, Welford mean of prev_device_step_time); rows whose
+        num_generation_tokens did not parse are omitted from ``by_ngen`` but
+        still fold into ``all_iter_count`` / ``all_iter_mean`` (and
+        ``total_count``). See _mean_at_mode_ngen for how the two are combined.
       - total_count: the number of iter >= 5 rows with a numeric
         prev_device_step_time across all files. This is monotonic as new
         lines flush across NFS (rows only get appended) so the caller can use
@@ -195,7 +220,7 @@ def _scan_gen_worker_device_step_time(
     (model load) write partial multibyte sequences that would otherwise raise
     UnicodeDecodeError mid-scan.
     """
-    per_file_by_ngen: List[Dict[int, Tuple[int, float]]] = []
+    per_file_scans: List[_GenFileScan] = []
     total_count = 0
     for i in range(num_gen_servers):
         log_path = os.path.join(output_dir, f"gen_server_{i}.log")
@@ -209,6 +234,8 @@ def _scan_gen_worker_device_step_time(
         )
 
         by_ngen: Dict[int, Tuple[int, float]] = {}
+        all_count = 0
+        all_mean = 0.0
         with open(log_path, errors="replace") as f:
             if seek_to:
                 f.seek(seek_to)
@@ -219,41 +246,64 @@ def _scan_gen_worker_device_step_time(
                 if int(m.group(1)) < 5:
                     continue
                 total_count += 1
+                dt = float(m.group(2))
+                # Fallback aggregate over every usable row, independent of
+                # whether num_generation_tokens parsed.
+                all_count += 1
+                all_mean += (dt - all_mean) / all_count
                 ngen_m = _NUM_GEN_TOKENS_RE.search(line)
                 if ngen_m is None:
                     continue
                 ngen = int(ngen_m.group(1))
-                dt = float(m.group(2))
                 count, mean = by_ngen.get(ngen, (0, 0.0))
                 count += 1
                 mean += (dt - mean) / count
                 by_ngen[ngen] = (count, mean)
-        if by_ngen:
-            per_file_by_ngen.append(by_ngen)
-    return per_file_by_ngen, total_count
+        if all_count:
+            per_file_scans.append((by_ngen, all_count, all_mean))
+    return per_file_scans, total_count
 
 
 def _mean_at_mode_ngen(
-    per_file_by_ngen: List[Dict[int, Tuple[int, float]]],
+    per_file_scans: List[_GenFileScan],
 ) -> Optional[float]:
-    """Aggregate per-file per-ngen buckets into a single mean.
+    """Aggregate per-file scans into a single mean.
 
-    Within each file pick the num_generation_tokens value with the most
-    iterations (the mode) and take its Welford mean; ties break to the
-    largest ngen because the steady-state plateau is the upper of any tied
-    clusters. Mode is more robust than strict == max — a one-off spike where
-    a single iter's ngen briefly exceeds the sustained batch would otherwise
-    collapse the mean to 1-2 samples. Then average the per-file means across
-    workers. Returns None if no file had a usable row.
+    Within each file, prefer the steady-state bucket: pick the
+    num_generation_tokens value with the most iterations (the mode) and take
+    its Welford mean; ties break to the largest ngen because the steady-state
+    plateau is the upper of any tied clusters. Mode is more robust than strict
+    == max — a one-off spike where a single iter's ngen briefly exceeds the
+    sustained batch would otherwise collapse the mean to 1-2 samples.
+
+    When a file produced usable prev_device_step_time rows but none carried a
+    parseable num_generation_tokens (empty ``by_ngen``), fall back to that
+    file's un-bucketed all-iter mean instead of dropping the file. This keeps
+    a present metric from collapsing to None (and a spurious
+    check_test_failure) when the states dict omits num_generation_tokens or
+    renders it in an unexpected form (nvbugs 6487036 / 6487040); it degrades
+    to the pre-steady-state-restriction behavior only for that file.
+
+    Then average the per-file means across workers. Returns None only if no
+    file had a usable row at all.
     """
     means: List[float] = []
-    for by_ngen in per_file_by_ngen:
-        if not by_ngen:
-            continue
-        _mode_ngen, (_count, mean) = max(by_ngen.items(), key=lambda kv: (kv[1][0], kv[0]))
-        means.append(mean)
+    fell_back = False
+    for by_ngen, all_count, all_mean in per_file_scans:
+        if by_ngen:
+            _mode_ngen, (_count, mean) = max(by_ngen.items(), key=lambda kv: (kv[1][0], kv[0]))
+            means.append(mean)
+        elif all_count:
+            means.append(all_mean)
+            fell_back = True
     if not means:
         return None
+    if fell_back:
+        print_info(
+            "parse_gen_worker_device_step_time: num_generation_tokens not "
+            "parseable on any row of at least one gen worker; using the "
+            "un-bucketed all-iter prev_device_step_time mean for that worker."
+        )
     return sum(means) / len(means)
 
 
@@ -275,7 +325,10 @@ def parse_gen_worker_device_step_time(
     below the steady-state cost. Using the mode (rather than strict == max)
     is robust against a single iter whose ngen briefly spikes above the
     sustained batch, which would otherwise collapse the mean to 1-2 samples.
-    Returns None if no usable line is found in any file.
+    If a worker logged usable prev_device_step_time rows but none carried a
+    parseable num_generation_tokens, that worker falls back to its un-bucketed
+    all-iter mean (see _mean_at_mode_ngen) so a present metric is never dropped
+    to None. Returns None only if no usable line is found in any file.
 
     When start_offsets is provided, only the bytes from start_offsets[i] to
     end-of-file are considered for gen_server_{i}.log — used to slice out a
@@ -296,20 +349,20 @@ def parse_gen_worker_device_step_time(
     deadline = time.time() + settle_timeout
     prev_count = -1
     while True:
-        per_file_by_ngen, total_count = _scan_gen_worker_device_step_time(
+        per_file_scans, total_count = _scan_gen_worker_device_step_time(
             output_dir, num_gen_servers, start_offsets
         )
         # Non-empty and unchanged since the last poll → the flush has settled.
         if total_count > 0 and total_count == prev_count:
-            return _mean_at_mode_ngen(per_file_by_ngen)
+            return _mean_at_mode_ngen(per_file_scans)
         if time.time() >= deadline:
-            if per_file_by_ngen:
+            if per_file_scans:
                 print_info(
                     f"parse_gen_worker_device_step_time: settle_timeout "
                     f"({settle_timeout}s) reached with {total_count} line(s); "
                     "returning current mean."
                 )
-                return _mean_at_mode_ngen(per_file_by_ngen)
+                return _mean_at_mode_ngen(per_file_scans)
             return None
         prev_count = total_count
         time.sleep(poll_interval)
