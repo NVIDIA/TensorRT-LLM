@@ -344,7 +344,6 @@ test_e2e.py::test_multi_nodes_eval[Kimi-K2-Thinking-NVFP4-tp16-mmlu] SKIP (https
 test_e2e.py::test_multi_nodes_eval[MiniMax-M3-tp16-mmlu] SKIP (https://nvbugs/6373561)
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus[DeepSeek-R1-W4AFP8-DeepSeek-R1/DeepSeek-R1-W4AFP8] SKIP (https://nvbugs/5836830)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[deepseekv3_mla-gen-bf16-HND-p32-v1] SKIP (https://nvbugs/6507109)
-unittest/_torch/misc/test_autotuner.py::test_cutedsl_nvfp4_heuristic_matches_full_sweep SKIP (https://nvbugs/6490028)
 unittest/_torch/misc/test_share_tensor.py::TestShareTensor::test_share_tensor_different_dtypes SKIP (https://nvbugs/6418021)
 unittest/_torch/modeling -k "modeling_qwen" SKIP (https://nvbugs/6433376)
 unittest/_torch/modeling/test_modeling_qwen3_5_vl.py::test_qwen35_dense_vl_resolves_mamba_ssm_cache_dtype SKIP (https://nvbugs/6433376)
