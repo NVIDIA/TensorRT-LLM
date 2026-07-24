@@ -26,6 +26,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Final,
     Generic,
     List,
     Optional,
@@ -105,6 +106,7 @@ from .sampling_utils import (
     sample_rejected,
     top_p_decay_active,
 )
+from .token_ban import OverlappedTokenBanHandler, SynchronousTokenBanHandler, TokenBanHandler
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -1346,8 +1348,8 @@ class AsyncWorkerMixin:
 
 
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
-    DEFAULT_MAX_STOP_WORD_LENGTH = 20
-    DEFAULT_MAX_STOP_WORDS = 10
+    DEFAULT_MAX_STOP_WORD_LENGTH: Final[int] = 20
+    DEFAULT_MAX_STOP_WORDS: Final[int] = 10
 
     SampleState = SampleStateTorch
 
@@ -2461,6 +2463,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # the per-slot TopPDecayStore buffers; discarded on slot reuse so stale
         # buffer entries are never consumed.
         self._top_p_decay_slots: set[int] = set()
+
+        # Token-ban handling (bad words, no-repeat ngram). The overlap-aware
+        # variant is selected once here from whether the overlap scheduler is
+        # enabled; only it produces the conditional (stale-host) bans.
+        self._token_ban_handler: TokenBanHandler = (
+            OverlappedTokenBanHandler()
+            if self._track_pending_steps
+            else SynchronousTokenBanHandler()
+        )
 
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
@@ -4736,218 +4747,35 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             sampled_slots=sampled_slots_cuda,
         )
 
-    @staticmethod
-    @torch.inference_mode()
-    def _apply_min_length_penalty(
-        logits: torch.Tensor,
-        requests: list[LlmRequest],
-        num_steps_tensor: torch.Tensor,
-        num_beams_tensor: torch.Tensor,
-    ) -> None:
-        """Apply min_length_penalty to logits, mutating ``logits`` in place.
+    def _compute_stale_by_one(self, requests: list[LlmRequest]) -> list[bool] | None:
+        """Per-request overlap-scheduler stale flags, or None when not applicable.
 
-        Args:
-            logits: The logits to apply min length penalty to
-            requests: The requests to apply min length penalty to
-            num_steps_tensor: The number of steps per request (host tensor)
-            num_beams_tensor: The number of beams per request (host tensor)
+        Returns a list where entry ``i`` is True when request ``i``'s host token
+        history lags the device state by exactly one token (the previous step's
+        token was sampled but not yet written back). Only the single-step,
+        single-beam overlap case is reconstructible on the device side; under
+        speculative decoding or beam search the missing history cannot be
+        recovered, so bans are matched against the lagging host history and may
+        be enforced one step late (warned once). Returns None when the overlap
+        scheduler is off, on a draft batch, or when nothing is pending.
         """
-        if not any(
-            r.py_min_length and (r.max_beam_num_tokens - r.py_orig_prompt_len) < r.py_min_length[0]
-            for r in requests
-        ):
-            return
-
-        # Deferred host conversion: only needed on the (rare) penalty path.
-        num_steps = num_steps_tensor.tolist()
-        num_beams = num_beams_tensor.tolist()
-
-        rows: list[int] = []
-        cols: list[int] = []
-        current_offset = 0
-        for index, r in enumerate(requests):
-            # Advance the offset before any guard below can skip the request:
-            # every request occupies its logits rows, penalized or not.
-            req_offset = current_offset
-            current_offset += num_steps[index] * num_beams[index]
-
-            if not r.py_min_length:
-                continue
-            # Use the original end_id (before ignore_eos override)
-            # so we suppress the real EOS token, not token -1.
-            end_id = getattr(r, "py_original_end_id", r.py_end_id)
-            if end_id is None or end_id <= -1:
-                continue
-
-            for beam_idx in range(num_beams[index]):
-                for step in range(num_steps[index]):
-                    if (r.get_num_tokens(beam_idx) - r.py_orig_prompt_len) + step < r.py_min_length[
-                        0
-                    ]:
-                        rows.append(req_offset + num_steps[index] * beam_idx + step)
-                        cols.append(end_id)
-                    else:
-                        break
-
-        if rows:
-            neg_inf = torch.full((), float("-inf"), dtype=logits.dtype, device=logits.device)
-            row_idx = torch.tensor(rows, dtype=torch.long, pin_memory=prefer_pinned()).to(
-                logits.device, non_blocking=True
-            )
-            col_idx = torch.tensor(cols, dtype=torch.long, pin_memory=prefer_pinned()).to(
-                logits.device, non_blocking=True
-            )
-            logits.index_put_((row_idx, col_idx), neg_inf, accumulate=False)
-
-    @staticmethod
-    @torch.inference_mode()
-    def _apply_bad_words(
-        logits: torch.Tensor,
-        requests: list[LlmRequest],
-        num_steps: list[int],
-        num_beams: list[int],
-        *,
-        new_tokens_cuda: torch.Tensor | None = None,
-        stale_by_one: list[bool] | None = None,
-    ) -> None:
-        """Inplace ban "bad words" by masking their final token's logit to -inf.
-
-        A single-token word is banned unconditionally; a multi-token word
-        ``[t0, ..., t_{k-1}]`` bans its final token ``t_{k-1}`` only when the
-        ``k-1`` most recently generated tokens exactly match the prefix
-        ``[t0, ..., t_{k-2}]``.
-
-        With the overlap scheduler, ``sample_async`` for step ``i`` runs before
-        ``update_requests`` for step ``i-1``, so ``r.get_tokens()`` is missing
-        exactly the previous step's token; that token still lives device-side in
-        ``new_tokens_cuda``. For requests flagged in ``stale_by_one``, the
-        prefix match is therefore split: the first ``k-2`` prefix tokens are
-        matched on the host against the (complete up to there) host context, and
-        the final prefix token is compared on the GPU against
-        ``new_tokens_cuda[0, seq_slot, 0]``, without any device-to-host
-        synchronization. This path only supports ``num_steps == 1`` and
-        ``num_beams == 1`` (no speculation, no beam search).
-
-        Args:
-            logits: Flattened ``[total_rows, vocab]`` logits; rows are packed per
-                request as ``num_steps * num_beams`` consecutive entries, in
-                beam-major / step-minor order (same layout as
-                ``_apply_min_length_penalty``). Modified in-place.
-            requests: The requests, aligned with the packed logits rows.
-            num_steps: Number of steps per request.
-            num_beams: Number of beams per request.
-            new_tokens_cuda: Device buffer holding the previous step's sampled
-                tokens, shape ``[max_tokens, max_num_sequences, max_beam_width]``.
-                Required when any entry of ``stale_by_one`` is True.
-            stale_by_one: Per-request flag; True when the host token list lags
-                the device state by exactly one token (overlap scheduler).
-        """
-        rows: list[int] = []
-        cols: list[int] = []
-        # Overlap path: bans whose last prefix token must be compared on-device.
-        cond_rows: list[int] = []
-        cond_cols: list[int] = []
-        cond_slots: list[int] = []
-        cond_expected: list[int] = []
-        current_offset = 0
-        for index, r in enumerate(requests):
-            request_offset = current_offset
-            # Advance to the next request's rows before any early continue.
-            current_offset += num_steps[index] * num_beams[index]
-
-            bad_words = getattr(r, "py_bad_words", None)
-            if not bad_words:
-                continue
-
-            if stale_by_one is not None and stale_by_one[index]:
-                assert num_steps[index] == 1 and num_beams[index] == 1, (
-                    "stale-host bad-words path only supports a single step and beam"
-                )
-                assert r.py_seq_slot is not None
-                # Host context is missing the previous step's token; the true
-                # sequence is context + [new_tokens_cuda[0, seq_slot, 0]].
-                context = r.get_tokens(0)
-                for word in bad_words:
-                    k = len(word)
-                    if k == 0:
-                        continue
-                    if k == 1:
-                        # Single-token word: banned unconditionally.
-                        rows.append(request_offset)
-                        cols.append(word[0])
-                        continue
-                    # True sequence length is len(context) + 1; need >= k - 1.
-                    if len(context) < k - 2:
-                        continue
-                    # Host part: all prefix tokens except the newest one.
-                    if k > 2 and context[-(k - 2) :] != word[: k - 2]:
-                        continue
-                    # Device part: the previous step's token must equal the
-                    # last prefix token; resolved on the GPU below.
-                    cond_rows.append(request_offset)
-                    cond_cols.append(word[-1])
-                    cond_slots.append(r.py_seq_slot)
-                    cond_expected.append(word[k - 2])
-                continue
-
-            for beam_idx in range(num_beams[index]):
-                # Full token sequence for this beam (prompt + generated), so a
-                # bad-word prefix ending inside the prompt is also matched.
-                context = r.get_tokens(beam_idx)
-                for word in bad_words:
-                    k = len(word)
-                    if k == 0:
-                        continue
-                    if k == 1:
-                        # Single-token word: banned unconditionally.
-                        col = word[0]
-                    elif len(context) >= k - 1 and context[-(k - 1) :] == word[:-1]:
-                        # Multi-token word: ban the final token only when the
-                        # generated suffix matches the word prefix.
-                        col = word[-1]
-                    else:
-                        continue
-                    # Apply to every step row of this beam.
-                    for step in range(num_steps[index]):
-                        rows.append(request_offset + num_steps[index] * beam_idx + step)
-                        cols.append(col)
-
-        if rows:
-            neg_inf = torch.full((), float("-inf"), dtype=logits.dtype, device=logits.device)
-            row_idx = torch.tensor(rows, dtype=torch.long, pin_memory=prefer_pinned()).to(
-                logits.device, non_blocking=True
-            )
-            col_idx = torch.tensor(cols, dtype=torch.long, pin_memory=prefer_pinned()).to(
-                logits.device, non_blocking=True
-            )
-            logits.index_put_((row_idx, col_idx), neg_inf, accumulate=False)
-
-        if cond_rows:
-            assert new_tokens_cuda is not None
-            device = logits.device
-            cond_row_idx = torch.tensor(cond_rows, dtype=torch.long, pin_memory=prefer_pinned()).to(
-                device, non_blocking=True
-            )
-            cond_col_idx = torch.tensor(cond_cols, dtype=torch.long, pin_memory=prefer_pinned()).to(
-                device, non_blocking=True
-            )
-            slot_idx = torch.tensor(cond_slots, dtype=torch.long, pin_memory=prefer_pinned()).to(
-                device, non_blocking=True
-            )
-            expected = torch.tensor(
-                cond_expected, dtype=new_tokens_cuda.dtype, pin_memory=prefer_pinned()
-            ).to(device, non_blocking=True)
-            # Previous step's token per request (single step, single beam).
-            prev_tokens = new_tokens_cuda[0].index_select(0, slot_idx)[:, 0]
-            # -inf where the device-side prefix token matches, 0 otherwise.
-            # Additive update keeps the op shape-static (boolean-mask indexing
-            # would force a device-to-host sync).
-            penalty = torch.where(
-                prev_tokens == expected,
-                torch.full((), float("-inf"), dtype=logits.dtype, device=device),
-                torch.zeros((), dtype=logits.dtype, device=device),
-            )
-            logits.index_put_((cond_row_idx, cond_col_idx), penalty, accumulate=True)
+        if not self._track_pending_steps or self._is_draft_batch(requests):
+            return None
+        pending = [
+            self._pending_steps[r.py_seq_slot] if r.py_seq_slot is not None else 0 for r in requests
+        ]
+        if not any(pending):
+            return None
+        if self.max_tokens == 1 and self.max_beam_width == 1 and max(pending) == 1:
+            return [p > 0 for p in pending]
+        logger.warning_once(
+            "bad_words / no_repeat_ngram_size with the overlap scheduler and "
+            "speculative decoding or beam search: bans are matched against a "
+            "host token history that lags the device state and may be enforced "
+            "inexactly.",
+            key="bad_words_stale_overlap",
+        )
+        return None
 
     @staticmethod
     def _select_generated_logits(
@@ -5254,42 +5082,26 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
         )
 
-        self._apply_min_length_penalty(
-            logits_cuda,
-            sampling_requests,
-            sampling_requests_metadata.req_num_steps,
-            sampling_requests_metadata.req_num_beams,
-        )
-
-        if any(getattr(r, "py_bad_words", None) for r in sampling_requests):
-            stale_by_one: list[bool] | None = None
-            if self._track_pending_steps and not self._is_draft_batch(sampling_requests):
-                pending = [
-                    self._pending_steps[r.py_seq_slot] if r.py_seq_slot is not None else 0
-                    for r in sampling_requests
-                ]
-                if any(pending):
-                    if self.max_tokens == 1 and self.max_beam_width == 1 and max(pending) == 1:
-                        stale_by_one = [p > 0 for p in pending]
-                    else:
-                        # Speculative decoding / beam search under overlap:
-                        # the missing host tokens cannot be reconstructed with
-                        # the single-token device-side check; multi-token bad
-                        # words may be applied one step late.
-                        logger.warning_once(
-                            "bad_words with the overlap scheduler and speculative "
-                            "decoding or beam search: multi-token bad words are "
-                            "matched against a host token history that lags the "
-                            "device state and may be enforced inexactly.",
-                            key="bad_words_stale_overlap",
-                        )
-            self._apply_bad_words(
-                logits_cuda,
+        has_min_length = any(getattr(r, "py_min_length", None) for r in sampling_requests)
+        has_bad_words = any(getattr(r, "py_bad_words", None) for r in sampling_requests)
+        # Normalized in executor_request_to_llm_request: a positive int, or
+        # None when the restriction is disabled for the request.
+        ngram_sizes = [getattr(r, "py_no_repeat_ngram_size", None) for r in sampling_requests]
+        has_no_repeat_ngram = any(size is not None for size in ngram_sizes)
+        if has_min_length or has_bad_words or has_no_repeat_ngram:
+            # Overlap-scheduler stale flags (per request): True when the host
+            # token history lags the device by one token. Only the overlap
+            # handler consumes them; computed here as it needs sampler state.
+            stale_by_one = self._compute_stale_by_one(sampling_requests)
+            bans = self._token_ban_handler.generate_ban_list(
                 sampling_requests,
                 sampling_requests_metadata.req_num_steps.tolist(),
                 sampling_requests_metadata.req_num_beams.tolist(),
-                new_tokens_cuda=new_tokens_cuda,
+                ngram_sizes,
                 stale_by_one=stale_by_one,
+            )
+            self._token_ban_handler.apply_ban_list(
+                logits_cuda, bans, new_tokens_cuda=new_tokens_cuda
             )
 
         # Fast path for greedy sampling

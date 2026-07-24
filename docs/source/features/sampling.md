@@ -115,6 +115,10 @@ llm.generate(["Hello, my name is",
   * Top-P decay is not supported in combination with beam search or with speculative decoding
     modes that route draft tokens through the Torch Sampler; such requests are rejected.
 
+* If `no_repeat_ngram_size = n` is specified, any token that would recreate an `n`-gram already
+  present in the sequence (prompt included) is excluded from sampling. `None` or `0` disables
+  the restriction.
+
 ### Performance
 
 The Torch Sampler leverages the optimized sampling kernels provided by
