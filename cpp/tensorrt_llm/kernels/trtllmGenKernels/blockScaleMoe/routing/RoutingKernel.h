@@ -110,9 +110,11 @@ struct DataBase
     int32_t mLocalExpertsStrideLog2;
     int32_t mNumLocalExperts;
 
-    /// For fused shared expert
-    int32_t mNumFusedSharedExperts;
-    int32_t mTotalExpertsPerToken;
+    /// For fused shared expert. Default to 0 (no fusion) so callers that
+    /// construct Data directly (e.g. the routing kernel unit tests) stay valid;
+    /// mTotalExpertsPerToken is derived in routingDeepSeek::run() from mTopK.
+    int32_t mNumFusedSharedExperts{0};
+    int32_t mTotalExpertsPerToken{0};
 };
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
