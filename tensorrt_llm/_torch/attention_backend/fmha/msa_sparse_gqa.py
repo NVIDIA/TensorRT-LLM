@@ -134,7 +134,12 @@ def run_msa_paged_gqa(
     head_dim = attn.head_dim
     kv_cache_manager = metadata.kv_cache_manager
     num_tokens = int(q.shape[0])
-    if k is not None and v is not None:
+    # The fused per-layer scatter (msa_write_layer_caches) may have written
+    # this layer's K/V already; consume the marker so it never goes stale.
+    prewritten = getattr(metadata, "_msa_prewritten_layer", None) == layer_idx
+    if prewritten:
+        metadata._msa_prewritten_layer = None
+    if k is not None and v is not None and not prewritten:
         write_msa_main_kv(
             kv_cache_manager, layer_idx, metadata.msa_out_cache_loc[:num_tokens], k, v
         )
