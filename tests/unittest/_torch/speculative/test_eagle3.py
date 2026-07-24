@@ -1069,7 +1069,12 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
                        **spec_config_kwargs))
 
     prompts = ["The president of the United States is"]
-    sampling_params = SamplingParams(max_tokens=20, temperature=1.0, top_p=1.0)
+    # min_p exercises the one-model min-p path (renorm on the sampled tokens and,
+    # in the dynamic-tree variant, the tree rejection-acceptance distributions).
+    sampling_params = SamplingParams(max_tokens=20,
+                                     temperature=1.0,
+                                     top_p=1.0,
+                                     min_p=0.05)
 
     results = llm_spec.generate(prompts, sampling_params)
     llm_spec.shutdown()

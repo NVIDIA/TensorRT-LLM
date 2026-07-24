@@ -376,6 +376,8 @@ class SamplingParams:
             raise ValueError(f"require 0 <= top_p <= 1, got top_p={self.top_p}")
         if self.top_k is not None and self.top_k < 0:
             raise ValueError(f"require top_k >= 0, got top_k={self.top_k}")
+        if self.min_p is not None and (self.min_p < 0 or self.min_p > 1):
+            raise ValueError(f"require 0 <= min_p <= 1, got min_p={self.min_p}")
         if self.temperature is not None and self.temperature < 0:
             raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
 
@@ -479,14 +481,17 @@ class SamplingParams:
         top_p: Optional[float],
         top_k: Optional[int],
         use_beam_search: bool | None,
+        min_p: Optional[float] = None,
         top_p_decay: Optional[float] = None,
     ) -> bool:
         """Whether the parameters resolve to greedy decoding.
 
         An explicit greedy control always wins. The implicit "all params unset"
-        greedy default is overridden by an active top-p decay (which implies
-        top-p sampling so the decayed runtime top-p can take effect); callers
-        that do not support decay may omit ``top_p_decay``.
+        greedy default is overridden by any active sampling knob: an active
+        top-p decay (which implies top-p sampling so the decayed runtime top-p
+        can take effect) or a positive ``min_p`` (which still selects among
+        multiple tokens); callers that do not support decay may omit
+        ``top_p_decay``.
         """
         if use_beam_search:
             return False
@@ -495,7 +500,9 @@ class SamplingParams:
         ):
             return True
         implicitly_greedy = temperature is None and top_p is None and top_k is None
-        return implicitly_greedy and not SamplingParams.params_imply_top_p_decay_active(top_p_decay)
+        min_p_active = min_p is not None and min_p > 0.0
+        decay_active = SamplingParams.params_imply_top_p_decay_active(top_p_decay)
+        return implicitly_greedy and not min_p_active and not decay_active
 
     @property
     def _greedy_decoding(self) -> bool:
@@ -504,6 +511,7 @@ class SamplingParams:
             top_p=self.top_p,
             top_k=self.top_k,
             use_beam_search=self.use_beam_search,
+            min_p=self.min_p,
             top_p_decay=self.top_p_decay,
         )
 

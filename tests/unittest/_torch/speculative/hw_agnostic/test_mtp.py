@@ -1764,8 +1764,10 @@ def test_vanilla_mtp_rejection():
         "The president of the United States is",
     ]
     # Non-greedy so rejection sampling actually engages (all-greedy bypasses it).
+    # min_p exercises the one-model min-p renorm on both the sampled tokens and
+    # the rejection-acceptance distributions.
     sampling_params = SamplingParams(
-        max_tokens=32, temperature=0.8, top_p=0.95, top_k=50, seed=1234
+        max_tokens=32, temperature=0.8, top_p=0.95, top_k=50, min_p=0.05, seed=1234
     )
     outputs = llm.generate(prompts, sampling_params)
     llm.shutdown()
@@ -1808,8 +1810,10 @@ def test_mtp_eagle_one_model_rejection():
         "The president of the United States is",
     ]
     # Non-greedy so rejection sampling actually engages (all-greedy bypasses it).
+    # min_p exercises the one-model min-p renorm on both the sampled tokens and
+    # the rejection-acceptance distributions.
     sampling_params = SamplingParams(
-        max_tokens=32, temperature=0.8, top_p=0.95, top_k=50, seed=1234
+        max_tokens=32, temperature=0.8, top_p=0.95, top_k=50, min_p=0.05, seed=1234
     )
     outputs = llm.generate(prompts, sampling_params)
     llm.shutdown()
