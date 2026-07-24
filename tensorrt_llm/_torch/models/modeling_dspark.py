@@ -45,6 +45,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..distributed import AllReduceParams
 from ..modules.linear import Linear
@@ -66,6 +67,7 @@ from .modeling_deepseekv4 import (
     DeepseekV4WeightLoader,
     _get_deepseek_v4_routed_moe_scale_name,
     _maybe_view_deepseek_v4_routed_moe_tensor,
+    _normalize_deepseek_v4_nvfp4_mixed_precision_config,
     _rename_deepseek_v4_attn_subkey,
     _rename_deepseek_v4_ffn_subkey,
 )
@@ -497,7 +499,8 @@ class DSparkDraftModel(nn.Module):
         """
         new_sa = cls._draft_sparse_config(model_config, base, num_stages)
         new_qcd = cls._draft_quant_config_dict(model_config, base, num_stages)
-        if new_sa is None and new_qcd is None:
+        new_qc = cls._draft_normalized_quant_config(model_config)
+        if new_sa is None and new_qcd is None and new_qc is None:
             return model_config
         draft_cfg = copy.copy(model_config)
         # ModelConfig is a frozen dataclass; bypass the guard for these fields.
@@ -505,7 +508,35 @@ class DSparkDraftModel(nn.Module):
             object.__setattr__(draft_cfg, "sparse_attention_config", new_sa)
         if new_qcd is not None:
             object.__setattr__(draft_cfg, "quant_config_dict", new_qcd)
+        if new_qc is not None:
+            object.__setattr__(draft_cfg, "quant_config", new_qc)
         return draft_cfg
+
+    @staticmethod
+    def _draft_normalized_quant_config(model_config):
+        """Resolved global ``quant_config`` for NVFP4 DSpark checkpoints, or None.
+
+        NVFP4 DSpark checkpoints declare a global ``MIXED_PRECISION`` quant algo
+        (per-layer NVFP4 routed experts over an FP8 base). The target resolves it
+        in :func:`_normalize_deepseek_v4_nvfp4_mixed_precision_config`
+        (base -> ``FP8_BLOCK_SCALES``); the separately-built draft config needs
+        the same, otherwise the inherited ``DeepseekV4DecoderLayer`` asserts
+        ``"MIXED_PRECISION is ambiguous"`` when it builds the draft stages.
+        Returns the resolved ``quant_config`` to set on the draft copy, or None
+        when nothing changes (e.g. the MXFP4 checkpoint, whose global algo is not
+        ``MIXED_PRECISION``) so the draft config is left byte-identical.
+        """
+        qc = getattr(model_config, "quant_config", None)
+        if qc is None or getattr(qc, "quant_algo", None) != QuantAlgo.MIXED_PRECISION:
+            return None
+        # Reuse the target normalizer on a throwaway shallow copy so we only
+        # extract the resolved global quant_config; the shared ``model_config``
+        # is left untouched (the normalizer rebinds ``.quant_config`` on the copy).
+        probe = copy.copy(model_config)
+        object.__setattr__(probe, "_frozen", False)
+        normalized = _normalize_deepseek_v4_nvfp4_mixed_precision_config(probe)
+        resolved = getattr(normalized, "quant_config", qc)
+        return resolved if resolved is not qc else None
 
     @staticmethod
     def _draft_sparse_config(model_config, base: int, num_stages: int):
