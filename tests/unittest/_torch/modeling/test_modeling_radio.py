@@ -22,12 +22,12 @@ _TINY_VIT = modeling_radio.VITTIMMConfig(
 )
 
 # Mirror the engine's encoder runtime sizes (``get_encoder_runtime_sizes`` ->
-# ``encoder_max_batch_size`` / ``encoder_max_num_tokens``, defaulting to
+# ``encoder_max_num_items`` / ``encoder_max_num_tokens``, defaulting to
 # ``max_batch_size`` / ``max_num_tokens``). The encoder ``AttentionMetadata`` is
 # sized once at load to this max budget; each forward re-preps it with the real
 # per-image seq lens. Two distinct axes: requests = image/sequence count budget,
 # tokens = total patch budget.
-_ENCODER_TEST_MAX_NUM_REQUESTS = 2048
+_ENCODER_TEST_MAX_NUM_ITEMS = 2048
 _ENCODER_TEST_MAX_NUM_TOKENS = 8192
 
 
@@ -98,7 +98,7 @@ def test_radio_fp8_parent_kv_cache_does_not_leak_into_vit(tiny_vit_config):
     for module in vision_model.modules():
         if isinstance(module, MultimodalEncoderMixin):
             module.setup_attn_metadata(
-                max_num_requests=_ENCODER_TEST_MAX_NUM_REQUESTS,
+                max_num_items=_ENCODER_TEST_MAX_NUM_ITEMS,
                 max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS,
             )
 

@@ -489,7 +489,7 @@
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",
-      "path": "encoder_max_batch_size"
+      "path": "encoder_max_num_items"
     },
     {
       "allowed_values": [],
@@ -982,6 +982,13 @@
       "converter": "",
       "kind": "value",
       "path": "moe_tensor_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "multimodal_config.enable_eager_encoder_scheduling"
     },
     {
       "allowed_values": [],

@@ -94,7 +94,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `enable_resource_governor` | `<class 'bool'>` | `value` |  |  |
 | `enable_speculative_beam_history_d2h` | `<class 'bool'>` | `value` |  |  |
 | `encode_only` | `<class 'bool'>` | `value` |  |  |
-| `encoder_max_batch_size` | `Optional[int]` | `value` |  |  |
+| `encoder_max_num_items` | `Optional[int]` | `value` |  |  |
 | `encoder_max_num_tokens` | `Optional[int]` | `value` |  |  |
 | `force_dynamic_quantization` | `<class 'bool'>` | `value` |  |  |
 | `garbage_collection_gen0_threshold` | `<class 'int'>` | `value` |  |  |

@@ -571,14 +571,30 @@ class MultimodalConfig(StrictBaseModel):
     encoder_cache_max_bytes: NonNegativeInt = Field(
         default=134_217_728,  # 128 MiB.
         description=
-        ("Maximum bytes for the per-model cross-request multimodal encoder embedding cache. "
-         "Set to 0 to disable. String values such as '512MB' and '1GiB' use binary units. "
-         "Cache entries are per multimodal item, but reuse is all-or-nothing for each request: "
-         "every item in the request must hit the cache before cached embeddings are reused. "
-         "Only single-modality requests are cacheable for the time being. "
-         "For the time being, this is incompatible with encoder_side_stream_max_ahead > 0. "
+        ("Maximum bytes for the per-model multimodal encoder embedding cache. "
+         "String values such as '512MB' and '1GiB' use binary units. "
+         "For models with item-level encoder scheduling this cache is the "
+         "exclusive storage for encoder outputs: its budget bounds encoder-"
+         "output GPU residency (reserved during memory profiling), entries "
+         "are reused per item across requests, and values below one prefill "
+         "iteration's embeddings (including 0) are raised to that minimum "
+         "with a warning. For other multimodal models it is a cross-request "
+         "cache with all-or-nothing per-request reuse (every item must hit "
+         "before cached embeddings are used); 0 disables it, and only "
+         "single-modality requests are cacheable for the time being. "
+         "For the time being, this is incompatible with "
+         "encoder_side_stream_max_ahead > 0. "
          "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
          ),
+        status="prototype",
+    )
+
+    enable_eager_encoder_scheduling: bool = Field(
+        default=False,
+        description=(
+            "Schedule encoder work for active multimodal requests before LLM "
+            "capacity filtering. This may advance encoder work for requests "
+            "that are not selected for the current LLM batch."),
         status="prototype",
     )
 
@@ -4876,31 +4892,53 @@ class TorchLlmArgs(BaseLlmArgs):
         description="DWDP (Distributed Weight Data Parallelism) config.",
         status="prototype")
 
-    encoder_max_batch_size: Optional[int] = Field(
+    encoder_max_num_items: Optional[int] = Field(
         default=None,
-        description=(
-            "Maximum batch size for the multimodal encoder's AttentionMetadata. "
-            "Falls back to `max_batch_size` when unset. This budget is shared "
-            "proportionately across all modalities the model encodes, not set "
-            "per modality; per-modality knobs may be added later."),
+        description=
+        ("Maximum number of atomic multimodal items (e.g. one image or one "
+         "video) scheduled for encoder execution in one iteration, shared "
+         "across requests and modalities; per-modality limits may be added "
+         "later. Item size is budgeted separately by `encoder_max_num_tokens`. "
+         "This count also defines the many-item warmup boundary and the "
+         "default encoder attention capacity for encoders whose items map "
+         "1:1 to attention sequences; encoders that split one item into "
+         "multiple sequences derive their capacity from the token budget "
+         "instead. Falls back to `max_batch_size` when unset."),
         status="prototype")
 
     encoder_max_num_tokens: Optional[int] = Field(
         default=None,
         description=(
-            "Maximum number of tokens for the multimodal encoder's "
-            "AttentionMetadata. Falls back to `max_num_tokens` when unset. This "
-            "budget is shared proportionately across all modalities the model "
-            "encodes, not set per modality; per-modality knobs may be added "
-            "later."),
+            "Maximum number of encoder attention tokens scheduled in one "
+            "multimodal encoder iteration. It falls back to `max_num_tokens` "
+            "when unset. Because an atomic multimodal item cannot be split, "
+            "the effective budget is raised to the model's largest atomic item "
+            "when necessary. This budget is shared proportionately across all "
+            "encoded modalities; per-modality knobs may be added later."),
         status="prototype")
 
-    @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")
+    @field_validator("encoder_max_num_items", "encoder_max_num_tokens")
     @classmethod
     def validate_encoder_runtime_sizes(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v <= 0:
             raise ValueError("must be a positive integer when set")
         return v
+
+    @model_validator(mode="after")
+    def validate_eager_encoder_scheduling_compatibility(self) -> 'TorchLlmArgs':
+        if not self.multimodal_config.enable_eager_encoder_scheduling:
+            return self
+        if self.enable_attention_dp:
+            raise ValueError(
+                "multimodal_config.enable_eager_encoder_scheduling does not "
+                "yet support attention DP (enable_attention_dp=True)")
+        if (self.cache_transceiver_config is not None
+                and self.cache_transceiver_config.backend is not None):
+            raise ValueError(
+                "multimodal_config.enable_eager_encoder_scheduling does not "
+                "yet support disaggregated serving "
+                "(cache_transceiver_config)")
+        return self
 
     attn_backend: str = Field(
         default='TRTLLM',
@@ -5213,15 +5251,15 @@ class TorchLlmArgs(BaseLlmArgs):
         self._quant_config = value
 
     def get_encoder_runtime_sizes(self) -> Tuple[int, int]:
-        """Return encoder runtime batch and token limits.
+        """Return encoder runtime item-count and token limits.
 
-        Returns `(encoder_max_batch_size, encoder_max_num_tokens)`, falling
+        Returns `(encoder_max_num_items, encoder_max_num_tokens)`, falling
         back to the LLM-side `max_batch_size` / `max_num_tokens` when the
         encoder-specific knobs are not set.
         """
         return (
-            self.encoder_max_batch_size
-            if self.encoder_max_batch_size is not None else self.max_batch_size,
+            self.encoder_max_num_items
+            if self.encoder_max_num_items is not None else self.max_batch_size,
             self.encoder_max_num_tokens
             if self.encoder_max_num_tokens is not None else self.max_num_tokens,
         )

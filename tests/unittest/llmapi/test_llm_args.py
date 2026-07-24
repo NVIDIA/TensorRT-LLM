@@ -208,16 +208,16 @@ model_kwargs:
 class TestEncoderRuntimeSizes:
     """Cover encoder runtime size fields and fallback to LLM limits.
 
-    `encoder_max_batch_size` / `encoder_max_num_tokens` are user-facing
-    knobs that size multimodal encoder AttentionMetadata; when unset they
-    fall back to the LLM-side `max_batch_size` / `max_num_tokens`. They are
-    PyTorch-backend only (the multimodal encoder profiling path), so they
-    live on `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
+    `encoder_max_num_items` / `encoder_max_num_tokens` are user-facing
+    knobs for multimodal encoder scheduling and AttentionMetadata. When unset,
+    they fall back to the corresponding LLM-side values before model-aware
+    atomic-item compatibility resolution. They are PyTorch-backend only, so
+    they live on `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
     """
 
     def test_defaults_are_none(self, llm_args_cls):
         llm_args = llm_args_cls(model=llama_model_path)
-        assert llm_args.encoder_max_batch_size is None
+        assert llm_args.encoder_max_num_items is None
         assert llm_args.encoder_max_num_tokens is None
 
     @pytest.mark.parametrize(
@@ -225,10 +225,10 @@ class TestEncoderRuntimeSizes:
         [
             # Neither encoder knob set -- falls back to LLM limits.
             (dict(max_batch_size=64, max_num_tokens=2048), (64, 2048)),
-            # Only encoder_max_batch_size overrides.
+            # Only encoder_max_num_items overrides.
             (dict(max_batch_size=64,
                   max_num_tokens=2048,
-                  encoder_max_batch_size=512), (512, 2048)),
+                  encoder_max_num_items=512), (512, 2048)),
             # Only encoder_max_num_tokens overrides.
             (dict(max_batch_size=64,
                   max_num_tokens=2048,
@@ -236,10 +236,10 @@ class TestEncoderRuntimeSizes:
             # Both encoder knobs override.
             (dict(max_batch_size=64,
                   max_num_tokens=2048,
-                  encoder_max_batch_size=512,
+                  encoder_max_num_items=512,
                   encoder_max_num_tokens=32768), (512, 32768)),
         ],
-        ids=["fallback", "only_batch", "only_tokens", "both"],
+        ids=["fallback", "only_items", "only_tokens", "both"],
     )
     def test_get_encoder_runtime_sizes(self, llm_args_cls, kwargs,
                                        expected_runtime_sizes):
@@ -249,8 +249,8 @@ class TestEncoderRuntimeSizes:
     @pytest.mark.parametrize(
         "field_name, invalid_value",
         [
-            ("encoder_max_batch_size", 0),
-            ("encoder_max_batch_size", -1),
+            ("encoder_max_num_items", 0),
+            ("encoder_max_num_items", -1),
             ("encoder_max_num_tokens", 0),
             ("encoder_max_num_tokens", -1),
         ],
@@ -259,6 +259,31 @@ class TestEncoderRuntimeSizes:
                                   invalid_value):
         with pytest.raises(ValidationError):
             llm_args_cls(model=llama_model_path, **{field_name: invalid_value})
+
+
+class TestEagerEncoderSchedulingCompatibility:
+    """Eager MM encoder scheduling rejects unsupported feature combinations."""
+
+    def test_eager_alone_is_accepted(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            multimodal_config=MultimodalConfig(
+                                enable_eager_encoder_scheduling=True))
+        assert args.multimodal_config.enable_eager_encoder_scheduling
+
+    def test_eager_rejects_attention_dp(self):
+        with pytest.raises(ValidationError, match="attention DP"):
+            TorchLlmArgs(model=llama_model_path,
+                         enable_attention_dp=True,
+                         multimodal_config=MultimodalConfig(
+                             enable_eager_encoder_scheduling=True))
+
+    def test_eager_rejects_disaggregated_serving(self):
+        with pytest.raises(ValidationError, match="disaggregated"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+                multimodal_config=MultimodalConfig(
+                    enable_eager_encoder_scheduling=True))
 
 
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
@@ -715,6 +740,7 @@ class TestMultimodalConfig:
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
+        assert not MultimodalConfig().enable_eager_encoder_scheduling
         assert MultimodalConfig().video_pruning_rate is None
 
     def test_torch_llm_args_default_multimodal_config(self):
@@ -723,6 +749,7 @@ class TestMultimodalConfig:
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
+        assert not args.multimodal_config.enable_eager_encoder_scheduling
         assert args.multimodal_config.video_pruning_rate is None
 
     @pytest.mark.parametrize(
@@ -753,6 +780,12 @@ class TestMultimodalConfig:
                                 encoder_cache_max_bytes=0,
                             ))
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
+
+    def test_torch_llm_args_with_eager_encoder_scheduling(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            multimodal_config=MultimodalConfig(
+                                enable_eager_encoder_scheduling=True))
+        assert args.multimodal_config.enable_eager_encoder_scheduling
 
     def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
         args = TorchLlmArgs(
@@ -792,10 +825,12 @@ class TestMultimodalConfig:
             multimodal_config={
                 "encoder_side_stream_max_ahead": 2,
                 "encoder_cache_max_bytes": 0,
+                "enable_eager_encoder_scheduling": True,
                 "video_pruning_rate": 0.5,
             },
         )
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
+        assert args.multimodal_config.enable_eager_encoder_scheduling
         assert args.multimodal_config.video_pruning_rate == 0.5
 
     def test_encoder_cuda_graph_and_side_stream_max_ahead_are_exclusive(self):

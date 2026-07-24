@@ -68,7 +68,8 @@ from .resource_manager import (BaseKVCacheCompressionManager, KVCacheManager,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2Scheduler, SimpleScheduler,
+                        KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
+                        MultimodalScheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
@@ -331,7 +332,7 @@ class KvCacheCreator:
         self._max_batch_size = max_batch_size
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
-        self._dummy_encoder_inputs: List[MultimodalParams] = []
+        self._dummy_encoder_inputs: List[List[MultimodalParams]] = []
         self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
         self._cache_transceiver_config = llm_args.cache_transceiver_config
@@ -557,10 +558,12 @@ class KvCacheCreator:
             requests = requests * self._mapping.tp_size
         return requests
 
-    def _create_dummy_encoder_inputs(self) -> List[MultimodalParams]:
-        """Build the worst-case dummy multimodal batch for direct encoder
-        profiling: the processor's worst-case dummy saturating
-        ``encoder_max_num_tokens`` (one batched encoder forward), staged to GPU.
+    def _create_dummy_encoder_inputs(self) -> List[List[MultimodalParams]]:
+        """Build boundary-shape MM batches for direct encoder profiling.
+
+        The same aggregate token budget can have different peaks as one long
+        item or as many shorter items. Build both shapes on CPU; the encoder
+        profiling path stages and releases one batch at a time.
 
         Returns an empty list when the model is not a multimodal-encoder model
         or the processor has no dummy builder (then the encoder is not profiled
@@ -587,13 +590,12 @@ class KvCacheCreator:
         if getattr(self._model_engine.model, "mm_encoder", object()) is None:
             return []
         input_processor = self._model_engine.input_processor
-        _, encoder_max_num_tokens = self._llm_args.get_encoder_runtime_sizes()
+        encoder_max_num_tokens = self._model_engine.encoder_max_num_tokens
         # Modality-agnostic: the model declares each modality's per-item token
         # demand; split the shared ``encoder_max_num_tokens`` budget across them
         # in proportion to that demand (they share one encoder microbatch cap, so
         # the shares sum to the budget rather than each claiming all of it). The
-        # processor then materializes a dummy per modality, merged into one batch
-        # so a single encode profiles the combined peak. Empty demand /
+        # processor then materializes a dummy per modality. Empty demand /
         # NotImplementedError on the builder → text-only dummy fallback.
         demand = input_processor.get_mm_max_tokens_per_item()
         total_demand = sum(demand.values())
@@ -603,41 +605,105 @@ class KvCacheCreator:
             m: max(1, encoder_max_num_tokens * d // total_demand)
             for m, d in demand.items()
         }
-        try:
-            multimodal_data = input_processor.get_dummy_mm_data_for_tokens(
-                max_tokens_per_modality=max_tokens_per_modality,
-                dtype=self._model_engine.model.dtype)
-        except NotImplementedError:
-            return []
 
-        if not multimodal_data:
-            return []
-        params = MultimodalParams(multimodal_data=multimodal_data)
-        params.to_device("multimodal_data",
-                         "cuda",
-                         pin_memory=prefer_pinned(),
-                         target_keywords=getattr(
-                             self._model_engine.model,
-                             "multimodal_data_device_paths", None))
-        return [params]
+        def distribute_items(max_num_items: int) -> Dict[str, int]:
+            """Split one shared item budget proportionally across modalities."""
+            allocations = {
+                modality: max_num_items * item_demand // total_demand
+                for modality, item_demand in demand.items()
+            }
+            remaining = max_num_items - sum(allocations.values())
+            order = sorted(
+                demand,
+                key=lambda modality: (max_num_items * demand[modality] %
+                                      total_demand, demand[modality], modality),
+                reverse=True,
+            )
+            for modality in order[:remaining]:
+                allocations[modality] += 1
+            return allocations
+
+        # Two boundary batches share the same token budget but peak
+        # differently: one maximal-length item stresses length-dominated
+        # attention scratch, while the maximal item count stresses per-item
+        # overheads. Profile both; skip the second when it degenerates to
+        # the first.
+        item_limits = [distribute_items(1)]
+        if self._model_engine.encoder_max_num_items > 1:
+            item_limits.append(
+                distribute_items(self._model_engine.encoder_max_num_items))
+
+        batches: List[List[MultimodalParams]] = []
+        for max_items_per_modality in item_limits:
+            try:
+                multimodal_data = input_processor.get_dummy_mm_data_for_tokens(
+                    max_tokens_per_modality=max_tokens_per_modality,
+                    max_items_per_modality=max_items_per_modality,
+                    dtype=self._model_engine.model.dtype)
+            except NotImplementedError:
+                logger.info(
+                    "MM encoder warmup skipped: %s does not implement "
+                    "get_dummy_mm_data_for_tokens(); memory estimation will "
+                    "not include encoder peak usage.",
+                    type(input_processor).__name__)
+                return []
+            if multimodal_data:
+                batches.append(
+                    [MultimodalParams(multimodal_data=multimodal_data)])
+        return batches
 
     def _encode_dummy_inputs(self):
-        """Run the multimodal encoder(s) once on the pre-built worst-case dummy
-        batch (``self._dummy_encoder_inputs``) and return its output so the
-        embeddings stay resident while the peak is measured (the caller must hold
-        the returned tensors so the peak accounts for the live embeddings).
-        Returns ``None`` when direct profiling does not apply."""
+        """Profile long-item and many-item MM boundary batches sequentially.
+
+        Inputs are staged immediately before each forward and released before
+        the next. The final (many-item, when present) output remains live for
+        the subsequent LLM dummy forward; supported models preserve total
+        output size for equal aggregate encoder-token budgets.
+        """
         if not self._dummy_encoder_inputs:
             return None
         with torch.inference_mode():
-            return self._model_engine.model.encode_multimodal_inputs(
-                self._dummy_encoder_inputs)
+            retained_output = None
+            for batch_idx, encoder_inputs in enumerate(
+                    self._dummy_encoder_inputs):
+                try:
+                    for encoder_input in encoder_inputs:
+                        encoder_input.to_device(
+                            "multimodal_data",
+                            "cuda",
+                            pin_memory=prefer_pinned(),
+                            target_keywords=getattr(
+                                self._model_engine.model,
+                                "multimodal_data_device_paths", None),
+                        )
+                    output = self._model_engine.model.encode_multimodal_inputs(
+                        encoder_inputs)
+                finally:
+                    encoder_inputs.clear()
+                if batch_idx + 1 == len(self._dummy_encoder_inputs):
+                    retained_output = output
+                else:
+                    del output
+            return retained_output
 
     def _reserve_multimodal_encoder_cache_memory(
         self,
         peak_memory: int,
     ) -> int:
-        """Reserve encoder-cache capacity when the model implements that cache."""
+        """Reserve encoder-output storage capacity in the estimated peak.
+
+        Item-scheduling models store every encoder output in the
+        engine-owned `MultimodalEncoderCacheManager`, so reserving its
+        (min-clamped) byte budget bounds ALL runtime encoder-output
+        residency: together with the boundary-batch transient profiled by
+        `_run_dummy_encoder_forwards`, runtime cannot exceed the estimated
+        peak. Other models keep the legacy full-request clone cache
+        reservation.
+        """
+        manager = getattr(self._model_engine, "mm_encoder_cache_manager", None)
+        if manager is not None:
+            return peak_memory + manager.max_bytes
+
         model = self._model_engine.model
         if (not isinstance(model, MultimodalModelMixin)
                 or not model.supports_encoder_cache):
@@ -2389,6 +2455,12 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
+    if getattr(model_engine, "mm_encoder_cache_manager", None) is not None:
+        # Route MM encoder-output teardown through the standard
+        # free_resources funnel (completion, cancellation, and error paths).
+        resources[ResourceManagerType.MM_ENCODER_CACHE_MANAGER] = (
+            model_engine.mm_encoder_cache_manager)
+
     # Register the compression manager (if one is configured) with the other
     # managers, before building ResourceManager, so it is part of the manager
     # set from the start. Reads its own config, not the sparse-attention one.
@@ -2525,6 +2597,31 @@ def create_py_executor_instance(
                 reorder_policy_config.policy_args.agent_types,
                 reorder_policy_config.policy_args.agent_inflight_seq_num)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
+
+    if getattr(model_engine, "supports_mm_encoder_item_scheduling", False):
+        # Wrap the LLM scheduler with atomic MM item budgeting. The
+        # side-stream conflict is checked here rather than in an args
+        # validator because item scheduling is a model capability
+        # (MultimodalModelMixin + processor opt-in) only known after model
+        # load; side-stream prefetch stays valid for other MM models.
+        multimodal_config = llm_args.multimodal_config
+        if multimodal_config.encoder_side_stream_max_ahead > 0:
+            raise NotImplementedError(
+                "MM side-stream prefetch is not yet compatible with "
+                "item-level encoder scheduling; set "
+                "multimodal_config.encoder_side_stream_max_ahead to 0")
+        scheduler_cls = MultimodalScheduler
+        if multimodal_config.enable_eager_encoder_scheduling:
+            logger.info("Eager multimodal encoder scheduling is enabled for "
+                        "capacity-rejected active requests.")
+            scheduler_cls = MultimodalEagerEncoderScheduler
+        scheduler = scheduler_cls(
+            scheduler,
+            max_num_items=model_engine.encoder_max_num_items,
+            max_num_tokens=model_engine.encoder_max_num_tokens,
+            cache_manager=model_engine.mm_encoder_cache_manager,
+            embedding_row_bytes=model_engine.mm_embedding_row_bytes,
+        )
 
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(

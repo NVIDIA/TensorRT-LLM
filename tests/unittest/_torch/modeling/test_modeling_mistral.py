@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import os
 import re
@@ -669,6 +672,17 @@ def test_dummy_mm_max_tokens_per_item_is_image_only():
     assert demand["image"] == (1540 // 14) ** 2 == 110**2
 
 
+def test_attention_metadata_capacity_uses_item_and_token_budgets():
+    proc = _make_dummy_processor(spatial_merge_size=2)
+
+    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_items=8, max_num_tokens=100) == {
+        "attention": 8
+    }
+    assert proc.get_mm_encoder_attention_metadata_capacity(
+        max_num_items=100, max_num_tokens=12
+    ) == {"attention": 3}
+
+
 @pytest.mark.parametrize("budget", [1024, 4096, 8192])
 def test_dummy_get_size_for_max_tokens_fits_and_aligns(budget):
     proc = _make_dummy_processor()
@@ -705,6 +719,22 @@ def test_dummy_get_dummy_mm_data_for_tokens_shapes_and_saturation(budget):
     per_image = (h // 14) * (w // 14)
     assert n * per_image <= budget
     assert n * per_image + per_image > budget
+
+
+def test_dummy_get_dummy_mm_data_for_tokens_covers_many_item_boundary():
+    proc = _make_dummy_processor(num_channels=3)
+    data = proc.get_dummy_mm_data_for_tokens(
+        max_tokens_per_modality={"image": 8192},
+        max_items_per_modality={"image": 8},
+        dtype=torch.float16,
+    )
+
+    pixel_values = data["image"]["pixel_values"]
+    num_images, _, height, width = pixel_values.shape
+    tokens_per_image = (height // 14) * (width // 14)
+    assert num_images == 8
+    assert tokens_per_image == 1024
+    assert num_images * tokens_per_image == 8192
 
 
 def test_dummy_for_tokens_empty_without_image_budget():

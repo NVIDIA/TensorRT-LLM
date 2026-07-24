@@ -694,6 +694,58 @@ def test_mm_max_tokens_per_item_is_image_only(processor_cls):
     assert demand["image"] > 0
 
 
+def test_qwen2_5_attention_metadata_capacity_uses_processor_geometry():
+    proc = _make_dummy_processor(
+        Qwen2VLInputProcessorBase,
+        patch_size=16,
+        spatial_merge_size=2,
+        min_pixels=32 * 32 * 4,
+        max_pixels=32 * 32 * 64,
+    )
+    proc.config.vision_config.window_size = 128
+
+    capacities = proc.get_mm_encoder_attention_metadata_capacity(
+        max_num_items=8, max_num_tokens=160)
+
+    # One full-attention frame has at least 4 merged cells * 4 physical
+    # patches. For 4x4 windows, the maximum window/area ratio is 2/5 (a
+    # 1x5 merged grid), or one window segment per 10 physical patches.
+    assert capacities == {
+        "full_attention": 10,
+        "window_attention": 16,
+    }
+
+
+def test_qwen2_5_rejects_runtime_grid_below_startup_geometry():
+    proc = _make_dummy_processor(
+        Qwen2VLInputProcessorBase,
+        patch_size=16,
+        spatial_merge_size=2,
+        min_pixels=32 * 32 * 4,
+        max_pixels=32 * 32 * 64,
+    )
+    proc.config.vision_config.window_size = 128
+
+    proc._validate_encoder_attention_geometry(
+        {"image": torch.tensor([[1, 4, 4]])})
+    with pytest.raises(ValueError, match="startup processor geometry"):
+        proc._validate_encoder_attention_geometry(
+            {"image": torch.tensor([[1, 2, 2]])})
+
+
+def test_qwen3_attention_capacity_keeps_long_video_safe():
+    proc = _make_dummy_processor(Qwen3VLInputProcessorBase,
+                                 spatial_merge_size=2)
+
+    capacities = proc.get_mm_encoder_attention_metadata_capacity(
+        max_num_items=1, max_num_tokens=160)
+
+    # Qwen3's video resize clamp applies to aggregate temporal pixels. A long
+    # atomic video can therefore reach the hard one-merged-cell minimum for
+    # each temporal segment, irrespective of the item-count budget.
+    assert capacities == {"attention": 40}
+
+
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
 @pytest.mark.parametrize("budget", [1024, 4096, 16384])
 def test_get_dummy_mm_data_for_tokens_saturates_budget(processor_cls, budget):
@@ -709,3 +761,19 @@ def test_get_dummy_mm_data_for_tokens_saturates_budget(processor_cls, budget):
     # Saturates: within the budget, and adding one more image would exceed it.
     assert total_patches <= budget
     assert total_patches + per_image > budget
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_get_dummy_mm_data_for_tokens_covers_many_item_boundary(processor_cls):
+    proc = _make_dummy_processor(processor_cls)
+    data = proc.get_dummy_mm_data_for_tokens(
+        max_tokens_per_modality={"image": 8192},
+        max_items_per_modality={"image": 8},
+        dtype=torch.float32,
+    )
+
+    grid = data["image"]["image_grid_thw"]
+    token_lengths = grid.prod(dim=1)
+    assert grid.shape[0] == 8
+    assert token_lengths.tolist() == [1024] * 8
+    assert int(token_lengths.sum().item()) == 8192

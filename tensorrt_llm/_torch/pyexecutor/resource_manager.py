@@ -99,6 +99,7 @@ class ResourceManagerType(enum.Enum):
     SEQ_SLOT_MANAGER = "SEQ_SLOT_MANAGER"
     SPEC_RESOURCE_MANAGER = "SPEC_RESOURCE_MANAGER"
     KV_CACHE_COMPRESSION_MANAGER = "KV_CACHE_COMPRESSION_MANAGER"
+    MM_ENCODER_CACHE_MANAGER = "MM_ENCODER_CACHE_MANAGER"
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:

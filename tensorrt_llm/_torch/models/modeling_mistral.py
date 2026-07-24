@@ -1,6 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import dataclasses
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torchvision
@@ -47,6 +50,7 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
 from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
@@ -354,6 +358,7 @@ class MistralCommonImageProcessor:
 
 class Mistral3InputProcessor(BaseMultimodalInputProcessor,
                              BaseMultimodalDummyInputsBuilder):
+    supports_mm_encoder_item_scheduling = True
 
     def __init__(
         self,
@@ -412,6 +417,40 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    def get_mm_encoder_item_metadata(
+        self,
+        _prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+    ) -> Optional[MultimodalEncoderItemMetadata]:
+        """Return Pixtral image items and physical ViT patch counts."""
+        image_data = multimodal_data.get("image")
+        if not isinstance(image_data, dict):
+            return None
+        image_sizes = image_data.get("image_sizes")
+        if image_sizes is None:
+            return None
+        patch, merge, _, _ = self._vision_geometry()
+        encoder_token_lengths = [
+            self._vit_tokens(width=int(width), height=int(height), patch=patch)
+            for height, width in image_sizes
+        ]
+        min_tokens_per_image = merge * merge
+        if any(token_length < min_tokens_per_image or token_length %
+               min_tokens_per_image for token_length in encoder_token_lengths):
+            raise ValueError(
+                "Processed Mistral image geometry must contain a nonempty "
+                f"multiple of {min_tokens_per_image} encoder tokens")
+        item_refs = [("image", item_idx)
+                     for item_idx in range(len(encoder_token_lengths))]
+        output_embedding_lengths = [
+            token_length // (merge * merge)
+            for token_length in encoder_token_lengths
+        ]
+        return MultimodalEncoderItemMetadata(
+            item_refs=item_refs,
+            encoder_token_lengths=encoder_token_lengths,
+            output_embedding_lengths=output_embedding_lengths)
 
     @torch.inference_mode()
     def call_with_text_prompt(
@@ -543,27 +582,48 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         edge = max((max_size // unit) * unit, unit)
         return {"image": self._vit_tokens(width=edge, height=edge, patch=patch)}
 
+    def get_mm_encoder_attention_metadata_capacity(
+            self, max_num_items: int,
+            max_num_tokens: int) -> Optional[Dict[str, int]]:
+        """Bound Pixtral contexts by item and physical-token budgets."""
+        _, merge, _, _ = self._vision_geometry()
+        min_tokens_per_image = merge * merge
+        return {
+            "attention":
+            max(1, min(max_num_items, max_num_tokens // min_tokens_per_image))
+        }
+
     def get_dummy_mm_data_for_tokens(
         self,
         *,
         max_tokens_per_modality: Dict[str, int],
+        max_items_per_modality: Optional[Dict[str, int]] = None,
         dtype: torch.dtype | None = None,
     ) -> Dict[str, Any]:
         """Vision implementation of the agnostic profiler entry: fill the
         ``"image"`` budget with identical worst-case images. ``num_images`` is
-        derived from the realized patch count so the batch saturates the
-        budget."""
+        derived from the realized patch count so the batch stays within the
+        token budget. ``max_items_per_modality`` selects the many-item
+        profiling boundary when provided."""
         budget = max_tokens_per_modality.get("image")
         if not budget:
             return {}
+        target_num_images = (None if max_items_per_modality is None else max(
+            1, max_items_per_modality.get("image", 1)))
+        per_image_budget = (budget if target_num_images is None else max(
+            1, budget // target_num_images))
         patch, _, _, _ = self._vision_geometry()
-        size = self.get_size_for_max_tokens(max_tokens=budget)
+        size = self.get_size_for_max_tokens(max_tokens=per_image_budget)
         tokens_per_image = max(
             1,
             self._vit_tokens(width=size["width"],
                              height=size["height"],
                              patch=patch))
+        if tokens_per_image > budget:
+            return {}
         num_images = max(1, budget // tokens_per_image)
+        if target_num_images is not None:
+            num_images = min(target_num_images, num_images)
         return self.get_dummy_mm_data_for_size(width=size["width"],
                                                height=size["height"],
                                                num_images=num_images,

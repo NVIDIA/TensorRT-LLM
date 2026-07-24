@@ -131,7 +131,7 @@ methods:
         annotation: bool
         default: False
         status: prototype
-      encoder_max_batch_size:
+      encoder_max_num_items:
         annotation: Optional[int]
         default: null
         status: prototype

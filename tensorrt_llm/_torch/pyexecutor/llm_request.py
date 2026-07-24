@@ -1,5 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Python extensions for executor requests."""
+
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 
 import torch
@@ -9,6 +14,8 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
+from tensorrt_llm.inputs.multimodal import strip_mm_encoder_inputs
+from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
@@ -45,6 +52,131 @@ REQUEST_TYPE_MAPPING = {
 # Internal request id for the attention-DP padding dummy. Generated real
 # request ids do not use 0; disaggregated global ids use a separate high range.
 ATTENTION_DP_DUMMY_REQUEST_ID = 0
+
+
+class MultimodalEncoderProgress(Enum):
+    """Python-only progress derived from request-local MM item outputs."""
+
+    PENDING = auto()
+    """No MM item of the request has an encoder output yet."""
+
+    PARTIAL = auto()
+    """Some but not all items are encoded; the request must continue on the
+    item-scheduling path until every item has an output."""
+
+    READY = auto()
+    """No further encoder work is needed: every item is encoded, a
+    precomputed embedding was supplied, or the request has no MM payload."""
+
+
+@dataclass
+class MultimodalEncoderRequestState:
+    """Per-item MM encoder bookkeeping owned by one request.
+
+    Created at admission by `initialize_multimodal_encoder_request` for
+    requests whose raw MM payloads run through the item scheduler; the
+    request's `py_mm_encoder_state` is `None` otherwise. Item slots are
+    recorded from two sources — fresh encoder outputs adopted into the
+    `MultimodalEncoderCacheManager` and manager hits — through the single
+    `record()` writer, so validation cannot diverge between them.
+
+    The state holds no storage of its own: every slot aliases a
+    manager-owned entry that the request holds until its prefill consumes
+    the embedding. Holds are released through the executor's teardown
+    funnel (`release_holds`), never by this object; held entries cannot
+    be evicted, so a recorded slot cannot regress.
+
+    The state is rank-local and never crosses a serialization boundary:
+    schedule distribution carries request/item IDs only, and every rank
+    constructs its own state at admission.
+    """
+
+    embedding_lengths: List[int]
+    """Declared embedding row count of each atomic item, in prompt order.
+    `record()` validates incoming views against these."""
+
+    outputs: List[Optional[torch.Tensor]]
+    """One slot per atomic item, in prompt order. ``None`` until the item is
+    recorded; then an alias of a held ``MultimodalEncoderCacheManager``
+    entry."""
+
+    @classmethod
+    def from_embedding_lengths(
+            cls,
+            embedding_lengths: List[int]) -> "MultimodalEncoderRequestState":
+        return cls(embedding_lengths=list(embedding_lengths),
+                   outputs=[None] * len(embedding_lengths))
+
+    def __post_init__(self) -> None:
+        if len(self.embedding_lengths) != len(self.outputs):
+            raise ValueError("MM encoder embedding lengths must have exactly "
+                             "one entry per item slot")
+
+    @property
+    def num_items(self) -> int:
+        return len(self.outputs)
+
+    @property
+    def progress(self) -> MultimodalEncoderProgress:
+        if all(output is not None for output in self.outputs):
+            return MultimodalEncoderProgress.READY
+        if any(output is not None for output in self.outputs):
+            return MultimodalEncoderProgress.PARTIAL
+        return MultimodalEncoderProgress.PENDING
+
+    def pending_item_indices(self) -> List[int]:
+        """Indices of items that still need an encoder output, prompt order."""
+        return [
+            item_idx for item_idx, output in enumerate(self.outputs)
+            if output is None
+        ]
+
+    def record(self, item_idx: int, output_view: torch.Tensor) -> None:
+        """Record one item's manager-owned output view into its slot.
+
+        ``output_view`` must come from the `MultimodalEncoderCacheManager`
+        (`adopt()` for fresh encoder outputs, `get_and_hold()` for hits) so
+        it is already held on this request's behalf; no copy happens
+        here. Raises when the view does not match the item's declared row
+        count, when the item was already recorded, or when it disagrees
+        with previously recorded items on trailing shape/dtype/device
+        (items of one request must concatenate cleanly at fuse time).
+        """
+        expected_rows = self.embedding_lengths[item_idx]
+        if output_view.shape[0] != expected_rows:
+            raise ValueError(
+                f"MM item {item_idx} produced {output_view.shape[0]} "
+                f"embeddings; expected {expected_rows}")
+        if self.outputs[item_idx] is not None:
+            raise ValueError(
+                f"MM item {item_idx} was already recorded; items are "
+                "encoded at most once per request")
+        reference = next((o for o in self.outputs if o is not None), None)
+        if reference is not None and (
+                reference.shape[1:] != output_view.shape[1:] or reference.dtype
+                != output_view.dtype or reference.device != output_view.device):
+            raise ValueError(
+                "MM encoder items for one request must have matching "
+                "output shape, dtype, and device")
+        self.outputs[item_idx] = output_view
+
+    def finalize_into(self, multimodal_data: Dict[str, Any]) -> bool:
+        """Publish the item views once every slot is recorded.
+
+        Attaches the prompt-ordered list of held item views as
+        ``multimodal_embedding`` and drops the raw pre-encoder inputs. The
+        views stay manager-owned; the per-request contiguous embedding is
+        materialized lazily inside the prefill forward
+        (`get_multimodal_embeddings`), so between encode and prefill the
+        only GPU residency is the manager's accounted entries. No-op
+        returning ``False`` while any slot is still pending.
+        """
+        if not self.outputs or any(output is None for output in self.outputs):
+            return False
+        multimodal_data["multimodal_embedding"] = list(self.outputs)
+        strip_mm_encoder_inputs(multimodal_data)
+        return True
+
 
 if TYPE_CHECKING:
     from .sampler.sampling_utils import Strategy
@@ -678,6 +810,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
         self.py_mm_item_order = kwargs.pop("py_mm_item_order", None)
+        # Per-item MM encoder state, created at admission by
+        # `initialize_multimodal_encoder_request` when raw MM payloads must
+        # run through the item scheduler; `None` otherwise (also the
+        # request-kind signal: state presence == item-scheduling request).
+        self.py_mm_encoder_state: Optional[MultimodalEncoderRequestState] = None
         encoder_input_tokens = kwargs.get("encoder_input_tokens")
         encoder_output_len = kwargs.get("encoder_output_len")
         return_encoder_output = bool(kwargs.get("return_encoder_output", False))
@@ -1066,6 +1203,92 @@ def get_multimodal_embedding_lengths(
                     f"multimodal_lengths[{item_idx}]")
 
     return multimodal_embedding_lengths
+
+
+def get_multimodal_encoder_token_lengths(
+        request: LlmRequest) -> Optional[List[int]]:
+    """Return per-item physical encoder attention-token costs.
+
+    Field-level validation happens inside
+    `get_multimodal_encoder_item_metadata`; only the request-level
+    cross-check against `multimodal_embedding_lengths` lives here.
+    """
+    item_metadata = get_multimodal_encoder_item_metadata(
+        request.py_multimodal_data)
+    if item_metadata is None:
+        return None
+    embedding_lengths = get_multimodal_embedding_lengths(request)
+    if embedding_lengths is None:
+        raise ValueError("Multimodal encoder item scheduling requires "
+                         "multimodal_embedding_lengths")
+    if item_metadata.output_embedding_lengths != embedding_lengths:
+        raise ValueError("Multimodal encoder item output lengths must match "
+                         "multimodal_embedding_lengths")
+    return item_metadata.encoder_token_lengths
+
+
+def initialize_multimodal_encoder_request(
+        request: LlmRequest,
+        max_num_tokens: int,
+        *,
+        max_output_bytes: Optional[int] = None,
+        embedding_row_bytes: int = 0) -> None:
+    """Initialize immutable request kind and mutable per-item encoder state.
+
+    Raises `ValueError` (failing only this request) when the request can
+    never execute under the startup guarantees: an atomic item larger than
+    the effective encoder token budget, or — when the encoder-output
+    storage budget is supplied — a total embedding footprint that could
+    never fit `multimodal_config.encoder_cache_max_bytes`. The latter is
+    ordinarily unreachable because prompts are bounded by `max_num_tokens`,
+    but LLM chunked prefill admits longer prompts whose full embedding must
+    stay resident across chunks.
+    """
+    mm_data = request.py_multimodal_data
+    has_raw_payload = isinstance(mm_data, dict) and any(
+        isinstance(mm_data.get(modality), dict)
+        for modality in ("image", "video", "audio"))
+    has_full_embedding = (isinstance(mm_data, dict)
+                          and mm_data.get("multimodal_embedding") is not None)
+    token_lengths = get_multimodal_encoder_token_lengths(
+        request) if has_raw_payload and not has_full_embedding else None
+    if token_lengths is not None:
+        largest = max(token_lengths, default=0)
+        if largest > max_num_tokens:
+            raise ValueError(
+                f"Multimodal item requires {largest} encoder tokens, exceeding "
+                f"the effective startup maximum {max_num_tokens}")
+
+    request.py_mm_encoder_state = None
+    if token_lengths is not None:
+        embedding_lengths = get_multimodal_embedding_lengths(request)
+        if embedding_lengths is None:
+            raise ValueError("Multimodal item scheduling requires "
+                             "multimodal_embedding_lengths")
+        if max_output_bytes is not None and embedding_row_bytes > 0:
+            total_bytes = sum(embedding_lengths) * embedding_row_bytes
+            if total_bytes > max_output_bytes:
+                raise ValueError(
+                    f"Multimodal request needs {total_bytes} bytes of "
+                    "encoder output storage but multimodal_config."
+                    f"encoder_cache_max_bytes only allows {max_output_bytes}; "
+                    "raise the cache budget to serve inputs of this size")
+        request.py_mm_encoder_state = (
+            MultimodalEncoderRequestState.from_embedding_lengths(
+                embedding_lengths))
+
+
+def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
+    """Return whether this request needs no further MM encoder work.
+
+    Readiness is purely a function of the request's encoder item state: a
+    request without one (text-only, precomputed embedding, or a model
+    outside item scheduling) needs no encoder work; otherwise the request
+    is ready once every item slot is filled (finer-grained progress lives
+    on `MultimodalEncoderRequestState.progress`).
+    """
+    state = request.py_mm_encoder_state
+    return state is None or state.progress is MultimodalEncoderProgress.READY
 
 
 def executor_request_to_llm_request(

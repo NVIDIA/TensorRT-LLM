@@ -265,6 +265,20 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     # `Qwen2VLInputProcessorBase` -- the grid math and the HF `smart_resize`
     # it defers to are identical for Qwen3-VL.
 
+    def get_mm_encoder_attention_metadata_capacity(
+        self, max_num_items: int, max_num_tokens: int
+    ) -> Optional[Dict[str, int]]:
+        """Bound temporal segments using Qwen3's hard geometry minimum.
+
+        ``max_num_items`` is intentionally not part of the bound: one atomic
+        video may contain enough temporal segments to consume the token
+        budget. Unlike Qwen2.5, Qwen3 clamps the aggregate temporal pixel
+        volume, so a long video can shrink each frame to one merged cell.
+        """
+        cfg = self.config.vision_config
+        merge_unit = cfg.spatial_merge_size * cfg.spatial_merge_size
+        return {"attention": max(1, max_num_tokens // merge_unit)}
+
     @classmethod
     def get_rope_index(
         cls,
@@ -801,22 +815,36 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
 
-    def setup_attn_metadata(self, max_num_requests: int, max_num_tokens: int) -> None:
+    def setup_attn_metadata(
+        self,
+        max_num_items: int,
+        max_num_tokens: int,
+        attention_metadata_capacity: Optional[Dict[str, int]] = None,
+    ) -> None:
         # Override the mixin default: each image / video frame is its own
         # attention segment (``seq_lens.extend([h * w] * t)`` in ``forward``),
         # so a single multi-image or video request can produce many more
-        # segments than ``max_batch_size``. The number of segments in one
-        # encoder forward is bounded by the token budget (every segment holds
-        # at least one token), NOT by the request count -- so floor the
-        # metadata's request capacity at ``max_num_tokens`` to keep the
-        # per-request buffers (prompt_lens / host_request_types / kv_lens) from
-        # overflowing when ``num_contexts`` is set to the segment count.
-        max_num_requests = max(max_num_requests, max_num_tokens)
+        # segments than ``max_num_items``. The number of segments in one
+        # encoder forward is bounded by the token budget and each segment
+        # contains at least ``spatial_merge_unit`` physical tokens. Use the
+        # processor/model capacity contract to keep the per-request buffers
+        # (prompt_lens / host_request_types / kv_lens) from overflowing when
+        # ``num_contexts`` is set to the segment count.
+        capacities = (
+            attention_metadata_capacity
+            if attention_metadata_capacity is not None
+            else self.get_encoder_attention_metadata_capacity(max_num_items, max_num_tokens)
+        )
         self.attn_metadata = self.metadata_cls(
-            max_num_requests=max_num_requests,
+            max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
+        # Pin the no-cache ``max_seq_len`` to the startup token budget once:
+        # it participates in the C++ attention-op cache key, so a stable
+        # value means one warmup-created op serves every runtime batch
+        # instead of a new cudaMalloc'd op per distinct segment length.
+        self.attn_metadata.max_seq_len = max_num_tokens
         # Pre-allocate the vision-block ``rope_position_ids`` as an ``arange``
         # sized to the encoder's ``max_num_tokens`` (engine-driven) so per-call
         # code just slices ``[:seq_len]`` instead of allocating a fresh
@@ -825,6 +853,19 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self._rope_position_ids_buffer = torch.arange(
             max_num_tokens, dtype=torch.int32, device=self.device
         )
+
+    def get_encoder_attention_metadata_capacity(
+        self, max_num_items: int, max_num_tokens: int
+    ) -> Dict[str, int]:
+        """Conservatively bound temporal segments from the token budget.
+
+        ``max_num_items`` is intentionally ignored because one atomic video
+        item can expand to multiple temporal attention segments. Qwen3's
+        processor-derived capacity intentionally resolves to this same hard
+        geometry bound because long videos can reach one merged cell per
+        segment.
+        """
+        return {"attention": max(1, max_num_tokens // self.spatial_merge_unit)}
 
     @staticmethod
     @lru_cache(maxsize=1024)
@@ -1235,6 +1276,24 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             encoder_forward_fn=self.mm_encoder.forward, multimodal_params=list(multimodal_params)
         )
         return mm_embeds[0]
+
+    @property
+    def embedding_dim(self) -> int:
+        """Width of each encoder output row (`MultimodalModelMixin` contract).
+
+        Qwen3-VL folds the deepstack feature maps into the hidden dim of
+        every embedding row, so a row is wider than the text hidden size —
+        byte accounting that assumed `hidden_size` would undercount 4x.
+        """
+        # `self.config` is narrowed to the text sub-config during init, and
+        # `deepstack_num_level` is cached there as a plain attribute (0 when
+        # the checkpoint has no deepstack).
+        text_config = getattr(self.config, "text_config", self.config)
+        return text_config.hidden_size * (1 + self.deepstack_num_level)
+
+    @property
+    def embedding_dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
 
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
         """No-op override.

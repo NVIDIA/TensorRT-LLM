@@ -32,6 +32,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
                                             MultimodalParams)
+from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
 
 from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -69,8 +70,7 @@ from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_encoder import (_ENCODER_FALLBACK_MAX_NUM_REQUESTS,
-                                          MultimodalEncoderMixin)
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
@@ -114,7 +114,22 @@ def _prepare_qwen_vl_vision_attn_metadata(
                                non_blocking=True)
     attn_metadata.cu_q_seqlens = cu_seqlens
     attn_metadata.cu_kv_seqlens = cu_seqlens
-    attn_metadata.max_seq_len = max(seq_lens)
+    # Deliberately do NOT update `max_seq_len` to this batch's maximum:
+    # it feeds the C++ attention-op cache key (mMaxSeqLen /
+    # mMaxContextLength), so a per-batch value creates and permanently
+    # caches a new AttentionOp — each with its own cudaMalloc'd workspace
+    # and semaphores — for every distinct segment length the serving
+    # traffic produces, growing GPU usage without bound. `max_seq_len` is
+    # pinned once in `setup_attn_metadata` to the encoder token budget, so
+    # every batch reuses the single op that warmup already created and
+    # profiled. Kernels read the real lengths from `seq_lens`.
+    batch_max_seq_len = max(seq_lens)
+    if batch_max_seq_len > attn_metadata.max_seq_len:
+        raise ValueError(
+            f"Encoder attention segment of {batch_max_seq_len} tokens "
+            f"exceeds the startup maximum {attn_metadata.max_seq_len}; "
+            "increase encoder_max_num_tokens or reduce the input "
+            "max_pixels")
     # The vision tower runs no-cache, context-only attention and supplies its
     # own `cu_seqlens` above, so the heavy KV-oriented `prepare()` (kv_lens /
     # prompt_lens / host_request_types setup) is unnecessary host work.
@@ -189,6 +204,7 @@ _MAX_PIXELS_TOKEN_PROBE = 1 << 31
 
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
+    supports_mm_encoder_item_scheduling = True
 
     def __init__(self,
                  model_path: str,
@@ -238,6 +254,143 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    def get_mm_encoder_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+    ) -> Optional[MultimodalEncoderItemMetadata]:
+        """Return prompt-ordered Qwen vision items and pre-merger costs."""
+        grids_by_modality: Dict[str, torch.Tensor] = {}
+        for modality, grid_key in (("image", "image_grid_thw"),
+                                   ("video", "video_grid_thw")):
+            modality_data = multimodal_data.get(modality)
+            if isinstance(modality_data,
+                          dict) and modality_data.get(grid_key) is not None:
+                grids_by_modality[modality] = modality_data[grid_key]
+        if not grids_by_modality:
+            return None
+
+        # Qwen2.5's fixed attention metadata is sized from the live
+        # processor's startup geometry. Validate the processed grids against
+        # that same contract before the request reaches the scheduler. This
+        # also covers request-local processor overrides (for example,
+        # ``min_pixels`` or ``do_resize=False``) without trying to infer their
+        # effect from the raw kwargs.
+        if getattr(self.config.vision_config, "window_size", None) is not None:
+            self._validate_encoder_attention_geometry(grids_by_modality)
+
+        config = self.config
+        image_token_id = int(config.image_token_id)
+        video_token_id = int(config.video_token_id)
+        vision_start_token_id = int(config.vision_start_token_id)
+        vision_end_token_id = int(config.vision_end_token_id)
+
+        # Bounded `list.index` scans run at C speed, unlike a per-token
+        # Python loop over the full prompt.
+        modalities: List[str] = []
+        search_start = 0
+        prompt_length = len(prompt_token_ids)
+        while search_start < prompt_length:
+            try:
+                item_start = prompt_token_ids.index(vision_start_token_id,
+                                                    search_start)
+            except ValueError:
+                break
+            try:
+                item_end = prompt_token_ids.index(vision_end_token_id,
+                                                  item_start + 1)
+            except ValueError as error:
+                raise ValueError(
+                    "Unclosed Qwen vision span in prompt token IDs") from error
+
+            image_pos = None
+            video_pos = None
+            try:
+                image_pos = prompt_token_ids.index(image_token_id,
+                                                   item_start + 1, item_end)
+            except ValueError:
+                pass
+            try:
+                video_pos = prompt_token_ids.index(video_token_id,
+                                                   item_start + 1, item_end)
+            except ValueError:
+                pass
+
+            if image_pos is not None and video_pos is not None:
+                raise ValueError(
+                    "Qwen vision span contains both image and video tokens")
+            if image_pos is not None:
+                modalities.append("image")
+            elif video_pos is not None:
+                modalities.append("video")
+            else:
+                raise ValueError(
+                    "Qwen vision span contains no image or video token")
+
+            search_start = item_end + 1
+
+        video_grids = grids_by_modality.get("video")
+        num_video_spans = modalities.count("video")
+        video_spans_per_item: List[int] = []
+        if video_grids is not None:
+            if num_video_spans == len(video_grids):
+                video_spans_per_item = [1] * len(video_grids)
+            else:
+                temporal_spans = [int(grid[0]) for grid in video_grids]
+                if num_video_spans != sum(temporal_spans):
+                    raise ValueError(
+                        "Prompt video spans do not match processed video grids")
+                video_spans_per_item = temporal_spans
+
+        canonical_modalities: List[str] = []
+        span_idx = 0
+        video_idx = 0
+        while span_idx < len(modalities):
+            modality = modalities[span_idx]
+            canonical_modalities.append(modality)
+            if modality == "image":
+                span_idx += 1
+                continue
+            if video_idx >= len(video_spans_per_item):
+                raise ValueError(
+                    "Prompt contains more video items than encoder grids")
+            spans = video_spans_per_item[video_idx]
+            if modalities[span_idx:span_idx + spans] != ["video"] * spans:
+                raise ValueError(
+                    "One original video must occupy consecutive prompt spans")
+            span_idx += spans
+            video_idx += 1
+        if video_idx != len(video_spans_per_item):
+            raise ValueError(
+                "Processed video grids contain items absent from the prompt")
+
+        local_indices = {"image": 0, "video": 0}
+        item_refs: List[Tuple[str, int]] = []
+        encoder_token_lengths: List[int] = []
+        for modality in canonical_modalities:
+            local_idx = local_indices[modality]
+            grids = grids_by_modality.get(modality)
+            if grids is None or local_idx >= len(grids):
+                raise ValueError(
+                    f"Prompt contains more {modality} items than encoder grids")
+            item_refs.append((modality, local_idx))
+            encoder_token_lengths.append(
+                int(torch.prod(grids[local_idx]).item()))
+            local_indices[modality] += 1
+
+        expected_items = sum(len(grids) for grids in grids_by_modality.values())
+        if len(item_refs) != expected_items:
+            raise ValueError("Prompt multimodal item order does not match "
+                             "processed Qwen encoder grids")
+        output_embedding_lengths = [
+            token_length // self.spatial_merge_unit
+            for token_length in encoder_token_lengths
+        ]
+        return MultimodalEncoderItemMetadata(
+            item_refs=item_refs,
+            encoder_token_lengths=encoder_token_lengths,
+            output_embedding_lengths=output_embedding_lengths)
 
     # ------------------------------------------------------------------
     # Deterministic dummy-input sizing for multimodal profiling.
@@ -433,30 +586,157 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             self._num_vision_tokens(width=size["width"], height=size["height"])
         }
 
+    def _post_merge_frame_area_bounds(self) -> Tuple[int, int]:
+        """Return startup frame-area bounds in merged-grid units.
+
+        Images and videos may use distinct HF processors. Qwen2/2.5 applies
+        the pixel clamp independently to every temporal frame, so use the
+        least restrictive minimum and greatest maximum across both.
+        """
+        cfg = self.config.vision_config
+        factor = cfg.patch_size * cfg.spatial_merge_size
+        pixel_bounds = []
+        for processor_name in ("image_processor", "video_processor"):
+            processor = getattr(self.processor, processor_name, None)
+            size = getattr(processor, "size", None)
+            if size is None:
+                continue
+            try:
+                min_pixels = int(size["shortest_edge"])
+                max_pixels = int(size["longest_edge"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if min_pixels > 0 and max_pixels >= min_pixels:
+                pixel_bounds.append((min_pixels, max_pixels))
+        if not pixel_bounds:
+            pixel_bounds.append(self._vision_pixel_bounds())
+
+        min_pixels = min(bounds[0] for bounds in pixel_bounds)
+        max_pixels = max(bounds[1] for bounds in pixel_bounds)
+        factor_area = factor * factor
+        min_area = max(1, math.ceil(min_pixels / factor_area))
+        max_area = max(min_area, max_pixels // factor_area)
+        return min_area, max_area
+
+    @staticmethod
+    @lru_cache(maxsize=32)
+    def _max_window_ratio(min_area: int, max_area: int,
+                          window_side: int) -> Tuple[int, int]:
+        """Return ``(windows, merged_tokens)`` with maximum ratio.
+
+        A resized Qwen frame has positive integer merged-grid dimensions
+        ``(h, w)`` and ``min_area <= h*w <= max_area``. Enumerating that
+        bounded domain gives a tight ratio upper bound for both images and
+        repeated video frames without assuming the runtime aspect ratio.
+        """
+        best_windows = 1
+        best_area = min_area
+        for grid_h in range(1, max_area + 1):
+            min_grid_w = max(1, math.ceil(min_area / grid_h))
+            max_grid_w = max_area // grid_h
+            for grid_w in range(min_grid_w, max_grid_w + 1):
+                area = grid_h * grid_w
+                windows = (math.ceil(grid_h / window_side) *
+                           math.ceil(grid_w / window_side))
+                if windows * best_area > best_windows * area:
+                    best_windows = windows
+                    best_area = area
+        return best_windows, best_area
+
+    def _validate_encoder_attention_geometry(
+            self, grids_by_modality: Dict[str, torch.Tensor]) -> None:
+        """Validate runtime grids against startup metadata-sizing bounds."""
+        cfg = self.config.vision_config
+        merge_size = cfg.spatial_merge_size
+        min_area, max_area = self._post_merge_frame_area_bounds()
+        window_side = max(1, cfg.window_size // merge_size // cfg.patch_size)
+        max_windows, ratio_area = self._max_window_ratio(
+            min_area, max_area, window_side)
+
+        for modality, grids in grids_by_modality.items():
+            for grid in grids:
+                _, grid_h, grid_w = (int(value) for value in grid)
+                if grid_h % merge_size or grid_w % merge_size:
+                    raise ValueError(
+                        f"Processed Qwen {modality} grid ({grid_h}, {grid_w}) "
+                        f"must be divisible by spatial_merge_size={merge_size}")
+                merged_h = grid_h // merge_size
+                merged_w = grid_w // merge_size
+                area = merged_h * merged_w
+                windows = (math.ceil(merged_h / window_side) *
+                           math.ceil(merged_w / window_side))
+                if (area < min_area
+                        or windows * ratio_area > max_windows * area):
+                    raise ValueError(
+                        f"Processed Qwen {modality} frame geometry "
+                        f"({grid_h}, {grid_w}) exceeds the encoder attention "
+                        "metadata capacity derived from the startup processor "
+                        "geometry. Configure the processor geometry at startup "
+                        "instead of lowering it per request.")
+
+    def get_mm_encoder_attention_metadata_capacity(
+            self, max_num_items: int,
+            max_num_tokens: int) -> Optional[Dict[str, int]]:
+        """Bound Qwen2.5 full/window segments using processor geometry.
+
+        ``max_num_items`` is intentionally not part of the bound: one atomic
+        video item may contain enough temporal segments to consume the whole
+        token budget.
+        """
+        cfg = self.config.vision_config
+        window_size = getattr(cfg, "window_size", None)
+        if window_size is None:
+            return None
+
+        merge_unit = cfg.spatial_merge_size * cfg.spatial_merge_size
+        min_area, max_area = self._post_merge_frame_area_bounds()
+        min_frame_tokens = merge_unit * min_area
+        full_capacity = max(1, max_num_tokens // min_frame_tokens)
+
+        window_side = max(
+            1, window_size // cfg.spatial_merge_size // cfg.patch_size)
+        windows, area = self._max_window_ratio(min_area, max_area, window_side)
+        window_capacity = max(1,
+                              max_num_tokens * windows // (merge_unit * area))
+        return {
+            "full_attention": full_capacity,
+            "window_attention": window_capacity,
+        }
+
     def get_dummy_mm_data_for_tokens(
         self,
         *,
         max_tokens_per_modality: Dict[str, int],
+        max_items_per_modality: Optional[Dict[str, int]] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
         """Vision implementation of the modality-agnostic profiler entry: for the
         ``"image"`` budget, pick the worst-case image size, fill it with identical
         copies, and materialize the encoder tensors.
 
+        ``max_items_per_modality`` selects the many-item profiling boundary.
         ``num_images`` is computed from the *realized* token count of the chosen
-        size (which the ``max_pixels`` cap may make smaller than the budget), so
-        the batch saturates the budget rather than assuming one image fills it.
+        size (which processor pixel bounds may clamp), so the batch stays within
+        both the item and token budgets.
         """
         max_tokens = max_tokens_per_modality.get("image")
         if not max_tokens:
             return {}
-        size = self.get_size_for_max_tokens(max_tokens=max_tokens)
+        target_num_images = (None if max_items_per_modality is None else max(
+            1, max_items_per_modality.get("image", 1)))
+        per_image_budget = (max_tokens if target_num_images is None else max(
+            1, max_tokens // target_num_images))
+        size = self.get_size_for_max_tokens(max_tokens=per_image_budget)
         tokens_per_image = max(
             1,
             self._num_vision_tokens(width=size["width"],
                                     height=size["height"],
                                     num_frames=size.get("num_frames", 1)))
+        if tokens_per_image > max_tokens:
+            return {}
         num_images = max(1, max_tokens // tokens_per_image)
+        if target_num_images is not None:
+            num_images = min(target_num_images, num_images)
         return self.get_dummy_mm_data_for_size(width=size["width"],
                                                height=size["height"],
                                                num_frames=size.get(
@@ -1411,30 +1691,53 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
                              None,
                              persistent=False)
 
-    def setup_attn_metadata(self, max_num_requests: int,
-                            max_num_tokens: int) -> None:
+    def setup_attn_metadata(
+        self,
+        max_num_items: int,
+        max_num_tokens: int,
+        attention_metadata_capacity: Optional[Dict[str, int]] = None,
+    ) -> None:
         # Override: Qwen2/2.5-VL uses two metadata objects (full + window
         # attention) instead of the mixin's single ``attn_metadata``.
         #
-        # Windowed attention splits each image into many attention sequences
-        # (one per window grid cell), so ``max_num_requests`` here is the
-        # **window** count, not the image count, and can far exceed the
-        # LLM-side ``max_batch_size`` that ``encoder_max_batch_size`` falls back
-        # to. Floor it at the same legacy fallback the mixin uses (see the TODO
-        # there: derive from ``encoder_max_num_tokens`` once the scheduler caps
-        # encoder forwards at it).
-        max_num_requests = max(max_num_requests,
-                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
-        kwargs = dict(max_num_requests=max_num_requests,
-                      max_num_tokens=max_num_tokens,
-                      kv_cache_manager=None)
-        self.full_attn_metadata = self.metadata_cls(**kwargs)
-        self.window_attn_metadata = self.metadata_cls(**kwargs)
+        capacities = (attention_metadata_capacity
+                      if attention_metadata_capacity is not None else
+                      self.get_encoder_attention_metadata_capacity(
+                          max_num_items, max_num_tokens))
+        kwargs = dict(max_num_tokens=max_num_tokens, kv_cache_manager=None)
+        self.full_attn_metadata = self.metadata_cls(
+            max_num_requests=capacities["full_attention"], **kwargs)
+        self.window_attn_metadata = self.metadata_cls(
+            max_num_requests=capacities["window_attention"], **kwargs)
+        # Pin the no-cache `max_seq_len` to the startup token budget once.
+        # It participates in the C++ attention-op cache key, so keeping it
+        # constant means one op (created during warmup, its workspace part
+        # of the profiled peak) serves every runtime batch instead of a new
+        # cudaMalloc'd op per distinct segment length; no encoder segment
+        # can exceed the budget (an atomic item must fit it, enforced at
+        # admission).
+        self.full_attn_metadata.max_seq_len = max_num_tokens
+        self.window_attn_metadata.max_seq_len = max_num_tokens
         # Size the vision-block ``rope_position_ids`` scratch to the encoder
         # token budget; ``forward`` grows it on the rare miss above the budget.
         self._rope_position_ids_buffer = torch.arange(max_num_tokens,
                                                       dtype=torch.int32,
                                                       device=self.device)
+
+    def get_encoder_attention_metadata_capacity(
+            self, max_num_items: int, max_num_tokens: int) -> Dict[str, int]:
+        """Conservatively bound Qwen sequences without processor geometry.
+
+        ``max_num_items`` is intentionally ignored because one atomic video
+        item can expand to multiple temporal and window-attention sequences.
+        The normal model-engine path injects the tighter live-processor bound
+        into :meth:`setup_attn_metadata` instead.
+        """
+        max_num_sequences = max(1, max_num_tokens // self.spatial_merge_unit)
+        return {
+            "full_attention": max_num_sequences,
+            "window_attention": max_num_sequences,
+        }
 
     def get_rotary_pos_emb_window_data(
         self, grid_rows: List[List[int]]

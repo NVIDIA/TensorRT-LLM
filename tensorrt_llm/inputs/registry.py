@@ -13,13 +13,14 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
+"""Input processor registry and multimodal preprocessing helpers."""
 
 import enum
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import (Any, Callable, ClassVar, Dict, List, Optional, Protocol,
-                    Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, List, NamedTuple, Optional,
+                    Protocol, Tuple, Type, TypeVar, Union)
 
 import torch
 from PIL import Image
@@ -32,7 +33,8 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
-from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
+from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
+                         _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
@@ -53,6 +55,81 @@ def _hash_mm_processor_kwargs(mm_processor_kwargs: Dict[str, Any],
     except (TypeError, ValueError, RuntimeError):
         return None
     return hasher.hexdigest()
+
+
+class MultimodalEncoderItemMetadata(NamedTuple):
+    """Prompt-ordered metadata for atomic multimodal encoder items."""
+
+    item_refs: List[Tuple[str, int]]
+    """``(modality, local index)`` per atomic item, in prompt order.
+
+    ``modality`` is ``"image"``/``"video"``/``"audio"`` and the local index
+    identifies the item within that modality's processed payload (for
+    example, its row range in ``pixel_values``), so an item can be sliced
+    out for a single-item encoder call.
+
+    TODO(TRTLLM-14477): `MultimodalParams.mm_item_order` carries the same prompt-order
+    manifest for the mixed-modality full-request encode path. Single-source
+    the two representations at the input processor so one manifest serves
+    both the item-scheduling path and the full-request interleave.
+    """
+
+    encoder_token_lengths: List[int]
+    """Physical encoder attention-token cost of each item.
+
+    This is what one encoder forward actually attends over (for example,
+    pre-merger patch tokens for Qwen ViTs) and is the unit the scheduler
+    charges against ``encoder_max_num_tokens``.
+    """
+
+    output_embedding_lengths: List[int]
+    """Embedding rows each item contributes to the LLM prompt.
+
+    Must equal the item's placeholder span in the prompt (the
+    ``multimodal_embedding_lengths`` contract); used to size and split the
+    encoder output back into per-item tensors.
+    """
+
+    def validate(self) -> None:
+        """Enforce the cross-field contract on producer-supplied metadata."""
+        if not all(isinstance(values, list) for values in self):
+            raise TypeError(
+                "Multimodal encoder item metadata fields must be lists")
+        if not all(
+                isinstance(length, int)
+                for lengths in (self.encoder_token_lengths,
+                                self.output_embedding_lengths)
+                for length in lengths):
+            raise TypeError(
+                "Multimodal encoder item lengths must contain only integers")
+        if not (len(self.item_refs) == len(self.encoder_token_lengths) == len(
+                self.output_embedding_lengths)):
+            raise ValueError(
+                "Multimodal encoder item references and lengths must align")
+        if any(length <= 0 for length in self.encoder_token_lengths):
+            raise ValueError(
+                "Multimodal encoder token lengths must be positive")
+        if any(length <= 0 for length in self.output_embedding_lengths):
+            raise ValueError(
+                "Multimodal encoder output embedding lengths must be positive")
+
+
+def get_multimodal_encoder_item_metadata(
+    multimodal_data: Optional[Dict[str, Any]],
+) -> Optional[MultimodalEncoderItemMetadata]:
+    """Return typed atomic-item metadata from Python multimodal data."""
+    if multimodal_data is None:
+        return None
+    if not isinstance(multimodal_data, dict):
+        raise TypeError("multimodal_data must be a dict")
+    metadata = multimodal_data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
+    if metadata is None:
+        return None
+    if not isinstance(metadata, MultimodalEncoderItemMetadata):
+        raise TypeError(f"{MULTIMODAL_ENCODER_ITEM_METADATA_KEY} must be a "
+                        "MultimodalEncoderItemMetadata")
+    metadata.validate()
+    return metadata
 
 
 class InputProcessor(Protocol):
@@ -176,6 +253,22 @@ class BaseMultimodalInputProcessor(ABC):
     # When True, `__call__` may route `prompt_token_ids + multi_modal_data`
     # inputs to `call_with_token_ids` instead of detokenizing upstream.
     supports_token_id_mm_expansion: ClassVar[bool] = False
+
+    # Whether this processor provides complete atomic-item metadata for the
+    # multimodal encoder runtime scheduler.
+    supports_mm_encoder_item_scheduling: ClassVar[bool] = False
+
+    def get_mm_encoder_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+    ) -> Optional[MultimodalEncoderItemMetadata]:
+        """Return item refs, physical costs, and encoder output lengths.
+
+        Models opting into runtime MM encoder scheduling override this hook.
+        The default keeps legacy multimodal processors unchanged.
+        """
+        return None
 
     def __init__(self,
                  model_path,
@@ -641,6 +734,22 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         """
         return {}
 
+    def get_mm_encoder_attention_metadata_capacity(
+            self, max_num_items: int,
+            max_num_tokens: int) -> Optional[Dict[str, int]]:
+        """Return a processor-geometry-aware encoder sequence capacity.
+
+        The keys identify model-specific attention metadata objects (for
+        example, Qwen2.5-VL has separate ``full_attention`` and
+        ``window_attention`` entries). ``None`` keeps the encoder model's
+        conservative fallback mapping. Concrete processors should return a
+        positive upper bound derived from the startup item/token budgets and
+        the same geometry constraints used to normalize runtime media.
+
+        The default intentionally ignores both inputs.
+        """
+        return None
+
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
         """Per-modality media-IO decode defaults for this model.
 
@@ -654,12 +763,17 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         self,
         *,
         max_tokens_per_modality: Dict[str, int],
+        max_items_per_modality: Optional[Dict[str, int]] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
         """Build the worst-case dummy ``multimodal_data`` per modality budget.
 
         The modality-agnostic entry the KV-cache encoder profiler calls, sizing
-        each modality to saturate its share of the token budget.
+        each modality to saturate its share of the token budget. When
+        ``max_items_per_modality`` is provided, concrete builders should spread
+        that budget across up to the requested number of equal-sized items;
+        this lets profiling cover the many-item boundary in addition to the
+        longest-item boundary.
 
         Returns the ``multimodal_data`` dict the model's encoder consumes (e.g.
         ``{"image": {"pixel_values": ..., "image_grid_thw": ...}}`` for Qwen-VL).
@@ -1306,6 +1420,47 @@ def create_input_processor_with_hash(
 
         maybe_compute_mm_embed_cumsum(prompt_token_ids, extra_processed_inputs,
                                       input_processor)
+        if extra_processed_inputs is None:
+            return prompt_token_ids, extra_processed_inputs
+
+        multimodal_data = extra_processed_inputs.get("multimodal_data")
+        if (not isinstance(multimodal_data, dict)
+                or multimodal_data.get("multimodal_embedding") is not None):
+            return prompt_token_ids, extra_processed_inputs
+
+        # `getattr` because unregistered/text-only models wrap a
+        # `DefaultInputProcessor`, which is not a
+        # `BaseMultimodalInputProcessor` and lacks the class var.
+        supports_item_scheduling = getattr(
+            input_processor, "supports_mm_encoder_item_scheduling", False)
+        has_raw_payload = any(
+            isinstance(multimodal_data.get(modality), dict)
+            for modality in ("image", "video", "audio"))
+        if not (supports_item_scheduling and has_raw_payload):
+            return prompt_token_ids, extra_processed_inputs
+
+        item_metadata = input_processor.get_mm_encoder_item_metadata(
+            prompt_token_ids, multimodal_data)
+        if not isinstance(item_metadata, MultimodalEncoderItemMetadata):
+            raise TypeError(
+                "get_mm_encoder_item_metadata() must return item metadata "
+                "(a MultimodalEncoderItemMetadata) for raw multimodal "
+                f"payloads, got {type(item_metadata).__name__}")
+        item_metadata.validate()
+
+        multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = item_metadata
+        existing_embedding_lengths = multimodal_data.get(
+            "multimodal_embedding_lengths")
+        if existing_embedding_lengths is not None:
+            if not isinstance(existing_embedding_lengths, list):
+                raise TypeError("multimodal_embedding_lengths must be a list")
+            if (existing_embedding_lengths
+                    != item_metadata.output_embedding_lengths):
+                raise ValueError(
+                    "Computed multimodal encoder embedding lengths "
+                    "do not match the existing prompt metadata")
+        multimodal_data[
+            "multimodal_embedding_lengths"] = item_metadata.output_embedding_lengths
         return prompt_token_ids, extra_processed_inputs
 
     return input_processor_wrapper
