@@ -1114,12 +1114,11 @@ def sampling_batch_spec_dec_one_model(
     # path; min_p=0 makes the min-p stage a no-op. All ops are branch-free, so this
     # stays CUDA-graph safe.
     is_greedy = temperatures <= vanilla.GREEDY_TEMPERATURE_THRESHOLD
-    greedy_tokens = logits.argmax(dim=-1)
+    top_k = torch.where(is_greedy, torch.ones_like(top_k), top_k)
+    top_p = torch.where(is_greedy, torch.ones_like(top_p), top_p)
     probs = compute_probs_from_logits(logits, temperatures, top_k, top_p, min_p)
     sampled = flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
-    # argmax yields int64; cast so torch.where preserves the sampler's dtype
-    # (flashinfer returns int32) instead of promoting the result to int64.
-    return torch.where(is_greedy, greedy_tokens.to(sampled.dtype), sampled)
+    return sampled
 
 
 @torch.compile(options={"max-autotune": True})

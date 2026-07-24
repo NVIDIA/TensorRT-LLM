@@ -134,6 +134,36 @@ def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
         validate_and_set_kv_cache_quant(model_config, "invalid_dtype")
 
 
+def _make_mixed_precision_model_config():
+    """MIXED_PRECISION checkpoint shape: global config plus per-layer entries
+    whose kv_cache_quant_algo comes only from hf_quant_config.json (None here)."""
+    return ModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION, kv_cache_quant_algo=None),
+        quant_config_dict={
+            "model.layers.0.attention": QuantConfig(quant_algo=QuantAlgo.FP8),
+            "model.layers.0.mixer.experts": QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        },
+    )
+
+
+def test_validate_and_set_kv_cache_quant_propagates_to_quant_config_dict():
+    """Explicit kv_cache_config.dtype must override the per-layer QuantConfigs
+    too, otherwise the KV pool (sized from the global config) and attention
+    modules (built from per-layer configs) disagree on KV element size."""
+    model_config = _make_mixed_precision_model_config()
+    validate_and_set_kv_cache_quant(model_config, "fp8")
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    for layer_quant_config in model_config.quant_config_dict.values():
+        assert layer_quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+def test_validate_and_set_kv_cache_quant_auto_keeps_quant_config_dict():
+    model_config = _make_mixed_precision_model_config()
+    validate_and_set_kv_cache_quant(model_config, "auto")
+    for layer_quant_config in model_config.quant_config_dict.values():
+        assert layer_quant_config.kv_cache_quant_algo is None
+
+
 def _write_safetensors_header(checkpoint_dir, tensor_dtype, tensor_shape):
     shard_name = "model-00001-of-00001.safetensors"
     header = {
