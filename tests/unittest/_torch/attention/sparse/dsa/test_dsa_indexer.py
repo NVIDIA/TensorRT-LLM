@@ -3330,3 +3330,55 @@ def test_topk_indices_buffer_cuda_graph():
     assert "indexer_topk_out_buffer" in metadata.cuda_graph_buffers.buffers, (
         "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena"
     )
+
+
+def test_kv_lens_row_reorder_threshold():
+    """_compute_kv_lens_row_reorder engages iff num_generations * next_n >= 2 * num_sms,
+    and produces a descending argsort of gen_kv_lens when active."""
+    num_sms = 16  # small synthetic value; threshold = 2 * 16 = 32 rows
+    next_n = 2  # max_draft_tokens=1 → next_n = 1 + 1 = 2
+
+    def make_mock(num_generations, kv_lens_list):
+        kv_cuda = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
+        buf = torch.zeros(64, dtype=torch.int32, device="cuda")
+        ns = SimpleNamespace(
+            enable_heuristic_topk=True,
+            use_cute_dsl_topk=True,
+            num_generations=num_generations,
+            num_sms=num_sms,
+            max_draft_tokens=next_n - 1,
+            num_contexts=0,
+            num_seqs=num_generations,
+            kv_lens_cuda=kv_cuda,
+            kv_lens_row_reorder_buffer=buf,
+            kv_lens_row_reorder=None,
+        )
+        ns._compute_kv_lens_row_reorder = (
+            lambda: DSAtrtllmAttentionMetadata._compute_kv_lens_row_reorder(ns)
+        )
+        return ns
+
+    # Fixed unsorted sequence for deterministic sort verification (len == num_sms)
+    kv_vals = [4, 1, 8, 2, 16, 3, 12, 6, 7, 9, 5, 11, 13, 10, 14, 15]
+
+    # Below threshold: 1 * 2 = 2 < 32 → None
+    md_below = make_mock(1, [1000])
+    md_below._compute_kv_lens_row_reorder()
+    assert md_below.kv_lens_row_reorder is None
+
+    # At threshold: num_sms * 2 = 32 → engages, verify descending argsort
+    md_at = make_mock(num_sms, kv_vals)
+    md_at._compute_kv_lens_row_reorder()
+    assert md_at.kv_lens_row_reorder is not None
+    reorder = md_at.kv_lens_row_reorder.cpu().tolist()
+    assert [kv_vals[i] for i in reorder] == sorted(kv_vals, reverse=True), (
+        "order_row must be a descending argsort of gen_kv_lens"
+    )
+
+    # Above threshold: (num_sms + 1) * 2 = 34 > 32 → also engages with correct sort
+    kv_vals2 = kv_vals + [100]
+    md_above = make_mock(num_sms + 1, kv_vals2)
+    md_above._compute_kv_lens_row_reorder()
+    assert md_above.kv_lens_row_reorder is not None
+    reorder2 = md_above.kv_lens_row_reorder.cpu().tolist()
+    assert [kv_vals2[i] for i in reorder2] == sorted(kv_vals2, reverse=True)

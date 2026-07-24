@@ -112,6 +112,10 @@ class UtilsSamplingParams:
         use_beam_search: Whether to use beam search.
         beam_width_in: The beam_width of a request before the sampling step.
         beam_width_out: The beam_width of a request after the sampling step.
+        top_p_decay: Per-step multiplicative decay applied to the runtime top-p.
+        top_p_min: Lower bound for the decayed runtime top-p.
+        top_p_reset_ids: Token id which, when sampled, resets the runtime top-p to
+            its initial value. A value < 0 never matches a token.
     """
 
     temperature: Optional[float]
@@ -121,6 +125,38 @@ class UtilsSamplingParams:
     min_p: Optional[float] = None
     beam_width_in: Optional[int] = None
     beam_width_out: Optional[int] = None
+    top_p_decay: Optional[float] = None
+    top_p_min: Optional[float] = None
+    top_p_reset_ids: Optional[int] = None
+
+
+@dataclass(kw_only=True)
+class TopPDecayMetadata(StrategyMetadata):
+    """Per-group runtime top-p override for Top-P Decay (attached to top_p /
+    top_k_top_p groups via the ``StrategyMetadata`` mechanism).
+
+    ``slots`` maps each per-step group row to its sequence slot; the decayed
+    per-row top-p is gathered on-device from the per-slot ``runtime_top_p``
+    store, gated by ``is_decay_slot`` (non-decay rows keep their static top-p).
+    Consumed by the TopP*/TopKTopP* strategy impls in ``sample()``. See
+    ``TorchSampler.TopPDecayStore`` for the feature-level semantics.
+    """
+
+    slots: torch.Tensor
+    """Per-step group rows' sequence slots (int64, device)."""
+    runtime_top_p: torch.Tensor
+    """Per-slot runtime (decayed) top-p store (float32, device)."""
+    is_decay_slot: torch.Tensor
+    """Per-slot decay-active gate (bool, device)."""
+
+
+def top_p_decay_active(params: UtilsSamplingParams) -> bool:
+    """Whether dynamic top-p decay is active for a request.
+
+    Delegates to the single-source predicate on SamplingParams; note that
+    ``top_p_min`` / ``top_p_reset_ids`` alone do not activate dynamic behavior.
+    """
+    return SamplingParams.params_imply_top_p_decay_active(params.top_p_decay)
 
 
 def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -> Strategy:
@@ -132,12 +168,16 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     top_k = params.top_k
     min_p = params.min_p
 
+    # The greedy verdict (including the top-p-decay override of the implicit
+    # all-unset greedy default, and explicit greedy controls winning over decay)
+    # is single-sourced in SamplingParams.params_imply_greedy_decoding.
     if SamplingParams.params_imply_greedy_decoding(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
         use_beam_search=use_beam_search,
         min_p=min_p,
+        top_p_decay=params.top_p_decay,
     ):
         return GREEDY
 
@@ -161,7 +201,10 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     assert top_k > 1, "non-greedy sampling requires valid top_k"
     need_top_k = top_k < vocab_size
     assert top_p > 0, "non-greedy sampling requires valid top_p"
-    need_top_p = top_p < 1
+    # A decay-active request must go through a top-p-capable path even when its
+    # initial top_p is 1.0, so the runtime top-p (sourced per-row at sample time)
+    # can shrink the nucleus on later steps.
+    need_top_p = top_p < 1 or top_p_decay_active(params)
 
     # Disabled top_k is 0 ("keep all"), not vocab_size, which can be the
     # fast-greedy probe (2**31) and overflow the int32 tensor; _compute_probs
@@ -392,6 +435,34 @@ class _StrategyImpls:
             new_tokens = cls._sample_from_probs(probs, generator=generator)
             return new_tokens, probs
 
+    class TopPDecayMixin:
+        """Mixed into the TopP*/TopKTopP* impls (the owners of a per-row
+        ``_top_p`` tensor) to consume ``TopPDecayMetadata``."""
+
+        _top_p: torch.Tensor
+
+        def _maybe_apply_top_p_decay(self, group_metadata: Optional[StrategyMetadata]) -> None:
+            """Override the per-row static top-p with the decayed runtime top-p.
+
+            Only decay-active rows (per the on-device ``is_decay_slot`` gate) are
+            overridden, so a group mixing top-p-decay and plain top-p requests
+            keeps each row's correct value. The overridden ``self._top_p`` tensor
+            then feeds both sampling and ``top_p_renorm_probs_op`` (so processed
+            logprobs match). Fused via torch.compile (gather + gate + select).
+            """
+            if not isinstance(group_metadata, TopPDecayMetadata):
+                return
+            assert self._top_p.shape == group_metadata.slots.shape, (
+                self._top_p.shape,
+                group_metadata.slots.shape,
+            )
+            self._top_p = Fusions.top_p_decay_gather(
+                runtime_top_p=group_metadata.runtime_top_p,
+                is_decay_slot=group_metadata.is_decay_slot,
+                static_top_p=self._top_p,
+                slots=group_metadata.slots,
+            )
+
     class StrategyImplWithProbs(StrategyImpl):
         @override
         @classmethod
@@ -420,7 +491,7 @@ class _StrategyImpls:
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             return self._sample_greedy_with_probs(logits, group_logit_indices=group_logit_indices)
 
-    class TopKTopPWithProbs(StrategyImplWithProbs):
+    class TopKTopPWithProbs(TopPDecayMixin, StrategyImplWithProbs):
         def __init__(self, top_k: torch.Tensor, top_p: torch.Tensor, temperature: torch.Tensor):
             self._top_k = top_k
             self._top_p = top_p
@@ -446,6 +517,7 @@ class _StrategyImpls:
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            self._maybe_apply_top_p_decay(group_metadata)
             return self._sample_with_probs(
                 logits,
                 group_logit_indices=group_logit_indices,
@@ -490,7 +562,7 @@ class _StrategyImpls:
                 generator=generator,
             )
 
-    class TopPWithProbs(StrategyImplWithProbs):
+    class TopPWithProbs(TopPDecayMixin, StrategyImplWithProbs):
         def __init__(self, top_p: torch.Tensor, temperature: torch.Tensor):
             self._top_p = top_p
             self._temperature = temperature
@@ -514,6 +586,7 @@ class _StrategyImpls:
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            self._maybe_apply_top_p_decay(group_metadata)
             return self._sample_with_probs(
                 logits,
                 group_logit_indices=group_logit_indices,
@@ -628,7 +701,7 @@ class _StrategyImpls:
                 logits = logits[group_logit_indices]
             return torch.argmax(logits, dim=-1), None
 
-    class TopKTopPSampleOnly(StrategyImplSampleOnly):
+    class TopKTopPSampleOnly(TopPDecayMixin, StrategyImplSampleOnly):
         def __init__(self, top_k: torch.Tensor, top_p: torch.Tensor, temperature: torch.Tensor):
             self._top_k = top_k
             self._top_p = top_p
@@ -654,6 +727,7 @@ class _StrategyImpls:
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            self._maybe_apply_top_p_decay(group_metadata)
             logits = self._prepare_logits_with_temperature(
                 logits, group_logit_indices, self._temperature
             )
@@ -699,7 +773,7 @@ class _StrategyImpls:
                 check_nan=self._flashinfer_check_nans(probs),
             ), None
 
-    class TopPSampleOnly(StrategyImplSampleOnly):
+    class TopPSampleOnly(TopPDecayMixin, StrategyImplSampleOnly):
         def __init__(self, top_p: torch.Tensor, temperature: torch.Tensor):
             self._top_p = top_p
             self._temperature = temperature
@@ -723,6 +797,7 @@ class _StrategyImpls:
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            self._maybe_apply_top_p_decay(group_metadata)
             probs = self._prepare_probs_with_temperature(
                 logits, group_logit_indices, self._temperature
             )
@@ -902,6 +977,8 @@ class FlashInferGroupedStrategySampler:
         match strategy_key:
             case ("beam_search", _, _):
                 return BeamSearchMetadata
+            case "top_p" | "top_k_top_p":
+                return TopPDecayMetadata
             case _:
                 return None
 

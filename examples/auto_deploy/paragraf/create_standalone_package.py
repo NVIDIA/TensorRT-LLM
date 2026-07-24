@@ -555,14 +555,6 @@ def _rewrite_imports_in_file(
             ensure_imports(trtllm_import.start(), "os", "pytest")
             insert_optional_trtllm_guard()
 
-    if optional_trtllm_guards:
-        # The standalone package can rely on the installed trtllm-bench entrypoint,
-        # but it does not ship TensorRT-LLM's source-tree benchmarks/ directory.
-        content = content.replace(
-            '    script_dir = Path(root_dir, "benchmarks")\n',
-            "    script_dir = Path(temp_dir)\n",
-        )
-
     replacements = sum(1 for a, b in zip(original, content) if a != b)  # rough count
     if content != original:
         with open(filepath, "w") as f:
