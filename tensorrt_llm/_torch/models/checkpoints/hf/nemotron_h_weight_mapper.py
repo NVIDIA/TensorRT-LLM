@@ -42,7 +42,10 @@ class NemotronHHfWeightMapper(HfWeightMapper):
             w = torch.concat(w).contiguous()
             return w
 
-        is_nvfp4 = self.config.quant_config.quant_algo == "NVFP4"
+        # Covers the whole NVFP4 family (NVFP4, W4A16_NVFP4, W4A8_NVFP4_FP8, …);
+        # a bare ``== "NVFP4"`` check misses W4A16_NVFP4, leaving the mamba
+        # in_proj block scales unsplit while the weight is TP-split -> garbage.
+        is_nvfp4 = self.config.quant_config.quant_mode.has_nvfp4()
         n_groups = config.n_groups
         d_state = config.ssm_state_size
         nheads = config.mamba_num_heads
