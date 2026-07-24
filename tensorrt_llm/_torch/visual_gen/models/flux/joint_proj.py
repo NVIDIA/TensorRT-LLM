@@ -168,6 +168,7 @@ class FluxJointQKVMLPProj(nn.Module):
         quant_config=None,
         skip_create_weights_in_init: bool = False,
         force_dynamic_quantization: bool = False,
+        use_cute_dsl_blockscaling_mm: bool = False,
         mapping: Optional[Mapping] = None,
         override_qkv_sharding=None,
     ):
@@ -255,6 +256,7 @@ class FluxJointQKVMLPProj(nn.Module):
                 mapping=mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 reduce_output=False,
+                use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
                 override_tp_sharding={
                     "gate": (local_mlp_hidden_start, local_mlp_hidden_end),
                     "up": (local_mlp_hidden_start, local_mlp_hidden_end),
