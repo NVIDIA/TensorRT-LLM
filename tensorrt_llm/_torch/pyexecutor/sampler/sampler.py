@@ -4090,7 +4090,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return True
         return False
 
-    @nvtx_range("maybe_create_beam_histories")
+    @nvtx_range("_prepare_cba_group_host")
     def _prepare_cba_group_host(
         self,
         requests: list[LlmRequest],

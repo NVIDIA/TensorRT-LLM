@@ -506,6 +506,10 @@ def _cba_step_math(
     beam_search_sampling_batch_cba), written without data-dependent shapes so
     it can be fused by torch.compile: everything between candidate selection
     and the store writebacks. Pure — all mutations happen in the caller.
+
+    NB: this function is torch.compile'd (see ``_cba_step_compiled``). Keep it
+    free of data-dependent shapes and of in-place ops on the input tensors
+    (use out-of-place ``masked_fill`` etc.), so tracing stays fullgraph-clean.
     """
     batch_size, num_candidates = cand_cum.shape
     neg_inf = float("-inf")
@@ -772,9 +776,8 @@ def beam_search_sampling_batch_cba(
     # compile latency would dominate, and the fusion only pays off on CUDA.
     step_fn = _cba_step_compiled if logits.is_cuda else _cba_step_math
     if logits.is_cuda:
-        for t in (cand_cum, cand_pred, cand_tok, slots, args.seq_lens, exponent):
+        for t in (cand_cum, cand_pred, cand_tok, slots, args.seq_lens, exponent, snap_arange):
             torch._dynamo.mark_dynamic(t, 0)
-        torch._dynamo.mark_dynamic(snap_arange, 0)
     (
         slot_pred,
         slot_tok,

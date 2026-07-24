@@ -151,7 +151,10 @@ Parameter Configuration:
 - `beam_search_diversity_rate`: Encourages beams to diverge from each other. During beam
   expansion, `diversity_rate * source_beam_index` is added to each candidate's ranking score,
   boosting candidates that expand from lower-ranked beams so that the selected beams do not all
-  descend from the single strongest beam. The default (`0.0`) disables the adjustment.
+  descend from the single strongest beam. Here `source_beam_index` is the rank of the beam a
+  candidate expands from among the current step's input beams, ordered by their cumulative
+  log-probability (`0` for the strongest beam, `1` for the next, and so on). The default (`0.0`)
+  disables the adjustment.
 - `early_stopping`: Controls when beam search stops. With the default (`1`), generation ends as
   soon as `best_of` finished candidates exist. The exhaustive modes (`0`, and other values for
   intermediate heuristics) keep a pool of finished candidates and continue searching while an
