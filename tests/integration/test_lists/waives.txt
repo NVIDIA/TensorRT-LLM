@@ -140,7 +140,6 @@ examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_gold
 examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden SKIP (https://nvbugs/6437341)
 examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_trtllm_backend SKIP (https://nvbugs/6463822)
 full:A100/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-CUTLASS] SKIP (https://nvbugs/6479837)
-full:A100X/llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_mtp SKIP (https://nvbugs/6287561)
 full:B200/accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_fp8] SKIP (https://nvbugs/6327718)
 full:B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True-enable_chunked_prefill=True-v2_kv_cache=False] SKIP (https://nvbugs/6422343)
 full:B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True-enable_chunked_prefill=True-v2_kv_cache=True] SKIP (https://nvbugs/6422343)
