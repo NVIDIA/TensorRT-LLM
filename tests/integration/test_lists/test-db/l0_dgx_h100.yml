@@ -168,12 +168,14 @@ l0_dgx_h100:
       orchestrator: mpi
   tests:
   # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
-  # Only CUTLASS backend runs on H100 (SM90). TRTLLM/CUTEDSL/DEEPGEMM require SM100+.
+  # Only CUTLASS and MARLIN backends run on H100 (SM90). TRTLLM/CUTEDSL/DEEPGEMM require SM100+.
   # --- CUTLASS ---
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8_BLOCK_SCALES"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A16_MXFP4"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_AWQ"
+  # --- MARLIN (SM90-only; focused DEP + ALLGATHER x NVFP4 matrix) ---
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MARLIN"
   # ------------- MoE: test_multi_gpu_eplb ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
 - condition:

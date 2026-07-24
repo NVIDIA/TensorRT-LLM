@@ -196,6 +196,8 @@ void initBindings(nb::module_& m)
         .def_prop_ro("kv_cache_transfer_time_ms", &GenLlmReq::getKvCacheTransferTimeMS)
         .def_prop_ro("kv_cache_transfer_start", &GenLlmReq::getKvCacheTransferStart)
         .def_prop_ro("kv_cache_transfer_end", &GenLlmReq::getKvCacheTransferEnd)
+        .def("get_kv_cache_transfer_start", &GenLlmReq::getKvCacheTransferStart)
+        .def("get_kv_cache_transfer_end", &GenLlmReq::getKvCacheTransferEnd)
         .def_prop_ro("kv_cache_size", &GenLlmReq::getKvCacheSize)
         .def("set_kv_cache_transfer_start", &GenLlmReq::setKvCacheTransferStart, nb::arg("time"))
         .def("set_kv_cache_transfer_end", &GenLlmReq::setKvCacheTransferEnd, nb::arg("time"))
@@ -479,7 +481,11 @@ void initBindings(nb::module_& m)
         .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
         .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, nb::arg("iter_counter"))
         .def("remove_lora_tensors", &tb::LlmRequest::removeLoraTensors)
-        .def_rw_static("global_steady_clock_offset", &tb::LlmRequest::sGlobalSteadyClockOffset);
+        // Bind to the single storage owned by libtensorrt_llm.so (reached through
+        // globalSteadyClockOffset()) instead of an inline-static member, so the
+        // offset is shared with the native library rather than living in this
+        // module's separate copy.
+        .def_rw_static("global_steady_clock_offset", &tb::globalSteadyClockOffset());
 
     nb::class_<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(nb::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), nb::arg("max_num_slots"),
