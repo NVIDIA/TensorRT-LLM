@@ -36,6 +36,12 @@ from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
 # (the parent test module this file imports from).
 pytestmark = pytest.mark.threadleak(enabled=False)
 
+# Ray-backed LLM teardown only fires from RayExecutor.shutdown(), which runs
+# after pytest-threadleak's per-test snapshot — see the matching docstring in
+# tests/unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py
+# (the parent test module this file imports from).
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 @pytest.fixture(autouse=True)
 def release_shared_cuda_memory():
