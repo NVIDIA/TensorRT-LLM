@@ -47,7 +47,6 @@ ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-a
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 ENABLE_UPLOAD_TEST_RESULTS = params.enableUploadTestResults != null ? params.enableUploadTestResults : true
-ENABLE_S3_ECHO_STDOUT = params.enableS3EchoStdout != null ? params.enableS3EchoStdout : false
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -1480,15 +1479,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 ]
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     extraArgs += [
-                        "-s",
+                        "--capture=fd",
                         "--s3-upload-path=${uploadPath}/${stageName}",
+                        "--s3-upload-mode=deferred",
                     ]
-                    if (ENABLE_S3_ECHO_STDOUT) {
-                        extraArgs += [
-                            "--s3-echo-stdout",
-                            "--s3-capture-mode=timestamped",
-                        ]
-                    }
                 }
                 def pytestCommand = getPytestBaseCommandLine(
                     llmSrcNode,
@@ -4012,15 +4006,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def extraArgs = [*clusterDurationsArgs]
         if (ENABLE_UPLOAD_TEST_RESULTS) {
             extraArgs += [
-                "-s",
+                "--capture=fd",
                 "--s3-upload-path=${uploadPath}/${stageName}",
+                "--s3-upload-mode=deferred",
             ]
-            if (ENABLE_S3_ECHO_STDOUT) {
-                extraArgs += [
-                    "--s3-echo-stdout",
-                    "--s3-capture-mode=timestamped",
-                ]
-            }
         }
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,

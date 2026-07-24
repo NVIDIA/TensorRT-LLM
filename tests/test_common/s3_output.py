@@ -13,942 +13,720 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
-import io
+import fcntl
+import hashlib
+import json
 import logging
 import os
+import posixpath
 import re
+import socket
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
-from datetime import datetime
+from pathlib import Path
 
 import pytest
-from _pytest.logging import catching_logs
 
 logger = logging.getLogger(__name__)
+
+_CAPTURE_SECTION_PATTERN = re.compile(r"^Captured (stdout|stderr|log)(?: (setup|call|teardown))?$")
+_STREAM_FILENAMES = {
+    "stdout": "stdout",
+    "stderr": "stderr",
+    "log": "logging",
+}
+_SPOOL_ROOT_NAME = ".s3-spool"
+_SPOOL_CONFIG_NAME = "upload-config.json"
+_SPOOL_WRITE_CHARS = 1024 * 1024
+_FAILED_OUTPUT_MAX_LINES = 200
+_FAILED_OUTPUT_MAX_BYTES = 65536
+
+
+def _spool_root(output_path: str) -> Path:
+    output_root = Path(os.path.abspath(output_path))
+    return output_root.parent / f"{_SPOOL_ROOT_NAME}-{output_root.name}"
 
 
 class EnvDefault(argparse.Action):
     def __init__(self, envvar, required=True, default=None, **kwargs):
-        if envvar:
-            if envvar in os.environ:
-                default = os.environ[envvar]
+        if envvar and envvar in os.environ:
+            default = os.environ[envvar]
         if required and default:
             required = False
-        super(EnvDefault, self).__init__(default=default, required=required, **kwargs)
+        super().__init__(default=default, required=required, **kwargs)
 
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, values)
 
 
 @dataclass(frozen=True)
-class FileSlice:
-    path: str
-    offset: int
-    size: int
+class PendingUpload:
+    source_path: str
+    object_key: str
+    test_name: str
+    filename: str
 
 
-class FileSliceReader(io.RawIOBase):
-    def __init__(self, file_slice):
-        self._slice = file_slice
-        self._file = open(file_slice.path, "rb", buffering=0)
-        self._position = 0
-        self._file.seek(file_slice.offset)
+@dataclass(frozen=True)
+class CapturedSection:
+    content: str
+    attempt: int
 
-    def readable(self):
+
+@dataclass
+class CapturedStream:
+    test_name: str
+    filename: str
+    source_path: str
+    filesize: int = 0
+    message: str = ""
+    force_output: bool = False
+    finalized: bool = False
+
+
+def _create_s3_client(
+    endpoint_url: str,
+    aws_access_key_id: str,
+    aws_secret_access_key: str,
+):
+    try:
+        import boto3
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("boto3 is required to upload test logs") from exc
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+    )
+
+
+def _process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _remove_empty_parents(path: Path, stop: Path) -> None:
+    parent = path.parent
+    while parent != stop.parent:
+        try:
+            parent.rmdir()
+        except OSError:
+            return
+        if parent == stop:
+            return
+        parent = parent.parent
+
+
+def drain_pending_uploads(output_path: str, secret_key: str | None = None) -> bool:
+    """Upload files left by pytest processes that exited before session finish."""
+    spool_root = _spool_root(output_path)
+    if not spool_root.exists():
         return True
 
-    def seekable(self):
+    config_paths = list(spool_root.rglob(_SPOOL_CONFIG_NAME))
+    if not config_paths:
         return True
 
-    def tell(self):
-        return self._position
-
-    def seek(self, offset, whence=os.SEEK_SET):
-        if whence == os.SEEK_SET:
-            position = offset
-        elif whence == os.SEEK_CUR:
-            position = self._position + offset
-        elif whence == os.SEEK_END:
-            position = self._slice.size + offset
-        else:
-            raise ValueError(f"Unsupported whence: {whence}")
-        if position < 0:
-            raise ValueError("Negative seek position")
-        self._file.seek(self._slice.offset + position)
-        self._position = position
-        return position
-
-    def readinto(self, buffer):
-        remaining = self._slice.size - self._position
-        if remaining <= 0:
-            return 0
-        view = memoryview(buffer)[: min(len(buffer), remaining)]
-        read_size = self._file.readinto(view)
-        if read_size is None:
-            return 0
-        self._position += read_size
-        return read_size
-
-    def close(self):
-        if not self.closed:
-            self._file.close()
-        super().close()
-
-
-class SessionFDSpool:
-    def __init__(self, target_fd, path):
-        self.target_fd = target_fd
-        self.path = path
-        self._saved_fd = None
-        self._spool_fd = None
-        self._attached = False
-
-    def _flush_target_stream(self):
-        stream = sys.stdout if self.target_fd == 1 else sys.stderr
-        try:
-            stream.flush()
-        except (OSError, ValueError):
-            pass
-
-    def start(self):
-        self._flush_target_stream()
-        self._saved_fd = os.dup(self.target_fd)
-        try:
-            self._spool_fd = os.open(
-                self.path,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND,
-                0o600,
-            )
-            os.dup2(self._spool_fd, self.target_fd, inheritable=True)
-            self._attached = True
-        except OSError:
-            if self._spool_fd is not None:
-                os.close(self._spool_fd)
-                self._spool_fd = None
-            os.close(self._saved_fd)
-            self._saved_fd = None
-            raise
-
-    def suspend_parent(self):
-        if not self._attached:
-            return
-        self._flush_target_stream()
-        os.dup2(self._saved_fd, self.target_fd, inheritable=True)
-        self._attached = False
-
-    def resume_parent(self):
-        if self._attached or self._spool_fd is None:
-            return
-        self._flush_target_stream()
-        os.dup2(self._spool_fd, self.target_fd, inheritable=True)
-        self._attached = True
-
-    def snapshot(self):
-        self._flush_target_stream()
-        return os.fstat(self._spool_fd).st_size
-
-    def stop(self):
-        self.suspend_parent()
-        if self._spool_fd is not None:
-            os.close(self._spool_fd)
-            self._spool_fd = None
-        if self._saved_fd is not None:
-            os.close(self._saved_fd)
-            self._saved_fd = None
-
-
-class SessionCapture:
-    def __init__(self, output_path):
-        spool_dir = os.path.join(output_path, ".s3-spool")
-        os.makedirs(spool_dir, exist_ok=True)
-        suffix = f"{os.getpid()}-{time.time_ns()}"
-        self._spools = {
-            "stdout.log": SessionFDSpool(1, os.path.join(spool_dir, f"stdout-{suffix}.log")),
-            "stderr.log": SessionFDSpool(2, os.path.join(spool_dir, f"stderr-{suffix}.log")),
-        }
-        self._suspend_depth = 0
-        self._started = False
-
-    def start(self):
-        started = []
-        try:
-            for spool in self._spools.values():
-                spool.start()
-                started.append(spool)
-        except Exception:
-            for spool in reversed(started):
-                spool.stop()
-            raise
-        self._started = True
-
-    def snapshot(self):
-        return {filename: spool.snapshot() for filename, spool in self._spools.items()}
-
-    def slices_since(self, offsets):
-        current = self.snapshot()
-        return {
-            filename: FileSlice(
-                path=spool.path,
-                offset=offsets[filename],
-                size=max(0, current[filename] - offsets[filename]),
-            )
-            for filename, spool in self._spools.items()
-        }
-
-    def suspend_parent(self):
-        if not self._started:
-            return
-        self._suspend_depth += 1
-        if self._suspend_depth == 1:
-            for spool in self._spools.values():
-                spool.suspend_parent()
-
-    def resume_parent(self):
-        if not self._started or self._suspend_depth == 0:
-            return
-        self._suspend_depth -= 1
-        if self._suspend_depth == 0:
-            for spool in self._spools.values():
-                spool.resume_parent()
-
-    def stop(self):
-        if not self._started:
-            return
-        self._suspend_depth = 0
-        for spool in self._spools.values():
-            spool.stop()
-        self._started = False
-
-    def remove_files(self):
-        for spool in self._spools.values():
-            try:
-                os.remove(spool.path)
-            except FileNotFoundError:
-                pass
-        try:
-            os.rmdir(os.path.dirname(next(iter(self._spools.values())).path))
-        except OSError:
-            pass
-
-
-class FDRedirector:
-    def __init__(
-        self,
-        target_fd,
-        log_file_path,
-        echo_to_original=False,
-        timestamp_format="%(asctime)s.%(msecs)03d",
-        date_format="%Y-%m-%d %H:%M:%S",
-    ):
-        self.target_fd = target_fd
-        self.log_file_path = log_file_path
-        self.echo_to_original = echo_to_original
-        self.timestamp_format = timestamp_format
-        self.date_format = date_format
-
-        self.saved_fd = None
-        self._reader_thread = None
-
-    def _flush_target_stream(self):
-        streams = []
-        if self.target_fd == 1:
-            streams = [sys.stdout]
-        elif self.target_fd == 2:
-            streams = [sys.stderr]
-        else:
-            streams = [sys.stdout, sys.stderr]
-
-        for stream in streams:
-            try:
-                stream.flush()
-            except Exception:
-                pass
-
-    def __enter__(self):
-        # Drain any pending buffered writes to the current target fd before we
-        # redirect it. sys.stdout/sys.stderr are block-buffered when connected
-        # to a pipe; without this, late flushes (e.g. of a previous test's
-        # post-teardown print) would land in this test's file after we swap
-        # the underlying fd.
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-            except Exception:
-                pass
-
-        log_file = open(self.log_file_path, "w", encoding="utf-8", buffering=1)
-        pipe_read, pipe_write = os.pipe()
-        self.saved_fd = os.dup(self.target_fd)
-        os.dup2(pipe_write, self.target_fd)
-        os.close(pipe_write)
-
-        pipe_stream = os.fdopen(pipe_read, "r", encoding="utf-8", errors="replace", buffering=1)
-
-        # Child processes may inherit the redirected fd and keep the pipe open
-        # after capture is restored. Do not let that block pytest shutdown.
-        self._reader_thread = threading.Thread(
-            target=self._reader_loop, args=(pipe_stream, log_file), daemon=True
-        )
-        self._reader_thread.start()
-
-        return self
-
-    def _reader_loop(self, pipe_stream, log_file):
-        need_timestamp = True
-
-        try:
-            while True:
-                chunk = pipe_stream.read(4096)
-                if not chunk:
-                    break
-
-                # Build the timestamp prefix once per chunk and reuse it for every
-                # line in that chunk. The previous implementation walked the chunk
-                # char-by-char in Python, which was the bottleneck under high-volume
-                # output (e.g. tqdm progress bars, repetitive kernel info logs).
-                # Within a single 4 KiB chunk the timestamp would have been
-                # identical anyway (the reader processes the chunk under the GIL),
-                # so reusing one prefix is semantics-preserving.
-                now = datetime.now()
-                ts_str = self.timestamp_format % {
-                    "asctime": now.strftime(self.date_format),
-                    "msecs": now.microsecond // 1000,
-                }
-                prefix = f"[{ts_str}] "
-
-                parts = []
-                for line in chunk.splitlines(keepends=True):
-                    if need_timestamp:
-                        parts.append(prefix)
-                    parts.append(line)
-                    need_timestamp = line.endswith("\n")
-                log_file.write("".join(parts))
-                log_file.flush()
-
-                if self.echo_to_original and self.saved_fd is not None:
-                    ret = os.write(self.saved_fd, chunk.encode("utf-8"))
-                    if ret != len(chunk):
-                        logger.warning(
-                            f"Partial write to original FD {self.target_fd}: {ret} != {len(chunk)}"
-                        )
-
-        except Exception as e:
-            logger.error(f"Error reading from pipe: {e}")
-        finally:
-            log_file.close()
-            pipe_stream.close()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.saved_fd is not None:
-            self._flush_target_stream()
-            # Restore the original fd binding. This also closes the previous
-            # binding (our pipe's write end), so the reader thread will see
-            # EOF and finish draining.
-            os.dup2(self.saved_fd, self.target_fd)
-            # NB: keep self.saved_fd valid until the reader thread joins;
-            # the reader may still drain pending bytes and want to echo them
-            # through saved_fd. Closing it here would race with that write.
-
-        if self._reader_thread:
-            self._reader_thread.join(timeout=5.0)
-            if self._reader_thread.is_alive():
-                logger.warning(f"Reader thread for FD {self.target_fd} did not exit in time")
-
-        if self.saved_fd is not None:
-            os.close(self.saved_fd)
-            self.saved_fd = None
-
+    secret_key = secret_key or os.environ.get("S3_SECRET_KEY")
+    if not secret_key:
+        logger.warning("Cannot drain S3 test logs without S3_SECRET_KEY")
         return False
 
+    success = True
+    current_host = socket.gethostname()
+    for config_path in config_paths:
+        try:
+            with config_path.open("r", encoding="utf-8") as config_file:
+                try:
+                    fcntl.flock(config_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
 
-class DirectFDRedirector:
-    def __init__(self, target_fd, log_file_path):
-        self.target_fd = target_fd
-        self.log_file_path = log_file_path
+                config = json.load(config_file)
+                owner_host = config.get("hostname")
+                owner_pid = int(config.get("pid", 0))
+                if owner_host != current_host or (owner_pid and _process_is_alive(owner_pid)):
+                    continue
 
-        self.saved_fd = None
-        self._log_file = None
+                spool_dir = config_path.parent
+                source_paths = [
+                    path for path in spool_dir.rglob("*") if path.is_file() and path != config_path
+                ]
+                config_success = True
+                if source_paths:
+                    client = _create_s3_client(
+                        config["endpoint_url"],
+                        config["aws_access_key_id"],
+                        secret_key,
+                    )
+                    uploads = {}
+                    worker_count = min(
+                        max(1, int(config.get("upload_workers", 8))),
+                        len(source_paths),
+                    )
+                    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                        for source_path in source_paths:
+                            relative_path = source_path.relative_to(spool_dir)
+                            object_key = posixpath.join(config["upload_path"], *relative_path.parts)
+                            future = executor.submit(
+                                client.upload_file,
+                                str(source_path),
+                                config["bucket"],
+                                object_key,
+                                ExtraArgs={"ContentType": "text/plain"},
+                            )
+                            uploads[future] = (source_path, object_key)
 
-    def _flush_target_stream(self):
-        streams = []
-        if self.target_fd == 1:
-            streams = [sys.stdout]
-        elif self.target_fd == 2:
-            streams = [sys.stderr]
-        else:
-            streams = [sys.stdout, sys.stderr]
+                        for future in as_completed(uploads):
+                            source_path, object_key = uploads[future]
+                            try:
+                                future.result()
+                            except Exception as exc:
+                                config_success = False
+                                success = False
+                                logger.warning(
+                                    "Failed to drain S3 test log %s to %s: %s",
+                                    source_path,
+                                    object_key,
+                                    exc,
+                                )
+                            else:
+                                source_path.unlink(missing_ok=True)
+                                _remove_empty_parents(source_path, spool_dir)
 
-        for stream in streams:
-            try:
-                stream.flush()
-            except Exception:
-                pass
+                if config_success:
+                    config_path.unlink(missing_ok=True)
+                    _remove_empty_parents(config_path, spool_dir)
+                    try:
+                        spool_dir.parent.rmdir()
+                    except OSError:
+                        pass
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            success = False
+            logger.warning("Failed to read S3 spool config %s: %s", config_path, exc)
 
-    def __enter__(self):
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-            except Exception:
-                pass
-
-        self._log_file = open(self.log_file_path, "w", encoding="utf-8", buffering=1)
-        self.saved_fd = os.dup(self.target_fd)
-        os.dup2(self._log_file.fileno(), self.target_fd)
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._flush_target_stream()
-
-        if self.saved_fd is not None:
-            os.dup2(self.saved_fd, self.target_fd)
-            os.close(self.saved_fd)
-            self.saved_fd = None
-
-        if self._log_file is not None:
-            self._log_file.close()
-            self._log_file = None
-
-        return False
+    return success
 
 
 class UploadLogPlugin:
     def __init__(
         self,
-        endpoint_url,
-        aws_access_key_id,
-        aws_secret_access_key,
-        bucket,
-        upload_path,
-        output_path,
-        echo_to_stdout=False,
-        skip_upload=False,
-        capture_mode="session",
-        upload_mode="sync",
-        upload_workers=8,
-        inline_output_max_bytes=256,
-        session_capture=None,
-    ):
-        self.upload_path = upload_path
-        self.output_path = output_path
-        self.bucket = bucket
+        endpoint_url: str,
+        aws_access_key_id: str,
+        aws_secret_access_key: str | None,
+        bucket: str,
+        upload_path: str,
+        output_path: str,
+        skip_upload: bool = False,
+        upload_mode: str = "sync",
+        upload_workers: int = 8,
+        inline_output_max_bytes: int = 256,
+    ) -> None:
         self.endpoint_url = endpoint_url
         self.aws_access_key_id = aws_access_key_id
-        self.echo_to_stdout = echo_to_stdout
+        self.bucket = bucket
+        self.upload_path = upload_path
+        self.output_path = output_path
         self.skip_upload = skip_upload
-        self.capture_mode = capture_mode
         self.upload_mode = upload_mode
         self.upload_workers = max(1, upload_workers)
         self.inline_output_max_bytes = inline_output_max_bytes
         if self.inline_output_max_bytes < 0:
             raise ValueError("--s3-inline-output-max-bytes must be >= 0")
-        if self.capture_mode in ("session", "direct") and self.echo_to_stdout:
-            raise ValueError(
-                f"--s3-capture-mode={self.capture_mode} cannot be used with --s3-echo-stdout"
-            )
+        if self.upload_mode not in ("sync", "deferred"):
+            raise ValueError("--s3-upload-mode must be 'sync' or 'deferred'")
+
         self.s3 = None
         if not self.skip_upload:
-            try:
-                import boto3
-            except ModuleNotFoundError as exc:
-                raise RuntimeError(
-                    "boto3 is required when --s3-upload-path is set without --s3-skip-upload"
-                ) from exc
-            self.s3 = boto3.client(
-                "s3",
-                endpoint_url=endpoint_url,
-                aws_access_key_id=aws_access_key_id,
-                aws_secret_access_key=aws_secret_access_key,
+            if not aws_secret_access_key:
+                raise ValueError("S3 secret key is required to upload test logs")
+            self.s3 = _create_s3_client(
+                endpoint_url,
+                aws_access_key_id,
+                aws_secret_access_key,
             )
-        # nodeid -> dict of open capture state + logging handler. Session mode
-        # spans setup, call, and teardown; legacy modes close after the call.
-        self._active_capture: dict = {}
-        self._test_names: dict = {}
-        self._deferred_uploads = []
-        self._captured_slices = {}
-        self._session_capture = session_capture
+
+        suffix = f"{socket.gethostname()}-{os.getpid()}-{time.time_ns()}"
+        self._spool_dir = str(_spool_root(output_path) / suffix)
+        self._spool_config_path = os.path.join(self._spool_dir, _SPOOL_CONFIG_NAME)
+        self._test_names: dict[str, str] = {}
+        self._used_test_names: set[str] = set()
+        self._captured_sections: dict[str, dict[tuple[str, str, int], CapturedSection]] = {}
+        self._captured_streams: dict[str, dict[tuple[int, str], CapturedStream]] = {}
+        self._pending_reruns: set[str] = set()
         self._upload_failed = False
+        self._executor = None
+        self._pending_uploads: dict[Future, PendingUpload] = {}
+        self._max_pending_uploads = self.upload_workers * 2
+        if not self.skip_upload:
+            self._write_spool_config()
+            if self.upload_mode == "deferred":
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self.upload_workers,
+                    thread_name_prefix="s3-test-log-upload",
+                )
 
-    def normalize_test_name(self, nodeid):
-        import hashlib
-
+    def normalize_test_name(self, nodeid: str) -> str:
         test_name = re.sub(r"[^\w\-]", "_", nodeid)
-        suffix = hashlib.md5(nodeid.encode()).hexdigest()[:8]
+        suffix = hashlib.md5(nodeid.encode(), usedforsecurity=False).hexdigest()[:8]
         timestamp = int(time.time())
-        # Linux limits a single path component to 255 bytes.
         if len(test_name) > 200:
             test_name = test_name[:200]
         return f"{test_name}-{suffix}-{timestamp}"
 
-    def _open_capture(self, item):
-        """Open stdout/stderr and logging capture for ``item``.
+    def _write_spool_config(self) -> None:
+        os.makedirs(self._spool_dir, exist_ok=True)
+        config = {
+            "endpoint_url": self.endpoint_url,
+            "aws_access_key_id": self.aws_access_key_id,
+            "bucket": self.bucket,
+            "upload_path": self.upload_path,
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "upload_workers": self.upload_workers,
+        }
+        temporary_path = f"{self._spool_config_path}.{os.getpid()}.tmp"
+        with open(temporary_path, "w", encoding="utf-8") as config_file:
+            json.dump(config, config_file)
+        os.replace(temporary_path, self._spool_config_path)
 
-        Returns a state dict on success, or ``None`` if setup failed (in which
-        case the test runs uncaptured). Never propagates exceptions.
-        """
-        state = {}
-        try:
-            test_name = self.normalize_test_name(item.nodeid)
-            state["test_name"] = test_name
-            output_path = os.path.join(self.output_path, test_name)
-            os.makedirs(output_path, exist_ok=True)
+    def _test_name(self, nodeid: str) -> str:
+        test_name = self._test_names.get(nodeid)
+        if test_name is None:
+            test_name = self.normalize_test_name(nodeid)
+            base_name = test_name
+            collision_index = 1
+            while test_name in self._used_test_names:
+                test_name = f"{base_name}-{collision_index}"
+                collision_index += 1
+            self._used_test_names.add(test_name)
+            self._test_names[nodeid] = test_name
+        return test_name
 
-            log_file = os.path.join(output_path, "logging.log")
+    def _object_key(self, test_name: str, filename: str) -> str:
+        return posixpath.join(self.upload_path, test_name, filename)
 
-            log_date_format = item.config.getini("log_date_format")
-            log_format = item.config.getini("log_format")
-
-            timestamp_format = None
-            if log_format:
-                match = re.search(r"\[([^\]]*%\(asctime\)s[^\]]*)\]", log_format)
-                if match:
-                    timestamp_format = match.group(1)
-
-            handler = logging.FileHandler(log_file)
-            logging_plugin = item.config.pluginmanager.getplugin("logging-plugin")
-            if logging_plugin is not None:
-                handler.setFormatter(logging_plugin.formatter)
-            elif log_format:
-                formatter = logging.Formatter(log_format, datefmt=log_date_format)
-                handler.setFormatter(formatter)
-            state["handler"] = handler
-
-            if self.capture_mode == "session":
-                if self._session_capture is None:
-                    raise RuntimeError("Session capture has not started")
-                state["session_offsets"] = self._session_capture.snapshot()
-            else:
-                stdout_file = os.path.join(output_path, "stdout.log")
-                stderr_file = os.path.join(output_path, "stderr.log")
-                fd_kwargs = {}
-                if log_date_format:
-                    fd_kwargs["date_format"] = log_date_format
-                if timestamp_format:
-                    fd_kwargs["timestamp_format"] = timestamp_format
-
-                if self.capture_mode == "direct":
-                    state["stdout_redir"] = DirectFDRedirector(1, stdout_file)
-                else:
-                    state["stdout_redir"] = FDRedirector(
-                        1, stdout_file, echo_to_original=self.echo_to_stdout, **fd_kwargs
-                    )
-                state["stdout_redir"].__enter__()
-                if self.capture_mode == "direct":
-                    state["stderr_redir"] = DirectFDRedirector(2, stderr_file)
-                else:
-                    state["stderr_redir"] = FDRedirector(
-                        2, stderr_file, echo_to_original=self.echo_to_stdout, **fd_kwargs
-                    )
-                state["stderr_redir"].__enter__()
-            state["log_cm"] = catching_logs(handler)
-            state["log_cm"].__enter__()
-            return state
-        except Exception as e:
-            logger.warning(
-                "S3 capture setup failed for %r: %s; running without capture", item.nodeid, e
-            )
-            self._close_capture(state)
-            return None
-
-    def _close_capture(self, state):
-        """Close capture state opened by ``_open_capture``. Never raises."""
-        if not state:
-            return
-        session_offsets = state.get("session_offsets")
-        if session_offsets is not None and self._session_capture is not None:
-            try:
-                slices = self._session_capture.slices_since(session_offsets)
-                for filename, file_slice in slices.items():
-                    self._captured_slices[(state["test_name"], filename)] = file_slice
-            except (OSError, ValueError) as e:
-                logger.warning("Error finalizing session capture: %s", e)
-        # Close in reverse order so fd 1/2 are restored before logging stops.
-        for key in ("log_cm", "stderr_redir", "stdout_redir"):
-            cm = state.get(key)
-            if cm is None:
-                continue
-            try:
-                cm.__exit__(None, None, None)
-            except Exception as e:
-                logger.warning("Error closing %s capture: %s", key, e)
-        handler = state.get("handler")
-        if handler is not None:
-            try:
-                handler.close()
-            except Exception:
-                pass
-
-    @pytest.hookimpl(wrapper=True)
-    def pytest_runtest_setup(self, item):
-        state = self._open_capture(item)
-        if state is not None:
-            self._active_capture[item.nodeid] = state
-            self._test_names[item.nodeid] = state["test_name"]
-        yield
-
-    @pytest.hookimpl(wrapper=True)
-    def pytest_sessionstart(self, session):
-        result = yield
-        if self.capture_mode == "session":
-            if self._session_capture is None:
-                self._session_capture = SessionCapture(self.output_path)
-                self._session_capture.start()
-            else:
-                self._session_capture.resume_parent()
-        return result
-
-    @pytest.hookimpl(wrapper=True)
-    def pytest_runtest_makereport(self, item, call):
-        report = yield
-        if self.capture_mode != "session" and (
-            report.when == "call" or (report.when == "setup" and report.outcome != "passed")
-        ):
-            self._close_capture(self._active_capture.pop(item.nodeid, None))
-        return report
-
-    @pytest.hookimpl(wrapper=True)
-    def pytest_runtest_teardown(self, item, nextitem):
-        if self.capture_mode == "session":
-            try:
-                return (yield)
-            finally:
-                self._close_capture(self._active_capture.pop(item.nodeid, None))
-
-        # Fallback for custom or interrupted runtest protocols that did not
-        # produce a call report. Normal execution closes capture earlier.
-        state = self._active_capture.pop(item.nodeid, None)
-        self._close_capture(state)
-        if state is not None:
-            logger.warning(
-                "S3 capture for %r remained active until teardown; "
-                "pytest result/progress output may have been captured",
-                item.nodeid,
-            )
-        yield
-
-    def _suspend_session_capture(self):
-        if self._session_capture is not None:
-            self._session_capture.suspend_parent()
-
-    def _resume_session_capture(self):
-        if self._session_capture is not None:
-            self._session_capture.resume_parent()
-
-    @pytest.hookimpl(wrapper=True)
-    def pytest_runtest_logstart(self, nodeid, location):
-        self._suspend_session_capture()
-        try:
-            return (yield)
-        finally:
-            self._resume_session_capture()
-
-    @pytest.hookimpl(wrapper=True)
-    def pytest_runtest_logfinish(self, nodeid, location):
-        self._suspend_session_capture()
-        try:
-            return (yield)
-        finally:
-            self._resume_session_capture()
-
-    def get_file_size(self, path):
-        try:
-            return os.path.getsize(path)
-        except FileNotFoundError:
-            return None
-
-    def _capture_source(self, test_name, filename):
-        file_slice = self._captured_slices.pop((test_name, filename), None)
-        if file_slice is not None:
-            return file_slice
-        return os.path.join(self.output_path, test_name, filename)
-
-    def _source_exists(self, source):
-        if isinstance(source, FileSlice):
-            return os.path.exists(source.path)
-        return os.path.exists(source)
-
-    def _source_size(self, source):
-        if isinstance(source, FileSlice):
-            return source.size
-        return os.path.getsize(source)
-
-    def _open_source(self, source):
-        if isinstance(source, FileSlice):
-            return io.BufferedReader(FileSliceReader(source))
-        return open(source, "rb")
-
-    def _remove_source(self, source):
-        if not isinstance(source, FileSlice):
-            self._remove_local_log_file(source)
-
-    def _object_key(self, test_name, filename):
-        return os.path.join(self.upload_path, test_name, filename)
-
-    def _file_url(self, object_key):
-        return os.path.join(
+    def _file_url(self, object_key: str) -> str:
+        return posixpath.join(
             self.endpoint_url,
             "v1/AUTH_" + self.aws_access_key_id,
             self.bucket,
             object_key,
         )
 
-    def _upload_source(self, source, object_key):
-        extra_args = {"ContentType": "text/plain"}
-        if isinstance(source, FileSlice):
-            with self._open_source(source) as source_file:
-                self.s3.upload_fileobj(
-                    source_file,
-                    self.bucket,
-                    object_key,
-                    ExtraArgs=extra_args,
-                )
-        else:
-            self.s3.upload_file(
-                source,
-                self.bucket,
-                object_key,
-                ExtraArgs=extra_args,
-            )
-
-    def _append_upload_failed(self, report, section_name, source, filesize, error):
-        with self._open_source(source) as source_file:
-            limit = 65536
-            # Limit content to 64k (65536 bytes)
-            trail_content = "... [truncated]"
-            content = source_file.read(limit + 1).decode("utf-8", errors="replace")
-            if len(content) > limit:
-                content = content[: limit - len(trail_content)] + trail_content
-        report.sections.append(
-            (
-                section_name,
-                f"""upload failed: {error}\nsize: {filesize} bytes\ncontent: {content}""",
-            )
+    def _write_spool_file(self, test_name: str, filename: str, content: str) -> str:
+        if not self.skip_upload and not os.path.exists(self._spool_config_path):
+            self._write_spool_config()
+        test_dir = os.path.join(self._spool_dir, test_name)
+        os.makedirs(test_dir, exist_ok=True)
+        source_path = os.path.join(test_dir, filename)
+        file_descriptor = os.open(
+            source_path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
         )
+        with os.fdopen(file_descriptor, "w", encoding="utf-8", errors="replace") as output:
+            for offset in range(0, len(content), _SPOOL_WRITE_CHARS):
+                output.write(content[offset : offset + _SPOOL_WRITE_CHARS])
+        return source_path
 
-    def _should_inline_output(self, filename, filesize):
-        return filename in ("stdout.log", "stderr.log") and filesize < self.inline_output_max_bytes
+    def _append_spool_file(self, test_name: str, filename: str, content: str) -> str:
+        if not self.skip_upload and not os.path.exists(self._spool_config_path):
+            self._write_spool_config()
+        test_dir = os.path.join(self._spool_dir, test_name)
+        os.makedirs(test_dir, exist_ok=True)
+        source_path = os.path.join(test_dir, filename)
+        file_descriptor = os.open(
+            source_path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        with os.fdopen(file_descriptor, "a", encoding="utf-8", errors="replace") as output:
+            for offset in range(0, len(content), _SPOOL_WRITE_CHARS):
+                output.write(content[offset : offset + _SPOOL_WRITE_CHARS])
+        return source_path
 
-    def _append_inline_output(self, report, section_name, source):
-        with self._open_source(source) as source_file:
-            content = source_file.read().decode("utf-8", errors="replace")
-        report.sections.append((section_name, content))
-
-    def _remove_local_log_file(self, filepath):
+    def _remove_source(self, source_path: str) -> None:
+        path = Path(source_path)
         try:
-            os.remove(filepath)
+            path.unlink()
         except FileNotFoundError:
             return
-        except OSError as e:
-            logger.warning("Failed to remove local S3 log file %s: %s", filepath, e)
+        except OSError as exc:
+            logger.warning("Failed to remove local S3 log file %s: %s", source_path, exc)
             return
+        _remove_empty_parents(path, Path(self._spool_dir))
+        try:
+            Path(self._spool_dir).parent.rmdir()
+        except OSError:
+            pass
 
-        output_root = os.path.abspath(self.output_path)
-        parent = os.path.abspath(os.path.dirname(filepath))
-        while parent != output_root and os.path.commonpath([output_root, parent]) == output_root:
+    def _upload_source(self, source_path: str, object_key: str) -> None:
+        self.s3.upload_file(
+            source_path,
+            self.bucket,
+            object_key,
+            ExtraArgs={"ContentType": "text/plain"},
+        )
+
+    def _finish_uploads(self, futures: set[Future]) -> None:
+        for future in futures:
+            upload = self._pending_uploads.pop(future)
             try:
-                os.rmdir(parent)
-            except OSError:
-                break
-            parent = os.path.dirname(parent)
-
-    def upload_and_report(self, report, test_name, filename, section_name):
-        source = self._capture_source(test_name, filename)
-        if not self._source_exists(source):
-            report.sections.append((section_name, "<not exist>"))
-            return
-        filesize = self._source_size(source)
-        if filesize == 0:
-            report.sections.append((section_name, "<empty>"))
-            self._remove_source(source)
-            return
-        if self._should_inline_output(filename, filesize):
-            self._append_inline_output(report, section_name, source)
-            self._remove_source(source)
-            return
-        object_key = self._object_key(test_name, filename)
-        fileurl = self._file_url(object_key)
-        if self.skip_upload:
-            # Experiment knob: skip the actual S3 upload to measure how much
-            # of this plugin's per-test overhead comes from boto3 network IO.
-            report.sections.append(
-                (
-                    section_name,
-                    f"{filesize} bytes (upload skipped, would upload to {fileurl})",
+                future.result()
+            except Exception as exc:
+                self._upload_failed = True
+                logger.warning(
+                    "Deferred upload failed. test_name: %s, filename: %s, "
+                    "object_key: %s, source: %s, error: %s",
+                    upload.test_name,
+                    upload.filename,
+                    upload.object_key,
+                    upload.source_path,
+                    exc,
                 )
+            else:
+                self._remove_source(upload.source_path)
+
+    def _reap_uploads(self, block_when_full: bool = False) -> None:
+        completed = {future for future in self._pending_uploads if future.done()}
+        if completed:
+            self._finish_uploads(completed)
+        if block_when_full and len(self._pending_uploads) >= self._max_pending_uploads:
+            completed, _ = wait(self._pending_uploads, return_when=FIRST_COMPLETED)
+            self._finish_uploads(completed)
+
+    def _schedule_upload(
+        self,
+        source_path: str,
+        object_key: str,
+        test_name: str,
+        filename: str,
+    ) -> None:
+        self._reap_uploads(block_when_full=True)
+        future = self._executor.submit(self._upload_source, source_path, object_key)
+        self._pending_uploads[future] = PendingUpload(
+            source_path=source_path,
+            object_key=object_key,
+            test_name=test_name,
+            filename=filename,
+        )
+
+    def _tail(self, source_path: str) -> str:
+        filesize = os.path.getsize(source_path)
+        read_size = min(filesize, _FAILED_OUTPUT_MAX_BYTES)
+        with open(source_path, "rb") as source:
+            source.seek(filesize - read_size)
+            tail = source.read(read_size).decode("utf-8", errors="replace")
+
+        lines = tail.splitlines(keepends=True)
+        truncated = filesize > read_size
+        if len(lines) > _FAILED_OUTPUT_MAX_LINES:
+            lines = lines[-_FAILED_OUTPUT_MAX_LINES:]
+            truncated = True
+        tail = "".join(lines)
+        if truncated:
+            tail = "... [truncated]\n" + tail
+        return tail
+
+    @staticmethod
+    def _format_report_content(message: str, tail: str | None = None) -> str:
+        if tail is None:
+            return f"{message}\n"
+        formatted = f"{message}\n\nLast {_FAILED_OUTPUT_MAX_LINES} lines:\n{tail}"
+        if not formatted.endswith("\n"):
+            formatted += "\n"
+        return formatted
+
+    @staticmethod
+    def _stream_filename(stream_name: str, attempt: int) -> str:
+        filename = _STREAM_FILENAMES[stream_name]
+        if attempt > 1:
+            filename += f"-attempt-{attempt}"
+        return f"{filename}.log"
+
+    def _stream_message(self, stream: CapturedStream) -> str:
+        object_key = self._object_key(stream.test_name, stream.filename)
+        file_url = self._file_url(object_key)
+        if self.skip_upload:
+            return f"{stream.filesize} bytes (upload skipped, would upload to {file_url})"
+        return f"{stream.filesize} bytes scheduled for upload to {file_url}"
+
+    def _append_capture(
+        self,
+        nodeid: str,
+        attempt: int,
+        stream_name: str,
+        content: str,
+    ) -> CapturedStream:
+        streams = self._captured_streams.setdefault(nodeid, {})
+        stream_key = (attempt, stream_name)
+        stream = streams.get(stream_key)
+        if stream is None:
+            test_name = self._test_name(nodeid)
+            filename = self._stream_filename(stream_name, attempt)
+            source_path = self._append_spool_file(test_name, filename, content)
+            stream = CapturedStream(
+                test_name=test_name,
+                filename=filename,
+                source_path=source_path,
             )
+            streams[stream_key] = stream
+        else:
+            if stream.finalized:
+                raise RuntimeError(f"Captured output arrived after {stream.filename} was finalized")
+            self._append_spool_file(stream.test_name, stream.filename, content)
+
+        stream.filesize = os.path.getsize(stream.source_path)
+        stream.message = self._stream_message(stream)
+        return stream
+
+    def _should_inline_stream(self, stream_name: str, stream: CapturedStream) -> bool:
+        return (
+            stream_name in ("stdout", "stderr")
+            and self.inline_output_max_bytes > 0
+            and stream.filesize < self.inline_output_max_bytes
+        )
+
+    def _finalize_stream(self, stream_name: str, stream: CapturedStream) -> None:
+        if stream.finalized:
+            return
+        stream.finalized = True
+        if self._should_inline_stream(stream_name, stream):
+            self._remove_source(stream.source_path)
+            return
+
+        object_key = self._object_key(stream.test_name, stream.filename)
+        file_url = self._file_url(object_key)
+        if self.skip_upload:
+            stream.message = self._stream_message(stream)
             return
         if self.upload_mode == "deferred":
-            self._deferred_uploads.append((source, object_key, test_name, filename))
-            report.sections.append(
-                (
-                    section_name,
-                    f"{filesize} bytes scheduled for upload to {fileurl}",
-                )
+            self._schedule_upload(
+                stream.source_path,
+                object_key,
+                stream.test_name,
+                stream.filename,
             )
+            stream.message = f"{stream.filesize} bytes scheduled for upload to {file_url}"
             return
+
         try:
-            self._upload_source(source, object_key)
-            report.sections.append(
-                (
-                    section_name,
-                    f"{filesize} bytes uploaded to {fileurl}",
-                )
-            )
-            self._remove_source(source)
-        except Exception as e:
+            self._upload_source(stream.source_path, object_key)
+        except Exception as exc:
             self._upload_failed = True
             logger.warning(
-                f"Upload failed. test_name: {test_name}, filename: {filename}, error: {e}"
+                "Upload failed. test_name: %s, filename: %s, error: %s",
+                stream.test_name,
+                stream.filename,
+                exc,
             )
-            self._append_upload_failed(report, section_name, source, filesize, e)
+            stream.message = f"upload failed: {exc}\nsize: {stream.filesize} bytes"
+            stream.force_output = True
+            return
 
-    @pytest.hookimpl(wrapper=True)
+        self._remove_source(stream.source_path)
+        stream.message = f"{stream.filesize} bytes uploaded to {file_url}"
+
+    def _finalize_attempt(self, nodeid: str, attempt: int) -> None:
+        streams = self._captured_streams.get(nodeid, {})
+        for (stream_attempt, stream_name), stream in streams.items():
+            if stream_attempt == attempt:
+                self._finalize_stream(stream_name, stream)
+
+    def _finalize_node(self, nodeid: str) -> None:
+        for (_, stream_name), stream in self._captured_streams.get(nodeid, {}).items():
+            self._finalize_stream(stream_name, stream)
+
+    @staticmethod
+    def _attempt(report) -> int:
+        rerun = getattr(report, "rerun", 0)
+        return rerun + 1 if isinstance(rerun, int) and rerun >= 0 else 1
+
+    def _process_report(self, report, default_phase: str) -> None:
+        nodeid = getattr(report, "nodeid", "unknown")
+        failed = getattr(report, "outcome", None) == "failed"
+        if getattr(report, "outcome", None) == "rerun":
+            self._pending_reruns.add(nodeid)
+        attempt = self._attempt(report)
+        captured_sections = self._captured_sections.setdefault(nodeid, {})
+        duplicate_counts: dict[tuple[str, str], int] = {}
+        section_entries = []
+        represented_streams = []
+        represented_stream_set = set()
+        for section_name, content in report.sections:
+            match = _CAPTURE_SECTION_PATTERN.fullmatch(section_name)
+            if match is None:
+                section_entries.append((section_name, content, None))
+                continue
+            stream_name = match.group(1)
+            phase = match.group(2) or default_phase
+            duplicate_key = (stream_name, phase)
+            duplicate_index = duplicate_counts.get(duplicate_key, 0)
+            duplicate_counts[duplicate_key] = duplicate_index + 1
+
+            section_key = (stream_name, phase, duplicate_index)
+            captured_section = captured_sections.get(section_key)
+            if captured_section is None or captured_section.content != content:
+                self._append_capture(
+                    nodeid,
+                    attempt,
+                    stream_name,
+                    content,
+                )
+                captured_section = CapturedSection(content, attempt)
+                captured_sections[section_key] = captured_section
+
+            stream_key = (captured_section.attempt, stream_name)
+            section_entries.append((section_name, content, stream_key))
+            if stream_key not in represented_stream_set:
+                represented_stream_set.add(stream_key)
+                represented_streams.append(stream_key)
+
+        failure_tails = {}
+        streams = self._captured_streams.get(nodeid, {})
+        if failed:
+            for stream_key in represented_streams:
+                stream_attempt, stream_name = stream_key
+                stream = streams[stream_key]
+                if stream_attempt == attempt and not self._should_inline_stream(
+                    stream_name, stream
+                ):
+                    failure_tails[stream_key] = self._tail(stream.source_path)
+
+        if default_phase in ("teardown", "collect"):
+            self._finalize_attempt(nodeid, attempt)
+
+        transformed_sections = []
+        reported_streams = set()
+        for section_name, content, stream_key in section_entries:
+            if stream_key is None:
+                transformed_sections.append((section_name, content))
+                continue
+            _, stream_name = stream_key
+            stream = streams[stream_key]
+            if self._should_inline_stream(stream_name, stream):
+                transformed_sections.append((section_name, content))
+                continue
+            if stream_key in reported_streams:
+                continue
+            reported_streams.add(stream_key)
+
+            tail = failure_tails.get(stream_key)
+            if tail is None and stream.force_output:
+                tail = self._tail(stream.source_path)
+            transformed_sections.append(
+                (
+                    f"Captured {stream_name}",
+                    self._format_report_content(stream.message, tail),
+                )
+            )
+        report.sections[:] = transformed_sections
+
+    def pytest_runtest_logstart(self, nodeid: str, location) -> None:
+        self._test_name(nodeid)
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_runtest_logreport(self, report):
-        self._suspend_session_capture()
-        try:
-            if report.when == "teardown":
-                test_name = self._test_names.pop(report.nodeid, None)
-                if test_name is None:
-                    test_name = self.normalize_test_name(report.nodeid)
-                # Add S3 report sections before the junitxml plugin handles
-                # this report, while pytest's terminal output bypasses capture.
-                self.upload_and_report(report, test_name, "stdout.log", "Captured stdout")
-                self.upload_and_report(report, test_name, "stderr.log", "Captured stderr")
-                self.upload_and_report(report, test_name, "logging.log", "Captured log")
-            return (yield)
-        finally:
-            self._resume_session_capture()
+        self._process_report(report, getattr(report, "when", "call"))
+        return (yield)
 
     @pytest.hookimpl(tryfirst=True)
-    def pytest_sessionfinish(self, session, exitstatus):
-        for state in self._active_capture.values():
-            self._close_capture(state)
-        self._active_capture.clear()
+    def pytest_collectreport(self, report) -> None:
+        self._process_report(report, "collect")
+        nodeid = getattr(report, "nodeid", "unknown")
+        self._test_names.pop(nodeid, None)
+        self._captured_sections.pop(nodeid, None)
+        self._captured_streams.pop(nodeid, None)
+        self._pending_reruns.discard(nodeid)
 
-        if self._session_capture is not None:
-            self._session_capture.stop()
+    def pytest_runtest_logfinish(self, nodeid: str, location) -> None:
+        self._finalize_node(nodeid)
+        self._test_names.pop(nodeid, None)
+        if nodeid in self._pending_reruns:
+            self._pending_reruns.remove(nodeid)
+            return
+        self._captured_sections.pop(nodeid, None)
+        self._captured_streams.pop(nodeid, None)
 
-        if not self.skip_upload and self._deferred_uploads:
-            workers = min(self.upload_workers, len(self._deferred_uploads))
-            logger.info(
-                "Uploading %d deferred S3 test log files with %d workers",
-                len(self._deferred_uploads),
-                workers,
-            )
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {
-                    executor.submit(self._upload_source, source, object_key): (
-                        source,
-                        object_key,
-                        test_name,
-                        filename,
-                    )
-                    for source, object_key, test_name, filename in self._deferred_uploads
-                }
-                for future in as_completed(futures):
-                    source, object_key, test_name, filename = futures[future]
-                    try:
-                        future.result()
-                        self._remove_source(source)
-                    except Exception as e:
-                        self._upload_failed = True
-                        logger.warning(
-                            "Deferred upload failed. test_name: %s, filename: %s, "
-                            "object_key: %s, source: %s, error: %s",
-                            test_name,
-                            filename,
-                            object_key,
-                            source,
-                            e,
-                        )
-            self._deferred_uploads.clear()
-
-        if (
-            self._session_capture is not None
-            and not self.skip_upload
-            and not self._upload_failed
-            and not self._captured_slices
-        ):
-            self._session_capture.remove_files()
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_sessionfinish(self, session, exitstatus) -> None:
+        for nodeid in tuple(self._captured_streams):
+            self._finalize_node(nodeid)
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+            self._finish_uploads(set(self._pending_uploads))
+        if not self.skip_upload and not self._upload_failed:
+            try:
+                Path(self._spool_config_path).unlink(missing_ok=True)
+                Path(self._spool_dir).rmdir()
+                Path(self._spool_dir).parent.rmdir()
+            except OSError:
+                pass
+        self._captured_sections.clear()
+        self._captured_streams.clear()
+        self._pending_reruns.clear()
 
 
-def add_options(parser):
-    """Register S3 CLI options. Call from pytest_addoption in any conftest that needs S3 upload."""
+def add_options(parser) -> None:
+    """Register S3 options on a pytest parser."""
     parser.addoption(
         "--s3-endpoint",
         action=EnvDefault,
         envvar="S3_ENDPOINT",
         default="https://pbss.s8k.io",
-        help="s3 endpoint",
+        help="S3 endpoint",
     )
     parser.addoption(
         "--s3-username",
         action=EnvDefault,
         envvar="S3_USERNAME",
         default="svc_tensorrt",
-        help="s3 username",
+        help="S3 username",
     )
     parser.addoption(
         "--s3-secret-key",
         action=EnvDefault,
         envvar="S3_SECRET_KEY",
         required=False,
-        help="s3 secret key",
+        help="S3 secret key",
     )
     parser.addoption(
         "--s3-bucket",
         action=EnvDefault,
         envvar="S3_BUCKET",
         default="trtllm-ci-logs",
-        help="s3 bucket name",
+        help="S3 bucket name",
     )
     parser.addoption(
         "--s3-upload-path",
         action=EnvDefault,
         envvar="S3_UPLOAD_PATH",
         required=False,
-        help="s3 upload path",
-    )
-    parser.addoption(
-        "--s3-echo-stdout",
-        action="store_true",
-        default=False,
-        help="Besides capturing stdout/stderr to per-test log files, also echo "
-        "them through to the original stdout/stderr for live debugging. "
-        "This requires --s3-capture-mode=timestamped and should be set on the outer pytest "
-        "invocation; nested pytest invocations spawned by individual tests "
-        "should NOT set this, to avoid duplicating their output back through "
-        "the outer pipe.",
+        help="S3 upload path",
     )
     parser.addoption(
         "--s3-skip-upload",
         action="store_true",
         default=False,
-        help="Experiment knob: still capture stdout/stderr/log per test and "
-        "append URLs to report sections, but skip the actual s3.upload_file "
-        "call. Used to measure how much of the plugin's per-test overhead "
-        "comes from boto3/network IO vs. local capture machinery.",
-    )
-    parser.addoption(
-        "--s3-capture-mode",
-        action="store",
-        choices=("session", "timestamped", "direct"),
-        default="session",
-        help="Capture each stream through a session-scoped append-only file and "
-        "split it into per-test ranges. Timestamped and direct retain the legacy "
-        "per-test FD redirection modes.",
+        help="Transform captured output into S3 report links without uploading it.",
     )
     parser.addoption(
         "--s3-upload-mode",
         action="store",
         choices=("sync", "deferred"),
         default="sync",
-        help="Upload each per-test log file synchronously in the test teardown, "
-        "or defer uploads until pytest session finish. Deferred mode keeps "
-        "per-test files and report URLs while reducing teardown latency for "
-        "nested pytest runs with many cases.",
+        help="Upload report sections synchronously or with a bounded background pool.",
     )
     parser.addoption(
         "--s3-upload-workers",
@@ -962,42 +740,55 @@ def add_options(parser):
         action="store",
         type=int,
         default=256,
-        help="Inline captured stdout/stderr into the test report and skip S3 "
-        "upload when each file is smaller than this many bytes. Set to 0 to "
-        "disable inlining for non-empty output.",
+        help="Inline stdout/stderr smaller than this size instead of uploading it.",
     )
 
 
-def register_plugin(config, session_capture=None):
-    """Register UploadLogPlugin if --s3-upload-path and --output-dir are both set."""
+def register_plugin(config):
+    """Register the report transformer when S3 output is configured."""
+    existing_plugin = config.pluginmanager.getplugin("upload_log_plugin")
+    if existing_plugin is not None:
+        return existing_plugin
+
     s3_upload_path = config.getoption("--s3-upload-path", default=None)
     output_dir = config.getoption("--output-dir", default=None)
     if not (s3_upload_path and output_dir):
         return None
-    pytest_capture_mode = config.getoption("capture", default="no")
-    if pytest_capture_mode != "no":
-        raise ValueError("capture mode must be 'no' when upload path is specified")
-    s3_secret_key = config.getoption("--s3-secret-key")
+    capture_mode = config.getoption("capture", default="fd")
+    if capture_mode != "fd":
+        raise ValueError("--s3-upload-path requires pytest --capture=fd")
+
     skip_upload = config.getoption("--s3-skip-upload", default=False)
+    s3_secret_key = config.getoption("--s3-secret-key", default=None)
     if not skip_upload and not s3_secret_key:
         raise ValueError(
             "--s3-secret-key (or S3_SECRET_KEY env var) is required when --s3-upload-path is set"
         )
-    s3_capture_mode = config.getoption("--s3-capture-mode", default="session")
+
     plugin = UploadLogPlugin(
         endpoint_url=config.getoption("--s3-endpoint"),
         aws_access_key_id=config.getoption("--s3-username"),
         aws_secret_access_key=s3_secret_key,
         bucket=config.getoption("--s3-bucket"),
         upload_path=s3_upload_path,
-        output_path=output_dir,
-        echo_to_stdout=config.getoption("--s3-echo-stdout", default=False),
+        output_path=os.path.abspath(output_dir),
         skip_upload=skip_upload,
-        capture_mode=s3_capture_mode,
         upload_mode=config.getoption("--s3-upload-mode", default="sync"),
         upload_workers=config.getoption("--s3-upload-workers", default=8),
         inline_output_max_bytes=config.getoption("--s3-inline-output-max-bytes", default=256),
-        session_capture=session_capture if s3_capture_mode == "session" else None,
     )
     config.pluginmanager.register(plugin, "upload_log_plugin")
     return plugin
+
+
+def _main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--drain-spool", metavar="OUTPUT_PATH")
+    args = parser.parse_args()
+    if args.drain_spool:
+        return 0 if drain_pending_uploads(args.drain_spool) else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
