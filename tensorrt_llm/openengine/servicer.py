@@ -74,7 +74,12 @@ def _arg(llm: object, name: str, default: Any = None) -> Any:
 
 def _data_parallel_size(llm: object) -> int:
     if bool(_arg(llm, "enable_attention_dp", False)):
-        return max(1, int(_arg(llm, "tensor_parallel_size", _arg(llm, "tp_size", 1))))
+        size = _arg(llm, "tensor_parallel_size", None)
+        if size is None:
+            size = _arg(llm, "tp_size", None)
+        if size is None:
+            size = _arg(llm, "data_parallel_size", 1)
+        return max(1, int(size))
     return max(1, int(_arg(llm, "data_parallel_size", 1)))
 
 
