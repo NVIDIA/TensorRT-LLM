@@ -2995,8 +2995,11 @@ class PyTorchModelEngine(ModelEngine):
     def _prepare_multimodal_indices(self, input_ids: list[int]):
         input_ids = torch.tensor(input_ids, dtype=torch.int, device="cpu")
         vocab_size = self.model.config.vocab_size
-        # TODO: unify naming of mm_token_ids across models
-        mm_token_ids = getattr(self.model, "mm_token_ids", None)
+        # `multimodal_token_ids` is the common wrapper-model contract. Keep the legacy name as a
+        # fallback for models not yet migrated to `MultimodalModelMixin`.
+        mm_token_ids = getattr(self.model, "multimodal_token_ids", None)
+        if mm_token_ids is None:
+            mm_token_ids = getattr(self.model, "mm_token_ids", None)
 
         text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
             input_ids, vocab_size=vocab_size, mm_token_ids=mm_token_ids)

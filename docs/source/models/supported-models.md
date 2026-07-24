@@ -127,11 +127,17 @@ Note:
 ## Multimodal Encoder Optimizations
 
 The following optimizations are available to models that implement
-`MultimodalModelMixin`. Currently, only `Mistral3ForConditionalGeneration` supports them.
+`MultimodalModelMixin`.
 
 | Model Architecture | Multimodal Encoder Side Stream | Multimodal Embeddings Cache |
 | ------------------ | ------------------------------ | --------------------------- |
+| `Gemma4ForConditionalGeneration` | Yes | Yes |
+| `Gemma4UnifiedForConditionalGeneration` | Yes | Yes |
 | `Mistral3ForConditionalGeneration` | Yes | Yes |
+| `Qwen3VLForConditionalGeneration` | Yes | Yes |
+| `Qwen3VLMoeForConditionalGeneration` | Yes | Yes |
+| `Qwen3_5ForConditionalGeneration` | Yes | Yes |
+| `Qwen3_5MoeForConditionalGeneration` | Yes | Yes |
 
 - **Multimodal encoder side stream** prefetches encoder work for pending requests on a separate
   CUDA stream, allowing it to overlap with work on the main stream. Set

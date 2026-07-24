@@ -663,6 +663,8 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     decorators (outer arch string + input-processor `model_type`).
     """
 
+    supports_encoder_cache = True
+
     @classmethod
     def get_model_defaults(cls, llm_args):
         # `ModelLoader` applies `get_model_defaults()` on the resolved outer

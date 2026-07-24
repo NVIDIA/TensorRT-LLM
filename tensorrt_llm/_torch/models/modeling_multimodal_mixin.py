@@ -197,15 +197,125 @@ class MultimodalModelMixin:
     ) -> Sequence[MultimodalParams]:
         """Select the params that participate in multimodal encoder work.
 
-        Returns the context-slice params with multimodal content. Helpers below
+        Returns the context-slice params with active multimodal content. Helpers below
         this method (`get_multimodal_embeddings`, `find_input_mm_embeds`,
         `fuse_input_embeds`) operate on the returned list and therefore see
         only `has_content()` params. Models overriding this hook must
         preserve that invariant.
         """
         return [
-            param for param in list(multimodal_params)[:num_context_requests] if param.has_content()
+            param
+            for param in list(multimodal_params)[:num_context_requests]
+            if param.has_content()
+            and (
+                param.multimodal_runtime is None
+                or param.multimodal_runtime.num_mm_tokens_in_chunk != 0
+            )
         ]
+
+    @property
+    def language_model(self) -> torch.nn.Module:
+        """Return the inner language model that receives prepared inputs."""
+        raise NotImplementedError
+
+    @property
+    def vocab_size_padded(self) -> int:
+        """Return the inner language model's padded vocabulary size."""
+        return self.language_model.vocab_size_padded
+
+    def infer_max_seq_len(self) -> int:
+        """Return the inner language model's maximum sequence length."""
+        return self.language_model.infer_max_seq_len()
+
+    def get_language_model_extra_forward_kwargs(
+        self,
+        *,
+        raw_input_ids: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        mm_inputs: PreparedLlmInputs,
+        **forward_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Return model-specific arguments for the inner language-model forward."""
+        return {}
+
+    def get_language_model_forward_kwargs(
+        self,
+        *,
+        attn_metadata: Any,
+        input_ids: Optional[torch.Tensor],
+        raw_input_ids: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        inputs_embeds: Optional[torch.Tensor],
+        mm_inputs: PreparedLlmInputs,
+        return_context_logits: bool,
+        **forward_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build common and model-specific inner language-model forward arguments."""
+        llm_kwargs = {
+            "attn_metadata": attn_metadata,
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "inputs_embeds": inputs_embeds,
+            "return_context_logits": return_context_logits,
+        }
+        llm_kwargs.update(
+            self.get_language_model_extra_forward_kwargs(
+                raw_input_ids=raw_input_ids,
+                position_ids=position_ids,
+                mm_inputs=mm_inputs,
+                **forward_kwargs,
+            )
+        )
+        return llm_kwargs
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        attn_metadata: Any,
+        input_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Any = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Prepare multimodal inputs and dispatch them to the language model."""
+        multimodal_params = kwargs.pop("multimodal_params", [])
+        mm_inputs = self.prepare_multimodal_inputs(
+            input_ids=input_ids,
+            positions=position_ids,
+            multimodal_params=multimodal_params,
+            num_context_requests=attn_metadata.num_contexts,
+            attn_metadata=attn_metadata,
+            **kwargs,
+        )
+        if inputs_embeds is not None:
+            if mm_inputs.inputs_embeds is not None:
+                raise ValueError(
+                    "MultimodalModelMixin.forward received both caller-supplied inputs_embeds "
+                    "and multimodal-derived inputs_embeds. These paths are mutually exclusive; "
+                    "pass at most one."
+                )
+            mm_inputs = PreparedLlmInputs(
+                input_ids=None,
+                inputs_embeds=inputs_embeds,
+                extra_embeds=mm_inputs.extra_embeds,
+            )
+
+        llm_kwargs = self.get_language_model_forward_kwargs(
+            attn_metadata=attn_metadata,
+            input_ids=mm_inputs.input_ids,
+            raw_input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=mm_inputs.inputs_embeds,
+            mm_inputs=mm_inputs,
+            return_context_logits=return_context_logits,
+            multimodal_params=multimodal_params,
+            num_generation_requests=attn_metadata.num_generations,
+            spec_metadata=spec_metadata,
+            **kwargs,
+        )
+        return self.language_model.forward(**llm_kwargs)
 
     def after_full_multimodal_embeddings(
         self,
@@ -719,8 +829,9 @@ def _dispatch_cross_iter_prefetch(
                 chunk_end_pos=cumsum.numel(),
                 embed_mask_cumsum=cumsum,
             ),
+            mm_item_order=req.py_mm_item_order,
         )
-        for _, mm_data, cumsum in candidates
+        for req, mm_data, cumsum in candidates
     ]
 
     # Prefetch targets requests outside the current iteration, so their
