@@ -427,12 +427,14 @@ class ConfigurableMoE(MoE):
         if self.use_dp and self.comm is not None:
             num_rows = self._dp_padded_num_rows(all_rank_num_tokens)
         else:
-            # non-DP: no cross-rank dispatch. The scheduler fills all_rank_num_tokens
-            # from [x.shape[0]] before calling here, so it must be a single-element list.
-            assert len(all_rank_num_tokens) == 1, (
-                f"non-DP path expects a single-element list, got {len(all_rank_num_tokens)}"
-            )
-            num_rows = all_rank_num_tokens[0]
+            # non-DP: no cross-rank dispatch. Chunking is over the local rank's
+            # rows only. The scheduler either passes the length-1 fast path
+            # ``[x.shape[0]]`` (single-rank / no meta), or the TEP path passes a
+            # per-rank list of length ``world_size``; both are valid here.
+            if len(all_rank_num_tokens) == 1:
+                num_rows = all_rank_num_tokens[0]
+            else:
+                num_rows = all_rank_num_tokens[self.mapping.tp_rank]
         return (num_rows + self.moe_max_num_tokens - 1) // self.moe_max_num_tokens
 
     def split_chunk(self, split_token_num: int, split_num_chunks: int) -> List[int]:
