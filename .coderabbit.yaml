@@ -50,6 +50,8 @@ reviews:
       or tests/integration/test_lists/qa/ (manual QA).
     - For source files: note any observable behavior changes a QA engineer should verify
       (new code paths, changed APIs, altered defaults, removed functionality).
+    - For configuration files (e.g. .coderabbit.yaml, *.yml, *.yaml, *.json, *.toml):
+      note any review or workflow behavior changes introduced by the config update.
     Keep each entry to 1-2 sentences; omit if no QA-relevant impact.
   collapse_walkthrough: false
   assess_linked_issues: true
