@@ -27,16 +27,18 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from tensorrt_llm._torch.pyexecutor.llm_request import (
-    ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
+from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
-    PoolConfiguration, get_pp_layers)
+    BaseResourceManager,
+    CacheTypeCpp,
+    DataType,
+    KVCacheManager,
+    PoolConfiguration,
+    get_pp_layers,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
-                                 torch_dtype_to_binding)
-from tensorrt_llm.bindings.internal.batch_manager import (
-    LinearAttentionMetadata, LinearCacheType)
+from tensorrt_llm._utils import nvtx_range, prefer_pinned, torch_dtype_to_binding
+from tensorrt_llm.bindings.internal.batch_manager import LinearAttentionMetadata, LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -691,8 +693,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         # cuda_graph_runner caches one dummy per runtime_draft_len value
         # (see _get_padded_batch), so any id in the range of dummy request IDs
         # may be live concurrently.
-        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-            CUDA_GRAPH_DUMMY_REQUEST_ID
+        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
         max_dl = self.speculative_num_draft_tokens or 0
         return (CUDA_GRAPH_DUMMY_REQUEST_ID - max_dl <= request_id <=
                 CUDA_GRAPH_DUMMY_REQUEST_ID)
@@ -1765,8 +1766,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         ``T = budget // bytes_per_token``.
         """
         # Lazy import to avoid pulling config_utils into module import order.
-        from tensorrt_llm._torch.pyexecutor.config_utils import \
-            extract_mamba_kv_cache_params
+        from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
 
         # Attention slope from the parent's existing formula.
         attention_slope = KVCacheManager.get_cache_size_per_token(
