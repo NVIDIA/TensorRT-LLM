@@ -38,7 +38,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 )
 from tensorrt_llm.logger import logger
 
-from ..compaction import build_compaction_plans, compact
+from ..compaction import build_compaction_plan, compact
 from .triattention_kernels import (
     _gather_mean_phase_kernel,
     _settle_ties_kernel,
@@ -1367,41 +1367,33 @@ class TriAttention(KVCacheCompressionManager):
             )
 
         # ---- compaction plans (opaque: only compact() interprets them) ---------
-        per_layer = self.eviction_mode == "per_layer_perhead"
-        draft_contract = None
-        if draft is not None:
-            draft_layout = draft["layout"]
-            draft_contract = dict(
-                layer_pools=draft_layout["layer_pools"],
-                dense_layers=list(draft_layout["dense_layers"]),
-                layer_group_representative=draft_layout["layer_group_representative"],
-                layer_pool_ids=tuple(draft_layout["layer_pool_ids"]),
-                kv_block_offsets=self._draft_block_offsets_device,
-                dense_move_offsets=draft_move_offsets_row,
-                protected_tail_capacity=int(draft["protected_tail_capacity"]),
-            )
-        self._compaction_plans = build_compaction_plans(
-            target=dict(
-                layer_pools=layer_pools,
-                dense_layers=list(dense_layers),
-                swa_layers=list(swa_layers),
-                swa_window=swa_window,
-                layer_group_representative=layer_group_representative,
-                layer_pool_ids=layer_pool_ids,
-                kv_block_offsets=self._block_offsets_device,
-                token_starts=self._token_starts_device,
-                swa_destination_bases=self._swa_destination_bases,
+        plans = [
+            build_compaction_plan(
+                layout,
+                block_offsets=self._block_offsets_device,
+                kept_ordinals=self._kept_ordinal_rows,
+                source_lengths=self._valid_seq_lens_device,
+                dense_destination_bases=self._token_starts_device,
                 # Per-round tails: the move offsets ride the staged metadata rows.
                 dense_move_offsets=dense_move_offsets_row,
-                swa_move_offsets=swa_move_offsets_row,
-                per_layer_sources=per_layer,
-                # The decision rows the plans pack into move sources.
-                kept_ordinal_rows=self._kept_ordinal_rows,
-                valid_seq_lens=self._valid_seq_lens_device,
                 protected_tail_capacity=int(protected_tail_capacity),
-            ),
-            draft=draft_contract,
-        )
+                swa_move_offsets=swa_move_offsets_row,
+                swa_destination_bases=self._swa_destination_bases,
+            )
+        ]
+        if draft is not None:
+            plans.append(
+                build_compaction_plan(
+                    draft["layout"],
+                    block_offsets=self._draft_block_offsets_device,
+                    kept_ordinals=self._kept_ordinal_rows,
+                    source_lengths=self._valid_seq_lens_device,
+                    dense_destination_bases=self._token_starts_device,
+                    dense_move_offsets=draft_move_offsets_row,
+                    protected_tail_capacity=int(draft["protected_tail_capacity"]),
+                )
+            )
+        self._compaction_plans = tuple(plans)
 
         # ---- round-ordering events ----------------------------------------------
         # Host staging (pinned metadata + snapshots) reuse fence.

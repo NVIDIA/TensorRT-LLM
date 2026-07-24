@@ -122,7 +122,7 @@ def build_compaction(**overrides):
     destination bases, and hands the test's pre-settled
     ``kept_token_ordinals`` in as the decision rows. Returns the opaque
     ``plans`` plus a test-side mirror of the caller-owned inputs."""
-    from tensorrt_llm._torch.kv_cache_compression.compaction import build_compaction_plans
+    from tensorrt_llm._torch.kv_cache_compression.compaction import build_compaction_plan
 
     args = dict(
         eviction_mode="union",
@@ -135,8 +135,7 @@ def build_compaction(**overrides):
         swa_window=None,
     )
     args.update(overrides)
-    mode = args.pop("eviction_mode")
-    per_layer = mode == "per_layer_perhead"
+    args.pop("eviction_mode")
     kept = args.pop("kept_token_ordinals")
     request_count = args["request_count"]
     keep_count = args["decode_keep_count"]
@@ -155,37 +154,43 @@ def build_compaction(**overrides):
     args.setdefault("swa_move_offsets", capacity_offsets(swa_window + tail) if has_swa else None)
     if has_draft:
         args.setdefault("draft_move_offsets", capacity_offsets(keep_count + draft_tail))
-    draft = None
-    if has_draft:
-        draft = dict(
-            layer_pools=args["draft_layer_pools"],
-            dense_layers=args["draft_layers"],
-            layer_group_representative=args["draft_layer_group_representative"],
-            layer_pool_ids=args["draft_layer_pool_ids"],
-            kv_block_offsets=args["draft_kv_block_offsets"],
-            dense_move_offsets=args["draft_move_offsets"],
-            protected_tail_capacity=draft_tail,
-        )
-    plans = build_compaction_plans(
-        target=dict(
-            layer_pools=args["layer_pools"],
-            dense_layers=args["dense_layers"],
-            swa_layers=args["swa_layers"],
-            swa_window=args["swa_window"],
-            layer_group_representative=args["layer_group_representative"],
-            layer_pool_ids=args["layer_pool_ids"],
-            kv_block_offsets=args["kv_block_offsets"],
-            token_starts=args["prompt_offsets"],
-            swa_destination_bases=swa_destination_bases,
+    plan_list = [
+        build_compaction_plan(
+            dict(
+                layer_pools=args["layer_pools"],
+                dense_layers=args["dense_layers"],
+                swa_layers=args["swa_layers"],
+                swa_window=args["swa_window"],
+                layer_pool_ids=args["layer_pool_ids"],
+            ),
+            block_offsets=args["kv_block_offsets"],
+            kept_ordinals=kept.reshape(-1, keep_count),
+            source_lengths=args["valid_sequence_lengths"],
+            dense_destination_bases=args["prompt_offsets"],
             dense_move_offsets=args["dense_move_offsets"],
-            swa_move_offsets=args["swa_move_offsets"],
-            per_layer_sources=per_layer,
-            kept_ordinal_rows=kept.reshape(-1, keep_count),
-            valid_seq_lens=args["valid_sequence_lengths"],
             protected_tail_capacity=tail,
-        ),
-        draft=draft,
-    )
+            swa_move_offsets=args["swa_move_offsets"],
+            swa_destination_bases=swa_destination_bases,
+        )
+    ]
+    if has_draft:
+        plan_list.append(
+            build_compaction_plan(
+                dict(
+                    layer_pools=args["draft_layer_pools"],
+                    dense_layers=args["draft_layers"],
+                    swa_layers=[],
+                    layer_pool_ids=args["draft_layer_pool_ids"],
+                ),
+                block_offsets=args["draft_kv_block_offsets"],
+                kept_ordinals=kept.reshape(-1, keep_count),
+                source_lengths=args["valid_sequence_lengths"],
+                dense_destination_bases=args["prompt_offsets"],
+                dense_move_offsets=args["draft_move_offsets"],
+                protected_tail_capacity=draft_tail,
+            )
+        )
+    plans = tuple(plan_list)
     # Opaque plans plus a test-side mirror of the caller-owned construction
     # inputs (production binds the same values as manager attributes); the
     # standalone helpers here need the move-offset rows and SWA staging back.
