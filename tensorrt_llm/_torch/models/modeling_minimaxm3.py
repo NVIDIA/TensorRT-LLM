@@ -55,6 +55,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, copy_weight, load_weight_shard
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..speculative import SpecMetadata
 from ..utils import (
     ActivationType,
     AuxStreamType,
@@ -64,7 +65,8 @@ from ..utils import (
 )
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
-from .modeling_utils import DecoderModel, DecoderModelForCausalLM, ModelConfig, register_auto_model
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import DecoderModel, ModelConfig, register_auto_model
 
 # Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
@@ -974,7 +976,17 @@ class MiniMaxM3Attention(Attention):
 
         # 7. Gather padded K/V for every batch row and run dense GQA.
         batch = int(m3_meta.slot_ids.shape[0])
-        max_k = int(m3_meta.max_seqlen_k)
+        # Graph capture bakes the gather/mask width, and max_seqlen_k is a
+        # per-step host bound later replays can outgrow. Bake
+        # min(page-table width, engine max_seq_len): the raw table width
+        # alone is inflated far past max_seq_len by the KV-estimation pass
+        # and would OOM the [batch, max_k, heads] gather. The seq_lens mask
+        # below invalidates the slack.
+        if attn_metadata.is_cuda_graph:
+            capacity = int(m3_meta.req_to_token.shape[1])
+            max_k = min(capacity, int(attn_metadata.max_seq_len or capacity))
+        else:
+            max_k = int(m3_meta.max_seqlen_k)
         if max_k <= 0:
             max_k = 1
         # ``_gather_paged_batched`` decomposes the flat slot id into
@@ -1001,15 +1013,11 @@ class MiniMaxM3Attention(Attention):
                 f"by num_key_value_heads ({self.num_key_value_heads})"
             )
         group = self.num_heads // max(self.num_key_value_heads, 1)
-        if group > 1:
-            k_padded = k_padded.repeat_interleave(group, dim=2)
-            v_padded = v_padded.repeat_interleave(group, dim=2)
 
         # Build the per-query attention mask that masks out padded KV
         # positions beyond each sequence's true ``seq_lens`` and (for
         # prefill) preserves causality. ``q_positions`` from the prefill
-        # metadata names each Q token's K-side position; for decode
-        # there is one Q token per request at position ``seq_lens - 1``.
+        # metadata names each Q token's K-side position.
         # The metadata tensors are produced by
         # :meth:`MiniMaxM3AttentionMetadata.prepare` on the cache
         # device, so ``.to(dtype=torch.long)`` is a same-device dtype
@@ -1018,6 +1026,9 @@ class MiniMaxM3Attention(Attention):
         kv_positions = torch.arange(max_k, device=q.device).unsqueeze(0)  # [1, max_k]
 
         if m3_meta.is_prefill:
+            if group > 1:
+                k_padded = k_padded.repeat_interleave(group, dim=2)
+                v_padded = v_padded.repeat_interleave(group, dim=2)
             # Prefill: build [total_q, max_k] mask using q_positions / q_batch_row.
             # Prefill never runs inside the CUDA-graph capture window
             # (capture is decode-only), so the per-batch Python loop and
@@ -1058,35 +1069,42 @@ class MiniMaxM3Attention(Attention):
                     )  # [1, H, q, d]
                 output_view[start:end].copy_(out_b.squeeze(0).transpose(0, 1))
         else:
-            # Decode: one Q token per request at position seq_lens - 1.
-            # Every input tensor here is already on q.device (set up by
-            # prepare()), so SDPA captures cleanly.
-            valid = kv_positions < seq_lens_dev.unsqueeze(-1)  # [batch, max_k]
-            q_b = q_view.unsqueeze(1).transpose(1, 2)  # [batch, H, 1, d]
-            k_b = k_padded.transpose(1, 2)  # [batch, H, k, d]
-            v_b = v_padded.transpose(1, 2)  # [batch, H, k, d]
-            mask_b = valid.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, k]
+            # Decode: qo_len query tokens per request; token t of request b
+            # attends seq_lens[b] - qo_len + t + 1 positions (the causal
+            # ladder; qo_len=1 is the classic one-token mask). Every input
+            # tensor here is already on q.device (set up by prepare()), so
+            # SDPA captures cleanly.
+            qo_len = int(m3_meta.decode_qo_len)
+            ladder = torch.arange(1 - qo_len, 1, device=q.device, dtype=torch.long)
+            # eff[b, t] = attendable position count for token t of row b.
+            eff = seq_lens_dev.unsqueeze(-1) + ladder  # [batch, qo]
+            valid = kv_positions.unsqueeze(1) < eff.unsqueeze(-1)  # [batch, qo, max_k]
+            q_b = q_view.view(batch, qo_len, self.num_heads, self.head_dim).transpose(
+                1, 2
+            )  # [batch, H, qo, d]
+            mask_b = valid.unsqueeze(1)  # [batch, 1, qo, k]
+            # Expand K/V one KV head at a time: the all-heads transient is
+            # O(batch * max_k * num_heads) inside the CUDA-graph pool and
+            # exceeds the pool budget under attention DP (unsharded heads);
+            # with TP-sharded KV heads this is one iteration.
+            out_b = q.new_empty(batch, self.num_heads, qo_len, self.head_dim)
             with sdpa_kernel(_DENSE_SDPA_BACKENDS):
-                out_b = torch.nn.functional.scaled_dot_product_attention(
-                    q_b.to(q.dtype),
-                    k_b.to(q.dtype),
-                    v_b.to(q.dtype),
-                    attn_mask=mask_b,
-                    dropout_p=0.0,
-                    is_causal=False,
-                )  # [batch, H, 1, d]
-            # Drop the singleton Q-length axis and write the resulting
-            # ``[batch, num_heads, head_dim]`` tensor into the final buffer.
-            # The prior ``.transpose(1, 2).reshape(batch, H, d)`` pattern
-            # was wrong: with ``H != head_dim`` (M3 TP=8 has H=8, d=128)
-            # the non-contiguous transpose forces ``reshape`` to copy the
-            # data in C-order under its current ``[batch, d, H]`` shape,
-            # then reinterpret as ``[batch, H, d]`` — which scrambles
-            # ``(head, head_dim)`` ordering and feeds permuted activations
-            # into ``o_proj``. Prefill is unaffected because its
-            # ``transpose(0, 1)`` runs between q-len and num_heads axes
-            # which the per-batch loop already laid out correctly.
-            output.view(batch, self.num_heads, self.head_dim).copy_(out_b.squeeze(2))
+                for h in range(max(self.num_key_value_heads, 1)):
+                    qh = slice(h * group, (h + 1) * group)
+                    k_h = k_padded[:, :, h : h + 1].repeat_interleave(group, dim=2)
+                    v_h = v_padded[:, :, h : h + 1].repeat_interleave(group, dim=2)
+                    out_b[:, qh] = torch.nn.functional.scaled_dot_product_attention(
+                        q_b[:, qh].to(q.dtype),
+                        k_h.transpose(1, 2).to(q.dtype),
+                        v_h.transpose(1, 2).to(q.dtype),
+                        attn_mask=mask_b,
+                        dropout_p=0.0,
+                        is_causal=False,
+                    )  # [batch, group, qo, d]
+            # Copy through a token-major [batch, qo, H, dh] view rather
+            # than transpose(1, 2).reshape, which (with H != head_dim)
+            # copies in C-order and scrambles (head, head_dim) into o_proj.
+            output.view(batch, qo_len, self.num_heads, self.head_dim).copy_(out_b.transpose(1, 2))
 
         return output
 
@@ -1381,6 +1399,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -1401,6 +1420,10 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
         else:
             hidden_states = self.mlp(hidden_states)
+        # hidden_states is fully TP-reduced at layer exit (no cross-layer
+        # allreduce+norm fusion).
+        if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -1451,6 +1474,7 @@ class MiniMaxM3Model(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1467,6 +1491,7 @@ class MiniMaxM3Model(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                spec_metadata=spec_metadata,
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -1474,19 +1499,14 @@ class MiniMaxM3Model(DecoderModel):
 
 
 @register_auto_model("MiniMaxM3SparseForCausalLM")
-class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedConfig]):
+class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         raw_pretrained = model_config.pretrained_config
         if is_minimax_m3_vl_config(raw_pretrained):
             model_config = get_text_model_config(model_config)
-        super().__init__(
-            MiniMaxM3Model(model_config),
-            config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=model_config.pretrained_config.vocab_size,
-        )
+        super().__init__(MiniMaxM3Model(model_config), model_config)
 
     def load_weights(
         self,
