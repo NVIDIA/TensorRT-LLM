@@ -37,6 +37,39 @@ class AuxBufferMeta:
 AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
 
 
+def compute_aux_transfer_descs(
+    src_meta: "AuxBufferMeta",
+    dst_meta: "AuxBufferMeta",
+    src_slot: int,
+    dst_slot: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build per-buffer (src_ptr, dst_ptr, size) descriptors for one aux-slot transfer.
+
+    The ctx and gen servers may be built with different speculative configs
+    (ctx/gen spec-config split), so a buffer's per-slot item size can differ
+    between the two sides — e.g. the draft-token buffer is sized by
+    max_draft_len, which is 0 on a ctx server without speculative_config and
+    >0 on an SA/NGram gen server. Offsets must therefore use each side's OWN
+    item stride, the transfer size must be clamped to min(src, dst) item size
+    (writing src-sized items through a smaller dst stride would overrun into
+    the next slot / past the buffer), and zero-size entries are dropped
+    (nothing to move, and zero-byte RDMA descriptors are agent-dependent
+    behavior).
+
+    Returns:
+        (src_ptrs, dst_ptrs, sizes) as int64 arrays of equal length.
+    """
+    src_ptrs = src_meta.ptrs + src_meta.item_sizes * src_slot
+    dst_ptrs = dst_meta.ptrs + dst_meta.item_sizes * dst_slot
+    sizes = np.minimum(src_meta.item_sizes, dst_meta.item_sizes).astype(np.int64, copy=False)
+    nonzero = sizes > 0
+    return (
+        src_ptrs[nonzero].astype(np.int64, copy=False),
+        dst_ptrs[nonzero].astype(np.int64, copy=False),
+        sizes[nonzero],
+    )
+
+
 class AuxBufferBase(ABC):
     """
     Abstract base class defining the interface for auxiliary buffer management.
