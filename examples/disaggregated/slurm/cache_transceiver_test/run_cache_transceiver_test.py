@@ -298,7 +298,7 @@ def _wait_ctx_complete(xcvr, rid, runtime):
       real executor that is benign (the session stays open and is re-polled
       every iteration), but returning here would free and refill the KV blocks
       mid-flight, so the receiver reads the NEXT request's pattern (verify FAIL
-      on every request except the last; job 2656113 sweep 0). So poll until
+      on every request except the last). So poll until
       this rid lands in the completed/failed lists. Collectively safe: every
       ctx rank loops on the same rid and the per-call consensus makes all
       ranks observe completion on the same iteration. The per-cell
@@ -678,7 +678,8 @@ def main():
             # rides a fabric-VMM staging buffer (CU_MEM_HANDLE_TYPE_FABRIC), which
             # is what lets UCX pick cuda_ipc across NVL72 nodes -- direct
             # pool-to-pool transfers from non-fabric allocations fall back to
-            # host-staged tcp (see docs/kimi_k3_v2_mpi_hang_rootcause.md).
+            # much slower host-staged tcp, so enable bounce for cross-node
+            # transfers inside an NVLink domain.
             kv_cache_bounce_size_mb=int(cfg["kv_cache"].get("bounce_size_mb", 0)),
         )
 

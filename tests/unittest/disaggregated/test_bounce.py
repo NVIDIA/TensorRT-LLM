@@ -602,14 +602,14 @@ class TestFanInReserve:
 # trailing-empty-group handling, and recurrent-state (extra_bytes) sizing
 # --------------------------------------------------------------------------- #
 
-# Kimi K3 geometry (docs/kimi_k3_kda_payload_memo.md): 24 MLA layers in one
-# attention layer group; 69 KDA layers whose per-layer recurrent state is a
-# bf16 short-conv slot + fp32 delta slot, replicated per rank.
+# Kimi K3 geometry: 24 MLA layers in one attention layer group; 69 KDA layers
+# whose per-layer recurrent state is a bf16 short-conv slot + fp32 delta slot,
+# replicated per rank.
 _K3_MLA_BLOCK_BYTES = 32 * 576 * 2 * 24  # tpb x (kv_lora_rank+rope) x bf16 x 24 layers = 884,736
 _K3_KDA_LAYERS = 69
 _K3_CONV_SLOT_BYTES = 294_912  # [3*H*hd, W] bf16 per layer
 _K3_SSM_SLOT_BYTES = 6_291_456  # [H, hd, hd] fp32 per layer (95.5% of the state)
-_K3_KDA_PAYLOAD_BYTES = 454_459_392  # memo §2: 69 x (conv + delta) per request per rank
+_K3_KDA_PAYLOAD_BYTES = 454_459_392  # 69 x (conv + delta) per request per rank, from the geometry above
 
 
 def _k3_page_table() -> KVCachePageTable:
@@ -651,7 +651,7 @@ class TestHybridK3Bounce:
         assert btr.block_bytes_per_group(_k3_page_table()) == [_K3_MLA_BLOCK_BYTES, None]
 
     def test_reserve_engages_on_k3_mixed_layout(self, monkeypatch):
-        # THE M1.1 regression pin: a K3 recv request always carries a trailing EMPTY entry for
+        # Regression pin: a K3 recv request always carries a trailing EMPTY entry for
         # the mamba layer group (transceiver._create_kv_slice), which used to trip the
         # unknown-slot-size guard and silently push every K3 request onto the per-fragment
         # (~0.4 GB/s host-staged) path. It must engage bounce, sized for MLA KV + KDA state.
@@ -690,9 +690,9 @@ class TestHybridK3Bounce:
         assert t.reserve(_recv_req([2, 0]), num_writers=2, extra_bytes=64) is False
         assert t.reserve(_recv_req([2, 0]), num_writers=2) is True  # no state -> fan-in fine
 
-    def test_mamba_payload_bytes_matches_k3_memo(self):
-        # Matched-TP replicated KDA state: payload_bytes must reproduce the audited per-request
-        # per-rank number from docs/kimi_k3_kda_payload_memo.md exactly.
+    def test_mamba_payload_bytes_matches_k3_geometry(self):
+        # Matched-TP replicated KDA state: payload_bytes must reproduce the per-request
+        # per-rank number derived from K3's KDA geometry (constants above) exactly.
         pt = _k3_page_table()
         ri = _k3_rank_info()
         got = MambaPolicy.payload_bytes(
