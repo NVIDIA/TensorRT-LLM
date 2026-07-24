@@ -15,6 +15,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import copy
 import itertools
 from dataclasses import dataclass
 from typing import (
@@ -319,22 +320,14 @@ class MultimodalModelMixin:
 
     * For the time being, the persistent multimodal encoder cache stores per-item embeddings for
       single-modality `MultimodalParams` objects. Mixed-modality objects bypass the cache.
-    * Per-item cache reuse is all-or-nothing by default. Models can opt into partial reuse by
-      implementing `slice_multimodal_data_items` and setting
-      `supports_granular_encoder_cache = True`; miss items are re-encoded and interleaved with
-      cached items in original per-item order.
+    * A partially cached `MultimodalParams` is handled by encoding only its miss items
+      and interleaving cached items back in original per-item order. The default
+      `build_multimodal_encoder_input` handles stacked-on-dim-0 and packed-with-grid-thw
+      layouts; models with other layouts override that method.
     """
 
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
-
-    supports_granular_encoder_cache: ClassVar[bool] = False
-    """Whether the mixin may reuse a partial cache hit for this model.
-
-    When True, a partially cached `MultimodalParams` is handled by encoding only its miss
-    items and interleaving cached items back in per-item order. Requires the model to
-    implement `slice_multimodal_data_items`.
-    """
 
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
@@ -451,7 +444,7 @@ class MultimodalModelMixin:
         # them as extra embeds without changing the base flow.
         return active_embeddings, ()
 
-    def slice_multimodal_data_items(
+    def build_multimodal_encoder_input(
         self,
         param: MultimodalParams,
         item_indices: Sequence[int],
@@ -459,12 +452,72 @@ class MultimodalModelMixin:
         """Return a `MultimodalParams` whose raw modality inputs contain only
         `item_indices` from `param`, in that order.
 
-        Only the model knows how to slice its own modality tensors (`pixel_values`,
-        `image_grid_thw`, packed audio features, ...). The parallel per-item metadata
+        Default handles two common single-modality layouts:
+
+        - Stacked on dim 0 (Mistral 3 / Pixtral / LLaVA-family): `pixel_values`
+          `[B, C, H, W]` with a parallel `image_sizes` list; both sliced by item.
+        - Packed with `*_grid_thw` offsets (Qwen2-VL family): `pixel_values`
+          `[total_patches, feat]` + `image_grid_thw` `[B, 3]`; prefix-summed patch
+          counts locate each item's slice, and `image_grid_thw` is sliced in parallel.
+
+        Models with a different layout (e.g. mixed-modality per param, custom packed
+        formats) override this method. The parallel per-item metadata
         (`multimodal_embedding_lengths`, `multimodal_hashes`) is re-sliced by the mixin
-        after this returns, so implementations should focus on modality data only.
+        after this returns, so overrides need only handle modality data.
         """
-        raise NotImplementedError
+        modality = self._encoder_cache_modality(param)
+        if modality is None:
+            raise NotImplementedError(
+                "Default `build_multimodal_encoder_input` only supports single-modality "
+                "params. Override for other layouts."
+            )
+        modality_data = param.multimodal_data[modality]
+        if not isinstance(modality_data, dict):
+            raise TypeError(
+                f"multimodal_data[{modality!r}] must be a dict, got {type(modality_data).__name__}"
+            )
+
+        indices = list(item_indices)
+        grid_key = {"image": "image_grid_thw", "video": "video_grid_thw"}.get(modality)
+        pixel_key = {"image": "pixel_values", "video": "pixel_values_videos"}.get(modality)
+
+        if grid_key and pixel_key and grid_key in modality_data and pixel_key in modality_data:
+            # Packed layout: prefix-sum patch counts to locate each item's slab, then
+            # concat the requested subset in item-index order.
+            grids = modality_data[grid_key]
+            patch_counts = [int(c) for c in torch.prod(grids, dim=1).tolist()]
+            per_item = torch.split(modality_data[pixel_key], patch_counts, dim=0)
+            sliced = {
+                **modality_data,
+                pixel_key: torch.cat([per_item[i] for i in indices], dim=0),
+                grid_key: grids[indices],
+            }
+        elif (
+            modality == "image"
+            and "pixel_values" in modality_data
+            and "image_sizes" in modality_data
+        ):
+            # Stacked layout: dim-0 select from `pixel_values` and list-index `image_sizes`.
+            sliced = {
+                **modality_data,
+                "pixel_values": modality_data["pixel_values"][indices],
+                "image_sizes": [modality_data["image_sizes"][i] for i in indices],
+            }
+        else:
+            raise NotImplementedError(
+                f"Default `build_multimodal_encoder_input` cannot slice {modality} layout "
+                f"with fields {sorted(modality_data)}; override this method."
+            )
+
+        # Shallow-copy `multimodal_input` so `_apply_metadata_slice` can rewrite
+        # `multimodal_hashes` on the residual without mutating the source.
+        residual_input = (
+            copy.copy(param.multimodal_input) if param.multimodal_input is not None else None
+        )
+        return MultimodalParams(
+            multimodal_data={**param.multimodal_data, modality: sliced},
+            multimodal_input=residual_input,
+        )
 
     # A future optional mixin-owned forward can build on the same template method.
     def prepare_multimodal_inputs(
@@ -546,19 +599,16 @@ class MultimodalModelMixin:
                     # The forward that attached this request-local embedding already populated the
                     # persistent cache.
                     continue
-                partition = self._partition_encoder_cache(param, encoder_cache)
+                partition = self.partition_encoder_cache(param, encoder_cache)
                 if partition is None or partition.is_full_miss:
                     cache_misses.append(param)
                     continue
                 if partition.is_full_hit:
-                    param.multimodal_data["multimodal_embedding"] = self._assemble_full_embedding(
+                    param.multimodal_data["multimodal_embedding"] = self.assemble_full_embedding(
                         partition.hits, len(partition.keys)
                     )
                     continue
-                if self.supports_granular_encoder_cache:
-                    partial_hits.append((param, partition))
-                else:
-                    cache_misses.append(param)
+                partial_hits.append((param, partition))
 
         if partial_hits:
             # `encoder_cache` is non-None here because partitions are only produced when the cache
@@ -719,7 +769,7 @@ class MultimodalModelMixin:
         ]
 
     @classmethod
-    def _partition_encoder_cache(
+    def partition_encoder_cache(
         cls,
         param: MultimodalParams,
         encoder_cache: TensorLRUCache,
@@ -756,7 +806,7 @@ class MultimodalModelMixin:
         return EncoderCachePartition(hits=hits, miss_indices=miss_indices, keys=keys)
 
     @staticmethod
-    def _assemble_full_embedding(
+    def assemble_full_embedding(
         item_tensors: Dict[int, torch.Tensor],
         total_items: int,
     ) -> torch.Tensor:
@@ -776,7 +826,7 @@ class MultimodalModelMixin:
     ) -> None:
         """Overwrite `residual`'s per-item metadata to match the sliced items.
 
-        Models slice raw modality tensors in `slice_multimodal_data_items`; the mixin owns
+        Models slice raw modality tensors in `build_multimodal_encoder_input`; the mixin owns
         the parallel per-item metadata slice so every model gets it identically.
         """
         source_lengths = source.multimodal_data["multimodal_embedding_lengths"]
@@ -799,7 +849,7 @@ class MultimodalModelMixin:
         cached.
         """
         for param, partition in partials:
-            residual = self.slice_multimodal_data_items(param, partition.miss_indices)
+            residual = self.build_multimodal_encoder_input(param, partition.miss_indices)
             self._apply_metadata_slice(residual, param, partition.miss_indices)
 
             residual_output = self.encode_multimodal_inputs([residual])
@@ -812,7 +862,7 @@ class MultimodalModelMixin:
             by_item: Dict[int, torch.Tensor] = dict(partition.hits)
             for miss_idx, tensor in zip(partition.miss_indices, miss_tensors, strict=True):
                 by_item[miss_idx] = tensor
-            param.multimodal_data["multimodal_embedding"] = self._assemble_full_embedding(
+            param.multimodal_data["multimodal_embedding"] = self.assemble_full_embedding(
                 by_item, len(partition.keys)
             )
 
