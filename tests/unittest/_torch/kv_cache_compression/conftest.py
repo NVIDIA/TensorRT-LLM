@@ -288,6 +288,7 @@ def make_buffer_stubs(manager, *, decode_width=260):
     )
     built_attributes = dict(
         _decode_width=decode_width,
+        _bucket_seq_len=1024,
         _page_table_token_capacity=65537,
         _max_requests=8,
         _token_starts_device=torch.zeros(8, dtype=torch.int32),
@@ -551,8 +552,17 @@ def make_cute_buffers(
         storage_groups = {0: list(range(num_layers))}
     if layer_pool_ids is None:
         layer_pool_ids = [0] * num_layers
+    # A live-manager source table exactly wide enough for the requested
+    # capacity (the staged width clamps to it).
+    requested_tokens = seq_len if page_table_token_capacity is None else page_table_token_capacity
+    tokens_per_block = int(layer_pools[0].shape[3])
+    source_blocks = -(-int(requested_tokens) // tokens_per_block)
+    source_blocks = (source_blocks + 3) // 4 * 4
     layout = dict(
-        manager=SimpleNamespace(num_pools=max(layer_pool_ids) + 1),
+        manager=SimpleNamespace(
+            num_pools=max(layer_pool_ids) + 1,
+            host_kv_cache_block_offsets=torch.empty(1, 1, 2, source_blocks, dtype=torch.int32),
+        ),
         layer_pools=layer_pools,
         dense_layers=list(range(num_layers)),
         swa_layers=[],
@@ -569,6 +579,9 @@ def make_cute_buffers(
     manager._draft_protected_tail_capacity = None
     manager.eviction_mode = eviction_mode
     manager.normalize_scores = normalize_scores
+    manager._staging_reuse_event = None
+    manager._block_offsets_ready_event = None
+    manager._compaction_done_event = None
     manager._phase = make_phase_table(offsets, omega, seq_len)
     manager._build_buffers(
         layout=layout,

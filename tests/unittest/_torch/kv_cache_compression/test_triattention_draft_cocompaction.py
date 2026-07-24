@@ -429,3 +429,67 @@ def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
         assert prepare.call_count == 2
         assert manager._buffers_built
         assert manager._decode_width == built_attributes["_decode_width"] + 8
+
+
+def test_source_growth_beyond_score_bucket_rebuilds_buffers():
+    """A later cohort can grow max(source_length) past the compiled score
+    bucket while decode width, page tokens, and request count all still fit;
+    the reuse gate must rebuild instead of scoring past the static geometry."""
+    manager = _make_triattention(budget=4)
+    layout, built_attributes = _make_buffer_stubs(manager)
+    prepared = [
+        _make_prepared_item(
+            _make_request(7),
+            request_id=7,
+            seq_len=1024,
+            prompt_len=1020,
+            expected_keep_count=4,
+        )
+    ]
+
+    def apply_built(**kwargs):
+        for name, value in built_attributes.items():
+            setattr(manager, name, value)
+
+    with mock.patch.object(manager, "_build_buffers", side_effect=apply_built) as prepare:
+        manager._ensure_buffers(layout, prepared)
+        assert prepare.call_count == 1
+        # One more source token, same decode width and request count.
+        grown = [
+            _make_prepared_item(
+                _make_request(7),
+                request_id=7,
+                seq_len=1025,
+                prompt_len=1021,
+                expected_keep_count=4,
+            )
+        ]
+        manager._ensure_buffers(layout, grown)
+        assert prepare.call_count == 2
+
+
+def test_staged_block_width_clamps_to_manager_source_width():
+    """Score tile rounding can request more page-table blocks than the live V2
+    source table holds; the staged width must clamp to the manager width so the
+    native gather never reads past the K plane (tpb=32, max_seq_len=96, tail=1)."""
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+        _allocate_block_offset_staging,
+    )
+
+    anchor_pool = torch.empty(1, 2, 1, 32, 4)
+    host, device_table = _allocate_block_offset_staging(
+        anchor_pool,
+        num_pools=1,
+        max_requests=2,
+        token_capacity=129,
+        max_source_blocks=4,
+    )
+    assert host.shape[-1] == 4 and device_table.shape[-1] == 4
+    host, device_table = _allocate_block_offset_staging(
+        anchor_pool,
+        num_pools=1,
+        max_requests=2,
+        token_capacity=129,
+        max_source_blocks=64,
+    )
+    assert host.shape[-1] == 8 and device_table.shape[-1] == 8

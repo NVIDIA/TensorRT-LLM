@@ -70,13 +70,16 @@ def _allocate_block_offset_staging(
     num_pools: int,
     max_requests: int,
     token_capacity: int,
+    max_source_blocks: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """One pinned host snapshot + persistent device table pair in the native
     V2 ``[pool, request, K/V, block]`` layout (block width 4-aligned for the
-    ``PackedInt`` copy ABI); the device follows the anchor KV pool."""
+    ``PackedInt`` copy ABI); the device follows the anchor KV pool. The staged
+    width is clamped to the manager's live source-table width: static bucket
+    slack never holds valid tokens and the native gather copies the full width."""
     tokens_per_block = int(anchor_pool.shape[3])
     page_count = (token_capacity + tokens_per_block - 1) // tokens_per_block
-    staged_blocks_per_seq = (page_count + 3) // 4 * 4
+    staged_blocks_per_seq = min((page_count + 3) // 4 * 4, int(max_source_blocks))
     shape = (num_pools, max_requests, 2, staged_blocks_per_seq)
     host = torch.empty(shape, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned())
     device_table = torch.empty(shape, dtype=torch.int32, device=anchor_pool.device)
@@ -163,9 +166,14 @@ class TriAttention(KVCacheCompressionManager):
                 + 1
             )
         self._generation_growth = 1 + int(kv_cache_manager._kv_reserve_draft_tokens)
-        # Buffers build once at the first eviction as plain attributes on this
-        # manager and stay resident for the manager's lifetime.
+        # Lazy resident eviction runtime: built at the first eviction, reused
+        # across rounds, and replaced as a whole when a capacity axis grows.
         self._buffers_built = False
+        # Round-ordering events: device-lifetime, created at the first build
+        # and reused across capacity rebuilds.
+        self._staging_reuse_event: Optional[torch.cuda.Event] = None
+        self._block_offsets_ready_event: Optional[torch.cuda.Event] = None
+        self._compaction_done_event: Optional[torch.cuda.Event] = None
         # Manager-lifetime layer facts, resolved once: V2 fixes pp_layers at
         # construction and the model config is immutable on disk.
         self._global_layers = [int(layer) for layer in kv_cache_manager.pp_layers]
@@ -827,6 +835,7 @@ class TriAttention(KVCacheCompressionManager):
     ) -> None:
         # Empty cohorts never reach here: _periodic_evict no-ops pre-launch.
         needed_width = max(item["seq_len"] - item["prompt_len"] for item in prepared)
+        needed_score_tokens = max(item["seq_len"] for item in prepared)
         needed_page_tokens = max(item["seq_len"] + item["protected_tail"] for item in prepared)
         needed_requests = len(prepared)
         if self.draft_kv_cache_manager is not None:
@@ -836,11 +845,15 @@ class TriAttention(KVCacheCompressionManager):
         if self._buffers_built:
             if (
                 needed_width <= self._decode_width
+                and needed_score_tokens <= self._bucket_seq_len
                 and needed_page_tokens <= self._page_table_token_capacity
                 and needed_requests <= self._max_requests
             ):
                 return
-            # This round outgrew the buffers: rebuild.
+            # This round outgrew the buffers: wait out the prior round (its
+            # completion event orders after every use of the old epoch), then rebuild.
+            if self._compaction_done_event is not None:
+                self._compaction_done_event.synchronize()
             self._buffers_built = False
 
         mgr = self.kv_cache_manager
@@ -970,6 +983,7 @@ class TriAttention(KVCacheCompressionManager):
             num_pools=num_page_table_slots,
             max_requests=max_requests,
             token_capacity=page_table_token_capacity,
+            max_source_blocks=int(layout["manager"].host_kv_cache_block_offsets.shape[-1]),
         )
         # The draft is never scored: these offsets feed only the draft compacts.
         self._draft_block_offsets_device = None
@@ -990,6 +1004,9 @@ class TriAttention(KVCacheCompressionManager):
                     num_pools=int(draft_layout["manager"].num_pools),
                     max_requests=max_requests,
                     token_capacity=int(draft["page_table_token_capacity"]),
+                    max_source_blocks=int(
+                        draft_layout["manager"].host_kv_cache_block_offsets.shape[-1]
+                    ),
                 )
             )
 
@@ -1396,13 +1413,16 @@ class TriAttention(KVCacheCompressionManager):
         self._compaction_params = tuple(compaction_params)
 
         # ---- round-ordering events ----------------------------------------------
-        # Host staging (pinned metadata + snapshots) reuse fence.
-        self._staging_reuse_event = torch.cuda.Event()
-        self._staging_reuse_event.record(torch.cuda.current_stream(device))
-        # Manager-stream H2D of the block-offset tables has completed.
-        self._block_offsets_ready_event = torch.cuda.Event()
-        # This cohort's compact is done: manager may resize/reuse pages.
-        self._compaction_done_event = torch.cuda.Event()
+        # Device-lifetime: created once and reused across capacity rebuilds
+        # (they carry no pointer state; replacing them orphans in-flight ordering).
+        if self._staging_reuse_event is None:
+            # Host staging (pinned metadata + snapshots) reuse fence.
+            self._staging_reuse_event = torch.cuda.Event()
+            self._staging_reuse_event.record(torch.cuda.current_stream(device))
+            # Manager-stream H2D of the block-offset tables has completed.
+            self._block_offsets_ready_event = torch.cuda.Event()
+            # This cohort's compact is done: manager may resize/reuse pages.
+            self._compaction_done_event = torch.cuda.Event()
 
     def _local_score_calibration(
         self,
