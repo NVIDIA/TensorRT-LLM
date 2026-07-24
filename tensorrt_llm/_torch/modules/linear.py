@@ -1431,7 +1431,10 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
-        allowed_backends_str = ','.join(module.nvfp4_allowed_backends)
+        sm_version = get_sm_version()
+        use_marlin = (90 <= sm_version < 100 and module.dtype == torch.bfloat16)
+        allowed_backends_str = ('marlin' if use_marlin else ','.join(
+            module.nvfp4_allowed_backends))
         output_buffer_kind = (
             int(BufferKind.NCCL_WINDOW)
             if self.supports_nccl_symmetric_memory_window_output
@@ -1443,7 +1446,7 @@ class NVFP4LinearMethod(LinearMethodBase):
                  and module.mapping is not None else None)
         # Fuse bias inside the GEMM op when N is unpadded and the output is a
         # plain buffer; otherwise fall back to post-op `out + bias` below.
-        fuse_bias_in_gemm = (bias is not None
+        fuse_bias_in_gemm = (bias is not None and not use_marlin
                              and output_buffer_kind == int(BufferKind.DEFAULT)
                              and module.weight.shape[0] == module.out_features)
         output = torch.ops.trtllm.nvfp4_gemm(
@@ -1905,9 +1908,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
 
 class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
-    """W4A16 NVFP4 linear with a small-M CUDA-core fast path."""
-
-    CUDA_CORE_MAX_M: ClassVar[int] = 16
+    """W4A16 NVFP4 linear using on-the-fly weight dequantization."""
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -1992,8 +1993,7 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
             super().process_weights_after_loading_fused_gate_up_linear)
 
     def transform_weights(self, module: Linear) -> None:
-        # Keep the checkpoint layout for the CUDA-core path and materialize the
-        # much smaller linear scale view once for Triton dequantization.
+        # Materialize the smaller linear scale view once for Triton dequantization.
         LinearMethodBase.transform_weights(self, module)
         self.cache_derived_state(module)
 
@@ -2031,17 +2031,6 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
             input = input * module.pre_quant_scale
         return input, original_shape
 
-    @classmethod
-    def _can_use_cuda_core(cls, module: Linear, input: torch.Tensor) -> bool:
-        return (input.dim() == 2 and 0 < input.shape[0] <= cls.CUDA_CORE_MAX_M
-                and get_sm_version() in (120, 121)
-                and input.dtype in (torch.float16, torch.bfloat16)
-                and module.dtype in (torch.float16, torch.bfloat16)
-                and input.is_contiguous() and input.shape[1] % 32 == 0
-                and module.weight.shape[0] % 2 == 0
-                and module.weight.shape[1] * 2 == input.shape[1]
-                and hasattr(torch.ops.trtllm, "w4a16_nvfp4_gemm"))
-
     @staticmethod
     def _restore_output(output: torch.Tensor, original_shape,
                         bias: Optional[torch.Tensor]):
@@ -2054,17 +2043,6 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         input, original_shape = self._prepare_input(module, input)
-        if self._can_use_cuda_core(module, input):
-            output = torch.ops.trtllm.w4a16_nvfp4_gemm(
-                input,
-                module.weight,
-                module.weight_scale,
-                module.weight_scale_2,
-                module.dtype,
-                bias=None,
-            )
-            return self._restore_output(output, original_shape, bias)
-
         from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import \
             dequant_nvfp4_2d_triton
         weight_deq = dequant_nvfp4_2d_triton(
@@ -2104,7 +2082,8 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
 
     @staticmethod
     def is_supported(module: Linear) -> bool:
-        return (get_sm_version() in (120, 121)
+        sm_version = get_sm_version()
+        return ((90 <= sm_version < 100 or sm_version in (120, 121))
                 and getattr(module, "dtype", None) == torch.bfloat16
                 and not getattr(module, "use_fused_gemm_allreduce", False)
                 and hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
@@ -3311,7 +3290,9 @@ class Linear(nn.Module):
             nvfp4_allowed_backends: List of backends to consider for NVFP4 GEMM auto-selection.
                 Default (via config): ['cutlass', 'cublaslt', 'cuda_core'] - excludes cutedsl for faster build.
                 Add 'cutedsl' for extreme performance at the cost of longer build time.
-                Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.
+                Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'.
+                NVFP4 uses Marlin by default on Hopper. W4A16 BF16 linear
+                layers use Marlin by default on Hopper and SM120/121.
                 Configure via nvfp4_gemm_config.allowed_backends in extra_llm_api_options.yaml.
         """
         from ..distributed import AllReduce
