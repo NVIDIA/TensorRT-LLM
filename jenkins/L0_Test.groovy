@@ -1186,6 +1186,13 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " NCCL_DEBUG=INFO"
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
+    // Persist the AutoTuner profiling cache to a CONTAINER-LOCAL, volatile path so
+    // that repeated tactic profiling is reused across testcases within one stage.
+    // /tmp lives on the container overlay (srun --no-container-mount-home / fresh
+    // pod), so the cache is never written to the host and vanishes when the stage
+    // container is destroyed. Never point this at a bind-mounted / shared path:
+    // the AutoTuner cache uses fcntl.lockf, which is unreliable over NFS.
+    extraInternalEnv += " TLLM_AUTOTUNER_CACHE_PATH=/tmp/trtllm_autotuner_cache/autotuner_cache.json"
     // CBTS stages put cbts_plugin on PYTHONPATH (via ${VAR:-} for set -u safety) plus the marker/config env vars sitecustomize.py reads in subprocesses.
     if (cbtsMode) {
         def cbtsScriptDir = "${llmSrc}/jenkins/scripts/cbts/coverage_utils"
