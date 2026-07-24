@@ -81,6 +81,14 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         self.spec_tree_manager = None
         self._d2t = None
 
+        # (all_rank_num_tokens, force_prepare_spec_dec_tree_mask) snapshot taken by
+        # _forward_impl before mutating attn_metadata; None means "not saved / already
+        # restored" (all_rank_num_tokens is legitimately None outside ADP, so we can't
+        # use it directly as a sentinel). Restored by _ensure_spec_dec_state_restored
+        # on the failure path so a tolerated forward exception does not leak state
+        # into subsequent iterations.
+        self._saved_extra_state = None
+
         # Pre-allocated draft-loop buffers (CUDA-graph safe).
         self.draft_tokens_buffer = torch.zeros(
             max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
@@ -226,6 +234,20 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                 self._saved_generation_lengths
             )
             self._saved_generation_lengths = None
+
+    def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
+        # Base cleanup handles the has_spec_dec_saved_state path. Undo the
+        # dynamic-tree-only mutations (all_rank_num_tokens,
+        # force_prepare_spec_dec_tree_mask) so a tolerated forward failure
+        # does not leak the pre-draft-loop state into later iterations.
+        super()._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
+        if attn_metadata is None or self._saved_extra_state is None:
+            return
+        (
+            attn_metadata.all_rank_num_tokens,
+            attn_metadata.force_prepare_spec_dec_tree_mask,
+        ) = self._saved_extra_state
+        self._saved_extra_state = None
 
     # ------------------------------------------------------------------ #
     # Helpers                                                            #
@@ -681,9 +703,13 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                 accepted_leaf_positions=accepted_leaf_positions,
             )
 
-        # Save attn/spec metadata before the draft loop mutates it.
-        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        original_force_prepare_spec_dec_tree_mask = attn_metadata.force_prepare_spec_dec_tree_mask
+        # Save attn/spec metadata before the draft loop mutates it. Stashed on
+        # self so _ensure_spec_dec_state_restored can undo the mutation if the
+        # draft loop raises (see SpecWorkerBase.forward try/finally).
+        self._saved_extra_state = (
+            attn_metadata.all_rank_num_tokens,
+            attn_metadata.force_prepare_spec_dec_tree_mask,
+        )
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
         attn_metadata.force_prepare_spec_dec_tree_mask = True
 
@@ -706,8 +732,11 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
 
         # Restore attn metadata to support cuda graph.
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
-        attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
-        attn_metadata.force_prepare_spec_dec_tree_mask = original_force_prepare_spec_dec_tree_mask
+        (
+            attn_metadata.all_rank_num_tokens,
+            attn_metadata.force_prepare_spec_dec_tree_mask,
+        ) = self._saved_extra_state
+        self._saved_extra_state = None
         attn_metadata.use_spec_decoding = True
 
         # (d) Prepare next_new_tokens for overlap scheduler.
