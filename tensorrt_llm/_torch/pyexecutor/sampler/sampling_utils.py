@@ -22,7 +22,7 @@ import abc
 import sys
 from collections.abc import Hashable
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Type, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, Type, TypeAlias, TypeVar, cast
 
 import torch
 
@@ -52,6 +52,9 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
 )
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.sampling_params import SamplingParams
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 # Ops imported above are re-exported for dependent modules (sampler, drafting
 # loops, tests). mypy runs in strict mode (no implicit re-export), so they must
@@ -931,48 +934,59 @@ def compute_probs_from_logits(
     """Compute filtered+normalized probs via flashinfer (hard dependency).
 
     ``temperatures``, ``top_k``, ``top_p`` are per-request tensors matching the
-    spec-decoding call site in interface.py.
+    spec-decoding call site in interface.py. A ``None`` top_k / top_p skips that
+    filter's kernel.
     """
     if top_k is not None:
         top_k = sanitize_top_k(top_k, logits.shape[-1])
-
     return flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
 
 
+def resolve_advanced_sampling_filters(
+    advanced_sampling_mode: "AdvancedSamplingMode",
+    top_k: Optional[torch.Tensor],
+    top_p: Optional[torch.Tensor],
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Resolve advanced_sampling_mode to effective (top_k, top_p) tensors.
+
+    A filter the mode disables (via ``skips_top_k`` / ``skips_top_p``), or one already
+    None, becomes None so the downstream op skips that kernel; kept filters pass through
+    unchanged (the op sanitizes top_k internally).
+    """
+    eff_top_k = None if advanced_sampling_mode.skips_top_k or top_k is None else top_k
+    eff_top_p = None if advanced_sampling_mode.skips_top_p or top_p is None else top_p
+    return eff_top_k, eff_top_p
+
+
 @torch.compile(options={"max-autotune": True})
-def sampling_batch_spec_dec_one_model(
+def sample_from_logits_op(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
+    top_k: Optional[torch.Tensor] = None,
+    top_p: Optional[torch.Tensor] = None,
     seed: Optional[torch.Tensor] = None,
     offset: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """CUDA-graph compatible sampling; supports mixed sampling params. Returns sampled tokens."""
-    top_k = sanitize_top_k(top_k, logits.shape[-1])
-    # Greedy rows (temperature <= threshold) must return the argmax token, not a
-    # sample from the temperature-scaled distribution. Capture the argmax from the
-    # *original* logits up front; safely_apply_temperature_inplace then guards the division
-    # against the greedy sentinel, and torch.where restores the greedy rows below.
-    # All ops are branch-free (no data-dependent control flow), so this stays
-    # CUDA-graph safe.
-    is_greedy = temperatures <= vanilla.GREEDY_TEMPERATURE_THRESHOLD
-    greedy_tokens = logits.argmax(dim=-1)
-    logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
-    sampled = flashinfer.top_k_top_p_sampling_from_logits_op(
-        logits, top_k, top_p, seed=seed, offset=offset
-    )
-    # argmax yields int64; cast so torch.where preserves the sampler's dtype
-    # (flashinfer returns int32) instead of promoting the result to int64.
-    return torch.where(is_greedy, greedy_tokens.to(sampled.dtype), sampled)
+    """CUDA-graph compatible one-model sampler; returns sampled tokens.
+
+    ``top_k`` / ``top_p`` are None when the caller's advanced_sampling_mode disables that
+    filter.
+    """
+    if top_k is not None:
+        top_k = sanitize_top_k(top_k, logits.shape[-1])
+        logits = top_k_mask_logits_op(logits, top_k)
+    probs = softmax_op(logits, temperatures)
+    if top_p is not None:
+        return top_p_sampling_from_probs_op(probs, top_p, seed=seed, offset=offset)
+    return sampling_from_probs_op(probs, seed=seed, offset=offset)
 
 
 @torch.compile(options={"max-autotune": True})
 def sampling_batch_spec_dec_one_model_for_rejection(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
+    top_k: Optional[torch.Tensor],
+    top_p: Optional[torch.Tensor],
     seed: Optional[torch.Tensor] = None,
     offset: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:

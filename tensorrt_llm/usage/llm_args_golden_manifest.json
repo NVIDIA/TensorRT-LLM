@@ -1636,6 +1636,18 @@
       "path": "speculative_config.acceptance_rate_window_size"
     },
     {
+      "allowed_values": [
+        "full",
+        "no_topk",
+        "no_topp",
+        "no_topk_no_topp"
+      ],
+      "annotation": "<enum 'AdvancedSamplingMode'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.advanced_sampling_mode"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
