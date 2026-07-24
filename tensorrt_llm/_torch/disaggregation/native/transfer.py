@@ -176,16 +176,16 @@ class AgentResult(Enum):
     FAILED = "FAILED"
 
 
-# KV_AGENT_RESULT prefix in one struct frame (was 5 ascii frames serialized/parsed under the
-# GIL per slice per writer): instance_rank, unique_rid, slice_id, is_last, status. The optional
-# bounce tail follows at message[2:].
-_KV_RESULT_PREFIX = struct.Struct("<qqq?B")
+# KV_AGENT_RESULT prefix in one struct frame (was ascii frames serialized/parsed under the
+# GIL per slice per writer): instance_rank, unique_rid, slice_id, is_last, status,
+# transfer_size. The optional bounce tail follows at message[2:].
+_KV_RESULT_PREFIX = struct.Struct("<qqq?Bq")
 _AGENT_RESULT_CODE = {AgentResult.SUCCESS: 0, AgentResult.FAILED: 1}
 _AGENT_RESULT_BY_CODE = {0: AgentResult.SUCCESS, 1: AgentResult.FAILED}
 
 
 def _make_kv_result_msg(
-    instance_rank, unique_rid, slice_id, is_last_slice, agent_result, tail=None
+    instance_rank, unique_rid, slice_id, is_last_slice, agent_result, transfer_size=0, tail=None
 ):
     """Build a KV_AGENT_RESULT message. ALL result sends (success AND failed/cancelled) must go
     through this single binary frame so the receiver's _KV_RESULT_PREFIX.unpack never hits a stale
@@ -198,6 +198,7 @@ def _make_kv_result_msg(
             int(slice_id),
             bool(is_last_slice),
             _AGENT_RESULT_CODE[agent_result],
+            int(transfer_size),
         ),
     ]
     if tail:
@@ -624,12 +625,14 @@ class Sender(SenderBase):
             if send_slot_id is not None and agent_result == AgentResult.SUCCESS
             else None
         )
+        transfer_size = timer.get_transfer_size(write_meta.peer_rank) if timer else 0
         result_msg = _make_kv_result_msg(
             self._instance_rank,
             write_meta.unique_rid,
             write_meta.slice_id,
             write_meta.is_last_slice,
             agent_result,
+            transfer_size=transfer_size,
             tail=tail,
         )
         self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(result_msg)
@@ -655,6 +658,8 @@ class Sender(SenderBase):
                 )
             else:
                 task.complete()
+                if all(t.status == TaskStatus.TRANSFERRED for t in session.kv_tasks):
+                    session.transfer_end_time = tensorrt_llm.bindings.global_steady_clock_now()
 
         logger.debug(
             f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
@@ -1206,6 +1211,8 @@ class TxSession(TxSessionBase):
         self._exception: Optional[Exception] = None
         self._closed = False
         self._terminal_status: Optional[SessionStatus] = None
+        self.transfer_start_time = None
+        self.transfer_end_time = None
         # Must be last: makes session visible to listener thread,
         # so all attributes above must be initialized first.
         self._sender.setup_session(self)
@@ -1238,6 +1245,8 @@ class TxSession(TxSessionBase):
         return SessionStatus.READY if self.receiver_ready else SessionStatus.INIT
 
     def send(self, slice: KVSlice) -> None:
+        if self.transfer_start_time is None:
+            self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         with self.lock:
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
@@ -1511,13 +1520,23 @@ class Receiver(ReceiverBase):
 
     def _build_recv_req_info(self, task: KVRecvTask) -> RecvReqInfo:
         self_ri = self._registrar.self_rank_info
-        assert task._params.ctx_request_id is not None, (
-            f"ctx_request_id is None for task unique_rid={task._unique_rid}"
-        )
         assert task._unique_rid is not None, "KVRecvTask unique_rid is None"
+        # Some requests arrive with ctx_request_id None while disagg_request_id
+        # is set; disagg_request_id is the receive-session key, so fall back to
+        # it instead of failing here (nvbugs/6482576).
+        sender_req_id = task._params.ctx_request_id
+        if sender_req_id is None:
+            sender_req_id = task._params.disagg_request_id
+        if sender_req_id is None:
+            # Not an assert: must survive python -O so a None id never reaches
+            # RecvReqInfo.sender_req_id / the wire.
+            raise ValueError(
+                "both ctx_request_id and disagg_request_id are None for task "
+                f"unique_rid={task._unique_rid}"
+            )
         # Receiver's cached prefix is implicit in block_ids size; sender derives dst_start.
         return RecvReqInfo(
-            sender_req_id=task._params.ctx_request_id,
+            sender_req_id=sender_req_id,
             instance_name=self_ri.instance_name,
             instance_rank=self_ri.instance_rank,
             block_ids_per_layer_groups=task._kv_slice.block_ids_per_layer_groups,
@@ -1725,7 +1744,7 @@ class Receiver(ReceiverBase):
                 f"_process_kv_agent_result: unexpected msg_type={message[0]!r}, expected KV_AGENT_RESULT"
             )
             return
-        peer_rank, unique_rid, sender_slice_id, is_last_slice, status_code = (
+        peer_rank, unique_rid, sender_slice_id, is_last_slice, status_code, transfer_size = (
             _KV_RESULT_PREFIX.unpack(message[1])
         )
         from .bounce import decode_result_tail
@@ -1745,6 +1764,7 @@ class Receiver(ReceiverBase):
             dst_ptrs=dst_ptrs,
             sizes=sizes,
             src_base=src_base,
+            transfer_size=transfer_size,
         )
 
     def _process_aux_agent_result(self, _send_id: bytes, message: list[bytes]):
@@ -1802,6 +1822,9 @@ class RxSession(RxSessionBase):
         self._exception: Optional[Exception] = None
         self._closed = False
         self._terminal_status: Optional[SessionStatus] = None
+        self.transfer_start_time = None
+        self.transfer_end_time = None
+        self.kv_cache_size_bytes: int = 0
         self._kv_tasks: list[KVRecvTask] = []
         self._aux_count = 0
         self._aux_status: TaskStatus = TaskStatus.INIT
@@ -1842,6 +1865,8 @@ class RxSession(RxSessionBase):
             self._kv_tasks[slice_id].status = TaskStatus.TRANSFERRING
 
     def receive(self, slice: KVSlice) -> None:
+        if self.transfer_start_time is None:
+            self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         params = self._base_args.params
         slice_id = len(self._kv_tasks)
         task = KVRecvTask(
@@ -1863,8 +1888,10 @@ class RxSession(RxSessionBase):
         dst_ptrs=None,
         sizes=None,
         src_base=None,
+        transfer_size: int = 0,
     ):
         with self.lock:
+            self.kv_cache_size_bytes += transfer_size
             assert sender_slice_id < len(self._kv_tasks), (
                 f"Receiver got slice_id={sender_slice_id} from sender but only has "
                 f"{len(self._kv_tasks)} receive task(s) for request {self.request_id}. "
@@ -1919,6 +1946,13 @@ class RxSession(RxSessionBase):
                                     f"slice={sender_slice_id}: {e}"
                                 )
                             task.complete()
+                            # Transfer end for perf/time-sync: only meaningful once every slice has
+                            # landed. Plain attribute write (atomic under the GIL); on_done must stay
+                            # lock-free, and consumers only read it after wait_complete succeeds.
+                            if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
+                                self.transfer_end_time = (
+                                    tensorrt_llm.bindings.global_steady_clock_now()
+                                )
                             logger.debug(
                                 f"KV transfer complete for request {request_id} "
                                 f"slice={sender_slice_id}"

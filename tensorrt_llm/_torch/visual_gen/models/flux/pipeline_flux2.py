@@ -336,8 +336,9 @@ class Flux2Pipeline(BasePipeline):
                     )
                 )
 
+            # Cache acceleration itself is enabled by the loader after
+            # torch.compile (see PipelineLoader.load).
             self._apply_teacache_coefficients(FLUX2_TEACACHE_COEFFICIENTS)
-            self._setup_cache_acceleration()
 
     @property
     def default_generation_params(self):

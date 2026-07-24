@@ -37,6 +37,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 import aiohttp
 import pytest
@@ -44,6 +45,7 @@ import uvicorn
 import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from prometheus_client.parser import text_string_to_metric_families
 
 from tensorrt_llm.llmapi.disagg_utils import (
     CtxGenServerConfig,
@@ -252,7 +254,10 @@ async def _wait_healthy(url, timeout_s=30.0):
     return False
 
 
-def test_disagg_completion_e2e_through_coordinator():
+def test_disagg_completion_e2e_through_coordinator(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
     with (
         _UvicornThread(_mock_worker_app("ctx"), _free_port()) as ctx,
         _UvicornThread(_mock_worker_app("gen"), _free_port()) as gen,
@@ -310,12 +315,27 @@ def _write_config(path, ctx_url, gen_url, public_port, num_workers=1):
         yaml.safe_dump(cfg, f)
 
 
-def test_disagg_completion_e2e_web_concurrency_4():
-    """Exercise the real CLI disaggregated-fleet path.
+def _request_counter_values(metrics_text: str) -> dict[str, float]:
+    requested_samples = {
+        "total_requests_total",
+        "nonstream_requests_total",
+        "total_responses_total",
+    }
+    return {
+        sample.name: sample.value
+        for family in text_string_to_metric_families(metrics_text)
+        for sample in family.samples
+        if sample.name in requested_samples
+    }
+
+
+def test_disagg_completion_e2e_web_concurrency_4() -> None:
+    """Exercise requests and Prometheus scrapes through a real CLI fleet.
 
     ``num_workers=4`` starts a coordinator and four disaggregated servers on the
-    public port. A completion traverses a fleet worker, coordinator, and mock
-    context/generation workers.
+    public port. Completions traverse fleet workers, the coordinator, and mock
+    context/generation workers. Independent scrape connections can land on any
+    fleet worker, and must all return the same deployment-wide request totals.
     """
     logger.set_level("info")  # trtllm logger defaults to "error"; show progress
     WORKERS = 4
@@ -340,6 +360,9 @@ def test_disagg_completion_e2e_web_concurrency_4():
             # trtllm logger defaults to "error"; raise it so the coordinator/fleet
             # launch logs are visible in the streamed [cli] output.
             env["TLLM_LOG_LEVEL"] = "info"
+            # The CLI parent must create a fresh directory for this deployment
+            # and pass it to all frontend workers.
+            env.pop("PROMETHEUS_MULTIPROC_DIR", None)
             # A plain HTTP fleet, never an MPI rank -- strip any launcher env so
             # the CLI's own strip is not even relied upon.
             for k in list(env):
@@ -395,24 +418,48 @@ def test_disagg_completion_e2e_web_concurrency_4():
                 asyncio.run(_wait_all())
 
                 async def drive():
-                    # Fire several requests so the kernel spreads them across the
-                    # 4 uvicorn workers. Every one must round-trip to GEN_TEXT.
-                    async with aiohttp.ClientSession() as sess:
-                        texts = []
-                        for i in range(8):
+                    # Separate concurrent connections allow SO_REUSEPORT to
+                    # distribute requests across the four frontend processes.
+                    async def complete(i):
+                        connector = aiohttp.TCPConnector(force_close=True)
+                        async with aiohttp.ClientSession(connector=connector) as sess:
                             payload = {"model": "m", "prompt": f"hello-{i}", "max_tokens": 8}
                             headers = {"X-Session-ID": f"conv-{i}"}
                             async with sess.post(
                                 f"{base}/v1/completions", json=payload, headers=headers, timeout=30
                             ) as r:
                                 assert r.status == 200, await r.text()
-                                texts.append((await r.json())["choices"][0]["text"])
-                            logger.info(f"request {i} -> {texts[-1]!r}")
-                        return texts
+                                return (await r.json())["choices"][0]["text"]
+
+                    return await asyncio.gather(*(complete(i) for i in range(8)))
 
                 texts = asyncio.run(drive())
                 assert all(t == GEN_TEXT for t in texts), texts
                 logger.info(f"all {len(texts)} requests round-tripped to GEN_TEXT")
+
+                async def scrape_metrics():
+                    async def scrape():
+                        connector = aiohttp.TCPConnector(force_close=True)
+                        async with aiohttp.ClientSession(connector=connector) as sess:
+                            async with sess.get(
+                                f"{base}/prometheus/metrics",
+                                headers={"Connection": "close"},
+                                timeout=30,
+                            ) as r:
+                                assert r.status == 200, await r.text()
+                                return _request_counter_values(await r.text())
+
+                    # Each scrape uses a separate connection and can be handled
+                    # by a different SO_REUSEPORT frontend process.
+                    return await asyncio.gather(*(scrape() for _ in range(16)))
+
+                scrape_values = asyncio.run(scrape_metrics())
+                expected = {
+                    "total_requests_total": len(texts),
+                    "nonstream_requests_total": len(texts),
+                    "total_responses_total": len(texts),
+                }
+                assert scrape_values == [expected] * len(scrape_values)
             finally:
                 # Kill the whole process group: the CLI parent + coordinator +
                 # all uvicorn workers. Terminating only proc leaves the workers
