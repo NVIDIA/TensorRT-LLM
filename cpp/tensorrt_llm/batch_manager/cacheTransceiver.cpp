@@ -36,6 +36,7 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/contextProgress.h"
+#include "tensorrt_llm/batch_manager/contextTransferCoordinator.h"
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
@@ -55,6 +56,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <numeric>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -503,6 +505,34 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     mCacheSender = std::make_unique<CacheSender>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
     mCacheReceiver = std::make_unique<CacheReceiver>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
 
+    // Keep automatic enablement within the currently qualified C++ NIXL/UCX TP1/CP1 pipeline topology.
+    bool const coordinatorTopologyEligible = worldConfig.getPipelineParallelism() > 1 && useMPI()
+        && backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL
+        && common::getEnvNixlBackend() == "UCX" && worldConfig.getTensorParallelism() == 1
+        && worldConfig.getContextParallelism() == 1 && !mCacheState->getParallelConfig().mEnableAttentionDP;
+    if (worldConfig.getPipelineParallelism() > 1 && useMPI())
+    {
+        TLLM_CHECK(mGroupPipeParaComm != nullptr);
+        constexpr std::uint64_t kCoordinatorProtocolVersion = 1;
+        std::uint64_t const localVersion = coordinatorTopologyEligible ? kCoordinatorProtocolVersion : 0;
+        constexpr bool cancellationEnabled = false;
+        std::uint64_t const localProtocolMode = (localVersion << 1) | static_cast<std::uint64_t>(cancellationEnabled);
+        std::vector<std::uint64_t> protocolModes(static_cast<std::size_t>(mGroupPipeParaComm->getSize()));
+        mGroupPipeParaComm->allgather(&localProtocolMode, protocolModes.data(), 1, mpi::MpiType::kUINT64);
+        TLLM_CHECK_WITH_INFO(std::all_of(protocolModes.begin(), protocolModes.end(),
+                                 [&](std::uint64_t const mode) { return mode == localProtocolMode; }),
+            "Context-transfer consensus protocol version or cancellation mode differs across PP ranks.");
+        if (localVersion != 0)
+        {
+            mContextTransferCoordinator = std::make_unique<ContextTransferCoordinator>(mGroupPipeParaComm);
+            TLLM_LOG_INFO(
+                "Enable asynchronous context-transfer consensus version %llu for PP group of size %d; in-flight "
+                "cancellation=%s.",
+                static_cast<unsigned long long>(kCoordinatorProtocolVersion), mGroupPipeParaComm->getSize(),
+                cancellationEnabled ? "enabled" : "disabled");
+        }
+    }
+
     initializeCommState();
 }
 
@@ -512,6 +542,7 @@ CacheTransceiver::~CacheTransceiver()
     // plugin are still alive. The workers can access both during termination.
     mCacheSender.reset();
     mCacheReceiver.reset();
+    mContextTransferCoordinator.reset();
 
     if (mWrapperLibHandle)
     {
@@ -769,6 +800,17 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         toCompleteIdSet.insert(request->mRequestId);
     }
 
+    auto recordOutcome
+        = [&](RequestIdType const requestId, std::shared_ptr<LlmRequest> const& request, bool const failed)
+    {
+        recordLocalTransferOutcome(requestId, request, failed, mCompletedSenderRequestIds, mFailedSenderRequestIds,
+            mSenderRequestsAwaitingConsensus);
+        if (mContextTransferCoordinator)
+        {
+            mContextTransferCoordinator->publishLocalOutcome(requestId, failed);
+        }
+    };
+
     // Record local terminal outcomes for requests selected this round. The
     // request is reported only after all ranks in the sync group agree that the
     // request reached a terminal state.
@@ -791,6 +833,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
         {
             auto const requestId = request->mRequestId;
+            bool terminal = false;
+            bool failed = false;
             try
             {
                 // Wait for up to a specified timeout
@@ -798,10 +842,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
                 {
                     future.get();
-                    bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
-                    recordLocalTransferOutcome(requestId, request, failed, mCompletedSenderRequestIds,
-                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
-                    it = mSenderFutures.erase(it);
+                    failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                    terminal = true;
                 }
                 else if (status == std::future_status::timeout)
                 {
@@ -813,18 +855,28 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 {
                     TLLM_LOG_ERROR(
                         "Future returned unexpected status for request %ld. Recording as failed.", requestId);
-
-                    recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
-                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
-                    it = mSenderFutures.erase(it);
+                    failed = true;
+                    terminal = true;
                 }
             }
             catch (std::exception const& e)
             {
                 TLLM_LOG_ERROR("Error occurred during context transfer for request %ld: %s", requestId, e.what());
-                recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
-                    mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                failed = true;
+                terminal = true;
+            }
+            catch (...)
+            {
+                TLLM_LOG_ERROR("Unknown error occurred during context transfer for request %ld", requestId);
+                failed = true;
+                terminal = true;
+            }
+            if (terminal)
+            {
+                auto terminalRequest = request;
                 it = mSenderFutures.erase(it);
+                // Publish outside the transfer-future try/catch. A protocol error must not rewrite an immutable vote.
+                recordOutcome(requestId, terminalRequest, failed);
             }
         }
         else
@@ -834,8 +886,35 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     }
 
     RequestStatuses requestsStatus{};
-    auto const consensusOutcome
-        = reduceTransferStates(syncComm, mGroupPipeParaComm, mCompletedSenderRequestIds, mFailedSenderRequestIds);
+    TransferConsensusOutcome consensusOutcome;
+    if (mContextTransferCoordinator)
+    {
+        auto mergeCoordinatorOutcome = [&]()
+        {
+            auto coordinatorOutcome = mContextTransferCoordinator->poll();
+            consensusOutcome.completedRequestIds.insert(
+                coordinatorOutcome.completedRequestIds.begin(), coordinatorOutcome.completedRequestIds.end());
+            consensusOutcome.failedRequestIds.insert(
+                coordinatorOutcome.failedRequestIds.begin(), coordinatorOutcome.failedRequestIds.end());
+        };
+        do
+        {
+            mergeCoordinatorOutcome();
+            if (blockAll
+                && consensusOutcome.completedRequestIds.size() + consensusOutcome.failedRequestIds.size()
+                    < mSenderRequestsAwaitingConsensus.size())
+            {
+                std::this_thread::yield();
+            }
+        } while (blockAll
+            && consensusOutcome.completedRequestIds.size() + consensusOutcome.failedRequestIds.size()
+                < mSenderRequestsAwaitingConsensus.size());
+    }
+    else
+    {
+        consensusOutcome
+            = reduceTransferStates(syncComm, mGroupPipeParaComm, mCompletedSenderRequestIds, mFailedSenderRequestIds);
+    }
     for (auto const requestId : consensusOutcome.failedRequestIds)
     {
         auto const requestIt = mSenderRequestsAwaitingConsensus.find(requestId);

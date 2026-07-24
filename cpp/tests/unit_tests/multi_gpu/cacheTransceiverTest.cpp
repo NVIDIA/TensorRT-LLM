@@ -31,6 +31,7 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/contextTransferCoordinator.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -42,6 +43,7 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -53,6 +55,7 @@
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
+#include <thread>
 
 #include "gtest/gtest.h"
 #include <gmock/gmock.h>
@@ -88,6 +91,95 @@ T serializeDeserialize(T const& val)
 }
 
 } // namespace
+
+TEST(ContextTransferCoordinatorTest, CommitsStaggeredSuccessAndFailureWithoutCollectivePolling)
+{
+    auto& world = tensorrt_llm::mpi::MpiComm::world();
+    if (world.getSize() < 2)
+    {
+        GTEST_SKIP() << "mpirun with at least two processes is required to run this test.";
+    }
+
+    auto comm = std::make_shared<CacheTransceiverComm>(std::addressof(world));
+    {
+        ContextTransferCoordinator coordinator(comm);
+        auto waitForOutcome = [&](std::uint64_t const requestId, bool const expectFailure)
+        {
+            bool observed = false;
+            auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!observed && std::chrono::steady_clock::now() < deadline)
+            {
+                auto result = coordinator.poll();
+                observed = expectFailure ? result.failedRequestIds.count(requestId) != 0
+                                         : result.completedRequestIds.count(requestId) != 0;
+                if (!observed)
+                {
+                    std::this_thread::yield();
+                }
+            }
+            EXPECT_TRUE(observed);
+        };
+        auto waitForTimeout = [&](std::uint64_t const requestId)
+        {
+            bool observed = false;
+            auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!observed && std::chrono::steady_clock::now() < deadline)
+            {
+                auto const result = coordinator.poll();
+                observed = result.timedOutRequestIds.count(requestId) != 0;
+                if (!observed)
+                {
+                    std::this_thread::yield();
+                }
+            }
+            EXPECT_TRUE(observed);
+        };
+
+        constexpr std::uint64_t kCompletedRequestId = 644815201;
+        world.barrier();
+        if (world.getRank() == world.getSize() - 1)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        coordinator.publishLocalOutcome(kCompletedRequestId, /*failed=*/false);
+        if (world.getRank() != world.getSize() - 1)
+        {
+            auto const earlyResult = coordinator.poll();
+            EXPECT_TRUE(earlyResult.completedRequestIds.empty());
+            EXPECT_TRUE(earlyResult.failedRequestIds.empty());
+        }
+        waitForOutcome(kCompletedRequestId, /*expectFailure=*/false);
+
+        constexpr std::uint64_t kFailedRequestId = 644815202;
+        world.barrier();
+        coordinator.publishLocalOutcome(kFailedRequestId, /*failed=*/world.getRank() == 0);
+        waitForOutcome(kFailedRequestId, /*expectFailure=*/true);
+
+        constexpr std::uint64_t kTimedOutRequestId = 644815203;
+        world.barrier();
+        if (world.getRank() == 0)
+        {
+            coordinator.publishTimeout(kTimedOutRequestId);
+            coordinator.publishTimeout(kTimedOutRequestId);
+        }
+        waitForTimeout(kTimedOutRequestId);
+        coordinator.publishLocalOutcome(kTimedOutRequestId, /*failed=*/false);
+        waitForOutcome(kTimedOutRequestId, /*expectFailure=*/true);
+
+        constexpr std::uint64_t kInvalidOrderingRequestId = 644815204;
+        world.barrier();
+        coordinator.publishLocalOutcome(kInvalidOrderingRequestId, /*failed=*/false);
+        EXPECT_ANY_THROW(coordinator.publishTimeout(kInvalidOrderingRequestId));
+        waitForOutcome(kInvalidOrderingRequestId, /*expectFailure=*/false);
+
+        // Exercise asymmetric but orderly teardown after every decision has committed.
+        if (world.getRank() == 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    world.barrier();
+}
 
 class RequestInfoTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
