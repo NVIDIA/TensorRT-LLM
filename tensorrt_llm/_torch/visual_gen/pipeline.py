@@ -35,16 +35,9 @@ class ExtraParamSchema(StrictBaseModel):
     )
     validator: Optional[Callable[[Any], Any]] = Field(
         default=None,
-        description="Optional value validator; raises ValueError on invalid values.",
-    )
-    # Like ``validator``, must be a module-level function (specs are pickled to
-    # the coordinator in the READY handshake).
-    reducer: Optional[Callable[[Any, Dict[str, Any]], Any]] = Field(
-        default=None,
-        description="Optional transport reducer, run once in the coordinator "
-        "before the request is copied/serialized: (value, extra_params) -> "
-        "reduced value. Must be semantics-preserving (the worker treats "
-        "reduced and unreduced values identically).",
+        description="Optional value validator; raises ValueError on invalid "
+        "values. Must be a module-level function (specs are pickled to the "
+        "coordinator in the READY handshake).",
     )
 
 

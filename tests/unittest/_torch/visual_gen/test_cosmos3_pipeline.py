@@ -33,7 +33,6 @@ from types import SimpleNamespace
 os.environ["TLLM_DISABLE_MPI"] = "1"
 os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 
-import numpy as np
 import PIL.Image
 import pytest
 import torch
@@ -43,7 +42,6 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_T2I_PARAMS,
-    _crop_video_frames,
     _normalize_condition_video_keep,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
@@ -56,7 +54,6 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     _normalize_condition_video_latent_indexes,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-from tensorrt_llm.inputs.media_io import frames_to_tensor
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
 pytestmark = pytest.mark.cosmos3
@@ -260,16 +257,6 @@ def _make_test_image() -> PIL.Image.Image:
     if image_path and os.path.exists(image_path):
         return PIL.Image.open(image_path).convert("RGB")
     return PIL.Image.new("RGB", (WIDTH, HEIGHT), color=(64, 128, 192))
-
-
-def _make_test_video(
-    num_frames: int = NUM_FRAMES,
-    *,
-    width: int = WIDTH,
-    height: int = HEIGHT,
-) -> list[PIL.Image.Image]:
-    image = _make_test_image().resize((width, height))
-    return [image.copy() for _ in range(num_frames)]
 
 
 @pytest.fixture
@@ -579,70 +566,7 @@ class TestCosmos3V2VConditioningParams:
             _normalize_condition_video_keep("middle")
 
 
-def _write_mp4(path, num_frames: int = 3) -> None:
-    """Synthesize a tiny mp4v clip (no video asset ships with the repo)."""
-    cv2 = pytest.importorskip("cv2")
-    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
-    try:
-        for _ in range(num_frames):
-            writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
-    finally:
-        writer.release()
-    assert path.exists() and path.stat().st_size > 0
-
-
-class TestLoadVideoFramesTensor:
-    """``media_io.load_video_frames_tensor`` builds the uint8 [T, H, W, C]
-    tensor the ``video`` extra param carries (all frames, no crop — the worker
-    keeps the conditioning window). Public helper, used by the example and
-    available to API clients. CPU-only."""
-
-    def test_from_video_file_all_frames(self, tmp_path):
-        pytest.importorskip("cv2")
-        from tensorrt_llm.inputs.media_io import load_video_frames_tensor
-
-        enc = tmp_path / "clip.mp4"
-        _write_mp4(enc, num_frames=8)
-        video = load_video_frames_tensor(enc)
-        assert video.dtype == torch.uint8
-        assert video.ndim == 4 and video.shape[0] == 8 and video.shape[-1] == 3
-
-    def test_from_image_file_is_single_frame(self, tmp_path):
-        from tensorrt_llm.inputs.media_io import load_video_frames_tensor
-
-        p = tmp_path / "img.png"
-        PIL.Image.new("RGB", (8, 8), (7, 7, 7)).save(p)
-        assert load_video_frames_tensor(p).shape == (1, 8, 8, 3)
-
-    def test_from_directory(self, tmp_path):
-        from tensorrt_llm.inputs.media_io import load_video_frames_tensor
-
-        for i in range(5):
-            PIL.Image.new("RGB", (8, 8), (i, i, i)).save(tmp_path / f"{i:03d}.png")
-        video = load_video_frames_tensor(tmp_path)
-        assert video.shape == (5, 8, 8, 3)
-        # Sorted lexicographically: frame k is the solid (k, k, k) image.
-        assert int(video[0].float().mean()) == 0 and int(video[4].float().mean()) == 4
-
-    def test_directory_selects_by_suffix_and_fails_loud_on_corrupt(self, tmp_path):
-        # Directories are user-curated: non-frame entries are ignored by name,
-        # but a selected frame that doesn't decode raises — corrupt frames are
-        # never silently dropped into a video with holes.
-        from tensorrt_llm.inputs.media_io import load_video_frames_tensor
-
-        PIL.Image.new("RGB", (8, 8), (1, 1, 1)).save(tmp_path / "000.png")
-        (tmp_path / "notes.txt").write_text("not a frame")  # ignored by suffix
-        assert load_video_frames_tensor(tmp_path).shape[0] == 1
-
-        (tmp_path / "001.png").write_bytes(b"corrupt")
-        with pytest.raises(PIL.UnidentifiedImageError):
-            load_video_frames_tensor(tmp_path)
-
-    def test_missing_path_raises(self, tmp_path):
-        from tensorrt_llm.inputs.media_io import load_video_frames_tensor
-
-        with pytest.raises(ValueError, match="does not exist"):
-            load_video_frames_tensor(tmp_path / "nope")
+_V2V_FIXTURE_MP4 = Path(__file__).parent / "test_data" / "cosmos3_v2v_ref_9f_bframes.mp4"
 
 
 @pytest.mark.integration
@@ -650,11 +574,14 @@ class TestLoadVideoFramesTensor:
 @pytest.mark.high_cuda_memory
 class TestCosmos3V2V:
     def test_v2v_smoke(self, cosmos3_pipeline):
-        video = frames_to_tensor(_make_test_video(NUM_FRAMES))
+        """The production V2V path end to end: encoded MP4 bytes (the only
+        ``video`` form) — each rank demuxes from memory, NVDEC-decodes the
+        conditioning window, resizes to the output resolution, VAE-encodes,
+        and generates with the V2V scheduler policy."""
         result = _run_forward(
             cosmos3_pipeline,
             image=None,
-            video=video,
+            video=_V2V_FIXTURE_MP4.read_bytes(),
             num_frames=NUM_FRAMES,
             condition_video_latent_indexes=[0, 1],
         )
@@ -666,53 +593,29 @@ class TestCosmos3V2V:
             use_karras_sigmas=False,
         )
 
-    def test_v2v_tensor_reference_smoke(self, cosmos3_pipeline):
-        """The V2V reference arrives as a decoded uint8 [T, H, W, C] tensor
-        (the ``video`` extra-param contract, cropped by the coordinator's
-        reducer in real requests); the worker VAE-encodes it, capping/padding
-        to the latent window in ``_prepare_latents_v2v``."""
-        from tensorrt_llm.inputs.media_io import frames_to_tensor
-
-        video = frames_to_tensor(_make_test_video(NUM_FRAMES))
-        assert video.dtype == torch.uint8 and video.ndim == 4
-        result = _run_forward(
-            cosmos3_pipeline,
-            image=None,
-            video=video,
-            num_frames=NUM_FRAMES,
-            condition_video_latent_indexes=[0, 1],
-        )
-        _assert_valid_video(result.video, num_frames=NUM_FRAMES)
-
     def test_v2v_keep_last_smoke(self, cosmos3_pipeline):
         """condition_video_keep="last" pins the tail of the input, not the head.
 
-        ``keep`` is consumed by the coordinator-side reducer
-        (``_crop_video_frames``), so this test composes reducer + forward the
-        way a real request flows. The input is longer than the conditioning
-        window and color-coded (dark head, bright tail); frame 0 of the output
-        must be a pinned VAE round-trip of the bright tail frames.
+        Drives the real bytes path end to end: ``keep`` is applied inside the
+        worker's NVDEC decode (ring buffer over the demuxed stream), exactly
+        as a request flows. The fixture's red channel encodes the frame index
+        (R = 20 + 25*i over 9 frames); with keep="last" the conditioning
+        window is frames 4-8, so output frame 0 must be a pinned VAE
+        round-trip of fixture frame 4 (R=120) — not fixture frame 0 (R=20).
         """
-        dark = PIL.Image.new("RGB", (WIDTH, HEIGHT), (40, 40, 40))
-        bright = PIL.Image.new("RGB", (WIDTH, HEIGHT), (230, 230, 230))
-        # 5 = max(condition_video_latent_indexes) * 4 + 1 conditioning frames.
-        video = frames_to_tensor(
-            [dark.copy() for _ in range(NUM_FRAMES)] + [bright.copy() for _ in range(5)]
-        )
-        video = _crop_video_frames(video, {"condition_video_keep": "last"})
-        assert video.shape[0] == 5
         result = _run_forward(
             cosmos3_pipeline,
             image=None,
-            video=video,
+            video=_V2V_FIXTURE_MP4.read_bytes(),
             num_frames=NUM_FRAMES,
             condition_video_latent_indexes=[0, 1],
+            condition_video_keep="last",
         )
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
-        first_frame_mean = result.video[0, 0].float().mean().item()
-        assert first_frame_mean > 135, (
-            f"keep='last' must condition on the bright tail frames; frame-0 mean "
-            f"{first_frame_mean:.1f} matches the dark head instead"
+        red_mean = result.video[0, 0, :, :, 0].float().mean().item()
+        assert red_mean > 70, (
+            f"keep='last' must condition on the tail frames (R=120..220); "
+            f"output frame-0 red mean {red_mean:.1f} matches the head (R=20) instead"
         )
         _assert_scheduler_config(
             cosmos3_pipeline,
@@ -743,7 +646,7 @@ class TestCosmos3V2V:
         with pytest.raises(StopAfterTokenize):
             pipeline.forward(
                 prompt="continue",
-                video=frames_to_tensor(_make_test_video(5, width=16, height=16)),
+                video=_V2V_FIXTURE_MP4.read_bytes(),
                 height=16,
                 width=16,
                 num_frames=5,
@@ -768,7 +671,7 @@ class TestCosmos3V2V:
             _run_forward(
                 cosmos3_pipeline,
                 image=_make_test_image(),
-                video=frames_to_tensor(_make_test_video(5)),
+                video=_V2V_FIXTURE_MP4.read_bytes(),
             )
 
     def test_t2i_and_video_rejected(self, cosmos3_pipeline):
@@ -776,7 +679,7 @@ class TestCosmos3V2V:
             _run_forward(
                 cosmos3_pipeline,
                 image=None,
-                video=frames_to_tensor(_make_test_video(5)),
+                video=_V2V_FIXTURE_MP4.read_bytes(),
                 output_type="image",
                 height=T2I_HEIGHT,
                 width=T2I_WIDTH,
@@ -823,7 +726,7 @@ class TestCosmos3Audio:
         result = _run_forward(
             cosmos3_pipeline,
             enable_audio=True,
-            video=frames_to_tensor(_make_test_video(NUM_FRAMES)),
+            video=_V2V_FIXTURE_MP4.read_bytes(),
             condition_video_latent_indexes=[0, 1],
         )
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
