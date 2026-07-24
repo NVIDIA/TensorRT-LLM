@@ -1811,7 +1811,7 @@ class PyExecutor:
         num_ctx_tokens = 0
         num_ctx_kv_tokens = 0
         for req in scheduled_batch.context_requests:
-            if filter_dummies and self._is_stats_dummy_request(req):
+            if filter_dummies and PyExecutor._is_stats_dummy_request(req):
                 continue
             num_context_requests += 1
             try:
@@ -1829,7 +1829,7 @@ class PyExecutor:
         num_gen_requests = 0
         num_gen_kv_tokens = 0
         for req in scheduled_batch.generation_requests:
-            if filter_dummies and self._is_stats_dummy_request(req):
+            if filter_dummies and PyExecutor._is_stats_dummy_request(req):
                 continue
             num_gen_requests += 1
             try:
@@ -1839,7 +1839,7 @@ class PyExecutor:
 
         num_paused_requests = 0
         for req in scheduled_batch.paused_requests:
-            if filter_dummies and self._is_stats_dummy_request(req):
+            if filter_dummies and PyExecutor._is_stats_dummy_request(req):
                 continue
             num_paused_requests += 1
 
@@ -1976,13 +1976,13 @@ class PyExecutor:
             # from treating dummy requests as real load.
             num_context_requests = sum(
                 1 for req in scheduled_batch.context_requests
-                if not self._is_stats_dummy_request(req))
+                if not PyExecutor._is_stats_dummy_request(req))
             num_gen_requests = sum(
                 1 for req in scheduled_batch.generation_requests
-                if not self._is_stats_dummy_request(req))
-            num_paused_requests = sum(1
-                                      for req in scheduled_batch.paused_requests
-                                      if not self._is_stats_dummy_request(req))
+                if not PyExecutor._is_stats_dummy_request(req))
+            num_paused_requests = sum(
+                1 for req in scheduled_batch.paused_requests
+                if not PyExecutor._is_stats_dummy_request(req))
         else:
             num_context_requests = scheduled_batch.num_context_requests
             num_gen_requests = scheduled_batch.num_generation_requests
@@ -2081,7 +2081,7 @@ class PyExecutor:
             num_ctx_kv_tokens = int(scheduled_batch_stats.num_ctx_kv_tokens)
         else:
             for req in scheduled_batch.context_requests:
-                if self._is_stats_dummy_request(req):
+                if PyExecutor._is_stats_dummy_request(req):
                     continue
                 last_chunk = getattr(req, "py_last_context_chunk", None)
                 if last_chunk is not None and last_chunk[0] is not None:
@@ -2101,7 +2101,7 @@ class PyExecutor:
             num_gen_kv_tokens = int(scheduled_batch_stats.num_gen_kv_tokens)
         else:
             for req in scheduled_batch.generation_requests:
-                if self._is_stats_dummy_request(req):
+                if PyExecutor._is_stats_dummy_request(req):
                     continue
                 try:
                     num_gen_kv_tokens += req.get_num_tokens(0)
@@ -2153,7 +2153,7 @@ class PyExecutor:
         # pool for this iteration.
         num_paused_kv_tokens = 0
         for req in scheduled_batch.paused_requests:
-            if self._is_stats_dummy_request(req):
+            if PyExecutor._is_stats_dummy_request(req):
                 continue
             try:
                 num_paused_kv_tokens += req.get_num_tokens(0)
