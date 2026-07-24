@@ -308,6 +308,23 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         intermediate_size=2048,
         quant_algo="FP8_BLOCK_SCALES",
         routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
+    ),
+    # GLM-5 (zai-org/GLM-5): 256 routed experts, top-8, sigmoid/noaux_tc
+    # (DeepSeek-V3-style) routing with a single expert group (n_group=1,
+    # topk_group=1). intermediate_size is the per-expert moe_intermediate_size.
+    # quant_algo left None: pass --quant on the CLI (the glm_5 sweep uses NVFP4).
+    "glm_5": ModelSpec(
+        name="glm_5",
+        num_experts=256,
+        top_k=8,
+        hidden_size=6144,
+        intermediate_size=2048,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
     ),
     # DeepSeek-V4-Pro: 1.6T total / 49B activated. quant_algo intentionally
     # left None: pass --quant on the CLI to pin the mode (the released
