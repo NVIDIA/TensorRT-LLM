@@ -337,7 +337,15 @@ class MiniMaxM3Gate(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Router runs in fp32 to match SGLang.
+        # Router matmul runs against the full-precision fp32 weight to match
+        # SGLang. The fused GEMM widens the bf16/fp16 activation to fp32 on-chip
+        # with fp32 accumulation, so no separate fp32 copy of the activation is
+        # materialized. The eager cast plus linear covers fp32 activations and
+        # non-CUDA tensors.
+        if hidden_states.is_cuda and hidden_states.dtype in (torch.bfloat16, torch.float16):
+            return torch.ops.trtllm.moe_router_gemm_op(
+                hidden_states, self.weight, out_dtype=torch.float32
+            )
         return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
 
     def load_weights(self, weights: List[Dict]):

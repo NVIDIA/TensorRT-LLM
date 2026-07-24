@@ -120,6 +120,7 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
+  moeRouterGemmOp.cpp
   customMoeRoutingOp.cpp
   mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp

@@ -221,6 +221,14 @@ def _register_fake():
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::moe_router_gemm_op")
+    def _(mat_a, mat_b, out_dtype):
+        # logits[M, N] = act[M, K] @ weight[N, K]^T; mat_b is [num_experts, hidden].
+        ret = mat_a.new_empty(
+            [mat_a.shape[0], mat_b.shape[0]],
+            dtype=out_dtype if out_dtype is not None else torch.float32)
+        return ret
+
     @torch.library.register_fake("trtllm::dsv3_fused_a_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
         shape = list(mat_a.shape)
