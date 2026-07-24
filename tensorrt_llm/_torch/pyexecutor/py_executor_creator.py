@@ -1029,6 +1029,7 @@ def create_py_executor(
         assert kv_cache_creator is not None
         with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
+
         # Shut down the transceiver before tearing down KV cache managers so
         # that NIXL-registered (pinned) GPU memory is deregistered first;
         # otherwise the old KV cache memory stays pinned and the subsequent
@@ -1040,13 +1041,11 @@ def create_py_executor(
         finally:
             kv_cache_creator.teardown_managers(resources)
 
-        # Release Phase-1 CUDA graph pools before final KV allocation to avoid overshoot.
+        # configure_kv_cache_capacity shuts down the Phase-1 executor, which
+        # releases its CUDA graphs before its resource managers. Only the
+        # profiling attention metadata remains to be discarded here.
         for eng in [model_engine, draft_model_engine]:
-            if eng is None:
-                continue
-            if eng.attn_metadata is not None:
-                if llm_args.cuda_graph_config is not None:
-                    eng._release_cuda_graphs()
+            if eng is not None:
                 eng.attn_metadata = None
 
         del py_executor  # free before constructing new
