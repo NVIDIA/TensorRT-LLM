@@ -81,6 +81,8 @@ def _cached_replay_kernel(
     pnat,
     scale,
     pool_stride_slot,
+    g_stride_row,
+    beta_stride_row,
     A_log,
     dt_bias,
     T: tl.constexpr,
@@ -222,12 +224,12 @@ def _cached_replay_kernel(
                 other=0,
             )
         b_g = tl.load(
-            g + (i_n * T + o_t) * HV + i_hv,
+            g + (i_n * T + o_t) * g_stride_row + i_hv,
             mask=mask_t,
             other=0.0,
         ).to(tl.float32)
         b_beta = tl.load(
-            beta + (i_n * T + o_t) * HV + i_hv,
+            beta + (i_n * T + o_t) * beta_stride_row + i_hv,
             mask=mask_t,
             other=0.0,
         ).to(tl.float32)
@@ -634,6 +636,8 @@ def commit_gdn_cached_replay_history_layers(
         "q",
         "k",
         "v",
+        "g",
+        "beta",
         "packed_qkv",
         "ssm_states",
         "old_u",
@@ -685,6 +689,12 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
     HV, V = v.shape[2], v.shape[3]
     assert q.shape == k.shape
     assert v.shape[:2] == (N, T)
+    assert g.shape == (N, T, HV)
+    assert beta.shape == (N, T, HV)
+    assert g.stride(2) == 1, "g head dimension must be contiguous"
+    assert beta.stride(2) == 1, "beta head dimension must be contiguous"
+    assert g.stride(0) == T * g.stride(1), "g token rows must have a uniform stride"
+    assert beta.stride(0) == T * beta.stride(1), "beta token rows must have a uniform stride"
     use_packed_qkv = packed_qkv is not None
     if use_packed_qkv:
         qkv_width = 2 * H * K + HV * V
@@ -804,6 +814,8 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
             pnat=prev_num_accepted_tokens,
             scale=scale,
             pool_stride_slot=s_h0_0,
+            g_stride_row=g.stride(1),
+            beta_stride_row=beta.stride(1),
             A_log=A_log,
             dt_bias=dt_bias,
             T=T,

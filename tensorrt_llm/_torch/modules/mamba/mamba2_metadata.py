@@ -289,9 +289,20 @@ class Mamba2Metadata:
             return
         num_decodes = batch_size - num_contexts
         self.replay_num_decodes = num_decodes
-        self.replay_n_writes.zero_()
         if num_decodes == 0:
             return
+        if getattr(kv_cache_manager, 'use_gdn_cached_replay_all_layer_commit',
+                   False):
+            from tensorrt_llm._torch.modules.fla.cached_replay import \
+                CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+
+            # The fused small-batch GDN kernel commits its checkpoint in-layer
+            # and indexes cache metadata directly. Work items are only consumed
+            # by the partitioned replay + all-layer commit path.
+            if num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
+                return
+
+        self.replay_n_writes.zero_()
         if not hasattr(kv_cache_manager, 'get_replay_state_update_metadata'):
             raise RuntimeError(
                 "Replay state update is enabled, but the KV cache manager "

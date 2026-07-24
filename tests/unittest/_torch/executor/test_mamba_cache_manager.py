@@ -20,6 +20,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     PythonMambaCacheManager,
     _get_mamba_hybrid_pool_size,
+    _promote_mamba_state_triton,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -223,6 +224,58 @@ def test_replay_update_mamba_states_skips_dummy_slots():
     assert mgr.mamba_cache.prev_num_accepted_tokens[dummy_slot].item() == 13
     assert mgr.mamba_cache.cache_buf_idx[real_slot].item() == 0
     assert mgr.mamba_cache.cache_buf_idx[dummy_slot].item() == 1
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    (
+        "position_source_values",
+        "position_source_is_token_count",
+        "expected_positions",
+    ),
+    [
+        ([3, 2], True, [2, 1]),
+        ([1, 3], False, [1, 3]),
+    ],
+)
+def test_promote_mamba_state_fuses_replay_bookkeeping(
+    position_source_values,
+    position_source_is_token_count,
+    expected_positions,
+):
+    intermediate = torch.arange(2 * 2 * 4 * 3, dtype=torch.float32, device="cuda").reshape(
+        2, 2, 4, 3
+    )
+    dst = torch.zeros(2, 5, 3, dtype=torch.float32, device="cuda")
+    src_state_indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    accepted_position_source = torch.tensor(
+        position_source_values, dtype=torch.int32, device="cuda"
+    )
+    num_accepted_tokens = torch.tensor([3, 2], dtype=torch.int32, device="cuda")
+    dst_state_indices = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
+    replay_pnat = torch.tensor([0, 13, 0, 7, 0], dtype=torch.int32, device="cuda")
+    replay_cache_buf_idx = torch.tensor([0, 1, 0, 1, 0], dtype=torch.int32, device="cuda")
+    dummy_request_mask = torch.tensor([False, True], dtype=torch.bool, device="cuda")
+
+    _promote_mamba_state_triton(
+        dst,
+        intermediate,
+        src_state_indices,
+        accepted_position_source,
+        dst_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        position_source_is_token_count=position_source_is_token_count,
+        replay_pnat=replay_pnat,
+        replay_cache_buf_idx=replay_cache_buf_idx,
+        dummy_request_mask=dummy_request_mask,
+        replay_step_width=4,
+        replay_history_size=MIN_REPLAY_HISTORY_SIZE,
+    )
+
+    torch.testing.assert_close(dst[:, 1], intermediate[:, 0, expected_positions[0]])
+    torch.testing.assert_close(dst[:, 3], intermediate[:, 1, expected_positions[1]])
+    assert replay_pnat.tolist() == [0, 3, 0, 7, 0]
+    assert replay_cache_buf_idx.tolist() == [0, 0, 0, 1, 0]
 
 
 @skip_no_cuda
