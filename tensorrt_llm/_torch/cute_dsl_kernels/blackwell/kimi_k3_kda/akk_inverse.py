@@ -13,12 +13,11 @@
 # limitations under the License.
 
 """
-Akk 64×64 Lower Triangular Block Inversion — Full BF16.
+Akk 64×64 Lower Triangular Block Inversion — mixed FP32/BF16.
 
-BF16 input, BF16 SMEM (packed bf16x2), BF16 MMA m16n8k16 (FP32 accum), BF16 output.
-Numerical precision aligned with Flash Attention / KDA kernels.
-
-  (I+L)⁻¹ = (I-L)(I+L²)(I+L⁴)(I+L⁸)   [L strictly lower triangular, L¹⁶=0]
+BF16 input/output and packed BF16 shared storage. The four 16×16 diagonal
+blocks use FP32 forward substitution to avoid unstable BF16 Neumann
+cancellation; the cross-block products retain BF16 MMA with FP32 accumulators.
 
 Architecture:
   - 4 warps (128 threads) per CTA, each CTA processes one 64×64 Akk matrix
@@ -26,7 +25,8 @@ Architecture:
     Total SMEM: 64*36*4 = 9216 bytes (vs 64*72*4 = 18432 in FP32 version)
   - sTemp [16, 24, 2] fp32: inter-warp FP32 accumulator communication
   - cp.async: BF16 global → packed bf16x2 in FP32 SMEM (raw bytes align)
-  - BF16 MMA m16n8k16 with FP32 accumulator for ALL matmuls
+  - FP32 forward substitution for diagonal blocks
+  - BF16 MMA m16n8k16 with FP32 accumulators for cross-block products
   - movmatrix.sync.aligned.m8n8.trans.b16 for A→B layout conversion
   - C→A chain: cvt.rn.bf16x2.f32 to pack FP32 accum → bf16x2 A-operand
 
@@ -35,7 +35,7 @@ Block layout in sAkk (4×4 sub-blocks of 16×16, packed bf16x2):
 
 Stages:
   0. cp.async load bf16 64×64 → sAkk (packed bf16x2)
-  1. Invert 4 diagonal blocks via Neumann series (all 4 warps, BF16 MMA)
+  1. Invert 4 diagonal blocks via FP32 forward substitution (2 warps)
   2. Warps 0-2: Ai10, Ai21, Ai32 via chain MMA (C→A pack)
   3. Warps 0+2 → Ai20, warps 1+3 → Ai31 (parallel pairs, sTemp)
   4. Warps 0+1+2 → Ai30 (sTemp aggregation)
@@ -45,6 +45,7 @@ Inputs:  A_in  [B, T, H, BT] bf16
 Outputs: A_out [B, T, H, BT] bf16
 """
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
@@ -450,6 +451,62 @@ def _invert_diag_neumann(sAkk: cute.Tensor, block_idx, lane_id, *, loc=None, ip=
     sAkk[r_off + gid + 8, c_off + 4 + tid] = _pack_bf16x2(INV_f6, INV_f7)
 
 
+@dsl_user_op
+def _load_packed_bf16(sAkk: cute.Tensor, row, packed_col_base, col, *, loc=None, ip=None):
+    """Load one logical BF16 value from packed-bf16x2 shared storage."""
+    valid_i = cutlass.Int32(col >= 0)
+    safe_col = col * valid_i
+    packed = cutlass.Float32(sAkk[row, packed_col_base + safe_col // 2])
+    lo = _unpack_bf16x2_lo(packed)
+    hi = _unpack_bf16x2_hi(packed)
+    use_hi = cutlass.Float32(safe_col % 2)
+    value = lo * (cutlass.Float32(1.0) - use_hi) + hi * use_hi
+    return value * cutlass.Float32(valid_i)
+
+
+@dsl_user_op
+def _invert_diag_forward_fp32(
+    sAkk: cute.Tensor,
+    block_idx,
+    lane_id,
+    *,
+    loc=None,
+    ip=None,
+):
+    """FP32 forward substitution with one final BF16 pack per inverse row."""
+    row = lane_id % 16
+    halfwarp_base = (lane_id // 16) * 16
+    r_off = block_idx * 16
+    c_off = block_idx * 8
+    inv = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), cutlass.Float32)
+    inv[0] = cutlass.Float32(1.0)
+    for d in range(1, 16):
+        inv[d] = cutlass.Float32(0.0)
+
+    for d in range(1, 16):
+        col_d = row - d
+        valid = cutlass.Float32(col_d >= 0)
+        a_val = _load_packed_bf16(sAkk, r_off + row, c_off, col_d)
+        acc = cutlass.Float32(0.0)
+        for j in range(1, d):
+            a_re = _load_packed_bf16(sAkk, r_off + row, c_off, row - (d - j))
+            inv_prev = cute.arch.shuffle_sync(inv[j], halfwarp_base + row - d + j)
+            acc = acc + a_re * inv_prev
+        inv[d] = (-a_val - acc) * valid
+
+    for pair in range(8):
+        col0 = pair * 2
+        col1 = col0 + 1
+        d0 = row - col0
+        d1 = row - col1
+        v0 = cutlass.Float32(row == col0)
+        v1 = cutlass.Float32(row == col1)
+        for d in range(1, 16):
+            v0 = v0 + inv[d] * cutlass.Float32(d0 == d)
+            v1 = v1 + inv[d] * cutlass.Float32(d1 == d)
+        sAkk[r_off + row, c_off + pair] = _pack_bf16x2(v0, v1)
+
+
 # ===========================================================================
 # 16×16 matmul: load A & B from packed bf16x2 sAkk, BF16 MMA, return FP32 C
 # ===========================================================================
@@ -654,7 +711,7 @@ def akk_inv_kernel(
     mBeta: cute.Tensor,
     akk_smem_layout: cute.Layout,
     temp_layout: cute.Layout,
-    NT: int,
+    NT: cutlass.Int32,
     H: int,
     mCuSeqlens: cute.Tensor,
     mChunkIndices: cute.Tensor,
@@ -737,8 +794,11 @@ def akk_inv_kernel(
                 sBeta[_bcol_hi] = cutlass.Float32(mBeta[b_idx, _bt_hi, h_idx])
     cute.arch.barrier()
 
-    # ===== Stage 1: Diagonal block inversion via Neumann series (BF16 MMA) =====
-    _invert_diag_neumann(sAkk, warp_idx, lane_id)
+    # ===== Stage 1: FP32 forward solve, two diagonal blocks per warp =====
+    if warp_idx == 0:
+        _invert_diag_forward_fp32(sAkk, lane_id // 16, lane_id)
+    if warp_idx == 1:
+        _invert_diag_forward_fp32(sAkk, 2 + lane_id // 16, lane_id)
 
     cute.arch.barrier()
 
@@ -920,13 +980,20 @@ def akk_inv_host(
     A_in: cute.Tensor,
     A_out: cute.Tensor,
     Beta_in: cute.Tensor,
-    B: cutlass.Constexpr[int],
-    NT: cutlass.Constexpr[int],
+    # B / NT / T_VAL are runtime scalars (shape-independent compile):
+    # baking them recompiled the kernel per batch shape — at eval traffic
+    # (unique total T per prefill batch) ~100 s of JIT per batch. Only H
+    # and IS_VARLEN remain compile-time specializers.
+    B: cutlass.Int32,
+    NT: cutlass.Int32,
     H: cutlass.Constexpr[int],
     mCuSeqlens: cute.Tensor,
     mChunkIndices: cute.Tensor,
     IS_VARLEN: cutlass.Constexpr[int],
-    T_VAL: cutlass.Constexpr[int],
+    T_VAL: cutlass.Int32,
+    # Launch stream — runtime argument; launching on the DSL default stream
+    # races with the executor's non-blocking execution stream.
+    stream: cuda.CUstream,
 ):
     # BF16 input: view as FP32 (packed bf16x2). Each FP32 element = 2 BF16.
     # Original BF16 shape: [B, T, H, BS] with stride per-element in BF16.
@@ -940,7 +1007,13 @@ def akk_inv_host(
     _col_stride = 1  # adjacent bf16x2 pairs
     _h_stride = BS // 2  # head stride (BF16 = BS, /2 for bf16x2)
     _dim3_stride = _dim3_stride_bf16 // 2
-    _batch_stride = T_VAL * H * BS // 2
+    # T_VAL is a runtime Int32, so this stride is dynamic. Mathematically it is
+    # T_VAL * (H * BS // 2) = T_VAL * 32 * H, i.e. always a multiple of 4 fp32
+    # elements (16 B). The IR verifier can't derive that on its own, and without
+    # it the b_idx slice offset breaks the 128-bit alignment proof required by
+    # the cp.async G2S atom below (ICE: "src ptr alignment (32 bits) does not
+    # meet requirement (128 bits)"). Assert divisibility explicitly.
+    _batch_stride = cute.assume(T_VAL * (H * BS // 2), divby=H * BS // 2)
 
     view_layout = cute.make_layout(
         (BS, BS // 2, H, _dim3_size, B),
@@ -998,4 +1071,5 @@ def akk_inv_host(
         grid=(H, NT, B),
         block=(THREADS, 1, 1),
         smem=smem_bytes,
+        stream=stream,
     )
