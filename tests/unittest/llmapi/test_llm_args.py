@@ -308,15 +308,15 @@ class TestEagerEncoderSchedulingCompatibility:
     def test_eager_alone_is_accepted(self):
         args = TorchLlmArgs(model=llama_model_path,
                             multimodal_config=MultimodalConfig(
-                                enable_eager_encoder_scheduling=True))
-        assert args.multimodal_config.enable_eager_encoder_scheduling
+                                encoder_scheduling_policy="EAGER"))
+        assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
 
     def test_eager_rejects_attention_dp(self):
         with pytest.raises(ValidationError, match="attention DP"):
             TorchLlmArgs(model=llama_model_path,
                          enable_attention_dp=True,
                          multimodal_config=MultimodalConfig(
-                             enable_eager_encoder_scheduling=True))
+                             encoder_scheduling_policy="EAGER"))
 
     def test_eager_rejects_disaggregated_serving(self):
         with pytest.raises(ValidationError, match="disaggregated"):
@@ -324,7 +324,7 @@ class TestEagerEncoderSchedulingCompatibility:
                 model=llama_model_path,
                 cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
                 multimodal_config=MultimodalConfig(
-                    enable_eager_encoder_scheduling=True))
+                    encoder_scheduling_policy="EAGER"))
 
 
 @pytest.mark.cpu_only
@@ -1013,7 +1013,7 @@ class TestMultimodalConfig:
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
-        assert not MultimodalConfig().enable_eager_encoder_scheduling
+        assert MultimodalConfig().encoder_scheduling_policy == "DEFAULT"
         assert MultimodalConfig().video_pruning_rate is None
 
     def test_torch_llm_args_default_multimodal_config(self):
@@ -1022,7 +1022,7 @@ class TestMultimodalConfig:
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
-        assert not args.multimodal_config.enable_eager_encoder_scheduling
+        assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
         assert args.multimodal_config.video_pruning_rate is None
 
     @pytest.mark.parametrize(
@@ -1056,8 +1056,8 @@ class TestMultimodalConfig:
     def test_torch_llm_args_with_eager_encoder_scheduling(self):
         args = TorchLlmArgs(model=llama_model_path,
                             multimodal_config=MultimodalConfig(
-                                enable_eager_encoder_scheduling=True))
-        assert args.multimodal_config.enable_eager_encoder_scheduling
+                                encoder_scheduling_policy="EAGER"))
+        assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
 
     def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
         args = TorchLlmArgs(
@@ -1097,12 +1097,12 @@ class TestMultimodalConfig:
             multimodal_config={
                 "encoder_side_stream_max_ahead": 2,
                 "encoder_cache_max_bytes": 0,
-                "enable_eager_encoder_scheduling": True,
+                "encoder_scheduling_policy": "EAGER",
                 "video_pruning_rate": 0.5,
             },
         )
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
-        assert args.multimodal_config.enable_eager_encoder_scheduling
+        assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
         assert args.multimodal_config.video_pruning_rate == 0.5
 
     def test_encoder_cuda_graph_and_side_stream_max_ahead_are_exclusive(self):

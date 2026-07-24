@@ -34,6 +34,7 @@ from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           get_multimodal_encoder_item_metadata)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
+                                          MultimodalEncoderSchedulingPolicy,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
@@ -479,9 +480,20 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
-        self.supports_mm_encoder_item_scheduling = (
+        # Item scheduling is declared once, as a model capability (the
+        # `MultimodalModelMixin` ClassVar). The engine stores only the
+        # actionable flag: whether the item-scheduling wiring is engaged this
+        # run (setup below, scheduler wrap, executor encoder step). A
+        # `DISABLED` policy keeps the capability but runs only the base LLM
+        # scheduler with legacy inline encode.
+        _mm_config = getattr(self.llm_args, "multimodal_config", None)
+        _mm_scheduling_policy = (_mm_config.encoder_scheduling_policy
+                                 if _mm_config is not None else
+                                 MultimodalEncoderSchedulingPolicy.DEFAULT)
+        self.mm_encoder_item_scheduling_enabled = (
             isinstance(self.model, MultimodalModelMixin)
-            and self.model.supports_mm_encoder_item_scheduling)
+            and self.model.supports_mm_encoder_item_scheduling and
+            _mm_scheduling_policy != MultimodalEncoderSchedulingPolicy.DISABLED)
         self.mm_encoder_attention_metadata_capacity: Optional[Dict[str,
                                                                    int]] = None
         self.mm_encoder_output_budget_bytes: Optional[int] = None
@@ -503,7 +515,7 @@ class PyTorchModelEngine(ModelEngine):
         #       estimation on top of (B) for cache-enabled models.
         # Item-level chunked MM prefill (see the roadmap doc) collapses (B) to a
         # single item and merges it with (C), leaving one resident budget.
-        if self.supports_mm_encoder_item_scheduling:
+        if self.mm_encoder_item_scheduling_enabled:
             if self.encoder_max_num_tokens is None:
                 raise ValueError(
                     "MM encoder item scheduling requires a token budget; set "
@@ -2849,7 +2861,7 @@ class PyTorchModelEngine(ModelEngine):
         (`_encoder_cache_item_key`) so entries hit across both.
         """
         # `getattr`: unit tests exercise partially constructed engines.
-        if not getattr(self, "supports_mm_encoder_item_scheduling", False):
+        if not getattr(self, "mm_encoder_item_scheduling_enabled", False):
             return None
         mm_data = request.py_multimodal_data
         item_metadata = get_multimodal_encoder_item_metadata(mm_data)

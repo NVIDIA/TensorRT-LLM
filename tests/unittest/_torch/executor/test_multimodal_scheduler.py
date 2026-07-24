@@ -332,7 +332,7 @@ def _executor_for_mm_admission(active_requests, *, max_num_tokens=8):
     executor.dist = SimpleNamespace(tp_size=1)
     executor.max_num_active_requests = 8
     executor.is_benchmark_disagg = False
-    executor._supports_mm_encoder_item_scheduling = True
+    executor._mm_encoder_item_scheduling_enabled = True
     executor.model_engine = SimpleNamespace(
         encoder_max_num_items=8,
         encoder_max_num_tokens=max_num_tokens,
@@ -480,7 +480,7 @@ def test_item_outputs_accumulate_on_request_and_release_raw_data(monkeypatch):
     monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
     engine = object.__new__(PyTorchModelEngine)
     engine.model = _Model()
-    engine.supports_mm_encoder_item_scheduling = True
+    engine.mm_encoder_item_scheduling_enabled = True
     request = _llm_request(
         1,
         multimodal_data={
@@ -576,7 +576,7 @@ def _cache_engine(cache, monkeypatch, *, supports_encoder_cache=True):
     model = _Model()
     model.supports_encoder_cache = supports_encoder_cache
     engine.model = model
-    engine.supports_mm_encoder_item_scheduling = True
+    engine.mm_encoder_item_scheduling_enabled = True
     return engine
 
 

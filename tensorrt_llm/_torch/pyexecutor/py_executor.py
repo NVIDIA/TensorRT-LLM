@@ -583,8 +583,8 @@ class PyExecutor:
         # Compatibility checks and MultimodalScheduler wrapping live in
         # `create_py_executor_instance`; the executor only keeps the flag
         # its loop paths branch on.
-        self._supports_mm_encoder_item_scheduling = getattr(
-            model_engine, "supports_mm_encoder_item_scheduling", False)
+        self._mm_encoder_item_scheduling_enabled = getattr(
+            model_engine, "mm_encoder_item_scheduling_enabled", False)
         self.scheduler = scheduler
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
@@ -2598,7 +2598,7 @@ class PyExecutor:
                             local_disagg_candidates,
                             fitting_disagg_gen_init_requests)
 
-                if (self._supports_mm_encoder_item_scheduling
+                if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
@@ -4043,7 +4043,7 @@ class PyExecutor:
                     self._finalize_adp_dummy_allocation(False)
                     continue
 
-                if (self._supports_mm_encoder_item_scheduling
+                if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
@@ -4523,7 +4523,7 @@ class PyExecutor:
                     self._finalize_adp_dummy_allocation(False)
                     continue
 
-                if (self._supports_mm_encoder_item_scheduling
+                if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
@@ -5114,7 +5114,7 @@ class PyExecutor:
             max_num_active_requests=self.max_num_active_requests,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
         if (not new_requests or
-                not getattr(self, "_supports_mm_encoder_item_scheduling", False)
+                not getattr(self, "_mm_encoder_item_scheduling_enabled", False)
                 or self.enable_attention_dp):
             return new_requests
         return self._apply_mm_encoder_admission(waiting_queue, new_requests)
@@ -5253,7 +5253,7 @@ class PyExecutor:
             """
             try:
                 self._validate_request(request)
-                if self._supports_mm_encoder_item_scheduling:
+                if self._mm_encoder_item_scheduling_enabled:
                     initialize_multimodal_encoder_request(
                         request,
                         max_num_tokens=self.model_engine.encoder_max_num_tokens,
