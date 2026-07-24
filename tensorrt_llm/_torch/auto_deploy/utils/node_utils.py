@@ -28,19 +28,9 @@ from torch.fx import GraphModule, Node
 
 from .logger import ad_logger
 
-try:
-    # import modelopt to get quantize_op
-    from modelopt.torch.quantization import tensor_quant  # noqa: F401
-
-    if hasattr(torch.ops, "tensorrt"):
-        modelopt_quantize_op = torch.ops.tensorrt.quantize_op
-        modelopt_dynamic_block_quantize_op = torch.ops.tensorrt.dynamic_block_quantize_op
-    else:
-        modelopt_quantize_op = None
-        modelopt_dynamic_block_quantize_op = None
-except ImportError:
-    modelopt_quantize_op = None
-    modelopt_dynamic_block_quantize_op = None
+# modelopt quantization support has been removed; these ops are no longer available.
+modelopt_quantize_op = None
+modelopt_dynamic_block_quantize_op = None
 
 OpOrOverload = Union[OpOverloadPacket, OpOverload]
 OperatorLike = Union[OpOrOverload, Callable]
