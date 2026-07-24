@@ -120,6 +120,17 @@ COSMOS3_LPIPS_SEED = 42
 COSMOS3_LPIPS_FRAME_RATE = 24.0
 COSMOS3_LPIPS_THRESHOLD = 0.05
 
+# FastWan 2.2 TI2V-5B (DMD distilled) LPIPS configuration
+FASTWAN_LPIPS_PROMPT = "A red fox walking through snow"
+FASTWAN_LPIPS_NEGATIVE_PROMPT = ""
+FASTWAN_LPIPS_HEIGHT = 704
+FASTWAN_LPIPS_WIDTH = 1280
+FASTWAN_LPIPS_NUM_FRAMES = 121
+FASTWAN_LPIPS_NUM_INFERENCE_STEPS = 3
+FASTWAN_LPIPS_GUIDANCE_SCALE = 1.0
+FASTWAN_LPIPS_SEED = 42
+FASTWAN_LPIPS_FRAME_RATE = 24.0
+FASTWAN_LPIPS_THRESHOLD = 0.05
 # LTX-2 configuration
 LTX2_MODEL_CHECKPOINT_PATH = "LTX-2/ltx-2-19b-dev.safetensors"
 LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
@@ -1132,6 +1143,42 @@ def test_qwenimage_cuda_graph_lpips_against_golden(tmp_path):
         generated_path,
     )
     _assert_lpips_below_threshold(score, QWENIMAGE_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_fastwan_lpips_against_golden(tmp_path):
+    generated_path = tmp_path / "fastwan_generated.mp4"
+    golden_path = _golden_media_path(
+        tmp_path, "fastwan_lpips_golden_video.mp4", "FastWan LPIPS golden video"
+    )
+    _generate_wan_lpips_video(
+        _lpips_model_path("FastWan2.2-TI2V-5B-FullAttn-Diffusers"),
+        generated_path,
+        FASTWAN_LPIPS_PROMPT,
+        FASTWAN_LPIPS_NEGATIVE_PROMPT,
+        FASTWAN_LPIPS_HEIGHT,
+        FASTWAN_LPIPS_WIDTH,
+        FASTWAN_LPIPS_NUM_FRAMES,
+        FASTWAN_LPIPS_NUM_INFERENCE_STEPS,
+        FASTWAN_LPIPS_GUIDANCE_SCALE,
+        FASTWAN_LPIPS_SEED,
+        FASTWAN_LPIPS_FRAME_RATE,
+    )
+    score = _run_lpips_eval(
+        tmp_path,
+        "fastwan",
+        "video",
+        FASTWAN_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _assert_lpips_below_threshold(score, FASTWAN_LPIPS_THRESHOLD)
+
+
+@pytest.fixture(scope="session")
+def wan_trtllm_video_path(_visual_gen_deps, llm_venv, llm_root):
+    """Generate input video via models/wan_t2v.py and return path to trtllm_output.mp4."""
+    return _generate_wan_video(llm_venv, llm_root, WAN_T2V_MODEL_SUBPATH, "wan")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

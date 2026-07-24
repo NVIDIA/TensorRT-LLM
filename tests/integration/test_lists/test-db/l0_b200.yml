@@ -220,6 +220,8 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py
   - unittest/_torch/visual_gen/test_wan_vsa_pipeline.py
   - unittest/_torch/visual_gen/test_wan_vae.py
+  - unittest/_torch/visual_gen/test_fastwan_dmd_math.py
+  - unittest/_torch/visual_gen/test_fastwan_pipeline.py
   - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache_user_coefficients.py
@@ -337,6 +339,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_qwenimage_cuda_graph_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
+  - examples/visual_gen/test_visual_gen.py::test_fastwan_lpips_against_golden TIMEOUT (10)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
   # ---- moved to post-merge (MoE CI optimization) ----
