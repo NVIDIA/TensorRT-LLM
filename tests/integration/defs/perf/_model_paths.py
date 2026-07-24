@@ -44,6 +44,7 @@ MODEL_PATH_DICT = {
     "gemma_3_12b_it": "gemma/gemma-3-12b-it",
     "gemma_3_12b_it_fp8": "gemma/gemma-3-12b-it-fp8",
     "gemma_3_12b_it_fp4": "gemma/gemma-3-12b-it-fp4",
+    "gemma_3_1b_it": "gemma/gemma-3-1b-it",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
