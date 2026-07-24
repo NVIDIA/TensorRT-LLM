@@ -86,7 +86,17 @@ srun -N2 --ntasks=8 --mpi=pmix python3 run_precheck.py --role gen --server-idx 0
 wait
 ```
 
-Unit tests (CPU-only): `pytest tests/unittest/others/test_cache_transceiver_precheck_config.py`.
+Tests:
+
+- Config resolution (CPU-only):
+  `pytest tests/unittest/others/test_cache_transceiver_precheck_config.py`
+- Driver logic + internal-API contract (the precheck drives unstable
+  TRT-LLM internals via `run_precheck.load_internal_apis()`; the contract
+  tests catch upstream renames in pre-merge CI):
+  `pytest tests/unittest/others/test_cache_transceiver_precheck_run.py`
+- End-to-end on one GPU (one `mpirun` world per ctx/gen instance, real
+  NIXL/PYTHON transfer + verdicts, incl. multi-instance and asymmetric TP):
+  `pytest tests/unittest/disaggregated/test_cache_transceiver_precheck_e2e.py`
 
 Lineage: adapted from `examples/disaggregated/slurm/cache_transceiver_test`
 (the UCX tuning harness), reduced to a single sweep and extended to

@@ -54,6 +54,7 @@ l0_a10:
   - unittest/inputs/test_multimodal_input_processor.py
   - unittest/inputs/test_video_decode.py
   - unittest/others/test_cache_transceiver_precheck_config.py
+  - unittest/others/test_cache_transceiver_precheck_run.py
   - unittest/others/test_convert_utils.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_lora_module_count.py
