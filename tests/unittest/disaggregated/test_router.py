@@ -12,7 +12,7 @@ from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
                                                 hash_v1_block_key,
                                                 truncate_sha256_hash_to_int64)
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ReuseScope, sequence_to_blockchain_keys)
 # yapf: disable
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,

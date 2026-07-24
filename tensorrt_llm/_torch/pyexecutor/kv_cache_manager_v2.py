@@ -67,6 +67,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ReuseScope,
     SwaScratchReuseConfig,
     TokenIdExt,
+    _cpp_introspection,
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
@@ -1183,23 +1184,35 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             for pool_id in range(self.num_pools):
                 layer_id = self.impl.layer_grouping[pool_id][0]
-                kv_cache_pool_pointers_list.append(
-                    [
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, Role.KEY, PageIndexMode.SHARED
-                        ),
-                        0,
-                    ]
+                key_base_addr = self.impl.get_mem_pool_base_address(
+                    layer_id, Role.KEY, PageIndexMode.SHARED
                 )
+                kv_cache_pool_pointers_list.append([key_base_addr, 0])
                 if self.dtype == DataType.NVFP4:
-                    block_scale_pool_pointers_list.append(
-                        [
-                            self.impl.get_mem_pool_base_address(
-                                layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
-                            ),
-                            0,
-                        ]
+                    # The KEY/scale pointers are a (rep-layer, 0-offset) origin
+                    # against which each layer's kv_cache_pool_mapping offset is
+                    # resolved. The block-scale origin must reproduce the SAME
+                    # per-layer offset() as KEY, so mirror the KEY base for the
+                    # same representative layer and shift it back by that layer's
+                    # offset. For the base manager offset(rep) == 0, so this is
+                    # just the rep layer's scale base; for address-ranked
+                    # subclasses (MiniMax-M3) offset(rep) may be non-zero, and the
+                    # shift lands the origin on the pool's slot-0 scale address.
+                    # This keeps block_scale_offset == offset without depending on
+                    # the non-contractual layer_grouping order.
+                    rep_offset = self._kv_pool_mapping_offset(layer_id, pool_id, key_base_addr)
+                    scale_stride = (
+                        self.get_layer_bytes_per_token(layer_id, Role.KEY_BLOCK_SCALE)
+                        * self.kv_factor
+                        * self.tokens_per_block
                     )
+                    scale_base_addr = (
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
+                        )
+                        - rep_offset * scale_stride
+                    )
+                    block_scale_pool_pointers_list.append([scale_base_addr, 0])
 
             for layer_id in typed_range(LayerId(self.num_local_layers)):
                 layer_group_id = self.impl.get_layer_group_id(layer_id)
@@ -1409,11 +1422,18 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
+        if _cpp_introspection is not None:
+            lifecycle_id = self.impl.get_layer_group_id(layer_id)
+            layer = self.kv_cache_manager_py_config.layers[int(layer_id)]
+            return (
+                f"role={role!s}, lifecycle_id={int(lifecycle_id)}, "
+                f"sliding_window_size={layer.sliding_window_size}"
+            )
         attr = self.impl._storage.get_buffer_attr(layer_id, role)
         pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
         lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
         return (
-            f"role={str(role)}, pool_group_id={int(pool_group_id)}, "
+            f"role={role!s}, pool_group_id={int(pool_group_id)}, "
             f"lifecycle_id={int(attr.life_cycle_id)}, "
             f"lifecycle={lifecycle}"
         )
@@ -1926,15 +1946,23 @@ class KVCacheManagerV2(BaseResourceManager):
         layer_offset = self.layer_offsets[layer_idx]
         try:
             addr = self.impl.get_mem_pool_base_address(layer_offset, Role.INDEX_KEY)
-            page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
-            page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.INDEX_KEY)
-            converter = self.impl.get_page_index_converter(layer_offset, Role.INDEX_KEY)
-        except KeyError:
+        except (KeyError, IndexError):
             # INDEX_KEY not registered for this layer (default V2 manager
             # registers only K/V/scale; sparse subclasses register
             # INDEX_KEY only on sparse layers via
             # ``_extra_buffers_per_layer``).
+            #
+            # The python backend raises ``KeyError`` from the missing dict
+            # lookup; the C++ backend's ``getBufferAttr`` throws
+            # ``std::out_of_range`` for an unknown buffer id, which nanobind
+            # maps to ``IndexError``. Catch both so the "role not registered
+            # -> None" contract holds on either backend.
             return None
+        # INDEX_KEY is registered; the remaining lookups must succeed. Keep them
+        # outside the try so genuine failures surface instead of returning None.
+        page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
+        page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.INDEX_KEY)
+        converter = self.impl.get_page_index_converter(layer_offset, Role.INDEX_KEY)
 
         if isinstance(dtype, DataType):
             torch_dtype = binding_to_torch_dtype(dtype)
@@ -2484,13 +2512,18 @@ class KVCacheManagerV2(BaseResourceManager):
         return self._stats_window_size(life_cycle.window_size)
 
     def _get_storage_statistics(self, cache_level: CacheLevel):
+        if _cpp_introspection is not None:
+            return _cpp_introspection.storage_statistics(self.impl, cache_level)
         return self.impl._storage.get_statistics(cache_level)
 
     def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
-        pool_groups_by_life_cycle = [
-            self.impl._storage.get_pool_group_index(LifeCycleId(life_cycle_id))
-            for life_cycle_id in range(len(self.impl.layer_grouping))
-        ]
+        if _cpp_introspection is not None:
+            pool_groups_by_life_cycle = _cpp_introspection.life_cycle_pool_group_indices(self.impl)
+        else:
+            pool_groups_by_life_cycle = [
+                self.impl._storage.get_pool_group_index(LifeCycleId(life_cycle_id))
+                for life_cycle_id in range(len(self.impl.layer_grouping))
+            ]
 
         metadata: dict[int, tuple[int, Optional[int], str]] = {}
         for life_cycle_id, layer_ids in enumerate(self.impl.layer_grouping):

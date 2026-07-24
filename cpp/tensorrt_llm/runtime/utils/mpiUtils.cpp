@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -597,6 +597,18 @@ MpiComm::~MpiComm() noexcept
 #if ENABLE_MULTI_DEVICE
     if (mFreeComm && mComm)
     {
+        // Static MpiComm objects (e.g. the local session communicator) are destroyed during C++
+        // static teardown via __cxa_atexit, which runs AFTER MPI has been finalized: mpi4py registers
+        // an MPI_Finalize as a Python atexit handler that fires during Py_Finalize, and initialize()
+        // registers another via std::atexit. Calling MPI_Comm_free() on an already-finalized MPI is
+        // undefined behavior and can corrupt the process heap (observed as a glibc "corrupted
+        // double-linked list" abort in libc's exit cleanup, with no application frames). Skip the free
+        // in that case; leaking the communicator handle at process shutdown is harmless.
+        int finalized = 0;
+        if (MPI_Finalized(&finalized) == MPI_SUCCESS && finalized != 0)
+        {
+            return;
+        }
         if (MPI_Comm_free(&mComm) != MPI_SUCCESS)
         {
             TLLM_LOG_ERROR("MPI_Comm_free failed");

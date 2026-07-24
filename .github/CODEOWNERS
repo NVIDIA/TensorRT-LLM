@@ -208,6 +208,7 @@
 /cpp/tensorrt_llm/batch_manager/blockKey* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/batch_manager/evictionPolicy* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/batch_manager/kvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
+/cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2 @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/blockKey* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/evictionPolicy* @NVIDIA/trt-llm-kv-cache-manager-devs

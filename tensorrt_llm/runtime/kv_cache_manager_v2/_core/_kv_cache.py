@@ -1017,7 +1017,12 @@ class _KVCache:
                         ),
                         move_ssm=is_end,
                     )
-                if has_partial_snapshot:
+                    # _commit_block transitions out of ALLOWED (to USER_STOP) when a
+                    # block cannot be committed (VIRTUAL_STOP). Stop here so we don't
+                    # re-enter _commit_block on an already-stopped cache.
+                    if self._commit_state != self.CommitState.ALLOWED:
+                        break
+                if has_partial_snapshot and self._commit_state == self.CommitState.ALLOWED:
                     partial_ordinal = BlockOrdinal(new_num_full_blocks)
                     if is_end:
                         self._commit_block(

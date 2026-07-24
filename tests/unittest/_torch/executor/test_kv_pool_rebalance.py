@@ -32,7 +32,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
+from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 # --------------------------------------------------------------------------- #
 # Helpers
