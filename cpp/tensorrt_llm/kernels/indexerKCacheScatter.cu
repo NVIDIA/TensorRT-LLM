@@ -61,7 +61,7 @@ __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
  * @param slot_mapping_fp8  Flat element index for FP8 data start position [num_tokens]
  * @param slot_mapping_scale Flat element index for scale data start position [num_tokens]
  * @param num_tokens        Number of tokens
- * @param head_dim          Head dimension (must be 128)
+ * @param head_dim          Payload byte width (128 for FP8, 64 for packed FP4)
  * @param scale_size        Scale size in bytes (must be 4)
  * @param cache_stride_0    Stride for k_cache dimension 0 (in bytes)
  * @param cache_stride_1    Stride for k_cache dimension 1 (in bytes)

@@ -159,39 +159,34 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
         m = attn_metadata
         saved['saved_dsa_state'] = {
             'host_indexer_k_cache_block_offsets':
-            m.host_indexer_k_cache_block_offsets.clone(),
+            m.host_indexer_k_cache_block_offsets,
             'indexer_k_cache_block_offsets':
             m.indexer_k_cache_block_offsets.clone(),
-            'host_slot_mapping_fp8':
-            m.host_slot_mapping_fp8.clone(),
-            'host_slot_mapping_scale':
-            m.host_slot_mapping_scale.clone(),
-            'slot_mapping_fp8':
-            m.slot_mapping_fp8.clone(),
-            'slot_mapping_scale':
-            m.slot_mapping_scale.clone(),
+            'host_slot_mapping_fp8': m.host_slot_mapping_fp8,
+            'host_slot_mapping_scale': m.host_slot_mapping_scale,
+            'slot_mapping_fp8': m.slot_mapping_fp8.clone(),
+            'slot_mapping_scale': m.slot_mapping_scale.clone(),
+            'slot_mapping_fp8_fullkv': m.slot_mapping_fp8_fullkv,
+            'slot_mapping_scale_fullkv': m.slot_mapping_scale_fullkv,
         }
-        # Derive pool indices from the draft manager's encoded block
-        # offsets (via _get_pool_block_indices) instead of using raw block
-        # IDs.  With host cache offload, block IDs can exceed
-        # blocks_in_primary_pool after offload swaps (the block keeps its
-        # original high ID even though its memory now lives in the primary
-        # GPU pool).  Using raw block IDs as pool indices causes OOB access
-        # in the indexer k-cache buffers.  _get_pool_block_indices correctly
-        # decodes memPoolBlockIndex from the C++ encoded offsets.
-        # Note: kv_cache_manager was already swapped to draft above (line 67).
-        pool_indices = m._get_pool_block_indices()
-        num_blocks = pool_indices.shape[1]
-        m.host_indexer_k_cache_block_offsets[:m.num_seqs, :num_blocks].copy_(
-            pool_indices)
-        m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
-            m.host_indexer_k_cache_block_offsets[:m.num_seqs],
-            non_blocking=True)
-        # Safety clamp: sanitize stale padding entries beyond num_seqs
-        # that may contain negative or out-of-range values, matching the
-        # regular DSA prepare() flow.
-        m.indexer_k_cache_block_offsets.clamp_(min=0)
+        # Keep the target's pinned host buffers untouched while asynchronous
+        # H2D copies from the draft mappings are in flight.  Restoring their
+        # contents in place can race those copies because CPU writes are not
+        # ordered with the CUDA stream.  The fresh host buffers stay attached
+        # to the metadata until after the draft forward has been enqueued.
+        m.host_indexer_k_cache_block_offsets = torch.empty_like(
+            m.host_indexer_k_cache_block_offsets,
+            pin_memory=m.host_indexer_k_cache_block_offsets.is_pinned())
+        m.host_slot_mapping_fp8 = torch.empty_like(
+            m.host_slot_mapping_fp8,
+            pin_memory=m.host_slot_mapping_fp8.is_pinned())
+        m.host_slot_mapping_scale = torch.empty_like(
+            m.host_slot_mapping_scale,
+            pin_memory=m.host_slot_mapping_scale.is_pinned())
+        # kv_cache_manager was already swapped to the draft manager above.
+        m._update_indexer_k_cache_block_offsets()
         Indexer.recompute_slot_mappings(m)
+        Indexer.recompute_context_kv_gather_mappings(m)
     return saved
 
 
@@ -209,14 +204,16 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
     saved_dsa = saved_state.get('saved_dsa_state')
     if saved_dsa is not None:
         m = attn_metadata
-        m.host_indexer_k_cache_block_offsets.copy_(
-            saved_dsa['host_indexer_k_cache_block_offsets'], non_blocking=True)
+        m.host_indexer_k_cache_block_offsets = saved_dsa[
+            'host_indexer_k_cache_block_offsets']
         m.indexer_k_cache_block_offsets.copy_(
             saved_dsa['indexer_k_cache_block_offsets'], non_blocking=True)
-        m.host_slot_mapping_fp8.copy_(saved_dsa['host_slot_mapping_fp8'])
-        m.host_slot_mapping_scale.copy_(saved_dsa['host_slot_mapping_scale'])
+        m.host_slot_mapping_fp8 = saved_dsa['host_slot_mapping_fp8']
+        m.host_slot_mapping_scale = saved_dsa['host_slot_mapping_scale']
         m.slot_mapping_fp8.copy_(saved_dsa['slot_mapping_fp8'])
         m.slot_mapping_scale.copy_(saved_dsa['slot_mapping_scale'])
+        m.slot_mapping_fp8_fullkv = saved_dsa['slot_mapping_fp8_fullkv']
+        m.slot_mapping_scale_fullkv = saved_dsa['slot_mapping_scale_fullkv']
 
 
 def get_force_num_accepted_tokens() -> int:
@@ -2121,49 +2118,19 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         Context manager to temporarily switch to draft KV cache manager in one-engine speculative decoding.
 
-        This swaps both the kv_cache_manager reference AND the block offset tensors,
-        since the target and draft KV caches have different block layouts.
+        This swaps the cache manager and its cache-layout-dependent attention
+        metadata, including DSA indexer offsets and slot mappings.
         """
-
-        # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
-        if draft_kv_cache_manager is None:
+        saved_state = prepare_attn_metadata_for_draft_replay(
+            attn_metadata, draft_kv_cache_manager)
+        if saved_state is None:
             yield
             return
-
-        # Only TrtllmAttentionMetadata supports separate draft KV cache layouts
-        if not isinstance(attn_metadata, TrtllmAttentionMetadata):
-            yield
-            return
-
-        # Check if draft KV cache block offsets are allocated
-        draft_block_offsets = getattr(attn_metadata,
-                                      'draft_kv_cache_block_offsets', None)
-        if draft_block_offsets is None:
-            # Draft KV cache block offsets not allocated, skip switching
-            yield
-            return
-
-        # Save main KV cache manager and block offsets
-        target_kv_cache_manager = attn_metadata.kv_cache_manager
-        target_kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets
-        target_host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets
-
-        # Switch to draft KV cache manager and its block offsets
-        attn_metadata.kv_cache_manager = draft_kv_cache_manager
-        attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
-        attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
-        if attn_metadata.enable_flash_mla:
-            attn_metadata.prepare_flash_mla()
 
         try:
             yield
         finally:
-            # Restore main KV cache manager and block offsets
-            attn_metadata.kv_cache_manager = target_kv_cache_manager
-            attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
-            attn_metadata.host_kv_cache_block_offsets = target_host_kv_cache_block_offsets
-            if attn_metadata.enable_flash_mla:
-                attn_metadata.prepare_flash_mla()
+            restore_attn_metadata_after_draft_replay(attn_metadata, saved_state)
 
     def _sample_tokens_for_batch(
         self,

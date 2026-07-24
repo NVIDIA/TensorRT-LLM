@@ -113,7 +113,10 @@ def get_kv_cache_manager_cls(
             logger.info("Hybrid linear model has 0 mamba layers; using "
                         "KV cache manager without mamba caching")
             if sparse_attn_config is not None:
-                return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+                return get_sparse_attn_kv_cache_manager(
+                    sparse_attn_config,
+                    use_kv_cache_manager_v2=kv_cache_config.
+                    use_kv_cache_manager_v2)
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
         if (sparse_attn_config is not None
@@ -161,7 +164,9 @@ def get_kv_cache_manager_cls(
                 )
         return default_cls
     elif sparse_attn_config is not None:
-        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+        return get_sparse_attn_kv_cache_manager(
+            sparse_attn_config,
+            use_kv_cache_manager_v2=kv_cache_config.use_kv_cache_manager_v2)
     else:
         return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
@@ -357,7 +362,7 @@ class KvCacheCreator:
             is_disagg=self._is_disagg,
             cache_transceiver_config=self._cache_transceiver_config)
         cls = self._fallback_if_unsupported_kv_cache_manager_v2(
-            cls, model_config, kv_cache_config)
+            cls, model_config)
         # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
         # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
         # state in a separate cache that doesn't honor block reuse. Warn at
@@ -376,11 +381,8 @@ class KvCacheCreator:
                 )
         return cls
 
-    def _fallback_if_unsupported_kv_cache_manager_v2(
-            self,
-            kv_cache_manager_cls,
-            model_config: ModelConfig,
-            kv_cache_config: Optional[KvCacheConfig] = None):
+    def _fallback_if_unsupported_kv_cache_manager_v2(self, kv_cache_manager_cls,
+                                                     model_config: ModelConfig):
         config = model_config.pretrained_config
         # Use ``issubclass`` rather than identity equality so V2 subclasses
         # (e.g. ``MiniMaxM3KVCacheManagerV2`` from the sparse-attention path)
@@ -391,25 +393,26 @@ class KvCacheCreator:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("beam_width > 1")
+            sparse_attn_config = model_config.sparse_attention_config
+            if (sparse_attn_config is not None
+                    and sparse_attn_config.algorithm == "dsa"
+                    and self._mapping.cp_config.get("cp_type") == CpType.STAR):
+                incompat.append("STAR context parallelism")
             if incompat:
                 incompat_str = ", ".join(incompat)
-                # Some models are structurally bound to V2 and cannot fall
-                # back to V1 without producing wrong outputs:
-                #   * Sparse-attention models (e.g. MiniMax-M3) need V2's
-                #     per-layer split-pool to allocate the per-sparse-layer
-                #     INDEX_KEY pool with a different stride than the main
-                #     K/V pool. V1's unified pool cannot represent that.
-                #   * Gemma4 hybrid uses per-layer head_dim that V1 would
-                #     coerce to ``max(head_dim)``, changing per-layer KV
-                #     byte sizes — correctness bug, not just efficiency.
-                sparse_attn_config = model_config.sparse_attention_config
+                # Never silently replace a sparse V2 manager with V1. Some
+                # sparse models require V2 structurally; for models such as DSA
+                # that support both managers, fallback would ignore the user's
+                # explicit manager selection.
                 if sparse_attn_config is not None:
                     raise NotImplementedError(
-                        f"Sparse-attention models "
-                        f"(algorithm={sparse_attn_config.algorithm!r}) require "
-                        f"KVCacheManagerV2, which is not yet supported with "
-                        f"{incompat_str}. Disable these KvCacheConfig features "
-                        f"to run sparse-attention models.")
+                        f"KVCacheManagerV2 for sparse-attention models "
+                        f"(algorithm={sparse_attn_config.algorithm!r}) is not "
+                        f"supported with "
+                        f"{incompat_str}. Disable the incompatible features to "
+                        f"run sparse-attention models.")
+                # Gemma4 hybrid uses per-layer head_dim that V1 would coerce to
+                # ``max(head_dim)``, changing per-layer KV byte sizes.
                 if is_gemma4_hybrid(config):
                     raise NotImplementedError(
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
@@ -1149,7 +1152,7 @@ class KvCacheCreator:
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
             effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
         draft_kv_cache_manager_cls = self._fallback_if_unsupported_kv_cache_manager_v2(
-            draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
+            draft_kv_cache_manager_cls, effective_draft_config)
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),

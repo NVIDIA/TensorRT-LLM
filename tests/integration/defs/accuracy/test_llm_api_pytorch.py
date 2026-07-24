@@ -7890,7 +7890,8 @@ class TestGLM52(LlmapiAccuracyTestHarness):
         # precision.
         model_name = "zai-org/GLM-5.2"
         model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        use_kv_cache_manager_v2=True)
 
         pytorch_config = dict(
             disable_overlap_scheduler=False,
@@ -7906,6 +7907,7 @@ class TestGLM52(LlmapiAccuracyTestHarness):
                  pipeline_parallel_size=1,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
+                 max_batch_size=128,
                  max_seq_len=8192,
                  **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
