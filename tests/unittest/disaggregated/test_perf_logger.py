@@ -47,9 +47,20 @@ class TestPerfTimer:
 # PerfLogManager tests
 # ---------------------------------------------------------------------------
 def _reset_singleton():
-    """Reset PerfLogManager singleton so each test gets a fresh instance."""
+    """Reset PerfLogManager singleton so each test gets a fresh instance.
+
+    Closes any file handlers the previous instance attached to the global
+    logging registry so temporary directories can be cleaned up and no file
+    descriptors leak across tests.
+    """
     from tensorrt_llm._torch.disaggregation.native import perf_logger
 
+    instance = perf_logger.PerfLogManager._instance
+    if instance is not None:
+        for file_logger in getattr(instance, "_file_loggers", {}).values():
+            for handler in list(file_logger.handlers):
+                file_logger.removeHandler(handler)
+                handler.close()
     perf_logger.PerfLogManager._instance = None
 
 
@@ -81,52 +92,60 @@ class TestPerfLogManager:
 
     def test_log_gen_transfer_summary_writes_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict(
-                "os.environ",
-                {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": tmpdir},
-                clear=False,
-            ):
-                from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfLogManager
+            try:
+                with patch.dict(
+                    "os.environ",
+                    {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": tmpdir},
+                    clear=False,
+                ):
+                    from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfLogManager
 
-                mgr = PerfLogManager()
-                mgr.log_gen_transfer_summary(
-                    unique_rid=42,
-                    instance_name="test_inst",
-                    instance_rank=0,
-                    gen_side_transfer_time_ms=12.345,
-                    kv_cache_size=1024,
-                )
-                csv_path = os.path.join(tmpdir, "test_inst_0_gen_transfer_summary.csv")
-                assert os.path.exists(csv_path), f"CSV file not created at {csv_path}"
-                with open(csv_path) as f:
-                    lines = f.readlines()
-                assert len(lines) >= 2  # header + at least 1 data row
-                assert "gen_side_transfer_time(ms)" in lines[0]
-                assert "42" in lines[1]
-                assert "12.345" in lines[1]
-                assert "1024" in lines[1]
+                    mgr = PerfLogManager()
+                    mgr.log_gen_transfer_summary(
+                        unique_rid=42,
+                        instance_name="test_inst",
+                        instance_rank=0,
+                        gen_side_transfer_time_ms=12.345,
+                        kv_cache_size=1024,
+                    )
+                    csv_path = os.path.join(tmpdir, "test_inst_0_gen_transfer_summary.csv")
+                    assert os.path.exists(csv_path), f"CSV file not created at {csv_path}"
+                    with open(csv_path) as f:
+                        lines = f.readlines()
+                    assert len(lines) >= 2  # header + at least 1 data row
+                    assert "gen_side_transfer_time(ms)" in lines[0]
+                    assert "42" in lines[1]
+                    assert "12.345" in lines[1]
+                    assert "1024" in lines[1]
+            finally:
+                # Close file handlers before the temporary directory exits.
+                _reset_singleton()
 
     def test_cpp_env_takes_priority_over_legacy_for_log(self) -> None:
         """With both C++ and legacy env vars set, log() uses the C++ naming."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            legacy_base = os.path.join(tmpdir, "legacy")
-            with patch.dict(
-                "os.environ",
-                {
-                    "TRTLLM_KVCACHE_TIME_OUTPUT_PATH": tmpdir,
-                    "TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO": "1",
-                    "TLLM_KV_TRANSFER_PERF_LOG_FILE": legacy_base,
-                },
-                clear=False,
-            ):
-                from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfLogManager
+            try:
+                legacy_base = os.path.join(tmpdir, "legacy")
+                with patch.dict(
+                    "os.environ",
+                    {
+                        "TRTLLM_KVCACHE_TIME_OUTPUT_PATH": tmpdir,
+                        "TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO": "1",
+                        "TLLM_KV_TRANSFER_PERF_LOG_FILE": legacy_base,
+                    },
+                    clear=False,
+                ):
+                    from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfLogManager
 
-                mgr = PerfLogManager()
-                mgr.log("test_inst", 0, "csv_line", "info_msg")
-                cpp_path = os.path.join(tmpdir, "test_inst_0.csv")
-                legacy_path = f"{legacy_base}_test_inst_0.csv"
-                assert os.path.exists(cpp_path), f"C++-style CSV not created at {cpp_path}"
-                assert not os.path.exists(legacy_path), "legacy-style CSV should not be used"
+                    mgr = PerfLogManager()
+                    mgr.log("test_inst", 0, "csv_line", "info_msg")
+                    cpp_path = os.path.join(tmpdir, "test_inst_0.csv")
+                    legacy_path = f"{legacy_base}_test_inst_0.csv"
+                    assert os.path.exists(cpp_path), f"C++-style CSV not created at {cpp_path}"
+                    assert not os.path.exists(legacy_path), "legacy-style CSV should not be used"
+            finally:
+                # Close file handlers before the temporary directory exits.
+                _reset_singleton()
 
     @patch.dict("os.environ", {}, clear=False)
     def test_log_gen_transfer_summary_disabled_without_env(self) -> None:
