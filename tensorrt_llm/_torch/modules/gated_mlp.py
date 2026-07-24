@@ -357,17 +357,13 @@ class GatedMLP(nn.Module):
                 "LoRA is not supported with uneven TP for GatedMLP "
                 "(intermediate_size not divisible by tp_size).")
 
-        h1, h1_lora_results = LoraLayer.forward_with_base(
+        h1 = LoraLayer.forward_with_base(
             lambda: self.gate_up_proj(x),
             (self.splitted_gate_up_lora, self.fused_gate_up_lora),
             x,
             lora_params,
             self.layer_idx,
         )
-
-        for h1_lora in h1_lora_results:
-            if h1_lora is not None:
-                h1 = h1 + h1_lora
 
         h2 = self._apply_activation(h1, has_lora=True)
         output = self.down_proj(h2,
