@@ -417,8 +417,6 @@ def create_py_executor(
     ) = llm_args.get_runtime_sizes()
 
     tokens_per_block = kv_cache_config.tokens_per_block
-    if llm_args.attn_backend == "VANILLA":
-        tokens_per_block = max_num_tokens
 
     # The MSA kernels require a page size of 128; the Triton reference uses TRT-LLM's default
     # of 32.

@@ -55,7 +55,7 @@ BACKEND_CAPS = {
         kv_layouts=("NHD", "HND"),  # selectable via metadata.kv_layout
     ),
     "VANILLA": dict(
-        paged=False,
+        paged=True,
         fp8_kv=True,
         fp4_kv=False,
         sliding_window=True,
