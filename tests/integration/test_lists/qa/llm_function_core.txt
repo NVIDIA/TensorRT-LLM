@@ -883,6 +883,8 @@ disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp
 disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer[False-TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer_missing_blocks[False-TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context_capacity[False-False-DeepSeek-V3-Lite-fp8/fp8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-TinyLlama-1.1B-Chat-v1.0]

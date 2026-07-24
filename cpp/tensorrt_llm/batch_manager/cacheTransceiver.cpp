@@ -51,6 +51,7 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
+#include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
@@ -619,6 +620,17 @@ CacheTransceiver::~CacheTransceiver()
 void CacheTransceiver::initializeCommState()
 {
     mCommState = std::addressof(mCacheSender->getCommState());
+}
+
+std::vector<char> CacheTransceiver::getSerializedDataTransceiverState() const
+{
+    TLLM_CHECK(mCommState != nullptr && mCacheState != nullptr);
+    executor::DataTransceiverState state;
+    state.setCommState(*mCommState);
+    state.setCacheState(*mCacheState);
+    // Only this API marks the state; context responses leave it unset.
+    state.setIsArbitraryTransferState(true);
+    return executor::Serialization::serialize(state);
 }
 
 void CacheTransceiver::setContextState(LlmRequest* llmRequest)

@@ -249,6 +249,12 @@ public:
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
+    /// Get the serialized DataTransceiverState (CacheState + CommState) for this transceiver.
+    [[nodiscard]] virtual std::vector<char> getSerializedDataTransceiverState() const
+    {
+        return {};
+    }
+
     [[nodiscard]] virtual bool hasPoisonedTransferBuffer() const
     {
         return false;
@@ -297,6 +303,8 @@ public:
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
+
+    [[nodiscard]] std::vector<char> getSerializedDataTransceiverState() const override;
 
     [[nodiscard]] bool hasPoisonedTransferBuffer() const override;
 
