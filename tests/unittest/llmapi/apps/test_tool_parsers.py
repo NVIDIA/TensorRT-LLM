@@ -2845,21 +2845,27 @@ class TestToolParserIntegration:
 
     def test_qwen3_5_reasoning_plus_qwen3_tool_parser_bare_json_pipeline(
             self, sample_tools):
-        """NVBug 6240584: end-to-end reasoning + tool parser pipeline.
+        r"""NVBug 6240584: end-to-end reasoning + tool parser pipeline.
 
-        Reproduces the exact scenario from the bug report: the model emits
-        `<think>...</think>` followed by a bare JSON tool call (no
-        `<tool_call>` wrapper). The `qwen3_5` reasoning parser strips the
-        thinking block, then the `qwen3` tool parser must recover the tool
-        call so `args.has_tool_call[0]` is True and downstream logic sets
+        Reproduces the exact scenario from the bug report: the Qwen3.6 FP8
+        chat template pre-injects `<think>\n` into the assistant prompt
+        prefix, so the model output starts *inside* the reasoning block
+        with no opening `<think>` tag. Content up to `</think>` is the
+        reasoning, and what follows is a bare JSON tool call (no
+        `<tool_call>` wrapper). The `qwen3_5` reasoning parser (registered
+        with `reasoning_at_start=True`) strips the thinking block, then
+        the `qwen3` tool parser must recover the tool call so
+        `args.has_tool_call[0]` is True and downstream logic sets
         `finish_reason="tool_calls"` (see chat_response_post_processor).
         """
         from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
         from tensorrt_llm.serve.postprocess_handlers import (
             ChatPostprocArgs, apply_reasoning_parser, apply_tool_parser)
 
-        # Bug-report input: reasoning block + bare JSON tool call.
-        text = ('<think>Reasoning here.</think>\n'
+        # Bug-report input: reasoning content (no leading `<think>` — the
+        # chat template already injected it into the prompt prefix) followed
+        # by a bare JSON tool call.
+        text = ('Reasoning here.</think>\n'
                 '{"name":"get_weather","arguments":{"city":"Paris"}}')
 
         # Build a minimal request so we can construct ChatPostprocArgs.
