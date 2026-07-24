@@ -263,6 +263,7 @@ l0_b200:
   tests:
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
   - unittest/disaggregated/test_openai_server_info.py
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
 - condition:
     ranges:
       system_gpu_count:

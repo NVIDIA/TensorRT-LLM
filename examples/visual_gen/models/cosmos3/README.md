@@ -13,6 +13,7 @@ Pass the Hub ID or local path via `--model`:
 
 - [`nvidia/Cosmos3-Nano`](https://huggingface.co/nvidia/Cosmos3-Nano)
 - [`nvidia/Cosmos3-Super`](https://huggingface.co/nvidia/Cosmos3-Super)
+- [`nvidia/Cosmos3-Super-Text2Image-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image-4Step) — DMD2-distilled text-to-image: fixed 4-step schedule with classifier-free guidance baked into the weights. Steps/guidance are read from the checkpoint; conflicting request values are rejected. Use with `configs/cosmos3-t2i-1gpu.yaml`.
 
 ## Guardrails
 
@@ -36,6 +37,7 @@ See `examples/visual_gen/configs/`:
 
 - `cosmos3-nano-1gpu.yaml` — 1 GPU
 - `cosmos3-super-4gpu.yaml` — 4 GPU, CFG + Ulysses + parallel VAE
+- `cosmos3-t2i-1gpu.yaml` — 1 GPU, text-to-image deployments (base or distilled): warms the deployed 1024×1024 single-frame shape instead of the omni video shape.
 
 Example prompts live under `prompts/` (mirroring `cosmos3-internal/inputs/omni`).
 
@@ -68,6 +70,14 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/t2i.json \
     --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --output_path output.png
+
+# T2I, distilled 4-step checkpoint (use the T2I config so warmup runs the
+# image shape; steps/guidance come from the checkpoint automatically)
+python cosmos3.py --model nvidia/Cosmos3-Super-Text2Image-4Step \
+    --prompt_file prompts/t2i.json \
+    --visual_gen_args ../../configs/cosmos3-t2i-1gpu.yaml \
+    --output_type image \
     --output_path output.png
 
 # Inline prompt (--prompt or a JSON file path)
