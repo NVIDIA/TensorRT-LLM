@@ -18,7 +18,6 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
-from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
@@ -162,16 +161,67 @@ def create_sparse_attn_weights(self) -> None:
 # Fused epilogue buffer management and output projection.
 
 
-def _validate_dsv4_epilogue_buffers(
+def _create_dsv4_epilogue_buffers(
     self,
+    q: torch.Tensor,
     num_tokens: int,
-    dsv4_epilogue_output: tuple[torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    fp8_o, output_sf = dsv4_epilogue_output
+    if self.n_local_groups <= 0 or self.num_heads_tp % self.n_local_groups != 0:
+        raise ValueError(
+            "DSv4 fused epilogue requires num_heads_tp to be divisible by n_local_groups."
+        )
+    heads_per_group = self.num_heads_tp // self.n_local_groups
     scale_buf_m = (num_tokens + 3) // 4 * 4
-    if fp8_o.shape[1] != num_tokens or output_sf.shape[2] != scale_buf_m:
-        raise RuntimeError("Invalid DSv4 fused epilogue buffers for current token count.")
+    fp8_o = q.new_empty(
+        (self.n_local_groups, num_tokens, heads_per_group * self.v_head_dim),
+        dtype=torch.float8_e4m3fn,
+    )
+    output_sf = q.new_empty(
+        (
+            self.n_local_groups,
+            heads_per_group * (self.v_head_dim // 128),
+            scale_buf_m,
+        ),
+        dtype=torch.float32,
+    )
     return fp8_o, output_sf
+
+
+def _run_dsv4_epilogue_bmm(
+    self,
+    epilogue_output: tuple[torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+) -> None:
+    attn_fp8, attn_scale = epilogue_output
+    torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+        attn_fp8,
+        self.o_a_proj,
+        attn_scale,
+        self.o_a_proj_scale,
+        output.transpose(0, 1),
+    )
+
+
+def _run_dsv4_epilogue_bmms(
+    self,
+    output: torch.Tensor,
+    num_context_tokens: int,
+    num_tokens: int,
+    context_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]],
+    generation_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]],
+) -> None:
+    if context_epilogue_output is not None:
+        _run_dsv4_epilogue_bmm(
+            self,
+            context_epilogue_output,
+            output[:num_context_tokens],
+        )
+    if generation_epilogue_output is not None:
+        _run_dsv4_epilogue_bmm(
+            self,
+            generation_epilogue_output,
+            output[num_context_tokens:num_tokens],
+        )
 
 
 def prepare_sparse_attn_outputs(
@@ -182,15 +232,7 @@ def prepare_sparse_attn_outputs(
         num_generations = attn_metadata.num_generations
         if self._disable_dsv4_epilogue_fusion:
             return False
-        # BCG eager breaks replay with dynamic, unpadded attention metadata,
-        # while captured segment tensors use static bucket shapes. The fused
-        # epilogue buffers cannot safely bridge that shape boundary.
-        if is_in_breakable_cuda_graph():
-            return False
         if num_contexts == 0 and num_generations == 0:
-            return False
-        if num_contexts > 0 and num_generations > 0:
-            # The fused buffers do not carry token offsets for a mixed batch.
             return False
         if self.mapping.has_cp_helix() or not is_sm_100f():
             return False
@@ -212,32 +254,15 @@ def prepare_sparse_attn_outputs(
             return False
         return not self.inverse_rotary_emb.is_neox
 
-    def _create_dsv4_epilogue_buffers() -> tuple[torch.Tensor, torch.Tensor]:
-        if self.n_local_groups <= 0 or self.num_heads_tp % self.n_local_groups != 0:
-            raise ValueError(
-                "DSv4 fused epilogue requires num_heads_tp to be divisible by n_local_groups."
-            )
-        heads_per_group = self.num_heads_tp // self.n_local_groups
-        num_tokens = attn_metadata.num_tokens
-        scale_buf_m = (num_tokens + 3) // 4 * 4
-        fp8_o = hidden_states.new_empty(
-            (self.n_local_groups, num_tokens, heads_per_group * self.v_head_dim),
-            dtype=torch.float8_e4m3fn,
-        )
-        output_sf = hidden_states.new_empty(
-            (
-                self.n_local_groups,
-                heads_per_group * (self.v_head_dim // 128),
-                scale_buf_m,
-            ),
-            dtype=torch.float32,
-        )
-        return fp8_o, output_sf
-
     if _should_use_dsv4_epilogue_fusion():
-        attn_output = [self.create_output(hidden_states[:0], attn_metadata.num_contexts)]
-        attn_output.extend(_create_dsv4_epilogue_buffers())
-        return attn_output
+        num_tokens = hidden_states.shape[0]
+        return [
+            torch.empty(
+                [num_tokens, self.n_local_groups, self.o_lora_rank],
+                device=hidden_states.device,
+                dtype=self.dtype,
+            )
+        ]
     return [self.create_output(hidden_states, attn_metadata.num_contexts)]
 
 
@@ -249,24 +274,10 @@ def project_sparse_attn_output(
     all_reduce_params: Optional["AllReduceParams"] = None,
 ) -> torch.Tensor:
     del attn_metadata, all_reduce_params
-    if len(attn_output) > 1:
-        attn_fp8, attn_scale = attn_output[1:]
-        num_tokens = attn_fp8.shape[1]
-        o_lora = torch.empty(
-            [num_tokens, self.n_local_groups, self.o_lora_rank],
-            device=attn_fp8.device,
-            dtype=self.dtype,
-        )
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
-            attn_fp8,
-            self.o_a_proj,
-            attn_scale,
-            self.o_a_proj_scale,
-            o_lora.transpose(0, 1),
-        )
-        return self.o_b_proj(o_lora.flatten(1))
-
     attn_output_tensor = attn_output[0]
+    if attn_output_tensor.ndim == 3:
+        return self.o_b_proj(attn_output_tensor.flatten(1))
+
     assert position_ids is not None
     num_tokens = attn_output_tensor.shape[0]
     attn_output_tensor = attn_output_tensor.view(num_tokens, self.num_heads_tp, -1)
@@ -353,11 +364,11 @@ def forward_generation_sparse_attn(
     compressed_kv: torch.Tensor,
     k_pe: torch.Tensor,
     attn_metadata: AttentionMetadata,
-    output: torch.Tensor,
+    output: Optional[torch.Tensor],
     position_ids: Optional[torch.Tensor] = None,
     latent_cache: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
-    sparse_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    enable_dsv4_epilogue_fusion: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the DeepSeek-V4 generation absorption path."""
     if get_sm_version() < 100:
@@ -402,10 +413,8 @@ def forward_generation_sparse_attn(
     attention_output = output
     output_sf = None
     inverse_rope_cos_sin = None
-    if sparse_epilogue_output is not None:
-        attention_output, output_sf = _validate_dsv4_epilogue_buffers(
-            self, num_tokens, sparse_epilogue_output
-        )
+    if enable_dsv4_epilogue_fusion:
+        attention_output, output_sf = _create_dsv4_epilogue_buffers(self, q, num_tokens)
         inverse_rope_cos_sin = self.inverse_rotary_emb.rotary_cos_sin
 
     attn_out_latent = self._attn_forward_gen(
@@ -429,11 +438,13 @@ def forward_generation_sparse_attn(
         mla_bmm2_scale=mla_bmm2_scale,
         quant_q_buffer=quant_q_buffer,
         dsv4_inv_rope_cos_sin_cache=inverse_rope_cos_sin,
-        enable_dsv4_epilogue_fusion=sparse_epilogue_output is not None,
+        enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
     )
-    if sparse_epilogue_output is not None:
-        return attn_out_latent
+    if enable_dsv4_epilogue_fusion:
+        assert attention_output is not None and output_sf is not None
+        return attention_output, output_sf
 
+    assert output is not None
     if self.mapping.has_cp_helix():
         raise RuntimeError(
             "DeepSeek-V4 + CP Helix is not supported because the post-process "
@@ -451,11 +462,11 @@ def forward_context_sparse_attn(
     compressed_kv: torch.Tensor,
     k_pe: torch.Tensor,
     attn_metadata: AttentionMetadata,
-    output: torch.Tensor,
+    output: Optional[torch.Tensor],
     latent_cache: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.Tensor] = None,
-    sparse_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    enable_dsv4_epilogue_fusion: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the DeepSeek-V4 context absorption path."""
     if get_sm_version() < 100:
@@ -484,10 +495,8 @@ def forward_context_sparse_attn(
     attention_output = output
     output_sf = None
     inverse_rope_cos_sin = None
-    if sparse_epilogue_output is not None:
-        attention_output, output_sf = _validate_dsv4_epilogue_buffers(
-            self, num_tokens, sparse_epilogue_output
-        )
+    if enable_dsv4_epilogue_fusion:
+        attention_output, output_sf = _create_dsv4_epilogue_buffers(self, q, num_tokens)
         inverse_rope_cos_sin = self.inverse_rotary_emb.rotary_cos_sin
 
     attn_out_latent = self._attn_forward_gen(
@@ -507,13 +516,16 @@ def forward_context_sparse_attn(
         quant_scale_qkv=quant_scale_qkv,
         sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk_indices),
         dsv4_inv_rope_cos_sin_cache=inverse_rope_cos_sin,
-        enable_dsv4_epilogue_fusion=sparse_epilogue_output is not None,
+        enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
     )
     self._fused_quant_q_buffer = None
     self._fused_q_pe = None
 
-    if sparse_epilogue_output is not None:
-        return attn_out_latent
+    if enable_dsv4_epilogue_fusion:
+        assert attention_output is not None and output_sf is not None
+        return attention_output, output_sf
+
+    assert output is not None
     if self.mapping.has_cp_helix():
         raise RuntimeError(
             "DeepSeek-V4 + CP Helix is not supported because the post-process "
@@ -538,14 +550,11 @@ def forward_sparse_attn(
     """Run DeepSeek-V4 MLA and write into the algorithm-defined output buffers."""
     assert self.mha is None and self.mqa is not None, "DeepSeek-V4 is only supported in MQA mode"
     output = attn_output[0]
-    sparse_epilogue_output = (attn_output[1], attn_output[2]) if len(attn_output) > 1 else None
+    enable_dsv4_epilogue_fusion = output.ndim == 3
     num_contexts = attn_metadata.num_contexts
     num_generations = attn_metadata.num_generations
     num_ctx_tokens = attn_metadata.num_ctx_tokens
     num_tokens = attn_metadata.num_tokens
-    if sparse_epilogue_output is not None and ((num_contexts > 0) == (num_generations > 0)):
-        raise RuntimeError("DSv4 epilogue fusion requires a context-only or generation-only batch.")
-
     hidden_states = hidden_states[:num_tokens, ...]
     if position_ids is not None:
         position_ids = position_ids[..., :num_tokens]
@@ -756,6 +765,8 @@ def forward_sparse_attn(
 
     assert output is not None, "output must be provided"
 
+    context_o_lora_bmm_input = None
+    generation_o_lora_bmm_input = None
     if num_contexts > 0:
         q_ctx = q[:num_ctx_tokens, ...]
         topk_indices_ctx = topk_indices[:num_ctx_tokens, :] if topk_indices is not None else None
@@ -767,17 +778,17 @@ def forward_sparse_attn(
             assert ctx_position_ids is not None
             k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, ctx_position_ids)
 
-        forward_context_sparse_attn(
+        context_o_lora_bmm_input = forward_context_sparse_attn(
             self,
             q_ctx,
             compressed_kv_ctx,
             k_pe_ctx,
             attn_metadata,
-            output[:num_ctx_tokens, :],
+            None if enable_dsv4_epilogue_fusion else output[:num_ctx_tokens, :],
             position_ids=ctx_position_ids,
             latent_cache=latent_cache_ctx,
             topk_indices=topk_indices_ctx,
-            sparse_epilogue_output=sparse_epilogue_output,
+            enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
         )
 
     if num_generations > 0:
@@ -795,17 +806,33 @@ def forward_sparse_attn(
             assert gen_position_ids is not None
             k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
 
-        forward_generation_sparse_attn(
+        generation_o_lora_bmm_input = forward_generation_sparse_attn(
             self,
             q_gen,
             compressed_kv_gen,
             k_pe_gen,
             attn_metadata,
-            output[num_ctx_tokens:num_tokens, :],
+            None if enable_dsv4_epilogue_fusion else output[num_ctx_tokens:num_tokens, :],
             position_ids=gen_position_ids,
             latent_cache=latent_cache_gen,
             topk_indices=topk_indices_gen,
-            sparse_epilogue_output=sparse_epilogue_output,
+            enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
+        )
+
+    if enable_dsv4_epilogue_fusion:
+        assert context_o_lora_bmm_input is None or isinstance(
+            context_o_lora_bmm_input, tuple
+        )
+        assert generation_o_lora_bmm_input is None or isinstance(
+            generation_o_lora_bmm_input, tuple
+        )
+        _run_dsv4_epilogue_bmms(
+            self,
+            output,
+            num_ctx_tokens,
+            num_tokens,
+            context_o_lora_bmm_input,
+            generation_o_lora_bmm_input,
         )
 
 

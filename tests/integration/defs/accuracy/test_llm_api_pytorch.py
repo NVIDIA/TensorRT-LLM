@@ -15,13 +15,16 @@
 import asyncio
 import json
 import os
+import statistics
 import sys
+import time
 from unittest import mock
 
 import pytest
 import torch
 from datasets import load_dataset
 from defs.conftest import get_sm_version, is_sm_100f
+from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import LLM
@@ -3919,6 +3922,180 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                              moe_backend,
                              eplb_config,
                              mtp_nextn=mtp_nextn)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.threadleak(enabled=False)
+    def test_mixed_breakable_cuda_graph_epilogue_fusion_ab(self, mocker):
+        from transformers import AutoTokenizer
+
+        from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+        fusion_env = "TRTLLM_DSV4_DISABLE_FMHA_EPILOGUE_FUSION"
+
+        def patched_start_mpi_pool(session):
+            assert not session.mpi_pool, "MPI session already started"
+            session.mpi_pool = MPIPoolExecutor(
+                max_workers=session.n_workers,
+                path=sys.path,
+                env={fusion_env: os.environ.get(fusion_env, "0")},
+            )
+
+        mocker.patch.object(MpiPoolSession, "_start_mpi_pool",
+                            patched_start_mpi_pool)
+
+        prompt_lengths = [64, 129, 257, 385, 513, 769]
+        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
+        base_prompt_ids = tokenizer.encode(
+            "TensorRT-LLM accelerates reliable large language model inference "
+            "with efficient attention, parallelism, and CUDA graphs. ",
+            add_special_tokens=False,
+        )
+        assert base_prompt_ids
+        prompts = [
+            (base_prompt_ids * ((prompt_length + len(base_prompt_ids) - 1) //
+                                len(base_prompt_ids)))[:prompt_length]
+            for prompt_length in prompt_lengths
+        ]
+        sampling_params = SamplingParams(
+            max_tokens=8,
+            min_tokens=8,
+            seed=42,
+            temperature=0,
+            ignore_eos=True,
+            detokenize=False,
+            add_special_tokens=False,
+        )
+        llm_kwargs = dict(
+            tensor_parallel_size=8,
+            moe_expert_parallel_size=8,
+            moe_config=MoeConfig(backend="TRTLLM"),
+            enable_attention_dp=True,
+            max_batch_size=8,
+            max_num_tokens=1024,
+            max_seq_len=2048,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                dtype="fp8",
+                free_gpu_memory_fraction=0.6,
+            ),
+            cuda_graph_config=CudaGraphConfig(
+                batch_sizes=[1, 2, 4, 6, 8],
+                enable_padding=True,
+            ),
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_capture_num_tokens=[128, 256, 512, 1024],
+        )
+
+        def run_variant(disable_fusion: bool) -> dict:
+            variant_start = time.perf_counter()
+            with mock.patch.dict(
+                    os.environ,
+                {fusion_env: "1" if disable_fusion else "0"},
+                    clear=False,
+            ):
+                with LLM(
+                        self.MODEL_PATH,
+                        **llm_kwargs,
+                        env_overrides={
+                            fusion_env: "1" if disable_fusion else "0"
+                        },
+                ) as llm:
+                    init_seconds = time.perf_counter() - variant_start
+                    warmup_start = time.perf_counter()
+                    llm.generate(prompts,
+                                 sampling_params=sampling_params,
+                                 use_tqdm=False)
+                    warmup_seconds = time.perf_counter() - warmup_start
+
+                    rounds = []
+                    for _ in range(5):
+                        round_start = time.perf_counter()
+                        outputs = llm.generate(
+                            prompts,
+                            sampling_params=sampling_params,
+                            use_tqdm=False,
+                        )
+                        latency_seconds = time.perf_counter() - round_start
+                        token_ids = [
+                            output.outputs[0].token_ids for output in outputs
+                        ]
+                        output_tokens = sum(len(ids) for ids in token_ids)
+                        rounds.append({
+                            "latency_seconds":
+                            latency_seconds,
+                            "output_tokens":
+                            output_tokens,
+                            "output_tokens_per_second":
+                            output_tokens / latency_seconds,
+                            "token_ids":
+                            token_ids,
+                        })
+
+            latencies = [
+                round_result["latency_seconds"] for round_result in rounds
+            ]
+            throughputs = [
+                round_result["output_tokens_per_second"]
+                for round_result in rounds
+            ]
+            return {
+                "fusion_disabled":
+                disable_fusion,
+                "engine_init_capture_seconds":
+                init_seconds,
+                "warmup_seconds":
+                warmup_seconds,
+                "rounds":
+                rounds,
+                "median_latency_seconds":
+                statistics.median(latencies),
+                "p90_latency_seconds":
+                statistics.quantiles(latencies, n=10, method="inclusive")[8],
+                "median_output_tokens_per_second":
+                statistics.median(throughputs),
+                "p90_output_tokens_per_second":
+                statistics.quantiles(throughputs, n=10, method="inclusive")[8],
+            }
+
+        disabled_result = run_variant(disable_fusion=True)
+        fusion_result = run_variant(disable_fusion=False)
+        disabled_token_ids = [
+            round_result["token_ids"]
+            for round_result in disabled_result["rounds"]
+        ]
+        fusion_token_ids = [
+            round_result["token_ids"]
+            for round_result in fusion_result["rounds"]
+        ]
+        disabled_repeatable = all(token_ids == disabled_token_ids[0]
+                                  for token_ids in disabled_token_ids[1:])
+        fusion_repeatable = all(token_ids == fusion_token_ids[0]
+                                for token_ids in fusion_token_ids[1:])
+        token_ids_match = fusion_token_ids == disabled_token_ids
+
+        result = {
+            "model": self.MODEL_PATH,
+            "prompt_lengths": prompt_lengths,
+            "max_tokens": sampling_params.max_tokens,
+            "disabled": disabled_result,
+            "fusion": fusion_result,
+            "disabled_repeatable": disabled_repeatable,
+            "fusion_repeatable": fusion_repeatable,
+            "token_ids_match": token_ids_match,
+        }
+        result_json = json.dumps(result, sort_keys=True)
+        if MPI.COMM_WORLD.Get_rank() == 0:
+            print(f"DSV4_BCG_EPILOGUE_AB_RESULT={result_json}")
+        result_path = os.environ.get("TRTLLM_DSV4_BCG_AB_RESULT_PATH")
+        if result_path and MPI.COMM_WORLD.Get_rank() == 0:
+            result_dir = os.path.dirname(result_path)
+            if result_dir:
+                os.makedirs(result_dir, exist_ok=True)
+            with open(result_path, "w") as result_file:
+                json.dump(result, result_file, indent=2, sort_keys=True)
+        assert disabled_repeatable
+        assert fusion_repeatable
+        assert token_ids_match
 
 
 _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
