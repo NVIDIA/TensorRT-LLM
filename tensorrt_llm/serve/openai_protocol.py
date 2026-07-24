@@ -1670,19 +1670,20 @@ class VideoGenerationRequest(OpenAIBaseModel):
         default=None,
         description=(
             "Optional image or video reference that guides generation. "
-            "Content is classified by decoding it — filename and MIME "
-            "metadata are not used for routing (JSON requests carry bare "
-            "base64 with no such metadata): Pillow must fully load an "
-            "image; OpenCV must open a video and return decodable "
-            "frames. Images condition image-to-video; videos condition "
-            "video-to-video on models that support it. Tested formats: "
-            "PNG (image/png) and JPEG (image/jpeg) images; MPEG-4 Part 2 "
-            "video in MP4 (video/mp4) and Motion JPEG in AVI "
-            "(video/x-msvideo). Other containers, codecs, profiles, and "
-            "pixel formats depend on the installed decoder backend and "
-            "are not guaranteed. Video references exceeding 1 GiB after "
-            "RGB decoding are rejected. JSON requests carry base64 "
-            "bytes; multipart requests upload the file."),
+            "Content is routed by its container signature — filename and "
+            "MIME metadata are ignored (JSON requests carry bare base64 "
+            "with no such metadata). Images (PNG image/png, JPEG "
+            "image/jpeg) must fully decode with Pillow at the boundary "
+            "and condition image-to-video. Video containers (MP4 "
+            "video/mp4, AVI video/x-msvideo) pass through encoded and "
+            "are decoded on the workers' NVDEC; tested codec is H.264 in "
+            "both containers, other codecs/profiles depend on the GPU's "
+            "decoder capabilities and are best-effort. Undecodable or "
+            "corrupt content fails as a client error (400); a valid "
+            "reference the deployment cannot fit fails as capacity "
+            "(503). Reference decoding is bounded to 7200 frames by "
+            "default (TRTLLM_MAX_REFERENCE_DECODE_FRAMES). JSON requests "
+            "carry base64 bytes; multipart requests upload the file."),
     )
 
     # Resolution

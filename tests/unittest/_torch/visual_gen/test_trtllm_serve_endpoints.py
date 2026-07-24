@@ -17,10 +17,10 @@ import asyncio
 import base64
 import os
 from io import BytesIO
+from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
 
-import numpy as np
 import pytest
 import torch
 from fastapi.testclient import TestClient
@@ -61,19 +61,7 @@ def _assert_llm_envelope(
         assert message_contains in body["message"], body["message"]
 
 
-def _require_opencv():
-    """Skip unless OpenCV is installed (the shared optional video decoder).
-
-    These tests drive the serve's in-memory reference classification/decode
-    (``is_decodable_image_bytes`` / ``decode_video_frames_from_bytes``), which decodes
-    via OpenCV (the same optional dep the multimodal video path uses). CI installs
-    ``opencv-python-headless`` in every test stage (``jenkins/L0_Test.groovy``),
-    so these tests always run there; the skip only spares bare local
-    environments, where cv2 stays optional (kept out of requirements by the
-    dependency policy). Returns the module for tests that synthesize a clip
-    with ``cv2.VideoWriter``.
-    """
-    return pytest.importorskip("cv2")
+_V2V_FIXTURE_MP4 = Path(__file__).parent / "test_data" / "cosmos3_v2v_ref_9f_bframes.mp4"
 
 
 def _make_dummy_image_tensor(height: int = 64, width: int = 64) -> torch.Tensor:
@@ -858,25 +846,16 @@ class TestVideoGenerationSync:
         assert params.image.endswith("_reference")
         assert os.path.exists(params.image)
 
-    def test_sync_video_generation_multipart_with_video_reference(self, video_client, tmp_path):
-        """A video ``input_reference`` is decoded into a uint8 [T, H, W, C]
-        tensor on the model-specific ``video`` extra param (V2V).
+    def test_sync_video_generation_multipart_with_video_reference(self, video_client):
+        """A video ``input_reference`` rides through as the encoded payload on
+        the model-specific ``video`` extra param (V2V), byte-identical — the
+        serve never decodes video; the worker demuxes/NVDEC-decodes it.
 
-        The reference is classified by decoding its content, so the clip is
-        synthesized in-test with OpenCV — no video asset ships with the repo.
+        Routed by container signature, so a checked-in H.264/MP4 fixture drives
+        the boundary directly.
         """
-        cv2 = _require_opencv()
-        ref_path = tmp_path / "ref.mp4"
-        # mp4v is a built-in FFmpeg mpeg4 encoder present in the opencv wheel.
-        writer = cv2.VideoWriter(str(ref_path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
-        try:
-            for _ in range(2):
-                writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
-        finally:
-            writer.release()
-        assert ref_path.exists() and ref_path.stat().st_size > 0
-
-        with open(ref_path, "rb") as f:
+        payload = _V2V_FIXTURE_MP4.read_bytes()
+        with open(_V2V_FIXTURE_MP4, "rb") as f:
             resp = video_client.post(
                 "/v1/videos/generations",
                 data={
@@ -890,51 +869,23 @@ class TestVideoGenerationSync:
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # Video content must NOT land on params.image; it's decoded into a
-        # uint8 [T, H, W, C] tensor on the model-specific ``video`` extra param
+        # Video content must NOT land on params.image; it rides the
+        # model-specific ``video`` extra param as the untouched encoded bytes
         # (the same intake the offline example's --video_path uses).
         params = video_client.mock_gen.last_params
         assert params.image is None
-        video = params.extra_params["video"]
-        assert isinstance(video, torch.Tensor)
-        assert video.dtype == torch.uint8
-        assert video.ndim == 4 and video.shape[-1] == 3
+        assert params.extra_params["video"] == payload
 
     def test_sync_video_generation_undecodable_reference_400(self, video_client):
-        """Content neither PIL nor OpenCV can decode is rejected at the boundary."""
-        _require_opencv()
+        """Content matching no image or video container signature is rejected
+        at the boundary."""
         resp = video_client.post(
             "/v1/videos/generations",
             data={"prompt": "x"},
             files={"input_reference": ("doc.txt", BytesIO(b"not media"), "text/plain")},
         )
         assert resp.status_code == 400
-        assert "neither a decodable image" in resp.text
-
-    def test_sync_video_oversized_reference_400_with_message(
-        self, video_client, tmp_path, monkeypatch
-    ):
-        """A reference over the decoded-byte budget gets an HTTP 400 whose body
-        carries the actionable size message (not the generic undecodable one)."""
-        cv2 = _require_opencv()
-        from tensorrt_llm.inputs import media_io
-
-        monkeypatch.setattr(media_io, "MAX_DECODED_VIDEO_BYTES", 100)
-        ref_path = tmp_path / "ref.mp4"
-        writer = cv2.VideoWriter(str(ref_path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
-        try:
-            for _ in range(4):
-                writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
-        finally:
-            writer.release()
-        with open(ref_path, "rb") as f:
-            resp = video_client.post(
-                "/v1/videos/generations",
-                data={"prompt": "x"},
-                files={"input_reference": ("ref.mp4", f, "video/mp4")},
-            )
-        assert resp.status_code == 400
-        assert "decoded-size budget" in resp.text
+        assert "not a recognized media container" in resp.text
 
     def test_sync_video_failure(self, failing_client):
         resp = failing_client.post(

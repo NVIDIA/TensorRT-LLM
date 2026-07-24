@@ -12,9 +12,8 @@ table plus the field-by-field overlay contract.
 from __future__ import annotations
 
 import base64
-import os
-import tempfile
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -293,141 +292,85 @@ class TestInputReferenceMaterialization:
         with pytest.raises(ValueError, match="media_storage_path"):
             parse_visual_gen_params(request, "vid-2", generator, media_storage_path=None)
 
-    @staticmethod
-    def _mp4_bytes(num_frames: int = 2) -> bytes:
-        """Encode a 16x16 mp4v-in-mp4 clip and return its bytes.
-
-        ``mp4v`` is a built-in FFmpeg mpeg4 encoder present in the opencv wheel.
-        OpenCV writes only to a path, so encode to a tempfile and read it back.
-        """
-        cv2 = pytest.importorskip("cv2")
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            path = tmp.name
-        try:
-            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
-            try:
-                assert writer.isOpened(), "cv2 VideoWriter failed to open (mp4v in MP4)"
-                for _ in range(num_frames):
-                    writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
-            finally:
-                writer.release()
-            with open(path, "rb") as f:
-                return f.read()
-        finally:
-            os.remove(path)
+    _TEST_DATA = Path(__file__).parent / "test_data"
 
     @staticmethod
-    def _avi_bytes(num_frames: int = 2) -> bytes:
-        """Encode a 16x16 Motion-JPEG-in-AVI clip and return its bytes.
+    def _mp4_bytes() -> bytes:
+        """9-frame H.264-in-MP4 fixture (provenance: test_data/README.md)."""
+        return (
+            TestInputReferenceMaterialization._TEST_DATA / "cosmos3_v2v_ref_9f_bframes.mp4"
+        ).read_bytes()
 
-        The second container/codec pair in the documented support contract;
-        ``MJPG`` is built into the opencv wheel like ``mp4v``.
-        """
-        cv2 = pytest.importorskip("cv2")
-        with tempfile.NamedTemporaryFile(suffix=".avi", delete=False) as tmp:
-            path = tmp.name
-        try:
-            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 4.0, (16, 16))
-            try:
-                assert writer.isOpened(), "cv2 VideoWriter failed to open (MJPG in AVI)"
-                for _ in range(num_frames):
-                    writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
-            finally:
-                writer.release()
-            with open(path, "rb") as f:
-                return f.read()
-        finally:
-            os.remove(path)
+    @staticmethod
+    def _avi_bytes() -> bytes:
+        """Same 9 frames as H.264-in-AVI (provenance: test_data/README.md)."""
+        return (
+            TestInputReferenceMaterialization._TEST_DATA / "cosmos3_v2v_ref_9f_bframes.avi"
+        ).read_bytes()
 
     def test_multipart_avi_reference_routes_to_video(self, tmp_path):
-        # The AVI/MJPEG contract pair must survive the real boundary, not
-        # just the decode primitive: classified as video by content, routed
-        # to the ``video`` extra param.
-        import torch
-
+        # The AVI container signature must survive the real boundary: routed
+        # to the ``video`` extra param as untouched encoded bytes.
         generator = _StubVisualGen()
-        upload = UploadFile(file=BytesIO(self._avi_bytes()), filename="clip.avi")
+        payload = self._avi_bytes()
+        upload = UploadFile(file=BytesIO(payload), filename="clip.avi")
         request = VideoGenerationRequest(prompt="x", input_reference=upload)
         params = parse_visual_gen_params(
             request, "vid-avi", generator, media_storage_path=str(tmp_path)
         )
         assert params.image is None
-        video = params.extra_params["video"]
-        assert isinstance(video, torch.Tensor)
-        assert tuple(video.shape) == (2, 16, 16, 3)
+        assert params.extra_params["video"] == payload
 
-    def test_multipart_video_reference_routes_to_extra_params_tensor(self, tmp_path):
-        import torch
-
+    def test_multipart_video_reference_routes_to_extra_params_bytes(self, tmp_path):
         generator = _StubVisualGen()
-        upload = UploadFile(file=BytesIO(self._mp4_bytes()), filename="clip.mp4")
+        payload = self._mp4_bytes()
+        upload = UploadFile(file=BytesIO(payload), filename="clip.mp4")
         request = VideoGenerationRequest(prompt="x", input_reference=upload)
         params = parse_visual_gen_params(
             request, "vid-3", generator, media_storage_path=str(tmp_path)
         )
-        # Video content is decoded into a uint8 [T, H, W, C] tensor on the
-        # model-specific ``video`` extra param, not params.image. The worker
-        # crops the conditioning window + VAE-encodes.
+        # Video content rides the model-specific ``video`` extra param as the
+        # encoded payload, byte-identical — the boundary never decodes video;
+        # the worker demuxes/NVDEC-decodes the conditioning window.
         assert params.image is None
-        video = params.extra_params["video"]
-        assert isinstance(video, torch.Tensor)
-        assert video.dtype == torch.uint8
-        assert video.ndim == 4 and video.shape[0] == 2 and video.shape[-1] == 3
-        # Video references are decoded in memory — nothing lands in media storage.
+        assert params.extra_params["video"] == payload
+        # Nothing lands in media storage for video references.
         assert list(tmp_path.iterdir()) == []
 
     def test_video_reference_needs_no_media_storage(self):
-        # The decode is in-memory, so V2V works without a storage path at all
-        # (only image references persist a file for the worker to read).
-        import torch
-
+        # Video bytes pass through in memory, so V2V works without a storage
+        # path at all (only image references persist a file for the worker).
         generator = _StubVisualGen()
         b64 = base64.b64encode(self._mp4_bytes()).decode()
         request = VideoGenerationRequest(prompt="x", input_reference=b64)
         params = parse_visual_gen_params(request, "vid-9", generator, media_storage_path=None)
-        assert isinstance(params.extra_params["video"], torch.Tensor)
+        assert params.extra_params["video"] == self._mp4_bytes()
 
-    def test_base64_video_reference_routes_to_extra_params_tensor(self, tmp_path):
-        # Classification is content-based, so the JSON/base64 path can
-        # carry video even though it has no content-type or filename.
-        import torch
-
+    def test_base64_video_reference_routes_to_extra_params_bytes(self, tmp_path):
+        # Routing is signature-based, so the JSON/base64 path can carry video
+        # even though it has no content-type or filename.
         generator = _StubVisualGen()
-        b64 = base64.b64encode(self._mp4_bytes()).decode()
+        payload = self._mp4_bytes()
+        b64 = base64.b64encode(payload).decode()
         request = VideoGenerationRequest(prompt="x", input_reference=b64)
         params = parse_visual_gen_params(
             request, "vid-4", generator, media_storage_path=str(tmp_path)
         )
         assert params.image is None
-        assert isinstance(params.extra_params["video"], torch.Tensor)
+        assert params.extra_params["video"] == payload
 
-    def test_video_reference_reduced_before_routes_hold_params(self):
-        """``parse_visual_gen_params`` applies the spec reducers itself: the
-        sync/async routes hold the returned params for the whole job lifetime,
-        and ``generate_async`` reduces non-mutatively — without reduction at
-        parse, the serve would retain the full decoded clip per queued
-        request."""
+    def test_video_reference_bytes_survive_real_specs(self):
+        """With the real cosmos3 specs loaded, parsing leaves the encoded
+        payload byte-identical in ``extra_params['video']`` — the boundary
+        never transforms video content; the worker decodes the window."""
         from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
 
         generator = _StubVisualGen(extra_param_specs=COSMOS3_EXTRA_SPECS)
-        b64 = base64.b64encode(self._mp4_bytes(num_frames=8)).decode()
+        payload = self._mp4_bytes()
+        b64 = base64.b64encode(payload).decode()
         request = VideoGenerationRequest(prompt="x", input_reference=b64)
         params = parse_visual_gen_params(request, "vid-10", generator, media_storage_path=None)
-        # Cropped to the default conditioning window (5) at parse, not later.
-        assert params.extra_params["video"].shape[0] == 5
-
-    def test_budget_error_message_survives_parse(self, monkeypatch):
-        # Helper-level: DecodedVideoTooLargeError passes through the generic
-        # "undecodable" handler with its message intact. The HTTP 400 itself
-        # is asserted in test_trtllm_serve_endpoints.py.
-        from tensorrt_llm.inputs import media_io
-
-        monkeypatch.setattr(media_io, "MAX_DECODED_VIDEO_BYTES", 100)
-        generator = _StubVisualGen()
-        b64 = base64.b64encode(self._mp4_bytes(num_frames=4)).decode()
-        request = VideoGenerationRequest(prompt="x", input_reference=b64)
-        with pytest.raises(ValueError, match="decoded-size budget"):
-            parse_visual_gen_params(request, "vid-11", generator, media_storage_path=None)
+        assert params.extra_params["video"] == payload
 
     def test_multipart_image_reference_routes_to_image(self, tmp_path):
         # JPEG upload: content sniffing classifies it as an image and routes
@@ -447,11 +390,10 @@ class TestInputReferenceMaterialization:
         assert str(params.image).endswith("vid-5_reference")
 
     def test_undecodable_reference_raises_and_cleans_up(self, tmp_path):
-        pytest.importorskip("cv2")
         generator = _StubVisualGen()
         b64 = base64.b64encode(b"neither an image nor a video").decode()
         request = VideoGenerationRequest(prompt="x", input_reference=b64)
-        with pytest.raises(ValueError, match="neither a decodable image"):
+        with pytest.raises(ValueError, match="not a recognized media container"):
             parse_visual_gen_params(request, "vid-6", generator, media_storage_path=str(tmp_path))
         # Classification runs on the bytes; rejected content never touches disk.
         assert list(tmp_path.iterdir()) == []
@@ -481,26 +423,6 @@ class TestInputReferenceMaterialization:
         assert list(tmp_path.iterdir()) == []
 
 
-class TestMediaFileProbes:
-    """File-path probes backing the offline producer path (``media_io``)."""
-
-    def test_truncated_image_file_is_not_decodable(self, tmp_path):
-        # Same strictness as the bytes probe: a truncated PNG parses its
-        # header but must not classify as a decodable image — and the video
-        # probe must not rescue it as a one-frame video either.
-        pytest.importorskip("cv2")
-        from tensorrt_llm.inputs.media_io import is_decodable_image_file, is_decodable_video_file
-
-        whole = tmp_path / "whole.png"
-        Image.fromarray(np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)).save(whole)
-        truncated = tmp_path / "truncated.png"
-        truncated.write_bytes(whole.read_bytes()[: whole.stat().st_size // 2])
-
-        assert is_decodable_image_file(whole)
-        assert not is_decodable_image_file(truncated)
-        assert not is_decodable_video_file(truncated)
-
-
 class TestMediaBytesProbes:
     """The in-memory probe/decode primitives the serve boundary runs on."""
 
@@ -517,47 +439,21 @@ class TestMediaBytesProbes:
         # Video bytes are not an image (mp4 has no PIL-openable header).
         assert not is_decodable_image_bytes(TestInputReferenceMaterialization._mp4_bytes())
 
-    def test_decode_video_frames_from_bytes(self):
-        pytest.importorskip("cv2")
-        from tensorrt_llm.inputs.media_io import decode_video_frames_from_bytes
+    def test_sniff_media_kind(self):
+        from tensorrt_llm.inputs.media_io import sniff_media_kind
 
-        frames = decode_video_frames_from_bytes(TestInputReferenceMaterialization._mp4_bytes())
-        assert len(frames) == 2
-        assert all(isinstance(f, Image.Image) for f in frames)
-
-    def test_decode_video_frames_from_bytes_max_frames(self):
-        pytest.importorskip("cv2")
-        from tensorrt_llm.inputs.media_io import decode_video_frames_from_bytes
-
-        frames = decode_video_frames_from_bytes(
-            TestInputReferenceMaterialization._mp4_bytes(), max_frames=1
-        )
-        assert len(frames) == 1
-
-    def test_decode_video_frames_from_bytes_rejects_garbage(self):
-        pytest.importorskip("cv2")
-        from tensorrt_llm.inputs.media_io import decode_video_frames_from_bytes
-
-        with pytest.raises(ValueError):
-            decode_video_frames_from_bytes(b"not a video at all")
-
-    def test_avi_mjpeg_bytes_decode(self):
-        # Motion-JPEG-in-AVI — the second container/codec pair in the
-        # documented support contract: not an image, decodes as video.
-        pytest.importorskip("cv2")
-        import torch
-
-        from tensorrt_llm.inputs.media_io import (
-            decode_video_tensor_from_bytes,
-            is_decodable_image_bytes,
-        )
-
-        payload = TestInputReferenceMaterialization._avi_bytes()
-        assert not is_decodable_image_bytes(payload)
-        video = decode_video_tensor_from_bytes(payload)
-        assert isinstance(video, torch.Tensor)
-        assert video.dtype == torch.uint8
-        assert tuple(video.shape) == (2, 16, 16, 3)
+        png = BytesIO()
+        Image.new("RGB", (2, 2)).save(png, format="PNG")
+        jpg = BytesIO()
+        Image.new("RGB", (2, 2)).save(jpg, format="JPEG")
+        assert sniff_media_kind(png.getvalue()) == "image"
+        assert sniff_media_kind(jpg.getvalue()) == "image"
+        assert sniff_media_kind(TestInputReferenceMaterialization._mp4_bytes()) == "video"
+        assert sniff_media_kind(TestInputReferenceMaterialization._avi_bytes()) == "video"
+        assert sniff_media_kind(b"plain text, not media") is None
+        assert sniff_media_kind(b"") is None
+        # RIFF alone is not AVI (e.g. WAV audio is RIFF too).
+        assert sniff_media_kind(b"RIFF\x00\x00\x00\x00WAVEfmt ") is None
 
     def test_truncated_image_bytes_are_not_decodable(self):
         # A truncated PNG still opens (the header parses) but cannot decode
@@ -576,9 +472,9 @@ class TestMediaBytesProbes:
         assert not is_decodable_image_bytes(truncated)
 
     def test_truncated_image_reference_rejected_at_parse(self):
-        # End of the chain: a truncated image upload is rejected as a client
-        # error at the boundary (never routed into the worker).
-        pytest.importorskip("cv2")
+        # End of the chain: a truncated image upload sniffs as an image but
+        # fails the strict decode -> client error at the boundary (never
+        # routed into the worker).
         rng_pixels = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
         buf = BytesIO()
         Image.fromarray(rng_pixels).save(buf, format="PNG")
@@ -588,47 +484,8 @@ class TestMediaBytesProbes:
         request = VideoGenerationRequest(
             prompt="x", input_reference=base64.b64encode(truncated).decode()
         )
-        with pytest.raises(ValueError, match="neither a decodable"):
+        with pytest.raises(ValueError, match="does not fully decode"):
             parse_visual_gen_params(request, "vid-12", generator, media_storage_path=None)
-
-    def test_decode_video_tensor_matches_pil_route(self):
-        # The streaming decoder (single preallocated buffer — the low-peak
-        # path the serve uses) must produce byte-identical output to the
-        # PIL-frames route.
-        pytest.importorskip("cv2")
-        import torch
-
-        from tensorrt_llm.inputs.media_io import (
-            decode_video_frames_from_bytes,
-            decode_video_tensor_from_bytes,
-            frames_to_tensor,
-        )
-
-        data = TestInputReferenceMaterialization._mp4_bytes()
-        streamed = decode_video_tensor_from_bytes(data)
-        via_pil = frames_to_tensor(decode_video_frames_from_bytes(data))
-        assert streamed.dtype == torch.uint8 and streamed.ndim == 4
-        assert torch.equal(streamed, via_pil)
-        assert torch.equal(decode_video_tensor_from_bytes(data, max_frames=1), via_pil[:1])
-
-    def test_decode_video_tensor_rejects_garbage(self):
-        pytest.importorskip("cv2")
-        from tensorrt_llm.inputs.media_io import decode_video_tensor_from_bytes
-
-        with pytest.raises(ValueError):
-            decode_video_tensor_from_bytes(b"not a video at all")
-
-    def test_tempfile_fallback_without_stream_backend(self, monkeypatch):
-        # Old OpenCV builds have no stream-buffered backend; the bytes spill
-        # to an auto-deleted tempfile and decode through the path route.
-        pytest.importorskip("cv2")
-        from tensorrt_llm.inputs import media_io
-
-        monkeypatch.setattr(media_io, "_select_cv2_stream_buffered_backend", lambda: None)
-        frames = media_io.decode_video_frames_from_bytes(
-            TestInputReferenceMaterialization._mp4_bytes()
-        )
-        assert len(frames) == 2
 
 
 # =============================================================================
@@ -682,118 +539,3 @@ class TestMergeExtraParams:
         params = self._make_params()
         _merge_extra_params(params, request_extras=None, extra_param_specs={})
         assert params.extra_params is None
-
-
-class _FakeCapture:
-    """Stands in for ``cv2.VideoCapture`` to exercise declared-count handling."""
-
-    def __init__(self, frames, declared):
-        self._frames = list(frames)
-        self._pos = 0
-        self._declared = declared
-
-    def isOpened(self):
-        return True
-
-    def get(self, prop):
-        return self._declared
-
-    def read(self):
-        if self._pos < len(self._frames):
-            frame = self._frames[self._pos]
-            self._pos += 1
-            return True, frame
-        return False, None
-
-
-class _FakeCv2:
-    CAP_PROP_FRAME_COUNT = 7
-    COLOR_BGR2RGB = 4
-
-    @staticmethod
-    def cvtColor(frame, code):
-        return frame
-
-
-class TestDecodeCaptureGuards:
-    """``_decode_capture_to_tensor`` against containers that misreport length.
-
-    The declared frame count is metadata, not evidence — the decoder must
-    stream correctly whether it is accurate, unknown, under-, over-, or
-    absurdly reported."""
-
-    def _decode(self, num_frames, declared, max_frames=None):
-        import torch
-
-        from tensorrt_llm.inputs.media_io import _decode_capture_to_tensor
-
-        frames = [np.full((4, 4, 3), i, dtype=np.uint8) for i in range(num_frames)]
-        out = _decode_capture_to_tensor(
-            _FakeCv2, _FakeCapture(frames, declared), max_frames, "test"
-        )
-        assert out.dtype == torch.uint8
-        return out
-
-    def test_accurate_declaration(self):
-        out = self._decode(3, declared=3)
-        assert out.shape == (3, 4, 4, 3)
-        assert int(out[2, 0, 0, 0]) == 2  # frame order preserved
-
-    def test_unknown_declaration_falls_back(self):
-        assert self._decode(3, declared=0).shape == (3, 4, 4, 3)
-        assert self._decode(3, declared=-1).shape == (3, 4, 4, 3)
-
-    def test_underreported_declaration_keeps_overflow(self):
-        out = self._decode(5, declared=2)
-        assert out.shape == (5, 4, 4, 3)
-        assert int(out[4, 0, 0, 0]) == 4
-
-    def test_overreported_declaration_trims_storage(self):
-        out = self._decode(3, declared=10)
-        assert out.shape == (3, 4, 4, 3)
-        # The oversized buffer is not retained behind the result.
-        assert out.untyped_storage().size() == out.numel()
-
-    def test_absurd_declaration_allocation_is_byte_budgeted(self, monkeypatch):
-        # Realistic 720p frames + an absurd declared count: the preallocation
-        # request itself must stay within MAX_DECODED_VIDEO_BYTES (a frame
-        # cap alone would still be ~18.5 GiB at 720p). Spy on np.empty to
-        # assert the requested size, not just the result.
-        import math
-
-        from tensorrt_llm.inputs import media_io
-
-        requested = []
-        real_empty = media_io.np.empty
-
-        def spy(shape, dtype=None):
-            requested.append((tuple(shape), dtype))
-            return real_empty(shape, dtype=dtype)
-
-        monkeypatch.setattr(media_io.np, "empty", spy)
-        # Lower the budget so the (real) allocation the spy delegates to stays
-        # small; the assertion is about the *requested* size honoring it.
-        monkeypatch.setattr(media_io, "MAX_DECODED_VIDEO_BYTES", 32 << 20)
-        frames = [np.zeros((720, 1280, 3), dtype=np.uint8) for _ in range(3)]
-        out = media_io._decode_capture_to_tensor(
-            _FakeCv2, _FakeCapture(frames, declared=10**9), None, "test"
-        )
-        assert out.shape == (3, 720, 1280, 3)
-        (shape, _dtype) = requested[0]
-        assert math.prod(shape) <= media_io.MAX_DECODED_VIDEO_BYTES
-
-    def test_decoded_byte_budget_rejects_oversized_streams(self, monkeypatch):
-        # Total accumulation is bounded too — a stream that exceeds the budget
-        # raises instead of growing without bound (unknown-length containers
-        # included, where no buffer is preallocated at all).
-        from tensorrt_llm.inputs import media_io
-
-        monkeypatch.setattr(media_io, "MAX_DECODED_VIDEO_BYTES", 100)
-        frames = [np.zeros((4, 4, 3), dtype=np.uint8) for _ in range(5)]  # 48 B each
-        with pytest.raises(ValueError, match="decoded-size budget"):
-            media_io._decode_capture_to_tensor(
-                _FakeCv2, _FakeCapture(frames, declared=0), None, "test"
-            )
-
-    def test_max_frames_bounds_decode(self):
-        assert self._decode(5, declared=5, max_frames=2).shape[0] == 2
