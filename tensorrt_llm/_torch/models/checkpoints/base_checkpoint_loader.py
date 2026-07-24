@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from torch import nn
@@ -67,6 +69,18 @@ class BaseCheckpointLoader(ABC):
         return self.weight_loader.load_weights(checkpoint_dir,
                                                mapping=mapping,
                                                **kwargs)
+
+    @contextmanager
+    def open_weight_session(self, checkpoint_dir: str, mapping: Mapping,
+                            **kwargs) -> Iterator[dict[str, Any]]:
+        """Open a synchronous weight-load session by default.
+
+        Specialized loaders may keep source-specific work alive while the
+        returned weights are materialized. Calling ``self.load_weights`` here
+        is intentional: subclasses such as MX and Mistral must retain their
+        polymorphic transfer and preprocessing behavior.
+        """
+        yield self.load_weights(checkpoint_dir, mapping=mapping, **kwargs)
 
     def is_weights_preloaded(self) -> bool:
         """Whether the last load wrote weights directly into the model."""
