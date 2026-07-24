@@ -60,7 +60,8 @@ class MPINodeState:
 
 
 def external_mpi_comm_available(model_world_size: int) -> bool:
-    """Check if the current process is launched by mpirun and does not use MPIPoolExecutor to spawn processes.
+    """Check if the current process is launched by mpirun without MPIPoolExecutor.
+
     e.g. mpirun -np 4 python script.py
     """
     if ENABLE_MULTI_DEVICE:
@@ -241,21 +242,23 @@ class MpiPoolSession(MpiSession):
                  n_workers: int,
                  wait_shutdown: bool = False,
                  env_overrides: Optional[Dict[str, str]] = None):
-        """Args:
-        n_workers: number of MPI workers to spawn.
-        wait_shutdown: when True, ``shutdown()`` blocks until the spawned
-            worker processes have actually exited. ``MPIPoolExecutor.shutdown``
-            returns at disconnect, but a worker's GPU memory is only released
-            when its process exits; callers that start new GPU work right
-            after ``shutdown()`` (e.g. CI test infrastructure handing a
-            pre-spawned pool to the next test) race that release and can OOM.
-            Off by default: production teardown does not need the barrier and
-            keeps its current latency.
-        env_overrides: extra environment variables to set in the WORKERS at
-            spawn, on top of the TRTLLM*/TLLM* variables forwarded from the
-            parent. The parent process environment is never touched — this
-            replaces the racy "set os.environ around the spawn, then restore"
-            pattern for callers that spawn pools from background threads.
+        """Initialize the MPI pool session.
+
+        Args:
+            n_workers: number of MPI workers to spawn.
+            wait_shutdown: when True, ``shutdown()`` blocks until the spawned
+                worker processes have actually exited. ``MPIPoolExecutor.shutdown``
+                returns at disconnect, but a worker's GPU memory is only released
+                when its process exits; callers that start new GPU work right
+                after ``shutdown()`` (e.g. CI test infrastructure handing a
+                pre-spawned pool to the next test) race that release and can OOM.
+                Off by default: production teardown does not need the barrier and
+                keeps its current latency.
+            env_overrides: extra environment variables to set in the WORKERS at
+                spawn, on top of the TRTLLM*/TLLM* variables forwarded from the
+                parent. The parent process environment is never touched — this
+                replaces the racy "set os.environ around the spawn, then restore"
+                pattern for callers that spawn pools from background threads.
         """
         self.n_workers = n_workers
         self._wait_shutdown = wait_shutdown
