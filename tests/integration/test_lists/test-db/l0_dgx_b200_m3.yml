@@ -13,6 +13,6 @@ l0_dgx_b200_m3:
       stage: pre_merge
       backend: pytorch
   tests:
-  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True]
-  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-use_msa=True-cuda_graph=True]
-  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=True-overlap_scheduler=True-use_msa=True-cuda_graph=True]
+  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-eval_mode=inferencemax]
+  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-use_msa=True-cuda_graph=True-eval_mode=inferencemax]
+  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=True-overlap_scheduler=True-use_msa=True-cuda_graph=True-eval_mode=inferencemax]

@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import importlib.util
+import shutil
 from pathlib import Path
 
 import pytest
@@ -22,31 +23,50 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "build_wheel.py"
 MSA_INTERFACE = Path("python/fmha_sm100/cute/interface.py")
+MSA_PATCH = Path("3rdparty/patches/msa_strided_paged_kv.patch")
 
 _SPEC = importlib.util.spec_from_file_location("build_wheel", SCRIPT_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _BUILD_WHEEL = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_BUILD_WHEEL)
-stage_msa_package = _BUILD_WHEEL.stage_msa_package
+apply_msa_patch = _BUILD_WHEEL.apply_msa_patch
 
 
-def test_stage_msa_package_applies_patch_without_modifying_submodule(tmp_path):
-    source_interface = REPO_ROOT / "3rdparty" / "MSA" / MSA_INTERFACE
-    if not source_interface.is_file():
+def _stage_project(tmp_path: Path) -> Path:
+    """Copy the MSA submodule and patch into a throwaway project tree.
+
+    The real submodule tree is left untouched; the copy drops .git so the apply
+    runs against a plain working tree, as it does after a fresh checkout.
+    """
+    source_msa = REPO_ROOT / "3rdparty" / "MSA"
+    if not (source_msa / MSA_INTERFACE).is_file():
         pytest.skip("3rdparty/MSA is not initialized")
 
-    source_before = source_interface.read_bytes()
-    staged_package = stage_msa_package(REPO_ROOT, tmp_path)
-    staged_interface = staged_package / "cute" / "interface.py"
+    project_dir = tmp_path / "project"
+    (project_dir / "3rdparty" / "patches").mkdir(parents=True)
+    shutil.copytree(
+        source_msa, project_dir / "3rdparty" / "MSA", ignore=shutil.ignore_patterns(".git")
+    )
+    shutil.copy(REPO_ROOT / MSA_PATCH, project_dir / MSA_PATCH)
+    return project_dir
 
-    assert b"def _prepare_paged_hnd_input" not in source_before
-    assert "def _prepare_paged_hnd_input" in staged_interface.read_text()
-    assert source_interface.read_bytes() == source_before
+
+def test_apply_msa_patch_is_idempotent_in_place(tmp_path):
+    project_dir = _stage_project(tmp_path)
+    patched_interface = project_dir / "3rdparty" / "MSA" / MSA_INTERFACE
+
+    apply_msa_patch(project_dir)
+    assert "def _prepare_paged_hnd_input" in patched_interface.read_text()
+
+    # A second call must short-circuit via the reverse-check guard rather than
+    # raise, leaving the patched content in place.
+    apply_msa_patch(project_dir)
+    assert "def _prepare_paged_hnd_input" in patched_interface.read_text()
 
 
-def test_stage_msa_package_requires_initialized_submodule(tmp_path):
+def test_apply_msa_patch_requires_initialized_submodule(tmp_path):
     project_dir = tmp_path / "project"
     project_dir.mkdir()
 
     with pytest.raises(FileNotFoundError, match="initialize 3rdparty/MSA"):
-        stage_msa_package(project_dir, tmp_path / "build")
+        apply_msa_patch(project_dir)
