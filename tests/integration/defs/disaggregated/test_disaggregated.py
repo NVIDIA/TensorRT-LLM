@@ -1159,8 +1159,8 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
 # per-block WRITEs are gathered into one coalesced fabric-VMM buffer before a single NIXL WRITE.
 # Restricted to GB200/GB300 since the bounce arena is fabric (MNNVL) VMM memory.
 #
-# The bounce transport coalesces a transfer only when it clears the receiver's min_blocks gate.
-# The test lowers that gate via the TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS env so the ordinary short
+# The bounce transport coalesces a transfer only when it clears the receiver's min_bytes gate.
+# The test lowers that gate via the TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES env so the ordinary short
 # prompts still take the coalesced-bounce WRITE path -- no special long prompt is needed. The test
 # runs the normal disagg output verification (the coalesced KV must still decode to the right
 # answer, e.g. "Berlin"; a corrupt transfer would garble it) AND asserts the generation worker
@@ -1177,9 +1177,9 @@ def test_disaggregated_overlap_transceiver_runtime_python_bounce(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
-    # min_blocks=1 forces bounce on even for the short test prompt (the gate is internal, tuned via
+    # min_bytes=1 forces bounce on even for the short test prompt (the gate is internal, tuned via
     # env). No fabric-pool env is needed: the bounce arena is its own fabric memory.
-    env["TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"] = "1"
+    env["TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python_bounce",
                            env=env,
