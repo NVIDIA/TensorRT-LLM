@@ -51,7 +51,7 @@ l0_dgx_b200:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[latency_adp_lmtp_tp4]
-  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM2::test_4gpus[attention_dp=False-cuda_graph=True-overlap_scheduler=True-tp_size=4-ep_size=4] TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[pp4-mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False] TIMEOUT (60)
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
@@ -62,6 +62,7 @@ l0_dgx_b200:
   - unittest/_torch/attention/sparse/test_cpp_custom_ops.py::test_fused_cat_fp4_shape_dispatch
   - unittest/_torch/attention/sparse/test_cpp_custom_ops.py::test_fused_cat_fp4_noncontiguous_split
   - unittest/_torch/attention/sparse/test_cpp_custom_ops.py::test_fused_cat_fp4_dsv32_prefill_shape
+  - unittest/_torch/attention/sparse/test_cpp_custom_ops.py::test_cute_dsl_fp8_indexer_q_gemm_rope_fp4_matches_unfused
   - unittest/_torch/attention/sparse/test_cpp_custom_ops.py::test_indexer_k_cache_gather_contiguous_fp4
   - unittest/_torch/attention/sparse/dsa/test_dsa_fp4_indexer.py
 - condition:
@@ -236,7 +237,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus[fp4_indexer_dsl_mtp3] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus[baseline_pp4_mtp1] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus_chunked_prefill[baseline_fp8kv] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8_piecewise_cuda_graph[tp_size=8-ep_size=8] TIMEOUT (180)
+  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8_piecewise_cuda_graph[use_msa=False] TIMEOUT (180)
   - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[tp8_attn_dp] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[ep8] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[dep8] TIMEOUT (60)
@@ -263,6 +264,7 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
+  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM2::test_4gpus[attention_dp=False-cuda_graph=True-overlap_scheduler=True-tp_size=4-ep_size=4] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-CUTLASS]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=FLASHINFER-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=FLASHINFER-torch_compile=False]

@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from strenum import StrEnum
 
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -1202,23 +1203,11 @@ class KVCacheManagerV2(BaseResourceManager):
 
             for layer_id in typed_range(LayerId(self.num_local_layers)):
                 layer_group_id = self.impl.get_layer_group_id(layer_id)
-                if self.dtype != DataType.NVFP4:
-                    key_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
-                    addr_offset = (
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, Role.KEY, PageIndexMode.SHARED
-                        )
-                        - key_base_addr
-                    )
-                else:
-                    key_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
+                key_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
+                offset = self._kv_pool_mapping_offset(layer_id, layer_group_id, key_base_addr)
+
+                if self.dtype == DataType.NVFP4:
                     block_scale_base_addr = block_scale_pool_pointers_list[layer_group_id][0]
-                    addr_offset = (
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, Role.KEY, PageIndexMode.SHARED
-                        )
-                        - key_base_addr
-                    )
                     block_scale_addr_offset = (
                         self.impl.get_mem_pool_base_address(
                             layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
@@ -1231,14 +1220,6 @@ class KVCacheManagerV2(BaseResourceManager):
                         * self.kv_factor
                         * self.tokens_per_block,
                     )
-                offset = exact_div(
-                    addr_offset,
-                    self.get_layer_bytes_per_token(layer_id, Role.KEY)
-                    * self.kv_factor
-                    * self.tokens_per_block,
-                )
-
-                if self.dtype == DataType.NVFP4:
                     assert block_scale_offset == offset, (
                         "Block scale offset and offset should be the same"
                     )
@@ -1298,6 +1279,29 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         if self.enable_swa_scratch_reuse:
             self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
+
+    def _kv_pool_mapping_offset(
+        self, layer_id: LayerId, layer_group_id: int, key_base_addr: int
+    ) -> int:
+        """Per-layer offset recorded in ``kv_cache_pool_mapping``.
+
+        The default derives the layer's position within its pool from the K
+        base address, assuming every layer contributes exactly K(+V) to the
+        pool slot so the layer stride is uniform. Managers whose pool slots
+        may interleave extra per-layer buffers between layers (non-uniform
+        layer strides — e.g. MiniMax M3 when the index-K buffer coalesces
+        into the K/V pool) must override this with a positional formula.
+        """
+        addr_offset = (
+            self.impl.get_mem_pool_base_address(layer_id, Role.KEY, PageIndexMode.SHARED)
+            - key_base_addr
+        )
+        return exact_div(
+            addr_offset,
+            self.get_layer_bytes_per_token(layer_id, Role.KEY)
+            * self.kv_factor
+            * self.tokens_per_block,
+        )
 
     def _get_runtime_cache_size_layer_components(self) -> tuple[List[int], List[Optional[int]]]:
         layer_sizes = []
@@ -1794,6 +1798,38 @@ class KVCacheManagerV2(BaseResourceManager):
         new roles do not require C++ changes.
         """
         return None
+
+    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
+        """Map native cache roles to disaggregation mapper kinds.
+
+        ``Role.ALL`` is the required fallback for roles without an explicit
+        entry. The default is the head-major (HND) ``INDEXED`` layout written
+        by the TRTLLM attention kernels — correct for V1 and standard V2
+        managers. ``Role.INDEX_KEY`` defaults to ``REPLICATED``: every
+        index-key side cache shipped so far (DSA indexer-K on V1, MiniMax M3
+        on V2) computes its projection replicated across TP ranks, so the
+        cache bytes are identical per rank; the entry is inert unless a
+        subclass actually registers ``INDEX_KEY`` buffers via
+        ``_extra_buffers_per_layer``. Model-specific managers may declare
+        logical layouts without requiring the shared extractor to inspect
+        private attributes or role names. MiniMax M3, for example, maps
+        ordinary K/V to ``NHD`` and keeps index-key ``REPLICATED``.
+
+        This declaration does not influence storage pooling: V2 storage
+        coalesces buffers purely by ``(life_cycle, buffer size)``, so roles
+        with different transfer semantics may share a pool slot when their
+        per-block sizes coincide (e.g. MiniMax M3 at TP degrees where
+        K == V == INDEX_KEY bytes per block). The disagg page-table builder
+        splits each physical pool into one logical view per mapper kind, so
+        transfer correctness never depends on the coalescing outcome.
+
+        Pool memory is layout-agnostic; this declaration describes what the
+        manager's paired attention backend actually writes. A static mapping
+        is valid only for a fixed manager/backend pair. A manager whose backend
+        selects the layout at runtime must derive the mapping from that
+        backend's configuration.
+        """
+        return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
 
     @property
     def blocks_in_primary_pool(self) -> int:
