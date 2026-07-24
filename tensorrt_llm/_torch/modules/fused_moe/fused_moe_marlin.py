@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Marlin-based MoE backend for NVFP4 on SM90 (Hopper).
+"""Marlin-based MoE backend for NVFP4 on SM89 (Ada, e.g. L40S) and SM90 (Hopper).
 
 Uses a fused ``marlin_nvfp4_moe_gemm`` CUDA kernel that processes ALL experts
 in a single launch.  W4A16 approach: BF16 activations + FP4 weights,
@@ -25,7 +25,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, is_nvfp4_marlin_supported_sm
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -44,7 +44,7 @@ def _has_fused_moe_kernel() -> bool:
 
 
 class MarlinFusedMoE(CutlassFusedMoE):
-    """MoE backend using Marlin W4A16 NVFP4 GEMM for SM90 (Hopper).
+    """MoE backend using Marlin W4A16 NVFP4 GEMM for SM89/SM90.
 
     Uses ``marlin_nvfp4_moe_gemm`` with BF16 activations to process all experts
     in a single kernel launch via sorted token dispatch. In-kernel topk_weights
@@ -54,7 +54,7 @@ class MarlinFusedMoE(CutlassFusedMoE):
 
     _QUANT_SUPPORT_TABLE = {
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {90}),
+            "sm_constraint": ("in", {89, 90}),
             "dtypes": {torch.bfloat16},
         },
     }
@@ -73,9 +73,9 @@ class MarlinFusedMoE(CutlassFusedMoE):
                 f"MarlinFusedMoE only supports NVFP4 (got quant_algo={quant_algo})"
             )
 
-        if sm_version != 90:
+        if not is_nvfp4_marlin_supported_sm(sm_version):
             return _warn_and_return(
-                f"MarlinFusedMoE only supports SM90 (Hopper), got SM{sm_version}"
+                f"MarlinFusedMoE only supports SM89 (Ada) and SM90 (Hopper), got SM{sm_version}"
             )
 
         if swiglu_gptoss_style:

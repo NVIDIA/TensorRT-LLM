@@ -1462,15 +1462,18 @@ def should_skip_to_accelerate_ci(
     ):
         return "[CI accel] Skip unquantized (quant=None) in CI"
 
-    # --- Rule 0a: MARLIN backend only runs NVFP4 on Hopper (SM90) ---
+    # --- Rule 0a: MARLIN backend only runs NVFP4 on Ada/Hopper (SM89/SM90) ---
     if backend_type == MoeBackendType.MARLIN:
+        from tensorrt_llm._torch.utils import is_nvfp4_marlin_supported_sm
         from tensorrt_llm._utils import get_sm_version
 
         if quant_algo != QuantAlgo.NVFP4:
             return f"[CI accel] MARLIN only tests NVFP4 in CI (got {quant_algo})"
         sm_version = get_sm_version()
-        if sm_version != 90:
-            return f"[CI accel] MARLIN only runs on Hopper (SM90) in CI (got SM{sm_version})"
+        if not is_nvfp4_marlin_supported_sm(sm_version):
+            return (
+                f"[CI accel] MARLIN only runs on Ada/Hopper (SM89-99) in CI "
+                f"(got SM{sm_version})")
 
     # Any e256-class model_config triggers CI Rule-1 minimal coverage:
     # the full dtype x seq_len x swiglu x routing matrix on e256 models

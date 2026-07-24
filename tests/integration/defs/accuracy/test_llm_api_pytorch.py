@@ -39,7 +39,8 @@ from tensorrt_llm.llmapi import (
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (check_device_contain, get_device_count, llm_models_root,
+from ..conftest import (check_device_contain, get_device_count,
+                        get_mpi_world_size, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
                         skip_no_mxfp4_swizzle, skip_post_blackwell,
                         skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
@@ -6882,12 +6883,15 @@ class TestNemotronV3Nano(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    @skip_pre_hopper
+    @skip_pre_ada
     @skip_post_hopper
-    @pytest.mark.skip_less_device_memory(80000)
-    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device_memory(45000)
     @parametrize_with_ids("tp_size", [1, 2, 4, 8])
     def test_nvfp4_marlin_multi_gpus(self, tp_size):
+        if get_mpi_world_size() < tp_size:
+            pytest.skip(
+                f"Requires MPI world size >= {tp_size} for TP={tp_size}")
+
         ep_size = tp_size
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",

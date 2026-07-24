@@ -48,6 +48,7 @@ from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
+                     is_nvfp4_marlin_supported_sm,
                      last_positive_power_of_2)
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -752,7 +753,7 @@ class CudaCoreNVFP4Runner(TunableRunner):
 
 
 class MarlinNVFP4Runner(TunableRunner):
-    """Marlin-based NVFP4 GEMM for SM90 (Hopper).
+    """Marlin-based NVFP4 GEMM for SM89 (Ada, e.g. L40S) and SM90 (Hopper).
 
     Weights are eagerly repacked to Marlin tiled format during
     ``get_valid_tactics`` (before CUDA graph capture) so that ``forward()`` does
@@ -761,8 +762,6 @@ class MarlinNVFP4Runner(TunableRunner):
 
     tuning_config = TuningConfig()  # single tactic, no tuning
 
-    MIN_SM_VERSION = 90
-    MAX_SM_VERSION = 99  # SM90-series only (Hopper)
     NVFP4_SCALE_VECTOR_SIZE = 16
 
     def __init__(self, output_buffer_kind: int, output_dtype: torch.dtype):
@@ -774,9 +773,7 @@ class MarlinNVFP4Runner(TunableRunner):
                           profile: OptimizationProfile, **kwargs) -> List[int]:
         if not torch.cuda.is_available():
             return []
-        capability = torch.cuda.get_device_capability(torch.device('cuda:0'))
-        sm_version = capability[0] * 10 + capability[1]
-        if sm_version < self.MIN_SM_VERSION or sm_version > self.MAX_SM_VERSION:
+        if not is_nvfp4_marlin_supported_sm():
             return []
 
         # Eagerly prepare Marlin weights so that forward() never allocates
@@ -1024,7 +1021,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         tactics = []
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
 
-        # Add Marlin tactics (SM90 Hopper only) — users must opt-in explicitly
+        # Add Marlin tactics (SM89 Ada / SM90 Hopper) — users must opt-in explicitly
         # by listing "marlin" in ``allowed_backends``.
         if self._is_backend_allowed("marlin"):
             marlin_runner = MarlinNVFP4Runner(self.output_buffer_kind,
@@ -1036,7 +1033,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             elif self._is_only_backend("marlin"):
                 sm_version = get_sm_version()
                 raise ValueError(
-                    f"Marlin backend requires SM 90-99 (Hopper), but got SM "
+                    f"Marlin backend requires SM 89-99 (Ada L40S or Hopper), but got SM "
                     f"{sm_version}. Please add other backends to "
                     "allowed_backends.")
 
@@ -1153,12 +1150,12 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
     ) -> torch.Tensor:
         # Handle fallback tactic on cache miss
         if tactic == -1:
-            # Prefer marlin on Hopper (SM90) when explicitly allowed, cutlass
+            # Prefer marlin on Ada/Hopper (SM89-99) when explicitly allowed, cutlass
             # otherwise, falling back to whatever backend is available.
             assert len(
                 self.allowed_backends) > 0, "No allowed backends available"
-            sm_version = get_sm_version()
-            if "marlin" in self.allowed_backends and 90 <= sm_version <= 99:
+            if ("marlin" in self.allowed_backends
+                    and is_nvfp4_marlin_supported_sm()):
                 tactic = ("marlin", -1)
             elif "cutlass" in self.allowed_backends:
                 tactic = ("cutlass", -1)
@@ -1219,7 +1216,7 @@ def nvfp4_gemm(
     - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
     - CuteDSL: Blackwell-optimized persistent kernels (when available and inputs are valid)
     - CUDA Core: CUDA Core implementation (requires SM >= 100 and M <= 8)
-    - Marlin: Hopper W4A16 NVFP4 implementation (requires SM 90-99)
+    - Marlin: Ada/Hopper W4A16 NVFP4 implementation (requires SM 89-99)
 
     The AutoTuner profiles all available backends during the first run and caches
     the best choice for each input shape. Subsequent calls use the cached selection
