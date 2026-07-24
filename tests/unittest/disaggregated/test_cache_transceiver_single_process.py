@@ -28,7 +28,10 @@ from types import SimpleNamespace
 # Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
 # (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
 # falls back to cuda_ipc / cuda_copy without affecting correctness).
-os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
+# Force a deterministic UCX/NIXL config regardless of what the cluster/CI
+# injects; see test_kv_transfer.py for the full rationale.
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -55,9 +58,6 @@ from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 
-# Reduce NIXL threads for unit test: default 8 threads per agent causes heavy
-# contention when creating multiple agents on a single GPU in the same process.
-os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "0")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
