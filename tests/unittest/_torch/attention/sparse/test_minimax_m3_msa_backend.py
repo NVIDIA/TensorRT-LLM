@@ -2,15 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Structural tests for the MiniMax-M3 MSA sparse attention backend.
 
-These validate backend selection and decode scratch-buffer sizing without
-launching kernels. Numerical parity against the Triton reference is covered
-by the SM100 integration accuracy test.
+Most of these validate backend selection and decode scratch-buffer sizing
+without launching kernels; the CUDA-gated tests cover the fused cache-scatter
+parity and strided-cache kernel paths. Numerical parity against the Triton
+reference is covered by the SM100 integration accuracy test.
 """
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import write_kv_slots
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_scatter import (
+    fused_write_layer_caches,
+)
 from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
@@ -353,3 +358,60 @@ def test_per_token_valid_blocks_multi_token_decode():
     n_valid = per_token_valid_blocks(qo, kv, off, causal=True, block_size=4)
     # Row 0: 9 positions -> 3 blocks. Row 1 tokens attend 4, 5, 6 -> 1, 2, 2.
     assert n_valid.tolist() == [3, 1, 2, 2]
+
+
+def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k):
+    num_tokens = int(slots.shape[0])
+    num_heads, head_dim = int(k_cache.shape[1]), int(k_cache.shape[3])
+    write_kv_slots(k_cache, slots, k.reshape(num_tokens, num_heads, head_dim), layout="HND")
+    write_kv_slots(v_cache, slots, v.reshape(num_tokens, num_heads, head_dim), layout="HND")
+    if idx_k is not None:
+        write_kv_slots(idx_cache, slots, idx_k.reshape(num_tokens, 1, head_dim), layout="HND")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("num_kv_heads", [1, 4])
+@pytest.mark.parametrize("with_idx", [True, False])
+def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx):
+    """The fused per-layer cache scatter must match the legacy write_kv_slots
+    path exactly on production-shaped inputs: non-contiguous HND cache views
+    carved from a pooled allocation and strided source rows sliced from a fused
+    projection, including the bf16 -> fp8 cache cast. Asserting on the whole
+    pool also catches stray writes outside the targeted slots."""
+    torch.manual_seed(0)
+    device = "cuda"
+    num_pages, tokens_per_block, head_dim = 6, 32, 128
+    num_tokens = 17
+    inner = num_kv_heads * head_dim
+
+    # Paged HND caches carved from a pool with a coalescing axis, so the
+    # views are non-contiguous like production get_buffers(...) output.
+    pool = torch.zeros(
+        num_pages, 2, num_kv_heads, tokens_per_block, head_dim, dtype=cache_dtype, device=device
+    )
+    k_cache, v_cache = pool[:, 0], pool[:, 1]
+    idx_pool = torch.zeros(
+        num_pages, 2, 1, tokens_per_block, head_dim, dtype=torch.bfloat16, device=device
+    )
+    idx_cache = idx_pool[:, 0]
+
+    # Strided sources: rows sliced out of a wider fused-projection tensor.
+    qkv = torch.randn(num_tokens, 3 * inner + 64, dtype=torch.bfloat16, device=device)
+    k = qkv[:, :inner]
+    v = qkv[:, inner : 2 * inner]
+    idx_k = qkv[:, 2 * inner : 2 * inner + head_dim] if with_idx else None
+
+    slots = torch.randperm(num_pages * tokens_per_block, device=device)[:num_tokens].to(torch.int32)
+
+    ref_pool = pool.clone()
+    ref_idx_pool = idx_pool.clone()
+    _reference_scatter_write(ref_pool[:, 0], ref_pool[:, 1], ref_idx_pool[:, 0], slots, k, v, idx_k)
+
+    wrote = fused_write_layer_caches(
+        k_cache, v_cache, idx_cache if with_idx else None, slots, k, v, idx_k
+    )
+    assert wrote
+
+    torch.testing.assert_close(pool.to(torch.float32), ref_pool.to(torch.float32))
+    torch.testing.assert_close(idx_pool, ref_idx_pool)
