@@ -620,6 +620,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             num_non_exiting_tiles,
             tile_size,
         )
+        mlp_fp4 = mlp_fp4.view(torch.uint8)
         mlp_out = self.to_out.mlp_proj(Fp4QuantizedTensor(mlp_fp4, mlp_sf))
         if padded_tokens != num_tokens:
             mlp_out = mlp_out[:num_tokens]

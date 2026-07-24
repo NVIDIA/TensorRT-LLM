@@ -19,6 +19,8 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -224,6 +226,127 @@ def test_flux2_moe_swiglu_reorders_gate_up(monkeypatch):
 
     expected = torch.cat((up, gate), dim=-1).reshape(2, 8)
     torch.testing.assert_close(captured["input"][:2], expected)
+
+
+def _make_flux2_nvfp4_swiglu_test_modules(hidden_states):
+    from tensorrt_llm._torch.modules.linear import (
+        Linear,
+        TensorParallelMode,
+        WeightMode,
+        WeightsLoadingConfig,
+    )
+    from tensorrt_llm._torch.visual_gen.models.flux.attention import Flux2ParallelSelfAttention
+
+    mapping = Mapping(world_size=2, rank=0, tp_size=2)
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    config = DiffusionModelConfig(
+        mapping=mapping,
+        quant_config=quant_config,
+        dynamic_weight_quant=True,
+        attention=AttentionConfig(backend="VANILLA"),
+    )
+    attention = Flux2ParallelSelfAttention(
+        hidden_size=256,
+        num_attention_heads=2,
+        head_dim=128,
+        mlp_ratio=2.0,
+        bias=False,
+        config=config,
+    ).cuda()
+    gate_up_proj = attention.to_qkv_mlp_proj.mlp_proj
+    down_proj = attention.to_out.mlp_proj
+
+    reference_gate_up_proj = Linear(
+        256,
+        1024,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=quant_config,
+        mapping=mapping,
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        reduce_output=False,
+        weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
+        fused_weight_shard_indices_mapping={
+            "gate": (0, 256),
+            "up": (256, 256),
+        },
+        override_tp_sharding={
+            "gate": (0, 256),
+            "up": (0, 256),
+        },
+    ).cuda()
+
+    torch.manual_seed(7)
+    gate_weight = torch.randn(512, 256, device="cuda", dtype=torch.bfloat16) * 0.1
+    up_weight = torch.randn(512, 256, device="cuda", dtype=torch.bfloat16) * 0.1
+    down_weight = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+
+    input_scale = hidden_states.abs().max().float() / (448 * 6)
+    local_gate = F.linear(hidden_states, gate_weight[:256])
+    local_up = F.linear(hidden_states, up_weight[:256])
+    down_input = F.silu(local_gate.float()) * local_up.float()
+    down_input_scale = down_input.abs().max() / (448 * 6)
+
+    loader = DynamicLinearWeightLoader(config)
+    gate_up_weights = [
+        {"weight": gate_weight, "input_scale": input_scale},
+        {"weight": up_weight, "input_scale": input_scale},
+    ]
+    loader.load_linear_weights(gate_up_proj, "gate_up_proj", gate_up_weights)
+    loader.load_linear_weights(reference_gate_up_proj, "gate_up_proj", gate_up_weights)
+    loader.load_linear_weights(
+        down_proj,
+        "down_proj",
+        [{"weight": down_weight, "input_scale": down_input_scale}],
+    )
+    for projection in (gate_up_proj, reference_gate_up_proj, down_proj):
+        projection.post_load_weights()
+
+    return attention, reference_gate_up_proj, down_proj
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="Real NVFP4 SwiGLU kernels require SM100 or SM103",
+)
+@pytest.mark.parametrize(
+    "path,num_tokens",
+    [
+        ("cute_bf16_output", 64),
+        ("cute_fp4_output", 128),
+        ("moe_split_fallback", 128),
+    ],
+)
+def test_flux2_nvfp4_swiglu_paths_match_eager(path, num_tokens):
+    torch.manual_seed(5)
+    hidden_states = torch.randn(1, num_tokens, 256, device="cuda", dtype=torch.bfloat16)
+    attention, reference_gate_up_proj, down_proj = _make_flux2_nvfp4_swiglu_test_modules(
+        hidden_states
+    )
+
+    gate_up_hidden = reference_gate_up_proj(hidden_states)
+    gate, up = gate_up_hidden.chunk(2, dim=-1)
+    eager_mlp = (F.silu(gate.float()) * up.float()).to(torch.bfloat16)
+    expected = down_proj(eager_mlp)
+
+    if path == "moe_split_fallback":
+        with mock.patch.object(
+            attention,
+            "_combine_split_projection",
+            side_effect=lambda _attn, mlp: mlp,
+        ):
+            actual = attention._project_split_output_with_fp4_mlp(
+                torch.empty(0, device="cuda"), gate_up_hidden
+            )
+    else:
+        expect_fp4_output = path == "cute_fp4_output"
+        assert attention._can_project_hidden_mlp_with_fp4out(hidden_states) is expect_fp4_output
+        actual = attention._project_hidden_mlp_with_cute_dsl(hidden_states)
+
+    cosine = F.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0)
+    relative_error = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert cosine > 0.995
+    assert relative_error < 0.12
 
 
 def test_flux2_mlp_fp4_guard_requires_blackwell(monkeypatch):
