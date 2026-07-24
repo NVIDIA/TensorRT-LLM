@@ -47,8 +47,70 @@ from .pipeline_ltx2 import (
     _LTX2CUDAGraphRunner,
     _prefetch_ltx2_safetensors_files,
 )
+from .transformer_ltx2 import Stage2Groups
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+
+
+class _TwoStagePhaseTimer(CudaPhaseTimer):
+    """CudaPhaseTimer + the two-stage extras: the stage-2 refinement loop and
+    the decode section.
+
+    Inherited marks keep their contract (``denoise`` = the whole stage-1
+    forward; stage 2 folds into ``post_denoise`` on ``PipelineOutput``).
+    The extra event pair brackets the stage-2 refinement step loop only
+    (upsample / LoRA bind / text-cache prep stay outside).
+
+    Event deltas are GPU-stream distances: they include GPU work plus any
+    CPU time exposed to the stream, and stay correct under CUDA graphs and
+    async enqueue (unlike host wall clocks read at enqueue time).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._stage2_marked = 0
+        self._decode_marked = 0
+        if self._enabled:
+            self._stage2_start = torch.cuda.Event(enable_timing=True)
+            self._stage2_end = torch.cuda.Event(enable_timing=True)
+            self._decode_start = torch.cuda.Event(enable_timing=True)
+            self._decode_end = torch.cuda.Event(enable_timing=True)
+
+    def mark_stage2_start(self) -> None:
+        if self._enabled:
+            self._stage2_start.record()
+            self._stage2_marked = 1
+
+    def mark_stage2_end(self) -> None:
+        if self._enabled and self._stage2_marked == 1:
+            self._stage2_end.record()
+            self._stage2_marked = 2
+
+    def stage2_denoise_time(self) -> Optional[float]:
+        """Loop-only stage-2 denoise seconds; None if stage 2 never completed."""
+        if not self._enabled or self._stage2_marked != 2:
+            return None
+        self._stage2_end.synchronize()
+        return self._stage2_start.elapsed_time(self._stage2_end) / 1000.0
+
+    def mark_decode_start(self) -> None:
+        if self._enabled:
+            self._decode_start.record()
+            self._decode_marked = 1
+
+    def mark_decode_end(self) -> None:
+        if self._enabled and self._decode_marked == 1:
+            self._decode_end.record()
+            self._decode_marked = 2
+
+    def decode_time(self) -> Optional[float]:
+        """Decode-only seconds; None if the decode bracket never completed."""
+        if not self._enabled or self._decode_marked != 2:
+            return None
+        self._decode_end.synchronize()
+        return self._decode_start.elapsed_time(self._decode_end) / 1000.0
+
+
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # Baseline BF16 peak memory ~75 GiB, saving BF16 weights snapshot total ~108 GiB.
 _BF16_WEIGHTS_SNAPSHOT_FREE_MEMORY_THRESHOLD_GIB = 115.0
@@ -897,20 +959,26 @@ class _PersistentLoRAWeightCache:
 
 
 class _LTX2TwoStageCUDAGraphRunner(_LTX2CUDAGraphRunner):
-    """CUDA graph runner keyed by LTX-2 two-stage LoRA weight state."""
+    """CUDA graph runner keyed by LTX-2 two-stage LoRA weight state and the
+    transformer's active topology (``topology_getter`` reads
+    ``LTXModel.active_topology``, the single source of truth, so the selected
+    graph always matches the live attention stacks)."""
 
     def __init__(
         self,
         config: CUDAGraphRunnerConfig,
         lora_state_getter: Callable[[], str],
+        topology_getter: Callable[[], str],
     ) -> None:
         super().__init__(config)
         self._lora_state_getter = lora_state_getter
+        self._topology_getter = topology_getter
 
     def get_graph_key(self, *args, **kwargs):
         return (
             *super().get_graph_key(*args, **kwargs),
             ("ltx2_two_stage_lora_state", self._lora_state_getter()),
+            ("ltx2_two_stage_topology", self._topology_getter()),
         )
 
 
@@ -940,6 +1008,44 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
     def _current_lora_cuda_graph_state(self) -> str:
         return getattr(self, "_lora_cuda_graph_state", "original")
+
+    def _build_stage2_dit_groups(self) -> Optional[Stage2Groups]:
+        """Build the stage-2 dual-topology groups (once, collectively, at load).
+
+        cfg is flattened into ulysses while every other mesh dim's groups are
+        preserved verbatim, so cp-side attention wrappers keep their peers. The
+        only new communicators are the stage-2 ulysses groups, plus one
+        seq-plane group at cp>1 whose shard/gather order is cp-major (encoded
+        via seq_rank/gather_index — ``dist.new_group`` sorts its rank list).
+        """
+        vgm = self.pipeline_config.visual_gen_mapping
+        if vgm is None or vgm.world_size <= 1 or vgm.cfg_size <= 1:
+            return None
+        # At tp>1 the seq plane below (flattened fold lists) would cross TP
+        # fibers whose ranks hold different weight shards.
+        assert vgm.tp_size == 1, "two-stage dual topology requires tp_size == 1"
+        fold = vgm.flatten_cfg_ranks()
+        uly_group = None
+        # Every rank must create EVERY group (world-collective); keep only ours.
+        for ranks in fold:
+            g = dist.new_group(ranks, use_local_synchronization=False)
+            if self.rank in ranks:
+                uly_group = g
+        flat = [r for ranks in fold for r in ranks]
+        if len(fold) == 1:
+            seq_group, gather_index = uly_group, None
+        else:
+            # dist.new_group sorts its rank list; at tp=1 the plane spans
+            # 0..world-1, so the cp-major flat order doubles as group ranks.
+            seq_group = dist.new_group(sorted(flat), use_local_synchronization=False)
+            gather_index = flat
+        return Stage2Groups(
+            ulysses_group=uly_group,
+            seq_group=seq_group,
+            seq_rank=flat.index(self.rank),
+            seq_size=len(flat),
+            gather_index=gather_index,
+        )
 
     def _is_cuda_graph_enabled(self) -> bool:
         for config_name in ("pipeline_config", "model_config"):
@@ -972,6 +1078,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         runner = _LTX2TwoStageCUDAGraphRunner(
             CUDAGraphRunnerConfig(use_cuda_graph=True),
             self._current_lora_cuda_graph_state,
+            lambda: self.transformer.active_topology,
         )
         compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(
@@ -1181,12 +1288,29 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             enhance_prompt = False
 
         _assert_resolution(height, width, is_two_stage=True)
+        if self.transformer._has_stage2:
+            # Fail fast (no serial fallback exists): the full-resolution latent
+            # token count must divide the stage-2 seq plane. Uses the canonical
+            # VAE scale factors rather than re-deriving them.
+            lat = VideoLatentShape.from_pixel_shape(
+                VideoPixelShape(
+                    batch=1, frames=num_frames, height=height, width=width, fps=frame_rate
+                )
+            )
+            s2_tokens = lat.frames * lat.height * lat.width
+            seq = self.transformer._sharder_s2.size
+            if s2_tokens % seq != 0:
+                raise ValueError(
+                    f"Stage-2 patchified token count ({s2_tokens} = {lat.frames}x"
+                    f"{lat.height}x{lat.width}) is not divisible by the stage-2 "
+                    f"seq-plane size ({seq}); adjust resolution or num_frames."
+                )
         pipeline_start = time.time()
         # Two-stage timing: stage 1 is reported as ``denoise``; stage 2
         # (spatial upsample + refinement denoise + decode) folds into
         # ``post_denoise``. Only the outer timer's numbers reach
         # ``PipelineOutput``.
-        timer = CudaPhaseTimer()
+        timer = _TwoStagePhaseTimer()
         timer.mark_pre_start()
         height_s1 = height // 2
         width_s1 = width // 2
@@ -1219,135 +1343,18 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             enhance_prompt=enhance_prompt,
         )
 
+        # Every rank computes the full stage-1 latents (all-rank denoise loop +
+        # per-forward gather) and output_type="latent" returns them on every
+        # rank, so Stage 2 needs no handoff collective in either parallel-VAE mode.
         video_latents = out.video  # (B, C, F_lat, H_lat_s1, W_lat_s1)
         audio_latents = out.audio  # (B, C, F_aud, M) or None
+        assert video_latents is not None, "stage-1 latents missing on this rank"
 
         timer.mark_post_start()
 
-        # Non-primary workers (rank != 0) receive None from
-        # decode_latents and exit here.  Rank 0 continues with Stage 2.
-        if video_latents is None:
-            timer.mark_end()
-            return timer.fill(PipelineOutput(video=None, audio=None, frame_rate=float(frame_rate)))
-
         # ================================================================
-        # Stage 2: spatial upsample + refinement denoise (rank-0 only)
+        # Stage 2: spatial upsample + refinement denoise — all ranks, collectively
         # ================================================================
-        # Only rank 0 refines; other vae_ranks skip Stage 2 and rejoin at the
-        # collective decode below, receiving the refined latents via broadcast.
-        if self.rank == 0:
-            video_latents, audio_latents = self._upsample_and_refine(
-                video_latents=video_latents,
-                audio_latents=audio_latents,
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=frame_rate,
-                seed=seed,
-                max_sequence_length=max_sequence_length,
-                image=image,
-                image_cond_strength=image_cond_strength,
-            )
-        else:
-            video_latents, audio_latents = None, None
-
-        # ================================================================
-        # Decode
-        # ================================================================
-        if output_type == "latent":
-            # No decode: only rank 0 holds the refined latents.
-            video_out, audio_out = (
-                (video_latents, audio_latents) if self.rank == 0 else (None, None)
-            )
-            if self.rank == 0:
-                logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
-            timer.mark_end()
-            return timer.fill(
-                PipelineOutput(
-                    video=video_out,
-                    audio=audio_out,
-                    frame_rate=float(frame_rate),
-                    audio_sample_rate=(
-                        int(self.audio_sampling_rate)
-                        if getattr(self, "audio_sampling_rate", None) is not None
-                        and audio_out is not None
-                        else None
-                    ),
-                )
-            )
-
-        if self._parallel_vae_enabled:
-            # Broadcast rank-0's refined Stage-2 latents to every vae_rank, then
-            # decode collectively (tile-parallel over vgm.vae_group).
-            vgm = self.pipeline_config.visual_gen_mapping
-            video_latents = self._broadcast_video_latents(video_latents, vgm.vae_group)
-            logger.info("Decoding upsampled video (tile-parallel)...")
-            video = tile_parallel_decode(
-                self.video_decoder,
-                video_latents,
-                TilingConfig.default(),
-                pg=vgm.vae_group,
-            )
-            video = postprocess_video_tensor(video)
-        else:
-            logger.info("Decoding upsampled video (tiled)...")
-            video_latents = video_latents.to(self.dtype)
-            chunks = list(
-                self.video_decoder.tiled_decode(
-                    video_latents,
-                    TilingConfig.default(),
-                    generator=None,
-                )
-            )
-            video = torch.cat(chunks, dim=2)
-            video = postprocess_video_tensor(video)
-
-        # Audio decode is rank-0 only (not tile-parallel).
-        audio_out = None
-        if self.rank == 0 and audio_latents is not None:
-            audio_latents = audio_latents.to(self.dtype)
-            audio_out = decode_audio(audio_latents, self.audio_decoder, self.vocoder)
-
-        if self.rank == 0:
-            logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
-        timer.mark_end()
-        return timer.fill(
-            PipelineOutput(
-                video=video,
-                audio=audio_out,
-                frame_rate=float(frame_rate),
-                audio_sample_rate=(
-                    int(self.audio_sampling_rate)
-                    if getattr(self, "audio_sampling_rate", None) is not None
-                    and audio_out is not None
-                    else None
-                ),
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _upsample_and_refine(
-        self,
-        video_latents: torch.Tensor,
-        audio_latents: Optional[torch.Tensor],
-        prompt: Union[str, List[str]],
-        height: int,
-        width: int,
-        num_frames: int,
-        frame_rate: float,
-        seed: int,
-        max_sequence_length: int,
-        image: Optional[Union[str, torch.Tensor]] = None,
-        image_cond_strength: float = 1.0,
-    ) -> tuple:
-        """Stage 2 (rank-0 only): learned 2x spatial upsample + refinement denoise.
-
-        Returns the refined ``(video_latents, audio_latents)`` in 5-D form.
-        """
         per_ch_stats = self._get_per_channel_statistics()
         video_latents = upsample_video(
             video_latents[:1],
@@ -1366,7 +1373,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         snapshot_required = 0
         n = 0
         dense_lora_merge_completed = False
-        stage2_start = time.time()
         try:
             if using_persistent_lora:
                 lora_cache.bind_merged()
@@ -1390,9 +1396,19 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 self._lora_cuda_graph_state = "merged"
                 logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
 
-            # Disable Ulysses for Stage 2: only rank 0 is active, so
-            # cross-rank collectives in the attention backend would hang.
-            self.transformer.set_ulysses_enabled(False)
+            if self.transformer._has_stage2:
+                # The switch atomically moves the graph-key topology with the
+                # attention stacks (the key reads active_topology). It precedes
+                # prepare_text_cache (topology-dependent) inside
+                # _refinement_denoise and is restored in the finally below.
+                self.transformer.set_ulysses_topology(is_stage2=True)
+                if self.rank == 0:
+                    vgm = self.pipeline_config.visual_gen_mapping
+                    logger.info(
+                        f"Stage 2: switched parallel topology from cfg{vgm.cfg_size} "
+                        f"uly{vgm.ulysses_size} to uly {self.transformer._sharder_s2.size} "
+                        "(there is no cfg in stage 2)"
+                    )
             video_latents, audio_latents = self._refinement_denoise(
                 video_latents=video_latents,
                 audio_latents=audio_latents,
@@ -1405,11 +1421,11 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 max_sequence_length=max_sequence_length,
                 image=image,
                 image_cond_strength=image_cond_strength,
+                timer=timer,
             )
         finally:
-            stage2_denoise_time = time.time() - stage2_start
-            logger.info(f"Stage 2 denoising time: {stage2_denoise_time:.2f}s (BF16 weights)")
-            self.transformer.set_ulysses_enabled(True)
+            if self.transformer._has_stage2:
+                self.transformer.set_ulysses_topology(is_stage2=False)
             if using_persistent_lora:
                 lora_cache.bind_original()
                 self._lora_cuda_graph_state = "original"
@@ -1444,34 +1460,99 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             else:
                 self._lora_cuda_graph_state = "original"
 
-        return video_latents, audio_latents
-
-    def _broadcast_video_latents(
-        self, video_latents: Optional[torch.Tensor], vae_group
-    ) -> torch.Tensor:
-        """Broadcast rank-0's refined Stage-2 latents to every ``vae_rank``.
-
-        ``tile_parallel_decode`` needs the full latent replicated on each rank of
-        ``vae_group``; only rank 0 ran Stage 2, so it is the broadcast source.
-        Video latents are 5-D ``(B, C, F, H, W)``.
-        """
-        if vae_group is None:
-            raise ValueError(
-                "parallel VAE decode requires a valid vae_group, got None "
-                "(a None group would fall back to the world group and hang on non-VAE ranks)."
+        # ================================================================
+        # Decode
+        # ================================================================
+        if output_type == "latent":
+            # No decode. Every rank holds the refined latents; the external
+            # contract returns them on rank 0 only.
+            video_out, audio_out = (
+                (video_latents, audio_latents) if self.rank == 0 else (None, None)
             )
-        if self.rank == 0:
+            if self.rank == 0:
+                logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
+            timer.mark_end()
+            return timer.fill(
+                PipelineOutput(
+                    video=video_out,
+                    audio=audio_out,
+                    frame_rate=float(frame_rate),
+                    audio_sample_rate=(
+                        int(self.audio_sampling_rate)
+                        if getattr(self, "audio_sampling_rate", None) is not None
+                        and audio_out is not None
+                        else None
+                    ),
+                )
+            )
+
+        # Event bracket: a host wall clock started here would absorb the queued
+        # stage-2 GPU tail (the graphed loop leaves the host far ahead).
+        timer.mark_decode_start()
+        vgm = self.pipeline_config.visual_gen_mapping
+        if self._parallel_vae_enabled and self.rank in vgm.vae_ranks:
+            # Parallel Stage 2 left identical refined latents on every rank;
+            # VAE ranks decode collectively (tile-parallel over vgm.vae_group).
             video_latents = video_latents.to(self.dtype).contiguous()
-            shape = torch.tensor(video_latents.shape, dtype=torch.long, device=self.device)
-        else:
-            shape = torch.empty(5, dtype=torch.long, device=self.device)
-        dist.broadcast(shape, src=0, group=vae_group)
-        if self.rank != 0:
-            video_latents = torch.empty(
-                torch.Size(shape.tolist()), dtype=self.dtype, device=self.device
+            logger.info("Decoding upsampled video (tile-parallel)...")
+            video = tile_parallel_decode(
+                self.video_decoder,
+                video_latents,
+                TilingConfig.default(),
+                pg=vgm.vae_group,
             )
-        dist.broadcast(video_latents, src=0, group=vae_group)
-        return video_latents
+            video = postprocess_video_tensor(video)
+        elif not self._parallel_vae_enabled and self.rank == 0:
+            logger.info("Decoding upsampled video (tiled)...")
+            video_latents = video_latents.to(self.dtype)
+            chunks = list(
+                self.video_decoder.tiled_decode(
+                    video_latents,
+                    TilingConfig.default(),
+                    generator=None,
+                )
+            )
+            video = torch.cat(chunks, dim=2)
+            video = postprocess_video_tensor(video)
+        else:
+            # Non-decoding ranks (outside vae_ranks under parallel VAE, or
+            # non-rank-0 otherwise) return no media.
+            video = None
+
+        # Audio decode is rank-0 only (not tile-parallel).
+        audio_out = None
+        if self.rank == 0 and audio_latents is not None:
+            audio_latents = audio_latents.to(self.dtype)
+            audio_out = decode_audio(audio_latents, self.audio_decoder, self.vocoder)
+
+        timer.mark_decode_end()
+        if self.rank == 0:
+            logger.info(f"Stage 1 denoising time: {out.denoise:.2f}s")
+            stage2_s = timer.stage2_denoise_time()
+            if stage2_s is not None:
+                logger.info(f"Stage 2 denoising time: {stage2_s:.2f}s")
+            decode_s = timer.decode_time()
+            if decode_s is not None:
+                logger.info(f"Decoding completed in {decode_s:.2f}s")
+            logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
+        timer.mark_end()
+        return timer.fill(
+            PipelineOutput(
+                video=video,
+                audio=audio_out,
+                frame_rate=float(frame_rate),
+                audio_sample_rate=(
+                    int(self.audio_sampling_rate)
+                    if getattr(self, "audio_sampling_rate", None) is not None
+                    and audio_out is not None
+                    else None
+                ),
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _get_per_channel_statistics(self) -> torch.nn.Module:
         """Return per-channel statistics for un-normalize/normalize.
@@ -1499,6 +1580,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         max_sequence_length: int,
         image: Optional[Union[str, torch.Tensor]] = None,
         image_cond_strength: float = 1.0,
+        timer: Optional[_TwoStagePhaseTimer] = None,
     ) -> tuple:
         """Run stage 2 refinement denoising on upsampled latents.
 
@@ -1628,6 +1710,11 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             dtype=self.dtype,
         )
 
+        # stage2_denoise measures ONLY the step loop (upsample, LoRA bind,
+        # and text-cache/scheduler prep stay outside the bracket).
+        if timer is not None:
+            timer.mark_stage2_start()
+
         # --- Euler denoising loop (no guidance) ---
         for i in range(len(sigmas) - 1):
             with nvtx_range(f"refinement_step {i}"):
@@ -1688,6 +1775,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     denoised_a = a_working.float() - vel_a.float() * sigma_a
                     velocity_a = (a_working.float() - denoised_a) / sigma_a
                     a_working = (a_working.float() + velocity_a * dt).to(a_working.dtype)
+
+        if timer is not None:
+            timer.mark_stage2_end()
 
         # --- Unpatchify ---
         video_out = self.video_patchifier.unpatchify(v_working, video_shape)

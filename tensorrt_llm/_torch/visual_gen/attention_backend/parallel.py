@@ -855,6 +855,7 @@ def wrap_parallel_attention(
     enable_sequence_parallel: bool = True,
     use_ulysses: bool = True,
     async_ulysses: bool = False,
+    ulysses_group: Optional[dist.ProcessGroup] = None,
 ) -> AttentionBackend:
     """Wrap a compute backend with the configured parallelism strategy.
 
@@ -888,7 +889,17 @@ def wrap_parallel_attention(
     elif ring_size > 1:
         attn = RingAttention(attn, process_group=vgm.ring_group)
 
-    if ulysses_size > 1 and use_ulysses:
+    if ulysses_group is not None:
+        # Explicit group override: wrap iff the override group is non-trivial,
+        # independent of vgm.ulysses_size (the caller's group may be wider or
+        # narrower than the mapping's).
+        if use_ulysses and dist.get_world_size(group=ulysses_group) > 1:
+            attn = UlyssesAttention(
+                attn,
+                process_group=ulysses_group,
+                async_ulysses=async_ulysses,
+            )
+    elif ulysses_size > 1 and use_ulysses:
         attn = UlyssesAttention(
             attn,
             process_group=vgm.ulysses_group,

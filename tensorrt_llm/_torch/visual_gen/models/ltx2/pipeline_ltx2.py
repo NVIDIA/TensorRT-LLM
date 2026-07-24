@@ -793,8 +793,14 @@ class LTX2Pipeline(BasePipeline):
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
             model_config=model_config,
+            stage2_groups=self._build_stage2_dit_groups(),
         )
         self.transformer._transformer_config = vars(cfg)
+
+    def _build_stage2_dit_groups(self):
+        """Two-stage pipeline override supplies the dual-topology groups;
+        single-stage builds none."""
+        return None
 
     # ------------------------------------------------------------------
     # CUDA graph setup (Modality-aware override)
@@ -2026,10 +2032,6 @@ class LTX2Pipeline(BasePipeline):
 
         def decode_video_fn(vid_latents):
             vid_latents = self.video_patchifier.unpatchify(vid_latents, video_shape)
-
-            if output_type == "latent":
-                return vid_latents
-
             vid_latents = vid_latents.to(self.dtype)
             tiling_config = TilingConfig.default()
             if self._parallel_vae_enabled:
@@ -2059,18 +2061,27 @@ class LTX2Pipeline(BasePipeline):
 
         def decode_audio_fn(aud_latents):
             aud_latents = self.audio_patchifier.unpatchify(aud_latents, audio_shape)
-
-            if output_type == "latent":
-                return aud_latents
-
             aud_latents = aud_latents.to(self.dtype)
             return decode_audio(aud_latents, self.audio_decoder, self.vocoder)
 
-        video, audio = self.decode_latents(
-            latents=latents,
-            decode_fn=decode_video_fn,
-            extra_latents={"audio": (audio_latents, decode_audio_fn)},
-        )
+        if output_type == "latent":
+            # Latent output is a local unpatchify with no VAE work, and every
+            # rank already holds the full latents after the denoise loop —
+            # return them on every rank. decode_latents' vae_ranks/rank-0 gate
+            # exists to skip real VAE decode only; the two-stage handoff
+            # consumes these latents in place with zero collectives.
+            video = self.video_patchifier.unpatchify(latents, video_shape)
+            audio = (
+                self.audio_patchifier.unpatchify(audio_latents, audio_shape)
+                if audio_latents is not None
+                else None
+            )
+        else:
+            video, audio = self.decode_latents(
+                latents=latents,
+                decode_fn=decode_video_fn,
+                extra_latents={"audio": (audio_latents, decode_audio_fn)},
+            )
 
         if self.rank == 0:
             logger.info(f"Decoding completed in {time.time() - decode_start:.2f}s")

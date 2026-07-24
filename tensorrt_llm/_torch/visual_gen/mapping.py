@@ -10,6 +10,7 @@ process groups.
 
 from __future__ import annotations
 
+import itertools
 import os
 from typing import Optional
 
@@ -392,6 +393,33 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
                 adj_groups[i] = pg
         if self._rank in self._vae_ranks:
             self._vae_adj_groups = adj_groups
+
+    def flatten_cfg_ranks(self) -> list:
+        """Rank lists for the ulysses groups of a topology whose cfg dim is
+        flattened into ulysses.
+
+        One list per combined coordinate of every OTHER mesh dim (tp,
+        cp/cp_row/cp_col); within a list the cfg coordinate varies outermost and
+        ulysses innermost. Every non-(cfg, ulysses) group of the current mesh is
+        therefore preserved verbatim by a topology built from these lists.
+        Pure layout arithmetic — no process group is created, no state is held.
+        """
+        strides, acc = {}, 1
+        for d in reversed(self._dim_names):
+            strides[d] = acc
+            acc *= self._dim_sizes[d]
+        other_dims = [d for d in self._dim_names if d not in ("cfg", "ulysses")]
+        groups = []
+        for coords in itertools.product(*(range(self._dim_sizes[d]) for d in other_dims)):
+            base = sum(strides[d] * v for d, v in zip(other_dims, coords))
+            groups.append(
+                [
+                    base + strides["cfg"] * c + strides["ulysses"] * u
+                    for c in range(self._dim_sizes["cfg"])
+                    for u in range(self._dim_sizes["ulysses"])
+                ]
+            )
+        return groups
 
     # ------------------------------------------------------------------
     # Rank decomposition
