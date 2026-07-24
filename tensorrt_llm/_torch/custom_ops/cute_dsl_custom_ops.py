@@ -4,7 +4,7 @@
 import functools
 import itertools
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Type
 
 import torch
 
@@ -8534,3 +8534,776 @@ if IS_CUTLASS_DSL_AVAILABLE:
                            max_context_len,
                            dtype=output_dtype,
                            device=q.device)
+
+    # =========================================================================
+    # MLA decode (Blackwell) - wraps the CuTe DSL kernels that live at
+    # tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/.
+    # Used by the cute_dsl_mla FMHA library (see attention_backend/fmha/cute_dsl.py).
+    # =========================================================================
+
+    from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8 import \
+        BlackwellMultiHeadLatentAttentionForwardFP8
+    from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp16 import \
+        BlackwellMultiHeadLatentAttentionForwardFP16
+
+    class CuteDSLNVMlaDecodeBlackwellRunner(TunableRunner):
+        """Generic TunableRunner for the Blackwell CuTe DSL MLA decode kernels.
+
+        Works for FP8, FP16, and BF16 - pass the cutlass input dtype at
+        construction; the kernel class is derived from it:
+
+            CuteDSLNVMlaDecodeBlackwellRunner(
+                in_dtype=cutlass.Float8E4M3FN, ...)   # -> ...ForwardFP8
+            CuteDSLNVMlaDecodeBlackwellRunner(
+                in_dtype=cutlass.Float16, ...)        # -> ...ForwardFP16
+            CuteDSLNVMlaDecodeBlackwellRunner(
+                in_dtype=cutlass.BFloat16, ...)       # -> ...ForwardFP16
+        """
+        kernel_cache = dict()
+        tuning_config_cache = dict()
+
+        _CLUSTER_SHAPE_MNK = (2, 1, 1)
+
+        # in_dtype -> kernel class. The kernels' own ``can_implement`` is
+        # what ultimately rejects unsupported dtypes, but this lookup
+        # picks which kernel we even try to compile.
+        _KERNEL_CLASS_BY_DTYPE = {
+            cutlass.Float8E4M3FN: BlackwellMultiHeadLatentAttentionForwardFP8,
+            cutlass.Float16: BlackwellMultiHeadLatentAttentionForwardFP16,
+            cutlass.BFloat16: BlackwellMultiHeadLatentAttentionForwardFP16,
+        }
+
+        # Fixed kernel-construction flags for this integration path (var-seq
+        # decode, scalar split): not tunable, not part of any cache key.
+        _IS_VAR_SEQ = True
+        _IS_VAR_SPLIT_KV = False
+        _SKIP_CORRECTION_THRESHOLD = 0.0
+
+        _WORKSPACE_ALIGN = 128
+        _LSE_DTYPE_BYTES = 4  # float32
+
+        def __init__(
+            self,
+            in_dtype,
+            num_heads: int,
+            seq_len_q: int,
+            page_size: int,
+            max_batch_size: int = 0,
+        ):
+            super().__init__()
+            kernel_class = self.__class__._KERNEL_CLASS_BY_DTYPE.get(in_dtype)
+            if kernel_class is None:
+                raise ValueError(
+                    f"CuteDSLNVMlaDecodeBlackwellRunner: unsupported "
+                    f"in_dtype={in_dtype}. Supported: "
+                    f"{list(self.__class__._KERNEL_CLASS_BY_DTYPE.keys())}")
+            self.in_dtype = in_dtype
+            self.kernel_class = kernel_class
+            self.num_heads = num_heads
+            self.seq_len_q = seq_len_q
+            self.page_size = page_size
+            self.max_batch_size = max_batch_size
+
+        def unique_id(self):
+            # seq_len_q is part of the id: each decode variant (the MTP
+            # target step's sq = 1 + draft_len, the draft steps' sq = 1)
+            # constructs its own runner and is tuned independently during
+            # the autotuner warmup's generation forward.
+            return (
+                self.in_dtype,
+                self.num_heads,
+                self.seq_len_q,
+                self.page_size,
+            )
+
+        @classmethod
+        def _get_max_active_blocks(cls) -> int:
+            """``max_active_clusters * cluster_shape[0]`` -- the occupancy ceiling
+            the split_kv heuristic divides. Queried once via HardwareInfo and
+            cached at class scope; must be populated by an eager warmup before
+            CUDA-graph capture (HardwareInfo cannot run during capture)."""
+            cached = getattr(cls, "_cute_dsl_max_active_blocks", None)
+            if cached is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "CuteDSLNVMlaDecodeBlackwellRunner: max_active_blocks was "
+                        "not cached before CUDA graph capture (run an eager "
+                        "warmup first).")
+                cluster_product = (cls._CLUSTER_SHAPE_MNK[0] *
+                                   cls._CLUSTER_SHAPE_MNK[1] *
+                                   cls._CLUSTER_SHAPE_MNK[2])
+                max_active_clusters = cutlass.utils.HardwareInfo(
+                ).get_max_active_clusters(cluster_product)
+                cached = int(max_active_clusters) * cls._CLUSTER_SHAPE_MNK[0]
+                cls._cute_dsl_max_active_blocks = cached
+            return cached
+
+        @staticmethod
+        def get_default_split_kv(B: int, S: int, max_active_blocks: int) -> int:
+            max_split_kv = 32
+            blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
+            split_kv = min(blocks_per_batch, max_split_kv)
+            return split_kv
+
+        @staticmethod
+        def get_default_is_persistent(B: int) -> bool:
+            if B >= 64:
+                return True
+            else:
+                return False
+
+        @staticmethod
+        def get_split_kv_candidates(B: int, S: int,
+                                    max_active_blocks: int) -> List[int]:
+            # TODO: default split_kv is not always the best choice. We need to optimize it.
+            return [
+                CuteDSLNVMlaDecodeBlackwellRunner.get_default_split_kv(
+                    B, S, max_active_blocks)
+            ]
+
+        @staticmethod
+        def get_is_persistent_candidates() -> List[bool]:
+            return [True, False]
+
+        @classmethod
+        def get_max_split_kv_workspace_size(
+            cls,
+            H: int,
+            D: int,
+            acc_dtype: Type[cutlass.Numeric],
+        ) -> int:
+            """Raw bytes reserved for split-KV intermediates.
+
+            Batch-INDEPENDENT: CUDA graphs are captured per batch size in
+            descending order, and a later capture that needed a larger workspace
+            would resize the buffer, dangling the address baked into every
+            previously captured graph.
+
+            # cuda graph capture(B=8):   eager warmup N times  →  capture graph_8
+            # cuda graph capture(B=4):   eager warmup N times  →  capture graph_4
+            # ...
+            # cuda graph replay
+            # A later capture with a bigger workspace would resize it, so the
+            # bound covers every batch size up-front."""
+            max_active_blocks = cls._get_max_active_blocks()
+            return (2 * H * (max_active_blocks // 2) * (D + 1) *
+                    acc_dtype.width // 8)
+
+        @classmethod
+        def get_workspace_layout(
+            cls,
+            H: int,
+            seq_len_q: int,
+            D: int,
+            max_batch_size: int,
+            acc_dtype: Type[cutlass.Numeric],
+        ) -> Tuple[int, int, int, int, int]:
+            """Return LSE/split-KV offsets and sizes, then total bytes."""
+            lse_offset = 0
+            lse_size = cls.get_lse_workspace_size(H, seq_len_q, max_batch_size)
+            split_kv_offset = pad_up(lse_offset + lse_size,
+                                     cls._WORKSPACE_ALIGN)
+            split_kv_size = cls.get_max_split_kv_workspace_size(H, D, acc_dtype)
+            workspace_size = split_kv_offset + pad_up(split_kv_size,
+                                                      cls._WORKSPACE_ALIGN)
+            return (lse_offset, lse_size, split_kv_offset, split_kv_size,
+                    workspace_size)
+
+        @classmethod
+        def get_lse_workspace_size(
+            cls,
+            H: int,
+            seq_len_q: int,
+            batch_size: int,
+        ) -> int:
+            """Raw bytes for an LSE tensor shaped ``(batch_size, seq_len_q, H)``."""
+            return seq_len_q * batch_size * H * cls._LSE_DTYPE_BYTES
+
+        @classmethod
+        def get_max_padded_workspace_size(
+            cls,
+            H: int,
+            seq_len_q: int,
+            D: int,
+            max_batch_size: int,
+            acc_dtype: Type[cutlass.Numeric],
+        ) -> int:
+            """Padded bytes for the max-batch LSE and split-KV regions."""
+            return cls.get_workspace_layout(H, seq_len_q, D, max_batch_size,
+                                            acc_dtype)[4]
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+            """Filter the candidate tilers via the kernel's
+            ``can_implement``. Returns a list of
+            ``(mma_qk_tiler_mn, mma_pv_tiler_mn)`` tuples; AutoTuner picks
+            one and passes it to ``forward`` as ``tactic``.
+            """
+            if get_sm_version() not in (100, 103):
+                return []
+            q_latent, q_rope, _c_latent, _c_rope, _page_table, cache_seqs, \
+                o, *_rest = inputs
+            h, latent_dim, seq_len_q, _ = q_latent.shape
+            rope_dim = q_rope.shape[1]
+            batch_size = cache_seqs.shape[0]
+            if o.dtype == torch.float16:
+                out_dtype = cutlass.Float16
+            elif o.dtype == torch.bfloat16:
+                out_dtype = cutlass.BFloat16
+            else:
+                out_dtype = self.in_dtype
+
+            candidate_tiler_tactics = [
+                ((128, 128), (128, 256)),
+            ]
+            max_active_blocks = self._get_max_active_blocks()
+            split_candidates = self.get_split_kv_candidates(
+                batch_size, seq_len_q, max_active_blocks)
+            persistent_candidates = self.get_is_persistent_candidates()
+
+            valid = []
+            for mma_qk_tiler_mn, mma_pv_tiler_mn in candidate_tiler_tactics:
+                for split_kv in split_candidates:
+                    for is_persistent in persistent_candidates:
+                        if self.kernel_class.can_implement(
+                                batch_size,
+                                seq_len_q,
+                                self.page_size,
+                                h,
+                                latent_dim,
+                                rope_dim,
+                                self.in_dtype,  # in_dtype
+                                out_dtype,
+                                cutlass.Float32,  # acc_dtype
+                                cutlass.Float32,  # lse_dtype
+                                mma_qk_tiler_mn,
+                                mma_pv_tiler_mn,
+                                split_kv,
+                                is_persistent,
+                                self._IS_VAR_SEQ,
+                                self._IS_VAR_SPLIT_KV,
+                                self.page_size,
+                        ):
+                            valid.append((mma_qk_tiler_mn, mma_pv_tiler_mn,
+                                          split_kv, is_persistent))
+                        else:
+                            logger.debug(
+                                "CuteDSLNVMlaDecodeBlackwellRunner.can_implement "
+                                "rejected tactic: kernel=%s in_dtype=%s "
+                                "H=%d L=%d R=%d S=%d B=%d page_size=%d "
+                                "mma_qk=%s mma_pv=%s persistent=%s var_seq=%s "
+                                "var_split=%s", self.kernel_class.__name__,
+                                self.in_dtype, h, latent_dim, rope_dim,
+                                seq_len_q, batch_size, self.page_size,
+                                mma_qk_tiler_mn, mma_pv_tiler_mn, is_persistent,
+                                self._IS_VAR_SEQ, self._IS_VAR_SPLIT_KV)
+            return valid
+
+        def _tuning_inputs_pre_hook(
+                self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+            """Fix up the RECONSTRUCTED profiling tensors so the decode kernel
+            compiles and runs in-bounds during AutoTuner profiling."""
+            inputs = list(inputs)
+
+            def _relayout(t, base_shape, permute_order):
+                # Same logical shape as ``t``, but with the real
+                # (leading-dim-contiguous) strides.
+                out = torch.empty(base_shape, dtype=t.dtype,
+                                  device=t.device).permute(*permute_order)
+                out.copy_(t)
+                return out
+
+            # q_latent [H, D, S_q, B] <- (B, S_q, H, D).permute(2, 3, 1, 0)
+            H, d_latent, seq_len_q, batch = inputs[0].shape
+            inputs[0] = _relayout(inputs[0], (batch, seq_len_q, H, d_latent),
+                                  (2, 3, 1, 0))
+            d_rope = inputs[1].shape[1]
+            inputs[1] = _relayout(inputs[1], (batch, seq_len_q, H, d_rope),
+                                  (2, 3, 1, 0))  # q_rope
+            inputs[6] = _relayout(inputs[6], (batch, seq_len_q, H, d_latent),
+                                  (2, 3, 1, 0))  # o
+
+            # page_table [max_blocks, B] <- (B, max_blocks).transpose(0, 1),
+            # with in-bounds page ids ([0, num_pages) from the c_latent pool).
+            page_table = inputs[4]
+            max_blocks = int(page_table.shape[0])
+            num_pages = int(inputs[2].shape[2])
+            pt_valid = (page_table.to(torch.long).abs() % num_pages).to(
+                page_table.dtype)
+            pt_out = torch.empty((batch, max_blocks),
+                                 dtype=page_table.dtype,
+                                 device=page_table.device).transpose(0, 1)
+            pt_out.copy_(pt_valid)
+            inputs[4] = pt_out
+
+            cache_seqs = inputs[5]
+            if isinstance(cache_seqs, torch.Tensor) and cache_seqs.numel():
+                max_kv = max_blocks * self.page_size
+                kv = max(1, min(2048, max_kv))
+                inputs[5] = torch.full((cache_seqs.shape[0], ),
+                                       kv,
+                                       dtype=cache_seqs.dtype,
+                                       device=cache_seqs.device)
+            return inputs
+
+        def get_tuning_config(self) -> TuningConfig:
+            """Batch is the single free tuning dim (on cache_seqs), and its
+            power-of-2 bucket ladder is determined by ``max_batch_size``
+            (when known, i.e. > 0), NOT by the batch observed while tuning:
+            one in-autotune forward at ANY batch then profiles every bucket
+            up to the engine's max batch, so no runtime batch falls to
+            ``default_tactic`` (whose freshly computed split_kv could
+            JIT-compile a kernel inside the timed region).
+
+            Every other dim carrying batch is tied to it via constraints.
+            seq_len_q needs no dynamic axis: it is fixed per runner (part of
+            ``unique_id``), and each decode variant is tuned by its own
+            forward inside the autotuner warmup."""
+            key = self.unique_id()
+            cache = self.__class__.tuning_config_cache
+            if key not in cache:
+                # Tensors' (index, name: shape):
+                #   0 q_latent:   (H, D, S_q, B)
+                #   1 q_rope:     (H, R, S_q, B)
+                #   2 c_latent:   (page_size, D, num_pages)
+                #   3 c_rope:     (page_size, R, num_pages)
+                #   4 page_table: (max_blocks_per_sequence, B)
+                #   5 cache_seqs: (B,)
+                #   6 o:          (H, D, S_q, B)
+                #   7 workspace:  (workspace_size,)
+
+                # cache_seqs (index 5) is the single free dynamic batch dim;
+                # every other batch-carrying dim is tied to it by a constraint.
+                batch_dims = ((0, 3), (1, 3), (4, 1), (5, 0), (6, 3))
+                free = 5  # cache_seqs
+                batch_constraints = tuple(
+                    ConstraintSpec(
+                        i, d, lambda shapes, _free=free: shapes[_free][0])
+                    for (i, d) in batch_dims if i != free)
+
+                # (input, dim) whose size is a static config quantity, not
+                # per-request: kept at its real size for profiling but excluded
+                # from the cache key (constraint dims are set to -1 in the key).
+                # page_table dim0 (max_blocks) and workspace dim0 -- both small
+                # (page_table is int32 max_blocks x B; the workspace is the
+                # max-batch LSE + a batch-independent split-KV region, tens of
+                # MB), so rebuilding them for profiling is cheap.
+                static_size_dims = ((4, 0), (7, 0))
+                static_constraints = tuple(
+                    ConstraintSpec(
+                        i, d, lambda shapes, _i=i, _d=d: shapes[_i][_d])
+                    for (i, d) in static_size_dims)
+
+                # The batch search space, fixed up-front by max_batch_size
+                # when the engine max is known.
+                batch_buckets = (get_last_power_of_2_num_tokens_buckets(
+                    self.max_batch_size) if self.max_batch_size > 0 else
+                                 get_last_power_of_2_num_tokens_buckets)
+                cache[key] = TuningConfig(
+                    dynamic_tensor_specs=(DynamicTensorSpec(
+                        free,
+                        0,
+                        batch_buckets,
+                        last_positive_power_of_2,
+                    ), ),
+                    constraint_specs=batch_constraints + static_constraints,
+                    inputs_pre_hook=self._tuning_inputs_pre_hook,
+                )
+            return cache[key]
+
+        def default_tactic(
+            self,
+            batch_size: int,
+        ) -> Tuple[Tuple[int, int], Tuple[int, int], int, bool]:
+            """Fallback 4-tuple tactic ``(mma_qk, mma_pv, split_kv,
+            is_persistent)`` for when the AutoTuner cache is not warmed and
+            ``choose_one`` returns its ``-1`` sentinel."""
+            mma_qk_tiler_mn = (128, 128)
+            mma_pv_tiler_mn = (128, 256)
+            max_active_blocks = self._get_max_active_blocks()
+            split_kv = self.get_default_split_kv(batch_size, self.seq_len_q,
+                                                 max_active_blocks)
+            is_persistent = self.get_default_is_persistent(batch_size)
+            return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent)
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+            **kwargs,
+        ) -> torch.Tensor:
+            """Run the CuTe DSL MLA decode kernel.
+
+            Args:
+                inputs (List[torch.Tensor]):
+                    inputs[0] (q_latent): Query latent tensor of shape
+                        (H, D, S_q, B).
+                    inputs[1] (q_rope): Query RoPE tensor of shape (H, R, S_q, B).
+                    inputs[2] (c_latent): Paged latent-cache tensor of shape
+                        (page_size, D, num_pages).
+                    inputs[3] (c_rope): Paged RoPE-cache tensor of shape
+                        (page_size, R, num_pages).
+                    inputs[4] (page_table): Page table tensor of shape
+                        (max_blocks_per_sequence, B), dtype: int32.
+                    inputs[5] (cache_seqs): Cache sequence lengths tensor of
+                        shape (B), dtype: int32.
+                    inputs[6] (o): Output tensor of shape (H, D, S_q, B).
+                    inputs[7] (workspace): Contiguous raw workspace with at least
+                        the workspace_size returned by get_workspace_layout.
+                tactic: Tuple containing (mma_qk_tiler_mn, mma_pv_tiler_mn,
+                    split_kv, is_persistent).
+                **kwargs: Optional softmax_scale and output_scale values.
+
+            Returns:
+                torch.Tensor: Output tensor of shape (H, D, S_q, B). The LSE
+                    tensor of shape (H, S_q, B) remains in the workspace.
+            """
+            (q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
+             workspace) = inputs
+            softmax_scale = float(kwargs.get("softmax_scale", 1.0))
+            output_scale = float(kwargs.get("output_scale", 1.0))
+
+            if not (isinstance(tactic, tuple) and len(tactic) == 4):
+                raise RuntimeError(
+                    "CuteDSLNVMlaDecodeBlackwellRunner.forward expected a 4-tuple "
+                    "tactic (mma_qk, mma_pv, split_kv, is_persistent), got "
+                    f"{tactic!r}.")
+            mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent = tactic
+            split_kv = int(split_kv)
+            is_persistent = bool(is_persistent)
+            mma_qk_tiler_mn = tuple(mma_qk_tiler_mn)
+            mma_pv_tiler_mn = tuple(mma_pv_tiler_mn)
+
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            if o.dtype == torch.float16:
+                out_dtype = cutlass.Float16
+            elif o.dtype == torch.bfloat16:
+                out_dtype = cutlass.BFloat16
+            else:
+                out_dtype = self.in_dtype
+
+            seq_len_q = self.seq_len_q
+
+            # workspace = lse + split_kv_workspace
+            batch_size = cache_seqs.shape[0]
+            d_latent = q_latent.shape[1]
+            max_batch_size = max(batch_size, self.max_batch_size)
+            (lse_offset, lse_size, split_kv_offset, split_kv_size,
+             required_workspace_size) = self.get_workspace_layout(
+                 self.num_heads, seq_len_q, d_latent, max_batch_size,
+                 cutlass.Float32)
+
+            if not workspace.is_contiguous():
+                raise RuntimeError(
+                    "CuteDSLNVMlaDecodeBlackwellRunner requires a contiguous "
+                    "workspace.")
+            workspace_bytes = workspace.view(torch.uint8).reshape(-1)
+            if workspace_bytes.numel() < required_workspace_size:
+                raise RuntimeError(
+                    "CuteDSLNVMlaDecodeBlackwellRunner workspace is too small: "
+                    f"got {workspace_bytes.numel()} bytes, require "
+                    f"{required_workspace_size} bytes for "
+                    f"batch_size={batch_size}, max_batch_size={max_batch_size}."
+                )
+
+            lse = workspace_bytes[lse_offset:lse_offset + lse_size].view(
+                torch.float32).view(max_batch_size, seq_len_q,
+                                    self.num_heads)[:batch_size].permute(
+                                        2, 1, 0)
+            # Kernel split-KV intermediates start AFTER the reserved LSE region.
+            split_workspace = workspace_bytes[split_kv_offset:split_kv_offset +
+                                              split_kv_size]
+
+            cache_key = self.unique_id() + (
+                out_dtype,
+                mma_qk_tiler_mn,
+                mma_pv_tiler_mn,
+                split_kv,
+                is_persistent,
+            )
+            if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
+                # A compile outside the tuning window stalls the serving loop
+                # for seconds -- always log enough to identify the variant.
+                logger.info(
+                    f"CuteDSL MLA decode: compiling kernel variant {cache_key} "
+                    f"B={cache_seqs.shape[0]} "
+                    f"tuning={AutoTuner.get().is_tuning_mode} "
+                    f"capturing={torch.cuda.is_current_stream_capturing()}")
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    self._CLUSTER_SHAPE_MNK[0] * self._CLUSTER_SHAPE_MNK[1] *
+                    self._CLUSTER_SHAPE_MNK[2])
+
+                # Fold seq_len_q into the head dimension when the head count
+                # alone does not fill the MMA M tile (num_heads < M) and there
+                # is more than one query token (MTP / spec-decode).
+                fold_sq = (self.num_heads < mma_qk_tiler_mn[0]
+                           and seq_len_q > 1)
+
+                mla = self.kernel_class(
+                    cutlass.Float32,  # acc_dtype
+                    cutlass.Float32,  # lse_dtype
+                    mma_qk_tiler_mn,
+                    mma_pv_tiler_mn,
+                    max_active_clusters,
+                    self.page_size,
+                    self._SKIP_CORRECTION_THRESHOLD,
+                    is_persistent,
+                    self._IS_VAR_SEQ,
+                    self._IS_VAR_SPLIT_KV,
+                    num_heads=self.num_heads,
+                    seq_len_q=seq_len_q,
+                    fold_sq=fold_sq,
+                )
+
+                q_latent_ct = cute.runtime.from_dlpack(
+                    q_latent,
+                    assumed_align=16).mark_layout_dynamic(leading_dim=1)
+                q_rope_ct = cute.runtime.from_dlpack(
+                    q_rope, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+                c_latent_ct = cute.runtime.from_dlpack(
+                    c_latent,
+                    assumed_align=16).mark_layout_dynamic(leading_dim=1)
+                c_rope_ct = cute.runtime.from_dlpack(
+                    c_rope, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+                page_table_ct = cute.runtime.from_dlpack(
+                    page_table,
+                    assumed_align=16).mark_layout_dynamic(leading_dim=0)
+                o_ct = cute.runtime.from_dlpack(
+                    o, assumed_align=16).mark_layout_dynamic(
+                        leading_dim=1).mark_compact_shape_dynamic(
+                            mode=1,
+                            stride_order=(3, 2, 0, 1),
+                            divisibility=(128 // out_dtype.width))
+                lse_ct = cute.runtime.from_dlpack(
+                    lse, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+                use_workspace = split_kv > 1 and split_workspace.numel() > 0
+                workspace_ct = (cute.runtime.from_dlpack(
+                    split_workspace, assumed_align=32).mark_layout_dynamic()
+                                if use_workspace else None)
+                cache_seqs_ct = cute.runtime.from_dlpack(
+                    cache_seqs, assumed_align=16).mark_layout_dynamic()
+                # Variable split-KV (block_split_kvs) is not used on this path:
+                block_split_kvs_ct = None
+
+                CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[cache_key] = \
+                    cute.compile(
+                        mla,
+                        q_latent_ct,
+                        q_rope_ct,
+                        c_latent_ct,
+                        c_rope_ct,
+                        page_table_ct,
+                        o_ct,
+                        lse_ct,
+                        workspace_ct,
+                        split_kv,
+                        cache_seqs_ct,
+                        block_split_kvs_ct,
+                        cutlass.Float32(softmax_scale),
+                        cutlass.Float32(output_scale),
+                        stream,
+                        options="--opt-level 2",
+                    )
+
+            compiled_mla = CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[
+                cache_key]
+            compiled_mla(
+                q_latent,
+                q_rope,
+                c_latent,
+                c_rope,
+                page_table,
+                o,
+                lse,
+                split_workspace if
+                (split_kv > 1 and split_workspace.numel() > 0) else None,
+                split_kv,
+                cache_seqs,
+                None,  # block_split_kvs: var-split path unused (is_var_split_kv False)
+                softmax_scale,
+                output_scale,
+                stream,
+            )
+            return o
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_mla_decode_fp8_blackwell",
+        mutates_args=("o", "workspace"),
+        device_types="cuda",
+    )
+    def cute_dsl_mla_decode_fp8_blackwell(
+        q_latent: torch.Tensor,
+        q_rope: torch.Tensor,
+        c_latent: torch.Tensor,
+        c_rope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqs: torch.Tensor,
+        o: torch.Tensor,
+        workspace: torch.Tensor,
+        num_heads: int,
+        seq_len_q: int,
+        page_size: int,
+        softmax_scale: float,
+        output_scale: float,
+        max_batch_size: int = 0,
+    ) -> None:
+        """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
+        """
+        if (sm_version := get_sm_version()) not in (100, 103):
+            raise ValueError(
+                f"trtllm::cute_dsl_mla_decode_fp8_blackwell requires SM 100 or "
+                f"SM 103, got SM {sm_version}")
+
+        # split_kv and is_persistent are chosen per shape by the runner's
+        # AutoTuner (the 3rd/4th tactic elements), NOT at the op boundary.
+        runner = CuteDSLNVMlaDecodeBlackwellRunner(
+            in_dtype=cutlass.Float8E4M3FN,
+            num_heads=num_heads,
+            seq_len_q=seq_len_q,
+            page_size=page_size,
+            max_batch_size=max_batch_size,
+        )
+        inputs = [
+            q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
+            workspace
+        ]
+        tuner = AutoTuner.get()
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_mla_decode_fp8_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        # ``forward`` requires a 4-tuple tactic; if the tuner returned its -1
+        # fallback (cache not warmed), supply the default 4-tuple so split_kv +
+        # is_persistent still come from a length-4 tactic.
+        if not (isinstance(best_tactic, tuple) and len(best_tactic) == 4):
+            best_tactic = runner.default_tactic(int(q_latent.shape[-1]))
+        runner(
+            inputs,
+            tactic=best_tactic,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
+        )
+
+    @torch.library.register_fake("trtllm::cute_dsl_mla_decode_fp8_blackwell")
+    def _(
+        q_latent: torch.Tensor,
+        q_rope: torch.Tensor,
+        c_latent: torch.Tensor,
+        c_rope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqs: torch.Tensor,
+        o: torch.Tensor,
+        workspace: torch.Tensor,
+        num_heads: int,
+        seq_len_q: int,
+        page_size: int,
+        softmax_scale: float,
+        output_scale: float,
+        max_batch_size: int = 0,
+    ) -> None:
+        return None
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_mla_decode_fp16_blackwell",
+        mutates_args=("o", "workspace"),
+        device_types="cuda",
+    )
+    def cute_dsl_mla_decode_fp16_blackwell(
+        q_latent: torch.Tensor,
+        q_rope: torch.Tensor,
+        c_latent: torch.Tensor,
+        c_rope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqs: torch.Tensor,
+        o: torch.Tensor,
+        workspace: torch.Tensor,
+        num_heads: int,
+        seq_len_q: int,
+        page_size: int,
+        softmax_scale: float,
+        output_scale: float,
+        max_batch_size: int = 0,
+    ) -> None:
+        """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
+        """
+        if (sm_version := get_sm_version()) not in (100, 103):
+            raise ValueError(
+                f"trtllm::cute_dsl_mla_decode_fp16_blackwell requires SM 100 "
+                f"or SM 103, got SM {sm_version}")
+
+        if q_latent.dtype == torch.float16:
+            in_dtype = cutlass.Float16
+        elif q_latent.dtype == torch.bfloat16:
+            in_dtype = cutlass.BFloat16
+        else:
+            raise ValueError(
+                "trtllm::cute_dsl_mla_decode_fp16_blackwell supports "
+                "torch.float16 or torch.bfloat16 inputs, got "
+                f"{q_latent.dtype}")
+        if not (q_rope.dtype == c_latent.dtype == c_rope.dtype == o.dtype ==
+                q_latent.dtype):
+            raise ValueError(
+                "trtllm::cute_dsl_mla_decode_fp16_blackwell requires q, KV, "
+                f"and output dtypes to match; got q_latent={q_latent.dtype}, "
+                f"q_rope={q_rope.dtype}, c_latent={c_latent.dtype}, "
+                f"c_rope={c_rope.dtype}, o={o.dtype}")
+
+        # split_kv / is_persistent are chosen per shape by the runner's
+        # AutoTuner (3rd/4th tactic elements), not at the op boundary.
+        runner = CuteDSLNVMlaDecodeBlackwellRunner(
+            in_dtype=in_dtype,
+            num_heads=num_heads,
+            seq_len_q=seq_len_q,
+            page_size=page_size,
+            max_batch_size=max_batch_size,
+        )
+        inputs = [
+            q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
+            workspace
+        ]
+        tuner = AutoTuner.get()
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_mla_decode_fp16_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        # ``forward`` requires a 4-tuple tactic; if the tuner returned its -1
+        # fallback (cache not warmed), supply the default 4-tuple so split_kv +
+        # is_persistent still come from a length-4 tactic.
+        if not (isinstance(best_tactic, tuple) and len(best_tactic) == 4):
+            best_tactic = runner.default_tactic(int(q_latent.shape[-1]))
+        runner(
+            inputs,
+            tactic=best_tactic,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
+        )
+
+    @torch.library.register_fake("trtllm::cute_dsl_mla_decode_fp16_blackwell")
+    def _(
+        q_latent: torch.Tensor,
+        q_rope: torch.Tensor,
+        c_latent: torch.Tensor,
+        c_rope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqs: torch.Tensor,
+        o: torch.Tensor,
+        workspace: torch.Tensor,
+        num_heads: int,
+        seq_len_q: int,
+        page_size: int,
+        softmax_scale: float,
+        output_scale: float,
+        max_batch_size: int = 0,
+    ) -> None:
+        return None

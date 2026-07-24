@@ -1158,8 +1158,8 @@ class PyTorchModelEngine(ModelEngine):
                 gc.collect()
                 torch.cuda.empty_cache()
 
-        # Autotuner warmup uses context-only requests. Helix CP
-        # is decode-only and runs into issues with autotuner warmup.
+        # Helix CP is decode-only and runs into issues with the
+        # autotuner warmup's context requests.
         if not is_enc_dec and not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
@@ -1442,6 +1442,17 @@ class PyTorchModelEngine(ModelEngine):
         else:
             logger.debug("Skipped TRTLLM-Gen FMHA JIT warmup for Ctx kernels")
 
+        if (not self.is_draft_model and self.guided_decoder is None
+                and can_run_general_warmup):
+            # The cute_dsl_mla FMHA lib now only support the generation-only batch, we need to warmup the TRTLLM-Gen FMHA lib for the mixed context+generation batch.
+            # One MIXED context+generation batch (1 ctx token + 1 gen request).
+            warmup_requests_configs.append(
+                (1 + self.max_total_draft_tokens + 1, 1))
+        else:
+            logger.debug(
+                "Skipped TRTLLM-Gen flashinfer_trtllm_gen FMHA lib JIT warmup When enable cute_dsl_mla FMHA lib"
+            )
+
         for num_tokens, num_gen_requests in warmup_requests_configs:
             warmup_request = self._create_warmup_request(
                 resource_manager,
@@ -1462,7 +1473,7 @@ class PyTorchModelEngine(ModelEngine):
                 torch.cuda.synchronize()
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
-        """Runs a forward pass to populate the autotuner cache."""
+        """Runs forward passes to populate the autotuner cache."""
         if not self.llm_args.enable_autotuner:
             return
         AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
@@ -1475,18 +1486,26 @@ class PyTorchModelEngine(ModelEngine):
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
 
+        warmup_configs = [(curr_max_num_tokens, 0)]
+        if (not self.is_draft_model and self.guided_decoder is None
+                and not self.mapping.has_pp()):
+            # Add generation request to warmup the autotuner cache.
+            warmup_configs.append((1 + self.max_total_draft_tokens, 1))
+
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
         with self.no_cuda_graph(), autotune(cache_path=cache_path):
-            warmup_request = self._create_warmup_request(
-                resource_manager, curr_max_num_tokens, 0)
-            with self._release_batch_context(warmup_request,
-                                             resource_manager) as batch:
-                if batch is None and self.mapping.tp_size <= 1:
-                    pass  # Single rank, safe to skip
-                else:
+            ran_forward = False
+            for num_tokens, num_gen_requests in warmup_configs:
+                warmup_request = self._create_warmup_request(
+                    resource_manager, num_tokens, num_gen_requests)
+                with self._release_batch_context(warmup_request,
+                                                 resource_manager) as batch:
+                    if batch is None and self.mapping.tp_size <= 1:
+                        continue  # Single rank, safe to skip
                     self._assert_all_tp_ranks_have_warmup_batch(
-                        batch, curr_max_num_tokens)
-                if batch is not None:
+                        batch, num_tokens)
+                    if batch is None:
+                        continue
                     # Reset the flag is_first_draft for the draft model.
                     # This is necessary for overlap scheduler.
                     spec_resource_manager = resource_manager.get_resource_manager(
@@ -1498,16 +1517,17 @@ class PyTorchModelEngine(ModelEngine):
                     self.forward(batch,
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
-
-                    # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
-                    # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
-                    AutoTuner.get().cache_pp_recv()
-                    # Send the cache after the tuning process to the next PP rank
-                    AutoTuner.get().cache_pp_send()
-                    # Clean the pp flag to avoid deadlock with synchronous send/recv
-                    AutoTuner.get().clean_pp_flag()
-
                     torch.cuda.synchronize()
+                    ran_forward = True
+
+            if ran_forward:
+                # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
+                # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
+                AutoTuner.get().cache_pp_recv()
+                # Send the cache after the tuning process to the next PP rank
+                AutoTuner.get().cache_pp_send()
+                # Clean the pp flag to avoid deadlock with synchronous send/recv
+                AutoTuner.get().clean_pp_flag()
 
         logger.info(
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"

@@ -16,6 +16,7 @@
 import os
 from typing import TypeAlias
 
+from .cute_dsl import CuteDslMlaFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
@@ -33,6 +34,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     from .msa_sparse_gqa import MsaSparseGqaFmha
 
     return {
+        "cute_dsl_mla": CuteDslMlaFmha,
         "msa_sparse_gqa": MsaSparseGqaFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,

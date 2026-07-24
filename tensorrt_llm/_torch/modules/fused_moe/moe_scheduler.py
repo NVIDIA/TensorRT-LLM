@@ -635,15 +635,17 @@ class ExternalCommMoEScheduler(MoEScheduler):
             router_logits_list = list(router_logits_list)
             input_ids_list = list(input_ids_list)
             for idx_chunk in range(num_chunks):
-                _x = x_list[idx_chunk]
-                if _x.numel() == 0:
+                # Keep the collective `sizes` consistent across ranks: substitute
+                # chunk 0's token count for EVERY rank whose chunk is empty.
+                num_tokens_list = all_rank_num_tokens_list[idx_chunk]
+                for r in range(len(num_tokens_list)):
+                    if num_tokens_list[r] == 0:
+                        num_tokens_list[r] = all_rank_num_tokens_list[0][r]
+                if x_list[idx_chunk].numel() == 0:
                     chunked_used[idx_chunk] = False
                     x_list[idx_chunk] = x_list[0]
                     router_logits_list[idx_chunk] = router_logits_list[0]
                     input_ids_list[idx_chunk] = input_ids_list[0]
-                    all_rank_num_tokens_list[idx_chunk][moe.mapping.tp_rank] = (
-                        all_rank_num_tokens_list[0][moe.mapping.tp_rank]
-                    )
             x_list = tuple(x_list)
             router_logits_list = tuple(router_logits_list)
             input_ids_list = tuple(input_ids_list)
