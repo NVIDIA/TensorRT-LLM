@@ -32,12 +32,16 @@ reviews:
     Assess whether the changed code is covered by tests outside this PR
     (existing entries in tests/integration/test_lists/test-db/ for CI or
     tests/integration/test_lists/qa/ for manual QA).
-    Coverage verdict: sufficient, insufficient, or needs follow-up.
-    If no source files are touched, write "No source changes requiring QA coverage."
+    If no test files are modified, write "No test changes."
+    When CBTS artifacts are available, the verdict must cite their results:
+    "sufficient" only when the relevant coverage passes; otherwise "insufficient"
+    with the failing or missing evidence identified.
+    When CBTS artifacts are unavailable, use "needs follow-up".
   walkthrough_instructions: |
     For each changed file, include a concise QA perspective:
-    - For test files (tests/**): note what the test covers and whether it is listed in
-      tests/integration/test_lists/test-db/ (CI) or tests/integration/test_lists/qa/ (manual QA).
+    - For test-code files (tests/** excluding tests/integration/test_lists/**): note what
+      the test covers and whether it is listed in tests/integration/test_lists/test-db/ (CI)
+      or tests/integration/test_lists/qa/ (manual QA).
     - For source files: note any observable behavior changes a QA engineer should verify
       (new code paths, changed APIs, altered defaults, removed functionality).
     Keep each entry to 1-2 sentences; omit if no QA-relevant impact.
