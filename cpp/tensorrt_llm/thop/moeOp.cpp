@@ -480,7 +480,7 @@ public:
         {
             // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
             // [num_experts, inter_size, hidden_size]
-	    // Mirror the non-woq else-branch below: gated activations (Swiglu/Geglu) require fc1's
+            // Mirror the non-woq else-branch below: gated activations (Swiglu/Geglu) require fc1's
             // intermediate dim to be 2x fc2's (one half each for gate and up), while non-gated
             // activations (Relu2/Identity/ReLU/SiLU/Gelu, e.g. Nemotron-H) require them to be equal.
             if (isGatedActivation(base_activation_type))
@@ -831,7 +831,7 @@ public:
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
-	
+
         // Validate the fc1/fc2 inter-size relationship now that the activation type (gated vs
         // non-gated) is finalized. INT8-woq uses a transposed weight layout, so its fc1/fc2 dim
         // ordering differs from the non-woq path; both mirror the gated/non-gated split used in

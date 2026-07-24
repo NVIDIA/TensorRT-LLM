@@ -1417,9 +1417,8 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
                               TensorParallelMode.COLUMN)
             for expert_id in module.initial_local_expert_ids
         ]
-        has_w3_scales = all(
-            f"{expert_id}.w3.weight_scale" in weights
-            for expert_id in module.initial_local_expert_ids)
+        has_w3_scales = all(f"{expert_id}.w3.weight_scale" in weights
+                            for expert_id in module.initial_local_expert_ids)
         if module.is_gated_activation and has_w3_scales:
             all_w3_scales = [
                 load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
@@ -1429,7 +1428,8 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
             ]
             w3_w1_scales = torch.cat(
                 [torch.stack(all_w3_scales),
-                 torch.stack(all_w1_scales)], dim=-1)
+                 torch.stack(all_w1_scales)],
+                dim=-1)
         else:
             w3_w1_scales = torch.stack(all_w1_scales)
         w3_w1_scales = w3_w1_scales.to(module.dtype)
