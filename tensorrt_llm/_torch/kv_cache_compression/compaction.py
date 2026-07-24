@@ -20,18 +20,20 @@ each round the caller writes its keep decision into the agreed rows and
 ``compact`` packs every cache's move sources and fires its native launches.
 """
 
-from typing import Dict, List, Optional, Tuple, TypedDict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
 
-class CompactionParams(TypedDict):
+@dataclass(kw_only=True, frozen=True)
+class CompactionParams:
     decision_rows: int
     pack_args: Tuple[Optional[torch.Tensor], ...]
     pack_constexprs: Dict[str, object]
-    compact_args: List[Tuple[object, ...]]
+    compact_args: List[Tuple[object, ...]] = field(default_factory=list)
 
 
 @triton.jit
@@ -235,7 +237,7 @@ def build_compaction_params(
                     dtype=torch.int32,
                     device=device,
                 )
-            params["compact_args"].append(
+            params.compact_args.append(
                 (
                     pools,
                     torch.tensor(
@@ -261,8 +263,8 @@ def compact(
     """Pack each cache's move sources and fire its native compacts, in order
     (pure mover: the caller owns the decision rows and the round's completion ordering)."""
     for cache_params in params:
-        _pack_move_sources_kernel[(request_count, cache_params["decision_rows"])](
-            *cache_params["pack_args"], **cache_params["pack_constexprs"]
+        _pack_move_sources_kernel[(request_count, cache_params.decision_rows)](
+            *cache_params.pack_args, **cache_params.pack_constexprs
         )
-        for args in cache_params["compact_args"]:
+        for args in cache_params.compact_args:
             torch.ops.trtllm.sparse_kv_cache_compact_layers(*args)
