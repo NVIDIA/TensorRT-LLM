@@ -128,6 +128,19 @@ def prepare_dummy_topk_and_hook(
     # experts and only ~1/ep_size of slots hit local.
     is_local = use_dp
 
+    def pad_with_remote_dummy_experts(topk_ids_local: torch.Tensor,
+                                      device: torch.device) -> torch.Tensor:
+        """Fill remaining slots with deterministic out-of-shard ids, mirroring
+        production rows when local_num_experts < top_k: a row's top_k picks
+        are distinct global experts, at most local_num_experts of them local.
+        """
+        num_tokens, k_local = topk_ids_local.shape
+        remote = (local_expert_offset + local_num_experts + torch.arange(
+            top_k - k_local, device=device, dtype=torch.int32)) % num_experts
+        return torch.cat(
+            [topk_ids_local,
+             remote.unsqueeze(0).expand(num_tokens, -1)], dim=1)
+
     def make_balanced_dummy_topk(
             num_tokens: int,
             device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -154,24 +167,26 @@ def prepare_dummy_topk_and_hook(
             n_target = local_num_experts if is_local else num_experts
             topk_ids[t, k] = (t + k * stride) % n_target  (+ local_expert_offset if is_local)
 
-        Stride is picked so each row's `top_k` entries stay distinct;
-        the assertion guards against degenerate (n_target < top_k) configs
-        that would produce in-row duplicates.
+        Stride is picked so each row's filled entries stay distinct; when
+        n_target < top_k (local regime only) the row is padded with
+        out-of-shard ids (see pad_with_remote_dummy_experts).
         """
         n_target = local_num_experts if is_local else num_experts
-        assert n_target >= top_k, (
-            f"make_balanced_dummy_topk requires n_target>={top_k}; "
-            f"got n_target={n_target}, is_local={is_local}, "
-            f"num_experts={num_experts}, local_num_experts={local_num_experts}")
-        stride = max(1, min(local_num_experts, n_target // top_k))
-        if stride * top_k > n_target:
-            stride = max(1, n_target // top_k)
-        base = torch.arange(top_k, device=device, dtype=torch.int32) * stride
+        assert is_local or n_target >= top_k, (
+            f"make_balanced_dummy_topk requires num_experts>={top_k} in "
+            f"the global regime; got num_experts={num_experts}")
+        k_fill = min(top_k, n_target)
+        stride = max(1, min(local_num_experts, n_target // k_fill))
+        if stride * k_fill > n_target:
+            stride = max(1, n_target // k_fill)
+        base = torch.arange(k_fill, device=device, dtype=torch.int32) * stride
         token_idx = torch.arange(num_tokens, device=device,
                                  dtype=torch.int32).unsqueeze(1)
         topk_ids = (base + token_idx) % n_target
         if is_local:
             topk_ids = topk_ids + local_expert_offset
+            if k_fill < top_k:
+                topk_ids = pad_with_remote_dummy_experts(topk_ids, device)
         topk_weights = torch.ones(num_tokens,
                                   top_k,
                                   dtype=torch.bfloat16,
@@ -261,9 +276,7 @@ def prepare_dummy_topk_and_hook(
             would observe.
         """
         if is_local:
-            assert local_num_experts >= top_k, (
-                f"random_local requires local_num_experts >= top_k; "
-                f"got local_num_experts={local_num_experts}, top_k={top_k}")
+            k_fill = min(top_k, local_num_experts)
             if (logits is None or logits.shape[0] != num_tokens
                     or logits.shape[-1] != local_num_experts):
                 logits = torch.randn(num_tokens,
@@ -272,9 +285,12 @@ def prepare_dummy_topk_and_hook(
                                      device=device)
             # Plain topk over local logits — bypasses the model's
             # routing_method on purpose (see docstring caveat re:
-            # grouped routings like DeepSeekV3 / Llama4).
-            topk_ids = torch.topk(logits.float(), top_k, dim=-1).indices.to(
+            # grouped routings like DeepSeekV3 / Llama4). If the shard has
+            # fewer than top_k experts, take all and pad (see helper).
+            topk_ids = torch.topk(logits.float(), k_fill, dim=-1).indices.to(
                 torch.int32) + local_expert_offset
+            if k_fill < top_k:
+                topk_ids = pad_with_remote_dummy_experts(topk_ids, device)
             topk_weights = torch.ones(num_tokens,
                                       top_k,
                                       dtype=torch.bfloat16,
