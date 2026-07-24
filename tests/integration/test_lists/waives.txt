@@ -351,7 +351,6 @@ unittest/_torch/multi_gpu/test_linear.py::test_row_linear[2-unbalanced] SKIP (ht
 unittest/_torch/multi_gpu/test_linear.py::test_row_linear_norm_fusion[2-hidden:16-seqlen:2] SKIP (https://nvbugs/6501404)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part0" SKIP (https://nvbugs/6490036)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part1" SKIP (https://nvbugs/6490036)
-unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part4" SKIP (https://nvbugs/6437410)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_fp8[Qwen3/Qwen3-8B-Qwen3/Qwen3-8B-FP8] SKIP (https://nvbugs/6490036)
 unittest/_torch/sampler/test_beam_search.py::test_beam_search_e2e[multi_process-TRTLLMSampler-cuda_graph_and_overlap-None-1-1-True-True-False] SKIP (https://nvbugs/6463819)
 unittest/_torch/sampler/test_trtllm_sampler.py::test_trtllm_sampler_best_of_with_logprobs SKIP (https://nvbugs/6487837)
