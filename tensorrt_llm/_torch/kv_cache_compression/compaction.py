@@ -15,9 +15,9 @@
 
 """Batched physical KV-cache compaction: an algorithm-neutral mover.
 
-``build_compaction_plan`` returns one opaque launch plan per compacted cache;
+``build_compaction_params`` pre-binds one cache's launch parameters;
 each round the caller writes its keep decision into the agreed rows and
-``compact`` packs every plan's move sources and fires its native launches.
+``compact`` packs every cache's move sources and fires its native launches.
 """
 
 from typing import Dict, List, Optional, Tuple, TypedDict
@@ -27,21 +27,11 @@ import triton
 import triton.language as tl
 
 
-class CompactionLaunch(TypedDict):
-    pools: List[torch.Tensor]
-    pool_pointers: torch.Tensor
-    page_table: torch.Tensor
-    move_indices: torch.Tensor
-    move_offsets: torch.Tensor
-    destination_bases: torch.Tensor
-    source_layer_indices: Optional[torch.Tensor]
-
-
-class CompactionPlan(TypedDict):
+class CompactionParams(TypedDict):
     decision_rows: int
     pack_args: Tuple[Optional[torch.Tensor], ...]
     pack_constexprs: Dict[str, object]
-    launches: Tuple[CompactionLaunch, ...]
+    compact_args: List[Tuple[object, ...]]
 
 
 @triton.jit
@@ -121,7 +111,7 @@ def _pack_move_sources_kernel(
                 )
 
 
-def build_compaction_plan(
+def build_compaction_params(
     layout: Dict[str, object],
     *,
     block_offsets: torch.Tensor,
@@ -132,9 +122,8 @@ def build_compaction_plan(
     protected_tail_capacity: int,
     swa_move_offsets: Optional[torch.Tensor] = None,
     swa_destination_bases: Optional[torch.Tensor] = None,
-) -> CompactionPlan:
-    """One opaque launch plan for one compacted cache; only :func:`compact`
-    reads its contents at launch."""
+) -> CompactionParams:
+    """Pre-bind one compacted cache's launch parameters; only :func:`compact` reads them."""
     layer_pools = layout["layer_pools"]
     dense_layers = tuple(int(layer) for layer in layout["dense_layers"])
     swa_layers = tuple(int(layer) for layer in layout["swa_layers"])
@@ -202,7 +191,29 @@ def build_compaction_plan(
     if swa_layers:
         move_capacity = max(move_capacity, swa_window + protected_tail_capacity)
 
-    launches: List[CompactionLaunch] = []
+    params = CompactionParams(
+        decision_rows=decision_rows,
+        pack_args=(
+            kept_ordinal_rows,
+            valid_seq_lens,
+            dense_move_offsets,
+            dense_move_indices,
+            swa_move_offsets,
+            swa_move_indices,
+        ),
+        pack_constexprs=dict(
+            KEEP_COUNT=keep_count,
+            DECISION_ROWS=decision_rows,
+            MOVE_CAPACITY=move_capacity,
+            NUM_KV_HEADS=num_kv_heads,
+            PER_LAYER=per_layer_sources,
+            DENSE_TOTAL=int(dense_move_indices.shape[-1]),
+            SWA_TOTAL=int(swa_move_indices.shape[-1]) if swa_move_indices is not None else 0,
+            SWA_WINDOW=swa_window,
+        ),
+        # One positional-args tuple per native compact call, in its op signature order.
+        compact_args=[],
+    )
     for entries, move_indices, move_offsets, destination_bases, slots in move_groups:
         grouped = {}
         for layer, pool, page_table in entries:
@@ -224,63 +235,34 @@ def build_compaction_plan(
                     dtype=torch.int32,
                     device=device,
                 )
-            launches.append(
-                CompactionLaunch(
-                    pools=pools,
-                    pool_pointers=torch.tensor(
+            params["compact_args"].append(
+                (
+                    pools,
+                    torch.tensor(
                         [pool.data_ptr() for pool in pools],
                         dtype=torch.int64,
                         device=device,
                     ),
-                    page_table=group_entries[0][2],
-                    move_indices=move_indices,
-                    move_offsets=move_offsets,
-                    destination_bases=destination_bases,
-                    source_layer_indices=source_layer_indices,
+                    group_entries[0][2],
+                    move_indices,
+                    move_offsets,
+                    destination_bases,
+                    source_layer_indices,
                 )
             )
 
-    return CompactionPlan(
-        decision_rows=decision_rows,
-        pack_args=(
-            kept_ordinal_rows,
-            valid_seq_lens,
-            dense_move_offsets,
-            dense_move_indices,
-            swa_move_offsets,
-            swa_move_indices,
-        ),
-        pack_constexprs=dict(
-            KEEP_COUNT=keep_count,
-            DECISION_ROWS=decision_rows,
-            MOVE_CAPACITY=move_capacity,
-            NUM_KV_HEADS=num_kv_heads,
-            PER_LAYER=per_layer_sources,
-            DENSE_TOTAL=int(dense_move_indices.shape[-1]),
-            SWA_TOTAL=int(swa_move_indices.shape[-1]) if swa_move_indices is not None else 0,
-            SWA_WINDOW=swa_window,
-        ),
-        launches=tuple(launches),
-    )
+    return params
 
 
 def compact(
-    plans: Tuple[CompactionPlan, ...],
+    params: Tuple[CompactionParams, ...],
     request_count: int,
 ) -> None:
-    """Pack each plan's move sources and fire its native compacts, in plan order
+    """Pack each cache's move sources and fire its native compacts, in order
     (pure mover: the caller owns the decision rows and the round's completion ordering)."""
-    for plan in plans:
-        _pack_move_sources_kernel[(request_count, plan["decision_rows"])](
-            *plan["pack_args"], **plan["pack_constexprs"]
+    for cache_params in params:
+        _pack_move_sources_kernel[(request_count, cache_params["decision_rows"])](
+            *cache_params["pack_args"], **cache_params["pack_constexprs"]
         )
-        for launch in plan["launches"]:
-            torch.ops.trtllm.sparse_kv_cache_compact_layers(
-                launch["pools"],
-                launch["pool_pointers"],
-                launch["page_table"],
-                launch["move_indices"],
-                launch["move_offsets"],
-                launch["destination_bases"],
-                launch["source_layer_indices"],
-            )
+        for args in cache_params["compact_args"]:
+            torch.ops.trtllm.sparse_kv_cache_compact_layers(*args)

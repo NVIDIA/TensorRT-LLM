@@ -177,7 +177,7 @@ def test_execute_eviction_round_orders_both_manager_streams():
     tri._keep_count = 4
     tri.eviction_mode = "union"
     tri._swa_window = None
-    tri._compaction_plans = ()
+    tri._compaction_params = ()
     tri._draft_protected_tail_capacity = 1
     tri._staging_reuse_event = mock.Mock()
     tri._compaction_done_event = event

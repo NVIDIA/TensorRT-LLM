@@ -38,7 +38,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 )
 from tensorrt_llm.logger import logger
 
-from ..compaction import build_compaction_plan, compact
+from ..compaction import build_compaction_params, compact
 from .triattention_kernels import (
     _gather_mean_phase_kernel,
     _settle_ties_kernel,
@@ -702,7 +702,7 @@ class TriAttention(KVCacheCompressionManager):
                     )
                 self._settle_top_tokens(request_count)
             with nvtx_range("triattention.compact", color="purple"):
-                compact(self._compaction_plans, request_count)
+                compact(self._compaction_params, request_count)
         finally:
             # Order V2 page-table reuse and resize after this cohort's compact.
             self._compaction_done_event.record(stream)
@@ -1367,8 +1367,8 @@ class TriAttention(KVCacheCompressionManager):
             )
 
         # ---- compaction plans (opaque: only compact() interprets them) ---------
-        plans = [
-            build_compaction_plan(
+        compaction_params = [
+            build_compaction_params(
                 layout,
                 block_offsets=self._block_offsets_device,
                 kept_ordinals=self._kept_ordinal_rows,
@@ -1382,8 +1382,8 @@ class TriAttention(KVCacheCompressionManager):
             )
         ]
         if draft is not None:
-            plans.append(
-                build_compaction_plan(
+            compaction_params.append(
+                build_compaction_params(
                     draft["layout"],
                     block_offsets=self._draft_block_offsets_device,
                     kept_ordinals=self._kept_ordinal_rows,
@@ -1393,7 +1393,7 @@ class TriAttention(KVCacheCompressionManager):
                     protected_tail_capacity=int(draft["protected_tail_capacity"]),
                 )
             )
-        self._compaction_plans = tuple(plans)
+        self._compaction_params = tuple(compaction_params)
 
         # ---- round-ordering events ----------------------------------------------
         # Host staging (pinned metadata + snapshots) reuse fence.

@@ -117,12 +117,12 @@ def make_ramp_pools(
 
 
 def build_compaction(**overrides):
-    """``build_compaction_plans`` with the suite's 2-layer defaults:
+    """``build_compaction_params`` with the suite's 2-layer defaults:
     allocates the caller-owned move-offset rows (capacity cumsum) and SWA
     destination bases, and hands the test's pre-settled
     ``kept_token_ordinals`` in as the decision rows. Returns the opaque
-    ``plans`` plus a test-side mirror of the caller-owned inputs."""
-    from tensorrt_llm._torch.kv_cache_compression.compaction import build_compaction_plan
+    ``params`` plus a test-side mirror of the caller-owned inputs."""
+    from tensorrt_llm._torch.kv_cache_compression.compaction import build_compaction_params
 
     args = dict(
         eviction_mode="union",
@@ -154,8 +154,8 @@ def build_compaction(**overrides):
     args.setdefault("swa_move_offsets", capacity_offsets(swa_window + tail) if has_swa else None)
     if has_draft:
         args.setdefault("draft_move_offsets", capacity_offsets(keep_count + draft_tail))
-    plan_list = [
-        build_compaction_plan(
+    params_list = [
+        build_compaction_params(
             dict(
                 layer_pools=args["layer_pools"],
                 dense_layers=args["dense_layers"],
@@ -174,8 +174,8 @@ def build_compaction(**overrides):
         )
     ]
     if has_draft:
-        plan_list.append(
-            build_compaction_plan(
+        params_list.append(
+            build_compaction_params(
                 dict(
                     layer_pools=args["draft_layer_pools"],
                     dense_layers=args["draft_layers"],
@@ -190,12 +190,12 @@ def build_compaction(**overrides):
                 protected_tail_capacity=draft_tail,
             )
         )
-    plans = tuple(plan_list)
+    params = tuple(params_list)
     # Opaque plans plus a test-side mirror of the caller-owned construction
     # inputs (production binds the same values as manager attributes); the
     # standalone helpers here need the move-offset rows and SWA staging back.
     return dict(
-        plans=plans,
+        params=params,
         prompt_offsets=args["prompt_offsets"],
         request_count=request_count,
         decode_keep_count=keep_count,
@@ -213,7 +213,7 @@ def build_compaction(**overrides):
 
 def run_compaction(compaction):
     """Replica of the round's move stage in production order: SWA
-    destination rebase, then ``compact`` loops the opaque plans (each packs
+    destination rebase, then ``compact`` loops the opaque params (each packs
     its decision rows into move sources and fires its native moves)."""
     from tensorrt_llm._torch.kv_cache_compression.compaction import compact
 
@@ -223,7 +223,7 @@ def run_compaction(compaction):
             compaction["swa_rebase_delta"],
             out=compaction["swa_destination_bases"],
         )
-    compact(compaction["plans"], compaction["request_count"])
+    compact(compaction["params"], compaction["request_count"])
 
 
 def make_bare_staging(device, *, max_requests, staged_blocks_per_seq):
