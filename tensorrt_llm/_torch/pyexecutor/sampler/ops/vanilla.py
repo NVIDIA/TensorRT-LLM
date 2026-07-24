@@ -475,3 +475,171 @@ class Fusions:
         torch._dynamo.mark_dynamic(slots, 0)
         torch._dynamo.mark_dynamic(static_top_p, 0)
         return Fusions._top_p_decay_gather_impl(runtime_top_p, is_decay_slot, static_top_p, slots)
+
+
+# --- Occurrence penalties (repetition / presence / frequency) -----------------
+# torch/torch.compile counterpart of the C++ ``batchApplyPenalty`` kernel, driven by
+# ``_OccurrencePenaltyHandler`` in sampler.py. The per-row math lives in an
+# Inductor-compiled ``_impl``; the wrapper does the ragged row expansion, the eager count
+# fold, and ``mark_dynamic`` -- the same idiom as the ``Fusions`` ops above.
+def update_occurrence_workspace(
+    counts: torch.Tensor,
+    presence_prefix: Optional[torch.Tensor],
+    counted_slots: torch.Tensor,
+    counted_tokens: torch.Tensor,
+    prefix_slots: torch.Tensor,
+    prefix_tokens: torch.Tensor,
+) -> None:
+    """Fold newly-committed tokens into the persistent occurrence workspace.
+
+    Mirrors the logical accumulation ``batchApplyPenalty`` performs in its
+    ``penaltyWorkspace``: tokens in the ignored prompt prefix
+    ``[0, prompt_ignore_length)`` set the presence mask only (they count for
+    repetition but not for presence/frequency), while all other tokens (the rest of
+    the prompt plus every generated token) increment the occurrence counts.
+
+    Arguments (all index tensors are 1-D and pre-split on the host):
+      counts: ``int32[num_slots, vocab_size]`` occurrence counts, updated in place.
+      presence_prefix: dense ``bool[num_slots, vocab_size]`` prefix-presence mask, or
+        ``None`` when no active request uses ``prompt_ignore_length``.
+      counted_slots / counted_tokens: (slot, token) pairs to increment in ``counts``.
+      prefix_slots / prefix_tokens: (slot, token) pairs to mark in ``presence_prefix``.
+    """
+    if counted_slots.numel() > 0:
+        ones = torch.ones(counted_slots.shape[0], dtype=counts.dtype, device=counts.device)
+        # accumulate=True sums repeated (slot, token) pairs -> occurrence count.
+        counts.index_put_((counted_slots, counted_tokens), ones, accumulate=True)
+    if presence_prefix is not None and prefix_slots.numel() > 0:
+        # Dense bool mask -> marking is idempotent and duplicate-safe (no bit carry,
+        # unlike a packed bitmap which would need an atomic OR).
+        presence_prefix[prefix_slots, prefix_tokens] = True
+
+
+# fullgraph=True is safe here: served model has fixed shapes and compiles ~2 graphs,
+# well under the default limit (8)
+@torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
+def _apply_occurrence_penalties_impl(
+    logits: torch.Tensor,
+    counts: torch.Tensor,
+    prefix_seen: Optional[torch.Tensor],
+    active: torch.Tensor,
+    has_previous_token: torch.Tensor,
+    new_tokens: torch.Tensor,
+    seq_slots: torch.Tensor,
+    request_offsets: torch.Tensor,
+    request_num_steps: torch.Tensor,
+    repetition: torch.Tensor,
+    presence: torch.Tensor,
+    frequency: torch.Tensor,
+) -> None:
+    """Fold the pending token and apply occurrence penalties over the full logits batch, in place.
+
+    ``logits`` is the packed generated-token logits ``[T, vocab]`` for *all* sampling
+    requests; request ``r`` (slot ``seq_slots[r]``) owns the contiguous rows
+    ``[request_offsets[r], request_offsets[r] + request_num_steps[r])``. ``counts`` /
+    ``prefix_seen`` / ``repetition`` / ``presence`` / ``frequency`` / ``active`` are
+    per-slot (length ``max_num_sequences``). Rows whose slot is inactive are written
+    back bit-identical.
+    """
+    vocab = logits.size(-1)
+
+    # Fold the device-pending sampled token into the persistent counts, once per armed
+    # active slot, before the gather reads them, via one flat scatter_add. Masked entries
+    # add 0 at counts[slot, 0], so inactive/unarmed/out-of-range slots are no-ops.
+    previous_token = new_tokens[0, seq_slots, 0].to(torch.int64)
+    fold_ok = (
+        active[seq_slots]
+        & has_previous_token[seq_slots]
+        & (request_num_steps > 0)
+        & (previous_token >= 0)
+        & (previous_token < vocab)
+    )
+    flat_index = seq_slots * vocab + torch.where(
+        fold_ok, previous_token, previous_token.new_zeros(())
+    )
+    counts.view(-1).scatter_add_(0, flat_index, fold_ok.to(counts.dtype))
+
+    rows = torch.arange(logits.size(0), device=logits.device).unsqueeze(1)  # [T, 1]
+    owned = (rows >= request_offsets) & (rows < request_offsets + request_num_steps)  # [T, R]
+    row_owned = owned.any(dim=1)  # [T]
+    row_slot = (owned * seq_slots).sum(dim=1)  # [T]; slot per row, 0 for unowned (masked below)
+    row_active = row_owned & active[row_slot]
+
+    count = counts[row_slot]
+    rep = repetition[row_slot].unsqueeze(1)
+    pre = presence[row_slot].unsqueeze(1)
+    freq = frequency[row_slot].unsqueeze(1)
+
+    seen = count > 0
+    if prefix_seen is not None:
+        # Prompt-ignore-prefix tokens count for repetition only, not presence/frequency.
+        seen = seen | prefix_seen[row_slot]
+
+    penalized = logits.float()
+    repeated = torch.where(penalized < 0, penalized * rep, penalized / rep)
+    penalized = torch.where(seen, repeated, penalized)
+    penalized = penalized - torch.where(
+        count > 0,
+        pre + freq * count.to(torch.float32),
+        penalized.new_zeros(()),
+    )
+    limit = torch.finfo(logits.dtype).max
+    penalized = penalized.clamp(-limit, limit).to(logits.dtype)
+    # Cast before the select so inactive rows stay bit-identical, then write in place.
+    logits.copy_(torch.where(row_active.unsqueeze(1), penalized, logits))
+
+
+def apply_batched_occurrence_penalties(
+    logits: torch.Tensor,
+    counts: torch.Tensor,
+    presence_prefix: Optional[torch.Tensor],
+    active: torch.Tensor,
+    has_previous_token: torch.Tensor,
+    new_tokens: torch.Tensor,
+    seq_slots: torch.Tensor,
+    request_offsets: torch.Tensor,
+    request_num_steps: torch.Tensor,
+    repetition: torch.Tensor,
+    presence: torch.Tensor,
+    frequency: torch.Tensor,
+) -> None:
+    """Apply occurrence penalties to ``logits`` in place, before temperature handling.
+
+    ``logits`` is the packed generated-token logits ``[sum(num_steps * num_beams),
+    vocab_size]``. Request ``r`` (slot ``seq_slots[r]``) owns the rows
+    ``request_offsets[r] + step`` for ``step in [0, request_num_steps[r])``; every
+    such addressed row observes the same folded occurrence history, and rows not
+    addressed by any request are left bit-identical.
+
+    All heavy lifting is fused into the single compiled ``_apply_occurrence_penalties_impl``
+    graph; this wrapper only moves the small ``[R]`` request metadata to device and marks
+    the batch-varying dims dynamic.
+    """
+    if seq_slots.numel() == 0 or logits.size(0) == 0:
+        return
+
+    device = logits.device
+    req_offsets = request_offsets.to(device=device, non_blocking=True)
+    req_num_steps = request_num_steps.to(device=device, non_blocking=True)
+
+    # Batch-varying dim-0 tensors; mark every one, or an unmarked peer forces the marked
+    # dims to specialize (ConstraintViolationError under dynamic=None). counts/active/params
+    # keep dim 0 == max_num_sequences (fixed) and new_tokens dim 1 == max_num_sequences.
+    torch._dynamo.mark_dynamic(logits, 0)
+    torch._dynamo.mark_dynamic(seq_slots, 0)
+    torch._dynamo.mark_dynamic(req_offsets, 0)
+    torch._dynamo.mark_dynamic(req_num_steps, 0)
+    _apply_occurrence_penalties_impl(
+        logits,
+        counts,
+        presence_prefix,
+        active,
+        has_previous_token,
+        new_tokens,
+        seq_slots,
+        req_offsets,
+        req_num_steps,
+        repetition,
+        presence,
+        frequency,
+    )

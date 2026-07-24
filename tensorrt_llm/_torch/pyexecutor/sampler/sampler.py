@@ -88,10 +88,7 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
-from .ops.trtllm_triton import (
-    apply_batched_occurrence_penalties_triton,
-    update_occurrence_workspace,
-)
+from .ops.vanilla import apply_batched_occurrence_penalties, update_occurrence_workspace
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
@@ -1375,8 +1372,8 @@ class _OccurrencePenaltyHandler:
       shape ``[max_num_sequences]``) -- the counterpart of
       ``allocateBuffer`` + ``fillBuffers``; filled once per request in
       ``prepare_for_new_request`` and gathered per step (no per-step host rebuild);
-    * an occurrence workspace (dense ``counts`` plus a packed ``presence_prefix``
-      bitmap) -- the counterpart of ``allocateWorkspace`` /
+    * an occurrence workspace (dense ``counts`` plus a dense ``presence_prefix``
+      mask) -- the counterpart of ``allocateWorkspace`` /
       ``mPenaltyWorkspaceDevice``; updated incrementally each step.
 
     The actual logits math lives in the ops module. Parameter buffers are allocated
@@ -1406,8 +1403,8 @@ class _OccurrencePenaltyHandler:
         prompt_ignore_length) and generated tokens. Drives presence/frequency and (via
         counts > 0) repetition."""
         presence_prefix: torch.Tensor | None = None
-        """Packed int32 or None; per-slot presence bitmap with shape
-        ``[slots, ceil(vocab / 32)]`` for the ignored prompt prefix
+        """bool or None; per-slot presence mask with shape
+        ``[slots, vocab_size]`` for the ignored prompt prefix
         ``[0, prompt_ignore_length)``. It contributes to repetition only."""
 
     @dataclass(kw_only=True)
@@ -1426,7 +1423,7 @@ class _OccurrencePenaltyHandler:
         self._max_num_sequences = max_num_sequences
         self._device = torch.device(device)
         # Whether any (past or current) active request uses prompt_ignore_length > 0,
-        # which requires allocating the presence-prefix bitmap.
+        # which requires allocating the presence-prefix mask.
         self._needs_prefix = False
         self._num_active_slots = 0
         # Per-slot state; None marks a slot without active occurrence penalties.
@@ -1442,13 +1439,6 @@ class _OccurrencePenaltyHandler:
                 has_previous_token=torch.zeros(
                     max_num_sequences, dtype=torch.bool, device=self._device
                 ),
-            )
-            # Persistent destinations for the per-step metadata consumed by Triton.
-            self._request_offsets = torch.empty(
-                max_num_sequences, dtype=torch.int32, device=self._device
-            )
-            self._request_num_steps = torch.empty(
-                max_num_sequences, dtype=torch.int32, device=self._device
             )
 
     @staticmethod
@@ -1525,10 +1515,9 @@ class _OccurrencePenaltyHandler:
                     (self._max_num_sequences, vocab_size), dtype=torch.int32, device=self._device
                 )
             if self._needs_prefix and self.store.presence_prefix is None:
-                packed_vocab_size = (vocab_size + 31) // 32
                 self.store.presence_prefix = torch.zeros(
-                    (self._max_num_sequences, packed_vocab_size),
-                    dtype=torch.int32,
+                    (self._max_num_sequences, vocab_size),
+                    dtype=torch.bool,
                     device=self._device,
                 )
 
@@ -1658,12 +1647,7 @@ class _OccurrencePenaltyHandler:
         for request, state in active_requests:
             self._initialize_workspace(request, state, logits.size(-1))
 
-        num_requests = len(requests)
-        kernel_request_offsets = self._request_offsets[:num_requests]
-        kernel_request_num_steps = self._request_num_steps[:num_requests]
-        kernel_request_offsets.copy_(request_offsets, non_blocking=True)
-        kernel_request_num_steps.copy_(request_num_steps, non_blocking=True)
-        apply_batched_occurrence_penalties_triton(
+        apply_batched_occurrence_penalties(
             logits,
             counts,
             store.presence_prefix,
@@ -1671,8 +1655,8 @@ class _OccurrencePenaltyHandler:
             store.has_previous_token,
             new_tokens,
             seq_slots,
-            kernel_request_offsets,
-            kernel_request_num_steps,
+            request_offsets,
+            request_num_steps,
             store.repetition,
             store.presence,
             store.frequency,
@@ -4419,6 +4403,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 self._retire_top_p_decay_slot(req)
 
+        self._penalty_handler.update_token_counts(finalized_token_updates)
+
     def _retire_top_p_decay_slot(self, req: LlmRequest) -> None:
         """Retire a finished request's slot from the top-p-decay membership set
         (lifecycle step 4, see ``TopPDecayStore``), so the O(1) hot-path
@@ -4430,8 +4416,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """
         if self._top_p_decay_slots and req.py_seq_slot is not None:
             self._top_p_decay_slots.discard(req.py_seq_slot)
-
-        self._penalty_handler.update_token_counts(finalized_token_updates)
 
     def _return_log_probs(self, requests: list[LlmRequest]) -> bool:
         return any(req.py_return_log_probs for req in requests)

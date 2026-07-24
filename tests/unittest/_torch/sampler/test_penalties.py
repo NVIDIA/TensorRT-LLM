@@ -17,11 +17,25 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.sampler.ops.trtllm_triton import (
-    apply_batched_occurrence_penalties_triton,
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
+    apply_batched_occurrence_penalties,
     update_occurrence_workspace,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import _OccurrencePenaltyHandler
+
+
+@pytest.fixture(autouse=True)
+def _dynamo_recompile_headroom():
+    """Recompile headroom for the fullgraph=True penalty op.
+
+    These cases sweep tensor shapes/dtypes, so the op legitimately builds one graph per shape
+    -- more than the default recompile_limit (8). A served model has fixed shapes; raising the
+    limit only here avoids tripping fullgraph's hard-fail without touching production.
+    """
+    import torch._dynamo
+
+    with torch._dynamo.config.patch(recompile_limit=128):
+        yield
 
 
 def _col(values: list[float]) -> torch.Tensor:
@@ -37,7 +51,7 @@ def _dense_penalty_reference(
     freq: torch.Tensor,
     temp: torch.Tensor,
 ) -> torch.Tensor:
-    """Dense post-temperature reference for ``apply_occurrence_penalties_triton``.
+    """Dense post-temperature reference for ``apply_batched_occurrence_penalties``.
 
     Follows the TorchSampler order: repetition where the token is present anywhere
     (``counts > 0`` or the prefix bitmap), then presence + frequency where counted
@@ -58,24 +72,24 @@ def _dense_penalty_reference(
     return (penalized - sub) / temp
 
 
-def _pack_presence_prefix(counts: torch.Tensor, presence: torch.Tensor) -> torch.Tensor:
-    packed = torch.zeros(
+def _dense_presence_prefix(counts: torch.Tensor, presence: torch.Tensor) -> torch.Tensor:
+    prefix = torch.zeros(
         presence.size(0),
-        (presence.size(1) + 31) // 32,
-        dtype=torch.int32,
+        presence.size(1),
+        dtype=torch.bool,
         device=presence.device,
     )
     prefix_slots, prefix_tokens = torch.nonzero(presence, as_tuple=True)
     empty = torch.empty(0, dtype=torch.int64, device=presence.device)
     update_occurrence_workspace(
         counts,
-        packed,
+        prefix,
         empty,
         empty,
         prefix_slots,
         prefix_tokens,
     )
-    return packed
+    return prefix
 
 
 @pytest.mark.parametrize(
@@ -101,7 +115,7 @@ def _pack_presence_prefix(counts: torch.Tensor, presence: torch.Tensor) -> torch
     ],
 )
 @pytest.mark.parametrize("num_steps", [1, 3], ids=["regular", "speculative"])
-def test_triton_matches_dense_logits_reference(
+def test_penalties_match_dense_logits_reference(
     name: str,
     rep: list[float],
     pre: list[float],
@@ -120,13 +134,13 @@ def test_triton_matches_dense_logits_reference(
         if use_prefix
         else None
     )
-    presence_prefix = _pack_presence_prefix(counts, presence) if presence is not None else None
+    presence_prefix = _dense_presence_prefix(counts, presence) if presence is not None else None
     rep_t, pre_t, freq_t, temp_t = _col(rep), _col(pre), _col(freq), _col(temp)
     slots = torch.arange(A, dtype=torch.int64, device="cuda")
     row_slots = slots.repeat_interleave(num_steps)
 
     got = logits.clone()
-    apply_batched_occurrence_penalties_triton(
+    apply_batched_occurrence_penalties(
         got,
         counts,
         presence_prefix,
@@ -154,7 +168,7 @@ def test_triton_matches_dense_logits_reference(
     torch.testing.assert_close(got / temp_t[row_slots], ref, rtol=1e-4, atol=1e-4)
 
 
-def test_triton_indirect_indexing_bf16() -> None:
+def test_penalties_indirect_indexing_bf16() -> None:
     # Permuted request offsets and sequence slots penalize a subset of logits rows, with
     # repeated slot mappings. Other rows must stay untouched. bfloat16 also covers the
     # fp32-compute -> bf16-store cast path.
@@ -175,7 +189,7 @@ def test_triton_indirect_indexing_bf16() -> None:
 
     active = torch.ones(num_slots, dtype=torch.bool, device="cuda")
     active[1] = False
-    apply_batched_occurrence_penalties_triton(
+    apply_batched_occurrence_penalties(
         logits,
         counts,
         None,
@@ -218,10 +232,10 @@ def test_triton_indirect_indexing_bf16() -> None:
     torch.testing.assert_close(logits[untouched], orig[untouched], rtol=0, atol=0)
 
 
-def test_packed_prefix_boundaries_match_dense_logits_reference() -> None:
+def test_prefix_marking_matches_dense_logits_reference() -> None:
     vocab = 70
     counts = torch.zeros(1, vocab, dtype=torch.int32, device="cuda")
-    presence_prefix = torch.zeros(1, (vocab + 31) // 32, dtype=torch.int32, device="cuda")
+    presence_prefix = torch.zeros(1, vocab, dtype=torch.bool, device="cuda")
 
     counted_tokens = torch.tensor([31, 31, 45], dtype=torch.int64, device="cuda")
     prefix_tokens = torch.tensor([0, 31, 31, 32, 63, 69], dtype=torch.int64, device="cuda")
@@ -238,7 +252,7 @@ def test_packed_prefix_boundaries_match_dense_logits_reference() -> None:
 
     logits = torch.linspace(-7.0, 7.0, vocab, device="cuda").view(1, -1)
     original = logits.clone()
-    apply_batched_occurrence_penalties_triton(
+    apply_batched_occurrence_penalties(
         logits,
         counts,
         presence_prefix,
@@ -264,21 +278,20 @@ def test_packed_prefix_boundaries_match_dense_logits_reference() -> None:
         torch.tensor([[0.3]], device="cuda"),
         torch.ones(1, 1, device="cuda"),
     )
-    assert presence_prefix.shape == (1, 3)
+    assert presence_prefix.shape == (1, vocab)
     torch.testing.assert_close(logits, expected, rtol=1e-4, atol=1e-4)
 
 
-def test_batched_kernel_does_not_latch_pending_token() -> None:
-    """The batched kernel must not write ``has_previous_token``.
+def test_penalty_op_does_not_latch_pending_token() -> None:
+    """The penalty op must not write ``has_previous_token``.
 
-    Every vocab block reads the flag at entry to decide whether to fold the pending
-    ``new_tokens`` token; a write from the kernel could be observed by a later block
-    (CTAs are unordered) and spuriously fold ``new_tokens`` into its ``counts`` slice.
-    Here the flag is False with a stale token in a high vocab block (above ``BLOCK_SIZE``):
-    nothing may be folded, the flag must stay False, and the logits must be untouched.
+    The op reads the flag to decide whether to fold the pending ``new_tokens`` token
+    into ``counts``; it must never write it (the host re-arms the flag after the op).
+    Here the flag is False with a stale token far up the vocab: nothing may be folded,
+    the flag must stay False, and the logits must be untouched.
     """
-    vocab = 3000  # > BLOCK_SIZE (1024) -> spans multiple vocab blocks
-    stale_token = 2500  # lives in vocab block 2, above block 0
+    vocab = 3000
+    stale_token = 2500  # a stale pending token far up the vocab
     has_previous_token = torch.zeros(1, dtype=torch.bool, device="cuda")
     new_tokens = torch.zeros(1, 1, 1, dtype=torch.int32, device="cuda")
     new_tokens[0, 0, 0] = stale_token
@@ -286,7 +299,7 @@ def test_batched_kernel_does_not_latch_pending_token() -> None:
     logits = torch.linspace(-4.0, 4.0, steps=vocab, device="cuda").view(1, vocab)
     original = logits.clone()
 
-    apply_batched_occurrence_penalties_triton(
+    apply_batched_occurrence_penalties(
         logits,
         counts,
         None,
@@ -301,10 +314,10 @@ def test_batched_kernel_does_not_latch_pending_token() -> None:
         torch.tensor([0.4], device="cuda"),
     )
 
-    # Deterministic: the raw kernel must leave the latch untouched (host re-arms it).
+    # Deterministic: the penalty op must leave the latch untouched (host re-arms it).
     assert not bool(has_previous_token.item())
     # With has_previous_token False and counts all zero, no penalty may be applied; the
-    # stale high-block token in particular must not be folded (would perturb logits[2500]).
+    # stale token in particular must not be folded (would perturb logits[2500]).
     torch.testing.assert_close(logits, original, rtol=0, atol=0)
 
 
