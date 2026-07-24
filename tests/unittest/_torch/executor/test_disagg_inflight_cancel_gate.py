@@ -196,6 +196,7 @@ def test_flag_unset_context_timeout_preserves_legacy_cleanup():
     request.py_kv_transfer_start_time = 1.0
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     executor = object.__new__(PyExecutor)
+    executor.canceled_req_ids = []
     executor.kv_cache_transceiver = Mock()
     executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
     executor.kv_cache_transceiver.take_context_cancelled_request_ids.return_value = []
@@ -226,6 +227,7 @@ def test_enabled_context_timeout_defers_cleanup_until_cpp_terminal_state(monkeyp
     request.py_kv_transfer_start_time = 1.0
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     executor = object.__new__(PyExecutor)
+    executor.canceled_req_ids = []
     executor.kv_cache_transceiver = Mock()
     executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
     executor.kv_cache_transceiver.take_context_cancelled_request_ids.return_value = []
