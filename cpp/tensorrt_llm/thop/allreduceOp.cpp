@@ -1850,6 +1850,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
         mcast_mem != nullptr, "[mnnvlFusionAllReduce] comm_buffer must be obtained from a mcastBuffer instance.");
+    TORCH_CHECK(mcast_mem->isMapped(), "[mnnvlFusionAllReduce] MNNVL workspace handles are not attached.");
     TORCH_CHECK(input.is_contiguous(), "[mnnvlFusionAllReduce] input must be contiguous");
     TORCH_CHECK(input.dim() >= 2, "[mnnvlFusionAllReduce] input must have at least 2 dimensions");
 
