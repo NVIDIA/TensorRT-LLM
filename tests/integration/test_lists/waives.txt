@@ -374,7 +374,6 @@ unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2" SKIP (https://nvbugs/642
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_get_stats_pp2[False-False-True] SKIP (https://nvbugs/6432826)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_get_stats_pp4[False-False-True] SKIP (https://nvbugs/6427411)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_get_stats_pp4[False-True-True] SKIP (https://nvbugs/6427411)
-unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1 SKIP (https://nvbugs/6109745)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_tinyllama_logits_processor_2gpu[1-2] SKIP (https://nvbugs/6427411)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_tinyllama_logits_processor_tp2pp2 SKIP (https://nvbugs/6427411)
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[None] SKIP (https://nvbugs/6162504)
