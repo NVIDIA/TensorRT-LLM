@@ -580,13 +580,21 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
         ],
     )
     def test_accuracy(self, model_id, world_size, enable_attention_dp,
-                      attn_backend):
+                      attn_backend, mocker):
         if world_size > get_device_count():
             pytest.skip(f"Not enough devices for world_size={world_size}")
         # attention-DP requires at least 2 ranks to exercise the cross-rank
         # max_dp_num_tokens path; on world_size=1 it's a no-op.
         if enable_attention_dp and world_size < 2:
             pytest.skip("attention_dp requires world_size >= 2")
+        # Score GSM8K on strict-match only. lm-eval reports both strict-match
+        # and flexible-extract; with the default scores_filter=None the harness
+        # averages them. The 65.428 reference for this model tracks strict-match
+        # (the canonical "#### N" CoT extractor); flexible-extract's last-number
+        # regex misfires on Nemotron-Nano-V3's CoT, dragging the mean below the
+        # threshold despite strict-match clearing it.
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,strict-match"})
         model_path = self.MODEL_PATHS[model_id]
         kwargs = {}
         device_memory_mib = get_device_memory()
