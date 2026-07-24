@@ -485,11 +485,10 @@ class QwenImagePipeline(BasePipeline):
 
         # Denoise loop.
         timer.mark_denoise_start()
-        self._start_predenoise_profile()
         logger.info("Denoising (%d steps)...", len(timesteps))
         pipeline_config = getattr(self, "pipeline_config", None)
         cuda_graph_enabled = getattr(getattr(pipeline_config, "cuda_graph", None), "enable", False)
-        self._start_denoise_profile()
+        self._profile_denoise_start()
         for i, t in enumerate(timesteps):
             self._start_step_profile(i)
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
@@ -527,7 +526,7 @@ class QwenImagePipeline(BasePipeline):
                 latents = latents.to(latents_dtype)
             self._stop_step_profile(i)
 
-        self._start_postdenoise_profile()
+        self._profile_denoise_end()
         timer.mark_post_start()
         logger.info("Decoding...")
         image = self._decode_latents(latents, height, width)

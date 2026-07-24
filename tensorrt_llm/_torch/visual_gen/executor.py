@@ -235,7 +235,7 @@ class DiffusionRequest:
     (a :class:`~tensorrt_llm.visual_gen.params.VisualGenParams` instance).
     When ``params`` is ``None`` (the default), the executor creates a
     ``VisualGenParams()`` and fills it with pipeline-specific defaults
-    before calling ``pipeline.infer()``.
+    before calling ``pipeline.run_inference()``.
     """
 
     request_id: int
@@ -429,12 +429,12 @@ class DiffusionExecutor:
                     f"torch.compile recompilation or CUDA graph capture. "
                     f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
                 )
-            # Host wall-clock around pipeline.infer(). The pipeline already
+            # Host wall-clock around pipeline.run_inference(). The pipeline already
             # syncs at the end (decode_latents path), so this captures the
             # full executor-side envelope including any pre/post-pipeline work
             # that the per-phase CUDA-event timings on PipelineOutput do not.
             generation_start = time.perf_counter()
-            output = self.pipeline.infer(req)
+            output = self.pipeline.run_inference(req)
             generation = time.perf_counter() - generation_start  # seconds
             if self.rank == 0:
                 # CUDA IPC handles are invalid within the producing process, so

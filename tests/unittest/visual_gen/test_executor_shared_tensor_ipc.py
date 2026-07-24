@@ -122,6 +122,9 @@ class _StubPipeline:
     def infer(self, req):
         return PipelineOutput(video=_expected_video(), frame_rate=24.0)
 
+    def run_inference(self, req):
+        return self.infer(req)
+
     def cleanup(self):
         pass
 
