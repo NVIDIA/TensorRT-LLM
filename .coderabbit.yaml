@@ -29,14 +29,20 @@ reviews:
     Correctness, performance, API consistency (CODING_GUIDELINES.md), error handling, regressions.
 
     **QA Engineer Review**
-    Assess whether the changed code is covered by tests outside this PR
-    (existing entries in tests/integration/test_lists/test-db/ for CI or
-    tests/integration/test_lists/qa/ for manual QA).
-    If no test files are modified, write "No test changes."
-    When CBTS artifacts are available, the verdict must cite their results:
-    "sufficient" only when the relevant coverage passes; otherwise "insufficient"
-    with the failing or missing evidence identified.
-    When CBTS artifacts are unavailable, use "needs follow-up".
+    If no test files are touched, write "No test changes."
+
+    For test-list-only changes (only tests/integration/test_lists/ files):
+    - Report which test-db/ or qa/ files were modified and what entries were added or removed.
+    - When CBTS artifacts are available: verdict is "sufficient" if coverage passes,
+      "insufficient" with the failing or missing evidence identified otherwise.
+    - When CBTS artifacts are unavailable: verdict is "needs follow-up".
+
+    For test-code changes (tests/** excluding tests/integration/test_lists/):
+    - List test functions added, modified, or removed.
+    - State whether each is covered in test-db/ (CI) or qa/ (manual QA).
+    - Apply the same CBTS-aware verdict logic above.
+
+    Keep feedback actionable: reference concrete list file names when suggesting additions.
   walkthrough_instructions: |
     For each changed file, include a concise QA perspective:
     - For test-code files (tests/** excluding tests/integration/test_lists/**): note what
@@ -58,23 +64,6 @@ reviews:
     drafts: false
     base_branches: ["main", "release/.+"]
   path_instructions:
-    - path: "tests/**"
-      instructions: |
-        Act as a QA engineer reviewing test changes and coverage for TensorRT-LLM.
-        Always produce a test coverage summary, even if no issues are found.
-
-        If the change touches ONLY files under tests/integration/test_lists/ (no test-code changes):
-        - Report which test-db/ or qa/ list files were modified and what entries were added or removed.
-        - Do NOT require changed test functions for this path.
-        - Use verdict "needs follow-up" when cbts_touchmap.sqlite or a CBTS coverage report is unavailable
-          to confirm the impacted test scope; otherwise use "sufficient" or "insufficient".
-
-        If the change includes test-code files (outside tests/integration/test_lists/), the summary must include:
-        1. Which test functions were added, modified, or removed.
-        2. Whether each changed test is listed in the appropriate test list files under
-           tests/integration/test_lists/ (test-db/ for CI, qa/ for manual QA).
-        3. A coverage verdict: sufficient, insufficient, or needs follow-up.
-        Keep feedback actionable: reference concrete list file names when suggesting additions.
     - path: "tests/integration/test_lists/qa/**"
       instructions: |
         Files here are manually-triggered QA perf/regression lists, maintained
