@@ -14,13 +14,24 @@
 # limitations under the License.
 """HangDetector timer behavior and the hard-kill propagation mechanism (no GPU)."""
 
+import contextlib
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+import types
 
-from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
+import pytest
+
+from tensorrt_llm._torch.pyexecutor import hang_detector as hd_module
+from tensorrt_llm._torch.pyexecutor.hang_detector import (
+    RANK_CRASH_KILL_GRACE_ENV,
+    HangDetector,
+    hard_kill_on_rank_crash,
+    start_rank_crash_kill_watchdog,
+)
 
 
 def test_detector_fires_after_timeout():
@@ -82,3 +93,201 @@ def test_propagate_hard_kill_self_sigkills_without_mpi():
         f"expected self-SIGKILL (-9), got {proc.returncode}; "
         f"stderr={proc.stderr.decode(errors='replace')[-500:]}"
     )
+
+
+# --------------------------------------------------------------------------
+# hard_kill_on_rank_crash: a rank whose executor loop crashed must kill the
+# world (after a grace) instead of leaving peers to burn 300s in collectives.
+# --------------------------------------------------------------------------
+
+
+def test_rank_crash_kill_single_rank_is_noop(monkeypatch):
+    """No peers to unblock: the worker's own death already carries the error."""
+    kills = []
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: kills.append(1))
+    assert hard_kill_on_rank_crash(world_size=1) is False
+    assert kills == []
+
+
+def test_rank_crash_kill_fires_for_multi_rank(monkeypatch):
+    kills = []
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
+    assert hard_kill_on_rank_crash(world_size=4) is True
+    assert kills == [1]
+
+
+def test_rank_crash_kill_sleeps_grace_before_kill(monkeypatch):
+    """The grace must elapse BEFORE the kill so cleaner error paths win the race."""
+    order = []
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: order.append("kill"))
+    monkeypatch.setattr(hd_module.time, "sleep", lambda s: order.append(("sleep", s)))
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "2.5")
+    assert hard_kill_on_rank_crash(world_size=2) is True
+    assert order == [("sleep", 2.5), "kill"]
+
+
+def test_rank_crash_kill_disabled_by_negative_grace(monkeypatch):
+    kills = []
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "-1")
+    assert hard_kill_on_rank_crash(world_size=8) is False
+    assert kills == []
+
+
+def test_rank_crash_kill_invalid_grace_uses_default(monkeypatch):
+    """A malformed env value must not disable the kill (fail-safe default)."""
+    order = []
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: order.append("kill"))
+    monkeypatch.setattr(hd_module.time, "sleep", lambda s: order.append(("sleep", s)))
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "bogus")
+    assert hard_kill_on_rank_crash(world_size=2) is True
+    assert order == [("sleep", 10.0), "kill"]
+
+
+def test_rank_crash_kill_never_raises(monkeypatch):
+    """It runs in a `finally`: raising would mask the loop's original error."""
+
+    def boom():
+        raise RuntimeError("abort machinery broken")
+
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", boom)
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
+    assert hard_kill_on_rank_crash(world_size=2) is False
+
+
+# --------------------------------------------------------------------------
+# start_rank_crash_kill_watchdog: the kill must fire even when executor-loop
+# cleanup never returns (e.g. blocked on a PP send handle wedged by the
+# crash), so it is armed in a daemon thread BEFORE cleanup starts.
+# --------------------------------------------------------------------------
+
+
+def test_watchdog_kills_while_caller_blocks(monkeypatch):
+    """The kill fires from the watchdog thread with no help from the caller."""
+    killed = threading.Event()
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", killed.set)
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
+
+    watchdog = start_rank_crash_kill_watchdog(world_size=2)
+
+    assert watchdog is not None
+    assert watchdog.daemon  # must never block interpreter exit
+    # The caller does nothing further (it would be blocked in cleanup);
+    # the kill must fire regardless.
+    assert killed.wait(timeout=30.0)
+    watchdog.join(timeout=30.0)
+
+
+def test_watchdog_not_armed_for_single_rank(monkeypatch):
+    kills = []
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
+    assert start_rank_crash_kill_watchdog(world_size=1) is None
+    assert kills == []
+
+
+def test_watchdog_not_armed_when_disabled(monkeypatch):
+    kills = []
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "-1")
+    assert start_rank_crash_kill_watchdog(world_size=8) is None
+    assert kills == []
+
+
+# --------------------------------------------------------------------------
+# Wiring: PyExecutor._event_loop_wrapper must invoke the kill on the crash
+# path only, and only after local cleanup has woken rank-local waiters.
+# --------------------------------------------------------------------------
+
+
+def _bare_executor(pe, monkeypatch, world_size):
+    # Neutralize the profiling/GC context managers: they are irrelevant to the
+    # crash path and must not depend on env/GC state in a unit test.
+    monkeypatch.setattr(pe, "host_profiler_context", lambda enable: contextlib.nullcontext())
+    monkeypatch.setattr(pe, "customized_gc_thresholds", lambda threshold: contextlib.nullcontext())
+    ex = pe.PyExecutor.__new__(pe.PyExecutor)
+    ex.dist = types.SimpleNamespace(world_size=world_size)
+    ex.garbage_collection_gen0_threshold = None
+    return ex
+
+
+def _stub_kill_paths(pe, monkeypatch, events):
+    monkeypatch.setattr(
+        pe, "hard_kill_on_rank_crash", lambda world_size: events.append(("kill", world_size))
+    )
+    monkeypatch.setattr(
+        pe,
+        "start_rank_crash_kill_watchdog",
+        lambda world_size: events.append(("watchdog", world_size)),
+    )
+
+
+def test_event_loop_wrapper_kills_world_on_crash(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import py_executor as pe
+
+    events = []
+    _stub_kill_paths(pe, monkeypatch, events)
+    ex = _bare_executor(pe, monkeypatch, world_size=4)
+    ex._executor_loop_cleanup = lambda: events.append("cleanup")
+
+    def crash():
+        raise ValueError("boom")
+
+    ex.event_loop = crash
+
+    with pytest.raises(ValueError, match="boom"):
+        ex._event_loop_wrapper()
+
+    # The watchdog is armed BEFORE cleanup (cleanup can block forever);
+    # cleanup wakes rank-local waiters (who read the stashed error) BEFORE
+    # the direct kill tears the world down.
+    assert events == [("watchdog", 4), "cleanup", ("kill", 4)]
+    assert isinstance(ex._event_loop_error, ValueError)
+
+
+def test_event_loop_wrapper_kills_world_when_cleanup_raises(monkeypatch):
+    """The kill must not be skippable by a cleanup failure.
+
+    Cleanup runs precisely when the process is already unhealthy; if its
+    exception aborted the finally block before the kill, peers would burn
+    300s in their HangDetectors — the worst case is exactly when the kill
+    matters most.
+    """
+    from tensorrt_llm._torch.pyexecutor import py_executor as pe
+
+    events = []
+    _stub_kill_paths(pe, monkeypatch, events)
+    ex = _bare_executor(pe, monkeypatch, world_size=4)
+
+    def broken_cleanup():
+        events.append("cleanup")
+        raise RuntimeError("cleanup exploded")
+
+    ex._executor_loop_cleanup = broken_cleanup
+
+    def crash():
+        raise ValueError("boom")
+
+    ex.event_loop = crash
+
+    with pytest.raises(RuntimeError, match="cleanup exploded"):
+        ex._event_loop_wrapper()
+
+    assert events == [("watchdog", 4), "cleanup", ("kill", 4)]
+    # The original loop error stays reachable for rank-local consumers.
+    assert isinstance(ex._event_loop_error, ValueError)
+
+
+def test_event_loop_wrapper_no_kill_on_clean_exit(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import py_executor as pe
+
+    events = []
+    _stub_kill_paths(pe, monkeypatch, events)
+    ex = _bare_executor(pe, monkeypatch, world_size=4)
+    ex._executor_loop_cleanup = lambda: events.append("cleanup")
+    ex.event_loop = lambda: None
+
+    ex._event_loop_wrapper()
+
+    assert events == ["cleanup"]
