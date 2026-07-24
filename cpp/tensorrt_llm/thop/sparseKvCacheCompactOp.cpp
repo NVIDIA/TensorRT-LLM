@@ -32,15 +32,9 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-//! Adapt one uniform group of KVCacheManagerV2 HND layer pools to the
-//! batched compaction kernels: dedicated double-buffered cp.async pipelined
-//! bf16 kernels, one CTA per (layer, KV head, request), addressed through a
-//! flat V2 K-plane block-offset table shared by all layers. Per-request
-//! destinationBases replace the former arbitrary destination tensor because
-//! every compaction move targets one contiguous interval per request.
-//! Within each request and KV head, the caller must supply increasing
-//! source ordinals with destinationBases[request] + move <= source[move],
-//! which makes the forward tiled in-place copy safe.
+//! Compact one uniform group of KVCacheManagerV2 HND layer pools in one batched
+//! launch (per request and KV head, moves are ascending and never overtake their
+//! sources: the copy runs in place).
 void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor const& poolPointers,
     th::Tensor const& pageTable, th::Tensor const& sourceIndices, th::Tensor const& sourceOffsets,
     th::Tensor const& destinationBases, std::optional<th::Tensor> const& sourceLayerIndices)
@@ -115,10 +109,7 @@ void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor
         sourceLayerPtr = layerIndices.data_ptr<int32_t>();
     }
 
-    // source_offsets carve each request's move range out of source_indices;
-    // the values live on device and the kernel trusts them. The index buffer
-    // may be wider than one round's total move count, so the head-row
-    // stride passed below comes from the tensor shape, not from the offsets.
+    // source_offsets carve each request's move range; device-resident, the kernel trusts them.
     TORCH_CHECK(sourceOffsets.is_cuda() && sourceOffsets.get_device() == device
             && sourceOffsets.scalar_type() == th::kInt32 && sourceOffsets.is_contiguous() && sourceOffsets.dim() == 1
             && sourceOffsets.size(0) == batchSize + 1,

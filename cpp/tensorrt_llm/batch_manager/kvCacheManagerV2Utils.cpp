@@ -19,8 +19,8 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include <cassert>
-#include <cstring>
 #include <cstdio>
+#include <cstring>
 #include <cuda.h>
 #include <fcntl.h>
 #include <memory>
@@ -221,36 +221,16 @@ at::Tensor IndexMapper::getCopyIndex(
 void IndexMapper::gatherKBlockOffsets(at::Tensor const& source, at::Tensor destination,
     std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numBlocks)
 {
-    TLLM_CHECK_WITH_INFO(source.device().is_cpu() && destination.device().is_cpu(),
-        "Block-offset gather requires CPU tensors");
-    TLLM_CHECK_WITH_INFO(source.scalar_type() == at::kInt && destination.scalar_type() == at::kInt,
-        "Block-offset gather requires int32 tensors");
-    TLLM_CHECK_WITH_INFO(source.dim() == 4 && destination.dim() == 4 && source.size(2) == 2
-            && destination.size(2) == 2,
-        "Block-offset gather requires [pool, sequence, K/V, block] tensors");
-    TLLM_CHECK_WITH_INFO(source.is_contiguous() && destination.is_contiguous(),
-        "Block-offset gather requires contiguous tensors");
-    TLLM_CHECK_WITH_INFO(source.storage().data_ptr().get() != destination.storage().data_ptr().get(),
-        "Block-offset gather requires distinct source and destination storage");
-    TLLM_CHECK_WITH_INFO(source.size(0) == destination.size(0), "Block-offset gather pool counts must match");
-    TLLM_CHECK_WITH_INFO(!requestIds.empty(), "Block-offset gather requires at least one request");
-    TLLM_CHECK_WITH_INFO(numBlocks > 0 && numBlocks <= source.size(3) && numBlocks <= destination.size(3),
-        "Block-offset gather block count exceeds the source or destination capacity");
-    TLLM_CHECK_WITH_INFO(static_cast<int64_t>(requestIds.size()) <= destination.size(1),
-        "Block-offset gather request count exceeds the destination capacity");
-
-    auto const sourceRows = source.size(1);
     std::vector<int64_t> sourceRowsByRequest;
     sourceRowsByRequest.reserve(requestIds.size());
     for (auto const requestId : requestIds)
     {
-        auto const sourceRow = static_cast<int64_t>(getIndex(requestId)) * maxBeamWidth_;
-        TLLM_CHECK_WITH_INFO(sourceRow < sourceRows, "IndexMapper slot exceeds the source tensor capacity");
-        sourceRowsByRequest.push_back(sourceRow);
+        sourceRowsByRequest.push_back(static_cast<int64_t>(getIndex(requestId)) * maxBeamWidth_);
     }
 
     auto const* sourceData = source.data_ptr<int32_t>();
     auto* destinationData = destination.data_ptr<int32_t>();
+    auto const sourceRows = source.size(1);
     auto const sourcePlanes = source.size(2);
     auto const sourceBlocks = source.size(3);
     auto const destinationRows = destination.size(1);

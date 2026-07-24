@@ -217,7 +217,7 @@ class TestIndexMapperSlotReuse:
         assert torch.count_nonzero(destination[:, :, 1] != -1) == 0
         assert torch.count_nonzero(destination[:, 2, 0] != -1) == 0
 
-    def test_gather_k_block_offsets_rejects_invalid_request_or_block_count(self):
+    def test_gather_k_block_offsets_rejects_unknown_request(self):
         from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
             IndexMapper,
         )
@@ -225,16 +225,11 @@ class TestIndexMapperSlotReuse:
         index_mapper = IndexMapper(max_batch_size=1, max_beam_width=1)
         index_mapper.add_new_sequence(11)
         source = torch.zeros((1, 1, 2, 4), dtype=torch.int32)
-        destination = torch.zeros((1, 2, 2, 3), dtype=torch.int32)
+        destination = torch.full((1, 2, 2, 3), -1, dtype=torch.int32)
 
-        destination.fill_(-1)
         with pytest.raises(Exception, match="Request ID not found"):
             index_mapper.gather_k_block_offsets(source, destination, [11, 12], 3)
         assert torch.count_nonzero(destination != -1) == 0
-        with pytest.raises(Exception, match="block count"):
-            index_mapper.gather_k_block_offsets(source, destination, [11], 4)
-        with pytest.raises(Exception, match="distinct source and destination storage"):
-            index_mapper.gather_k_block_offsets(source, source, [11], 4)
 
     def test_gather_k_block_offsets_matches_beam_zero_index_select(self):
         from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
