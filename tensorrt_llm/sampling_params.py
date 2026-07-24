@@ -25,7 +25,7 @@ from strenum import StrEnum
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
 
-MAX_TOP_LOGPROBS = 20
+MAX_TOP_LOGPROBS = 100
 
 
 def validate_thinking_token_budget(value: Optional[Union[int, float, bool]]) -> Optional[int]:
