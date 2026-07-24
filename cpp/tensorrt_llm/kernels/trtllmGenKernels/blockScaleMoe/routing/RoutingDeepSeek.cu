@@ -565,6 +565,10 @@ void run(Data& data, void* stream)
     }
 
     int const numBlocks = data.mNumTokens;
+    // Derive the per-token entry count (topK routed + fused shared) here so callers
+    // that construct Data directly (unit tests) need not set it; the main kernel uses
+    // it as the output stride before mTopK is expanded below.
+    data.mTotalExpertsPerToken = data.mTopK + data.mNumFusedSharedExperts;
     // Account for fused shared experts (appended after the routed experts) when sizing the histogram.
     int const numThreadsHist = getMaxNumExperts(data.mNumExperts + data.mNumFusedSharedExperts);
     static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
