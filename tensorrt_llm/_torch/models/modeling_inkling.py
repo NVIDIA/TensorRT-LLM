@@ -144,6 +144,198 @@ def _ink_rowdiff(t: Optional[torch.Tensor], ctx=None) -> float:
     return (t.detach().float() - r0).abs().max().item()
 
 
+# feedback #17 op-level B2 bisection: intra-layer op boundaries in forward order.
+# The op fingerprint (``InklingModel._ink_fp_ops``) is a
+# ``[num_layers, N_INK_FP_OPS, 4]`` capture-safe STATS buffer -- for every op it
+# stores ``[nonfinite_count, max_abs, 0, numel]`` computed element-wise on-device
+# and ``copy_``'d INTO the decode graph. Stats (not the raw vector) so the buffer
+# is shape-agnostic: it fingerprints the non-hidden-width attention internals
+# (q/k/v/rel_logits) alongside the hidden-width residual points, and
+# ``nonfinite_count`` names the FIRST tensor that is finite in eager but
+# NON-FINITE under CUDA graph regardless of shape. The chain walks the feedback
+# #17 order: attn_norm -> QK(q,k,v,rel) -> softmax/PV/KV-page(attn_kernel) ->
+# TP all-reduce(o_proj_out) -> attn_sconv -> h_attn. Order MUST match
+# inkling_fp_ops_analyze.py OP_NAMES.
+#
+# HEISENBUG GUARD (iter-79 -- fixes the iter-75/76/77/78 NO_NONFINITE + onset-
+# unprobed rejects). Job data proved the op probe is NOT a passive observer:
+# op-probing a global-attention layer PROTECTS it, moving the B2 nan onset to the
+# first UNPROBED global layer (no probe -> onset L5, job 5558469; probe globals
+# 5/11/17 -> onset L23, job 5560480; probe ALL globals -> fully SUPPRESSED, job
+# 5561260 -- onset pushed past layer 65). Cause: the earlier fingerprint
+# allocated ~3 numel-sized temporaries per op (a reshape-copy of the possibly
+# non-contiguous q/k/v slice, ``.to(fp32)``, the ``isfinite`` bool, the ``abs``
+# float) IN THE MIDDLE of the global-attention kernel path, shifting the
+# CUDA-graph memory pool exactly where B2's capture-baked stale-buffer read
+# lives. So chasing the onset with a layer cap (probe layer <= N) is futile --
+# the probe always moves the onset off the probed set. The iter-79 fix instead
+# makes the fingerprint ALLOCATION-FREE (see ``_ink_fp_stat``): a pre-allocated
+# fp32 scratch + in-place ``abs_`` + a scalar ``amax``, allocating NOTHING
+# numel-sized -- strictly lighter than the per-layer residual ``_ink_fp``
+# ``.to(fp32)`` copy that is already proven CUDA-graph-transparent (5558469
+# reproduces at natural onset L5 with it active). Transparent => no protection =>
+# B2 reproduces at its NATURAL onset layer, which is itself op-probed, so ALL 11
+# global-attention layers can be probed at once (any global onset is captured).
+# Retained from the lean iter-77 probe: GLOBAL-attention layers only (55
+# local/SWA skipped), the ``o_proj_local`` extra GEMM (op 6) left UNMEASURED
+# (matmul-vs-all-reduce discriminated via cross-rank attn_kernel/o_proj_out
+# finiteness in FP_OPS_XRANK), and mlp-side ops 10/11/12 UNMEASURED (B2 is
+# attention-born; the ``_ink_fp`` residual covers the post-mlp stream).
+_INK_FP_OP_NAMES = (
+    "attn_norm",     # 0 decoder: pre-attention RMSNorm output
+    "attn_q",        # 1 attention: q after qkv-proj + qk-norm
+    "attn_k",        # 2 attention: k after kv-sconv + qk-norm
+    "attn_v",        # 3 attention: v after kv-sconv
+    "attn_rel",      # 4 attention: relative-position bias rel_logits
+    "attn_kernel",   # 5 attention: paged decode-kernel output (softmax/PV/KV-page read)
+    "o_proj_local",  # 6 UNMEASURED (extra GEMM dropped -- Heisenbug); use XRANK
+    "o_proj_out",    # 7 attention: o_proj output POST all-reduce (= h_core)
+    "attn_sconv",    # 8 decoder: attention short-conv output (h_asc)
+    "h_attn",        # 9 decoder: post-attention residual (residual + h_asc)
+    "mlp_norm",      # 10 UNMEASURED (mlp-side; residual buffer covers downstream)
+    "moe_out",       # 11 UNMEASURED (mlp-side; residual buffer covers downstream)
+    "mlp_sconv",     # 12 UNMEASURED (mlp-side; residual buffer covers downstream)
+)
+N_INK_FP_OPS = len(_INK_FP_OP_NAMES)
+_INK_FP_STAT_W = 4  # [nonfinite_count, max_abs, l2, numel]
+
+
+def _ink_fp_stat(slot: torch.Tensor, t: torch.Tensor,
+                 scratch: Optional[torch.Tensor] = None) -> None:
+    """Capture-safe finiteness fingerprint of ``t`` written into ``slot`` (a
+    length-4 fp32 view): ``[nonfinite_flag, max_abs, 0, numel]``.
+
+    ALLOCATION-FREE when ``scratch`` (a pre-allocated fp32 1-D buffer sized
+    ``>= t.numel()``) is supplied: the per-op work is ``copy_`` (cast+gather into
+    the scratch) -> in-place ``abs_`` -> a scalar ``amax`` reduction, so NOTHING
+    numel-sized is allocated inside the captured decode graph. Only tiny scalars
+    (the amax result + its ``isfinite``) are created -- strictly lighter than the
+    per-layer residual ``_ink_fp`` ``.to(fp32)`` copy that is already proven
+    CUDA-graph-transparent (job 5558469 reproduces B2 at its natural onset layer 5
+    with that residual probe active). See the HEISENBUG GUARD note above for why
+    allocation-freedom is load-bearing: the earlier ~3-numel-temp-per-op
+    fingerprint shifted the CUDA-graph memory pool and PROTECTED whichever global
+    layer it probed, moving the nan onset off the probed set.
+
+    ``nonfinite_flag`` (>0) is the FIRST-op nan detector for ANY tensor shape:
+    ``max_abs = amax(|t|)`` is nan if ``t`` has any nan and +inf if ``t`` has any
+    inf, so ``~isfinite(max_abs)`` flags any nonfinite element regardless of
+    shape. Everything is device-side (no ``.item()``/``.cpu()`` host sync) so it
+    is CUDA-graph-capture-safe. Pass the already-sliced last row (decode: the last
+    generation request)."""
+    tv = t.detach()
+    n = tv.numel()
+    if scratch is not None and n <= scratch.numel():
+        sv = scratch[:n].view(tv.shape)   # view of pre-alloc scratch (no alloc)
+        sv.copy_(tv)                       # cast->fp32 + gather (no numel alloc)
+        sv.abs_()                          # in-place abs (no alloc)
+        m = sv.amax()                      # scalar reduction (no host sync)
+        slot[0].copy_((~torch.isfinite(m)).to(torch.float32))
+        slot[1].copy_(torch.nan_to_num(m, nan=0.0, posinf=0.0, neginf=0.0))
+        slot[3].fill_(float(n))
+        return
+    # Fallback (no scratch supplied, or op larger than the scratch -- does not
+    # happen for the probed Inkling ops): the original small-alloc path.
+    tf = tv.reshape(-1).to(torch.float32)
+    slot.copy_(
+        torch.stack([
+            (~torch.isfinite(tf)).sum().to(torch.float32),
+            tf.abs().amax(),
+            tf.new_zeros(()),
+            tf.new_full((), float(tf.numel())),
+        ]))
+
+
+# ===========================================================================
+# feedback #18 -- NO-PROBE capture-time buffer bisection for B2 (Stage 6).
+#
+# WHY (supersedes the feedback #17 op-probe as the FIRST tactic). The in-graph
+# op fingerprint above (``INKLING_FP_OPS``) is a Heisenbug: every element-wise
+# stat it records into the decode graph perturbs the CUDA-graph memory pool and
+# MOVES/SUPPRESSES the nan (no probe -> onset L5, job 5558469; probe 5/11/17 ->
+# L23, 5560480; probe all globals -> suppressed, 5561260). That layout
+# sensitivity is itself the tell: B2 is a CAPTURE-TIME fault from a
+# stale/UNINITIALIZED buffer or a captured pointer/offset in the global-attention
+# decode path (nan present from the FIRST replay at kv_pos=5, BEFORE any KV-page
+# boundary; the captured graph HOLDS it; eager is finite at identical metadata).
+#
+# So this route carries NO in-graph fingerprint. The pass/fail signal is the real
+# free-run output itself (B2 = collapse to a token-0 repeat; fixed = coherent
+# text -- driven by ``inkling_fp_localize_test.py`` with ``INKLING_FP`` UNSET).
+# ``INKLING_B2_FIX`` selects ONE candidate init/refresh toggle per run; each is a
+# distinct hypothesis about which captured buffer is stale, and each is a
+# candidate FIX if it flips collapse -> coherent while eager stays finite.
+#
+# CAPTURED-BUFFER ENUMERATION (global-attention decode, ``_run_generation`` +
+# ``inkling_decode_attention``). Every tensor the captured decode kernel reads:
+#   * ``q`` / ``rel_logits``          transient, RE-computed in-graph each replay
+#                                     (qkv_proj / einsum) -> not stale.
+#   * ``k_cache`` / ``v_cache``       persistent KVCacheManagerV2 pool views;
+#                                     stable pointer, contents read LIVE. If the
+#                                     pool is allocated uninitialized (poisoned),
+#                                     a decode read of an unwritten (page,slot)
+#                                     returns nan -> candidate ``zero_kvpool``.
+#   * ``meta.seq_lens``/``page_table``stable per-layer buffers (InklingDecodeMeta)
+#                                     refreshed EAGERLY each step; only ``[:num_gen]``
+#                                     is written, so a stale padding/prior-batch
+#                                     row could drive the in-graph KV scatter to a
+#                                     wrong page -> candidate ``full_meta`` (memset
+#                                     the whole cap each refresh). Their H2D copy
+#                                     is ``non_blocking`` -> a capture/replay read
+#                                     could race it -> candidate ``sync_meta``.
+#   * decode kernel out ``o``         ``torch.empty_like(q)`` -- a FRESH transient
+#                                     grabbed from the graph pool each forward, so
+#                                     its address moves with the pool layout (the
+#                                     exact Heisenbug knob). Candidate
+#                                     ``persist_out`` gives it a stable,
+#                                     eagerly-zeroed persistent buffer instead.
+# The four above were all RULED OUT (feedback #19). The leading unexplored
+# feedback #19 candidate class is the CUDA-graph PADDING metadata:
+#   * padding/dummy generation row     the ``max_batch_size=8`` decode graph pads
+#     KV scatter                       the single real request up to the bucket with
+#                                      dummy rows. The DIAG (job 5567187) MEASURED a
+#                                      padded replay batch as {row0: real, sl=511,
+#                                      16 pages} + {row1..7: dummy, sl=1, one page
+#                                      each, e.g. 99/110/121/.. and sometimes page 0}.
+#                                      Each dummy still runs the in-graph KV scatter
+#                                      ``k_cache[pages,:,offs,:] = k`` at slot 0 of
+#                                      its page, writing its pool-transient (garbage,
+#                                      possibly non-finite) k/v there. If a real
+#                                      request ever reads one of those pages a
+#                                      capture-time nan results -- at kv_pos<=5,
+#                                      before any page boundary, memory-layout-
+#                                      sensitive (the dummy's hidden state is
+#                                      pool-transient garbage), and INVISIBLE to
+#                                      compute-sanitizer initcheck (the slot was
+#                                      written, so the read is of initialised-but-
+#                                      corrupted memory, not an uninitialised read).
+#                                      Candidate ``pad_scatter`` redirects the dummy
+#                                      rows to a scratch page that no real row uses,
+#                                      EAGERLY in :meth:`refresh` (zero in-graph op,
+#                                      so a collapse->coherent flip is a real fix not
+#                                      a pool-perturbation artifact). CORRECTED
+#                                      detector: a dummy is a ``seq_len==1`` row in a
+#                                      PADDED CUDA-graph batch (``is_graph and
+#                                      num_gen>1``); iter-88 keyed on ``seq_len==1``
+#                                      alone and so also mis-redirected the sole real
+#                                      row of an eager ``num_gen==1`` warmup step
+#                                      (sl==1 there too), which made its NO_LEAD
+#                                      invalid (iter-90 confound analysis).
+# Toggles are env-gated and BYTE-UNCHANGED when ``INKLING_B2_FIX`` is unset.
+_B2_FIX_NAMES = ("zero_kvpool", "persist_out", "full_meta", "sync_meta",
+                 "pad_scatter")
+
+
+def _b2_fix_active(name: str) -> bool:
+    """True iff the feedback #18 no-probe B2 candidate ``name`` is selected via
+    ``INKLING_B2_FIX`` (comma-separated). Single ``dict`` lookup -> zero cost when
+    the env is unset (the production path is byte-unchanged)."""
+    v = os.environ.get("INKLING_B2_FIX")
+    if not v:
+        return False
+    return name in v.split(",")
+
+
 def _ink_report_divergence(num_layers: int, dsink: dict,
                            inputs_embeds: torch.Tensor,
                            out: torch.Tensor) -> None:
@@ -1005,6 +1197,28 @@ class InklingDecodeMeta:
         self.seq_lens: Optional[torch.Tensor] = None  # [cap] int32 GPU total-KV
         self.page_table: Optional[torch.Tensor] = None  # [cap, max_pages] int32
         self.ready = False
+        # feedback #18 no-probe B2 candidates. ``_owner`` is the InklingAttention
+        # (set right after construction) so :meth:`refresh` can size the persistent
+        # decode-output buffer eagerly. ``out_buf`` is the ``persist_out`` candidate
+        # -- a stable, eagerly-zeroed replacement for the decode kernel's fresh
+        # ``torch.empty_like`` output (whose pool-transient address is the Heisenbug
+        # knob). Both stay ``None`` unless the matching toggle is selected.
+        self._owner = None
+        self.out_buf: Optional[torch.Tensor] = None
+        # feedback #19 padding-metadata candidate ``pad_scatter``: total physical
+        # page count of this layer's KV pool, resolved LAZILY and ONLY when the
+        # toggle is selected (production path never calls this), so a CUDA-graph
+        # padding/dummy generation row can be scattered to a reserved scratch page
+        # instead of aliasing the real request's physical page 0.
+        self.num_pages: Optional[int] = None
+        # Guards for the INKLING_B2_DIAG batch-composition dump (eager, gated OFF
+        # by default -> production byte-unchanged). Two independent guards: one for
+        # the first eager/warmup refresh and one that fires up to 4x on the PADDED
+        # CUDA-graph replay (is_graph & num_gen>1). Job 5566938 proved a single
+        # one-shot guard logged only the num_gen=1 warmup and MISSED the padded
+        # batch=8 replay -- the batch composition B2 actually depends on.
+        self._diag_eager_logged = False
+        self._diag_graph_n = 0
 
     def _ensure(self, num_gen: int, mgr, device, is_graph: bool) -> None:
         if self.max_pages is None:
@@ -1022,6 +1236,32 @@ class InklingDecodeMeta:
         self.page_table = torch.zeros((self.cap, self.max_pages),
                                       dtype=torch.int32,
                                       device=device)
+
+    def _b2_fix_eager(self, device) -> None:
+        """Apply the feedback #18 no-probe B2 candidates that must run EAGERLY (the
+        captured forward only READS these stable buffers):
+
+        * ``full_meta`` -- memset the WHOLE cap (not just ``[:num_gen]``) so a stale
+          padding / prior-batch page-table row cannot drive the in-graph KV scatter
+          to a wrong page.
+        * ``persist_out`` -- size the stable, zeroed decode-output buffer HERE
+          (never inside the captured forward), so the candidate adds no in-graph
+          allocation or zero of its own that would itself perturb the pool layout
+          and could "fix" B2 by perturbation (a false positive).
+
+        No-op unless the matching toggle is selected. Split out of :meth:`refresh`
+        so it is unit-testable without a full ``attn_metadata``."""
+        if _b2_fix_active("full_meta"):
+            self.seq_lens.fill_(1)
+            self.page_table.zero_()
+        if _b2_fix_active("persist_out") and self._owner is not None and (
+                self.out_buf is None or self.out_buf.shape[0] < self.cap):
+            o = self._owner
+            self.out_buf = torch.zeros(self.cap,
+                                       o.local_num_heads,
+                                       o.head_dim,
+                                       dtype=o.qkv_proj.weight.dtype,
+                                       device=device)
 
     def refresh(self, attn_metadata, device) -> bool:
         """Publish this batch's generation decode metadata into the stable
@@ -1044,6 +1284,49 @@ class InklingDecodeMeta:
         block_ids = mgr.get_batch_cache_indices(gen_ids, self.layer_idx)
         is_graph = bool(getattr(attn_metadata, "is_cuda_graph", False))
         self._ensure(num_gen, mgr, device, is_graph)
+        self._b2_fix_eager(device)
+        # ``sync_meta``: force the metadata H2D copies synchronous (production is
+        # ``non_blocking``) to test whether a captured/replayed decode read races
+        # the async copy of the eagerly-published seq_lens/page_table.
+        nb = not _b2_fix_active("sync_meta")
+        # ``pad_scatter`` (feedback #19 padding-metadata hypothesis; detector
+        # CORRECTED per iter-90's confound analysis): a CUDA-graph padded/dummy
+        # generation row (num_cached==0 -> seq_len==1) still runs the in-graph KV
+        # scatter, writing its pool-transient (garbage) k/v into whatever physical
+        # page its page-table row names; if a real request later reads that page a
+        # capture-time nan results. Redirect every dummy row to a scratch page that
+        # NO real row in this batch uses.
+        #
+        # RELIABLE dummy detector (fixes the iter-88 confound): dummy rows exist
+        # ONLY in a PADDED CUDA-graph batch (``is_graph and num_gen > 1``); the DIAG
+        # (job 5567187) proved such a batch is always {1 real row sl=511} + {N dummy
+        # rows sl=1}. In an eager or ``num_gen==1`` step the sole row is the real
+        # request even when its sl==1 at graph warmup -- so gating on
+        # ``is_graph and num_gen > 1`` never redirects a real row (the exact
+        # mis-redirect that made iter-88's NO_LEAD invalid). Lazy + toggle-gated ->
+        # the production path never calls ``get_buffers`` and stays byte-unchanged.
+        scratch_page = None
+        if _b2_fix_active("pad_scatter") and is_graph and num_gen > 1:
+            if self.num_pages is None:
+                try:
+                    kvb = mgr.get_buffers(self.layer_idx, kv_layout="HND")
+                    self.num_pages = int(kvb.shape[0])
+                except Exception:  # noqa: BLE001 - diagnostic; fall back to no-op
+                    self.num_pages = None
+            if self.num_pages and self.num_pages > 1:
+                # Pages the REAL rows (num_cached>0 -> sl>1) hold this step; a dummy
+                # must never be scattered onto one of them. Pick the highest FREE
+                # page as scratch (num_pages-1 itself can be a real page -- the DIAG
+                # real row used page 242).
+                real_pages = set()
+                for j in range(num_gen):
+                    if int(num_cached[j]) > 0:
+                        real_pages.update(int(b) for b in block_ids[j]
+                                          if int(b) >= 0)
+                for p in range(self.num_pages - 1, -1, -1):
+                    if p not in real_pages:
+                        scratch_page = p
+                        break
         # Build host staging (pinned) then ONE async copy into each stable buffer.
         pin = prefer_pinned()
         sl_host = torch.empty(num_gen, dtype=torch.int32, pin_memory=pin)
@@ -1053,12 +1336,51 @@ class InklingDecodeMeta:
                               dtype=torch.int32,
                               pin_memory=pin)
         for i, blocks in enumerate(block_ids):
+            # ``pad_scatter``: ``scratch_page`` is non-None only in a padded
+            # CUDA-graph batch (is_graph and num_gen>1), so ``sl_host[i]==1`` here
+            # reliably means a dummy row (a real gen row has num_cached>=1 ->
+            # seq_len>=2). Point its whole page-table row at the real-row-free
+            # scratch page so the in-graph KV scatter cannot write the dummy's
+            # (pool-transient) k/v into any physical page a real request reads.
+            # Eager (no in-graph op) so a collapse->coherent flip is a real fix,
+            # not a pool-perturbation artifact.
+            if scratch_page is not None and int(sl_host[i]) == 1:
+                pt_host[i, :] = scratch_page
+                continue
             valid = [int(b) for b in blocks if int(b) >= 0]
             if valid:
                 w = min(len(valid), self.max_pages)
                 pt_host[i, :w] = torch.tensor(valid[:w], dtype=torch.int32)
-        self.seq_lens[:num_gen].copy_(sl_host, non_blocking=True)
-        self.page_table[:num_gen].copy_(pt_host, non_blocking=True)
+        # INKLING_B2_DIAG (eager, gated OFF by default -> production byte-unchanged):
+        # dump this batch's decode composition at the first global layer (5) so the
+        # CUDA-graph padding structure B2 depends on is MEASURED, not guessed.
+        # Per-row request id + seq_len + allocated pages reveal whether padding/dummy
+        # rows exist, their seq_len (validating the pad_scatter seq_len==1 detector),
+        # and whether they alias the real request's physical page 0 (row0). Log the
+        # first eager refresh AND up to 4 PADDED graph refreshes (is_graph & num_gen>1)
+        # -- the padded batch=8 replay is the composition that must be captured; a
+        # single one-shot guard fired only on the num_gen=1 warmup (job 5566938).
+        if os.environ.get("INKLING_B2_DIAG") == "1" and self.layer_idx == 5:
+            is_pad = is_graph and num_gen > 1
+            do_log = False
+            if is_pad and self._diag_graph_n < 4:
+                self._diag_graph_n += 1
+                do_log = True
+            elif not is_pad and not self._diag_eager_logged:
+                self._diag_eager_logged = True
+                do_log = True
+            if do_log:
+                parts = []
+                for i in range(num_gen):
+                    pgs = [int(b) for b in block_ids[i] if int(b) >= 0]
+                    parts.append(
+                        f"row{i}:id={gen_ids[i]!s} sl={int(sl_host[i])} pages={pgs}")
+                print(
+                    f"INKLING_B2_DIAG layer=5 num_gen={num_gen} is_graph={is_graph} "
+                    f"num_pages={self.num_pages} | " + " | ".join(parts),
+                    flush=True)
+        self.seq_lens[:num_gen].copy_(sl_host, non_blocking=nb)
+        self.page_table[:num_gen].copy_(pt_host, non_blocking=nb)
         self.ready = True
         return True
 
@@ -1208,6 +1530,13 @@ class InklingAttention(QKNormRoPEAttention):
         # refreshed eagerly (before capture/replay) by the model engine via
         # InklingForCausalLM.prepare_inkling_attn_decode -> _decode_meta.refresh.
         self._decode_meta = InklingDecodeMeta(layer_idx)
+        # feedback #18 no-probe B2 candidates: give the decode-meta a back-ref so
+        # ``refresh`` can size the ``persist_out`` buffer from this layer's head
+        # geometry; ``_b2_kvpool_zeroed`` gates the one-time ``zero_kvpool`` pool
+        # memset (see ``_attention``). Both are inert unless ``INKLING_B2_FIX`` is
+        # set, so the production path is byte-unchanged.
+        self._decode_meta._owner = self
+        self._b2_kvpool_zeroed = False
 
     def _project(self,
                  hidden_states,
@@ -1329,6 +1658,19 @@ class InklingAttention(QKNormRoPEAttention):
         num_seqs = len(seq_lens)
         ctx_tokens = sum(seq_lens[:num_contexts])
 
+        # feedback #18 no-probe B2 candidate ``zero_kvpool``: zero this layer's
+        # paged KV pool ONCE, eagerly, on its first context (prefill) pass -- before
+        # any K/V is written -- so a later decode read of an unwritten (page, slot)
+        # sees a finite 0 instead of poisoned/uninitialized pool memory (a candidate
+        # capture-time B2 nan source). Fires at most once per layer lifetime (the
+        # first prefill / KV-estimation forward, never under decode-graph capture),
+        # so it cannot wipe a live request's cache. Diagnostic-only (the single-
+        # request B2 repro); default-off, production byte-unchanged.
+        if (num_contexts > 0 and not self._b2_kvpool_zeroed
+                and _b2_fix_active("zero_kvpool")):
+            kv.zero_()
+            self._b2_kvpool_zeroed = True
+
         # A mixed context+generation batch needs ``_project`` to apply the
         # prefill short-conv to the context tokens and the decode short-conv to
         # the generation tokens -- which only the per-request short-conv state
@@ -1416,9 +1758,19 @@ class InklingAttention(QKNormRoPEAttention):
             # request -> [num_req, num_kv_heads, head_dim], matching new k/v.
             k_cache[pages, :, offs, :] = k.to(k_cache.dtype)
             v_cache[pages, :, offs, :] = v.to(v_cache.dtype)
+            # feedback #18 no-probe B2 candidate ``persist_out``: write the decode
+            # kernel into the stable, eagerly-zeroed per-layer buffer (sized in
+            # ``_decode_meta.refresh``) instead of a fresh pool-transient
+            # ``torch.empty_like`` output whose address moves with the CUDA-graph
+            # pool layout -- the exact Heisenbug knob. ``None`` -> production path
+            # (fresh output), byte-unchanged when the toggle is off.
+            ob = (meta.out_buf[:num_req]
+                  if (meta.out_buf is not None
+                      and _b2_fix_active("persist_out")) else None)
             return inkling_decode_attention(q, k_cache, v_cache, sl, pt,
                                             page_size, self.sm_scale, rel_logits,
-                                            self.rel_extent, self.window_left)
+                                            self.rel_extent, self.window_left,
+                                            out=ob)
         # The write and the ragged->dense block-id work are host-side; under
         # CUDA-graph replay ``skip_kv_write`` is set and static ``decode_*``
         # tensors are supplied, so this whole block is skipped and only GPU ops
@@ -1458,6 +1810,8 @@ class InklingAttention(QKNormRoPEAttention):
                 decode_page_table=None,
                 skip_kv_write: bool = False,
                 return_conv_state: bool = False,
+                ops_fp: Optional[torch.Tensor] = None,
+                ops_scratch: Optional[torch.Tensor] = None,
                 **kwargs):
         """Inkling attention through the Triton score_mod path.
 
@@ -1482,7 +1836,19 @@ class InklingAttention(QKNormRoPEAttention):
         hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
         q, k, v, new_kv_state = self._project(hidden_states, conv_states,
                                               conv_pool_kv, conv_rt)
+        # feedback #17 op-level B2 bisection -- walk INTO the global-attention
+        # kernel. q/k/v (post qkv-proj + kv-sconv + qk-norm) and rel_logits are
+        # the paged-decode kernel's INPUTS; if they are finite but attn_kernel is
+        # non-finite, the nan is born in the softmax / PV / KV-page read, not
+        # upstream. Written capture-safely (element-wise stats, D2D into the graph)
+        # only under INKLING_FP_OPS. Fingerprint the last generation row.
+        if ops_fp is not None:
+            _ink_fp_stat(ops_fp[1], q[-1], ops_scratch)  # attn_q
+            _ink_fp_stat(ops_fp[2], k[-1], ops_scratch)  # attn_k
+            _ink_fp_stat(ops_fp[3], v[-1], ops_scratch)  # attn_v
         rel_logits = self._build_rel_logits(hidden_states, position_ids)
+        if ops_fp is not None:
+            _ink_fp_stat(ops_fp[4], rel_logits[-1], ops_scratch)  # attn_rel
         attn_out = self._attention(q,
                                    k,
                                    v,
@@ -1493,7 +1859,21 @@ class InklingAttention(QKNormRoPEAttention):
                                    skip_kv_write=skip_kv_write,
                                    allow_mixed=conv_rt is not None)
         attn_out = attn_out.reshape(num_tokens, self.q_size)
+        if ops_fp is not None:
+            # attn_kernel = softmax/PV/KV-page-read output (pre out-proj).
+            _ink_fp_stat(ops_fp[5], attn_out[-1], ops_scratch)
+            # op index 6 (o_proj_local, the per-rank o_proj matmul PRE all-reduce)
+            # is INTENTIONALLY left UNMEASURED: the extra F.linear GEMM per global
+            # layer is the heaviest in-graph op and is what shifted the CUDA-graph
+            # pool and SUPPRESSED B2 in iter-75. The matmul-vs-all-reduce question
+            # is answered instead from the CROSS-RANK finiteness of attn_kernel
+            # (op 5, this rank's pre-o_proj input) vs o_proj_out (op 7, post
+            # all-reduce) in FP_OPS_XRANK: attn_kernel finite on every rank while
+            # o_proj_out is non-finite implicates the TP all-reduce collective (or
+            # a remote rank's nan it summed), not this rank's kernel.
         out = self.o_proj(attn_out)
+        if ops_fp is not None:
+            _ink_fp_stat(ops_fp[7], out[-1], ops_scratch)  # o_proj_out (post all-reduce)
         if return_conv_state:
             return out, new_kv_state
         return out
@@ -1784,6 +2164,8 @@ class InklingDecoderLayer(nn.Module):
                 conv_rt: Optional[InklingConvRuntime] = None,
                 dump_sink: Optional[dict] = None,
                 diverge_sink: Optional[dict] = None,
+                ops_fp: Optional[torch.Tensor] = None,
+                ops_scratch: Optional[torch.Tensor] = None,
                 **kwargs) -> torch.Tensor:
         """Pre-norm attention + MLP, each followed by a short-conv (internal
         residual), then the residual add.
@@ -1827,19 +2209,44 @@ class InklingDecoderLayer(nn.Module):
 
             residual = hidden_states
             h = self.attn_norm(hidden_states)
+            # feedback #17 op-level B2 bisection (env INKLING_FP_OPS, zero cost
+            # off): capture-safe element-wise finiteness stats of this layer's
+            # intra-layer op boundaries recorded INTO the decode graph, so the
+            # analyzer names the FIRST op inside the first divergent layer that
+            # goes non-finite under CUDA graph. ``self.attn`` writes its OWN
+            # internals (indices 1..7: attn_q/k/v, attn_rel, attn_kernel,
+            # o_proj_local, o_proj_out) so the bisection walks INTO the
+            # global-attention kernel / paged-KV read / TP all-reduce; this layer
+            # writes the boundaries around it. Order MUST match _INK_FP_OP_NAMES /
+            # inkling_fp_ops_analyze.py.
+            if ops_fp is not None:
+                _ink_fp_stat(ops_fp[0], h[-1], ops_scratch)  # attn_norm
             h_core = self.attn(position_ids,
                                h,
                                attn_metadata,
                                conv_pool_kv=(conv_state.k, conv_state.v),
                                conv_rt=conv_rt,
+                               ops_fp=ops_fp,
+                               ops_scratch=ops_scratch,
                                **kwargs)
+            # (h_core == o_proj_out, written as ops_fp[7] inside self.attn.)
             h_asc = _apply_sconv(self.attn_sconv, h_core, conv_state.attn,
                                  conv_rt)
+            if ops_fp is not None:
+                _ink_fp_stat(ops_fp[8], h_asc[-1], ops_scratch)  # attn_sconv
             h = residual + h_asc
+            if ops_fp is not None:
+                _ink_fp_stat(ops_fp[9], h[-1], ops_scratch)  # h_attn
 
             residual = h
             hn = self.mlp_norm(h)
             hmlp = self.mlp(hn)
+            # ops 10/11/12 (mlp_norm/moe_out/mlp_sconv) are INTENTIONALLY not
+            # fingerprinted here: B2 is attention-born (first divergent layer is a
+            # global-ATTENTION layer) and the per-layer ``_ink_fp`` residual buffer
+            # already captures the post-mlp stream, so skipping the mlp-side probes
+            # trims in-graph reductions (the iter-75 Heisenbug lever) at no cost to
+            # the attention op-localization verdict.
             if dump_sink is not None:
                 # Sub-block localizer split: the post-attention residual isolates
                 # the attention TP transform; the pure MLP/MoE transform output
@@ -1888,6 +2295,8 @@ class InklingDecoderLayer(nn.Module):
                                 torch.int32).cpu()
                         dump_sink["routed_w"] = _pick(_rw)
             hm = _apply_sconv(self.mlp_sconv, hmlp, conv_state.mlp, conv_rt)
+            # op 12 (mlp_sconv) intentionally not fingerprinted (see the mlp-side
+            # note above -- attention-born B2, residual buffer covers downstream).
             if dump_sink is not None and dump_sink.get("_finegrain"):
                 # point 6: mlp short-conv output (computed after the dump block).
                 dump_sink["mlp_sconv"] = (
@@ -2007,8 +2416,19 @@ class InklingModel(DecoderModel):
         # ``InklingForCausalLM.prepare_inkling_attn_decode`` and its contents are
         # read out eagerly there too (see that method). ``None`` => feature off.
         self._ink_fp: Optional[torch.Tensor] = None
+        self._ink_fp_ops: Optional[torch.Tensor] = None
+        # iter-79: pre-allocated fp32 scratch for the ALLOCATION-FREE op
+        # fingerprint (``_ink_fp_stat``), so the per-op probe never allocates a
+        # numel-sized temporary inside the captured decode graph.
+        self._ink_fp_ops_scratch: Optional[torch.Tensor] = None
         self._ink_fp_step = 0
         self._ink_fp_prev_decode = False
+        # Op-probe layer cap (Heisenbug safety knob): fingerprint global-attention
+        # layers with index <= this. Default unlimited (all 11 globals). Set
+        # INKLING_FP_OPS_MAXLAYER small (e.g. 17 => globals 5/11/17) to shrink the
+        # in-graph op count when confirming B2 still reproduces under the probe --
+        # the all-layer ``_ink_fp`` residual finds the true onset layer regardless.
+        self._ink_fp_ops_maxlayer = 10_000
 
     def _ensure_fp_buffer(self, device) -> None:
         """Allocate the capture-safe decode-fingerprint buffer once, EAGERLY,
@@ -2018,9 +2438,33 @@ class InklingModel(DecoderModel):
         when ``INKLING_FP`` is set."""
         if self._ink_fp is not None:
             return
+        import os
         h = self.norm.weight.shape[0]
         self._ink_fp = torch.zeros(len(self.layers) + 1, h,
                                    dtype=torch.float32, device=device)
+        # feedback #17 op-level B2 bisection: per-layer intra-layer op boundaries
+        # (N_INK_FP_OPS=13, walking attn_norm -> QK(q,k,v,rel) ->
+        # softmax/PV/KV-page(attn_kernel) -> out-proj(o_proj_local) ->
+        # TP all-reduce(o_proj_out) -> sconv -> downstream) as capture-safe
+        # element-wise stats [nonfinite_count, max_abs, l2, numel], so the analyzer
+        # names the FIRST op inside the first divergent layer that goes non-finite
+        # under CUDA graph -- even for the non-hidden-width attention internals.
+        # Allocated EAGERLY (pre-capture) like _ink_fp. Zero cost unless
+        # INKLING_FP_OPS is set.
+        if os.environ.get("INKLING_FP_OPS"):
+            self._ink_fp_ops = torch.zeros(len(self.layers), N_INK_FP_OPS,
+                                           _INK_FP_STAT_W, dtype=torch.float32,
+                                           device=device)
+            self._ink_fp_ops_maxlayer = int(
+                os.environ.get("INKLING_FP_OPS_MAXLAYER", "10000"))
+            # iter-79 ALLOCATION-FREE op fingerprint: a fp32 scratch sized well
+            # above the largest probed op numel (global rel_logits[-1] =
+            # local_heads*rel_extent <= 64*1024 at TP=1; hidden=6144; q<=8192).
+            # 1<<17 (512 KiB) gives >=8x margin at TP=4 and is allocated EAGERLY
+            # (pre-capture) like the buffers above, so ``_ink_fp_stat`` reuses it
+            # with copy_/abs_/amax and allocates nothing numel-sized in-graph.
+            self._ink_fp_ops_scratch = torch.zeros(1 << 17, dtype=torch.float32,
+                                                   device=device)
 
     def forward(self,
                 attn_metadata: AttentionMetadata,
@@ -2160,7 +2604,14 @@ class InklingModel(DecoderModel):
                                   conv_state=layer_state,
                                   conv_rt=conv_rt,
                                   dump_sink=_sink,
-                                  diverge_sink=_active_sink)
+                                  diverge_sink=_active_sink,
+                                  ops_fp=(self._ink_fp_ops[i]
+                                          if (_fp_on
+                                              and self._ink_fp_ops is not None
+                                              and not layer.attn.is_local
+                                              and i <= self._ink_fp_ops_maxlayer)
+                                          else None),
+                                  ops_scratch=self._ink_fp_ops_scratch)
             if _fp_on:
                 # Last generation row's residual after layer i (device->device,
                 # captured -> replays). fp32 cast is a transient graph-pool alloc.
@@ -2245,6 +2696,14 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel,
         device = self.model.embed_tokens.weight.device
         for layer in self.model.layers:
             layer.attn._decode_meta.refresh(attn_metadata, device)
+        # feedback #18 no-probe B2 candidate ``sync_meta``: block until every
+        # layer's eager metadata H2D copy has landed before the captured/replayed
+        # decode forward reads it. Legal here (``prepare`` runs EAGERLY, outside any
+        # CUDA-graph capture); one device sync per decode step. Tests whether a
+        # captured/replayed read races the async seq_lens/page_table copy. No-op
+        # unless the toggle is selected.
+        if _b2_fix_active("sync_meta"):
+            torch.cuda.synchronize(device)
         # --- B2 CUDA-graph decode localizer (env INKLING_FP, zero cost off) ---
         # The captured decode forward runs no Python at replay, so we (1) allocate
         # the capture-safe fingerprint buffer EAGERLY here (before capture) and
@@ -2273,9 +2732,36 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel,
                         rank = int(self.model.model_config.mapping.tp_rank)
                     except Exception:  # noqa: BLE001
                         rank = 0
+                    step = self.model._ink_fp_step
                     torch.save(
                         self.model._ink_fp.detach().to("cpu"),
-                        f"{fp_path}.rank{rank}.step{self.model._ink_fp_step}")
+                        f"{fp_path}.rank{rank}.step{step}")
+                    # feedback #17 op-level stats dump. The [L,13,4] stats tensor
+                    # is tiny (~14 KB), so dump EVERY step (no MAXSTEP truncation):
+                    # the analyzer needs the full onset trace -- including steps
+                    # PAST a KV-page boundary -- to classify capture (nan from the
+                    # first replay, before any page boundary) vs replay-metadata
+                    # (nan onset AT a page-boundary-crossing step).
+                    if self.model._ink_fp_ops is not None:
+                        torch.save(
+                            self.model._ink_fp_ops.detach().to("cpu"),
+                            f"{fp_path}.ops.rank{rank}.step{step}")
+                        # One-time page_size sidecar (rank 0, first dumped step):
+                        # the KV-cache page/token size, so the analyzer can place
+                        # each step's KV position relative to a page boundary for
+                        # the capture-vs-replay call. Best-effort; the verdict
+                        # degrades to pos-only if this is absent.
+                        if rank == 0 and step == 0:
+                            try:
+                                import json as _json
+                                _kv = attn_metadata.kv_cache_manager.get_buffers(
+                                    0, kv_layout="HND")
+                                with open(f"{fp_path}.page_size.json",
+                                          "w") as _pf:
+                                    _json.dump({"page_size": int(_kv.shape[3])},
+                                               _pf)
+                            except Exception:  # noqa: BLE001
+                                pass
                     self.model._ink_fp_step += 1
                 self.model._ink_fp_prev_decode = (num_gen > 0)
 

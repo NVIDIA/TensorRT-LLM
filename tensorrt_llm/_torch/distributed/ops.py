@@ -897,7 +897,29 @@ class AllReduce(nn.Module):
         disable_allreduce_autotune = os.environ.get(
             "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
 
-        if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
+        # Never freeze the AutoTuner-selected all-reduce (``tunable_allreduce``)
+        # into a CUDA graph: the tactic the tuner picks can be capture-unsafe and
+        # produce a non-finite result when the captured graph is replayed. This is
+        # the Inkling TP=4 enabled-runtime "B2" decode collapse -- a captured
+        # global-attention all-reduce goes non-finite and decode collapses to a
+        # token-0 repeat ("Paris!!!!"). The bug was localized by a single-variable
+        # isolation (only disabling this autotune fixed it while keeping the
+        # CUDA-graph hard path exercised). During graph capture, fall back to the
+        # direct ``all_reduce_op`` with the same (AUTO) strategy, which resolves
+        # statically and is graph-safe. Warm-up / eager calls (not capturing) still
+        # autotune, so steady-state performance is unchanged.
+        use_tunable_allreduce = (allreduce_strategy == AllReduceStrategy.AUTO
+                                 and not disable_allreduce_autotune
+                                 and not self._disable_mpi)
+        if use_tunable_allreduce and torch.cuda.is_current_stream_capturing():
+            use_tunable_allreduce = False
+            logger.debug_once(
+                "Skipping tunable_allreduce during CUDA graph capture; using "
+                "graph-safe all_reduce_op (AUTO strategy).",
+                key="skip_tunable_allreduce_capture",
+            )
+
+        if use_tunable_allreduce:
             output = torch.ops.trtllm.tunable_allreduce(
                 input=input,
                 residual=all_reduce_params.residual,
