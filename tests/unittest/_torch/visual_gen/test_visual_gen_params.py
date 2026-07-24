@@ -963,6 +963,43 @@ class TestRequestValidation:
         req = self._make_request(extra_params={"boundary_ratio": None})
         self._merge_and_validate(executor, req)
 
+    def test_literal_extra_param_rejects_bad_value(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+
+        req = self._make_request(extra_params={"action_mode": "not_a_mode"})
+        with pytest.raises(ValueError, match="expected one of"):
+            from tensorrt_llm.visual_gen.params import validate_visual_gen_params
+
+            validate_visual_gen_params(
+                req.params,
+                declared_defaults=None,
+                extra_param_specs=COSMOS3_EXTRA_SPECS,
+            )
+
+    def test_literal_extra_param_accepts_numeric_choice(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+        from tensorrt_llm.visual_gen.params import validate_visual_gen_params
+
+        req = self._make_request(extra_params={"action_resolution": 480})
+        validate_visual_gen_params(
+            req.params,
+            declared_defaults=None,
+            extra_param_specs=COSMOS3_EXTRA_SPECS,
+        )
+
+    def test_path_or_list_extra_param_type_checked(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+
+        req = self._make_request(extra_params={"video": 123})
+        with pytest.raises(ValueError, match="expected type 'path_or_list'"):
+            from tensorrt_llm.visual_gen.params import validate_visual_gen_params
+
+            validate_visual_gen_params(
+                req.params,
+                declared_defaults=None,
+                extra_param_specs=COSMOS3_EXTRA_SPECS,
+            )
+
 
 # =============================================================================
 # Parameter validation — message content per category

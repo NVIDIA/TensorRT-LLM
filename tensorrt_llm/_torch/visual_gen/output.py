@@ -37,8 +37,9 @@ class PipelineOutput:
     """Internal per-pipeline output.
 
     Each pipeline ``infer()`` populates the media tensor it produces plus
-    the metadata it owns (``frame_rate``, ``audio_sample_rate``) and the
-    three CUDA-event-measured timing phases that decompose ``pipeline.infer()``.
+    the metadata it owns (``frame_rate``, ``audio_sample_rate``, action fields)
+    and the three CUDA-event-measured timing phases that decompose
+    ``pipeline.infer()``.
 
     Attributes:
         image: Generated image as ``torch.Tensor`` shape ``(B, H, W, C)``,
@@ -51,12 +52,25 @@ class PipelineOutput:
             ``(B, channels, T_audio)``, dtype ``float32``. Populated by LTX-2.
             The leading batch dim is always present, even for single-prompt
             requests (size 1).
+        action: Predicted or refined action trajectory as ``torch.Tensor``
+            shape ``(B, T_action, D_raw)``, dtype ``float32``. Populated by
+            Cosmos3 action generation (``policy`` / ``forward_dynamics`` /
+            ``inverse_dynamics``). Sliced to ``raw_action_dim`` DOF; no VAE
+            decode. ``None`` when action generation was not requested.
         frame_rate: Video frame rate in fps. Populated by video pipelines
             (Wan T2V/I2V emit ``16.0``; LTX-2 emits ``params.frame_rate``).
             ``None`` for image-only pipelines.
         audio_sample_rate: Audio sample rate in Hz. Populated by LTX-2 from
             its audio config (no hard-coded literal). ``None`` for pipelines
             without audio.
+        raw_action_dim: Number of action degrees of freedom in the trailing
+            dimension of ``action``. Populated by Cosmos3 action generation.
+            ``None`` when ``action`` is ``None``.
+        action_mode: Requested Cosmos3 action mode (``policy``,
+            ``forward_dynamics``, or ``inverse_dynamics``). ``None`` when
+            action generation was not requested.
+        domain_id: Resolved embodiment domain id for Cosmos3 action
+            generation. ``None`` when action generation was not requested.
         pre_denoise: Wall-clock GPU-stream time (seconds) before the
             denoising loop (text encoding, latent prep, conditioning),
             measured by CUDA events. ``0.0`` if not measured.
@@ -72,8 +86,12 @@ class PipelineOutput:
     image: Optional[torch.Tensor] = None
     video: Optional[torch.Tensor] = None
     audio: Optional[torch.Tensor] = None
+    action: Optional[torch.Tensor] = None
     frame_rate: Optional[float] = None
     audio_sample_rate: Optional[int] = None
+    raw_action_dim: Optional[int] = None
+    action_mode: Optional[str] = None
+    domain_id: Optional[int] = None
     pre_denoise: float = 0.0
     denoise: float = 0.0
     post_denoise: float = 0.0
@@ -201,8 +219,12 @@ def to_visual_gen_output(resp: "DiffusionResponse") -> "VisualGenOutput":
         image=out.image,
         video=out.video,
         audio=out.audio,
+        action=out.action,
         frame_rate=out.frame_rate,
         audio_sample_rate=out.audio_sample_rate,
+        raw_action_dim=out.raw_action_dim,
+        action_mode=out.action_mode,
+        domain_id=out.domain_id,
         metrics=metrics,
     )
 
@@ -245,6 +267,10 @@ def split_visual_gen_output(resp: "DiffusionResponse", batch_size: int) -> List[
         assert out.audio.shape[0] == batch_size, (
             f"audio leading dim {out.audio.shape[0]} != batch_size {batch_size}"
         )
+    if out.action is not None:
+        assert out.action.shape[0] == batch_size, (
+            f"action leading dim {out.action.shape[0]} != batch_size {batch_size}"
+        )
     metrics = VisualGenMetrics(
         generation=resp.generation,
         pre_denoise=out.pre_denoise,
@@ -259,8 +285,12 @@ def split_visual_gen_output(resp: "DiffusionResponse", batch_size: int) -> List[
                 image=out.image[i] if out.image is not None else None,
                 video=out.video[i] if out.video is not None else None,
                 audio=out.audio[i] if out.audio is not None else None,
+                action=out.action[i] if out.action is not None else None,
                 frame_rate=out.frame_rate,
                 audio_sample_rate=out.audio_sample_rate,
+                raw_action_dim=out.raw_action_dim,
+                action_mode=out.action_mode,
+                domain_id=out.domain_id,
                 metrics=metrics,
             )
         )

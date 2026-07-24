@@ -5,13 +5,13 @@
 Two payload formats are supported:
 
 - ``"safetensors"``: writes a single file with named tensors
-  (``image``/``video``/``audio``). Scalar metadata (``frame_rate``,
-  ``audio_sample_rate``) is stored two ways: as a 0-d tensor under
-  the same key (so ``safetensors.torch.load(bytes)`` returns it
-  alongside the media tensors — consumers call ``.item()`` to
-  unbox) and as a stringified value in the file header (preserved
-  for callers using ``safe_open(...).metadata()``). No pickle on
-  load.
+  (``image``/``video``/``audio``/``action``). Numeric scalar metadata
+  (``frame_rate``, ``audio_sample_rate``, ``raw_action_dim``, ``domain_id``)
+  is stored two ways: as a 0-d tensor under the same key (so
+  ``safetensors.torch.load(bytes)`` returns it alongside the media tensors —
+  consumers call ``.item()`` to unbox) and as a stringified value in the file
+  header (preserved for callers using ``safe_open(...).metadata()``). String
+  metadata such as ``action_mode`` is header-only. No pickle on load.
 - ``"pt"``: writes a single file via :func:`torch.save` with the
   same tensor keys plus scalar metadata as native Python values.
   Clients should load with ``torch.load(buf, weights_only=True)``
@@ -49,12 +49,14 @@ def is_tensor_format(fmt: Optional[str]) -> bool:
 # canonical ``(H, W, C)`` shape is unbatched at rank 3 and batched at
 # rank 4; video is unbatched at rank 4 ``(T, H, W, C)`` and batched at
 # rank 5; audio is unbatched at rank 2 ``(channels, T_audio)`` and
-# batched at rank 3. The serializer uses these to decide whether a
+# batched at rank 3; action is unbatched at rank 2 ``(T, action_dim)``
+# and batched at rank 3. The serializer uses these to decide whether a
 # media tensor has a true batch axis to slice along.
 _BATCHED_RANKS: Dict[str, int] = {
     "image": 4,
     "video": 5,
     "audio": 3,
+    "action": 3,
 }
 
 
@@ -63,14 +65,15 @@ def _modalities(output: "VisualGenOutput") -> Tuple[Tuple[str, Optional[torch.Te
         ("image", output.image),
         ("video", output.video),
         ("audio", output.audio),
+        ("action", output.action),
     )
 
 
 def infer_batch_size(output: "VisualGenOutput") -> int:
     """Return the leading batch dimension across the populated media tensors.
 
-    Image is batched only at rank 4, video at rank 5, audio at rank 3.
-    An unbatched media tensor reports a batch size of 1 so list-path
+    Image is batched only at rank 4, video at rank 5, audio and action
+    at rank 3. An unbatched media tensor reports a batch size of 1 so list-path
     callers can still ask for ``[0]`` and get a single-item payload.
     Raises :class:`ValueError` when *output* carries no media tensor.
     """
@@ -143,6 +146,12 @@ def _collect_tensors_and_metadata(
         metadata["frame_rate"] = float(frame_rate)
     if audio_sample_rate is not None:
         metadata["audio_sample_rate"] = int(audio_sample_rate)
+    if output.raw_action_dim is not None:
+        metadata["raw_action_dim"] = int(output.raw_action_dim)
+    if output.domain_id is not None:
+        metadata["domain_id"] = int(output.domain_id)
+    if output.action_mode is not None:
+        metadata["action_mode"] = str(output.action_mode)
 
     return tensors, metadata
 
@@ -202,7 +211,9 @@ def serialize_visual_gen_output(
         # ``loaded["frame_rate"].item()`` directly) and as a string in the
         # file header (preserved for callers that already use
         # ``safe_open(...).metadata()``). The two views always agree.
-        scalar_tensors = {k: torch.as_tensor(v) for k, v in metadata.items()}
+        scalar_tensors = {
+            k: torch.as_tensor(v) for k, v in metadata.items() if isinstance(v, (int, float))
+        }
         return safetensors_save(
             {**tensors, **scalar_tensors},
             metadata={k: str(v) for k, v in metadata.items()},

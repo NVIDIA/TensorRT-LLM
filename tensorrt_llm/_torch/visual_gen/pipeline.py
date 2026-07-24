@@ -1042,8 +1042,11 @@ class BasePipeline(nn.Module):
             guidance_interval: Optional ``(lo, hi)`` scheduler-timestep range in which CFG
                               is active. Outside the interval the effective scale is 1.0
                               (conditional prediction only); both branches still run.
-            post_step_fn: Optional callable applied to latents after each scheduler step.
-                         Signature: post_step_fn(latents) -> latents
+            post_step_fn: Optional callable applied after each scheduler step.
+                         It is invoked as ``post_step_fn(latents,
+                         extra_stream_latents) -> (latents, extra_stream_latents)``,
+                         where ``extra_stream_latents`` is the dict of parallel streams
+                         from ``extra_streams`` (e.g. ``{"action": ...}``).
                          Use for constraints that must hold throughout denoising.
 
         Returns:
@@ -1174,7 +1177,7 @@ class BasePipeline(nn.Module):
             )
 
             if post_step_fn is not None:
-                latents = post_step_fn(latents)
+                latents, extra_stream_latents = post_step_fn(latents, extra_stream_latents)
 
             # Logging
             if self.rank == 0:
