@@ -1,7 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import os
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from itertools import chain
 from typing import Any, Callable, Dict, List, Optional, cast
 
@@ -149,6 +163,48 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         logger.info(f"transfer worker ctx_server_endpoints: {endpoints}")
         logger.info(f"layer_num_per_pp: {layer_num_per_pp}")
         logger.info(f"self._context_info_endpoint: {self._context_info_endpoint}")
+
+    def get_status_dump(self) -> str:
+        """Return a one-line summary of transceiver state for debugging hangs."""
+
+        def summarize(
+            sessions: Dict[int, Any],
+            include_receiver_ready: bool,
+        ) -> str:
+            session_items = list(sessions.copy().items())
+            status_counts = Counter()
+            receiver_ready = 0
+            for _, session in session_items:
+                status = session.status
+                if isinstance(status, SessionStatus):
+                    status_counts[status] += 1
+                else:
+                    status_counts["unknown"] += 1
+
+                if include_receiver_ready:
+                    receiver_ready += int(bool(session.receiver_ready))
+
+            fields = [
+                f"sessions={len(session_items)}",
+                f"init={status_counts[SessionStatus.INIT]}",
+                f"ready_to_transfer={status_counts[SessionStatus.READY]}",
+                f"transferring={status_counts[SessionStatus.TRANSFERRING]}",
+                f"kv_transferred={status_counts[SessionStatus.KV_TRANSFERRED]}",
+                f"fully_transferred={status_counts[SessionStatus.FULLY_TRANSFERRED]}",
+                f"error={status_counts[SessionStatus.ERROR]}",
+                f"cancelled={status_counts[SessionStatus.CANCELLED]}",
+                f"unknown={status_counts['unknown']}",
+            ]
+            if include_receiver_ready:
+                fields.append(f"peer_ready={receiver_ready}/{len(session_items)}")
+            return ", ".join(fields)
+
+        tx_status = summarize(self._send_sessions, include_receiver_ready=True)
+        rx_status = summarize(self._recv_sessions, include_receiver_ready=False)
+        return (
+            f"KV cache transceiver | backend=NIXL | TX({tx_status}) | RX({rx_status}) | "
+            f"waiting_for_peer_info={len(self._wait_reqs)}"
+        )
 
     def shutdown(self):
         if getattr(self, "_shutdown", False):
