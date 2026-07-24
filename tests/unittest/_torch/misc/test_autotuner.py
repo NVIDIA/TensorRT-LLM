@@ -1260,7 +1260,11 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
         f"({sweep_us:.2f} us) for M={m}, N={n}, K={k}")
 
     # The heuristic CuteDSL kernel should beat cuBLAS or be within tolerance.
-    cublas_tolerance = 1.05
+    # This is a cross-library comparison (CuteDSL vs cuBLASLt) at ~28us per call
+    # profiled over only 20 iterations; run-to-run jitter easily reaches a few
+    # percent from DVFS, L2 residency, and interleaving with cuBLAS autotune
+    # warmup, so keep this bound looser than the intra-CuteDSL one above.
+    cublas_tolerance = 1.10
     assert heuristic_us <= cublas_us * cublas_tolerance, (
         f"CuteDSL heuristic kernel ({heuristic_us:.2f} us) is "
         f">{cublas_tolerance:.2f}x slower than cuBLAS NVFP4 "
