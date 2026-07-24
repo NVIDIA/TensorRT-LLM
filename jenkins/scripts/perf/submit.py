@@ -23,6 +23,7 @@ import os
 import re
 
 import yaml
+from cluster_env import get_ucx_tls_cmd, gpu_type_from_stage_name
 
 AGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/aggregated"
 DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
@@ -456,6 +457,13 @@ def main():
         help="1-indexed split group id. Selects the N-th test from the test list.",
     )
     parser.add_argument("--stage-name", default="", help="Stage name (for logging / GPU detect)")
+    parser.add_argument(
+        "--cluster-name",
+        default="",
+        help="Slurm cluster name as resolved by the Jenkins pipeline "
+        "(bloom SlurmPartition.clusterName, e.g. gcp-nrt, aws-cmh). "
+        "Used with the GPU type to pick UCX env settings.",
+    )
 
     args = parser.parse_args()
 
@@ -500,8 +508,7 @@ def main():
     ) = get_pytest_commands(script_prefix_lines, runtime_mode)
     test_output_dir = get_test_output_dir(script_prefix_lines, test_case_name)
 
-    is_gb300 = "GB300" in args.stage_name.upper()
-    is_b200 = "B200" in args.stage_name.upper() and "GB200" not in args.stage_name.upper()
+    gpu_type = gpu_type_from_stage_name(args.stage_name)
 
     if runtime_mode == "aggregated":
         # Aggregated (incl. ctx_only): single pytestCommand built from the
@@ -562,12 +569,8 @@ def main():
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
-        if is_gb300:
-            ucx_tls_cmd = "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
-        elif is_b200:
-            ucx_tls_cmd = "export UCX_TLS=^ib &&"
-        else:
-            ucx_tls_cmd = "unset UCX_TLS UCX_NET_DEVICES &&"
+        ucx_tls_cmd = get_ucx_tls_cmd(args.cluster_name, gpu_type)
+        print(f"UCX env: cluster={args.cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
         ucx_tls_server_cmd = ucx_tls_cmd
 
         pytest_common_vars = ""

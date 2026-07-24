@@ -6,9 +6,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime
 
 import yaml
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from cluster_env import get_ucx_tls_cmd, gpu_type_from_supported_gpus  # noqa: E402
 
 AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
 DISAGG_CONFIG_FOLDER = os.environ.get(
@@ -342,6 +346,26 @@ def partition_has_gpu_gres(partition):
         return False
 
 
+def detect_cluster_name():
+    """Best-effort Slurm cluster name detection on the submission frontend."""
+    name = os.environ.get("SLURM_CLUSTER_NAME", "")
+    if name:
+        return name
+    try:
+        config_out = subprocess.check_output(
+            ["scontrol", "show", "config"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+        for line in config_out.splitlines():
+            if line.strip().startswith("ClusterName"):
+                return line.split("=", 1)[1].strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
 def generate_sbatch_params(args, hardware_config, work_dir):
     """Generate #SBATCH parameters."""
     total_nodes = hardware_config["total_nodes"]
@@ -591,6 +615,14 @@ def main():
         default=8000,
         help="Port the disagg server listens on (exported as DISAGG_SERVER_PORT)",
     )
+    parser.add_argument(
+        "--cluster-name",
+        default="",
+        help="Cluster name used with the GPU type to pick UCX env settings "
+        "(bloom SlurmPartition.clusterName, e.g. gcp-nrt, aws-cmh). If not "
+        "set, best-effort detected from SLURM_CLUSTER_NAME / scontrol; note "
+        "Slurm's own ClusterName may differ from the bloom name.",
+    )
 
     args = parser.parse_args()
 
@@ -652,10 +684,10 @@ def main():
         with open(config_yaml, "r") as f:
             config = yaml.safe_load(f)
 
-    # Detect GPU type from config metadata
+    # Detect GPU type from config metadata; cluster from CLI arg or frontend.
     supported_gpus = config.get("metadata", {}).get("supported_gpus", [])
-    is_b200 = "B200" in supported_gpus
-    is_gb300 = "GB300" in supported_gpus
+    gpu_type = gpu_type_from_supported_gpus(supported_gpus)
+    cluster_name = args.cluster_name or detect_cluster_name()
 
     # Create timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -843,12 +875,8 @@ def main():
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
-        if is_gb300:
-            ucx_tls_cmd = "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
-        elif is_b200:
-            ucx_tls_cmd = "export UCX_TLS=^ib &&"
-        else:
-            ucx_tls_cmd = "unset UCX_TLS UCX_NET_DEVICES &&"
+        ucx_tls_cmd = get_ucx_tls_cmd(cluster_name, gpu_type)
+        print(f"UCX env: cluster={cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
         script_prefix_lines.extend(
             [
                 f'export CTX_WORKER_ENV_VARS="{ctx_worker_env_vars}"',
