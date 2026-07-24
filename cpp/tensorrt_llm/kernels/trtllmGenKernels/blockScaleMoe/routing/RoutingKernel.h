@@ -151,8 +151,8 @@ struct KernelParamsBase
     int32_t mLocalExpertsStrideLog2 = 0;
     int32_t mNumLocalExperts = 0;
 
-    int32_t mNumFusedSharedExperts;
-    int32_t mTotalExpertsPerToken;
+    int32_t mNumFusedSharedExperts = 0;
+    int32_t mTotalExpertsPerToken = 0;
 
     // Public initialization function - make it a template to accept different Data types
     template <typename DataType>

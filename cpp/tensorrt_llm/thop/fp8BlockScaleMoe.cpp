@@ -130,6 +130,13 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
 
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
 
+    // Fused shared experts are appended by the integrated routing kernel (from routing_logits);
+    // that path is skipped when external topk_ids/topk_weights are supplied, which would silently
+    // drop the shared experts. Reject the unsupported combination up front.
+    TORCH_CHECK(num_fused_shared_experts.value_or(0) == 0 || (!topk_ids.has_value() && !topk_weights.has_value()),
+        "Fused shared experts require integrated routing; external topk_ids/topk_weights are not "
+        "supported when num_fused_shared_experts > 0.");
+
     // If both routing inputs are provided, they must be on the same device
     if (routing_logits.has_value() && topk_ids.has_value())
     {
@@ -140,12 +147,10 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 
-    int64_t const num_total_experts
-        = num_experts + (num_fused_shared_experts.value_or(0) > 0 ? num_fused_shared_experts.value() : 0);
-    int64_t const total_experts_per_token
-        = top_k + (num_fused_shared_experts.value_or(0) > 0 ? num_fused_shared_experts.value() : 0);
-    int64_t const num_total_local_experts
-        = local_num_experts + (num_fused_shared_experts.value_or(0) > 0 ? num_fused_shared_experts.value() : 0);
+    TORCH_CHECK(num_fused_shared_experts.value_or(0) >= 0, "num_fused_shared_experts must be non-negative.");
+    int64_t const num_total_experts = num_experts + num_fused_shared_experts.value_or(0);
+    int64_t const total_experts_per_token = top_k + num_fused_shared_experts.value_or(0);
+    int64_t const num_total_local_experts = local_num_experts + num_fused_shared_experts.value_or(0);
 
     // setup args
     // note: the assumption is that output data type is always Bfloat16 (the default)
@@ -388,10 +393,9 @@ public:
         std::optional<int64_t> const numFusedSharedExpert, int64_t hiddenSize, int64_t intermediateSize,
         int64_t numLocalExperts, int64_t numTokens) const
     {
-        int64_t const totalExpertsPerToken
-            = topK + (numFusedSharedExpert.value_or(0) > 0 ? numFusedSharedExpert.value() : 0);
-        int64_t const numTotalLocalExperts
-            = numLocalExperts + (numFusedSharedExpert.value_or(0) > 0 ? numFusedSharedExpert.value() : 0);
+        TORCH_CHECK(numFusedSharedExpert.value_or(0) >= 0, "num_fused_shared_experts must be non-negative.");
+        int64_t const totalExpertsPerToken = topK + numFusedSharedExpert.value_or(0);
+        int64_t const numTotalLocalExperts = numLocalExperts + numFusedSharedExpert.value_or(0);
         // WAR: the small-tile (tileN 8/16) dynB TRTLLM-Gen batched-GEMM cubins flakily hit an
         // illegal memory access (garbage TMA-descriptor pointer, MMU fault in the gemm2 K-loop)
         // when shared experts are fused into the grouped GEMM (num_fused_shared_experts > 0);
@@ -443,10 +447,8 @@ public:
         // Autotuner has requested a default or 'fallback' config index
         if (tileN == -1 || config == -1)
         {
-            int64_t const total_experts_per_token
-                = top_k + (num_fused_shared_experts.value_or(0) > 0 ? num_fused_shared_experts.value() : 0);
-            int64_t const num_total_local_experts
-                = local_num_experts + (num_fused_shared_experts.value_or(0) > 0 ? num_fused_shared_experts.value() : 0);
+            int64_t const total_experts_per_token = top_k + num_fused_shared_experts.value_or(0);
+            int64_t const num_total_local_experts = local_num_experts + num_fused_shared_experts.value_or(0);
 
             auto const num_tokens = hidden_states.sizes()[0];
             auto const hidden_size = hidden_states.sizes()[1];
