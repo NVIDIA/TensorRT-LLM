@@ -893,6 +893,25 @@ class DFlashForCausalLM(nn.Module):
             f"target_layer_ids: {self.target_layer_ids}, block_size: {self.block_size}"
         )
 
+        # DSpark drafters (DFlash + low-rank Markov head + confidence head,
+        # arXiv 2607.05147) load and run through the plain-DFlash path, but
+        # the dspark-specific semantics are NOT implemented: the Markov
+        # intra-block logit bias and confidence-scheduled verification are
+        # skipped (their weights are dropped at load), and the sliding-window
+        # / shift_label draft attention conventions are not applied. Draft
+        # acceptance will be degraded vs the trained drafter's potential.
+        dspark_features = [
+            k for k in ('projector_type', 'markov_rank', 'markov_head_type',
+                        'use_confidence_head', 'use_swa', 'shift_label')
+            if dflash_config.get(k)
+        ]
+        if dspark_features:
+            logger.warning(
+                f"DFlash drafter declares dspark features {dspark_features} "
+                "that this runtime does not implement; running as plain "
+                "DFlash (Markov/confidence heads ignored, no SWA). Expect "
+                "degraded acceptance until dspark support lands.")
+
         self.logits_processor = None  # Set by caller after construction
 
         # RoPE - lazily initialized from draft model's attention module
