@@ -1489,11 +1489,14 @@ class GvrTopKKernel:
         nfull = N >> st2log
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
             nfull = cutlass.Int32(0)
-        it0 = cutlass.Int32(0)
-        while it0 < nfull:
-            ia0 = (it0 * cutlass.Int32(2) * cutlass.Int32(num_threads) + tidx) * cutlass.Int32(
-                vec_w
-            )
+        # software pipeline: the claims are memory-ordered atomics, so
+        # without a preload the next round's vector loads serialize
+        # behind them (the same wall pass 2 hit). Preload round i+1 into
+        # the shadow fragments BEFORE claiming round i, then ping-pong.
+        frag_c = cute.make_fragment((vec_w,), self.dtype)
+        frag_d = cute.make_fragment((vec_w,), self.dtype)
+        if nfull > cutlass.Int32(0):
+            ia0 = tidx * cutlass.Int32(vec_w)
             ib0 = ia0 + cutlass.Int32(step1)
             for _fq in cutlass.range_constexpr(2):
                 fq0 = ia0 if _fq == 0 else ib0
@@ -1508,13 +1511,34 @@ class GvrTopKKernel:
                     cute.make_tensor(pq0, cute.make_layout((vec_w,))),
                     frag_a if _fq == 0 else frag_b,
                 )
+        it0 = cutlass.Int32(0)
+        while it0 < nfull:
+            ia0 = (it0 * cutlass.Int32(2) * cutlass.Int32(num_threads) + tidx) * cutlass.Int32(
+                vec_w
+            )
+            ib0 = ia0 + cutlass.Int32(step1)
+            nxt0 = it0 + cutlass.Int32(1)
+            if nxt0 < nfull:
+                ja0 = (nxt0 * cutlass.Int32(2) * cutlass.Int32(num_threads) + tidx) * cutlass.Int32(
+                    vec_w
+                )
+                jb0 = ja0 + cutlass.Int32(step1)
+                for _fq in cutlass.range_constexpr(2):
+                    fq0 = ja0 if _fq == 0 else jb0
+                    pq0 = cute.make_ptr(
+                        self.dtype,
+                        row_addr + cutlass.Int64(fq0) * cutlass.Int64(elem_bytes),
+                        cute.AddressSpace.gmem,
+                        assumed_align=vec_align,
+                    )
+                    cute.copy(
+                        copy_atom,
+                        cute.make_tensor(pq0, cute.make_layout((vec_w,))),
+                        frag_c if _fq == 0 else frag_d,
+                    )
             # v6: per-element DIRECT atomic claims for passers — smem
-            # atomics do NOT synchronize the warp, so the vector loads of
-            # later rounds keep flowing (the packed shfl-prefix design
-            # capped in-flight loads at 2/warp: ncu showed 0.19% memory
-            # throughput, pure latency bound). Same-address service is
-            # ~0.5ns effective and n0 is line-bounded, so the claim queue
-            # hides completely under the read stream.
+            # atomics do NOT synchronize the warp; with the preload above
+            # they no longer stall the next round's loads either.
             for _jh in cutlass.range_constexpr(2):
                 for _jv in cutlass.range_constexpr(vec_w):
                     v0 = cutlass.Float32(frag_a[_jv]) if _jh == 0 else cutlass.Float32(frag_b[_jv])
@@ -1537,6 +1561,10 @@ class GvrTopKKernel:
                                 c0 = cutlass.Int32(-1)
                             else:
                                 c0 = c0 + cutlass.Int32(1)
+            if nxt0 < nfull:
+                for _jv in cutlass.range_constexpr(vec_w):
+                    frag_a[_jv] = frag_c[_jv]
+                    frag_b[_jv] = frag_d[_jv]
             it0 = it0 + cutlass.Int32(1)
         # scalar tail (< 2*step1 elements): per-element DIRECT atomic
         # claims — divergent-safe, no warp collectives
