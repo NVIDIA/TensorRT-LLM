@@ -540,7 +540,17 @@ def _launch_k4_persistent(
 
     k4_fn = cute_wrappers.get("_k4_fn")
     if k4_fn is None:
-        cache_key = (dev_idx, num_sm)
+        # H and the state K/V dims MUST be in the key: s_ct bakes the inner
+        # [H, K, V] shape and all strides at compile time
+        # (mark_compact_shape_dynamic(mode=0) in _get_buffers), so the
+        # compiled function is head-count-specific. Reusing an H=96-compiled
+        # kernel for a smaller H misaddresses every (seq, head) state tile
+        # (baked mode-0 stride H*K*V) — silently corrupting final_state and,
+        # through the recurrence, O. Observed as the small-H parity
+        # regression whenever another head count compiled first in the same
+        # process (isolated processes were clean). N_seqs and the token/chunk
+        # counts stay runtime — only layout-baked dims belong here.
+        cache_key = (dev_idx, num_sm, H, S_out.shape[-2], V_dim)
         k4_fn = _k4p_cache.get(cache_key)
         if k4_fn is None:
             host_fn = _k4p_make_host(num_sm=num_sm)
