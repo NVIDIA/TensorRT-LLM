@@ -37,6 +37,12 @@ namespace moe::dev::routing
 /// No-op: scores are passed through unchanged.
 struct NoOpPreprocess
 {
+    /// Elementwise: each score is transformed independently of the others.
+    /// Elementwise preprocess policies can run with any expert-to-thread partitioning
+    /// (see routingIndicesCoopBlockKernel); non-elementwise ones (softmax) require the
+    /// one-warp-per-token layout of the classic kernels.
+    static constexpr bool IsElementwise = true;
+
     /// BaseType: when no preprocess is applied, use the input type directly.
     template <typename InputT>
     using BaseType = InputT;
@@ -58,6 +64,9 @@ struct NoOpPreprocess
 /// Softmax: applies softmax over all expert scores before topK selection.
 struct SoftmaxPreprocess
 {
+    /// Softmax couples all scores of a token — NOT elementwise (see NoOpPreprocess).
+    static constexpr bool IsElementwise = false;
+
     /// BaseType: softmax is always computed in float for numerical stability.
     template <typename InputT>
     using BaseType = float;
@@ -80,6 +89,9 @@ struct SoftmaxPreprocess
 /// Sigmoid: applies sigmoid(score) for topK selection (no bias).
 struct SigmoidPreprocess
 {
+    /// Elementwise — see NoOpPreprocess.
+    static constexpr bool IsElementwise = true;
+
     /// BaseType: sigmoid is computed in float for numerical stability.
     template <typename InputT>
     using BaseType = float;
@@ -107,6 +119,9 @@ struct SigmoidPreprocess
 /// Used by DeepSeek-style routing where expert selection is based on biased sigmoid scores.
 struct SigmoidBiasPreprocess
 {
+    /// Elementwise — see NoOpPreprocess.
+    static constexpr bool IsElementwise = true;
+
     /// BaseType: sigmoid is computed in float for numerical stability.
     template <typename InputT>
     using BaseType = float;
@@ -290,6 +305,11 @@ struct ScaledSumNormalizePostprocess
 template <typename PreprocessPolicy_, typename PostprocessPolicy_>
 struct TopKExpertSelect
 {
+    /// Expose the wrapped policies so kernels with a non-standard work partitioning
+    /// (e.g. routingIndicesCoopBlockKernel) can apply them piecewise.
+    using PreprocessPolicy = PreprocessPolicy_;
+    using PostprocessPolicy = PostprocessPolicy_;
+
     /// BaseType: delegated to the preprocess policy.
     template <typename InputT>
     using BaseType = typename PreprocessPolicy_::template BaseType<InputT>;
@@ -371,6 +391,8 @@ static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * Num
 static constexpr int BlockKernelMaxNumTokens = 4;
 static constexpr int DynBlockKernelMaxNumTokens = 16;
 static constexpr int DynBlockKernelMaxNumExperts = 256;
+// Cooperative block kernel: one thread per expert, so at most 1024 experts (1 CUDA block).
+static constexpr int CoopBlockKernelMaxNumExperts = 1024;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

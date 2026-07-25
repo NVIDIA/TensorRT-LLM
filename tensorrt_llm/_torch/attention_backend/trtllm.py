@@ -169,6 +169,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                             init=False,
                                             repr=False)
 
+    # Per-forward-pass staging key for the CuTeDSL MLA generation workspace
+    # (page table + sequence lengths). All MLA layers of one step stage
+    # byte-identical data into the shared workspace, so the first layer
+    # copies and later layers skip. Reset whenever kv lens can change so
+    # eager forwards always re-stage (under CUDA graphs the first layer's
+    # captured copies replay once per step).
+    _cute_dsl_mla_staging_key: Optional[tuple] = field(default=None,
+                                                       init=False,
+                                                       repr=False)
+
     use_paged_context_fmha: bool = field(init=False, default=False, repr=False)
 
     # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
@@ -461,6 +471,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
+        self._cute_dsl_mla_staging_key = None
 
     def update_for_spec_dec(self) -> None:
         # MTP updates kv_lens_cuda in-place between sub-steps, which changes
@@ -468,6 +479,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # so that forward() recomputes it for the next sub-step.
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
+        self._cute_dsl_mla_staging_key = None
 
     def update_helix_param(
         self,
@@ -517,6 +529,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def prepare(self) -> None:
         super().prepare()
+        # New forward pass: the CuTeDSL MLA workspace must be re-staged by
+        # the first generation MLA layer.
+        self._cute_dsl_mla_staging_key = None
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:

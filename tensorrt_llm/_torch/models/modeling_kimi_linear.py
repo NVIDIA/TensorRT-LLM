@@ -39,15 +39,22 @@ executor-provided metadata with ``AttentionInputType.generation_only``.
 
 Parallelism
 -----------
-EP-only: every rank holds the full bf16 non-expert model replicated (no TP on
-any ``nn.Linear``); each MoE layer holds only a contiguous
-``num_experts / ep_size`` slice of the MXFP4 expert bank, where
-``ep_size == mapping.tp_size`` (launch with ``tensor_parallel_size=N``).
-Routing is computed replicated; the routed partial sums are all-reduced in
-the latent space (before ``routed_expert_norm`` / ``routed_expert_up_proj``,
-which are nonlinear/linear layers applied to the full sum). ``lm_head`` uses
-the stock ``LMHead`` (vocab-sharded + gather), so logits are identical on all
-ranks.
+The routed-expert bank supports a configurable MoE TP x EP split
+(``moe_tp_size * moe_ep_size == mapping.tp_size``); the default is EP-only
+(``moe_ep_size == mapping.tp_size``), the historical K3 layout. Under EP each
+MoE layer holds a contiguous ``num_experts / moe_ep_size`` slice of the MXFP4
+expert bank (whole experts); under MoE TP each rank holds ALL experts, with
+w1/w3 column-sharded and w2 row-sharded along the intermediate dim
+(``intermediate / moe_tp_size`` per rank; group-32 MXFP4 packed bytes and
+scales sliced consistently by the stock TRTLLM-Gen quant-method loaders).
+The split is EP-only unless the user sets ``moe_tensor_parallel_size`` /
+``moe_expert_parallel_size`` explicitly (or the ``TLLM_K3_MOE_TP_SIZE`` /
+``TLLM_K3_MOE_EP_SIZE`` env overrides). Routing is computed replicated; the
+routed partial sums — EP partials of whole experts, or TP partials over the
+intermediate shards — are all-reduced in the latent space (before
+``routed_expert_norm`` / ``routed_expert_up_proj``, which are
+nonlinear/linear layers applied to the full sum). ``lm_head`` uses the stock
+``LMHead`` (vocab-sharded + gather), so logits are identical on all ranks.
 
 Speculative decoding: SA (suffix automaton, one-engine, draft-weight-free);
 the KDA/MLA runtimes implement multi-token verification with deferred
@@ -92,6 +99,19 @@ from ..modules.rms_norm import RMSNorm
 from ..utils import ActType_TrtllmGen
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
+
+# A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
+# instead of the min-latency fused GEMM op (read once at import).
+_K3_DISABLE_MIN_LATENCY_LATENT_PROJ = os.environ.get(
+    "TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", "0") == "1"
+
+# Routed-expert MoE TP/EP split overrides (read per model init, not import).
+# Highest precedence; either one may be set alone, the other is derived from
+# tp_size. Without them, an explicit moe_tensor_parallel_size /
+# moe_expert_parallel_size pair from the user config is honored, and the
+# default stays EP-only (moe_ep == tp_size).
+_K3_MOE_TP_ENV = "TLLM_K3_MOE_TP_SIZE"
+_K3_MOE_EP_ENV = "TLLM_K3_MOE_EP_SIZE"
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -242,8 +262,21 @@ class KimiK3MoERuntime(nn.Module):
         situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
         dtype = torch.bfloat16
 
-        # Routing params stay fp32 (scores are computed in fp32).
-        self.gate = KimiK3MoEGate(cfg)
+        # Routing scores stay fp32; with attention-DP off the gate GEMM runs
+        # bf16xbf16 with fp32 accumulate/output (checkpoint stores the gate
+        # weight in bf16; saves a per-layer input cast + fp32 splitK pair on
+        # the bs1 decode path). Under attention-DP the legacy upcast-to-fp32
+        # GEMM is kept: the bf16-input min-latency GEMM's different reduction
+        # order flips borderline top-16 picks (GSM8K 96.7 -> 96.1/96.4,
+        # 3-run bisect on 62b20dd868), and the bs1-latency win is irrelevant
+        # at DEP batch sizes. KIMI_K3_ROUTER_BF16=1/0 forces either path.
+        _router_bf16_env = os.environ.get("KIMI_K3_ROUTER_BF16")
+        _router_bf16 = (_router_bf16_env == "1"
+                        if _router_bf16_env is not None else
+                        not model_config.mapping.enable_attention_dp)
+        self.gate = KimiK3MoEGate(
+            cfg,
+            logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None)
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)
         routed_quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
@@ -331,8 +364,40 @@ class KimiK3MoERuntime(nn.Module):
                                           dtype=dtype)
 
     @staticmethod
+    def _select_moe_tp_ep(mapping: Mapping) -> Tuple[int, int]:
+        """Resolve the routed-expert ``(moe_tp, moe_ep)`` split.
+
+        Precedence:
+
+        1. ``TLLM_K3_MOE_TP_SIZE`` / ``TLLM_K3_MOE_EP_SIZE`` env overrides
+           (either alone; the other is derived from ``tp_size``).
+        2. Explicit ``moe_tensor_parallel_size`` / ``moe_expert_parallel_size``
+           from the user config. Detected via
+           ``mapping.moe_tp_ep_user_specified`` so the auto-resolved mapping
+           default (``moe_tp=tp_size, moe_ep=1``) is NOT mistaken for a TP
+           request.
+        3. Default: EP-only (``moe_tp=1, moe_ep=tp_size``), the historical
+           K3 layout.
+        """
+        tp_size = mapping.tp_size
+        env_tp = os.environ.get(_K3_MOE_TP_ENV)
+        env_ep = os.environ.get(_K3_MOE_EP_ENV)
+        if env_tp is not None or env_ep is not None:
+            moe_tp = int(env_tp) if env_tp is not None else 0
+            moe_ep = int(env_ep) if env_ep is not None else 0
+            if moe_tp <= 0 and moe_ep > 0:
+                moe_tp = tp_size // moe_ep
+            elif moe_ep <= 0 and moe_tp > 0:
+                moe_ep = tp_size // moe_tp
+            return moe_tp, moe_ep
+        if getattr(mapping, "moe_tp_ep_user_specified", False):
+            return mapping.moe_tp_size, mapping.moe_ep_size
+        return 1, tp_size
+
+    @staticmethod
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
-        """Build a private EP-only mapping without mutating the shared config."""
+        """Build a private routed-expert mapping without mutating the shared
+        config. Default split is EP-only; see ``_select_moe_tp_ep``."""
         if model_config.moe_load_balancer is not None:
             raise NotImplementedError(
                 "Kimi K3 packed-checkpoint streaming does not yet support "
@@ -342,10 +407,25 @@ class KimiK3MoERuntime(nn.Module):
         if getattr(mapping, "_dwdp_size", 0) > 1:
             raise NotImplementedError("Kimi K3 packed-checkpoint streaming does not support DWDP.")
 
+        moe_tp, moe_ep = KimiK3MoERuntime._select_moe_tp_ep(mapping)
+        if moe_tp < 1 or moe_ep < 1 or moe_tp * moe_ep != mapping.tp_size:
+            raise ValueError(
+                f"Kimi K3 routed MoE split moe_tp={moe_tp} x moe_ep={moe_ep} "
+                f"must multiply to tp_size={mapping.tp_size}.")
+        if moe_tp > 1 and mapping.enable_attention_dp:
+            raise NotImplementedError(
+                "Kimi K3 MoE tensor parallelism requires "
+                "enable_attention_dp=false (the attention-DP dispatch/combine "
+                "path is validated for EP-only splits).")
+        logger.info_once(
+            f"Kimi K3 routed MoE parallelism: moe_tp={moe_tp}, "
+            f"moe_ep={moe_ep} (tp_size={mapping.tp_size})",
+            key="kimi_k3_moe_tp_ep_split")
+
         mapping_dict = mapping.to_dict()
         mapping_dict["moe_cluster_size"] = 1
-        mapping_dict["moe_tp_size"] = 1
-        mapping_dict["moe_ep_size"] = mapping.tp_size
+        mapping_dict["moe_tp_size"] = moe_tp
+        mapping_dict["moe_ep_size"] = moe_ep
         routed_mapping = Mapping.from_dict(mapping_dict)
 
         routed_model_config = copy.copy(model_config)
@@ -363,7 +443,19 @@ class KimiK3MoERuntime(nn.Module):
         router_logits = self.gate.compute_logits(hidden_states)
 
         def _routed_output():
-            routed_in = self.routed_expert_down_proj(hidden_states)
+            # Latent down/up projections via the min-latency fused GEMM op:
+            # at <=16 tokens (decode graphs) it runs a single pipelined
+            # bf16 kernel per projection instead of cuBLAS's split-K GEMV +
+            # splitKreduce pair (~17+3.6us -> ~8us for 7168->3584 at M=1);
+            # for larger token counts the op falls back to cuBLAS internally.
+            # TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ=1 restores nn.Linear
+            # (A/B escape hatch).
+            if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ:
+                routed_in = self.routed_expert_down_proj(hidden_states)
+            else:
+                routed_in = torch.ops.trtllm.dsv3_fused_a_gemm_op(
+                    hidden_states, self.routed_expert_down_proj.weight.t(),
+                    None, None)
             y = self.routed_experts(
                 routed_in,
                 router_logits,
@@ -372,7 +464,10 @@ class KimiK3MoERuntime(nn.Module):
             # EP partial latent sums are completed by the wrapper's own
             # reduction BEFORE the (nonlinear) latent norm.
             y = self.routed_expert_norm(y)
-            return self.routed_expert_up_proj(y)
+            if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ:
+                return self.routed_expert_up_proj(y)
+            return torch.ops.trtllm.dsv3_fused_a_gemm_op(
+                y, self.routed_expert_up_proj.weight.t(), None, None)
 
         # Shared experts are replicated (computed once per rank) and depend
         # only on the block input, not on the routed dispatch/expert/combine
@@ -456,6 +551,60 @@ class KimiKDARuntime(nn.Module):
             use_optimized_decode=True,
         )
         self.proj_size = (num_heads // self._kda_tp_size) * lin["head_dim"]
+        # Decode fast-path constants, built once by
+        # ``finalize_decode_weights()`` after checkpoint load:
+        # fused in-projection weight + kernel-layout conv weights + fp32
+        # copies of the small parameters. ``None`` routes decode through
+        # the reference (module-level) path.
+        self._in_proj_weight: Optional[torch.Tensor] = None
+        self._w_q_t = self._w_k_t = self._w_v_t = None
+        self._A_log_f32 = self._dt_bias_f32 = self._onorm_w_f32 = None
+        # Persistent batch-row-dense staging for the fused decode kernel's
+        # per-section conv windows (lazily sized to the pool slot count).
+        self._cs_dense: Optional[torch.Tensor] = None
+
+    def finalize_decode_weights(self) -> None:
+        """Build the decode fast-path constants (once, after weight load).
+
+        1. Fused in-projection ``[q | k | v | g | f_a | b]``: all six
+           projections consume the same hidden state, so one GEMV replaces
+           five GEMV+splitK-reduce pairs plus a cublas dot per layer per
+           decode step. The source parameters are repointed to row views
+           of the fused buffer (no extra memory; prefill/verify paths keep
+           using them unchanged).
+        2. Kernel-layout constants that ``_decode_via_optimized`` used to
+           rebuild with ~6 device kernels per layer per decode step:
+           transposed conv weights (bf16 ``[W, D]``) and fp32 copies of
+           ``A_log`` / ``dt_bias`` / ``o_norm.weight``.
+        """
+        mixer = self.mixer
+        if (mixer._dispatch.decode_kernel_path != "optimized"
+                or not mixer.use_full_rank_gate):
+            return
+        if mixer.q_proj.weight.device.type != "cuda":
+            return
+        with torch.no_grad():
+            mods = (mixer.q_proj, mixer.k_proj, mixer.v_proj, mixer.g_proj,
+                    mixer.f_a_proj, mixer.b_proj)
+            fused = torch.cat([m.weight.data for m in mods],
+                              dim=0).contiguous()
+            off = 0
+            for m in mods:
+                n = m.weight.shape[0]
+                m.weight.data = fused[off:off + n]
+                off += n
+            self._w_q_t = (mixer.q_conv1d.weight.detach().squeeze(1).transpose(
+                0, 1).to(torch.bfloat16).contiguous())
+            self._w_k_t = (mixer.k_conv1d.weight.detach().squeeze(1).transpose(
+                0, 1).to(torch.bfloat16).contiguous())
+            self._w_v_t = (mixer.v_conv1d.weight.detach().squeeze(1).transpose(
+                0, 1).to(torch.bfloat16).contiguous())
+            self._A_log_f32 = mixer.A_log.detach().float().contiguous()
+            self._dt_bias_f32 = mixer.dt_bias.detach().float().contiguous()
+            self._onorm_w_f32 = (
+                mixer.o_norm.weight.detach().float().contiguous())
+            # Publish last: `_in_proj_weight is not None` gates the fast path.
+            self._in_proj_weight = fused
 
     def forward(self, hidden_states: torch.Tensor,
                 attn_metadata: AttentionMetadata) -> torch.Tensor:
@@ -465,8 +614,12 @@ class KimiKDARuntime(nn.Module):
         num_prefills = attn_metadata.num_contexts
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         batch_size = attn_metadata.seq_lens.shape[0]
-        # index_copy_/index_select need int64 indices.
-        state_indices = mamba_metadata.state_indices[:batch_size].long()
+        # index_copy_/index_select need int64 indices; the int64 mirror is
+        # prepared once per step by Mamba2Metadata.prepare() so KDA layers
+        # do not each replay an int32->int64 cast inside the decode graph.
+        state_indices = getattr(mamba_metadata, "state_indices_long", None)
+        if state_indices is None or state_indices.shape[0] != batch_size:
+            state_indices = mamba_metadata.state_indices[:batch_size].long()
         cu_seqlens = mamba_metadata.query_start_loc_long[:num_prefills + 1]
         num_decodes = batch_size - num_prefills
 
@@ -497,6 +650,7 @@ class KimiKDARuntime(nn.Module):
                         conv_pool,
                         ssm_pool,
                         state_indices[num_prefills:],
+                        mamba_metadata,
                         layer_cache,
                     ))
             else:
@@ -629,7 +783,132 @@ class KimiKDARuntime(nn.Module):
         return self._output_gate_and_proj(x, o)
 
     def _forward_decode(self, x2d, conv_pool, ssm_pool, slot_indices,
-                        layer_cache=None) -> torch.Tensor:
+                        mamba_metadata=None, layer_cache=None) -> torch.Tensor:
+        """Plain T=1 decode, fast path.
+
+        Calls ``trtllm::kda_decode`` directly with kernel-native layouts
+        (nsys 07-24: the reference path spent ~70 us/layer on glue around
+        the 5 us kernel — 6 separate in-projection GEMV pairs, per-step
+        re-transposition of constant weights, conv-window slice/roll
+        copies, per-call torch.arange defaults, and redundant dtype
+        casts):
+
+        * one fused in-projection GEMV (``finalize_decode_weights``);
+        * conv windows staged with one gather + one repack copy into a
+          persistent dense per-section buffer;
+        * conv-pool write-back with one cat + one index_copy_;
+        * constant tensors (transposed conv weights, fp32 A_log/dt_bias/
+          o_norm weight) reused instead of rebuilt per step.
+
+        NOTE: every compiled launch of the decode kernel uses the static
+        layout (``slot = bos = batch row``; ``ssm_state_indices`` /
+        ``cu_seqlens`` are dead), so state and conv windows must be
+        gathered batch-row-dense here. Passing the pools directly (saving
+        the fp32 state gather+scatter, ~5 us/layer) needs a CUDA-side
+        dynamic-layout dispatch flag — documented follow-up.
+        """
+        mixer = self.mixer
+        if (self._in_proj_weight is None or mamba_metadata is None
+                or ssm_pool.dtype != torch.float32):
+            return self._forward_decode_ref(x2d, conv_pool, ssm_pool,
+                                            slot_indices, layer_cache)
+
+        d = self.proj_size
+        hd = mixer.head_dim
+        H = mixer.num_heads
+        B = x2d.shape[0]
+        W = mixer.conv_size
+
+        # Allocated ONCE at the pool slot count (== per-rank max batch on
+        # the Mixed manager) and never reallocated: captured CUDA graphs
+        # hold this pointer, so a later realloc would leave earlier graphs
+        # writing into freed memory. Footprint: slots x ~9(H=6)..222(H=96)
+        # KB per layer.
+        buf = self._cs_dense
+        if buf is None or buf.shape[1] < B:
+            if torch.cuda.is_current_stream_capturing():
+                # Never allocate inside CUDA graph capture; the reference
+                # path is capture-safe (just slower).
+                return self._forward_decode_ref(x2d, conv_pool, ssm_pool,
+                                                slot_indices, layer_cache)
+            buf = torch.empty(3,
+                              max(conv_pool.shape[0], B),
+                              d,
+                              W - 1,
+                              dtype=torch.bfloat16,
+                              device=x2d.device)
+            self._cs_dense = buf
+
+        # One GEMV over [q | k | v | g | f_a | b]; slices below are views.
+        proj = torch.nn.functional.linear(x2d, self._in_proj_weight)
+        x_qkv = proj[:, :3 * d]
+        onorm_g = proj[:, 3 * d:4 * d]
+        f_a = proj[:, 4 * d:4 * d + hd]
+        beta = proj[:, 4 * d + hd:4 * d + hd + H]
+        g = mixer.f_b_proj(f_a)  # [B, d]
+
+        # Gather the HF-layout conv windows once, then repack the
+        # historical W-1 columns into the kernel's dense per-section
+        # [B, d, W-1] layout (single strided copy kernel).
+        cs = conv_pool.index_select(0, slot_indices)  # [B, 3d, W]
+        cs_dense = buf[:, :B]
+        cs_dense.copy_(cs.view(B, 3, d, W)[:, :, :, 1:].permute(1, 0, 2, 3))
+
+        # Recurrent state: gathered batch-row-dense copy, updated in place
+        # by the kernel, written back below.
+        state = ssm_pool.index_select(0, slot_indices)
+
+        o = mixer._dispatch.decode_kda(
+            x_q=x_qkv[:, :d].unflatten(-1, (H, hd)).unsqueeze(0),
+            x_k=x_qkv[:, d:2 * d].unflatten(-1, (H, hd)).unsqueeze(0),
+            x_v=x_qkv[:, 2 * d:].unflatten(-1, (H, hd)).unsqueeze(0),
+            w_q_t=self._w_q_t,
+            w_k_t=self._w_k_t,
+            w_v_t=self._w_v_t,
+            bias_q=None,
+            bias_k=None,
+            bias_v=None,
+            cs_q=cs_dense[0],
+            cs_k=cs_dense[1],
+            cs_v=cs_dense[2],
+            A_log=self._A_log_f32,
+            g=g.unflatten(-1, (H, hd)).unsqueeze(0),
+            dt_bias=self._dt_bias_f32,
+            beta=beta.unsqueeze(0),
+            state=state,
+            onorm_g=onorm_g.unflatten(-1, (H, hd)).unsqueeze(0),
+            onorm_weight=self._onorm_w_f32,
+            out=None,
+            # Dead in the static-layout kernel; persistent buffers keep
+            # the wrapper from launching torch.arange every call.
+            ssm_state_indices=mamba_metadata._arange_buffer[:B],
+            cu_seqlens=mamba_metadata._arange_buffer[:B + 1],
+            scale=hd**-0.5,
+            onorm_eps=mixer.o_norm.eps,
+            lower_bound=mixer.gate_lower_bound,
+            use_beta_sigmoid_in_kernel=True,
+            verbose=False,
+            update_conv_cache=False,
+        )
+        ssm_pool.index_copy_(0, slot_indices, state)
+
+        # Roll the HF-layout conv pool by one token: new window =
+        # [old columns 1..W-1, x_new]. One cat + one scatter.
+        new_win = torch.cat([cs[:, :, 1:], x_qkv.unsqueeze(-1)], dim=-1)
+        if new_win.dtype != conv_pool.dtype:
+            new_win = new_win.to(conv_pool.dtype)
+        conv_pool.index_copy_(0, slot_indices, new_win)
+        # Fused-verify replay caches (spec decoding only): keep the
+        # committed conv window in sync with the plain-decode advance.
+        self._sync_kda_replay_conv_window(layer_cache, slot_indices,
+                                          new_win[:, :d],
+                                          new_win[:, d:2 * d],
+                                          new_win[:, 2 * d:])
+
+        return mixer.o_proj(o.view(B, d))
+
+    def _forward_decode_ref(self, x2d, conv_pool, ssm_pool, slot_indices,
+                            layer_cache=None) -> torch.Tensor:
         from ..modules.kimi_kda.kimi_kda_mixer import KimiKDACachedState
 
         mixer = self.mixer
@@ -1327,7 +1606,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
 
     # ------------------------------------------------------------------
     # Weight loading (streams the 1.5TB checkpoint; only the rank-local
-    # expert slice of each MoE layer is read).
+    # expert slice of each MoE layer is kept: whole experts under MoE EP,
+    # the intra-expert intermediate shard of ALL experts under MoE TP —
+    # in the TP case every expert tensor is read and sliced, so expect a
+    # correspondingly longer load).
     # ------------------------------------------------------------------
 
     def checkpoint_name_plan(self, prefix: str):
@@ -1365,7 +1647,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
             else:
                 expected_keys.add(ckpt_key)
 
-        # Backend-owned expert slots (per-expert checkpoint tensors, EP-sliced).
+        # Backend-owned expert slots (per-expert checkpoint tensors; the
+        # rank-local id range — an EP slice of whole experts, or ALL experts
+        # when the routed MoE is TP-sharded (moe_ep=1 -> ids 0..num_experts)).
         expert_jobs = []
         for layer_idx, layer in enumerate(self.model.layers):
             if not getattr(layer, "is_moe", False):
@@ -1717,6 +2001,17 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
                     f"slots; missing {missing_slots[:10]}."
                 )
             backend._weights_transformed = False
+
+        # Build the KDA decode fast-path constants (fused in-projection
+        # weight views + kernel-layout conv weights + fp32 params). Must
+        # run after every KDA parameter is loaded/sharded.
+        num_kda_fused = 0
+        for layer in self.model.layers:
+            if getattr(layer, "is_kda", False):
+                layer.self_attn.finalize_decode_weights()
+                num_kda_fused += int(
+                    layer.self_attn._in_proj_weight is not None)
         logger.info(
             f"Kimi K3: loaded {len(param_jobs)} parameters and the expert "
-            f"slices of {len(expert_jobs)} MoE layers")
+            f"slices of {len(expert_jobs)} MoE layers; fused decode "
+            f"in-projections on {num_kda_fused} KDA layers")

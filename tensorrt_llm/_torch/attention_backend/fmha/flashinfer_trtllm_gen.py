@@ -151,6 +151,7 @@ def _prepare_cute_dsl_mla_buffers(
     block_tables: torch.Tensor,
     sequence_lengths: torch.Tensor,
     padded_num_pages: int,
+    skip_copy: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if block_tables.size(-1) > padded_num_pages:
         raise RuntimeError("CuTeDSL MLA page table exceeds its pre-allocated shape.")
@@ -165,14 +166,16 @@ def _prepare_cute_dsl_mla_buffers(
     page_table_storage = (
         workspace_bytes[:page_table_bytes].view(torch.int32).view(batch_size, padded_num_pages)
     )
-    page_table_storage.zero_()
-    page_table_storage[:, : block_tables.size(-1)].copy_(block_tables[:, 0, :])
+    if not skip_copy:
+        page_table_storage.zero_()
+        page_table_storage[:, : block_tables.size(-1)].copy_(block_tables[:, 0, :])
 
     sequence_lengths_storage = workspace_bytes[
         sequence_lengths_offset:kernel_workspace_offset
     ].view(torch.int32)
     aligned_sequence_lengths = sequence_lengths_storage[:batch_size]
-    aligned_sequence_lengths.copy_(sequence_lengths.flatten()[:batch_size])
+    if not skip_copy:
+        aligned_sequence_lengths.copy_(sequence_lengths.flatten()[:batch_size])
 
     kernel_workspace_bytes = (workspace_bytes.numel() - kernel_workspace_offset) // 4 * 4
     kernel_workspace = workspace_bytes[
@@ -1306,7 +1309,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
 
         pages_per_superblock = 128 // params.tokens_per_block
-        if pages_per_superblock > 1:
+        if pages_per_superblock > 1 and self._mla_backend != "cute-dsl":
+            # The cute-dsl branch stages the page table into a
+            # zero-initialized workspace region already padded to
+            # ``padded_num_pages`` below, so padding here would launch a
+            # redundant device kernel per layer.
             num_blocks = block_tables.size(-1)
             remainder = num_blocks % pages_per_superblock
             if remainder != 0:
@@ -1360,12 +1367,42 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             padded_num_pages = (
                 math.ceil(block_tables.size(-1) / pages_per_superblock) * pages_per_superblock
             )
+            # Every MLA layer of one forward step shares this metadata, its
+            # workspace, and (for a single paged pool) identical block tables
+            # and sequence lengths — so the staged copies are byte-identical
+            # across layers. Stage once per step: the first generation-only
+            # call copies, subsequent layers with a matching key skip the 3
+            # copy kernels. ``prepare()`` / ``update_spec_dec_param`` reset
+            # the key each step so eager forwards always re-stage; under CUDA
+            # graphs the first layer's captured copies replay once per step.
+            # The capture flag is part of the key: CUDA-graph capture is
+            # preceded by warmup forwards on the same metadata without an
+            # intervening prepare(), and the capture pass MUST re-record the
+            # staging copies (a skip would freeze stale page tables into the
+            # graph).
+            staging_key = (
+                torch.cuda.is_current_stream_capturing(),
+                params.workspace.data_ptr(),
+                block_tables.data_ptr(),
+                tuple(block_tables.shape),
+                params.sequence_lengths.data_ptr(),
+                params.seq_offset,
+                batch_beam,
+                padded_num_pages,
+            )
+            skip_staging_copy = (
+                meta.num_contexts == 0
+                and getattr(meta, "_cute_dsl_mla_staging_key", None) == staging_key
+            )
             workspace_buffer, block_tables, sequence_lengths = _prepare_cute_dsl_mla_buffers(
                 params.workspace,
                 block_tables,
                 params.sequence_lengths,
                 padded_num_pages,
+                skip_copy=skip_staging_copy,
             )
+            if meta.num_contexts == 0:
+                meta._cute_dsl_mla_staging_key = staging_key
             uses_shared_paged_kv_idx = True
         else:
             sequence_lengths = params.sequence_lengths

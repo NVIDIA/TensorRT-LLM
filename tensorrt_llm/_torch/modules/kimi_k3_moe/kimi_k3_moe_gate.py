@@ -57,6 +57,7 @@ class KimiK3MoEGate(nn.Module):
         softmax_routing_mutation: bool = False,
         biased_weights_mutation: bool = False,
         omit_renormalize_mutation: bool = False,
+        logits_gemm_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -74,7 +75,19 @@ class KimiK3MoEGate(nn.Module):
         )
 
         # Same parameter shapes / names as HF ``KimiMoEGate``.
-        self.weight = nn.Parameter(torch.empty((self.num_experts, self.gating_dim)))
+        #
+        # ``logits_gemm_dtype=torch.bfloat16`` stores the gate weight in
+        # bf16 and runs the logits GEMM as a single bf16xbf16 kernel with
+        # fp32 accumulate/output (``trtllm::dsv3_router_gemm_op``). The K3
+        # checkpoint stores this weight in bf16, so the fp32 master was an
+        # exact upcast and bf16 storage is lossless; this removes the
+        # per-layer bf16->fp32 input cast + fp32 splitK-reduce that ran
+        # inside the decode CUDA graph (~5 us x 92 layers per step).
+        # Default ``None`` keeps the legacy fp32 GEMM (module parity tests).
+        weight_dtype = logits_gemm_dtype or torch.float32
+        self.weight = nn.Parameter(
+            torch.empty((self.num_experts, self.gating_dim), dtype=weight_dtype)
+        )
         self.e_score_correction_bias = nn.Parameter(torch.empty(self.num_experts))
 
         self.softmax_routing_mutation = softmax_routing_mutation
@@ -94,11 +107,24 @@ class KimiK3MoEGate(nn.Module):
         Used when the MoE block is hosted under ``ConfigurableMoE``: the
         post-linear gate math (sigmoid, bias-for-selection, renormalize,
         ``routed_scaling_factor``) runs inside the wrapper's routing method
-        per chunk; only the fp32 gate GEMM stays here, keeping the
-        checkpoint parameter mapping identity.
+        per chunk; only the gate GEMM stays here, keeping the checkpoint
+        parameter mapping identity.
         """
+        hidden_2d = hidden_states.reshape(-1, self.gating_dim)
+        if (self.weight.dtype == torch.bfloat16
+                and hidden_2d.dtype == torch.bfloat16):
+            # Single bf16xbf16 -> fp32 GEMM (fp32 accumulate); no input
+            # upcast kernel, no fp32 splitK-reduce. K3's 896 experts miss
+            # the op's specialized 256-expert kernels and take its cublas
+            # path, which is the point here (one fused kernel).
+            return torch.ops.trtllm.dsv3_router_gemm_op(
+                hidden_2d.contiguous(),
+                self.weight.t(),
+                bias=None,
+                out_dtype=torch.float32,
+            )
         return torch.nn.functional.linear(
-            hidden_states.reshape(-1, self.gating_dim).type(torch.float32),
+            hidden_2d.type(torch.float32),
             self.weight.type(torch.float32),
             None,
         )
