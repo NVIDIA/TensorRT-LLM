@@ -777,7 +777,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 spec_metadata.temperatures[:num_flat_tokens],
                 top_ks,
                 spec_metadata.top_ps[:num_flat_tokens],
-                min_p=spec_metadata.min_ps[:num_flat_tokens],
+                min_p=(
+                    None if spec_metadata.skip_min_p else spec_metadata.min_ps[:num_flat_tokens]
+                ),
                 seed=self.seed,
                 offset=self.offset,
             )
@@ -886,7 +888,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 spec_metadata.temperatures[:num_contexts],
                 top_ks_ctx,
                 spec_metadata.top_ps[:num_contexts],
-                min_p=spec_metadata.min_ps[:num_contexts],
+                min_p=(None if spec_metadata.skip_min_p else spec_metadata.min_ps[:num_contexts]),
                 seed=self.seed,
                 offset=self.offset,
             )
@@ -911,7 +913,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             temps = spec_metadata.request_temperatures[gen_slice]
             top_ks_rej = spec_metadata.request_top_ks[gen_slice]
             top_ps_rej = spec_metadata.request_top_ps[gen_slice]
-            min_p_rej = spec_metadata.request_min_p[gen_slice]
+            min_p_rej = None if spec_metadata.skip_min_p else spec_metadata.request_min_p[gen_slice]
 
             slot_storage = spec_tree_manager.slot_storage
             gen_slot_ids = slot_storage.all_ids_buf[num_contexts : num_contexts + num_gens]

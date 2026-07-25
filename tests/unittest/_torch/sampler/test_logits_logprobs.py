@@ -778,6 +778,8 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
                     group_logit_indices=None,
                     top_k=torch.tensor([topk], dtype=torch.int32, device="cuda"),
                     top_p=torch.tensor([topp], dtype=torch.float32, device="cuda"),
+                    # None disables the min-p stage; no request here sets min_p.
+                    min_p=None,
                     temperature=torch.tensor([temperature], dtype=torch.float32, device="cuda"),
                     generator=None,
                 )

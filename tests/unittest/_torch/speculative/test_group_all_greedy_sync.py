@@ -102,6 +102,21 @@ def test_min_p_only_request_is_not_greedy():
     assert meta.skip_top_p is True
 
 
+def test_capture_override_keeps_min_p_disabled():
+    # The captured advanced-sampling graph must bake the min_p-free kernel
+    # variant: maybe_get_cuda_graph routes min_p batches to eager, so a
+    # capture-time skip_min_p of False would both trip that gate (skipping the
+    # capture) and record kernels no replaying batch can use. The other filters
+    # stay forced on so the graph covers the advanced path.
+    meta = _fake_meta(force_capture=True)
+    _scan(meta, [_fake_request(min_p=0.1)])
+    assert meta.is_all_greedy_sample is False
+    assert meta.skip_min_p is True
+    assert meta.skip_temperature is False
+    assert meta.skip_top_k is False
+    assert meta.skip_top_p is False
+
+
 def test_min_p_zero_stays_greedy():
     # min_p == 0 disables min_p; an otherwise-unset request stays greedy.
     meta = _fake_meta(group_all_greedy_sample=None)

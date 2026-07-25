@@ -1106,19 +1106,27 @@ def sampling_batch_spec_dec_one_model(
     offset: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CUDA-graph compatible sampling; supports mixed sampling params. Returns sampled tokens."""
-    # Greedy rows (temperature <= threshold) must return the argmax token, not a
-    # sample from the temperature-scaled distribution. Capture the argmax from the
-    # *original* logits up front and restore those rows via torch.where below.
-    # flashinfer has no fused top_k+top_p+min_p kernel, so route through the probs
-    # pipeline (stable softmax + top_k/top_p/min_p renorm) shared with the rejection
-    # path; min_p=0 makes the min-p stage a no-op. All ops are branch-free, so this
-    # stays CUDA-graph safe.
+    top_k = sanitize_top_k(top_k, logits.shape[-1])
+    # Greedy rows (temperature <= threshold) reduce to top_k=1 sampling: flashinfer
+    # then deterministically returns the max-probability token, i.e. the argmax of
+    # the original logits. All ops are branch-free, so this stays CUDA-graph safe.
     is_greedy = temperatures <= vanilla.GREEDY_TEMPERATURE_THRESHOLD
     top_k = torch.where(is_greedy, torch.ones_like(top_k), top_k)
     top_p = torch.where(is_greedy, torch.ones_like(top_p), top_p)
+    if min_p is None:
+        # No request in the batch uses min_p: mainline fast path (single fused
+        # kernel, no probs materialization). The only variant a CUDA graph
+        # captures -- min-p batches are gated to eager in maybe_get_cuda_graph,
+        # since the two branches bake different kernels into the graph.
+        logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
+        return flashinfer.top_k_top_p_sampling_from_logits_op(
+            logits, top_k, top_p, seed=seed, offset=offset
+        )
+    # min_p active: flashinfer has no fused top_k+top_p+min_p kernel, so route
+    # through the probs pipeline (top_k/top_p/min_p renorm) shared with the
+    # rejection path.
     probs = compute_probs_from_logits(logits, temperatures, top_k, top_p, min_p)
-    sampled = flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
-    return sampled
+    return flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
 
 
 @torch.compile(options={"max-autotune": True})

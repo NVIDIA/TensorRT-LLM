@@ -848,14 +848,18 @@ class SpecMetadata:
         # graph for the (is_all_greedy_sample=False) key gets captured. Dummy
         # warmup requests carry no sampling params, so substitute synthetic
         # non-greedy scalars to populate the GPU buffers.
+        # min_p stays disabled: batches that use it are routed to eager by
+        # maybe_get_cuda_graph, so the captured graph must bake the min_p-free
+        # kernel variant -- and leaving skip_min_p False here would trip that
+        # same gate and skip the capture entirely.
         if getattr(self, '_force_non_greedy_for_capture', False):
             self.skip_temperature = False
             self.skip_top_k = False
             self.skip_top_p = False
-            self.skip_min_p = False
+            self.skip_min_p = True
             self.is_all_greedy_sample = False
             per_request_normalized = [
-                (0.7, 50, 0.9, 0.1, num_tokens)
+                (0.7, 50, 0.9, DISABLE_MINP_VAL, num_tokens)
                 for (*_, num_tokens) in per_request_normalized
             ]
 
@@ -1549,7 +1553,10 @@ class SpecWorkerBase(nn.Module, ABC):
         temperatures = spec_metadata.request_temperatures[:batch_size]
         top_ks = spec_metadata.request_top_ks[:batch_size]
         top_ps = spec_metadata.request_top_ps[:batch_size]
-        min_ps = spec_metadata.request_min_p[:batch_size]
+        # None when no request uses min_p, so the kernel takes the fused fast
+        # path -- the only variant a CUDA graph ever captures.
+        min_ps = (None if spec_metadata.skip_min_p else
+                  spec_metadata.request_min_p[:batch_size])
 
         self._update_advance_draft_sampling_seed(logits.device)
         if spec_metadata.use_rejection_sampling and draft_step is not None:
@@ -1957,8 +1964,8 @@ class SpecWorkerBase(nn.Module, ABC):
             num_contexts:batch_size].repeat_interleave(K)
         top_ps = spec_metadata.request_top_ps[
             num_contexts:batch_size].repeat_interleave(K)
-        min_ps = spec_metadata.request_min_p[
-            num_contexts:batch_size].repeat_interleave(K)
+        min_ps = (None if spec_metadata.skip_min_p else spec_metadata.
+                  request_min_p[num_contexts:batch_size].repeat_interleave(K))
 
         self._update_advance_draft_sampling_seed(gen_logits.device)
         flat_logits = gen_logits.reshape(num_gens * K, vocab)
@@ -2243,7 +2250,8 @@ class SpecWorkerBase(nn.Module, ABC):
             temperatures = spec_metadata.temperatures[:num_tokens]
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
-            min_ps = spec_metadata.min_ps[:num_tokens]
+            min_ps = (None if spec_metadata.skip_min_p else
+                      spec_metadata.min_ps[:num_tokens])
 
             # Lazily initialize seed/offset tensors on correct device
             if self.seed is None:
