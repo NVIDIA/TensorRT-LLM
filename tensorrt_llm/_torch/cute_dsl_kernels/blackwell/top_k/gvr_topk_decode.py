@@ -1242,6 +1242,7 @@ class GvrTopKKernel:
         seed_thr_row,  # [3] fp32 closed-loop lines, ascending t0 < t1 < t2
         smem_keys,  # [seg_total] fp32 value segments (A @0 / B @segA / C @2segA)
         cand_idx_row,  # [seg_total] int32 gmem POSITION column (write-only here)
+        block_max_row,  # [nb_pad] fp32 per-32-position maxima, or None
         s_seg,  # [>=7] int32 scratch (reuses smem_wcnt_p1: P1 never runs
         #         on a row this phase succeeded on): [0..2] A/B/C claim
         #         cursors, [3] void, [4] n0, [5] n1, [6] n2
@@ -1280,6 +1281,61 @@ class GvrTopKKernel:
         t1_s = seed_thr_row[1]
         t2_s = seed_thr_row[2]
         row_addr = input_row.iterator.toint()
+        # ---- stage-2 BLOCK-SKIP variant: the GEMM tail left per-32-
+        # position maxima; a block whose max < t0 contributes nothing to
+        # any count or segment, so it is never read. One warp per block:
+        # the bmax compare is warp-uniform (all lanes read the same
+        # scalar), a passing block is one coalesced 128B load, claims
+        # are the same non-synchronizing per-element atomics as the
+        # dense loop - so the block loop needs no uniform trip counts.
+        if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
+            # v8.2: 8 blocks per warp iteration. Every lane vector-loads
+            # the SAME 8 bmax values (L1 broadcast - the pass decisions
+            # are warp-uniform registers), then the passing blocks are
+            # loaded back-to-back (independent 128B coalesced loads, so
+            # the memory level parallelism the naive one-block loop
+            # lacked is restored; at high skip rates an iteration is
+            # just the one 32B bmax vector).
+            bm_addr = block_max_row.iterator.toint()
+            nb0 = (N + cutlass.Int32(31)) >> cutlass.Int32(5)
+            nwp = cutlass.const_expr(self.num_warps)
+            frag_m = cute.make_fragment((8,), cutlass.Float32)
+            bg0 = warp_id * cutlass.Int32(8)
+            while bg0 < nb0:
+                for _jm in cutlass.range_constexpr(8):
+                    frag_m[_jm] = cutlass.Float32(self.NEG_FLT_MAX)
+                    if bg0 + cutlass.Int32(_jm) < nb0:
+                        bps = cute.make_ptr(
+                            cutlass.Float32,
+                            bm_addr + cutlass.Int64(bg0 + cutlass.Int32(_jm)) * cutlass.Int64(4),
+                            cute.AddressSpace.gmem,
+                            assumed_align=4,
+                        )
+                        frag_m[_jm] = cute.make_tensor(bps, cute.make_layout((1,)))[0]
+                # SINGLE-BAND collection against the TIGHTEST line: the
+                # loose band's pass fraction (~80% of blocks) can never
+                # pay for skipping, the accepted band's (~12-22%) can.
+                # Only segment A is filled; overflow just drops (the
+                # cursor keeps counting, and the A prefix remains a
+                # value-blind SAMPLE - the sample-cut path handles the
+                # over-B* case exactly as with the external list).
+                for _jb in cutlass.range_constexpr(8):
+                    if cutlass.Float32(frag_m[_jb]) >= t2_s:
+                        pos0 = ((bg0 + cutlass.Int32(_jb)) << cutlass.Int32(5)) + lane
+                        if pos0 < N:
+                            vp0 = cute.make_ptr(
+                                cutlass.Float32,
+                                row_addr + cutlass.Int64(pos0) * cutlass.Int64(4),
+                                cute.AddressSpace.gmem,
+                                assumed_align=4,
+                            )
+                            v0 = cute.make_tensor(vp0, cute.make_layout((1,)))[0]
+                            if v0 >= t2_s:
+                                sl0 = atomicAdd(s_seg.iterator, cutlass.Int32(1))
+                                if sl0 < cutlass.Int32(segA):
+                                    smem_keys[sl0] = v0
+                                    cand_idx_row[sl0] = pos0
+                bg0 = bg0 + cutlass.Int32(nwp * 8)
         copy_atom = self._make_load_copy_atom()
         frag_a = cute.make_fragment((vec_w,), self.dtype)
         frag_b = cute.make_fragment((vec_w,), self.dtype)
@@ -1292,6 +1348,8 @@ class GvrTopKKernel:
         # bounds checks at all. The remainder (< 2*step1 elements) takes
         # the scalar tail below with per-element direct atomics.
         nfull = N >> st2log
+        if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
+            nfull = cutlass.Int32(0)
         it0 = cutlass.Int32(0)
         while it0 < nfull:
             ia0 = (it0 * cutlass.Int32(2) * cutlass.Int32(num_threads) + tidx) * cutlass.Int32(
@@ -1344,6 +1402,8 @@ class GvrTopKKernel:
         # scalar tail (< 2*step1 elements): per-element DIRECT atomic
         # claims — divergent-safe, no warp collectives
         pt0 = (N >> st2log) * cutlass.Int32(step2) + tidx
+        if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
+            pt0 = N
         while pt0 < N:
             spt = cute.make_ptr(
                 cutlass.Float32,
@@ -1373,23 +1433,34 @@ class GvrTopKKernel:
             pt0 = pt0 + cutlass.Int32(num_threads)
         cute.arch.barrier()
         if tidx == cutlass.Int32(0):
-            curA0 = s_seg[0]
-            curB0 = s_seg[1]
-            curC0 = s_seg[2]
-            spA0 = curA0 - cutlass.Int32(segA)
-            if spA0 < cutlass.Int32(0):
-                spA0 = cutlass.Int32(0)
-            spB0 = curB0 - cutlass.Int32(segA)
-            if spB0 < cutlass.Int32(0):
-                spB0 = cutlass.Int32(0)
-            n1_0 = curA0 + curB0 - spA0
-            n0_0 = n1_0 + curC0 - spB0
-            s_seg[3] = cutlass.Int32(0)
-            if curC0 > cutlass.Int32(capC):
-                s_seg[3] = cutlass.Int32(1)
-            s_seg[4] = n0_0
-            s_seg[5] = n1_0
-            s_seg[6] = curA0
+            if cutlass.const_expr(self.enable_block_skip):
+                # single-band mode: every count is the t2 cursor; a cut
+                # can only land on t2 (in band), the sample-hist (over)
+                # or the fallback (under) - exactly the v5 state machine
+                # fed with n0 == n1 == n2
+                curT0 = s_seg[0]
+                s_seg[3] = cutlass.Int32(0)
+                s_seg[4] = curT0
+                s_seg[5] = curT0
+                s_seg[6] = curT0
+            if cutlass.const_expr(not self.enable_block_skip):
+                curA0 = s_seg[0]
+                curB0 = s_seg[1]
+                curC0 = s_seg[2]
+                spA0 = curA0 - cutlass.Int32(segA)
+                if spA0 < cutlass.Int32(0):
+                    spA0 = cutlass.Int32(0)
+                spB0 = curB0 - cutlass.Int32(segA)
+                if spB0 < cutlass.Int32(0):
+                    spB0 = cutlass.Int32(0)
+                n1_0 = curA0 + curB0 - spA0
+                n0_0 = n1_0 + curC0 - spB0
+                s_seg[3] = cutlass.Int32(0)
+                if curC0 > cutlass.Int32(capC):
+                    s_seg[3] = cutlass.Int32(1)
+                s_seg[4] = n0_0
+                s_seg[5] = n1_0
+                s_seg[6] = curA0
         cute.arch.barrier()
 
     @cute.jit
@@ -5123,6 +5194,7 @@ class GvrTopKKernel:
                         seed_thr_row,
                         smem_keys,
                         cand_idx_row,
+                        block_max_row,
                         smem_wcnt_p1,
                         tidx,
                         warp_id,

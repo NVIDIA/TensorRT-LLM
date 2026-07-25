@@ -733,7 +733,9 @@ def gvr_topk_decode(
     # (kC/K = 6 vs 10), the bounds prune less, and the row-split configs
     # win outright (cold protocol, pro 262k BS1: skip 21.3-21.6us at
     # cs1/cs8 vs stock cs8 19.7us) -> keep the stock path.
-    if block_max is not None and num_rows < 8 and top_k > 512:
+    if block_max is not None and num_rows < 8 and top_k > 512 and not self_scan:
+        # self_scan stage 2 owns its own skip economics (phase-0 block
+        # loop) — the stock-path small-batch gate does not apply
         block_max = None
     if self_scan:
         # fused self-contained mode: kernel scans/buckets the row itself.
