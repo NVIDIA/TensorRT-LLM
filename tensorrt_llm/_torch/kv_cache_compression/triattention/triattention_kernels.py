@@ -260,6 +260,32 @@ def prepare_per_head_scores(
 
 
 @triton.jit
+def _fold_union_ranks_kernel(
+    gathered_rows,
+    selection_rows,
+    request_count,
+    TP_SIZE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr = 1024,
+):
+    """Fold the TP-gathered rank-local union rows into the global union row
+    (elementwise max over the rank blocks)."""
+    request = tl.program_id(0)
+    token_block = tl.program_id(1)
+    token = token_block * BLOCK + tl.arange(0, BLOCK)
+    mask = token < WIDTH
+    folded = tl.full((BLOCK,), -float("inf"), tl.float32)
+    for rank in tl.static_range(0, TP_SIZE):
+        value = tl.load(
+            gathered_rows + (rank * request_count + request) * WIDTH + token,
+            mask=mask,
+            other=-float("inf"),
+        )
+        folded = tl.maximum(folded, value)
+    tl.store(selection_rows + request * WIDTH + token, folded, mask=mask)
+
+
+@triton.jit
 def _settle_ties_kernel(
     selection_scores_rows,
     selection_row_lengths,

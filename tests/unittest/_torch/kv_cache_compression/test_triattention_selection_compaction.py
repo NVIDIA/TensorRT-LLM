@@ -815,3 +815,28 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
             swa_after.index_select(2, swa_destination),
             swa_before.index_select(2, swa_source),
         )
+
+
+def test_fold_union_ranks_matches_max_oracle():
+    """The TP union fold is an exact elementwise max over the gathered rank blocks."""
+    import triton
+
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+        _fold_union_ranks_kernel,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    tp_size, request_count, width = 4, 3, 300
+    generator = torch.Generator(device="cpu").manual_seed(46)
+    gathered = torch.randn(tp_size * request_count, width, generator=generator).to(device)
+    folded = torch.full((request_count, width), float("nan"), device=device)
+    _fold_union_ranks_kernel[(request_count, triton.cdiv(width, 1024))](
+        gathered,
+        folded,
+        request_count,
+        TP_SIZE=tp_size,
+        WIDTH=width,
+    )
+    expected = gathered.view(tp_size, request_count, width).amax(dim=0)
+    torch.cuda.synchronize(device)
+    assert torch.equal(folded, expected)

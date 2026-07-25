@@ -29,6 +29,7 @@ import cuda.bindings.driver as cuda_driver
 import torch
 import triton
 
+from tensorrt_llm._torch.distributed import allgather
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheCompressionManager
@@ -41,6 +42,7 @@ from tensorrt_llm.logger import logger
 
 from ..compaction import build_compaction_params, compact
 from .triattention_kernels import (
+    _fold_union_ranks_kernel,
     _gather_mean_phase_kernel,
     _settle_ties_kernel,
     prepare_per_head_scores,
@@ -598,6 +600,22 @@ class TriAttention(KVCacheCompressionManager):
                         request_count,
                         cu_stream,
                     )
+                    if self._union_tp_mapping is not None:
+                        # Max-fold the rank-local unions into the global union (exact:
+                        # max is order-free), so every rank keeps the same ordinals.
+                        gathered = allgather(
+                            self._selection_scores_rows[:request_count],
+                            self._union_tp_mapping,
+                            dim=0,
+                        )
+                        width = int(self._selection_scores_rows.shape[1])
+                        _fold_union_ranks_kernel[(request_count, triton.cdiv(width, 1024))](
+                            gathered,
+                            self._selection_scores_rows,
+                            request_count,
+                            TP_SIZE=self._union_tp_size,
+                            WIDTH=width,
+                        )
             with nvtx_range("triattention.select", color="yellow"):
                 if not union:
                     # Per-head reduces read each decode window straight out of the scratch.
@@ -853,6 +871,12 @@ class TriAttention(KVCacheCompressionManager):
             local_q_heads = int(q_real.shape[1]) // tp_size
             heads = slice(mapping.tp_rank * local_q_heads, (mapping.tp_rank + 1) * local_q_heads)
             q_real, q_imag, mlr_coef = q_real[:, heads], q_imag[:, heads], mlr_coef[:, heads]
+        # Union reduces over ALL heads: rank-local rows are max-folded across the
+        # TP group each round so the kept set matches the single-rank algorithm.
+        self._union_tp_mapping = (
+            mapping if (self.eviction_mode == "union" and tp_size > 1) else None
+        )
+        self._union_tp_size = tp_size
         q_real, q_imag, mlr_coef, freq_scale_sq = (
             tensor.to(device=device, dtype=torch.float32).contiguous()
             for tensor in (q_real, q_imag, mlr_coef, self._freq_scale_sq)
