@@ -440,5 +440,79 @@ class TestSADisaggGenInit:
             manager.shutdown()
 
 
+class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
+    """seed_kda_replay_caches_for_disagg_gen must mirror
+    _sync_kda_replay_conv_window for transferred requests: committed conv
+    window seeded from the (transferred) conv pool, draft tail columns and
+    pending-draft scratch cleared, other slots untouched."""
+
+    L, SLOTS, D, W, M, NHEADS = 2, 4, 6, 4, 2, 3  # committed = W - 1 = 3
+
+    def _make_manager(self, use_kda_replay=True):
+        from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+            PythonMambaCacheManager
+        L, SLOTS, D, W, M, NH = (self.L, self.SLOTS, self.D, self.W, self.M,
+                                 self.NHEADS)
+        committed = W - 1
+
+        class _FakeSpecState:
+            pass
+
+        cache = _FakeSpecState()
+        torch.manual_seed(0)
+        cache.conv = torch.randn(L, SLOTS, 3 * D, W)
+        cache.kda_conv_q = torch.full((L, SLOTS, D, committed + M), 7.0)
+        cache.kda_conv_k = torch.full((L, SLOTS, D, committed + M), 7.0)
+        cache.kda_conv_v = torch.full((L, SLOTS, D, committed + M), 7.0)
+        cache.kda_qkg_cache = torch.full((L, SLOTS, M, 3, D), 7.0)
+        cache.kda_v_cache = torch.full((L, SLOTS, M, D), 7.0)
+        cache.kda_beta_cache = torch.full((L, SLOTS, M, NH), 7.0)
+        cache.prev_num_accepted_tokens = torch.full((SLOTS, ),
+                                                    5,
+                                                    dtype=torch.int32)
+
+        mgr = PythonMambaCacheManager.__new__(PythonMambaCacheManager)
+        mgr._use_kda_replay_update = use_kda_replay
+        mgr.SpeculativeState = _FakeSpecState
+        mgr.mamba_cache = cache
+        mgr.mamba_cache_index = {101: 1, 202: 3}
+        return mgr, cache
+
+    def test_seeds_committed_window_and_clears_scratch(self):
+        mgr, cache = self._make_manager()
+        committed = self.W - 1
+        conv_before = cache.conv.clone()
+        mgr.seed_kda_replay_caches_for_disagg_gen([101, 202])
+        d = self.D
+        for slot in (1, 3):
+            for kda, lo, hi in ((cache.kda_conv_q, 0, d),
+                                (cache.kda_conv_k, d, 2 * d),
+                                (cache.kda_conv_v, 2 * d, 3 * d)):
+                torch.testing.assert_close(
+                    kda[:, slot, :, :committed],
+                    conv_before[:, slot, lo:hi, 1:].to(kda.dtype))
+                assert (kda[:, slot, :, committed:] == 0).all()
+            assert (cache.kda_qkg_cache[:, slot] == 0).all()
+            assert (cache.kda_v_cache[:, slot] == 0).all()
+            assert (cache.kda_beta_cache[:, slot] == 0).all()
+            assert cache.prev_num_accepted_tokens[slot] == 0
+        # Conv pool itself must not be modified.
+        torch.testing.assert_close(cache.conv, conv_before)
+        # Untouched slots keep their contents.
+        for slot in (0, 2):
+            assert (cache.kda_conv_q[:, slot] == 7.0).all()
+            assert (cache.kda_qkg_cache[:, slot] == 7.0).all()
+            assert cache.prev_num_accepted_tokens[slot] == 5
+
+    def test_noop_without_kda_replay_or_unknown_ids(self):
+        mgr, cache = self._make_manager(use_kda_replay=False)
+        mgr.seed_kda_replay_caches_for_disagg_gen([101])
+        assert (cache.kda_conv_q == 7.0).all()
+
+        mgr2, cache2 = self._make_manager()
+        mgr2.seed_kda_replay_caches_for_disagg_gen([999])  # not in index
+        assert (cache2.kda_conv_q == 7.0).all()
+
+
 if __name__ == "__main__":
     unittest.main()
