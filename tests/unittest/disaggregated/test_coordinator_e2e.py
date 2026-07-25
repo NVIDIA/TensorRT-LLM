@@ -31,6 +31,7 @@ exercises the whole chain including the coordinator HTTP hop.
 """
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -40,6 +41,7 @@ import time
 from pathlib import Path
 
 import aiohttp
+import msgspec
 import pytest
 import uvicorn
 import yaml
@@ -60,6 +62,10 @@ from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 
 GEN_TEXT = "HELLO_FROM_GEN"
+
+# The orchestrator->worker body is msgspec-msgpack (flagged X-TRTLLM-Msgpack),
+# so the mock workers decode it the same way a real _MsgspecRoute worker does.
+_MOCK_MSGPACK_DECODER = msgspec.msgpack.Decoder()
 
 # The uvicorn worker threads / CLI-output pump thread are background threads that
 # outlive a strict thread snapshot; exempt this module (same as the other e2e).
@@ -131,7 +137,17 @@ def _mock_worker_app(role: str) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(raw: Request):
-        body = await raw.json()
+        # The orchestrator sends the body as msgspec-msgpack under
+        # Content-Type application/json, flagged with X-TRTLLM-Msgpack; mirror
+        # the real worker's _MsgspecRequest.json() decode instead of assuming
+        # stdlib JSON (a bare Request.json() would choke on the msgpack bytes).
+        raw_body = await raw.body()
+        if not raw_body:
+            body = {}
+        elif raw.headers.get("x-trtllm-msgpack") == "1":
+            body = _MOCK_MSGPACK_DECODER.decode(raw_body)
+        else:
+            body = json.loads(raw_body)
         dp = body.get("disaggregated_params") or {}
         model = body.get("model", "m")
         if dp.get("request_type") == "context_only":
