@@ -562,6 +562,7 @@ def make_cute_buffers(
     manager.kv_cache_manager = SimpleNamespace(
         num_pools=max(layer_pool_ids) + 1,
         host_kv_cache_block_offsets=torch.empty(1, 1, 2, source_blocks, dtype=torch.int32),
+        mapping=SimpleNamespace(tp_size=1, tp_rank=0, enable_attention_dp=False),
     )
     manager.draft_kv_cache_manager = None
     manager._draft_protected_tail_capacity = None

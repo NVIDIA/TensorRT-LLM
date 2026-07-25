@@ -846,6 +846,13 @@ class TriAttention(KVCacheCompressionManager):
         page_table_token_capacity = seq_len + protected_tail_capacity
 
         q_real, q_imag, mlr_coef = self._local_score_calibration(target_layout["global_layers"])
+        # TP splits attention heads contiguously per rank; the calibration is global.
+        mapping = self.kv_cache_manager.mapping
+        tp_size = 1 if mapping.enable_attention_dp else int(mapping.tp_size)
+        if tp_size > 1:
+            local_q_heads = int(q_real.shape[1]) // tp_size
+            heads = slice(mapping.tp_rank * local_q_heads, (mapping.tp_rank + 1) * local_q_heads)
+            q_real, q_imag, mlr_coef = q_real[:, heads], q_imag[:, heads], mlr_coef[:, heads]
         q_real, q_imag, mlr_coef, freq_scale_sq = (
             tensor.to(device=device, dtype=torch.float32).contiguous()
             for tensor in (q_real, q_imag, mlr_coef, self._freq_scale_sq)
