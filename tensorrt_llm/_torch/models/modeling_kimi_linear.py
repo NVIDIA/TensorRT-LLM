@@ -2453,6 +2453,26 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
         kda_glue_fp8 = kda_fp8 and os.environ.get(
             _KIMI_K3_KDA_GLUE_FP8_ENV, "1") != "0"
 
+        # TODO(kimi-k3): the FP8 fused decode glue is INCOMPATIBLE with an
+        # FP8 KV cache — warmup aborts on every rank with
+        # CUBLAS_STATUS_EXECUTION_FAILED in a bf16 strided-batched GEMM
+        # downstream of the glue conversion (first seen: TEP8, kv fp8 +
+        # TLLM_K3_MLA_GEN_BACKEND=trtllm-gen, job 2682481; the same FP8-KV
+        # config passes without the glue). Fail fast at load time until the
+        # interaction is fixed; the abort otherwise costs a full multi-node
+        # warmup (~25 min) to discover.
+        kv_quant = getattr(self.model_config.quant_config,
+                           "kv_cache_quant_algo", None)
+        if kda_glue_fp8 and kv_quant == QuantAlgo.FP8:
+            raise ValueError(
+                f"Kimi K3: the FP8 fused decode glue "
+                f"({_KIMI_K3_KDA_GLUE_FP8_ENV}=1, default on) is not "
+                "supported with an FP8 KV cache "
+                "(kv_cache_config.dtype='fp8'): model warmup aborts in "
+                "cuBLAS. Either set KIMI_K3_KDA_GLUE_FP8=0 to disable the "
+                "glue fast path, or use a non-FP8 KV cache "
+                "(kv_cache_config.dtype 'auto'/'bfloat16').")
+
         # Build the KDA decode fast-path constants (fused in-projection
         # weight views + kernel-layout conv weights + fp32 params). Must
         # run after every KDA parameter is loaded/sharded.
