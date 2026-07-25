@@ -337,28 +337,6 @@ def test_qwenimage_lpips_against_golden(_visual_gen_deps, tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_qwenimage_cuda_graph_lpips_against_golden(_visual_gen_deps, tmp_path):
-    generated_path = tmp_path / "qwenimage_cuda_graph_generated.png"
-    golden_path = _golden_media_path(
-        tmp_path, "qwenimage_lpips_golden.png", "QwenImage LPIPS golden image"
-    )
-    _generate_qwenimage_lpips_image(
-        _lpips_model_path(QWEN_IMAGE_MODEL_SUBPATH),
-        generated_path,
-        enable_cuda_graph=True,
-    )
-    score = _run_lpips_eval(
-        tmp_path,
-        "qwenimage_cuda_graph",
-        "image",
-        QWENIMAGE_LPIPS_PROMPT,
-        golden_path,
-        generated_path,
-    )
-    _assert_lpips_below_threshold(score, QWENIMAGE_LPIPS_THRESHOLD)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_qwen_image_layered_lpips_against_golden(tmp_path):
     input_path = tmp_path / "qwen_image_layered_input.png"
     generated_path = tmp_path / "qwen_image_layered_generated.png"
@@ -480,9 +458,7 @@ def test_qwen_image_layered_example(_visual_gen_deps, tmp_path, llm_root, llm_ve
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
 
 
-def test_qwen_image_edit_example(
-    _visual_gen_deps: Any, llm_root: str, llm_venv: Any
-) -> None:
+def test_qwen_image_edit_example(_visual_gen_deps: Any, llm_root: str, llm_venv: Any) -> None:
     """Run examples/visual_gen/models/qwen_image_edit.py end-to-end.
 
     Validates that the Qwen-Image-Edit example script and

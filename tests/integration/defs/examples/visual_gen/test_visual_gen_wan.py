@@ -88,6 +88,7 @@ class WanModelSpec:
     num_frames: int
     num_inference_steps: int
     guidance_scale: float
+    seed: int
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,7 @@ class WanAccuracyCase:
     num_frames: int
     num_inference_steps: int
     guidance_scale: float
+    seed: int
     features: FeatureConfigState
     lpips_threshold: float
 
@@ -118,6 +120,7 @@ WAN_MODEL_SPECS = (
         num_frames=WAN21_LPIPS_NUM_FRAMES,
         num_inference_steps=WAN21_LPIPS_NUM_INFERENCE_STEPS,
         guidance_scale=WAN21_LPIPS_GUIDANCE_SCALE,
+        seed=WAN21_LPIPS_SEED,
     ),
     WanModelSpec(
         id="wan22",
@@ -129,6 +132,7 @@ WAN_MODEL_SPECS = (
         num_frames=WAN22_LPIPS_NUM_FRAMES,
         num_inference_steps=WAN22_LPIPS_NUM_INFERENCE_STEPS,
         guidance_scale=WAN22_LPIPS_GUIDANCE_SCALE,
+        seed=WAN22_LPIPS_SEED,
     ),
 )
 
@@ -165,6 +169,7 @@ def _build_wan_accuracy_cases():
                         num_frames=model.num_frames,
                         num_inference_steps=model.num_inference_steps,
                         guidance_scale=model.guidance_scale,
+                        seed=model.seed,
                         features=features,
                         lpips_threshold=WAN_FEATURE_LPIPS_THRESHOLD,
                     ),
@@ -349,7 +354,7 @@ def _generate_wan_feature_video(case, output_path):
                 num_frames=case.num_frames,
                 num_inference_steps=case.num_inference_steps,
                 guidance_scale=case.guidance_scale,
-                seed=WAN21_LPIPS_SEED,
+                seed=case.seed,
             )
             assert result.video is not None, f"{case.id} produced no video"
             _assert_single_device_feature_executed(pipeline, case.features)
