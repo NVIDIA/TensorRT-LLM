@@ -837,11 +837,18 @@ def gvr_topk_decode(
     N_cols = logits.shape[1]
     N_dec = max_seq_len if max_seq_len is not None else N_cols
     if num_threads_per_block is None:
-        if max_seq_len is not None and logits.dtype != torch.float32:
-            n_thresh_t = 131072
+        if self_scan:
+            # self_scan owns the whole row scan in one CTA: the phase-0
+            # cp.async pipeline scales with warp count at every N (the
+            # 512-thread short-row heuristic below is tuned for the
+            # stock multi-pass kernel and costs ~5us/cell here).
+            num_threads_per_block = 1024
         else:
-            n_thresh_t = 65536
-        num_threads_per_block = 1024 if (num_rows <= num_sms and N_dec >= n_thresh_t) else 512
+            if max_seq_len is not None and logits.dtype != torch.float32:
+                n_thresh_t = 131072
+            else:
+                n_thresh_t = 65536
+            num_threads_per_block = 1024 if (num_rows <= num_sms and N_dec >= n_thresh_t) else 512
     if use_256bit_load is None:
         use_256bit_load = logits.dtype == torch.float32 and N_dec >= 16384
     if enable_warp_parallel_reduce is None:
