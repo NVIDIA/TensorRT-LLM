@@ -160,6 +160,21 @@ _KIMI_K3_FP8_WEIGHT_READ_KDA_ENV = "KIMI_K3_FP8_WEIGHT_READ_KDA"
 # the SM100 gate still apply.
 _KIMI_K3_FP8_WEIGHT_READ_MLA_ENV = "KIMI_K3_FP8_WEIGHT_READ_MLA"
 
+# Opt-in (prototype): keep the KimiKDARuntime decode fast path — fused
+# in-projection + persistent conv staging + precomputed kernel-layout
+# constants (``_forward_decode``) — when the KDA projections are read at FP8
+# block-scale. By default the FP8 KDA read routes decode through the
+# reference path, which re-does ~70 us/layer of glue per decode step around
+# the 5 us kernel (see ``_forward_decode``'s docstring). With this set to
+# "1", the fast path issues the loader's fused FP8 ``qkvg_proj`` GEMM for
+# q/k/v/g plus one small BF16 GEMV for [f_a | b]
+# (``finalize_decode_weights_fp8``), so FP8 weight storage and the decode
+# glue savings coexist. Requires the FP8 KDA read to be active; no effect
+# otherwise. Default on ("0" disables): GPU-validated 2026-07-25 — TEP8
+# +14.6/+16.1/+10.4% and DEP16 +8.2/+6.2% tps/user vs control at the five
+# standard anchors, GSM8K strict-match bit-identical to control.
+_KIMI_K3_KDA_GLUE_FP8_ENV = "KIMI_K3_KDA_GLUE_FP8"
+
 
 # ---------------------------------------------------------------------------
 # Config helpers.
@@ -865,6 +880,10 @@ class KimiKDARuntime(nn.Module):
         # copies of the small parameters. ``None`` routes decode through
         # the reference (module-level) path.
         self._in_proj_weight: Optional[torch.Tensor] = None
+        # FP8 variant (``finalize_decode_weights_fp8``): q/k/v/g stay in the
+        # mixer's fused FP8 ``qkvg_proj`` GEMM and only the small [f_a | b]
+        # GEMV weight is fused here. ``None`` when the FP8 fast path is off.
+        self._in_proj_small_weight: Optional[torch.Tensor] = None
         self._w_q_t = self._w_k_t = self._w_v_t = None
         self._A_log_f32 = self._dt_bias_f32 = self._onorm_w_f32 = None
         # Persistent batch-row-dense staging for the fused decode kernel's
@@ -901,18 +920,60 @@ class KimiKDARuntime(nn.Module):
                 n = m.weight.shape[0]
                 m.weight.data = fused[off:off + n]
                 off += n
-            self._w_q_t = (mixer.q_conv1d.weight.detach().squeeze(1).transpose(
-                0, 1).to(torch.bfloat16).contiguous())
-            self._w_k_t = (mixer.k_conv1d.weight.detach().squeeze(1).transpose(
-                0, 1).to(torch.bfloat16).contiguous())
-            self._w_v_t = (mixer.v_conv1d.weight.detach().squeeze(1).transpose(
-                0, 1).to(torch.bfloat16).contiguous())
-            self._A_log_f32 = mixer.A_log.detach().float().contiguous()
-            self._dt_bias_f32 = mixer.dt_bias.detach().float().contiguous()
-            self._onorm_w_f32 = (
-                mixer.o_norm.weight.detach().float().contiguous())
+            self._build_decode_kernel_constants()
             # Publish last: `_in_proj_weight is not None` gates the fast path.
             self._in_proj_weight = fused
+
+    def _build_decode_kernel_constants(self) -> None:
+        """Kernel-layout constants shared by both finalize variants."""
+        mixer = self.mixer
+        self._w_q_t = (mixer.q_conv1d.weight.detach().squeeze(1).transpose(
+            0, 1).to(torch.bfloat16).contiguous())
+        self._w_k_t = (mixer.k_conv1d.weight.detach().squeeze(1).transpose(
+            0, 1).to(torch.bfloat16).contiguous())
+        self._w_v_t = (mixer.v_conv1d.weight.detach().squeeze(1).transpose(
+            0, 1).to(torch.bfloat16).contiguous())
+        self._A_log_f32 = mixer.A_log.detach().float().contiguous()
+        self._dt_bias_f32 = mixer.dt_bias.detach().float().contiguous()
+        self._onorm_w_f32 = (mixer.o_norm.weight.detach().float().contiguous())
+
+    def finalize_decode_weights_fp8(self) -> None:
+        """FP8 counterpart of ``finalize_decode_weights()``.
+
+        Runs AFTER ``_convert_kda_projections_to_fp8_weight_read``, so
+        q/k/v/g already live in the mixer's fused FP8 ``qkvg_proj`` GEMM
+        and the fast path's big projection is that GEMM as-is. Only the
+        two small BF16 projections reading the same hidden — ``f_a_proj``
+        and ``b_proj`` (kept BF16 by the FP8 conversion: outputs are not
+        128-multiples and feed the accuracy-sensitive recurrent decay) —
+        are fused here into one ``[f_a | b]`` GEMV weight, with the source
+        parameters repointed to row views. The decode step then issues two
+        GEMMs (FP8 qkvg + BF16 small) instead of the reference path's four
+        plus its per-step glue; the kernel-layout constants are shared with
+        the BF16 finalize.
+        """
+        mixer = self.mixer
+        if (mixer._dispatch.decode_kernel_path != "optimized"
+                or not mixer.use_full_rank_gate):
+            return
+        fused_qkvg = getattr(mixer, "qkvg_proj", None)
+        split_sizes = getattr(mixer, "qkvg_split_sizes", None)
+        if fused_qkvg is None or split_sizes is None or len(split_sizes) != 4:
+            return
+        if mixer.f_a_proj.weight.device.type != "cuda":
+            return
+        with torch.no_grad():
+            mods = (mixer.f_a_proj, mixer.b_proj)
+            fused = torch.cat([m.weight.data for m in mods],
+                              dim=0).contiguous()
+            off = 0
+            for m in mods:
+                n = m.weight.shape[0]
+                m.weight.data = fused[off:off + n]
+                off += n
+            self._build_decode_kernel_constants()
+            # Publish last: gates the FP8 decode fast path.
+            self._in_proj_small_weight = fused
 
     def forward(self, hidden_states: torch.Tensor,
                 attn_metadata: AttentionMetadata) -> torch.Tensor:
@@ -1129,7 +1190,9 @@ class KimiKDARuntime(nn.Module):
             logger.info_once(
                 "Kimi K3 KDA static recurrent-state path is active",
                 key="kimi_k3_kda_static_state")
-        if (self._in_proj_weight is None or mamba_metadata is None
+        if ((self._in_proj_weight is None
+             and self._in_proj_small_weight is None)
+                or mamba_metadata is None
                 or ssm_pool.dtype != torch.float32):
             return self._forward_decode_ref(x2d, conv_pool, ssm_pool,
                                             slot_indices, layer_cache,
@@ -1162,12 +1225,24 @@ class KimiKDARuntime(nn.Module):
                               device=x2d.device)
             self._cs_dense = buf
 
-        # One GEMV over [q | k | v | g | f_a | b]; slices below are views.
-        proj = torch.nn.functional.linear(x2d, self._in_proj_weight)
-        x_qkv = proj[:, :3 * d]
-        onorm_g = proj[:, 3 * d:4 * d]
-        f_a = proj[:, 4 * d:4 * d + hd]
-        beta = proj[:, 4 * d + hd:4 * d + hd + H]
+        if self._in_proj_weight is not None:
+            # One GEMV over [q | k | v | g | f_a | b]; slices below are views.
+            proj = torch.nn.functional.linear(x2d, self._in_proj_weight)
+            x_qkv = proj[:, :3 * d]
+            onorm_g = proj[:, 3 * d:4 * d]
+            f_a = proj[:, 4 * d:4 * d + hd]
+            beta = proj[:, 4 * d + hd:4 * d + hd + H]
+        else:
+            # FP8 weight read (KIMI_K3_KDA_GLUE_FP8=1): the loader's fused
+            # FP8 [q | k | v | g] GEMM plus one BF16 GEMV over [f_a | b];
+            # slices below are views.
+            qkvg = mixer.qkvg_proj(x2d)
+            small = torch.nn.functional.linear(x2d,
+                                               self._in_proj_small_weight)
+            x_qkv = qkvg[:, :3 * d]
+            onorm_g = qkvg[:, 3 * d:4 * d]
+            f_a = small[:, :hd]
+            beta = small[:, hd:hd + H]
         g = mixer.f_b_proj(f_a)  # [B, d]
 
         # Gather the HF-layout conv windows once, then repack the
@@ -2368,11 +2443,15 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
         # both fuse the same projections and the wrapper path — checked first
         # at decode — would bypass the FP8 modules entirely, leaving the FP8
         # copies resident but inert. KIMI_K3_FP8_WEIGHT_READ_KDA=0 restores
-        # the bf16 wrapper fast path.
+        # the bf16 wrapper fast path; KIMI_K3_KDA_GLUE_FP8=1 instead rebuilds
+        # the wrapper fast path on top of the FP8 modules after the
+        # conversion (finalize_decode_weights_fp8), so neither is traded away.
         fp8_weight_read = (is_sm_100f() and os.environ.get(
             _KIMI_K3_FP8_WEIGHT_READ_ENV, "1") != "0")
         kda_fp8 = fp8_weight_read and os.environ.get(
             _KIMI_K3_FP8_WEIGHT_READ_KDA_ENV, "1") != "0"
+        kda_glue_fp8 = kda_fp8 and os.environ.get(
+            _KIMI_K3_KDA_GLUE_FP8_ENV, "1") != "0"
 
         # Build the KDA decode fast-path constants (fused in-projection
         # weight views + kernel-layout conv weights + fp32 params). Must
@@ -2407,6 +2486,21 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
                     f"Kimi K3: reading {n_kda} KDA q/k/v/g/o projections "
                     f"at FP8 block-scale (q/k/v/g fused into one decode GEMM "
                     f"per layer)")
+                if kda_glue_fp8:
+                    # Rebuild the wrapper decode fast path on top of the FP8
+                    # modules (must run after the conversion above so the
+                    # fused FP8 qkvg_proj exists and only [f_a | b] is fused
+                    # in bf16).
+                    n_glue = 0
+                    for layer in self.model.layers:
+                        if getattr(layer, "is_kda", False):
+                            layer.self_attn.finalize_decode_weights_fp8()
+                            n_glue += int(
+                                layer.self_attn._in_proj_small_weight
+                                is not None)
+                    logger.info(
+                        f"Kimi K3: FP8 fused decode glue on {n_glue} KDA "
+                        f"layers ({_KIMI_K3_KDA_GLUE_FP8_ENV}=1)")
             # The MLA q_a/q_b/o and output-gate projections are the remaining
             # replicated attention weight read the MLP and KDA passes above
             # leave in BF16; convert them to the same FP8 block-scale read
