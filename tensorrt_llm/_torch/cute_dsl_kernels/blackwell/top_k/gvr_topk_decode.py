@@ -619,15 +619,19 @@ class GvrTopKKernel:
             # on-chip segment budget: values only, 4B/entry; C sized so
             # keys(160KB) + vals(32KB) + hist + scratch stay under the
             # 227KB CTA limit with room for the stage-2 skip list.
-            self.seg_total = 2 * self.accept_cap + int(cap_c if cap_c is not None else 24576)
+            self.seg_total = 2 * self.accept_cap + int(cap_c if cap_c is not None else 16384)
             self.cap_c = self.seg_total - 2 * self.accept_cap
-            # cp.async staging depth for the phase-0 dense scan: 4 rounds
-            # in flight when the C segment is trimmed enough to pay for
-            # the extra 32KB, else the zero-cost 2 (staging then aliases
-            # smem_vals exactly). Rows are 16B slots, one per thread per
-            # in-flight round; never smaller than vals so the alias always
+            # cp.async staging for the phase-0 dense scan: the pair-step
+            # pipeline keeps 2 pairs x 2 slots in flight per thread, so
+            # exactly 4 slot rows are required. The 64KB staging fits the
+            # CTA budget only with the C segment trimmed to <= 16384
+            # (keys 128KB + staging 64KB + hist/scratch); larger C would
+            # silently overrun the alias, so reject it outright. Rows are
+            # 16B slots; never fewer than vals holds so the alias always
             # covers it.
-            self.stage_slots = 4 if self.cap_c <= 16384 else 2
+            if self.cap_c > 16384:
+                raise ValueError("self_scan requires cap_c <= 16384 (staging budget)")
+            self.stage_slots = 4
             self.stage_rows = max(self.stage_slots * self.num_threads, self.kC // 4)
         else:
             self.seg_total = self.kC
@@ -1487,20 +1491,19 @@ class GvrTopKKernel:
                     ptd0 = ptd0 + cutlass.Int32(num_threads)
         cpw = cutlass.const_expr(4)  # cp.async caps at 16B per copy
         step1 = cutlass.const_expr(num_threads * cpw)
-        st1log = cutlass.const_expr(step1.bit_length() - 1)
-        n_stage = cutlass.const_expr(self.stage_slots)
-        n_smask = cutlass.const_expr(self.stage_slots - 1)
-        # v13 cp.async deep pipeline: LDGSTS stages each round's vector
-        # straight into the slot-major smem staging buffer — no data
-        # registers consumed, no scoreboard stall until the WAIT — so
-        # n_stage rounds stay in flight per thread (the register pipeline
-        # topped out at two). The staging buffer aliases smem_vals (only
-        # written after phase 0); every non-empty group is drained inside
-        # the loop (one commit per step, wait_group(n_stage-1) pops the
-        # oldest), so nothing is ever in flight once the alias is read.
-        # FULL-vector steps only in the hot loop; the remainder takes the
-        # scalar tail below.
-        nfull = N >> st1log
+        st2log = cutlass.const_expr((2 * step1).bit_length() - 1)
+        # v14 pair-step cp.async pipeline: the scan is instruction-issue
+        # bound (pcsamp: no_instructions + wait dominate; long_scoreboard
+        # is 6%), so each step processes TWO 16B vectors per thread —
+        # loop/wait/commit/address overhead amortizes over 8 elements
+        # instead of 4 while the in-flight byte count stays put (2 pairs
+        # x 32B across the 4 staging slots). One commit group per pair;
+        # wait_group(1) pops the oldest pair. The staging buffer aliases
+        # smem_vals (only written after phase 0); every non-empty group
+        # is drained inside the loop, so nothing is in flight once the
+        # alias is read. FULL-pair steps only in the hot loop; the
+        # remainder takes the scalar tail below.
+        nfull = N >> st2log
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
             nfull = cutlass.Int32(0)
         g2s_atom = cute.make_copy_atom(
@@ -1509,86 +1512,106 @@ class GvrTopKKernel:
             num_bits_per_copy=128,
         )
         stage_addr = smem_stage.iterator.toint()
-        for _p in cutlass.range_constexpr(n_stage):
+        for _p in cutlass.range_constexpr(2):
             if cutlass.Int32(_p) < nfull:
-                pr0 = cutlass.Int32(_p) * cutlass.Int32(num_threads) + tidx
-                pp0 = pr0 * cutlass.Int32(cpw)
-                pq0 = cute.make_ptr(
-                    self.dtype,
-                    row_addr + cutlass.Int64(pp0) * cutlass.Int64(elem_bytes),
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                )
-                dq0 = cute.make_ptr(
-                    cutlass.Float32,
-                    stage_addr + cutlass.Int64(pr0 * cutlass.Int32(cpw)) * cutlass.Int64(4),
-                    cute.AddressSpace.smem,
-                    assumed_align=16,
-                )
-                cute.copy(
-                    g2s_atom,
-                    cute.make_tensor(pq0, cute.make_layout((cpw,))),
-                    cute.make_tensor(dq0, cute.make_layout((cpw,))),
-                )
+                for _v in cutlass.range_constexpr(2):
+                    pr0 = cutlass.Int32(2 * _p + _v) * cutlass.Int32(num_threads) + tidx
+                    pp0 = cutlass.Int32(2 * _p + _v) * cutlass.Int32(step1) + tidx * cutlass.Int32(
+                        cpw
+                    )
+                    pq0 = cute.make_ptr(
+                        self.dtype,
+                        row_addr + cutlass.Int64(pp0) * cutlass.Int64(elem_bytes),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    dq0 = cute.make_ptr(
+                        cutlass.Float32,
+                        stage_addr + cutlass.Int64(pr0 * cutlass.Int32(cpw)) * cutlass.Int64(4),
+                        cute.AddressSpace.smem,
+                        assumed_align=16,
+                    )
+                    cute.copy(
+                        g2s_atom,
+                        cute.make_tensor(pq0, cute.make_layout((cpw,))),
+                        cute.make_tensor(dq0, cute.make_layout((cpw,))),
+                    )
             cute.arch.cp_async_commit_group()
         it0 = cutlass.Int32(0)
         while it0 < nfull:
-            cute.arch.cp_async_wait_group(n_smask)
-            sb0 = (it0 & cutlass.Int32(n_smask)) * cutlass.Int32(num_threads) + tidx
-            sq0 = cute.make_ptr(
-                cutlass.Float32,
-                stage_addr + cutlass.Int64(sb0 * cutlass.Int32(cpw)) * cutlass.Int64(4),
-                cute.AddressSpace.smem,
-                assumed_align=16,
-            )
-            srow = cute.make_tensor(sq0, cute.make_layout((cpw,)))
-            ia0 = (it0 * cutlass.Int32(num_threads) + tidx) * cutlass.Int32(cpw)
+            cute.arch.cp_async_wait_group(1)
+            sp0 = (it0 & cutlass.Int32(1)) * cutlass.Int32(2 * num_threads) + tidx
+            ia0 = it0 * cutlass.Int32(2 * step1) + tidx * cutlass.Int32(cpw)
             # v6: per-element DIRECT atomic claims for passers — smem
             # atomics do NOT synchronize the warp and hide under the
             # async copy stream.
-            for _jv in cutlass.range_constexpr(cpw):
-                v0 = cutlass.Float32(srow[_jv])
-                if v0 >= t0_s:
-                    pos0 = ia0 + cutlass.Int32(_jv)
-                    c0 = cutlass.Int32(2)
-                    if v0 >= t1_s:
-                        c0 = cutlass.Int32(1)
-                    if v0 >= t2_s:
-                        c0 = cutlass.Int32(0)
-                    while c0 >= cutlass.Int32(0) and c0 <= cutlass.Int32(2):
-                        cap0 = cutlass.Int32(segA)
-                        if c0 == cutlass.Int32(2):
-                            cap0 = cutlass.Int32(capC)
-                        sl0 = atomicAdd(s_seg.iterator + c0, cutlass.Int32(1))
-                        if sl0 < cap0:
-                            cd0 = c0 * cutlass.Int32(segA) + sl0
-                            smem_keys[cd0] = v0
-                            cand_idx_row[cd0] = pos0
-                            c0 = cutlass.Int32(-1)
-                        else:
-                            c0 = c0 + cutlass.Int32(1)
-            # reissue the just-consumed slot for step it0 + n_stage (the
-            # thread's own prior reads are ordered before the async write
-            # begins, so no fence is needed)
-            kn0 = it0 + cutlass.Int32(n_stage)
-            if kn0 < nfull:
-                jp0 = (kn0 * cutlass.Int32(num_threads) + tidx) * cutlass.Int32(cpw)
-                pq0 = cute.make_ptr(
-                    self.dtype,
-                    row_addr + cutlass.Int64(jp0) * cutlass.Int64(elem_bytes),
-                    cute.AddressSpace.gmem,
+            for _jh in cutlass.range_constexpr(2):
+                sq0 = cute.make_ptr(
+                    cutlass.Float32,
+                    stage_addr
+                    + cutlass.Int64(
+                        (sp0 + cutlass.Int32(_jh) * cutlass.Int32(num_threads)) * cutlass.Int32(cpw)
+                    )
+                    * cutlass.Int64(4),
+                    cute.AddressSpace.smem,
                     assumed_align=16,
                 )
-                cute.copy(
-                    g2s_atom,
-                    cute.make_tensor(pq0, cute.make_layout((cpw,))),
-                    srow,
-                )
+                srow = cute.make_tensor(sq0, cute.make_layout((cpw,)))
+                for _jv in cutlass.range_constexpr(cpw):
+                    v0 = cutlass.Float32(srow[_jv])
+                    if v0 >= t0_s:
+                        pos0 = ia0 + cutlass.Int32(_jh) * cutlass.Int32(step1) + cutlass.Int32(_jv)
+                        c0 = cutlass.Int32(2)
+                        if v0 >= t1_s:
+                            c0 = cutlass.Int32(1)
+                        if v0 >= t2_s:
+                            c0 = cutlass.Int32(0)
+                        while c0 >= cutlass.Int32(0) and c0 <= cutlass.Int32(2):
+                            cap0 = cutlass.Int32(segA)
+                            if c0 == cutlass.Int32(2):
+                                cap0 = cutlass.Int32(capC)
+                            sl0 = atomicAdd(s_seg.iterator + c0, cutlass.Int32(1))
+                            if sl0 < cap0:
+                                cd0 = c0 * cutlass.Int32(segA) + sl0
+                                smem_keys[cd0] = v0
+                                cand_idx_row[cd0] = pos0
+                                c0 = cutlass.Int32(-1)
+                            else:
+                                c0 = c0 + cutlass.Int32(1)
+            # reissue the just-consumed slot pair for step it0 + 2 (the
+            # thread's own prior reads are ordered before the async write
+            # begins, so no fence is needed)
+            kn0 = it0 + cutlass.Int32(2)
+            if kn0 < nfull:
+                for _jh in cutlass.range_constexpr(2):
+                    jr0 = sp0 + cutlass.Int32(_jh) * cutlass.Int32(num_threads)
+                    jp0 = (
+                        kn0 * cutlass.Int32(2 * step1)
+                        + cutlass.Int32(_jh) * cutlass.Int32(step1)
+                        + tidx * cutlass.Int32(cpw)
+                    )
+                    pq0 = cute.make_ptr(
+                        self.dtype,
+                        row_addr + cutlass.Int64(jp0) * cutlass.Int64(elem_bytes),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    dq0 = cute.make_ptr(
+                        cutlass.Float32,
+                        stage_addr + cutlass.Int64(jr0 * cutlass.Int32(cpw)) * cutlass.Int64(4),
+                        cute.AddressSpace.smem,
+                        assumed_align=16,
+                    )
+                    cute.copy(
+                        g2s_atom,
+                        cute.make_tensor(pq0, cute.make_layout((cpw,))),
+                        cute.make_tensor(dq0, cute.make_layout((cpw,))),
+                    )
             cute.arch.cp_async_commit_group()
             it0 = it0 + cutlass.Int32(1)
         # scalar tail (< step1 elements): per-element DIRECT atomic
         # claims — divergent-safe, no warp collectives
-        pt0 = (N >> st1log) * cutlass.Int32(step1) + tidx
+        pt0 = (N >> st2log) * cutlass.Int32(2 * step1) + tidx
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
             pt0 = N
         while pt0 < N:

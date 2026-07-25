@@ -753,7 +753,7 @@ def gvr_topk_decode(
         if seed_counts is None:
             seed_counts = torch.zeros((num_rows, 3), dtype=torch.int32, device=logits.device)
         _bstar = int(os.environ["GVR_BSTAR"])
-        _capc = cap_c if cap_c is not None else int(os.environ.get("GVR_CAPC", "24576"))
+        _capc = cap_c if cap_c is not None else int(os.environ.get("GVR_CAPC", "16384"))
         _segtot = 2 * _bstar + _capc
         if cand_idx is None:
             cand_idx = torch.empty((num_rows, _segtot), dtype=torch.int32, device=logits.device)
@@ -904,7 +904,7 @@ def gvr_topk_decode(
         self_scan,
         cap_c
         if cap_c is not None
-        else (int(os.environ.get("GVR_CAPC", "24576")) if self_scan else None),
+        else (int(os.environ.get("GVR_CAPC", "16384")) if self_scan else None),
     )
     # When return_output_values=False the kernel was compiled to skip
     # STG.value and accepts None for the value-output slot.
