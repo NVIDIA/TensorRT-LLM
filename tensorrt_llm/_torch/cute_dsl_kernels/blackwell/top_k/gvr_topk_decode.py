@@ -1298,44 +1298,127 @@ class GvrTopKKernel:
             # just the one 32B bmax vector).
             bm_addr = block_max_row.iterator.toint()
             nb0 = (N + cutlass.Int32(31)) >> cutlass.Int32(5)
-            nwp = cutlass.const_expr(self.num_warps)
-            frag_m = cute.make_fragment((8,), cutlass.Float32)
-            bg0 = warp_id * cutlass.Int32(8)
-            while bg0 < nb0:
-                for _jm in cutlass.range_constexpr(8):
-                    frag_m[_jm] = cutlass.Float32(self.NEG_FLT_MAX)
-                    if bg0 + cutlass.Int32(_jm) < nb0:
-                        bps = cute.make_ptr(
-                            cutlass.Float32,
-                            bm_addr + cutlass.Int64(bg0 + cutlass.Int32(_jm)) * cutlass.Int64(4),
-                            cute.AddressSpace.gmem,
-                            assumed_align=4,
-                        )
-                        frag_m[_jm] = cute.make_tensor(bps, cute.make_layout((1,)))[0]
-                # SINGLE-BAND collection against the TIGHTEST line: the
-                # loose band's pass fraction (~80% of blocks) can never
-                # pay for skipping, the accepted band's (~12-22%) can.
-                # Only segment A is filled; overflow just drops (the
-                # cursor keeps counting, and the A prefix remains a
-                # value-blind SAMPLE - the sample-cut path handles the
-                # over-B* case exactly as with the external list).
-                for _jb in cutlass.range_constexpr(8):
-                    if cutlass.Float32(frag_m[_jb]) >= t2_s:
-                        pos0 = ((bg0 + cutlass.Int32(_jb)) << cutlass.Int32(5)) + lane
-                        if pos0 < N:
-                            vp0 = cute.make_ptr(
-                                cutlass.Float32,
-                                row_addr + cutlass.Int64(pos0) * cutlass.Int64(4),
-                                cute.AddressSpace.gmem,
-                                assumed_align=4,
+            # v9 two-pass skip: (1) DENSE-scan the bmax array itself (it
+            # is 1/32 of the row) with the tuned vector loop, compacting
+            # PASSING BLOCK IDS into the idle C segment (single-band mode
+            # never fills C; ids < 2^23 store exactly as floats);
+            # (2) walk the compact list, 8 blocks per warp round issued
+            # unguarded back-to-back - every element read is useful and
+            # the loads pipeline. If the list overflows capC the row
+            # falls back to the dense full scan (routing should have
+            # sent it there anyway).
+            # pass-1 vectors: 128-bit (the bmax row base is only 16B
+            # aligned: nb_pad %% 4)
+            pass1_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.Float32,
+                num_bits_per_copy=128,
+            )
+            p1w = cutlass.const_expr(4)
+            frag_p = cute.make_fragment((p1w,), cutlass.Float32)
+            nfb0 = nb0 >> cutlass.const_expr((num_threads * 4).bit_length() - 1)
+            itp0 = cutlass.Int32(0)
+            while itp0 < nfb0:
+                ip0 = (itp0 * cutlass.Int32(num_threads) + tidx) * cutlass.Int32(p1w)
+                pp0 = cute.make_ptr(
+                    cutlass.Float32,
+                    bm_addr + cutlass.Int64(ip0) * cutlass.Int64(4),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                cute.copy(
+                    pass1_atom,
+                    cute.make_tensor(pp0, cute.make_layout((p1w,))),
+                    frag_p,
+                )
+                for _jp in cutlass.range_constexpr(p1w):
+                    if cutlass.Float32(frag_p[_jp]) >= t2_s:
+                        slp0 = atomicAdd(s_seg.iterator + cutlass.Int32(1), cutlass.Int32(1))
+                        if slp0 < cutlass.Int32(capC):
+                            smem_keys[cutlass.Int32(2 * segA) + slp0] = cutlass.Float32(
+                                ip0 + cutlass.Int32(_jp)
                             )
-                            v0 = cute.make_tensor(vp0, cute.make_layout((1,)))[0]
-                            if v0 >= t2_s:
-                                sl0 = atomicAdd(s_seg.iterator, cutlass.Int32(1))
-                                if sl0 < cutlass.Int32(segA):
-                                    smem_keys[sl0] = v0
-                                    cand_idx_row[sl0] = pos0
-                bg0 = bg0 + cutlass.Int32(nwp * 8)
+                itp0 = itp0 + cutlass.Int32(1)
+            ptb0 = nfb0 * cutlass.Int32(num_threads * 4) + tidx
+            while ptb0 < nb0:
+                bpt0 = cute.make_ptr(
+                    cutlass.Float32,
+                    bm_addr + cutlass.Int64(ptb0) * cutlass.Int64(4),
+                    cute.AddressSpace.gmem,
+                    assumed_align=4,
+                )
+                if cute.make_tensor(bpt0, cute.make_layout((1,)))[0] >= t2_s:
+                    slp0 = atomicAdd(s_seg.iterator + cutlass.Int32(1), cutlass.Int32(1))
+                    if slp0 < cutlass.Int32(capC):
+                        smem_keys[cutlass.Int32(2 * segA) + slp0] = cutlass.Float32(ptb0)
+                ptb0 = ptb0 + cutlass.Int32(num_threads)
+            cute.arch.barrier()
+            nlist0 = s_seg[1]
+            if nlist0 <= cutlass.Int32(capC):
+                # pass 2: 8 listed blocks per warp round
+                nwp = cutlass.const_expr(self.num_warps)
+                lb0 = warp_id * cutlass.Int32(8)
+                while lb0 < nlist0:
+                    for _jb in cutlass.range_constexpr(8):
+                        li0 = lb0 + cutlass.Int32(_jb)
+                        if li0 < nlist0:
+                            bid0 = cutlass.Int32(smem_keys[cutlass.Int32(2 * segA) + li0])
+                            pos0 = (bid0 << cutlass.Int32(5)) + lane
+                            if pos0 < N:
+                                vp0 = cute.make_ptr(
+                                    cutlass.Float32,
+                                    row_addr + cutlass.Int64(pos0) * cutlass.Int64(4),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=4,
+                                )
+                                v0 = cute.make_tensor(vp0, cute.make_layout((1,)))[0]
+                                if v0 >= t2_s:
+                                    sl0 = atomicAdd(s_seg.iterator, cutlass.Int32(1))
+                                    if sl0 < cutlass.Int32(segA):
+                                        smem_keys[sl0] = v0
+                                        cand_idx_row[sl0] = pos0
+                    lb0 = lb0 + cutlass.Int32(nwp * 8)
+            if nlist0 > cutlass.Int32(capC):
+                # list overflow (pass rate too high for skip): dense full
+                # scan backup - nothing was read yet, plain re-run
+                itd0 = cutlass.Int32(0)
+                nfd0 = N >> cutlass.const_expr((num_threads * 4).bit_length() - 1)
+                while itd0 < nfd0:
+                    idd0 = (itd0 * cutlass.Int32(num_threads) + tidx) * cutlass.Int32(p1w)
+                    pd0 = cute.make_ptr(
+                        self.dtype,
+                        row_addr + cutlass.Int64(idd0) * cutlass.Int64(4),
+                        cute.AddressSpace.gmem,
+                        assumed_align=vec_align,
+                    )
+                    cute.copy(
+                        pass1_atom,
+                        cute.make_tensor(pd0, cute.make_layout((p1w,))),
+                        frag_p,
+                    )
+                    for _jd in cutlass.range_constexpr(p1w):
+                        vd0 = cutlass.Float32(frag_p[_jd])
+                        if vd0 >= t2_s:
+                            sl0 = atomicAdd(s_seg.iterator, cutlass.Int32(1))
+                            if sl0 < cutlass.Int32(segA):
+                                smem_keys[sl0] = vd0
+                                cand_idx_row[sl0] = idd0 + cutlass.Int32(_jd)
+                    itd0 = itd0 + cutlass.Int32(1)
+                ptd0 = nfd0 * cutlass.Int32(num_threads * 4) + tidx
+                while ptd0 < N:
+                    pe0 = cute.make_ptr(
+                        cutlass.Float32,
+                        row_addr + cutlass.Int64(ptd0) * cutlass.Int64(4),
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    )
+                    ve0 = cute.make_tensor(pe0, cute.make_layout((1,)))[0]
+                    if ve0 >= t2_s:
+                        sl0 = atomicAdd(s_seg.iterator, cutlass.Int32(1))
+                        if sl0 < cutlass.Int32(segA):
+                            smem_keys[sl0] = ve0
+                            cand_idx_row[sl0] = ptd0
+                    ptd0 = ptd0 + cutlass.Int32(num_threads)
         copy_atom = self._make_load_copy_atom()
         frag_a = cute.make_fragment((vec_w,), self.dtype)
         frag_b = cute.make_fragment((vec_w,), self.dtype)
