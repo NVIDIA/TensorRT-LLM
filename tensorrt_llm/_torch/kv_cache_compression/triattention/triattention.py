@@ -191,16 +191,9 @@ class TriAttention(KVCacheCompressionManager):
         global_layers = self._global_layers
         num_layers = len(global_layers)
 
-        try:
-            from transformers import AutoConfig
+        from transformers import AutoConfig
 
-            config = AutoConfig.from_pretrained(
-                model_path, trust_remote_code=True, local_files_only=True
-            )
-        except (OSError, ValueError) as exc:
-            raise ValueError(
-                f"TriAttention could not load the local model config from {model_path!r}"
-            ) from exc
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
         config_values = config.get_text_config().to_dict()
         layer_types = config_values.get("layer_types")
         if not layer_types:
@@ -314,54 +307,29 @@ class TriAttention(KVCacheCompressionManager):
 
     def _rope_tables(self, freq_count: int):
         """Derive the RoPE frequency tables from the model config."""
-        import transformers
         from transformers import AutoConfig
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
         cfg = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True).get_text_config()
         config_values = cfg.to_dict()
-        head_dim = freq_count * 2
         rope_params = (
             config_values.get("rope_parameters") or config_values.get("rope_scaling") or {}
         )
-        if rope_params and all(isinstance(v, dict) for v in rope_params.values()):
+        if rope_params and all(isinstance(value, dict) for value in rope_params.values()):
             raise ValueError(
-                f"TriAttention: layer-type-keyed rope_parameters are not supported for "
-                f"calibration conversion (model {self.model_path}); got {rope_params!r}."
+                f"TriAttention does not support per-layer-type rope parameters ({self.model_path})"
             )
         rope_type = rope_params.get("rope_type") or rope_params.get("type") or "default"
-        theta_seen = rope_params.get("rope_theta", config_values.get("rope_theta"))
-        base = float(theta_seen) if theta_seen is not None else 10000.0
-
-        def analytic_inv_freq():
-            idx = torch.arange(0, head_dim, 2, dtype=torch.float32)
-            return (1.0 / (base ** (idx / head_dim)))[:freq_count].clone()
-
         if rope_type == "default":
-            # transformers>=5.5 no longer keys "default" in ROPE_INIT_FUNCTIONS: use the formula.
-            omega, scale_sq = analytic_inv_freq(), 1.0
+            # "default" has no ROPE_INIT_FUNCTIONS entry; the analytic formula is its definition.
+            head_dim = freq_count * 2
+            theta = rope_params.get("rope_theta", config_values.get("rope_theta"))
+            base = float(theta) if theta is not None else 10000.0
+            positions = torch.arange(0, head_dim, 2, dtype=torch.float32)
+            omega = (1.0 / (base ** (positions / head_dim)))[:freq_count].clone()
+            scale_sq = 1.0
         else:
-            try:
-                from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-            except ImportError:
-                logger.warning(
-                    f"TriAttention: transformers rope-init unavailable; using the analytic "
-                    f"inv_freq with theta={base} for {self.model_path} and IGNORING "
-                    f"rope_type={rope_type!r} scaling corrections."
-                )
-                return analytic_inv_freq(), torch.ones(freq_count, dtype=torch.float32)
-            if rope_type not in ROPE_INIT_FUNCTIONS:
-                raise ValueError(
-                    f"TriAttention: unknown rope_type {rope_type!r} for {self.model_path} "
-                    f"(transformers {transformers.__version__} provides "
-                    f"{sorted(ROPE_INIT_FUNCTIONS)}); rope config seen: {rope_params!r}."
-                )
-            try:
-                inv_freq, attention_factor = ROPE_INIT_FUNCTIONS[rope_type](cfg, device="cpu")
-            except Exception as exc:
-                raise ValueError(
-                    f"TriAttention: rope-init {rope_type!r} failed for {self.model_path}; "
-                    f"rope config seen: {rope_params!r}."
-                ) from exc
+            inv_freq, attention_factor = ROPE_INIT_FUNCTIONS[rope_type](cfg, device="cpu")
             omega = inv_freq.to(torch.float32)[:freq_count].clone()
             scale_sq = float(attention_factor) ** 2
         return omega, torch.full((freq_count,), scale_sq, dtype=torch.float32)
