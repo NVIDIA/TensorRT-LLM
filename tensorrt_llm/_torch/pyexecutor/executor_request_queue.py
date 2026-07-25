@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import datetime
 import queue
@@ -8,6 +11,9 @@ from typing import Iterable, List, Optional, Tuple
 
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
+from ..disaggregation.diagnostics import (DisaggLifecycleEmitter,
+                                          DisaggLifecycleEmitterName,
+                                          DisaggLifecycleEvent)
 from ..distributed import Distributed
 from .llm_request import ExecutorRequest
 from .request_utils import get_num_child_requests
@@ -54,6 +60,7 @@ class ExecutorRequestQueue:
         max_batch_size: int,
         enable_iter_perf_stats: bool,
         batch_wait_timeout_ms: float,
+        disagg_lifecycle_emitter: Optional[DisaggLifecycleEmitter] = None,
     ):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
@@ -64,6 +71,7 @@ class ExecutorRequestQueue:
         self.start_times = {}
         self.active = True
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
+        self._disagg_lifecycle_emitter = disagg_lifecycle_emitter
 
     def _get_request_id(self, request: Optional[ExecutorRequest] = None):
         # if request has a disagg_request_id, use it as request id so that
@@ -96,6 +104,7 @@ class ExecutorRequestQueue:
                                                    Optional[List]]]
     ) -> List[int]:
         req_ids = []
+        lifecycle_arrivals = []
         with self.enqueue_lock:
             assert self.active, "PyExecutor has already been shutdown."
             start_time = time.time()
@@ -105,13 +114,82 @@ class ExecutorRequestQueue:
                     self.start_times[req_id] = start_time
                 child_req_ids = self._generate_child_request_ids(request)
 
+                if (self._disagg_lifecycle_emitter is not None
+                        and self._disagg_lifecycle_emitter.enabled):
+                    lifecycle_arrivals.append(
+                        (self._disagg_lifecycle_emitter.capture_stamp(),
+                         request, req_id))
                 self.request_queue.put(
                     RequestQueueItem(req_id,
                                      request,
                                      child_req_ids=child_req_ids,
                                      query=query))
                 req_ids.append(req_id)
+        if self._disagg_lifecycle_emitter is not None:
+            for stamp, request, req_id in lifecycle_arrivals:
+                if stamp is None:
+                    self._disagg_lifecycle_emitter.publish(None)
+                    continue
+                self._disagg_lifecycle_emitter.emit_for_role(
+                    ctx_event=DisaggLifecycleEvent.CTX_ARRIVED,
+                    gen_event=DisaggLifecycleEvent.GEN_ARRIVED,
+                    request=request,
+                    emitter=DisaggLifecycleEmitterName.EXECUTOR_QUEUE,
+                    local_request_id=req_id,
+                    stamp=stamp,
+                )
         return req_ids
+
+    def emit_disagg_dequeue_events(
+            self, request_items: Iterable[RequestQueueItem]) -> None:
+        """Record requests removed from the rank-zero engine queue."""
+
+        self._emit_disagg_role_events(
+            request_items,
+            ctx_event=DisaggLifecycleEvent.CTX_DEQUEUED,
+            gen_event=DisaggLifecycleEvent.GEN_DEQUEUED,
+        )
+
+    def emit_disagg_dispatch_events(
+            self, request_items: Iterable[RequestQueueItem]) -> None:
+        """Record requests accepted for rank-zero waiting-queue dispatch."""
+
+        self._emit_disagg_role_events(
+            request_items,
+            ctx_event=DisaggLifecycleEvent.CTX_DISPATCHED,
+            gen_event=DisaggLifecycleEvent.GEN_DISPATCHED,
+        )
+
+    def emit_disagg_waiting_release_events(
+            self, request_items: Iterable[RequestQueueItem]) -> None:
+        """Record rank-zero release from the replicated waiting queue."""
+
+        self._emit_disagg_role_events(
+            request_items,
+            ctx_event=DisaggLifecycleEvent.CTX_WAITING_RELEASED,
+            gen_event=DisaggLifecycleEvent.GEN_WAITING_RELEASED,
+        )
+
+    def _emit_disagg_role_events(
+        self,
+        request_items: Iterable[RequestQueueItem],
+        *,
+        ctx_event: DisaggLifecycleEvent,
+        gen_event: DisaggLifecycleEvent,
+    ) -> None:
+        emitter = self._disagg_lifecycle_emitter
+        if emitter is None or not emitter.enabled:
+            return
+        for item in request_items:
+            if not item.is_normal_request or item.request is None:
+                continue
+            emitter.emit_for_role(
+                ctx_event=ctx_event,
+                gen_event=gen_event,
+                request=item.request,
+                emitter=DisaggLifecycleEmitterName.EXECUTOR_QUEUE,
+                local_request_id=item.id,
+            )
 
     def enqueue_requests(self, requests: List[ExecutorRequest]) -> List[int]:
         """

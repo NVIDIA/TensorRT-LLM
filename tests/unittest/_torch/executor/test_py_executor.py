@@ -20,9 +20,20 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
+import tensorrt_llm._torch.pyexecutor.py_executor as py_executor_module
+from tensorrt_llm._torch.disaggregation.diagnostics import (
+    DisaggLifecycleDecision,
+    DisaggLifecycleEmitter,
+    DisaggLifecycleEvent,
+    DisaggLifecycleGate,
+    DisaggLifecycleRole,
+    DisaggLifecycleTimerBasis,
+    get_disagg_role,
+)
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
+    ExecutorRequestQueue,
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
@@ -434,7 +445,238 @@ def _make_disagg_transfer_request(
     req.py_prompt_len = prompt_len
     req.total_input_len_cp = prompt_len if total_input_len_cp is None else total_input_len_cp
     req.is_disagg_generation_transmission_in_progress = in_progress
+    req.py_disagg_lifecycle_state = None
     return req
+
+
+def _make_raw_disagg_request(request_id):
+    return types.SimpleNamespace(
+        disagg_request_id=request_id,
+        ctx_request_id=None,
+        request_id=request_id,
+        request_type=types.SimpleNamespace(name="REQUEST_TYPE_GENERATION_ONLY"),
+        sampling_config=types.SimpleNamespace(
+            beam_width=1,
+            num_return_sequences=1,
+        ),
+        disaggregated_params=None,
+        schedule_style=types.SimpleNamespace(name="GENERATION_FIRST"),
+        priority=0.5,
+    )
+
+
+def _parse_lifecycle_record(record):
+    _, payload = record.split("] ", maxsplit=1)
+    return dict(field.split("=", maxsplit=1) for field in payload.split())
+
+
+def _make_fetch_executor(emitter):
+    executor = object.__new__(PyExecutor)
+    executor.dist = types.SimpleNamespace(
+        rank=0,
+        tp_size=1,
+        has_pp=False,
+        cp_size=1,
+        cp_rank=0,
+        cp_config=None,
+    )
+    executor.control_requests = []
+    executor.request_accumulated = []
+    executor.canceled_req_ids = []
+    executor.is_shutdown = False
+    executor._disable_mpi = False
+    executor.hang_detector = Mock()
+    executor.hang_detector.pause.return_value = MagicMock()
+    executor.request_broadcaster = Mock()
+    executor.request_broadcaster.broadcast.side_effect = lambda requests: (requests, None)
+    executor.executor_request_queue = ExecutorRequestQueue(
+        dist=executor.dist,
+        max_batch_size=8,
+        enable_iter_perf_stats=False,
+        batch_wait_timeout_ms=0,
+        disagg_lifecycle_emitter=emitter,
+    )
+    return executor
+
+
+def _make_shutdown_executor(emitter, *, hang_detected=False):
+    executor = object.__new__(PyExecutor)
+    executor.executor_request_queue = Mock()
+    executor.shutdown_event = Mock()
+    executor.hang_detector = Mock()
+    executor.hang_detector.detected.return_value = hang_detected
+    executor.worker_thread = Mock()
+    executor.dist = types.SimpleNamespace(pp_size=1)
+    executor._shutdown_sleep_wakeup_listeners = Mock()
+    executor.model_engine = None
+    executor.draft_model_engine = None
+    executor.resource_manager = types.SimpleNamespace(resource_managers={})
+    executor.virtual_memory_pools = None
+    executor.sampler = object()
+    executor.dwdp_manager = None
+    executor._disagg_lifecycle_emitter = emitter
+    return executor
+
+
+def test_shutdown_closes_disagg_lifecycle_writer(monkeypatch):
+    emitter = Mock()
+    executor = _make_shutdown_executor(emitter)
+    monkeypatch.setattr(py_executor_module.torch.cuda, "is_available", Mock(return_value=False))
+
+    PyExecutor.shutdown(executor)
+
+    emitter.close.assert_called_once_with()
+
+
+def test_hang_shutdown_does_not_wait_for_disagg_lifecycle_writer():
+    emitter = Mock()
+    executor = _make_shutdown_executor(emitter, hang_detected=True)
+
+    PyExecutor.shutdown(executor)
+
+    emitter.close.assert_not_called()
+
+
+def test_fetch_and_enqueue_control_boundary_emits_exactly_once(monkeypatch):
+    records = []
+    monkeypatch.setattr(
+        py_executor_module.disagg_diagnostics,
+        "_write_lifecycle_record",
+        records.append,
+    )
+    emitter = DisaggLifecycleEmitter(
+        enabled=True,
+        rank=0,
+        runtime="CPP",
+        backend="NIXL",
+        clock_id="control-boundary",
+        async_output=False,
+    )
+    executor = _make_fetch_executor(emitter)
+    waiting_queue = FCFSWaitingQueue()
+    request_before = _make_raw_disagg_request(101)
+    request_after = _make_raw_disagg_request(102)
+    executor.executor_request_queue.enqueue_request(request_before)
+    executor.executor_request_queue.enqueue_control_request()
+    executor.executor_request_queue.enqueue_request(request_after)
+
+    PyExecutor._fetch_and_enqueue_requests(executor, waiting_queue, 0)
+    assert [item.id for item in waiting_queue] == [101]
+    assert [item.id for item in executor.request_accumulated] == [102]
+    executor.control_requests.clear()
+    PyExecutor._fetch_and_enqueue_requests(executor, waiting_queue, 0)
+
+    events_by_request = {101: [], 102: []}
+    for record in records:
+        event = _parse_lifecycle_record(record)
+        request_id = int(event["local_request_id"])
+        if request_id in events_by_request:
+            events_by_request[request_id].append(event["event"])
+    assert events_by_request == {
+        101: ["gen_arrived", "gen_dequeued", "gen_dispatched"],
+        102: ["gen_arrived", "gen_dequeued", "gen_dispatched"],
+    }
+
+
+def test_fetch_new_requests_records_delayed_waiting_release(monkeypatch):
+    records = []
+    monkeypatch.setattr(
+        py_executor_module.disagg_diagnostics,
+        "_write_lifecycle_record",
+        records.append,
+    )
+    emitter = DisaggLifecycleEmitter(
+        enabled=True,
+        rank=0,
+        runtime="CPP",
+        backend="NIXL",
+        clock_id="waiting-boundary",
+        async_output=False,
+    )
+    executor = _make_fetch_executor(emitter)
+    executor._disagg_lifecycle_emitter = emitter
+    executor.enable_attention_dp = False
+    executor.enable_iter_perf_stats = False
+    executor.is_benchmark_disagg = False
+    executor.num_fetch_requests = 0
+    executor.should_exclude_last_generation_logits = False
+    waiting_queue = FCFSWaitingQueue()
+    request = _make_raw_disagg_request(201)
+    executor.executor_request_queue.enqueue_request(request)
+    monkeypatch.setattr(
+        py_executor_module,
+        "merge_requests",
+        lambda request_items, **_: [item.request for item in request_items],
+    )
+
+    executor.max_num_active_requests = 0
+    assert PyExecutor._fetch_new_requests(executor, waiting_queue, []) == []
+    assert [item.id for item in waiting_queue] == [201]
+    executor.max_num_active_requests = 1
+    assert PyExecutor._fetch_new_requests(executor, waiting_queue, []) == [request]
+
+    request_events = [
+        event["event"]
+        for event in map(_parse_lifecycle_record, records)
+        if event["local_request_id"] == "201"
+    ]
+    assert request_events == [
+        "gen_arrived",
+        "gen_dequeued",
+        "gen_dispatched",
+        "gen_waiting_released",
+        "gen_local_scheduler_activated",
+    ]
+
+
+class _RecordingLifecycleEmitter:
+    enabled = True
+
+    def __init__(self):
+        self.records = []
+        self.failures = 0
+
+    def emit_for_request(self, event, request, **kwargs):
+        self.records.append((event, request, kwargs))
+
+    def emit(self, event, **kwargs):
+        self.records.append((event, None, kwargs))
+
+    def emit_for_role(self, *, ctx_event, gen_event, request, **kwargs):
+        role = get_disagg_role(request)
+        if role is None:
+            return
+        event = ctx_event if role == DisaggLifecycleRole.CTX else gen_event
+        self.emit_for_request(event, request, role=role, **kwargs)
+
+    def record_failure(self):
+        self.failures += 1
+
+
+@pytest.mark.parametrize("warning_fails", [False, True])
+def test_disagg_lifecycle_writer_start_failure_is_fail_open(
+    monkeypatch,
+    warning_fails,
+):
+    executor = object.__new__(PyExecutor)
+    executor.dist = types.SimpleNamespace(rank=0)
+    executor.llm_args = types.SimpleNamespace(
+        cache_transceiver_config=types.SimpleNamespace(
+            transceiver_runtime="PYTHON",
+            backend="NIXL",
+        )
+    )
+    monkeypatch.setenv(py_executor_module.disagg_diagnostics.DISAGG_DIAGNOSTICS_ENV, "1")
+    monkeypatch.setattr(
+        py_executor_module.disagg_diagnostics.threading.Thread,
+        "start",
+        Mock(side_effect=RuntimeError("thread unavailable")),
+    )
+    warning = Mock(side_effect=RuntimeError("warning unavailable") if warning_fails else None)
+    monkeypatch.setattr(py_executor_module.logger, "warning", warning)
+
+    assert PyExecutor._create_disagg_lifecycle_emitter(executor) is None
+    warning.assert_called_once()
 
 
 @pytest.fixture
@@ -525,11 +767,48 @@ class TestDisaggTransferAdmissionController:
 
         assert admitted == []
         assert wait_for_progress
+        assert candidate.py_disagg_lifecycle_state is None
         executor._revert_ctx_alloc.assert_called_once_with([candidate])
+
+    def test_apply_records_defer_then_admit_transitions(self):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = False
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        candidate = _make_disagg_transfer_request(2, 32)
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, [candidate]
+        )
+        assert admitted == []
+        assert wait_for_progress
+
+        executor.active_requests = []
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, [candidate]
+        )
+
+        assert admitted == [candidate]
+        assert not wait_for_progress
+        transitions = [
+            (record[2]["gate"], record[2]["decision"])
+            for record in executor._disagg_lifecycle_emitter.records
+            if record[0] == DisaggLifecycleEvent.GEN_ADMISSION_CHANGED
+        ]
+        assert transitions == [
+            (DisaggLifecycleGate.SCHEDULER, DisaggLifecycleDecision.ELIGIBLE),
+            (DisaggLifecycleGate.TRANSFER, DisaggLifecycleDecision.DEFER),
+            (DisaggLifecycleGate.TRANSFER, DisaggLifecycleDecision.ADMIT),
+        ]
 
     def test_apply_missing_controller_preserves_candidates(self):
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
         executor.active_requests = []
         candidate = _make_disagg_transfer_request(1, 32)
 
@@ -539,6 +818,10 @@ class TestDisaggTransferAdmissionController:
 
         assert admitted == [candidate]
         assert not wait_for_progress
+        assert (
+            executor._disagg_lifecycle_emitter.records[-1][2]["decision"]
+            == DisaggLifecycleDecision.BYPASS
+        )
 
     def test_apply_missing_v2_flag_defaults_to_non_v2(self):
         executor = object.__new__(PyExecutor)
@@ -607,6 +890,551 @@ class TestDisaggTransferAdmissionController:
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferIdleProgress:
+    def test_local_scheduler_activation_precedes_scheduler_eligibility(self):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        executor.enable_attention_dp = False
+        request = _make_disagg_transfer_request(7, 64)
+        request.py_llm_request_type = types.SimpleNamespace(name="LLMREQUEST_TYPE_GENERATION_ONLY")
+
+        PyExecutor._record_disagg_local_scheduler_activations(executor, [request])
+        PyExecutor._record_disagg_admission_transition(
+            executor,
+            request,
+            gate=DisaggLifecycleGate.SCHEDULER,
+            decision=DisaggLifecycleDecision.ELIGIBLE,
+        )
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.GEN_LOCAL_SCHEDULER_ACTIVATED,
+            DisaggLifecycleEvent.GEN_ADMISSION_CHANGED,
+        ]
+
+    def test_prepare_gen_resources_precedes_transceiver_handoff(self):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        resource_manager = Mock()
+        executor.resource_manager = Mock(
+            resource_managers={ResourceManagerType.KV_CACHE_MANAGER: resource_manager}
+        )
+        request = _make_disagg_transfer_request(7, 64)
+        request.state = LlmRequestState.DISAGG_GENERATION_INIT
+
+        def assert_resources_are_recorded(_):
+            assert (
+                executor._disagg_lifecycle_emitter.records[-1][0]
+                == DisaggLifecycleEvent.GEN_RESOURCES_READY
+            )
+
+        executor._recv_disagg_gen_cache = Mock(side_effect=assert_resources_are_recorded)
+
+        PyExecutor._prepare_disagg_gen_init(executor, [request])
+
+        resource_manager.prepare_resources.assert_called_once()
+        executor._recv_disagg_gen_cache.assert_called_once_with([request])
+
+    def test_prepare_gen_adds_no_diagnostic_loop_when_disabled(self):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = None
+        executor._emit_disagg_lifecycle = Mock()
+        resource_manager = Mock()
+        executor.resource_manager = Mock(
+            resource_managers={ResourceManagerType.KV_CACHE_MANAGER: resource_manager}
+        )
+        executor._recv_disagg_gen_cache = Mock()
+        request = _make_disagg_transfer_request(7, 64)
+
+        PyExecutor._prepare_disagg_gen_init(executor, [request])
+
+        executor._emit_disagg_lifecycle.assert_not_called()
+        executor._recv_disagg_gen_cache.assert_called_once_with([request])
+
+    def test_async_receive_records_handoff_before_adapter_call(self):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=None)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        request = _make_disagg_transfer_request(7, 64)
+        request.state = LlmRequestState.DISAGG_GENERATION_INIT
+
+        def receive(req):
+            assert (
+                executor._disagg_lifecycle_emitter.records[-1][0]
+                == DisaggLifecycleEvent.TRANSCEIVER_HANDOFF
+            )
+            req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+
+        executor.kv_cache_transceiver.request_and_receive_async.side_effect = receive
+
+        PyExecutor._recv_disagg_gen_cache(executor, [request])
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.TRANSCEIVER_HANDOFF,
+            DisaggLifecycleEvent.TRANSCEIVER_CALL_RETURNED,
+        ]
+
+    def test_async_receive_calls_adapter_directly_when_diagnostics_disabled(self):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = None
+        executor._invoke_disagg_transceiver = Mock()
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=None)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        request = _make_disagg_transfer_request(7, 64)
+
+        PyExecutor._recv_disagg_gen_cache(executor, [request])
+
+        executor._invoke_disagg_transceiver.assert_not_called()
+        executor.kv_cache_transceiver.request_and_receive_async.assert_called_once_with(request)
+
+    def test_async_receive_records_adapter_exception_and_reraises(self):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=None)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        request = _make_disagg_transfer_request(7, 64)
+        request.state = LlmRequestState.DISAGG_GENERATION_INIT
+        executor.kv_cache_transceiver.request_and_receive_async.side_effect = RuntimeError(
+            "session creation failed"
+        )
+
+        with pytest.raises(RuntimeError, match="session creation failed"):
+            PyExecutor._recv_disagg_gen_cache(executor, [request])
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.TRANSCEIVER_HANDOFF,
+            DisaggLifecycleEvent.TRANSFER_ADAPTER_ERROR,
+        ]
+
+    def test_sync_receive_records_handoff_deadline_before_error(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=1000)
+        executor._sync_disagg_transfer_made_progress = False
+        executor._check_cache_transfer_errors = Mock()
+        request = _make_disagg_transfer_request(7, 64)
+        request.state = LlmRequestState.DISAGG_GENERATION_INIT
+        monotonic_values = iter((10.0, 12.0))
+        monkeypatch.setattr(
+            py_executor_module.time,
+            "monotonic",
+            lambda: next(monotonic_values),
+        )
+
+        def fail(req):
+            req.state = LlmRequestState.DISAGG_TRANS_ERROR
+
+        executor.kv_cache_transceiver.request_and_receive_sync.side_effect = fail
+
+        PyExecutor._recv_disagg_gen_cache(executor, [request])
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.TRANSCEIVER_HANDOFF,
+            DisaggLifecycleEvent.HANDOFF_DEADLINE_CROSSED,
+            DisaggLifecycleEvent.TRANSCEIVER_CALL_RETURNED,
+            DisaggLifecycleEvent.TRANSFER_ADAPTER_ERROR,
+        ]
+        assert (
+            executor._disagg_lifecycle_emitter.records[1][2]["timer_basis"]
+            == DisaggLifecycleTimerBasis.TRANSCEIVER_HANDOFF
+        )
+
+    def test_async_receive_arms_timeout_after_adapter_call(self, monkeypatch):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=1000)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        request = _make_disagg_transfer_request(7, 64)
+        request.state = LlmRequestState.DISAGG_GENERATION_INIT
+        request.py_kv_transfer_start_time = None
+        monkeypatch.setattr(py_executor_module.time, "monotonic", lambda: 12.0)
+
+        def receive(req):
+            assert req.py_kv_transfer_start_time is None
+            req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+
+        executor.kv_cache_transceiver.request_and_receive_async.side_effect = receive
+
+        PyExecutor._recv_disagg_gen_cache(executor, [request])
+
+        assert request.py_kv_transfer_start_time == 12.0
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.TRANSCEIVER_HANDOFF,
+            DisaggLifecycleEvent.TRANSCEIVER_CALL_RETURNED,
+            DisaggLifecycleEvent.TIMEOUT_ARMED,
+        ]
+
+    def test_context_send_records_handoff_before_adapter_call(self):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        executor.kv_cache_manager = Mock()
+        executor.async_transfer_manager = Mock()
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=None)
+        executor.kv_connector_manager = None
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        request = Mock(
+            py_request_id=17,
+            is_context_only_request=True,
+            is_context_finished=True,
+            is_finished_due_to_length=False,
+            is_finished_due_to_cancellation=False,
+            state=LlmRequestState.CONTEXT_INIT,
+        )
+
+        def send(_):
+            assert (
+                executor._disagg_lifecycle_emitter.records[-1][0]
+                == DisaggLifecycleEvent.TRANSCEIVER_HANDOFF
+            )
+
+        executor.kv_cache_transceiver.respond_and_send_async.side_effect = send
+
+        PyExecutor._send_kv_async(executor, [request])
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.CTX_ARTIFACT_READY,
+            DisaggLifecycleEvent.TRANSCEIVER_HANDOFF,
+            DisaggLifecycleEvent.TRANSCEIVER_CALL_RETURNED,
+        ]
+
+    def test_timeout_records_local_phase_once(self, monkeypatch):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=1000)
+        executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        request = _make_disagg_transfer_request(7, 64)
+        request.py_kv_transfer_start_time = 10.0
+        request.py_kv_transfer_timed_out = False
+        request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.requests_in_transfer.return_value = {
+            request.py_request_id: request
+        }
+        executor.active_requests = []
+        monkeypatch.setattr(py_executor_module.time, "monotonic", lambda: 12.0)
+
+        PyExecutor._check_kv_transfer_timeout(executor)
+        PyExecutor._check_kv_transfer_timeout(executor)
+
+        assert request.py_kv_transfer_timed_out
+        timeout_records = [
+            record
+            for record in executor._disagg_lifecycle_emitter.records
+            if record[0] == DisaggLifecycleEvent.TIMEOUT_OBSERVED
+        ]
+        assert len(timeout_records) == 1
+        assert timeout_records[0][2]["timeout_ms"] == 1000
+        assert timeout_records[0][2]["elapsed_ms"] == 2000
+        assert timeout_records[0][2]["timer_basis"] == DisaggLifecycleTimerBasis.EXECUTOR_WATCHDOG
+
+    def test_timeout_event_precedes_warning(self, monkeypatch):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        request = _make_disagg_transfer_request(7, 64)
+        request.py_kv_transfer_start_time = 10.0
+        request.py_kv_transfer_timed_out = False
+
+        def assert_timeout_is_recorded(_message):
+            assert request.py_kv_transfer_timed_out
+            assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+                DisaggLifecycleEvent.TIMEOUT_OBSERVED
+            ]
+
+        monkeypatch.setattr(py_executor_module.logger, "warning", assert_timeout_is_recorded)
+
+        assert PyExecutor._mark_kv_transfer_timeout(
+            executor,
+            request,
+            role=DisaggLifecycleRole.GEN,
+            timeout_ms=1000,
+            current_time=12.0,
+            requesting_cancellation=False,
+        )
+
+    def test_handoff_threshold_does_not_suppress_watchdog_timeout(self, monkeypatch):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=1000)
+        executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        request = _make_disagg_transfer_request(7, 64)
+        request.py_kv_transfer_start_time = 10.0
+        request.py_kv_transfer_timed_out = False
+        monotonic_values = iter((10.0, 12.0))
+        monkeypatch.setattr(
+            py_executor_module.time,
+            "monotonic",
+            lambda: next(monotonic_values),
+        )
+
+        PyExecutor._start_disagg_transfer_observation(executor, request)
+        PyExecutor._observe_disagg_handoff_deadline(
+            executor,
+            request,
+            role=DisaggLifecycleRole.GEN,
+        )
+        PyExecutor._mark_kv_transfer_timeout(
+            executor,
+            request,
+            role=DisaggLifecycleRole.GEN,
+            timeout_ms=1000,
+            current_time=12.0,
+            requesting_cancellation=False,
+        )
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.HANDOFF_DEADLINE_CROSSED,
+            DisaggLifecycleEvent.TIMEOUT_OBSERVED,
+        ]
+        assert [
+            record[2]["timer_basis"] for record in executor._disagg_lifecycle_emitter.records
+        ] == [
+            DisaggLifecycleTimerBasis.TRANSCEIVER_HANDOFF,
+            DisaggLifecycleTimerBasis.EXECUTOR_WATCHDOG,
+        ]
+
+    def test_inflight_cancel_records_timeout_before_cancel(self, monkeypatch):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=1000)
+        executor._request_kv_transfer_cancellation = Mock(return_value=True)
+        executor._disagg_timed_out_gen_cancelled_ids = set()
+        executor.canceled_req_ids = []
+        executor.dist = Mock(tp_size=1)
+        request = _make_disagg_transfer_request(7, 64, in_progress=True)
+        request.py_kv_transfer_start_time = 10.0
+        request.py_kv_transfer_timed_out = False
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        executor.active_requests = [request]
+        monkeypatch.setattr(py_executor_module.time, "monotonic", lambda: 12.0)
+
+        PyExecutor._cancel_timed_out_gen_transfers(executor)
+        PyExecutor._cancel_timed_out_gen_transfers(executor)
+
+        timeout_records = [
+            record
+            for record in executor._disagg_lifecycle_emitter.records
+            if record[0] == DisaggLifecycleEvent.TIMEOUT_OBSERVED
+        ]
+        assert len(timeout_records) == 1
+        executor._request_kv_transfer_cancellation.assert_called_once_with(request)
+
+    def test_cpp_style_status_mutation_records_adapter_completion(self):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        request = _make_disagg_transfer_request(7, 64, in_progress=True)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        executor.active_requests = [request]
+        executor.canceled_req_ids = []
+        executor.kv_cache_transceiver = Mock()
+        executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        executor._check_cache_transfer_errors = Mock()
+
+        def complete(_):
+            request.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            request.is_disagg_generation_transmission_in_progress = False
+            return None
+
+        executor.kv_cache_transceiver.check_gen_transfer_status.side_effect = complete
+
+        PyExecutor._check_disagg_gen_cache_transfer_status(executor, 0)
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.TRANSFER_ADAPTER_COMPLETE
+        ]
+
+    def test_cpp_style_status_mutation_records_adapter_error(self):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        request = _make_disagg_transfer_request(7, 64, in_progress=True)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        executor.active_requests = [request]
+        executor.canceled_req_ids = []
+        executor.kv_cache_transceiver = Mock()
+        executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        executor._check_cache_transfer_errors = Mock()
+
+        def fail(_):
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            request.is_disagg_generation_transmission_in_progress = False
+            return None
+
+        executor.kv_cache_transceiver.check_gen_transfer_status.side_effect = fail
+
+        PyExecutor._check_disagg_gen_cache_transfer_status(executor, 0)
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.TRANSFER_ADAPTER_ERROR
+        ]
+
+    def test_gen_status_crossing_handoff_deadline_precedes_adapter_error(self, monkeypatch):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        request = _make_disagg_transfer_request(7, 64, in_progress=True)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        executor.active_requests = [request]
+        executor.canceled_req_ids = []
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=1000)
+        executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        executor._check_cache_transfer_errors = Mock()
+        monotonic_values = iter((10.0, 10.5, 12.0))
+        monkeypatch.setattr(
+            py_executor_module.time,
+            "monotonic",
+            lambda: next(monotonic_values),
+        )
+        PyExecutor._start_disagg_transfer_observation(executor, request)
+
+        def fail(_):
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            request.is_disagg_generation_transmission_in_progress = False
+            return None
+
+        executor.kv_cache_transceiver.check_gen_transfer_status.side_effect = fail
+
+        PyExecutor._check_disagg_gen_cache_transfer_status(executor, 0)
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.HANDOFF_DEADLINE_CROSSED,
+            DisaggLifecycleEvent.TRANSFER_ADAPTER_ERROR,
+        ]
+        assert (
+            executor._disagg_lifecycle_emitter.records[0][2]["timer_basis"]
+            == DisaggLifecycleTimerBasis.TRANSCEIVER_HANDOFF
+        )
+
+    def test_ctx_status_crossing_handoff_deadline_precedes_adapter_error(self, monkeypatch):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        request = _make_disagg_transfer_request(7, 64)
+        request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        request.py_kv_transfer_timed_out = False
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.requests_in_transfer.side_effect = [
+            {request.py_request_id: request},
+            {request.py_request_id: request},
+            {},
+        ]
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=1000)
+        executor.kv_cache_transceiver.check_context_transfer_status.return_value = (
+            [],
+            [request.py_request_id],
+        )
+        executor._end_transfer_and_maybe_terminate = Mock()
+        executor._check_cache_transfer_errors = Mock()
+        executor._disagg_timed_out_ctx_cancelled_ids = set()
+        monotonic_values = iter((10.0, 10.5, 12.0))
+        monkeypatch.setattr(
+            py_executor_module.time,
+            "monotonic",
+            lambda: next(monotonic_values),
+        )
+        PyExecutor._start_disagg_transfer_observation(executor, request)
+
+        PyExecutor._check_disagg_ctx_cache_transfer_status(executor, 0)
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.HANDOFF_DEADLINE_CROSSED,
+            DisaggLifecycleEvent.TRANSFER_ADAPTER_ERROR,
+        ]
+        executor._end_transfer_and_maybe_terminate.assert_called_once_with(request)
+
+    @pytest.mark.parametrize(
+        "role",
+        [DisaggLifecycleRole.CTX, DisaggLifecycleRole.GEN],
+    )
+    def test_status_exception_crossing_handoff_deadline_precedes_poll_error(
+        self, monkeypatch, role
+    ):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=1000)
+        request = _make_disagg_transfer_request(7, 64, in_progress=role == DisaggLifecycleRole.GEN)
+        request.state = (
+            LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            if role == DisaggLifecycleRole.CTX
+            else LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        )
+        monotonic_values = iter((10.0, 10.5, 12.0))
+        monkeypatch.setattr(
+            py_executor_module.time,
+            "monotonic",
+            lambda: next(monotonic_values),
+        )
+        PyExecutor._start_disagg_transfer_observation(executor, request)
+
+        if role == DisaggLifecycleRole.CTX:
+            executor.async_transfer_manager = Mock()
+            executor.async_transfer_manager.requests_in_transfer.return_value = {
+                request.py_request_id: request
+            }
+            status_check = executor.kv_cache_transceiver.check_context_transfer_status
+            invoke = PyExecutor._check_disagg_ctx_cache_transfer_status
+        else:
+            executor.active_requests = [request]
+            status_check = executor.kv_cache_transceiver.check_gen_transfer_status
+            invoke = PyExecutor._check_disagg_gen_cache_transfer_status
+        status_check.side_effect = RuntimeError("status failed")
+
+        with pytest.raises(RuntimeError, match="status failed"):
+            invoke(executor, 0)
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.HANDOFF_DEADLINE_CROSSED,
+            DisaggLifecycleEvent.ADAPTER_STATUS_POLL_ERROR,
+        ]
+
+    def test_gen_status_exception_records_poll_error_and_reraises(self):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        request = _make_disagg_transfer_request(7, 64, in_progress=True)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        executor.active_requests = [request]
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=None)
+        executor.kv_cache_transceiver.check_gen_transfer_status.side_effect = RuntimeError(
+            "status failed"
+        )
+
+        with pytest.raises(RuntimeError, match="status failed"):
+            PyExecutor._check_disagg_gen_cache_transfer_status(executor, 0)
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.ADAPTER_STATUS_POLL_ERROR
+        ]
+        assert (
+            executor._disagg_lifecycle_emitter.records[0][2]["reason"]
+            == py_executor_module.disagg_diagnostics.DisaggLifecycleReason.ADAPTER_EXCEPTION
+        )
+        assert executor._disagg_lifecycle_emitter.records[0][2]["request_count"] == 1
+        assert "outcome" not in executor._disagg_lifecycle_emitter.records[0][2]
+
+    def test_ctx_status_exception_records_poll_error_and_reraises(self):
+        executor = object.__new__(PyExecutor)
+        executor._disagg_lifecycle_emitter = _RecordingLifecycleEmitter()
+        request = _make_disagg_transfer_request(7, 64)
+        request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.requests_in_transfer.return_value = {
+            request.py_request_id: request
+        }
+        executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=None)
+        executor.kv_cache_transceiver.check_context_transfer_status.side_effect = RuntimeError(
+            "status failed"
+        )
+
+        with pytest.raises(RuntimeError, match="status failed"):
+            PyExecutor._check_disagg_ctx_cache_transfer_status(executor, 0)
+
+        assert [record[0] for record in executor._disagg_lifecycle_emitter.records] == [
+            DisaggLifecycleEvent.ADAPTER_STATUS_POLL_ERROR
+        ]
+        assert (
+            executor._disagg_lifecycle_emitter.records[0][2]["reason"]
+            == py_executor_module.disagg_diagnostics.DisaggLifecycleReason.ADAPTER_EXCEPTION
+        )
+        assert executor._disagg_lifecycle_emitter.records[0][2]["request_count"] == 1
+        assert "outcome" not in executor._disagg_lifecycle_emitter.records[0][2]
+
     def test_gen_transfer_status_polls_active_transfers(self):
         executor = object.__new__(PyExecutor)
         executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]

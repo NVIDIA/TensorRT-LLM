@@ -47,6 +47,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
     get_global_profiler, host_profiler_context)
 
+from ..disaggregation import diagnostics as disagg_diagnostics
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
 from ..expert_statistic import ExpertStatistic
@@ -586,6 +587,8 @@ class PyExecutor:
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
         self.llm_args = self.model_engine.llm_args
+        self._disagg_lifecycle_emitter = (
+            self._create_disagg_lifecycle_emitter())
         self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
@@ -853,6 +856,7 @@ class PyExecutor:
             max_batch_size=max_batch_size,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
+            disagg_lifecycle_emitter=self._disagg_lifecycle_emitter,
         )
         # When overlap scheduler is enabled then when starting to handle a new prompt,
         # _sample_async is called twice before the first call to update_requests:
@@ -1509,6 +1513,15 @@ class PyExecutor:
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
+        disagg_lifecycle_emitter = getattr(self, "_disagg_lifecycle_emitter",
+                                           None)
+        if disagg_lifecycle_emitter is not None:
+            try:
+                # A False return means the bounded drain elapsed, but close()
+                # has already scheduled self-termination after sink recovery.
+                disagg_lifecycle_emitter.close()
+            except Exception:
+                disagg_lifecycle_emitter.record_failure()
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -3411,18 +3424,321 @@ class PyExecutor:
         return isinstance(getattr(self, "kv_cache_manager", None),
                           KVCacheManagerV2)
 
+    def _create_disagg_lifecycle_emitter(
+            self) -> Optional[disagg_diagnostics.DisaggLifecycleEmitter]:
+        """Create optional diagnostics without affecting executor startup."""
+
+        try:
+            cache_transceiver_config = getattr(self.llm_args,
+                                               "cache_transceiver_config", None)
+            emitter = (
+                disagg_diagnostics.DisaggLifecycleEmitter.from_environment(
+                    rank=self.dist.rank,
+                    runtime=getattr(cache_transceiver_config,
+                                    "transceiver_runtime", None),
+                    backend=getattr(cache_transceiver_config, "backend", None),
+                ))
+            return emitter if emitter.enabled else None
+        except Exception as error:
+            try:
+                logger.warning(
+                    "Disaggregated lifecycle diagnostics could not start; "
+                    f"request execution is continuing: {error}")
+            except Exception:
+                pass
+            return None
+
+    def _emit_disagg_lifecycle(
+        self,
+        event: disagg_diagnostics.DisaggLifecycleEvent,
+        request: LlmRequest,
+        *,
+        role: disagg_diagnostics.DisaggLifecycleRole,
+        **kwargs,
+    ) -> None:
+        emitter = getattr(self, "_disagg_lifecycle_emitter", None)
+        if emitter is None:
+            return
+        emitter.emit_for_request(
+            event,
+            request,
+            emitter=disagg_diagnostics.DisaggLifecycleEmitterName.PYEXECUTOR,
+            role=role,
+            **kwargs,
+        )
+
+    def _record_disagg_local_scheduler_activations(
+            self, requests: Iterable[LlmRequest]) -> None:
+        """Record requests entering this rank's local scheduler."""
+
+        emitter = getattr(self, "_disagg_lifecycle_emitter", None)
+        if emitter is None:
+            return
+        for request in requests:
+            emitter.emit_for_role(
+                ctx_event=(disagg_diagnostics.DisaggLifecycleEvent.
+                           CTX_LOCAL_SCHEDULER_ACTIVATED),
+                gen_event=(disagg_diagnostics.DisaggLifecycleEvent.
+                           GEN_LOCAL_SCHEDULER_ACTIVATED),
+                request=request,
+                emitter=(
+                    disagg_diagnostics.DisaggLifecycleEmitterName.PYEXECUTOR),
+            )
+
+    def _get_disagg_lifecycle_state(
+        self, request: LlmRequest
+    ) -> Optional[disagg_diagnostics.DisaggRequestLifecycleState]:
+        """Return lazily attached state without affecting request execution."""
+
+        emitter = getattr(self, "_disagg_lifecycle_emitter", None)
+        if emitter is None:
+            return None
+        try:
+            lifecycle_state = getattr(request, "py_disagg_lifecycle_state",
+                                      None)
+            if not isinstance(lifecycle_state,
+                              disagg_diagnostics.DisaggRequestLifecycleState):
+                lifecycle_state = (
+                    disagg_diagnostics.DisaggRequestLifecycleState())
+                request.py_disagg_lifecycle_state = lifecycle_state
+            return lifecycle_state
+        except Exception:
+            emitter.record_failure()
+            return None
+
+    def _start_disagg_transfer_observation(self, request: LlmRequest) -> None:
+        """Start the diagnostics-only handoff timer for one adapter call."""
+
+        lifecycle_state = self._get_disagg_lifecycle_state(request)
+        if lifecycle_state is None:
+            return
+        try:
+            lifecycle_state.transfer_handoff_time = time.monotonic()
+            lifecycle_state.handoff_deadline_crossed = False
+            lifecycle_state.watchdog_timeout_observed = False
+        except Exception:
+            self._disagg_lifecycle_emitter.record_failure()
+
+    def _record_disagg_watchdog_timeout(
+        self,
+        request: LlmRequest,
+        *,
+        role: disagg_diagnostics.DisaggLifecycleRole,
+        timeout_ms: int,
+        elapsed_ms: float,
+    ) -> bool:
+        """Record an actual timeout decision by the executor watchdog."""
+
+        lifecycle_state = self._get_disagg_lifecycle_state(request)
+        if (lifecycle_state is None
+                or lifecycle_state.watchdog_timeout_observed):
+            return False
+        try:
+            lifecycle_state.watchdog_timeout_observed = True
+            self._emit_disagg_lifecycle(
+                disagg_diagnostics.DisaggLifecycleEvent.TIMEOUT_OBSERVED,
+                request,
+                role=role,
+                reason=(
+                    disagg_diagnostics.DisaggLifecycleReason.DEADLINE_EXCEEDED),
+                timeout_ms=timeout_ms,
+                elapsed_ms=elapsed_ms,
+                timer_basis=(disagg_diagnostics.DisaggLifecycleTimerBasis.
+                             EXECUTOR_WATCHDOG),
+            )
+            return True
+        except Exception:
+            self._disagg_lifecycle_emitter.record_failure()
+            return False
+
+    def _observe_disagg_handoff_deadline(
+        self,
+        request: LlmRequest,
+        *,
+        role: disagg_diagnostics.DisaggLifecycleRole,
+    ) -> bool:
+        """Record handoff latency crossing the configured timeout threshold."""
+
+        try:
+            lifecycle_state = self._get_disagg_lifecycle_state(request)
+            if (lifecycle_state is None
+                    or lifecycle_state.handoff_deadline_crossed
+                    or lifecycle_state.transfer_handoff_time is None):
+                return False
+            timeout_ms = getattr(self.kv_cache_transceiver,
+                                 "kv_transfer_timeout_ms", None)
+            if not isinstance(timeout_ms, (int, float)):
+                return False
+            elapsed_ms = (time.monotonic() -
+                          lifecycle_state.transfer_handoff_time) * 1000
+            if elapsed_ms <= timeout_ms:
+                return False
+            lifecycle_state.handoff_deadline_crossed = True
+            self._emit_disagg_lifecycle(
+                disagg_diagnostics.DisaggLifecycleEvent.
+                HANDOFF_DEADLINE_CROSSED,
+                request,
+                role=role,
+                reason=(
+                    disagg_diagnostics.DisaggLifecycleReason.DEADLINE_EXCEEDED),
+                timeout_ms=timeout_ms,
+                elapsed_ms=elapsed_ms,
+                timer_basis=(disagg_diagnostics.DisaggLifecycleTimerBasis.
+                             TRANSCEIVER_HANDOFF),
+            )
+            return True
+        except Exception:
+            self._disagg_lifecycle_emitter.record_failure()
+            return False
+
+    def _emit_disagg_status_poll_error(
+        self,
+        *,
+        role: disagg_diagnostics.DisaggLifecycleRole,
+        operation: disagg_diagnostics.DisaggLifecycleOperation,
+        request_count: int,
+    ) -> None:
+        """Record an operation-scoped poll failure without terminal claims."""
+
+        emitter = getattr(self, "_disagg_lifecycle_emitter", None)
+        if emitter is None:
+            return
+        emitter.emit(
+            disagg_diagnostics.DisaggLifecycleEvent.ADAPTER_STATUS_POLL_ERROR,
+            emitter=disagg_diagnostics.DisaggLifecycleEmitterName.PYEXECUTOR,
+            role=role,
+            correlation=disagg_diagnostics.DisaggCorrelation(None, None, None),
+            operation=operation,
+            reason=disagg_diagnostics.DisaggLifecycleReason.ADAPTER_EXCEPTION,
+            request_count=request_count,
+        )
+
+    def _invoke_disagg_transceiver(
+        self,
+        request: LlmRequest,
+        *,
+        role: disagg_diagnostics.DisaggLifecycleRole,
+        operation: disagg_diagnostics.DisaggLifecycleOperation,
+        callback: Callable[[LlmRequest], object],
+    ) -> object:
+        """Invoke an adapter boundary without changing exception behavior."""
+
+        emitter = getattr(self, "_disagg_lifecycle_emitter", None)
+        if emitter is None:
+            return callback(request)
+
+        self._start_disagg_transfer_observation(request)
+        self._emit_disagg_lifecycle(
+            disagg_diagnostics.DisaggLifecycleEvent.TRANSCEIVER_HANDOFF,
+            request,
+            role=role,
+            operation=operation,
+        )
+        try:
+            result = callback(request)
+        except Exception:
+            self._observe_disagg_handoff_deadline(request, role=role)
+            self._emit_disagg_lifecycle(
+                disagg_diagnostics.DisaggLifecycleEvent.TRANSFER_ADAPTER_ERROR,
+                request,
+                role=role,
+                operation=operation,
+                outcome=disagg_diagnostics.DisaggLifecycleOutcome.FAILED,
+                reason=(
+                    disagg_diagnostics.DisaggLifecycleReason.ADAPTER_EXCEPTION),
+            )
+            raise
+        if operation == disagg_diagnostics.DisaggLifecycleOperation.SYNC_RECEIVE:
+            self._observe_disagg_handoff_deadline(request, role=role)
+        self._emit_disagg_lifecycle(
+            disagg_diagnostics.DisaggLifecycleEvent.TRANSCEIVER_CALL_RETURNED,
+            request,
+            role=role,
+            operation=operation,
+        )
+        return result
+
+    def _record_disagg_admission_transition(
+        self,
+        request: LlmRequest,
+        *,
+        gate: disagg_diagnostics.DisaggLifecycleGate,
+        decision: disagg_diagnostics.DisaggLifecycleDecision,
+        **kwargs,
+    ) -> None:
+        emitter = getattr(self, "_disagg_lifecycle_emitter", None)
+        if emitter is None or not emitter.enabled:
+            return
+
+        try:
+            lifecycle_state = self._get_disagg_lifecycle_state(request)
+            if lifecycle_state is None:
+                return
+
+            if gate == disagg_diagnostics.DisaggLifecycleGate.SCHEDULER:
+                if lifecycle_state.scheduler_eligible:
+                    return
+                lifecycle_state.scheduler_eligible = True
+            else:
+                if lifecycle_state.admission_decision == decision:
+                    return
+                lifecycle_state.admission_decision = decision
+
+            self._emit_disagg_lifecycle(
+                disagg_diagnostics.DisaggLifecycleEvent.GEN_ADMISSION_CHANGED,
+                request,
+                role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                gate=gate,
+                decision=decision,
+                **kwargs,
+            )
+        except Exception:
+            emitter.record_failure()
+
     def _apply_disagg_transfer_admission(
         self, fitting_disagg_gen_init_requests: List[LlmRequest]
     ) -> Tuple[List[LlmRequest], bool]:
+        lifecycle_enabled = bool(
+            getattr(getattr(self, "_disagg_lifecycle_emitter", None), "enabled",
+                    False))
+        if lifecycle_enabled:
+            for request in fitting_disagg_gen_init_requests:
+                self._record_disagg_admission_transition(
+                    request,
+                    gate=disagg_diagnostics.DisaggLifecycleGate.SCHEDULER,
+                    decision=(
+                        disagg_diagnostics.DisaggLifecycleDecision.ELIGIBLE),
+                )
+
         # gen_only_no_context has no CTX worker and does not transfer data.
         # Real synchronous gen_only transfers still honor the budget to bound
         # the number of blocking transfers started in one executor iteration.
         if self._is_disagg_gen_only_no_context_benchmark():
+            if lifecycle_enabled:
+                for request in fitting_disagg_gen_init_requests:
+                    self._record_disagg_admission_transition(
+                        request,
+                        gate=disagg_diagnostics.DisaggLifecycleGate.TRANSFER,
+                        decision=(
+                            disagg_diagnostics.DisaggLifecycleDecision.BYPASS),
+                        reason=(disagg_diagnostics.DisaggLifecycleReason.
+                                GEN_ONLY_NO_CONTEXT),
+                    )
             return fitting_disagg_gen_init_requests, False
 
         controller = self._get_disagg_transfer_admission_controller()
         if not (getattr(self, "kv_cache_transceiver", None)
                 and controller.enabled() and fitting_disagg_gen_init_requests):
+            if lifecycle_enabled:
+                for request in fitting_disagg_gen_init_requests:
+                    self._record_disagg_admission_transition(
+                        request,
+                        gate=disagg_diagnostics.DisaggLifecycleGate.TRANSFER,
+                        decision=(
+                            disagg_diagnostics.DisaggLifecycleDecision.BYPASS),
+                        reason=(disagg_diagnostics.DisaggLifecycleReason.
+                                ADMISSION_DISABLED),
+                    )
             return fitting_disagg_gen_init_requests, False
 
         admission_result = controller.select(self.active_requests,
@@ -3435,6 +3751,26 @@ class PyExecutor:
                          f"admitted transfer blocks="
                          f"{admission_result.admitted_transfer_blocks}, "
                          f"budget={controller.max_transfer_blocks}")
+
+        if lifecycle_enabled:
+            admitted_request_ids = {
+                request.py_request_id
+                for request in admission_result.admitted_requests
+            }
+            for request in fitting_disagg_gen_init_requests:
+                is_admitted = request.py_request_id in admitted_request_ids
+                self._record_disagg_admission_transition(
+                    request,
+                    gate=disagg_diagnostics.DisaggLifecycleGate.TRANSFER,
+                    decision=(disagg_diagnostics.DisaggLifecycleDecision.ADMIT
+                              if is_admitted else
+                              disagg_diagnostics.DisaggLifecycleDecision.DEFER),
+                    reason=(None if is_admitted else disagg_diagnostics.
+                            DisaggLifecycleReason.TRANSFER_BUDGET),
+                    blocks=controller._estimate_request_blocks(request),
+                    budget_blocks=controller.max_transfer_blocks,
+                    active_blocks=admission_result.active_transfer_blocks,
+                )
 
         self._revert_deferred_disagg_gen_init_alloc(
             fitting_disagg_gen_init_requests,
@@ -4941,8 +5277,11 @@ class PyExecutor:
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
             with self.hang_detector.pause():
-                new_requests.extend(
+                dequeued_requests = (
                     self.executor_request_queue.get_from_request_queue(timeout))
+            self.executor_request_queue.emit_disagg_dequeue_events(
+                dequeued_requests)
+            new_requests.extend(dequeued_requests)
 
         # Broadcast requests and handle Python objects. RequestBroadcaster probes
         # the request count first and can skip the heavy payload broadcast on
@@ -4952,6 +5291,9 @@ class PyExecutor:
 
         # Validate and filter requests
         new_requests = self._handle_special_queue_items(new_requests)
+        if self.dist.rank == 0:
+            self.executor_request_queue.emit_disagg_dispatch_events(
+                new_requests)
 
         # Attach Python objects to requests
         if py_request_objects and (self.dist.tp_size > 1 or self.dist.has_pp
@@ -5042,6 +5384,9 @@ class PyExecutor:
         new_requests = self._pop_from_waiting_queue(
             waiting_queue, total_num_active_requests,
             all_ranks_num_active_requests)
+        if self.dist.rank == 0:
+            self.executor_request_queue.emit_disagg_waiting_release_events(
+                new_requests)
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -5073,12 +5418,15 @@ class PyExecutor:
             new_requests = new_requests_cur_rank
 
         # 7. Merge requests
-        return merge_requests(new_requests,
-                              cp_config=self.dist.cp_config,
-                              cp_rank=self.dist.cp_rank,
-                              cp_size=self.dist.cp_size,
-                              exclude_last_generation_logits=self.
-                              _should_exclude_last_generation_logits())
+        merged_requests = merge_requests(
+            new_requests,
+            cp_config=self.dist.cp_config,
+            cp_rank=self.dist.cp_rank,
+            cp_size=self.dist.cp_size,
+            exclude_last_generation_logits=self.
+            _should_exclude_last_generation_logits())
+        self._record_disagg_local_scheduler_activations(merged_requests)
+        return merged_requests
 
     def _handle_special_queue_items(
             self,
@@ -5503,6 +5851,44 @@ class PyExecutor:
                          f"{request.py_request_id}; will retry: {error}")
             return False
 
+    def _mark_kv_transfer_timeout(
+        self,
+        request: LlmRequest,
+        *,
+        role: disagg_diagnostics.DisaggLifecycleRole,
+        timeout_ms: int,
+        current_time: float,
+        requesting_cancellation: Optional[bool],
+    ) -> bool:
+        """Mark and record one local timeout observation."""
+
+        if (request.py_kv_transfer_start_time is None
+                or request.py_kv_transfer_timed_out):
+            return False
+        elapsed_time = (current_time - request.py_kv_transfer_start_time) * 1000
+        if elapsed_time <= timeout_ms:
+            return False
+
+        if requesting_cancellation is None:
+            requesting_cancellation = (self._is_disagg_inflight_cancel_active())
+        verb = ("Requesting cancellation for"
+                if requesting_cancellation else "Observed timeout on")
+        role_name = ("context"
+                     if role == disagg_diagnostics.DisaggLifecycleRole.CTX else
+                     "generation")
+        request.py_kv_transfer_timed_out = True
+        self._record_disagg_watchdog_timeout(
+            request,
+            role=role,
+            timeout_ms=timeout_ms,
+            elapsed_ms=elapsed_time,
+        )
+        logger.warning(
+            f"{verb} {role_name} request {request.py_request_id} due to KV "
+            f"cache transfer timeout: elapsed {elapsed_time:.0f}ms > "
+            f"kv_transfer_timeout_ms={timeout_ms}ms")
+        return True
+
     @nvtx_range("_cancel_timed_out_gen_transfers")
     def _cancel_timed_out_gen_transfers(self) -> None:
         """Request cancellation for timed-out generation transfers.
@@ -5524,16 +5910,13 @@ class PyExecutor:
         }
         current_time = time.monotonic()
         for request in requests_in_transfer.values():
-            if request.py_kv_transfer_start_time is None:
-                continue
-            elapsed_time = ((current_time - request.py_kv_transfer_start_time) *
-                            1000)
-            if (elapsed_time > timeout_ms
-                    and not request.py_kv_transfer_timed_out):
-                logger.warning(
-                    f"Requesting cancellation for generation request "
-                    f"{request.py_request_id} due to KV cache transfer timeout")
-                request.py_kv_transfer_timed_out = True
+            self._mark_kv_transfer_timeout(
+                request,
+                role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                timeout_ms=timeout_ms,
+                current_time=current_time,
+                requesting_cancellation=True,
+            )
 
         user_canceled_ids = set(self.canceled_req_ids)
         local_timed_out_ids = sorted(
@@ -5608,27 +5991,24 @@ class PyExecutor:
         if timeout_ms is None:
             return
 
-        def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
-            current_time = time.monotonic()
-            if req.py_kv_transfer_start_time is None:
-                return
-            elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
-            if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
-                verb = ("Requesting cancellation for"
-                        if self._is_disagg_inflight_cancel_active() else
-                        "Observed timeout on")
-                logger.warning(
-                    f"{verb} {type} request {req.py_request_id} due to KV "
-                    f"cache transfer timeout: elapsed {elapsed_time:.0f}ms > "
-                    f"kv_transfer_timeout_ms={timeout_ms}ms")
-                req.py_kv_transfer_timed_out = True
-
         for req in self.async_transfer_manager.requests_in_transfer().values():
-            flag_if_kv_transfer_timed_out(req, "context")
+            self._mark_kv_transfer_timeout(
+                req,
+                role=disagg_diagnostics.DisaggLifecycleRole.CTX,
+                timeout_ms=timeout_ms,
+                current_time=time.monotonic(),
+                requesting_cancellation=None,
+            )
 
         for req in self.active_requests:
             if req.is_disagg_generation_transmission_in_progress:
-                flag_if_kv_transfer_timed_out(req, "generation")
+                self._mark_kv_transfer_timeout(
+                    req,
+                    role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                    timeout_ms=timeout_ms,
+                    current_time=time.monotonic(),
+                    requesting_cancellation=None,
+                )
 
         return
 
@@ -5850,6 +6230,15 @@ class PyExecutor:
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
 
+            if getattr(self, "_disagg_lifecycle_emitter", None) is not None:
+                for request in fitting_disagg_gen_init_requests:
+                    self._emit_disagg_lifecycle(
+                        disagg_diagnostics.DisaggLifecycleEvent.
+                        GEN_RESOURCES_READY,
+                        request,
+                        role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                    )
+
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
@@ -5896,6 +6285,12 @@ class PyExecutor:
                     req.add_new_token(first_gen_tokens[beam], beam)
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
+                if getattr(self, "_disagg_lifecycle_emitter", None) is not None:
+                    self._emit_disagg_lifecycle(
+                        disagg_diagnostics.DisaggLifecycleEvent.GEN_READY,
+                        req,
+                        role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                    )
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
@@ -6023,6 +6418,8 @@ class PyExecutor:
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
+        lifecycle_enabled = getattr(self, "_disagg_lifecycle_emitter",
+                                    None) is not None
 
         # gen_only_no_context has no CTX worker, so mark each request as
         # transmission-complete immediately.
@@ -6036,19 +6433,74 @@ class PyExecutor:
             # batch. Drain all synchronous receives even after one fails so no
             # prepared request is left in DISAGG_GENERATION_INIT.
             for req in new_gen_reqs:
-                self.kv_cache_transceiver.request_and_receive_sync(req)
+                if lifecycle_enabled:
+                    self._invoke_disagg_transceiver(
+                        req,
+                        role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                        operation=(disagg_diagnostics.DisaggLifecycleOperation.
+                                   SYNC_RECEIVE),
+                        callback=(
+                            self.kv_cache_transceiver.request_and_receive_sync),
+                    )
+                else:
+                    self.kv_cache_transceiver.request_and_receive_sync(req)
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
                     self._sync_disagg_transfer_made_progress = True
+                    if lifecycle_enabled:
+                        self._emit_disagg_lifecycle(
+                            disagg_diagnostics.DisaggLifecycleEvent.
+                            TRANSFER_ADAPTER_COMPLETE,
+                            req,
+                            role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                            operation=(disagg_diagnostics.
+                                       DisaggLifecycleOperation.SYNC_RECEIVE),
+                            outcome=(disagg_diagnostics.DisaggLifecycleOutcome.
+                                     COMPLETED),
+                        )
+                elif (lifecycle_enabled
+                      and req.state == LlmRequestState.DISAGG_TRANS_ERROR):
+                    self._emit_disagg_lifecycle(
+                        disagg_diagnostics.DisaggLifecycleEvent.
+                        TRANSFER_ADAPTER_ERROR,
+                        req,
+                        role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                        operation=(disagg_diagnostics.DisaggLifecycleOperation.
+                                   SYNC_RECEIVE),
+                        outcome=(
+                            disagg_diagnostics.DisaggLifecycleOutcome.FAILED),
+                    )
             self._check_cache_transfer_errors("generation requests")
             return
 
         for req in new_gen_reqs:
-            self.kv_cache_transceiver.request_and_receive_async(req)
+            if lifecycle_enabled:
+                self._invoke_disagg_transceiver(
+                    req,
+                    role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                    operation=(disagg_diagnostics.DisaggLifecycleOperation.
+                               ASYNC_RECEIVE),
+                    callback=(
+                        self.kv_cache_transceiver.request_and_receive_async),
+                )
+            else:
+                self.kv_cache_transceiver.request_and_receive_async(req)
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
             for req in new_gen_reqs:
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                     req.py_kv_transfer_start_time = time.monotonic()
+                    if lifecycle_enabled:
+                        self._emit_disagg_lifecycle(
+                            disagg_diagnostics.DisaggLifecycleEvent.
+                            TIMEOUT_ARMED,
+                            req,
+                            role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                            timeout_ms=(self.kv_cache_transceiver.
+                                        kv_transfer_timeout_ms),
+                            timer_basis=(
+                                disagg_diagnostics.DisaggLifecycleTimerBasis.
+                                EXECUTOR_WATCHDOG),
+                        )
 
         self._check_disagg_gen_cache_transfer_status(0)
 
@@ -6056,6 +6508,8 @@ class PyExecutor:
 
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
+        lifecycle_enabled = getattr(self, "_disagg_lifecycle_emitter",
+                                    None) is not None
 
         def kv_connector_request_finished(req: LlmRequest):
             try:
@@ -6074,6 +6528,14 @@ class PyExecutor:
                 if req.is_context_only_request and (
                         req.is_context_finished or req.is_finished_due_to_length
                 ) and not req.is_finished_due_to_cancellation:
+                    if lifecycle_enabled:
+                        PyExecutor._emit_disagg_lifecycle(
+                            self,
+                            disagg_diagnostics.DisaggLifecycleEvent.
+                            CTX_ARTIFACT_READY,
+                            req,
+                            role=disagg_diagnostics.DisaggLifecycleRole.CTX,
+                        )
                     # Forward is done for this request — release the
                     # IndexMapper slot so new requests can reuse it.
                     # KV blocks stay allocated for the upcoming transfer.
@@ -6083,10 +6545,34 @@ class PyExecutor:
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
-                    self.kv_cache_transceiver.respond_and_send_async(req)
+                    if lifecycle_enabled:
+                        PyExecutor._invoke_disagg_transceiver(
+                            self,
+                            req,
+                            role=disagg_diagnostics.DisaggLifecycleRole.CTX,
+                            operation=(disagg_diagnostics.
+                                       DisaggLifecycleOperation.ASYNC_SEND),
+                            callback=(self.kv_cache_transceiver.
+                                      respond_and_send_async),
+                        )
+                    else:
+                        self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.monotonic()
+                        if lifecycle_enabled:
+                            PyExecutor._emit_disagg_lifecycle(
+                                self,
+                                disagg_diagnostics.DisaggLifecycleEvent.
+                                TIMEOUT_ARMED,
+                                req,
+                                role=disagg_diagnostics.DisaggLifecycleRole.CTX,
+                                timeout_ms=(self.kv_cache_transceiver.
+                                            kv_transfer_timeout_ms),
+                                timer_basis=(
+                                    disagg_diagnostics.DisaggLifecycleTimerBasis
+                                    .EXECUTOR_WATCHDOG),
+                            )
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
@@ -6142,9 +6628,38 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
-        finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
-            atLeastNum)
+        lifecycle_enabled = bool(
+            getattr(getattr(self, "_disagg_lifecycle_emitter", None), "enabled",
+                    False))
+        tracked_requests = []
+        if lifecycle_enabled:
+            try:
+                tracked_requests = list(
+                    self.async_transfer_manager.requests_in_transfer().values())
+            except Exception:
+                self._disagg_lifecycle_emitter.record_failure()
+            for request in tracked_requests:
+                self._observe_disagg_handoff_deadline(
+                    request, role=disagg_diagnostics.DisaggLifecycleRole.CTX)
+        try:
+            finished_requests, error_requests = (
+                self.kv_cache_transceiver.check_context_transfer_status(
+                    atLeastNum))
+        except Exception:
+            for request in tracked_requests:
+                self._observe_disagg_handoff_deadline(
+                    request, role=disagg_diagnostics.DisaggLifecycleRole.CTX)
+            self._emit_disagg_status_poll_error(
+                role=disagg_diagnostics.DisaggLifecycleRole.CTX,
+                operation=(
+                    disagg_diagnostics.DisaggLifecycleOperation.ASYNC_SEND),
+                request_count=len(tracked_requests),
+            )
+            raise
 
+        for request in tracked_requests:
+            self._observe_disagg_handoff_deadline(
+                request, role=disagg_diagnostics.DisaggLifecycleRole.CTX)
         completed_req_ids = set(finished_requests + error_requests)
 
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
@@ -6159,6 +6674,27 @@ class PyExecutor:
 
             request = requests_in_transfer[request_id]
 
+            if lifecycle_enabled and request_id in error_requests:
+                self._emit_disagg_lifecycle(
+                    disagg_diagnostics.DisaggLifecycleEvent.
+                    TRANSFER_ADAPTER_ERROR,
+                    request,
+                    role=disagg_diagnostics.DisaggLifecycleRole.CTX,
+                    operation=(
+                        disagg_diagnostics.DisaggLifecycleOperation.ASYNC_SEND),
+                    outcome=(disagg_diagnostics.DisaggLifecycleOutcome.FAILED),
+                )
+            elif lifecycle_enabled:
+                self._emit_disagg_lifecycle(
+                    disagg_diagnostics.DisaggLifecycleEvent.
+                    TRANSFER_ADAPTER_COMPLETE,
+                    request,
+                    role=disagg_diagnostics.DisaggLifecycleRole.CTX,
+                    operation=(
+                        disagg_diagnostics.DisaggLifecycleOperation.ASYNC_SEND),
+                    outcome=(
+                        disagg_diagnostics.DisaggLifecycleOutcome.COMPLETED),
+                )
             self._end_transfer_and_maybe_terminate(request)
 
         # The set of requests in transfer may have changed since we terminated some requests.
@@ -6193,7 +6729,33 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
-        result = self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
+        lifecycle_enabled = bool(
+            getattr(getattr(self, "_disagg_lifecycle_emitter", None), "enabled",
+                    False))
+        tracked_requests = ([
+            request for request in self.active_requests
+            if request.is_disagg_generation_transmission_in_progress
+        ] if lifecycle_enabled else [])
+        for request in tracked_requests:
+            self._observe_disagg_handoff_deadline(
+                request, role=disagg_diagnostics.DisaggLifecycleRole.GEN)
+        try:
+            result = self.kv_cache_transceiver.check_gen_transfer_status(
+                atLeastNum)
+        except Exception:
+            for request in tracked_requests:
+                self._observe_disagg_handoff_deadline(
+                    request, role=disagg_diagnostics.DisaggLifecycleRole.GEN)
+            self._emit_disagg_status_poll_error(
+                role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                operation=(
+                    disagg_diagnostics.DisaggLifecycleOperation.ASYNC_RECEIVE),
+                request_count=len(tracked_requests),
+            )
+            raise
+        for request in tracked_requests:
+            self._observe_disagg_handoff_deadline(
+                request, role=disagg_diagnostics.DisaggLifecycleRole.GEN)
         if isinstance(result, tuple):
             _, _, cancelled_reqs = result
             user_canceled_set = set(self.canceled_req_ids)
@@ -6201,6 +6763,29 @@ class PyExecutor:
                 req_id = req.py_request_id if not req.is_child else req.parent_request_id
                 if req_id not in user_canceled_set:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
+
+        for request in tracked_requests:
+            if request.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
+                self._emit_disagg_lifecycle(
+                    disagg_diagnostics.DisaggLifecycleEvent.
+                    TRANSFER_ADAPTER_COMPLETE,
+                    request,
+                    role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                    operation=(disagg_diagnostics.DisaggLifecycleOperation.
+                               ASYNC_RECEIVE),
+                    outcome=(
+                        disagg_diagnostics.DisaggLifecycleOutcome.COMPLETED),
+                )
+            elif request.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                self._emit_disagg_lifecycle(
+                    disagg_diagnostics.DisaggLifecycleEvent.
+                    TRANSFER_ADAPTER_ERROR,
+                    request,
+                    role=disagg_diagnostics.DisaggLifecycleRole.GEN,
+                    operation=(disagg_diagnostics.DisaggLifecycleOperation.
+                               ASYNC_RECEIVE),
+                    outcome=(disagg_diagnostics.DisaggLifecycleOutcome.FAILED),
+                )
         if not self._is_disagg_inflight_cancel_active():
             self._check_cache_transfer_errors("generation requests")
 
