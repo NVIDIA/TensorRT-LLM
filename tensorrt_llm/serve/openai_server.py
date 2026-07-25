@@ -512,8 +512,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def _validate_internal_disagg_request(self, request, raw_request) -> None:
         headers = {} if raw_request is None else raw_request.headers
-        validate_internal_disagg_request(self._internal_disagg_auth_key,
-                                         request, headers)
+        validate_internal_disagg_request(
+            getattr(self, "_internal_disagg_auth_key", None), request, headers)
 
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
@@ -640,8 +640,8 @@ class OpenAIServer(_VideoRoutesMixin):
     def _validate_internal_disagg_request(
             self, request, raw_request: Optional[Request]) -> None:
         headers = None if raw_request is None else raw_request.headers
-        validate_internal_disagg_request(self._internal_disagg_auth_key,
-                                         request, headers)
+        validate_internal_disagg_request(
+            getattr(self, "_internal_disagg_auth_key", None), request, headers)
 
     def _log_config_info_metrics(self) -> None:
         """Extract configuration from generator args and log as Prometheus info gauges."""
