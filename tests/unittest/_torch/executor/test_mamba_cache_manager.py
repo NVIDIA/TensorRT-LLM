@@ -468,6 +468,30 @@ def _build_hybrid_with_mamba_layer(
 
 
 @skip_no_cuda
+def test_cpp_hybrid_keeps_kv_dtype_for_recurrent_pool_on_non_nvfp4_kv_cache():
+    """https://nvbugs/6479324: the disagg KV wire transfers recurrent-window
+    blocks with the KV pools' dtype; a differing recurrent-pool dtype breaks
+    split/concat mid-transfer and stalls generation-side onboarding. The SSM
+    dtype override is only needed for NVFP4 KV caches, whose container/scale
+    semantics would corrupt the byte-blob recurrent state."""
+    mgr = _build_hybrid_with_mamba_layer(
+        dtype=DataType.FP8,
+        mamba_ssm_cache_dtype=torch.bfloat16,
+    )
+
+    expected_dtypes = [
+        (LinearCacheType.RECURRENT_STATES.value, DataType.FP8),
+        (128, DataType.FP8),
+    ]
+    assert [
+        (config.window_size, config.dtype) for config in mgr.pool_configurations
+    ] == expected_dtypes
+    assert [
+        (config.window_size, config.dtype) for config in mgr.impl.pool_configurations
+    ] == expected_dtypes
+
+
+@skip_no_cuda
 @pytest.mark.parametrize(
     "mamba_ssm_cache_dtype",
     [torch.float16, torch.float32, torch.bfloat16],

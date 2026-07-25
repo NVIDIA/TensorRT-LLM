@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -191,6 +191,29 @@ bool FabricMemory::supportFabricMemory()
 // CacheTransBufferManager Implementation
 // ============================================================================
 
+SizeType32 CacheTransBufferManager::kvTransportPoolIdx(KVCacheManager::BaseKVCacheManager* cacheManager)
+{
+    auto const& blockManager = cacheManager->getBlockManager();
+    auto const numPools = blockManager.getNumPools();
+    for (SizeType32 poolIdx = 0; poolIdx < numPools; ++poolIdx)
+    {
+        if (LinearAttentionMetadata::hasLinearCache(blockManager.getPoolWindowSize(poolIdx)))
+        {
+            // Recurrent/linear-attention state pools transfer through
+            // RnnCacheTransBufferManager, not the KV path, and may carry a
+            // dtype different from the KV pools (e.g. BF16 SSM state next to
+            // FP8 KV). They must not define the KV wire dtype or sizing.
+            continue;
+        }
+        if (blockManager.containsBlockScales(poolIdx))
+        {
+            continue;
+        }
+        return poolIdx;
+    }
+    return 0;
+}
+
 size_t CacheTransBufferManager::computeTransferBufferSize(
     KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
 {
@@ -201,7 +224,7 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
     }
     else
     {
-        dataType = cacheManager->getPrimaryPool(0)->getDataType();
+        dataType = cacheManager->getPrimaryPool(kvTransportPoolIdx(cacheManager))->getDataType();
     }
 
     auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
@@ -219,7 +242,7 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
         }
         else
         {
-            auto primaryPool = cacheManager->getPrimaryPool(0);
+            auto primaryPool = cacheManager->getPrimaryPool(kvTransportPoolIdx(cacheManager));
             kvCacheByteSizePerTokenPerLayer
                 = primaryPool->getDimension<-1>() * primaryPool->getDimension<2>() * dataSize / tokensPerBlock;
         }
@@ -246,7 +269,7 @@ CacheTransBufferManager::CacheTransBufferManager(
     KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
     : BaseTransBufferManager(computeTransferBufferSize(cacheManager, maxNumTokens, transferIndexerKCache),
         transferIndexerKCache ? cacheManager->getIndexerKCachePool()->getDataType()
-                              : cacheManager->getPrimaryPool(0)->getDataType(),
+                              : cacheManager->getPrimaryPool(kvTransportPoolIdx(cacheManager))->getDataType(),
         maxNumTokens)
     , mCacheManager{cacheManager}
     , mTransferIndexerKCache{transferIndexerKCache}
@@ -254,25 +277,35 @@ CacheTransBufferManager::CacheTransBufferManager(
     // TODO: FP4 dataSize
     TLLM_CHECK(mCacheManager);
     // TODO(disagg-multi-dtype): Per-pool dtype dispatch in formatter / transfer buffer
-    // not yet implemented.  Disagg currently picks pool 0's dtype as the canonical
-    // transport type (above), so any KV pool with a different dtype would be silently
-    // miscoerced on the wire.  Fail loudly until per-pool dispatch lands.  We restrict
-    // the comparison to KV pools (getNumPools(false, false)) since block-scale and
-    // indexer-K pools legitimately have their own dtypes and travel through their own
-    // code paths.
+    // not yet implemented.  Disagg picks the canonical KV transport pool's dtype (above),
+    // and the formatter's split/concat path moves every non-scale pool's blocks —
+    // including recurrent-states blocks on hybrid models — over the wire with that
+    // single dtype.  A pool with a differing dtype trips dtype/shape assertions
+    // mid-transfer; the sender swallows the exception and the receiver then waits
+    // forever for a ready signal (https://nvbugs/6479324).  Fail loudly at
+    // construction instead.  Block-scale / indexer-K pools legitimately have their
+    // own dtypes and travel through their own code paths.  The loop below iterates
+    // the absolute pool index domain — the same domain getPrimaryPool() uses —
+    // rather than the compacted count from getNumPools(false, false), whose
+    // index-domain mismatch previously made this check vacuous for hybrid models.
     if (!transferIndexerKCache)
     {
-        auto const numKvPools = mCacheManager->getBlockManager().getNumPools(
-            /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
-        auto const dtype0 = mCacheManager->getPrimaryPool(0)->getDataType();
-        for (SizeType32 i = 1; i < numKvPools; ++i)
+        auto const& blockManager = mCacheManager->getBlockManager();
+        auto const canonicalPoolIdx = kvTransportPoolIdx(mCacheManager);
+        auto const canonicalDtype = mCacheManager->getPrimaryPool(canonicalPoolIdx)->getDataType();
+        auto const numPools = blockManager.getNumPools();
+        for (SizeType32 i = 0; i < numPools; ++i)
         {
+            if (i == canonicalPoolIdx || blockManager.containsBlockScales(i))
+            {
+                continue;
+            }
             auto const dtypeI = mCacheManager->getPrimaryPool(i)->getDataType();
-            TLLM_CHECK_WITH_INFO(dtypeI == dtype0,
+            TLLM_CHECK_WITH_INFO(dtypeI == canonicalDtype,
                 "Disaggregated KV cache transfer does not yet support pools with differing dtypes "
-                "(pool 0 dtype=%d, pool %d dtype=%d). TODO(disagg-multi-dtype): per-pool dtype "
-                "dispatch in formatter.",
-                static_cast<int>(dtype0), i, static_cast<int>(dtypeI));
+                "(canonical pool %d dtype=%d, pool %d dtype=%d). TODO(disagg-multi-dtype): per-pool "
+                "dtype dispatch in formatter.",
+                canonicalPoolIdx, static_cast<int>(canonicalDtype), i, static_cast<int>(dtypeI));
         }
     }
     TLLM_LOG_INFO("CacheTransBufferManager created for KV cache");
