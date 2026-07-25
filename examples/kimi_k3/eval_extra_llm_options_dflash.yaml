@@ -1,10 +1,10 @@
 # Extra LLM-API options for Kimi K3 GSM8K/eval runs WITH DFlash speculative
 # decoding. STATUS: the real K3 drafter is a DSpark drafter (schema known
 # from the training team's dummy-dspark0724 checkpoint; weights still
-# training). The runtime loads it but runs plain DFlash — Markov head,
-# confidence head, SWA, and shift_label are NOT implemented yet (see
-# docs/kimi_k3_dflash_scaffold.md), so acceptance with real weights will be
-# degraded until dspark support lands. Point speculative_model at the real
+# training). The drafter-forward dspark semantics (Markov intra-block
+# bias, SWA, shift_label) ARE implemented; confidence-scheduled
+# verification is the remaining gap (weights loaded, unused — see
+# docs/kimi_k3_dflash_scaffold.md). Point speculative_model at the real
 # drafter when it drops, or at the output of
 # make_synthetic_dflash_drafter.py to exercise the wiring only (random
 # weights draft gibberish; acceptance ~0, so that validates plumbing, not

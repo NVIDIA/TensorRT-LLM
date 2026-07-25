@@ -33,6 +33,34 @@ if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
 
 
+def dflash_draft_slot_ids(
+    num_gens: int,
+    block_size: int,
+    num_draft_tokens: int,
+    shift_label: bool,
+    device="cuda",
+) -> torch.Tensor:
+    """Flat indices into the [num_gens * block_size] drafter block outputs
+    whose hidden states produce the K draft-token logits per request.
+
+    Plain DFlash (K2.7 convention, shift_label off): the hidden state at
+    mask slot j (j = 1..K) predicts draft token j; slot 0 (which holds the
+    anchor/bonus token) is unused.
+
+    DSpark shift_label convention (DeepSpec: labels for a block anchored at
+    position p are input_ids[p+1 .. p+block_size], so the hidden state at
+    block slot j predicts the token at position p+1+j): slots 0..K-1 are
+    used, and slot 0 — the anchor token slot — predicts the first draft
+    token.
+    """
+    request_bases = (
+        torch.arange(num_gens, dtype=torch.long, device=device) * block_size
+    )
+    offsets = torch.arange(num_draft_tokens, dtype=torch.long, device=device)
+    first_slot = 0 if shift_label else 1
+    return (request_bases.unsqueeze(1) + first_slot + offsets.unsqueeze(0)).flatten()
+
+
 @dataclass
 class DFlashSpecMetadata(SpecMetadata):
     """Metadata for DFlash speculative decoding.
@@ -472,13 +500,15 @@ class DFlashWorker(SpecWorkerBase):
                     ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
                 )
 
-                # Gather K logits per gen request from mask positions (1..K).
-                # hidden_states_out is flat: [num_gens * block_size, hidden_dim]
+                # Gather K logits per gen request from the block outputs.
+                # hidden_states_out is flat: [num_gens * block_size, hidden_dim].
+                # Plain DFlash reads mask slots 1..K; dspark shift_label reads
+                # slots 0..K-1 (see dflash_draft_slot_ids).
                 block_size = self._resolved_block_size
-                request_bases = torch.arange(num_gens, dtype=torch.long, device="cuda") * block_size
-                offsets = torch.arange(K, dtype=torch.long, device="cuda")
-                # Masks are at positions 1..K in each request's block_size output
-                gen_gather_ids = (request_bases.unsqueeze(1) + 1 + offsets.unsqueeze(0)).flatten()
+                shift_label = getattr(draft_model, "_dspark_shift_label", False)
+                gen_gather_ids = dflash_draft_slot_ids(
+                    num_gens, block_size, K, shift_label, device="cuda"
+                )
                 gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
 
                 gen_logits = draft_model.logits_processor(
@@ -487,6 +517,13 @@ class DFlashWorker(SpecWorkerBase):
 
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
+
+                # DSpark Markov head: add the greedy-chained intra-block
+                # logit bias before sampling (no-op for plain DFlash).
+                if getattr(draft_model, "has_markov_head", False):
+                    gen_logits = self._apply_dspark_markov_bias(
+                        draft_model, gen_logits, inputs["first_prev_tokens"], spec_metadata
+                    )
 
                 gen_draft_tokens = self.sample_draft_tokens(
                     gen_logits,
@@ -534,6 +571,61 @@ class DFlashWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+    def _apply_dspark_markov_bias(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        spec_metadata,
+    ) -> torch.Tensor:
+        """Apply the dspark vanilla-Markov intra-block bias to block logits.
+
+        Reference (DeepSpec VanillaMarkov.sample_block_tokens, temperature 0):
+        step i adds bias = markov_w2 @ markov_w1[prev_i] to the shared-lm_head
+        logits, where prev_0 is the anchor (last accepted) token and prev_{i>0}
+        is the greedy token from step i-1's biased logits. Greedy per-position
+        argmax of the returned logits therefore reproduces the reference
+        sampled chain; the rejection-sampling path samples from the same
+        biased distributions (proposal conditioned on the greedy chain).
+
+        Handles a TP vocab-sharded draft lm_head by slicing markov_w2's rows
+        to this rank's contiguous shard and chaining through the TP-aware
+        global argmax.
+        """
+        if self._d2t is not None:
+            raise NotImplementedError(
+                "DSpark Markov head requires a shared draft/target vocab "
+                "(d2t vocab mapping is not supported)."
+            )
+        full_vocab = draft_model.markov_w2.shape[0]
+        shard = gen_logits.shape[-1]
+        vocab_slice = None
+        if shard != full_vocab:
+            mapping = self.mapping
+            if (
+                mapping is None
+                or getattr(mapping, "enable_attention_dp", False)
+                or shard * mapping.tp_size != full_vocab
+            ):
+                raise NotImplementedError(
+                    f"DSpark Markov head: draft logits width {shard} does not "
+                    f"match the drafter vocab {full_vocab} and is not a plain "
+                    "TP column shard of it."
+                )
+            vocab_slice = slice(mapping.tp_rank * shard, (mapping.tp_rank + 1) * shard)
+
+        def argmax_fn(step_logits):
+            # Full-vocab token ids (TP-aware when sharded); tokens stay in
+            # draft-vocab space, which is what markov_w1 indexes.
+            return self.greedy_sample_draft_with_tp_gather(step_logits, spec_metadata).long()
+
+        return draft_model.apply_markov_chain_logits(
+            gen_logits,
+            first_prev_tokens,
+            argmax_fn=argmax_fn,
+            vocab_slice=vocab_slice,
+        )
 
     def prepare_1st_drafter_inputs(
         self,
@@ -685,6 +777,7 @@ class DFlashWorker(SpecWorkerBase):
             query_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
             num_ctx_per_req_t = torch.empty(0, dtype=torch.long, device="cuda")
             slots = torch.empty(0, dtype=torch.long, device="cuda")
+            bonus = torch.empty(0, dtype=torch.long, device="cuda")
 
         return {
             "noise_embedding": noise_embedding,
@@ -693,4 +786,7 @@ class DFlashWorker(SpecWorkerBase):
             "ctx_k_cache": self._ctx_k_buf,
             "ctx_v_cache": self._ctx_v_buf,
             "ctx_cache_batch_idx": slots,
+            # Anchor token per gen request (block slot 0): last accepted
+            # token. The dspark Markov chain conditions its first step on it.
+            "first_prev_tokens": bonus,
         }
