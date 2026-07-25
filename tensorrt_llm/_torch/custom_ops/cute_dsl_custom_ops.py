@@ -6838,6 +6838,76 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         return None
 
+    def warmup_cute_dsl_radix_topk_decode(
+        top_k: int,
+        num_cols: int,
+        next_n: int = 1,
+        dtype: torch.dtype = torch.float32,
+        num_copy_bits: int = 256,
+        num_sms: Optional[int] = None,
+    ) -> None:
+        """Pre-compile the radix-filter DSL decode top-k for every
+        ``cluster_size`` variant the runtime dispatch can pick for this
+        deployment.
+
+        ``cute_dsl_indexer_topk_decode`` JIT-compiles a fresh CuTe DSL kernel
+        per compile-key ``(dtype, bucketed_num_cols, top_k, next_n, ...,
+        cluster_size)`` on first touch (~seconds). Every key dimension is
+        fixed for a deployment (``num_cols = indexer_max_seq_len``) except
+        ``cluster_size = auto_cluster_size(num_cols, num_rows, ...)``, which
+        steps across the coarse ``num_rows`` occupancy bands
+        (<=4 / <=8 / <=32 / <=64 / <=num_sms / >num_sms). CUDA-graph warmup
+        only exercises ``cuda_graph_batch_sizes``; eager iters (mixed
+        prefill+decode batch, or ``cuda_graph`` disabled) whose ``num_rows``
+        lands in an uncovered band otherwise pay the JIT stall on a live
+        request. Issuing one decode per representative ``num_rows`` funnels
+        every ``cluster_size`` compile into warmup — the op's own dispatch
+        (radix-SELECT / radix-FILTER cluster / single-CTA) picks and compiles
+        exactly what the runtime would.
+
+        Meant to run during warmup, before serving. Captured geometries are
+        already compiled by the warmup-step forwards; this fills in the bands
+        the eager (non-captured) path can still hit. Best-effort: per-band
+        failures are logged and skipped so one broken bucket does not abort
+        startup.
+        """
+        if top_k <= 0 or num_cols <= 0 or next_n <= 0:
+            return
+        num_sms = num_sms or _get_num_sms()
+        device = torch.device("cuda")
+        # One representative num_rows per auto_cluster_size occupancy band.
+        # Rounded up to a multiple of next_n (kernel shape contract:
+        # num_rows % next_n == 0); identical num_rows are de-duplicated.
+        band_targets = (4, 8, 32, 64, num_sms, num_sms + 1)
+        seen = set()
+        for target in band_targets:
+            num_gen = max(1, -(-target // next_n))  # ceil(target / next_n)
+            num_rows = num_gen * next_n
+            if num_rows in seen:
+                continue
+            seen.add(num_rows)
+            logits = torch.zeros((num_rows, num_cols),
+                                 dtype=dtype,
+                                 device=device)
+            seq_lens = torch.full((num_gen, ),
+                                  num_cols,
+                                  dtype=torch.int32,
+                                  device=device)
+            output_indices = torch.empty((num_rows, top_k),
+                                         dtype=torch.int32,
+                                         device=device)
+            try:
+                torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+                    logits, seq_lens, output_indices, top_k, next_n,
+                    num_copy_bits)
+            except RuntimeError as e:
+                logger.warning(
+                    f"[DSL topk warmup] radix-filter prewarm failed for "
+                    f"num_rows={num_rows} (num_cols={num_cols}, top_k={top_k}, "
+                    f"next_n={next_n}); skipping band. "
+                    f"{type(e).__name__}: {e}")
+        torch.cuda.synchronize()
+
     # ------------------------------------------------------------------ #
     #  CuTe DSL GVR Top-K Decode                                         #
     # ------------------------------------------------------------------ #
