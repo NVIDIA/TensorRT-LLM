@@ -29,7 +29,8 @@ from typing import Any, Tuple
 import torch
 from torch import nn
 
-from ..fused_moe.routing import DeepSeekV3MoeRoutingMethod
+from ..fused_moe.routing import (DeepSeekV3MoeRoutingMethod,
+                                 Deepseekv3RoutingImpl)
 
 
 class KimiK3MoEGate(nn.Module):
@@ -93,6 +94,39 @@ class KimiK3MoEGate(nn.Module):
         self.softmax_routing_mutation = softmax_routing_mutation
         self.biased_weights_mutation = biased_weights_mutation
         self.omit_renormalize_mutation = omit_renormalize_mutation
+
+        # Fast path: the fused ``noaux_tc`` routing kernel computes exactly K3's
+        # production routing contract in one launch -- per-expert sigmoid,
+        # ``e_score_correction_bias`` added for *selection* only, top-k weights
+        # sampled from the raw sigmoid scores, renormalized by ``sum + 1e-20``,
+        # then scaled by ``routed_scaling_factor``. Route through the shared
+        # ``Deepseekv3RoutingImpl`` (same op DeepSeek-V3 uses) when the config is
+        # eligible and none of the parity-breaking mutation controls are active.
+        # The eager path below stays the reference for those controls, for
+        # softmax scoring, for ``moe_renormalize=False``, and for grouped /
+        # oversized configs the kernel does not support.
+        self._routing_impl = Deepseekv3RoutingImpl(
+            top_k=self.top_k,
+            n_group=self.num_expert_group,
+            topk_group=self.topk_group,
+            routed_scaling_factor=self.routed_scaling_factor,
+            is_fused=True,
+        )
+        # Bounds mirror the n_group == 1 branch of
+        # ``Deepseekv3RoutingImpl.noaux_tc`` (num_experts <= 1024, top_k <= 32);
+        # staying inside them guarantees the fused kernel branch is taken (never
+        # the impl's own PyTorch fallback, whose grouped path differs from K3's).
+        self._use_fused_routing = (
+            self.moe_router_activation_func == "sigmoid"
+            and self.num_expert_group == 1
+            and self.moe_renormalize
+            and self.top_k > 1
+            and self.num_experts <= 1024
+            and self.top_k <= 32
+            and not softmax_routing_mutation
+            and not biased_weights_mutation
+            and not omit_renormalize_mutation
+        )
 
     def _score(self, logits: torch.Tensor) -> torch.Tensor:
         if self.softmax_routing_mutation:
@@ -159,6 +193,18 @@ class KimiK3MoEGate(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         bsz, seq_len, h = hidden_states.shape
         logits = self.compute_logits(hidden_states)
+
+        if self._use_fused_routing:
+            # One fused kernel replaces the sigmoid -> (+bias) -> top-k ->
+            # gather -> renormalize -> scale chain below. ``noaux_tc`` returns
+            # (weights, indices); return the eager dtype contract -- int64
+            # indices (as ``torch.topk`` yields) and fp32 weights -- so every
+            # downstream consumer is byte-for-byte unaffected by the swap.
+            topk_weight, topk_idx = self._routing_impl.noaux_tc(
+                logits, self.e_score_correction_bias.float()
+            )
+            return topk_idx.to(torch.int64), topk_weight.to(torch.float32)
+
         scores = self._score(logits)
         scores = scores.view(bsz * seq_len, -1)
 

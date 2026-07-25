@@ -23,6 +23,7 @@ Two activation paths coexist:
 
 from __future__ import annotations
 
+import os
 from typing import Mapping, Optional
 
 import torch
@@ -30,6 +31,13 @@ import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
 import triton.language.extra.libdevice as tldevice  # type: ignore[import]
 from torch import nn
+
+from ...flashinfer_utils import IS_FLASHINFER_AVAILABLE
+
+# Route the RMSNorm forward through flashinfer's single-kernel fused RMSNorm
+# instead of the eager pow/mean/rsqrt/mul/cast chain. Set to "0" to fall back
+# to the eager reference (the exact-parity rollback lever).
+_FUSED_RMSNORM = os.environ.get("KIMI_K3_FUSED_RMSNORM", "1") == "1"
 
 
 class SituAndMul(nn.Module):
@@ -267,6 +275,18 @@ class KimiK3RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # flashinfer's fused RMSNorm does the same fp32-accumulate
+        # normalization in one kernel, collapsing the eager
+        # pow/mean/rsqrt/mul/cast launch chain. It is only valid for a CUDA
+        # fp16/bf16 input whose dtype matches the weight; CPU / fp32 parity
+        # paths, meta init, and the KIMI_K3_FUSED_RMSNORM=0 rollback keep the
+        # exact eager math below.
+        if (_FUSED_RMSNORM and IS_FLASHINFER_AVAILABLE and hidden_states.is_cuda
+                and hidden_states.dtype in (torch.float16, torch.bfloat16)
+                and self.weight.dtype == hidden_states.dtype):
+            from ...custom_ops import flashinfer_rmsnorm
+            return flashinfer_rmsnorm(hidden_states.contiguous(), self.weight,
+                                      self.eps)
         input_dtype = hidden_states.dtype
         h = hidden_states.to(torch.float32)
         variance = h.pow(2).mean(-1, keepdim=True)
