@@ -494,7 +494,9 @@ class TestModelDefaults:
         model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
 
         apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args,
+                                          model_defaults,
+                                          original_setting="auto")
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
 
@@ -504,6 +506,45 @@ class TestModelDefaults:
         _resolve_kv_cache_manager_v2_auto(llm_args, {})
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+
+    @pytest.mark.parametrize(
+        ("backend", "runtime"),
+        [
+            ("NIXL", "CPP"),
+            ("UCX", None),
+            ("MPI", None),
+        ],
+    )
+    def test_kv_cache_manager_v2_auto_falls_back_for_incompatible_disagg(
+            self, backend, runtime):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend=backend, transceiver_runtime=runtime),
+        )
+        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+
+        apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args,
+                                          model_defaults,
+                                          original_setting="auto")
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+
+    def test_kv_cache_manager_v2_auto_keeps_python_nixl_model_default(self):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="PYTHON"),
+        )
+        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+
+        apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args,
+                                          model_defaults,
+                                          original_setting="auto")
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
 
     @pytest.mark.parametrize("user_setting", [False, True])
     def test_kv_cache_manager_v2_explicit_value_overrides_model_default(
@@ -759,15 +800,6 @@ def test_KvCacheConfig_requires_v2_for_additional_snapshot_offsets(
         use_kv_cache_manager_v2=True,
     )
     assert getattr(config.mamba_state_config, field) == offsets
-
-
-def test_KvCacheConfig_allows_periodic_snapshots_with_v1():
-    config = KvCacheConfig(
-        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
-        use_kv_cache_manager_v2=False,
-    )
-
-    assert config.mamba_state_config.periodic_snapshot_interval == 64
 
 
 def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
@@ -3501,13 +3533,32 @@ class TestTransceiverRuntimeAutoResolution:
         # creation time.
         assert args.cache_transceiver_config.backend == "DEFAULT"
 
-    def test_default_backend_env_override_falls_back_to_cpp(self, monkeypatch):
-        """DEFAULT + TRTLLM_USE_UCX_KVCACHE=1 means effective UCX -> C++."""
-        monkeypatch.delenv("TRTLLM_USE_NIXL_KVCACHE", raising=False)
-        monkeypatch.setenv("TRTLLM_USE_UCX_KVCACHE", "1")
+    @pytest.mark.parametrize(
+        "backend_env",
+        ["TRTLLM_USE_UCX_KVCACHE", "TRTLLM_USE_MPI_KVCACHE"],
+    )
+    def test_default_backend_env_override_falls_back_to_v1_cpp(
+            self, monkeypatch, backend_env):
+        """An incompatible DEFAULT route falls back to the V1 C++ path."""
+        for env_var in (
+                "TRTLLM_USE_NIXL_KVCACHE",
+                "TRTLLM_USE_UCX_KVCACHE",
+                "TRTLLM_USE_MOONCAKE_KVCACHE",
+                "TRTLLM_USE_MPI_KVCACHE",
+        ):
+            monkeypatch.delenv(env_var, raising=False)
+        monkeypatch.setenv(backend_env, "1")
         args = self._disagg_args(backend="DEFAULT")
+        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+        apply_model_defaults_to_llm_args(args, model_defaults)
+
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        _resolve_kv_cache_manager_v2_auto(args,
+                                          model_defaults,
+                                          original_setting="auto")
+
         assert args.cache_transceiver_config.transceiver_runtime is None
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is False
 
     def test_disagg_disabled_is_noop(self):
         """Resolver never creates a config when cache_transceiver_config is None."""

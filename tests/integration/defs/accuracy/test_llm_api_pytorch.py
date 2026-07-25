@@ -6291,6 +6291,9 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=enable_block_reuse)
+        if enable_block_reuse:
+            kv_cache_config.avg_seq_len = 2048
+            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         # DeepGEMM MoE kernels only support datacenter Blackwell (SM100/SM103).
         # Fall back to the CUTLASS MoE backend (which supports FP8 block scales)
         # on other architectures such as Hopper (SM90) and consumer Blackwell
@@ -6444,6 +6447,9 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
                                         enable_block_reuse=enable_block_reuse)
+        if enable_block_reuse:
+            kv_cache_config.avg_seq_len = 2048
+            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         cuda_graph_config = CudaGraphConfig(max_batch_size=256,
                                             enable_padding=True)
 
@@ -7154,6 +7160,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=True,
+                    avg_seq_len=2048,
                     mamba_ssm_cache_dtype="float16",
                     mamba_state_config=MambaStateConfig(
                         periodic_snapshot_interval=periodic_snapshot_interval),
@@ -7229,7 +7236,10 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 model_path,
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=True,
+                    avg_seq_len=2048,
                     mamba_ssm_cache_dtype="float16",
+                    mamba_state_config=MambaStateConfig(
+                        periodic_snapshot_interval=256),
                     free_gpu_memory_fraction=0.5,
                 ),
                 max_batch_size=32,
@@ -7583,6 +7593,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=True,
+                    avg_seq_len=2048,
                     mamba_ssm_cache_dtype="float16",
                     mamba_state_config=MambaStateConfig(
                         periodic_snapshot_interval=periodic_snapshot_interval),

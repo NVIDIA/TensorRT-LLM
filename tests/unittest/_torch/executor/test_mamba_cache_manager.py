@@ -534,8 +534,8 @@ def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
         )
         model_defaults = model_cls.get_model_defaults(llm_args)
         apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
         _resolve_transceiver_runtime_auto(llm_args, model_cls)
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults, original_setting="auto")
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
         assert llm_args.kv_cache_config.enable_block_reuse is False
         assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
@@ -1001,14 +1001,20 @@ def test_v2_hybrid_snapshot_sizing_scales_with_pp_and_explicit_rules():
     )
 
     assert mgr._num_ssm_snapshots_for_capacity(512, config) == 24
-    assert mgr._ssm_slots_per_request_for_typical_batch(512, config) == [4] * 8
+    assert mgr._num_ssm_states_per_typical_request(128, config) == 4
+    assert [desc.capacity for desc in mgr._typical_request_descs(128, config)] == [
+        32,
+        32,
+        32,
+        32,
+    ]
 
     periodic_config = KvCacheConfig(
         enable_block_reuse=True,
         mamba_state_config=MambaStateConfig(periodic_snapshot_interval=48),
     )
-    assert mgr._ssm_slots_per_request_for_typical_batch(47, periodic_config) == [1] * 8
-    assert mgr._ssm_slots_per_request_for_typical_batch(48, periodic_config) == [2] + [1] * 7
+    assert mgr._num_ssm_states_per_typical_request(47, periodic_config) == 1
+    assert mgr._num_ssm_states_per_typical_request(48, periodic_config) == 1
 
 
 def test_cpp_mamba_estimator_handles_disabled_snapshots_without_attention():
@@ -1087,10 +1093,7 @@ def test_hybrid_mtp_layout_honors_explicit_base_partition():
                 kv_cache_config=KvCacheConfig(enable_block_reuse=False),
                 spec_config=spec_config,
             )
-            extra_attention_bound = (
-                4096 * (rank + 1) if manager_cls is MambaHybridCacheManagerV2 else 0
-            )
-            assert cache_cost == (64 * (rank + 1), 2400 + extra_attention_bound)
+            assert cache_cost == (64 * (rank + 1), 2400)
 
 
 def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state():
@@ -1115,7 +1118,7 @@ def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state():
             spec_config=spec_config,
             use_separate_draft_kv_cache=True,
         )
-        assert target_cost == (64, 6496)
+        assert target_cost == (64, 2400)
 
         _, local_mamba_layers, local_attention_layers = _get_local_mamba_cache_layout(
             model_config,
@@ -1135,25 +1138,25 @@ def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state():
             spec_config=spec_config,
             is_draft=True,
         )
-        assert draft_cost == (64 * rank, 4096 * rank)
+        assert draft_cost == (64 * rank, 0)
 
 
 @pytest.mark.parametrize(
     ("spec_config", "enable_attention_dp", "expected_intercept"),
     [
-        (None, False, 1728),
-        (MTPDecodingConfig(max_draft_len=4), True, 1792),
+        (None, False, 320),
+        (MTPDecodingConfig(max_draft_len=4), True, 384),
         (
             MTPDecodingConfig(
                 max_draft_len=4,
                 draft_len_schedule={1: 4, 2: 2, 3: 1},
             ),
             True,
-            1984,
+            576,
         ),
     ],
 )
-def test_v2_hybrid_estimator_accounts_for_ssm_slot_attention_bound(
+def test_v2_hybrid_estimator_counts_dummy_states_without_attention_capacity(
     monkeypatch, spec_config, enable_attention_dp, expected_intercept
 ):
     monkeypatch.setattr(
@@ -1208,18 +1211,6 @@ def test_v2_hybrid_attention_bound_is_snapshot_alignment_agnostic():
     assert aligned[1] == unaligned[1]
 
 
-def test_v2_hybrid_planned_capacity_is_bounded_by_resident_sequences():
-    mgr = object.__new__(MambaHybridCacheManagerV2)
-    mgr.max_batch_size = 4
-    mgr.mapping = Mapping(world_size=2, rank=0, tp_size=1, pp_size=2)
-    mgr.max_seq_len = 128
-    mgr._get_max_tokens_from_quota = lambda quota: 1 << 30
-
-    capacity = mgr._planned_token_capacity(KvCacheConfig(max_tokens=None), 1 << 40)
-
-    assert capacity == 4 * 2 * 128
-
-
 def _base_attention_layer_configs(num_layers):
     return [
         AttentionLayerConfig(
@@ -1230,7 +1221,7 @@ def _base_attention_layer_configs(num_layers):
     ]
 
 
-def test_v2_hybrid_typical_batch_uses_num_ssm_slots():
+def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.kv_cache_type = CacheTypeCpp.SELF
     mgr.head_dim_per_layer = [64, 64]
@@ -1253,10 +1244,14 @@ def test_v2_hybrid_typical_batch_uses_num_ssm_slots():
     mgr.num_extra_kv_tokens = 0
     mgr.get_layer_bytes_per_token = lambda **kwargs: 8
     mgr._minimum_live_gpu_quota = lambda: 0
-    mgr._planned_token_capacity = lambda *_args: 128
     kv_cache_config = KvCacheConfig(
         enable_partial_reuse=True,
-        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=48),
+        avg_seq_len=96,
+        mamba_state_config=MambaStateConfig(
+            periodic_snapshot_interval=48,
+            additional_snapshot_offsets_from_start=[32],
+            additional_snapshot_offsets_from_end=[0],
+        ),
     )
     mgr.kv_cache_config = kv_cache_config
     constraints = [BatchDesc([KVCacheDesc(capacity=64, history_length=0)])]
@@ -1272,12 +1267,38 @@ def test_v2_hybrid_typical_batch_uses_num_ssm_slots():
 
     assert isinstance(config.layers[0], SsmLayerConfig)
     assert config.layers[1] is base_layers[1]
-    assert len(config.typical_step.kv_caches) == 2
-    assert [kv.num_ssm_slots for kv in config.typical_step.kv_caches] == [3, 2]
-    assert config.constraints is constraints
-    assert not hasattr(config.typical_step, "ssm_cache")
-    assert not hasattr(config.typical_step, "additional_attention_cache")
-    assert not hasattr(config.typical_step.kv_caches[0], "num_extra_attention_slots")
+    assert config.typical_step == BatchDesc(
+        [KVCacheDesc(capacity=32, history_length=31)] * 6
+        + [KVCacheDesc(capacity=0, history_length=0)]
+    )
+    assert config.constraints == [
+        BatchDesc(
+            [
+                KVCacheDesc(capacity=64, history_length=0),
+                KVCacheDesc(capacity=0, history_length=0),
+            ]
+        )
+    ]
+    assert sum(kv.capacity for kv in config.typical_step.kv_caches) == 2 * 96
+    assert not hasattr(config.typical_step.kv_caches[0], "num_ssm_slots")
+
+
+def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.max_seq_len = 4096
+    warnings_seen = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.warning",
+        lambda message: warnings_seen.append(message),
+    )
+
+    capacity = mgr._get_typical_request_capacity(KvCacheConfig())
+
+    assert capacity == 2048
+    assert len(warnings_seen) == 1
+    assert "kv_cache_config.avg_seq_len" in warnings_seen[0]
+    assert "max_seq_len / 2=2048" in warnings_seen[0]
+    assert "workload's average total sequence length" in warnings_seen[0]
 
 
 def test_v2_hybrid_rejects_quota_below_live_state_floor():
@@ -2214,58 +2235,6 @@ def test_hybrid_replay_buffers_size_by_tokens_per_gen_step(builder):
         _assert_replay_layer_cache_uses_history_size(
             layer_cache, replay_metadata.replay_history_size
         )
-    finally:
-        mgr.shutdown()
-
-
-@skip_no_cuda
-def test_v2_hybrid_replay_bookkeeping_matches_checkpoint_predicate(monkeypatch):
-    spec_config = _make_wide_spec_config(max_draft_len=2, tokens_per_gen_step=5)
-    mgr = _build_v2_hybrid_with_mamba_layer(
-        max_batch_size=4,
-        spec_config=spec_config,
-        use_replay_state_update=True,
-    )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._promote_mamba_state_triton",
-        lambda *args, **kwargs: None,
-    )
-    try:
-        # Derive the checkpoint threshold from the manager's own replay
-        # metadata instead of hardcoding it: replay_history_size is
-        # max(MIN_REPLAY_HISTORY_SIZE, tokens_per_gen_step), so the boundary
-        # is not simply tokens_per_gen_step.
-        replay_metadata = mgr.get_replay_state_update_metadata()
-        step_width = replay_metadata.replay_step_width
-        history_size = replay_metadata.replay_history_size
-
-        slot = torch.tensor([0], dtype=torch.int32, device="cuda")
-        attn_metadata = SimpleNamespace(num_seqs=1, num_contexts=0)
-
-        def advance(accepted):
-            mgr.update_mamba_states(
-                attn_metadata,
-                torch.tensor([accepted], dtype=torch.int32, device="cuda"),
-                state_indices=slot,
-            )
-
-        # Accumulate below the checkpoint threshold: while
-        # prev + step_width <= history_size the manager keeps writing into the
-        # same cache_buf_idx and grows prev_num_accepted_tokens monotonically.
-        prev = 0
-        while prev + step_width <= history_size:
-            advance(1)
-            prev += 1
-            assert mgr.prev_num_accepted_tokens[0].item() == prev
-            assert mgr.cache_buf_idx[0].item() == 0
-
-        # The next step crosses the threshold (prev + step_width > history_size):
-        # the manager starts a fresh checkpoint, resetting
-        # prev_num_accepted_tokens to the accepted count and flipping
-        # cache_buf_idx to the other buffer.
-        advance(2)
-        assert mgr.prev_num_accepted_tokens[0].item() == 2
-        assert mgr.cache_buf_idx[0].item() == 1
     finally:
         mgr.shutdown()
 

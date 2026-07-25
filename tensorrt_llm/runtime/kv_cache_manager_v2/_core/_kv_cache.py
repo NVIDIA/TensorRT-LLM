@@ -1077,6 +1077,10 @@ class _KVCache:
         elif ssm_lc_id is not None:
             return None
 
+        def get_committed_page(block: Block, life_cycle_id: LifeCycleId) -> CommittedPage | None:
+            page_ref = block.storage[life_cycle_id]
+            return page_ref() if page_ref is not None else None
+
         end = BlockOrdinal(len(matched_blocks))
         pages_to_drop: list[CommittedPage] = []
         for lc_idx, lc in self.manager._life_cycles.items():
@@ -1090,19 +1094,13 @@ class _KVCache:
             window_start = min(stale_range.end, end)
             for ordinal in typed_range(window_start, end):
                 tree_block = matched_blocks[ordinal]
-                page_ref = tree_block.storage[lc_idx]
-                if page_ref is None:
-                    return None
-                page = page_ref()
+                page = get_committed_page(tree_block, lc_idx)
                 if page is None:
                     return None
                 pages_to_drop.append(page)
 
         if ssm_lc_id is not None:
-            page_ref = matched_blocks[-1].storage[ssm_lc_id]
-            if page_ref is None:
-                return None
-            page = page_ref()
+            page = get_committed_page(matched_blocks[-1], ssm_lc_id)
             if not isinstance(page, SsmCommittedPage):
                 return None
             pages_to_drop.append(page)

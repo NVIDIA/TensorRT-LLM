@@ -1699,13 +1699,10 @@ def _estimate_mamba_hybrid_cache_cost(
     has_unaligned_periodic_snapshot = (interval is not None
                                        and interval % tokens_per_block != 0)
     if cap_partial_attention_snapshots:
-        # V2 storage receives only an SSM slot count, which does not reveal
-        # whether each snapshot is block-aligned. Once any non-live SSM slot is
-        # possible, reserve one retained partial attention page per resident
-        # lineage. Fewer non-live slots and dummy slots only make this an
-        # overestimate; the bound does not rely on S >= 2N.
-        has_non_live_ssm_capacity = (fixed_rules > 0 or interval is not None
-                                     or num_reserved_dummy_slots > 0)
+        # Snapshot alignment is unknown while estimating cache cost. Once a
+        # snapshot is possible, reserve one retained partial attention page
+        # per resident lineage. Dummy requests carry no attention capacity.
+        has_non_live_ssm_capacity = fixed_rules > 0 or interval is not None
         partial_attention_slots = (max_resident_sequences
                                    if has_non_live_ssm_capacity else 0)
     else:
@@ -2763,30 +2760,65 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return (self._max_resident_sequences() * fixed_rules +
                 regular_snapshots)
 
-    def _ssm_slots_per_request_for_typical_batch(
+    def _num_ssm_states_per_typical_request(
         self,
         capacity: int,
         kv_cache_config: KvCacheConfig,
-    ) -> List[int]:
-        num_sequences = self._max_resident_sequences()
-        snapshot_slots = self._num_ssm_snapshots_for_capacity(
+    ) -> int:
+        fixed_rules, _ = _mamba_snapshot_rule_counts(
+            kv_cache_config,
+            capacity,
+            self.tokens_per_block,
+        )
+        # Additional snapshots are stable boundaries that must remain alive.
+        # Periodic snapshots are evictable cache entries and therefore do not
+        # increase the guaranteed state count represented by BatchDesc.
+        return 1 + fixed_rules
+
+    def _typical_request_descs(
+        self,
+        capacity: int,
+        kv_cache_config: KvCacheConfig,
+    ) -> List[KVCacheDesc]:
+        """Model one request with one descriptor per live SSM state."""
+        num_states = self._num_ssm_states_per_typical_request(
             capacity, kv_cache_config)
-        snapshot_slots_per_request, snapshot_remainder = divmod(
-            snapshot_slots, num_sequences)
-        dummy_per_request, dummy_remainder = divmod(
-            self._num_reserved_dummy_slots, num_sequences)
-        return [
-            1 + snapshot_slots_per_request + int(i < snapshot_remainder) +
-            dummy_per_request + int(i < dummy_remainder)
-            for i in range(num_sequences)
+        capacity_per_state, capacity_remainder = divmod(capacity, num_states)
+        capacities = [
+            capacity_per_state + int(i < capacity_remainder)
+            for i in range(num_states)
         ]
+        return [
+            KVCacheDesc(
+                capacity=state_capacity,
+                history_length=max(0, state_capacity - 1),
+            ) for state_capacity in capacities
+        ]
+
+    def _get_typical_request_capacity(
+        self,
+        kv_cache_config: KvCacheConfig,
+    ) -> int:
+        if kv_cache_config.avg_seq_len is not None:
+            return kv_cache_config.avg_seq_len
+
+        fallback_capacity = max(1, self.max_seq_len // 2)
+        logger.warning(
+            "'kv_cache_config.avg_seq_len' is not set for a hybrid Mamba "
+            "model using KV cache manager V2. Falling back to "
+            f"max_seq_len / 2={fallback_capacity} for cache-pool sizing. Set "
+            "'kv_cache_config.avg_seq_len' in the YAML configuration to the "
+            "workload's average total sequence length for an accurate KV/SSM "
+            "pool ratio.")
+        return fallback_capacity
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         attention_quota = super()._get_quota_from_max_tokens(max_tokens)
         num_request_lineages = self._max_resident_sequences()
+        snapshot_slots = self._num_ssm_snapshots_for_capacity(
+            max_tokens, self.kv_cache_config)
         state_slots = (num_request_lineages + self._num_reserved_dummy_slots +
-                       self._num_ssm_snapshots_for_capacity(
-                           max_tokens, self.kv_cache_config))
+                       snapshot_slots)
         state_quota = state_slots * self._mamba_state_bytes_per_slot()
         # Once the plan contains any non-live SSM capacity, reserve one partial
         # attention page per request lineage. This remains conservative when
@@ -2794,7 +2826,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         extra_attention_quota = (num_request_lineages *
                                  self._attention_cache_bytes_per_token() *
                                  self.tokens_per_block
-                                 if state_slots > num_request_lineages else 0)
+                                 if snapshot_slots > 0 else 0)
         return attention_quota + state_quota + extra_attention_quota
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
@@ -2816,20 +2848,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             else:
                 high = mid
         return low
-
-    def _planned_token_capacity(
-        self,
-        kv_cache_config: KvCacheConfig,
-        gpu_quota: int,
-    ) -> int:
-        capacity = self._get_max_tokens_from_quota(gpu_quota)
-        capacity = min(
-            capacity,
-            self.max_seq_len * self._max_resident_sequences(),
-        )
-        if kv_cache_config.max_tokens is not None:
-            capacity = min(capacity, kv_cache_config.max_tokens)
-        return max(0, int(capacity))
 
     def _minimum_live_gpu_quota(self) -> int:
         """Return the minimum quota for live states and one attention page."""
@@ -2871,26 +2889,31 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     ],
                 )
 
-        num_sequences = self._max_resident_sequences()
-        planned_capacity = self._planned_token_capacity(kv_cache_config,
-                                                        cache_tiers[0].quota)
-        capacity_per_request, capacity_remainder = divmod(
-            planned_capacity, num_sequences)
-        typical_ssm_slots = self._ssm_slots_per_request_for_typical_batch(
-            planned_capacity, kv_cache_config)
+        dummy_requests = [
+            KVCacheDesc(capacity=0, history_length=0)
+            for _ in range(self._num_reserved_dummy_slots)
+        ]
+        constraints = [
+            replace(
+                batch,
+                kv_caches=[*batch.kv_caches, *dummy_requests],
+            ) for batch in config.constraints
+        ]
 
-        typical_step = BatchDesc([
-            KVCacheDesc(
-                capacity=capacity_per_request + int(i < capacity_remainder),
-                history_length=max(
-                    0, capacity_per_request + int(i < capacity_remainder) - 1),
-                num_ssm_slots=typical_ssm_slots[i],
-            ) for i in range(num_sequences)
-        ])
+        typical_step = config.typical_step
+        if config.initial_pool_ratio is None:
+            typical_capacity = self._get_typical_request_capacity(
+                kv_cache_config)
+            request_descs = self._typical_request_descs(typical_capacity,
+                                                        kv_cache_config)
+            typical_step = BatchDesc(request_descs *
+                                     self._max_resident_sequences() +
+                                     dummy_requests)
         return replace(
             config,
             layers=layers,
             typical_step=typical_step,
+            constraints=constraints,
             # SSM lifecycles require minimum-snapshot commit semantics. The
             # flag is harmless when reuse is disabled because no commits are
             # attempted, while the runtime config still needs the invariant.

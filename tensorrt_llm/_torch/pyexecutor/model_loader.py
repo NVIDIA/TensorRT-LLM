@@ -422,6 +422,8 @@ class ModelLoader:
                                                  config.pretrained_config)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
+        use_kv_cache_manager_v2 = (
+            llm_args.kv_cache_config.use_kv_cache_manager_v2)
 
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}
@@ -434,16 +436,6 @@ class ModelLoader:
                     logger.info(
                         f"Applied model defaults for {model_cls.__name__}: {applied_defaults}"
                     )
-
-        use_kv_cache_manager_v2 = llm_args.kv_cache_config.use_kv_cache_manager_v2
-        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
-        _validate_and_adjust_mamba_snapshot_config(config, llm_args)
-        if use_kv_cache_manager_v2 == "auto":
-            logger.info(
-                "Resolved use_kv_cache_manager_v2='auto' to %s for %s",
-                llm_args.kv_cache_config.use_kv_cache_manager_v2,
-                model_cls.__name__
-                if model_cls is not None else "unknown model")
 
         # The transceiver preference follows the checkpoint's original
         # architecture: _resolve_class may rewrite it to an execution class
@@ -458,6 +450,15 @@ class ModelLoader:
         # Resolve "auto" sentinel values after model defaults are applied.
         _resolve_transceiver_runtime_auto(llm_args, preference_cls,
                                           config.pretrained_config)
+        _resolve_kv_cache_manager_v2_auto(
+            llm_args, model_defaults, original_setting=use_kv_cache_manager_v2)
+        _validate_and_adjust_mamba_snapshot_config(config, llm_args)
+        if use_kv_cache_manager_v2 == "auto":
+            logger.info(
+                "Resolved use_kv_cache_manager_v2='auto' to %s for %s",
+                llm_args.kv_cache_config.use_kv_cache_manager_v2,
+                model_cls.__name__
+                if model_cls is not None else "unknown model")
 
         return llm_args
 

@@ -96,6 +96,7 @@ an end offset of `0`) when using it with a hybrid Mamba model. For example:
 kv_cache_config:
   enable_block_reuse: true
   use_kv_cache_manager_v2: true
+  avg_seq_len: 2048
   mamba_state_config:
     periodic_snapshot_interval: 0
     additional_snapshot_offsets_from_start: [128]
@@ -104,7 +105,11 @@ kv_cache_config:
 
 This retains snapshots after the first 128 tokens, at the end of the prompt,
 and before the final 32 prompt tokens. Positions outside a particular prompt
-are ignored. Exact explicit boundaries currently require
+are ignored. Set `avg_seq_len` to the workload's average total sequence length
+so V2 can size the attention KV and Mamba state pools in the right proportion.
+If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
+Mamba models warn and fall back to half of `max_seq_len`, which can produce a
+suboptimal pool split. Exact explicit boundaries currently require
 `MambaHybridCacheManagerV2`, `max_beam_width=1`, and no KV connector. Hybrid
 Mamba models select V2 by default when
 `use_kv_cache_manager_v2: auto`; set it to `false` to select the V1 C++

@@ -3823,20 +3823,20 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default=None,
         min_length=1,
         status="prototype",
-        description=
-        "Initial pool ratios for KV cache manager v2. When used by DeepSeek-V4, "
-        "values map to KVCacheManagerV2 pool_group_id order and must sum to 1.0. "
-        "When set, DeepSeek-V4 uses this directly and avg_seq_len does not take effect."
-    )
+        description="Initial pool ratios for KV cache manager v2. Values map to "
+        "KVCacheManagerV2 pool_group_id order and must sum to 1.0. Hybrid Mamba "
+        "models and DeepSeek-V4 use this directly, so avg_seq_len does not take "
+        "effect when this is set.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     avg_seq_len: Optional[PositiveInt] = Field(
         default=None,
         status="prototype",
         description=
-        "Average sequence length used by DeepSeek-V4 to build the KV cache manager v2 "
-        "typical step. If unset, max_seq_len is used. This does not take effect when "
-        "pool_ratio is set.")
+        "Average total sequence length of the serving workload, used to build the "
+        "KV cache manager v2 typical step for hybrid Mamba models and DeepSeek-V4. "
+        "Hybrid Mamba models warn and fall back to half of max_seq_len when this is "
+        "unset. This does not take effect when pool_ratio is set.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     block_reuse_policy: Literal[

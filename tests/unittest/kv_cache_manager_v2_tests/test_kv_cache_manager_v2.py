@@ -2764,94 +2764,23 @@ class TestInitRatioConfig(unittest.TestCase):
         self.assertLess(ratio[0], 0.15)
         manager.shutdown()
 
-    def test_num_ssm_slots_controls_ssm_slot_count(self):
-        """SSM sizing uses explicit state-slot count, not token capacity."""
+    def test_zero_capacity_request_reserves_only_an_ssm_slot(self):
+        """Every request reserves one SSM slot, including a zero-token dummy."""
         manager = KVCacheManager(self._make_hybrid_config())
         ssm_lc = manager._life_cycles.ssm_life_cycle_id
         assert ssm_lc is not None
         ssm_pg = manager._storage.get_pool_group_index(ssm_lc)
+        attn_pg = 1 - ssm_pg
 
         batch = BatchDesc(
             kv_caches=[
-                KVCacheDesc(
-                    capacity=1024,
-                    history_length=1023,
-                    num_ssm_slots=3,
-                )
-            ]
-            * 2
-        )
-        slots = manager._storage._compute_slots_for_batch(batch, self.TOKENS_PER_BLOCK, None)
-        self.assertEqual(slots[ssm_pg], 6)
-
-        default_batch = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4095)] * 2)
-        default_slots = manager._storage._compute_slots_for_batch(
-            default_batch, self.TOKENS_PER_BLOCK, None
-        )
-        self.assertEqual(default_slots[ssm_pg], 2)
-        manager.shutdown()
-
-    def test_num_ssm_slots_must_be_positive(self):
-        with self.assertRaises(AssertionError):
-            KVCacheDesc(capacity=1, history_length=0, num_ssm_slots=0)
-
-    def test_ssm_slots_bound_additional_attention_capacity(self):
-        manager = KVCacheManager(self._make_hybrid_config())
-        ssm_lc = manager._life_cycles.ssm_life_cycle_id
-        assert ssm_lc is not None
-        ssm_pg = manager._storage.get_pool_group_index(ssm_lc)
-        attn_pg = 1 - ssm_pg
-        batch = BatchDesc([KVCacheDesc(capacity=64, history_length=63, num_ssm_slots=3)])
-
-        slots = manager._storage._compute_slots_for_batch(batch, self.TOKENS_PER_BLOCK, None)
-
-        # Two SSM slots beyond the live state imply at most one retained
-        # partial attention page for this request lineage.
-        self.assertEqual(slots[attn_pg], 3)
-        manager.shutdown()
-
-    def test_ssm_slot_attention_bound_applies_to_each_lifecycle(self):
-        config = self._make_config(enable_swa_scratch_reuse=True)
-        manager = KVCacheManager(config)
-        base_batch = BatchDesc([KVCacheDesc(capacity=512, history_length=32)])
-        snapshot_batch = BatchDesc([KVCacheDesc(capacity=512, history_length=32, num_ssm_slots=3)])
-
-        base_slots = manager._storage._compute_slots_for_batch(
-            base_batch, self.TOKENS_PER_BLOCK, config.swa_scratch_reuse
-        )
-        snapshot_slots = manager._storage._compute_slots_for_batch(
-            snapshot_batch, self.TOKENS_PER_BLOCK, config.swa_scratch_reuse
-        )
-        expected_increase = [0] * manager._storage.num_pool_groups
-        for life_cycle_id, _ in manager._life_cycles.attention_life_cycles():
-            pool_group = manager._storage.get_pool_group_index(life_cycle_id)
-            expected_increase[pool_group] += 1
-
-        self.assertEqual(
-            [actual - base for actual, base in zip(snapshot_slots, base_slots)],
-            expected_increase,
-        )
-        manager.shutdown()
-
-    def test_ssm_slot_attention_bound_reserves_each_lineage(self):
-        manager = KVCacheManager(self._make_hybrid_config())
-        ssm_lc = manager._life_cycles.ssm_life_cycle_id
-        assert ssm_lc is not None
-        ssm_pg = manager._storage.get_pool_group_index(ssm_lc)
-        attn_pg = 1 - ssm_pg
-        batch = BatchDesc(
-            [
-                KVCacheDesc(capacity=64, history_length=63, num_ssm_slots=3),
-                *[KVCacheDesc(capacity=64, history_length=63)] * 3,
+                KVCacheDesc(capacity=64, history_length=63),
+                KVCacheDesc(capacity=0, history_length=0),
             ]
         )
-
         slots = manager._storage._compute_slots_for_batch(batch, self.TOKENS_PER_BLOCK, None)
-
-        self.assertEqual(slots[ssm_pg], 6)
-        # Any extra SSM slot enables the conservative upper bound of one
-        # partial attention page for every request lineage.
-        self.assertEqual(slots[attn_pg], 12)
+        self.assertEqual(slots[ssm_pg], 2)
+        self.assertEqual(slots[attn_pg], 2)
         manager.shutdown()
 
     def test_constraints_floor_typical_step(self):
