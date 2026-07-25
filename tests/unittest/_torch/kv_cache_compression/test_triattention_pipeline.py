@@ -27,8 +27,8 @@ import pytest
 import torch
 from conftest import make_bare_staging as _make_bare_staging
 from conftest import make_cute_buffers as _make_cute_buffers
+from conftest import make_eviction_input as _make_eviction_input
 from conftest import make_fake_v2 as _make_fake_v2
-from conftest import make_prepared_item as _make_prepared_item
 from conftest import make_request as _make_request
 from conftest import make_staging_manager as _make_staging_manager
 from conftest import make_tri_config as _make_tri_config
@@ -161,11 +161,11 @@ class TestTriAttentionClass:
         triattention._buffers_built = True
         triattention._score_scratch = buffers
         batch = SimpleNamespace()
-        triattention._prepared_generation_batch = batch
+        triattention._inflight_scheduled_batch = batch
         triattention.on_request_finish(_make_request(11))
         triattention.on_request_finish(_make_request(12))
         assert triattention._request_states == {}
-        assert triattention._prepared_generation_batch is batch
+        assert triattention._inflight_scheduled_batch is batch
         assert triattention._buffers_built and triattention._score_scratch is buffers
 
     def test_resolve_accepts_flat_pt(self, flat_calibration_pt):
@@ -290,7 +290,7 @@ class TestCompressedTokenPublication:
         state = _set_request_state(manager, 7, generation_steps=127)
 
         with _mocked_eviction_internals(manager) as internals:
-            manager._periodic_evict(SimpleNamespace(generation_requests=[request]))
+            manager._evict_due_requests(SimpleNamespace(generation_requests=[request]))
 
         internals.execute.assert_not_called()
         assert request.py_num_compressed_tokens == 0
@@ -306,13 +306,13 @@ class TestEvictionLifecycle:
             context_requests_last_chunk=[],
             generation_requests=[_make_request(7)],
         )
-        with mock.patch.object(manager, "_periodic_evict") as periodic_evict:
+        with mock.patch.object(manager, "_evict_due_requests") as evict_due:
             manager.prepare_resources(batch)
-            periodic_evict.assert_not_called()
+            evict_due.assert_not_called()
 
             manager.update_resources(batch)
 
-        periodic_evict.assert_called_once_with(batch)
+        evict_due.assert_called_once_with(batch)
 
     @staticmethod
     def _make_due_decode_request(seq_len, *, num_extra_kv_tokens=0, kv_reserve_draft_tokens=0):
@@ -360,12 +360,12 @@ class TestEvictionLifecycle:
         second_state = _set_request_state(manager, 8, generation_steps=127)
         batch = SimpleNamespace(generation_requests=[first_request, second_request])
 
-        with mock.patch.object(manager, "_evict_requests", side_effect=lambda p: p) as evict:
-            manager._periodic_evict(batch)
+        with _mocked_eviction_internals(manager) as internals:
+            manager._evict_due_requests(batch)
 
         # Only the active request launched; the suspended one deferred whole.
-        prepared = evict.call_args.args[0]
-        assert [item["request_id"] for item in prepared] == [7]
+        eviction_inputs = internals.execute.call_args.args[0]
+        assert [item["request"].py_request_id for item in eviction_inputs] == [7]
         assert first_state["generation_steps"] == 128
         assert second_state["generation_steps"] == 127
 
@@ -387,7 +387,7 @@ class TestEvictionLifecycle:
         request.py_num_accepted_draft_tokens = accepted
         cache = mgr.kv_cache_manager.kv_cache_map[7]
         cache.capacity = confirmed + tail
-        mgr._prepared_generation_batch = SimpleNamespace(generation_requests=[request])
+        mgr._inflight_scheduled_batch = SimpleNamespace(generation_requests=[request])
         draft_manager = _make_fake_v2(is_draft=True)
         draft_cache = SimpleNamespace(is_active=True, resize=mock.Mock(return_value=True))
         draft_manager.kv_cache_map = {7: draft_cache}
@@ -396,35 +396,30 @@ class TestEvictionLifecycle:
         # Injected post-construction: mirror the ctor-cached manager-lifetime tail.
         mgr._draft_protected_tail_capacity = 1
 
-        def compact(prepared):
-            # Publish and resize consume the same prepared cohort.
-            return prepared
+        with _mocked_eviction_internals(mgr) as internals:
+            mgr._evict_due_requests(batch)
 
-        with mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict:
-            mgr._periodic_evict(batch)
-
-        # Tail excluded from seq_len; keep target = prompt + budget.
-        evict.assert_called_once_with(
+        # Tail excluded from the source length; keep target = prompt + budget.
+        internals.execute.assert_called_once_with(
             [
                 {
                     "request": request,
-                    "request_id": 7,
-                    "kv_cache": cache,
-                    "draft_kv_cache": draft_cache,
-                    "seq_len": confirmed,
-                    "round_start": confirmed,
-                    "prompt_len": 1024,
-                    "expected_keep_count": retained,
-                    "protected_tail": tail,
+                    "target_cache": cache,
+                    "draft_cache": draft_cache,
+                    "source_length": confirmed,
+                    "logical_source_length": confirmed,
+                    "prompt_length": 1024,
+                    "target_tail_length": tail,
                 }
             ]
         )
+        assert request.py_num_compressed_tokens == confirmed - retained
         cache.resize.assert_called_once_with(retained + tail, None)
         draft_cache.resize.assert_called_once_with(retained + 1, None)
 
     def test_confirmed_length_comes_from_capacity_ledger_not_logical_length(self):
-        # The due-branch seq_len must come from the physical capacity ledger
-        # (capacity minus the protected tail), never the logical length.
+        # The due-branch source length must come from the physical capacity
+        # ledger (capacity minus the protected tail), never the logical length.
         physical_confirmed = 6100
         manager = _make_triattention(beta=128)
         manager.calibration = {}
@@ -445,12 +440,14 @@ class TestEvictionLifecycle:
             py_draft_tokens=[1, 2, 3, 4],
         )
 
-        with mock.patch.object(manager, "_evict_requests", return_value=[]) as evict:
-            manager._periodic_evict(SimpleNamespace(generation_requests=[request]))
+        with _mocked_eviction_internals(manager) as internals:
+            manager._evict_due_requests(SimpleNamespace(generation_requests=[request]))
 
-        prepared = evict.call_args.args[0]
-        assert prepared[0]["seq_len"] == physical_confirmed
-        cache.resize.assert_not_called()
+        eviction_inputs = internals.execute.call_args.args[0]
+        assert eviction_inputs[0]["source_length"] == physical_confirmed
+        # The logical position restores everything already evicted.
+        assert eviction_inputs[0]["logical_source_length"] == physical_confirmed + 100
+        cache.resize.assert_called_once_with(1024 + manager.budget, None)
 
     def test_one_model_draft_co_compression_contract_is_accepted(self):
         # Construction accepts the separate draft manager, and the executor
@@ -497,7 +494,7 @@ class TestEvictionLifecycle:
 
         triattention.prepare_resources(batch)
 
-        assert triattention._prepared_generation_batch is batch
+        assert triattention._inflight_scheduled_batch is batch
         # Members of the prepared batch grow by the cached constant; others
         # by zero. The prepared batch itself is the identity early-out.
         assert triattention._inflight_generation_growth(SimpleNamespace(), 7) == expected_growth
@@ -521,10 +518,12 @@ class TestFixedScoreMetadata:
             torch.zeros(1, 2, 2, 12, dtype=torch.int32), gather, torch.cuda.Stream(device=device)
         )
         staging.kv_cache_manager = manager
-        prepared = [_make_prepared_item(request_id=7, seq_len=64, round_start=2**31)]
+        eviction_inputs = [
+            _make_eviction_input(request_id=7, source_length=64, logical_source_length=2**31)
+        ]
 
         with pytest.raises((RuntimeError, OverflowError, ValueError)):
-            staging._execute_eviction_round(prepared)
+            staging._execute_eviction_round(eviction_inputs)
         assert gather.call_count == 0
 
     def test_bulk_page_table_copy_snapshots_and_orders_consumers(self):
@@ -624,7 +623,7 @@ class TestFixedScoreMetadata:
         assert snapshot[0, 0, 0, :5].tolist() == [36, 38, 40, 42, 44]
         assert staging._block_offsets_device[0, 0, 0, :5].tolist() == [46, 48, 50, 52, 54]
 
-    def test_cohort_move_offsets_stage_keep_plus_tail_and_pad_rows(self):
+    def test_compaction_move_offsets_stage_keep_plus_tail_and_pad_rows(self):
         # The derived move offsets stage keep + tail moves per request
         # (keep_count=4 -> [6, 7]); padded rows past the cohort repeat the
         # final offset and contribute no moves. (The executor-call contract
@@ -634,11 +633,11 @@ class TestFixedScoreMetadata:
         offsets_manager._keep_count = 4
         offsets_manager._swa_window = None
         offsets_manager._draft_protected_tail_capacity = None
-        prepared = [
-            _make_prepared_item(request_id=7, seq_len=8, protected_tail=2),
-            _make_prepared_item(request_id=8, seq_len=10, protected_tail=3),
+        eviction_inputs = [
+            _make_eviction_input(request_id=7, source_length=8, target_tail_length=2),
+            _make_eviction_input(request_id=8, source_length=10, target_tail_length=3),
         ]
-        dense, swa, draft = offsets_manager._cohort_move_offsets(prepared)
+        dense, swa, draft = offsets_manager._compute_compaction_move_offsets(eviction_inputs)
         assert dense == [0, 6, 13, 13, 13, 13, 13, 13, 13]
         assert swa is None
         assert draft is None
@@ -736,11 +735,11 @@ class TestFixedScoreMetadata:
 
         def prepared_cohort():
             return [
-                _make_prepared_item(
+                _make_eviction_input(
                     request_id=request,
-                    seq_len=int(valid_seq_lens[request]),
-                    round_start=int(round_device[request]),
-                    prompt_len=prompt_len,
+                    source_length=int(valid_seq_lens[request]),
+                    logical_source_length=int(round_device[request]),
+                    prompt_length=prompt_len,
                 )
                 for request in range(request_count)
             ]

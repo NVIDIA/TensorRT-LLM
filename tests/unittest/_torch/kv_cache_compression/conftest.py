@@ -228,7 +228,7 @@ def run_compaction(compaction):
 
 def make_bare_staging(device, *, max_requests, staged_blocks_per_seq):
     """A bare manager carrying only the staging attributes, for the bulk
-    page-table copy tests (mirrors the product's ``_build_buffers`` names)."""
+    page-table copy tests (mirrors the product's ``_rebuild_eviction_runtime`` names)."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
     staging = TriAttention.__new__(TriAttention)
@@ -266,10 +266,10 @@ def make_staging_manager(host_table, gather, manager_stream, *, num_slots=1):
 
 
 def make_buffer_stubs(manager, *, decode_width=260):
-    """Stub the calibration/layout surfaces around ``_ensure_buffers``.
+    """Stub the calibration/layout surfaces around ``_ensure_eviction_runtime``.
 
     Returns the layout dict plus the manager attributes a stubbed
-    ``_build_buffers`` should set (production sets them in place)."""
+    ``_rebuild_eviction_runtime`` should set (production sets them in place)."""
     manager._freq_scale_sq = torch.ones(2)
     manager._phase = {"rows": 8}
     manager.calibration = {"omega": torch.ones(2)}
@@ -289,7 +289,6 @@ def make_buffer_stubs(manager, *, decode_width=260):
     built_attributes = dict(
         _decode_width=decode_width,
         _bucket_seq_len=1024,
-        _page_table_token_capacity=65537,
         _max_requests=8,
         _token_starts_device=torch.zeros(8, dtype=torch.int32),
         _valid_widths=torch.empty(8, dtype=torch.int32),
@@ -386,29 +385,30 @@ def make_triattention(**overrides):
     return TriAttention(make_tri_config(**overrides), make_fake_v2())
 
 
-def make_prepared_item(
+def make_eviction_input(
     request=None,
     *,
     request_id=0,
-    seq_len,
-    round_start=None,
-    prompt_len=0,
-    expected_keep_count=0,
-    protected_tail=0,
-    kv_cache=None,
-    draft_kv_cache=None,
+    source_length,
+    logical_source_length=None,
+    prompt_length=0,
+    target_tail_length=0,
+    target_cache=None,
+    draft_cache=None,
 ):
-    """One prepared-cohort item shaped exactly like ``_periodic_evict`` builds."""
+    """One due-cohort item shaped exactly like ``_evict_due_requests`` builds."""
+    if request is None:
+        request = SimpleNamespace(py_request_id=request_id, py_num_compressed_tokens=0)
     return {
         "request": request,
-        "request_id": request_id,
-        "kv_cache": kv_cache,
-        "draft_kv_cache": draft_kv_cache,
-        "seq_len": int(seq_len),
-        "round_start": int(seq_len if round_start is None else round_start),
-        "prompt_len": int(prompt_len),
-        "expected_keep_count": int(expected_keep_count),
-        "protected_tail": int(protected_tail),
+        "target_cache": target_cache,
+        "draft_cache": draft_cache,
+        "source_length": int(source_length),
+        "logical_source_length": int(
+            source_length if logical_source_length is None else logical_source_length
+        ),
+        "prompt_length": int(prompt_length),
+        "target_tail_length": int(target_tail_length),
     }
 
 
@@ -432,10 +432,10 @@ def make_request(request_id, **overrides):
 
 @contextmanager
 def mocked_eviction_internals(manager):
-    """Run the real ``_evict_requests`` body around a mocked round executor."""
+    """Run the real ``_evict_due_requests`` transaction around a mocked round executor."""
     with (
         mock.patch.object(manager, "_runtime_kv_layout", return_value={}),
-        mock.patch.object(manager, "_ensure_buffers"),
+        mock.patch.object(manager, "_ensure_eviction_runtime"),
         mock.patch.object(manager, "_execute_eviction_round") as execute,
     ):
         yield SimpleNamespace(execute=execute)
@@ -529,7 +529,6 @@ def make_cute_buffers(
     offsets,
     decode_width=None,
     keep_count=1,
-    page_table_token_capacity=None,
     protected_tail_capacity=0,
     storage_groups=None,
     layer_pool_ids=None,
@@ -554,7 +553,7 @@ def make_cute_buffers(
         layer_pool_ids = [0] * num_layers
     # A live-manager source table exactly wide enough for the requested
     # capacity (the staged width clamps to it).
-    requested_tokens = seq_len if page_table_token_capacity is None else page_table_token_capacity
+    requested_tokens = seq_len + protected_tail_capacity
     tokens_per_block = int(layer_pools[0].shape[3])
     source_blocks = -(-int(requested_tokens) // tokens_per_block)
     source_blocks = (source_blocks + 3) // 4 * 4
@@ -563,6 +562,7 @@ def make_cute_buffers(
             num_pools=max(layer_pool_ids) + 1,
             host_kv_cache_block_offsets=torch.empty(1, 1, 2, source_blocks, dtype=torch.int32),
         ),
+        global_layers=list(range(num_layers)),
         layer_pools=layer_pools,
         dense_layers=list(range(num_layers)),
         swa_layers=[],
@@ -583,20 +583,20 @@ def make_cute_buffers(
     manager._block_offsets_ready_event = None
     manager._compaction_done_event = None
     manager._phase = make_phase_table(offsets, omega, seq_len)
-    manager._build_buffers(
-        layout=layout,
-        q_real=q_real,
-        q_imag=q_imag,
-        mlr_coef=mlr_coef,
-        freq_scale_sq=freq_scale_sq,
-        max_requests=max_requests,
-        bucket_seq_len=seq_len,
-        decode_width=decode_width,
-        page_table_token_capacity=(
-            seq_len if page_table_token_capacity is None else page_table_token_capacity
-        ),
-        keep_count=keep_count,
-        protected_tail_capacity=protected_tail_capacity,
+    # Real owner state consumed by the cold builder (production sets these at
+    # construction / calibration load).
+    manager.budget = keep_count
+    manager._protected_tail_capacity = protected_tail_capacity
+    manager._freq_scale_sq = freq_scale_sq
+    manager._triattn_q_real = q_real
+    manager._triattn_q_imag = q_imag
+    manager._triattn_mlr_coef = mlr_coef
+    manager._rebuild_eviction_runtime(
+        layout,
+        None,
+        request_capacity=max_requests,
+        score_token_capacity=seq_len,
+        selection_width_capacity=decode_width,
     )
     return manager
 

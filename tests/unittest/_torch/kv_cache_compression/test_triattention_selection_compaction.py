@@ -7,7 +7,7 @@ import torch
 from conftest import build_compaction as _build_compaction
 from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_cute_buffers as _make_cute_buffers
-from conftest import make_prepared_item as _make_prepared_item
+from conftest import make_eviction_input as _make_eviction_input
 from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import make_staging_manager as _make_staging_manager
 from conftest import run_compaction as _run_compaction
@@ -505,9 +505,11 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         torch.cuda.Stream(device=device),
         num_slots=2,
     )
-    prepared = [_make_prepared_item(request_id=7, seq_len=seq_len, round_start=0)]
+    eviction_inputs = [
+        _make_eviction_input(request_id=7, source_length=seq_len, logical_source_length=0)
+    ]
     tri.kv_cache_manager = manager
-    tri._execute_eviction_round(prepared)
+    tri._execute_eviction_round(eviction_inputs)
     assert torch.equal(tri._kept_ordinal_rows.view_as(expected_keep), expected_keep)
     torch.cuda.synchronize(device)
 
@@ -646,27 +648,26 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             offsets=torch.zeros(1, dtype=torch.float32, device=device),
             decode_width=seq_len - prompt_len,
             keep_count=keep_count,
-            page_table_token_capacity=seq_len + protected_tail,
             protected_tail_capacity=protected_tail,
         )
         tri.kv_cache_manager = manager
 
         def evict_once() -> tuple[torch.Tensor, torch.Tensor]:
             before = snapshot(seq_len + protected_tail)
-            prepared = [
-                _make_prepared_item(
+            eviction_inputs = [
+                _make_eviction_input(
                     request_id=request_id,
-                    seq_len=seq_len,
-                    round_start=0,
-                    prompt_len=prompt_len,
-                    protected_tail=protected_tail,
+                    source_length=seq_len,
+                    logical_source_length=0,
+                    prompt_length=prompt_len,
+                    target_tail_length=protected_tail,
                 )
             ]
             # THE union path (fused pipeline) through the one round executor;
             # the derived move offsets stage keep_count + protected_tail
             # moves. Z-normalization is monotonic per row, so the raw-score
             # keep set is unchanged.
-            tri._execute_eviction_round(prepared)
+            tri._execute_eviction_round(eviction_inputs)
             selected = tri._kept_ordinal_rows[0].clone().to(torch.long)
             torch.cuda.synchronize(device)
             assert cache.resize(compacted_capacity, None)
