@@ -36,25 +36,36 @@ ships a training recipe). Architecture per the real config:
 Checkpoint = 73 tensors (K2.7's 69-tensor DFlash layout + the 4 dspark
 head tensors), verified against the dummy checkpoint's safetensors header.
 
-### Runtime gap: dspark semantics not implemented
+### Runtime gap: dspark drafter-forward semantics implemented; confidence scheduling pending
 
-The generic `DFlashForCausalLM` loads and runs this checkpoint as **plain
-DFlash**: the Markov and confidence weights are dropped at load
-(`allow_partial_loading`), the intra-block Markov logit bias and
-confidence-scheduled verification are skipped, and the draft block
-attention runs non-causal full-window (no SWA) without the shift_label
-convention. `DFlashDraftModel` logs a warning when these config fields are
-present. Consequences:
+The weights-independent dspark drafter-forward math is now implemented in
+the generic `DFlashForCausalLM` / `DFlashWorker`, gated on `dflash_config`
+so plain-DFlash (K2.7-style) drafters take the exact old code path
+(derivation: deepseek-ai/DeepSpec `deepspec/modeling/dspark/markov_head.py`
++ `deepspec/eval/dspark/draft_ops.py`; cross-checked against llama.cpp
+PR #25173):
 
-- Wiring, capture, verify and Mamba-state rewind are fully exercisable.
-- With real trained weights, acceptance will be **degraded** vs the
-  drafter's potential (DSpark's reported gains over DFlash come from the
-  Markov + confidence heads) — and possibly degraded vs plain DFlash if
-  the backbone distribution depends on SWA/shift_label at context >1024.
-- Implementing dspark semantics (markov bias in the block-decode sampling
-  loop, optional confidence-based draft-length scheduling, SWA window in
-  `flash_attn_with_kvcache`, shift_label alignment) is the follow-up work
-  item; the DeepSpec reference and llama.cpp PR #25173 are the guides.
+- **Markov intra-block bias** (`markov_rank` / `markov_head_type:
+  vanilla`): `markov_w1/w2` are loaded, and the block logits get
+  `bias_i = markov_w1[prev_i] @ markov_w2.T` per draft step, with
+  `prev_0` = the anchor (last accepted) token and `prev_{i>0}` = the
+  greedy token from step i-1's biased logits (TP-vocab-shard aware).
+- **SWA** (`use_swa` / `swa_window_size`, `layer_types:
+  sliding_attention`): the block decode passes
+  `window_size = (swa_window_size - 1, swa_window_size - 1)` (the HF
+  flash-attn translation of `sliding_window`) to
+  `flash_attn_with_kvcache`, non-causal — draft queries attend the last
+  `swa_window_size` context tokens plus the block.
+- **shift_label**: draft logits are read from block slots `0..K-1`
+  (slot 0, the anchor slot, predicts the first draft token) instead of
+  the plain-DFlash mask slots `1..K`.
+
+Still pending (follow-up MR): **confidence-scheduled verification** —
+`confidence_proj.{weight,bias}` are loaded and kept on the drafter but
+never used; drafting always proposes the full K tokens.
+`DFlashDraftModel` warns only about that remaining gap. Reference-parity
+and no-regression tests live in
+`tests/unittest/_torch/speculative/hw_agnostic/test_kimi_k3_dspark_semantics.py`.
 
 ## What this branch changes
 
@@ -87,12 +98,16 @@ present. Consequences:
   the analogous point, which for K3 is the same quantity — but the drafter
   must be *trained* against whatever the capture emits. Confirm the
   training-side hook matches the prefix-sum convention.
-- **SWA + non-causal draft attention.** The config says `causal: false`
-  with `swa_window_size: 1024`. Confirm how the window applies over the
-  (projected-context + block) KV layout at draft time — needed before
-  implementing SWA in the block decode.
-- **shift_label.** Confirm the exact label-shift convention so drafter
-  logits align with the right positions at inference.
+- **SWA + non-causal draft attention** *(resolved from the DeepSpec
+  reference; confirm against the K3 training fork)*: implemented as the HF
+  flash-attn translation — non-causal `window_size = (w-1, w-1)` over the
+  (projected-context + block) KV layout, on `sliding_attention` layers.
+  The public DeepSpec configs use full-attention draft layers, so the SWA
+  convention is inferred from the HF-style drafter config; a
+  training-team confirmation is still valuable.
+- **shift_label** *(resolved)*: DeepSpec labels a block anchored at p with
+  `input_ids[p+1 .. p+block_size]` — block slot j predicts token p+1+j, so
+  inference reads slots `0..K-1` (slot 0 = anchor slot).
 - **DFlash x attention-DP parity.** SA x attention-DP was
   parity-certified; DFlash has not been. Rerun the parity harness
   (`brnguyen/k3-disagg-parity-harness`) once real weights exist.
@@ -103,7 +118,8 @@ The training team's dummy checkpoint works directly:
 
 ```bash
 sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
-    --model $K3_CKPT --image $SQSH --dflash ~/lustre/dummy-dspark0724
+    --model $K3_CKPT --image $SQSH \
+    --dflash /scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/brnguyen/dummy-dspark0724
 ```
 
 Or generate a synthetic checkpoint from a real drafter config:
