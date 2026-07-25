@@ -621,6 +621,14 @@ class GvrTopKKernel:
             # 227KB CTA limit with room for the stage-2 skip list.
             self.seg_total = 2 * self.accept_cap + int(cap_c if cap_c is not None else 24576)
             self.cap_c = self.seg_total - 2 * self.accept_cap
+            # cp.async staging depth for the phase-0 dense scan: 4 rounds
+            # in flight when the C segment is trimmed enough to pay for
+            # the extra 32KB, else the zero-cost 2 (staging then aliases
+            # smem_vals exactly). Rows are 16B slots, one per thread per
+            # in-flight round; never smaller than vals so the alias always
+            # covers it.
+            self.stage_slots = 4 if self.cap_c <= 16384 else 2
+            self.stage_rows = max(self.stage_slots * self.num_threads, self.kC // 4)
         else:
             self.seg_total = self.kC
             self.cap_c = 0
@@ -1243,6 +1251,7 @@ class GvrTopKKernel:
         smem_keys,  # [seg_total] fp32 value segments (A @0 / B @segA / C @2segA)
         cand_idx_row,  # [seg_total] int32 gmem POSITION column (write-only here)
         block_max_row,  # [nb_pad] fp32 per-32-position maxima, or None
+        smem_stage,  # [stage_rows, 4] fp32 cp.async staging (aliases smem_vals)
         s_seg,  # [>=7] int32 scratch (reuses smem_wcnt_p1: P1 never runs
         #         on a row this phase succeeded on): [0..2] A/B/C claim
         #         cursors, [3] void, [4] n0, [5] n1, [6] n2
@@ -1258,18 +1267,19 @@ class GvrTopKKernel:
         uncapped), so {n0, void, n1, n2} fall out for free — the same
         contract the v5 emitter produced externally.
 
-        Perf shape (v3): per round each thread front-loads TWO vec_w
-        vectors (independent LDGs, latency overlapped), classifies
-        branchlessly in registers, and the whole round pays ONE packed
-        warp shfl-prefix (all three segment counts in 10-bit fields) +
-        at most three warp atomics. Segment overflow is marked and
-        resolved by a RARE per-element direct-atomic pass (a segment
-        overflows at most once per row, and divergent scalar atomics
-        need no warp coordination)."""
+        Perf shape (v13): the dense scan is a cp.async pipeline — each
+        thread streams one 16B vector per step into its private
+        slot-major smem staging slot (LDGSTS: no data registers, no
+        scoreboard stall until the wait), keeping ``stage_slots`` steps
+        in flight; classification reads the staged values and claims
+        passers with per-element direct smem atomics (they don't
+        synchronize the warp and hide under the async copy stream).
+        Segment overflow is resolved in-claim by spilling to the next
+        looser segment (a segment overflows at most once per row, and
+        divergent scalar atomics need no warp coordination)."""
         num_threads = cutlass.const_expr(self.num_threads)
         segA = cutlass.const_expr(self.accept_cap)
         capC = cutlass.const_expr(self.cap_c)
-        vec_w = cutlass.const_expr(self.vec_bits // self.dtype.width)
         elem_bytes = cutlass.const_expr(self.dtype.width // 8)
         vec_align = cutlass.const_expr(self.vec_align_bytes)
         p0ck0 = cutlass.Int64(0)
@@ -1475,100 +1485,110 @@ class GvrTopKKernel:
                             smem_keys[sl0] = ve0
                             cand_idx_row[sl0] = ptd0
                     ptd0 = ptd0 + cutlass.Int32(num_threads)
-        copy_atom = self._make_load_copy_atom()
-        frag_a = cute.make_fragment((vec_w,), self.dtype)
-        frag_b = cute.make_fragment((vec_w,), self.dtype)
-        step1 = cutlass.const_expr(num_threads * vec_w)
-        step2 = cutlass.const_expr(2 * step1)
-        st2log = cutlass.const_expr((2 * step1).bit_length() - 1)
-        # FULL-vector rounds only in the hot loop: nfull is warp-uniform
-        # (every lane's two vectors are in bounds by construction), so the
-        # warp collectives inside are legal and the hot path carries no
-        # bounds checks at all. The remainder (< 2*step1 elements) takes
-        # the scalar tail below with per-element direct atomics.
-        nfull = N >> st2log
+        cpw = cutlass.const_expr(4)  # cp.async caps at 16B per copy
+        step1 = cutlass.const_expr(num_threads * cpw)
+        st1log = cutlass.const_expr(step1.bit_length() - 1)
+        n_stage = cutlass.const_expr(self.stage_slots)
+        n_smask = cutlass.const_expr(self.stage_slots - 1)
+        # v13 cp.async deep pipeline: LDGSTS stages each round's vector
+        # straight into the slot-major smem staging buffer — no data
+        # registers consumed, no scoreboard stall until the WAIT — so
+        # n_stage rounds stay in flight per thread (the register pipeline
+        # topped out at two). The staging buffer aliases smem_vals (only
+        # written after phase 0); every non-empty group is drained inside
+        # the loop (one commit per step, wait_group(n_stage-1) pops the
+        # oldest), so nothing is ever in flight once the alias is read.
+        # FULL-vector steps only in the hot loop; the remainder takes the
+        # scalar tail below.
+        nfull = N >> st1log
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
             nfull = cutlass.Int32(0)
-        # software pipeline: the claims are memory-ordered atomics, so
-        # without a preload the next round's vector loads serialize
-        # behind them (the same wall pass 2 hit). Preload round i+1 into
-        # the shadow fragments BEFORE claiming round i, then ping-pong.
-        frag_c = cute.make_fragment((vec_w,), self.dtype)
-        frag_d = cute.make_fragment((vec_w,), self.dtype)
-        if nfull > cutlass.Int32(0):
-            ia0 = tidx * cutlass.Int32(vec_w)
-            ib0 = ia0 + cutlass.Int32(step1)
-            for _fq in cutlass.range_constexpr(2):
-                fq0 = ia0 if _fq == 0 else ib0
+        g2s_atom = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(cute.nvgpu.cpasync.LoadCacheMode.GLOBAL),
+            cutlass.Float32,
+            num_bits_per_copy=128,
+        )
+        stage_addr = smem_stage.iterator.toint()
+        for _p in cutlass.range_constexpr(n_stage):
+            if cutlass.Int32(_p) < nfull:
+                pr0 = cutlass.Int32(_p) * cutlass.Int32(num_threads) + tidx
+                pp0 = pr0 * cutlass.Int32(cpw)
                 pq0 = cute.make_ptr(
                     self.dtype,
-                    row_addr + cutlass.Int64(fq0) * cutlass.Int64(elem_bytes),
+                    row_addr + cutlass.Int64(pp0) * cutlass.Int64(elem_bytes),
                     cute.AddressSpace.gmem,
-                    assumed_align=vec_align,
+                    assumed_align=16,
+                )
+                dq0 = cute.make_ptr(
+                    cutlass.Float32,
+                    stage_addr + cutlass.Int64(pr0 * cutlass.Int32(cpw)) * cutlass.Int64(4),
+                    cute.AddressSpace.smem,
+                    assumed_align=16,
                 )
                 cute.copy(
-                    copy_atom,
-                    cute.make_tensor(pq0, cute.make_layout((vec_w,))),
-                    frag_a if _fq == 0 else frag_b,
+                    g2s_atom,
+                    cute.make_tensor(pq0, cute.make_layout((cpw,))),
+                    cute.make_tensor(dq0, cute.make_layout((cpw,))),
                 )
+            cute.arch.cp_async_commit_group()
         it0 = cutlass.Int32(0)
         while it0 < nfull:
-            ia0 = (it0 * cutlass.Int32(2) * cutlass.Int32(num_threads) + tidx) * cutlass.Int32(
-                vec_w
+            cute.arch.cp_async_wait_group(n_smask)
+            sb0 = (it0 & cutlass.Int32(n_smask)) * cutlass.Int32(num_threads) + tidx
+            sq0 = cute.make_ptr(
+                cutlass.Float32,
+                stage_addr + cutlass.Int64(sb0 * cutlass.Int32(cpw)) * cutlass.Int64(4),
+                cute.AddressSpace.smem,
+                assumed_align=16,
             )
-            ib0 = ia0 + cutlass.Int32(step1)
-            nxt0 = it0 + cutlass.Int32(1)
-            if nxt0 < nfull:
-                ja0 = (nxt0 * cutlass.Int32(2) * cutlass.Int32(num_threads) + tidx) * cutlass.Int32(
-                    vec_w
-                )
-                jb0 = ja0 + cutlass.Int32(step1)
-                for _fq in cutlass.range_constexpr(2):
-                    fq0 = ja0 if _fq == 0 else jb0
-                    pq0 = cute.make_ptr(
-                        self.dtype,
-                        row_addr + cutlass.Int64(fq0) * cutlass.Int64(elem_bytes),
-                        cute.AddressSpace.gmem,
-                        assumed_align=vec_align,
-                    )
-                    cute.copy(
-                        copy_atom,
-                        cute.make_tensor(pq0, cute.make_layout((vec_w,))),
-                        frag_c if _fq == 0 else frag_d,
-                    )
+            srow = cute.make_tensor(sq0, cute.make_layout((cpw,)))
+            ia0 = (it0 * cutlass.Int32(num_threads) + tidx) * cutlass.Int32(cpw)
             # v6: per-element DIRECT atomic claims for passers — smem
-            # atomics do NOT synchronize the warp; with the preload above
-            # they no longer stall the next round's loads either.
-            for _jh in cutlass.range_constexpr(2):
-                for _jv in cutlass.range_constexpr(vec_w):
-                    v0 = cutlass.Float32(frag_a[_jv]) if _jh == 0 else cutlass.Float32(frag_b[_jv])
-                    if v0 >= t0_s:
-                        pos0 = (ia0 if _jh == 0 else ib0) + cutlass.Int32(_jv)
-                        c0 = cutlass.Int32(2)
-                        if v0 >= t1_s:
-                            c0 = cutlass.Int32(1)
-                        if v0 >= t2_s:
-                            c0 = cutlass.Int32(0)
-                        while c0 >= cutlass.Int32(0) and c0 <= cutlass.Int32(2):
-                            cap0 = cutlass.Int32(segA)
-                            if c0 == cutlass.Int32(2):
-                                cap0 = cutlass.Int32(capC)
-                            sl0 = atomicAdd(s_seg.iterator + c0, cutlass.Int32(1))
-                            if sl0 < cap0:
-                                cd0 = c0 * cutlass.Int32(segA) + sl0
-                                smem_keys[cd0] = v0
-                                cand_idx_row[cd0] = pos0
-                                c0 = cutlass.Int32(-1)
-                            else:
-                                c0 = c0 + cutlass.Int32(1)
-            if nxt0 < nfull:
-                for _jv in cutlass.range_constexpr(vec_w):
-                    frag_a[_jv] = frag_c[_jv]
-                    frag_b[_jv] = frag_d[_jv]
+            # atomics do NOT synchronize the warp and hide under the
+            # async copy stream.
+            for _jv in cutlass.range_constexpr(cpw):
+                v0 = cutlass.Float32(srow[_jv])
+                if v0 >= t0_s:
+                    pos0 = ia0 + cutlass.Int32(_jv)
+                    c0 = cutlass.Int32(2)
+                    if v0 >= t1_s:
+                        c0 = cutlass.Int32(1)
+                    if v0 >= t2_s:
+                        c0 = cutlass.Int32(0)
+                    while c0 >= cutlass.Int32(0) and c0 <= cutlass.Int32(2):
+                        cap0 = cutlass.Int32(segA)
+                        if c0 == cutlass.Int32(2):
+                            cap0 = cutlass.Int32(capC)
+                        sl0 = atomicAdd(s_seg.iterator + c0, cutlass.Int32(1))
+                        if sl0 < cap0:
+                            cd0 = c0 * cutlass.Int32(segA) + sl0
+                            smem_keys[cd0] = v0
+                            cand_idx_row[cd0] = pos0
+                            c0 = cutlass.Int32(-1)
+                        else:
+                            c0 = c0 + cutlass.Int32(1)
+            # reissue the just-consumed slot for step it0 + n_stage (the
+            # thread's own prior reads are ordered before the async write
+            # begins, so no fence is needed)
+            kn0 = it0 + cutlass.Int32(n_stage)
+            if kn0 < nfull:
+                jp0 = (kn0 * cutlass.Int32(num_threads) + tidx) * cutlass.Int32(cpw)
+                pq0 = cute.make_ptr(
+                    self.dtype,
+                    row_addr + cutlass.Int64(jp0) * cutlass.Int64(elem_bytes),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                cute.copy(
+                    g2s_atom,
+                    cute.make_tensor(pq0, cute.make_layout((cpw,))),
+                    srow,
+                )
+            cute.arch.cp_async_commit_group()
             it0 = it0 + cutlass.Int32(1)
-        # scalar tail (< 2*step1 elements): per-element DIRECT atomic
+        # scalar tail (< step1 elements): per-element DIRECT atomic
         # claims — divergent-safe, no warp collectives
-        pt0 = (N >> st2log) * cutlass.Int32(step2) + tidx
+        pt0 = (N >> st1log) * cutlass.Int32(step1) + tidx
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
             pt0 = N
         while pt0 < N:
@@ -4857,11 +4877,31 @@ class GvrTopKKernel:
         # SEGMENT COORDINATE of each compacted candidate (identity for the
         # deferred position gather via cand_idx[coord]) — every consumer
         # (P4, tail repair, gather) works unchanged.
-        smem_vals = smem.allocate_tensor(
-            element_type=cutlass.Int32,
-            layout=cute.make_ordered_layout((kC,), order=(0,)),
-            byte_alignment=128,
-        )
+        if cutlass.const_expr(self.self_scan):
+            # phase-0 cp.async staging, ALIASED over vals: vals is only
+            # written after phase 0 completes and every in-flight group
+            # is drained inside the dense loop, so the lifetimes never
+            # overlap. Slot-major (slot s of thread t at row
+            # s*num_threads + t): a warp's 16B reads/writes land on
+            # consecutive banks, conflict-free.
+            smem_stage = smem.allocate_tensor(
+                element_type=cutlass.Float32,
+                layout=cute.make_ordered_layout(
+                    (cutlass.const_expr(self.stage_rows), 4), order=(1, 0)
+                ),
+                byte_alignment=128,
+            )
+            smem_vals = cute.make_tensor(
+                cute.recast_ptr(smem_stage.iterator, dtype=cutlass.Int32),
+                cute.make_ordered_layout((kC,), order=(0,)),
+            )
+        else:
+            smem_stage = None
+            smem_vals = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout((kC,), order=(0,)),
+                byte_alignment=128,
+            )
         # histogram[kNumBins] int32 (P4 only)
         smem_hist = smem.allocate_tensor(
             element_type=cutlass.Int32,
@@ -5139,6 +5179,7 @@ class GvrTopKKernel:
                         cand_ctl_row=cand_ctl_row,
                         smem_active=smem_active,
                         s_active_cnt=s_active_cnt,
+                        smem_stage=smem_stage,
                     )
                 else:
                     # Short row: only CTA 0 scans the full row; the other
@@ -5189,6 +5230,7 @@ class GvrTopKKernel:
                             cand_ctl_row=cand_ctl_row,
                             smem_active=smem_active,
                             s_active_cnt=s_active_cnt,
+                            smem_stage=smem_stage,
                         )
             else:
                 # cs=1: one CTA per row, no cluster sync.
@@ -5236,6 +5278,7 @@ class GvrTopKKernel:
                     cand_ctl_row=cand_ctl_row,
                     smem_active=smem_active,
                     s_active_cnt=s_active_cnt,
+                    smem_stage=smem_stage,
                 )
 
         griddepcontrol_launch_dependents()
@@ -5286,6 +5329,7 @@ class GvrTopKKernel:
         cand_ctl_row=None,  # ext cand: this row's [2] int32 {claimed, void}
         smem_active=None,
         s_active_cnt=None,
+        smem_stage=None,  # self_scan: [stage_rows, 4] fp32 cp.async staging
     ):
         """Run Phase 1-4 + final cluster barrier on a given row slice.
 
@@ -5364,6 +5408,7 @@ class GvrTopKKernel:
                         smem_keys,
                         cand_idx_row,
                         block_max_row,
+                        smem_stage,
                         smem_wcnt_p1,
                         tidx,
                         warp_id,
