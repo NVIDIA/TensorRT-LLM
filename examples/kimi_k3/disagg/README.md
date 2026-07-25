@@ -60,8 +60,6 @@ prerequisites for every worker shell (see caveats below for why):
 export UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc   # on clusters where verbs cannot
                                                 # initialize; a container-default
                                                 # UCX_TLS=tcp breaks V2 NIXL
-export      # pair with kv_cache_bounce_size_mb
-                                                # (see constraints above)
 ```
 
 1. Start the context server (16-rank MPI world across its 4 nodes):
