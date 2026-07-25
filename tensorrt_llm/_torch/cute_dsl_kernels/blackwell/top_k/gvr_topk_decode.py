@@ -1272,6 +1272,9 @@ class GvrTopKKernel:
         vec_w = cutlass.const_expr(self.vec_bits // self.dtype.width)
         elem_bytes = cutlass.const_expr(self.dtype.width // 8)
         vec_align = cutlass.const_expr(self.vec_align_bytes)
+        p0ck0 = cutlass.Int64(0)
+        if cutlass.const_expr(_P4_SUB_DBG):
+            p0ck0 = cute.arch.clock64()
         if tidx == cutlass.Int32(0):
             s_seg[0] = cutlass.Int32(0)
             s_seg[1] = cutlass.Int32(0)
@@ -1358,9 +1361,23 @@ class GvrTopKKernel:
                 # pass 2: 8 listed blocks per warp round
                 nwp = cutlass.const_expr(self.num_warps)
                 lb0 = warp_id * cutlass.Int32(8)
+                frag_v = cute.make_fragment((8,), cutlass.Float32)
                 while lb0 < nlist0:
+                    # LOAD phase first: eight independent block loads in
+                    # flight before any atomic (claims are memory-ordered
+                    # and would serialize the blocks otherwise)
+                    p2b0 = cutlass.Int32(0)
+                    p2b1 = cutlass.Int32(0)
+                    p2b2 = cutlass.Int32(0)
+                    p2b3 = cutlass.Int32(0)
+                    p2b4 = cutlass.Int32(0)
+                    p2b5 = cutlass.Int32(0)
+                    p2b6 = cutlass.Int32(0)
+                    p2b7 = cutlass.Int32(0)
                     for _jb in cutlass.range_constexpr(8):
                         li0 = lb0 + cutlass.Int32(_jb)
+                        bid0 = cutlass.Int32(-1)
+                        vv0 = cutlass.Float32(self.NEG_FLT_MAX)
                         if li0 < nlist0:
                             bid0 = cutlass.Int32(smem_keys[cutlass.Int32(2 * segA) + li0])
                             pos0 = (bid0 << cutlass.Int32(5)) + lane
@@ -1371,12 +1388,51 @@ class GvrTopKKernel:
                                     cute.AddressSpace.gmem,
                                     assumed_align=4,
                                 )
-                                v0 = cute.make_tensor(vp0, cute.make_layout((1,)))[0]
-                                if v0 >= t2_s:
-                                    sl0 = atomicAdd(s_seg.iterator, cutlass.Int32(1))
-                                    if sl0 < cutlass.Int32(segA):
-                                        smem_keys[sl0] = v0
-                                        cand_idx_row[sl0] = pos0
+                                vv0 = cute.make_tensor(vp0, cute.make_layout((1,)))[0]
+                        frag_v[_jb] = vv0
+                        if cutlass.const_expr(_jb == 0):
+                            p2b0 = bid0
+                        elif cutlass.const_expr(_jb == 1):
+                            p2b1 = bid0
+                        elif cutlass.const_expr(_jb == 2):
+                            p2b2 = bid0
+                        elif cutlass.const_expr(_jb == 3):
+                            p2b3 = bid0
+                        elif cutlass.const_expr(_jb == 4):
+                            p2b4 = bid0
+                        elif cutlass.const_expr(_jb == 5):
+                            p2b5 = bid0
+                        elif cutlass.const_expr(_jb == 6):
+                            p2b6 = bid0
+                        else:
+                            p2b7 = bid0
+                    # CLAIM phase
+                    for _jb in cutlass.range_constexpr(8):
+                        bidc = (
+                            p2b0
+                            if _jb == 0
+                            else p2b1
+                            if _jb == 1
+                            else p2b2
+                            if _jb == 2
+                            else p2b3
+                            if _jb == 3
+                            else p2b4
+                            if _jb == 4
+                            else p2b5
+                            if _jb == 5
+                            else p2b6
+                            if _jb == 6
+                            else p2b7
+                        )
+                        vvc = cutlass.Float32(frag_v[_jb])
+                        if bidc >= cutlass.Int32(0) and vvc >= t2_s:
+                            posc = (bidc << cutlass.Int32(5)) + lane
+                            if posc < N:
+                                sl0 = atomicAdd(s_seg.iterator, cutlass.Int32(1))
+                                if sl0 < cutlass.Int32(segA):
+                                    smem_keys[sl0] = vvc
+                                    cand_idx_row[sl0] = posc
                     lb0 = lb0 + cutlass.Int32(nwp * 8)
             if nlist0 > cutlass.Int32(capC):
                 # list overflow (pass rate too high for skip): dense full
@@ -1526,6 +1582,8 @@ class GvrTopKKernel:
                 s_seg[4] = curT0
                 s_seg[5] = curT0
                 s_seg[6] = curT0
+            if cutlass.const_expr(_P4_SUB_DBG):
+                s_seg[7] = cutlass.Int32(cute.arch.clock64() - p0ck0)
             if cutlass.const_expr(not self.enable_block_skip):
                 curA0 = s_seg[0]
                 curB0 = s_seg[1]
@@ -6352,6 +6410,8 @@ class GvrTopKKernel:
                             xstate_row[5] = cutlass.Float32(cutlass.Int32(ck2 - ck1))  # P2/P3 gap
                             xstate_row[6] = cutlass.Float32(cutlass.Int32(ck3 - ck2))  # Phase 4
                             xstate_row[7] = s_thr[1]  # cnt_strad
+                        if cutlass.const_expr(_P4_SUB_DBG):
+                            xstate_row[2] = cutlass.Float32(smem_wcnt_p1[7])
                         if cutlass.const_expr(_P4_SUB_DBG):
                             # P4 sub-phase cycles staged by rank_scatter.
                             # Chain-safe layout: [2] (closed-loop anchor)
