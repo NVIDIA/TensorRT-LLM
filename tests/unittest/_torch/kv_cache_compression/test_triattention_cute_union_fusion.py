@@ -24,8 +24,8 @@ def _run_fused_union(
 ):
     """The fused score+stats+normalized-union pipeline (THE union path), fired
     directly off the compiled entries exactly like the round. Test mean phases
-    load into the build-bound buffers; the fused rows land in the build-bound
-    ``tri._union_scores`` and copy out."""
+    load into the build-bound buffers; the fused rows land straight in the
+    build-bound ``tri._selection_scores_rows``."""
     import cuda.bindings.driver as cuda_driver
 
     _stage_score_metadata(tri, request_count, valid_seq_lens, valid_widths, token_starts)
@@ -47,11 +47,12 @@ def _run_fused_union(
     tri._compiled_normalize_union[request_count](
         tri._cute_partial_stats,
         *tri._cute_selection_prefix,
-        tri._cute_union_scores,
+        tri._cute_selection_scores_rows,
         request_count,
         stream,
     )
-    union_out[:request_count].copy_(tri._union_scores[:request_count])
+    columns = min(union_out.shape[1], tri._selection_scores_rows.shape[1])
+    union_out[:request_count, :columns].copy_(tri._selection_scores_rows[:request_count, :columns])
 
 
 def _reference_union_scores(scores_rows: torch.Tensor, valid_widths: torch.Tensor) -> torch.Tensor:

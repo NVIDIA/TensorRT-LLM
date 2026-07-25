@@ -141,14 +141,17 @@ class _TriAttentionNormalizeUnionKernel:
         tokens_per_lane: int,
         token_subtiles: int,
         row_cluster_ctas: int,
+        output_row_stride: int,
     ) -> None:
         # Real head row q_head lives in score plane kv*8 + qg; partial-stats rows stay compact.
         self.score_group_size = num_q_heads // num_kv_heads
         self.score_head_pad = _PADDED_HEAD_COLUMNS - self.score_group_size
         self.num_layers = num_layers
         self.seq_len = seq_len
-        # The widest score window (the whole bucket) sizes the output rows and token-tile grid.
+        # The widest score window (the whole bucket) sizes the token-tile grid;
+        # output rows are the TopK selection rows with their own stride.
         self.width = seq_len
+        self.output_row_stride = output_row_stride
         self.num_q_heads = num_q_heads
         self.num_rows = num_layers * num_q_heads
         self.page_shards = page_shards
@@ -242,11 +245,11 @@ class _TriAttentionNormalizeUnionKernel:
                         )
                 reduced_values[token_slot] = union_value
             subtile_first_token = first_token + token_subtile * self.subtile_token_tile
-            # Straddling subtiles store per token; union_scores stays < 2^31 so i32 cannot wrap.
-            if cutlass.const_expr(self.width % self.tokens_per_lane == 0) and cutlass.dynamic_expr(
-                subtile_first_token + self.tokens_per_lane <= valid_width
-            ):
-                union_index = request_idx * self.width + subtile_first_token
+            # Straddling subtiles store per token; the selection rows stay < 2^31 so i32 cannot wrap.
+            if cutlass.const_expr(
+                self.output_row_stride % self.tokens_per_lane == 0
+            ) and cutlass.dynamic_expr(subtile_first_token + self.tokens_per_lane <= valid_width):
+                union_index = request_idx * self.output_row_stride + subtile_first_token
                 union_tile = _gmem_lane_tile(
                     union_scores.iterator,
                     union_index,
@@ -262,7 +265,9 @@ class _TriAttentionNormalizeUnionKernel:
                 for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
                     token = subtile_first_token + token_slot
                     if cutlass.dynamic_expr(token < valid_width):
-                        union_scores[request_idx * self.width + token] = reduced_values[token_slot]
+                        union_scores[request_idx * self.output_row_stride + token] = reduced_values[
+                            token_slot
+                        ]
 
     @cute.kernel
     def kernel(

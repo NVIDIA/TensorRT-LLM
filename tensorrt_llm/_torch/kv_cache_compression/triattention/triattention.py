@@ -580,85 +580,40 @@ class TriAttention(KVCacheCompressionManager):
                     HAS_SWA=self._swa_destination_bases is not None,
                     num_warps=1,
                 )
+                cu_stream = cuda_driver.CUstream(stream.cuda_stream)
+                self._compiled_score_by_request_count[request_count](
+                    *self._cute_score_prefix,
+                    self._cute_mean_cos,
+                    self._cute_mean_sin,
+                    *self._cute_score_tail,
+                    request_count,
+                    cu_stream,
+                )
                 if union:
-                    # Union path: fused score+stats, then the normalized union reduction.
-                    cu_stream = cuda_driver.CUstream(stream.cuda_stream)
-                    self._compiled_score_by_request_count[request_count](
-                        *self._cute_score_prefix,
-                        self._cute_mean_cos,
-                        self._cute_mean_sin,
-                        *self._cute_score_tail,
-                        request_count,
-                        cu_stream,
-                    )
+                    # Normalized union reduction, written straight into the selection rows.
                     self._compiled_normalize_union[request_count](
                         self._cute_partial_stats,
                         *self._cute_selection_prefix,
-                        self._cute_union_scores,
+                        self._cute_selection_scores_rows,
                         request_count,
                         cu_stream,
-                    )
-                    columns = min(self._union_scores.shape[1], self._selection_scores_rows.shape[1])
-                    self._selection_scores_rows[:request_count, :columns].copy_(
-                        self._union_scores[:request_count, :columns]
-                    )
-                else:
-                    cu_stream = cuda_driver.CUstream(stream.cuda_stream)
-                    self._compiled_score_by_request_count[request_count](
-                        *self._cute_score_prefix,
-                        self._cute_mean_cos,
-                        self._cute_mean_sin,
-                        *self._cute_score_tail,
-                        request_count,
-                        cu_stream,
-                    )
-                    # Gather each decode window into the [request, layer, head, token] layout of the reduces.
-                    group_size = self._num_q_heads // self._num_kv_heads
-                    num_segments = request_count * self._num_layers
-                    pad = self._padded_head_columns
-                    source = (
-                        self._score_scratch[
-                            : self._num_kv_heads * pad * num_segments * self._score_token_capacity
-                        ]
-                        .view(
-                            self._num_kv_heads,
-                            pad,
-                            request_count,
-                            self._num_layers,
-                            self._score_token_capacity,
-                        )[:, :group_size]
-                        .permute(2, 3, 0, 1, 4)
-                    )
-                    torch.add(
-                        self._prompt_lengths_device[:request_count].view(-1, 1, 1, 1, 1),
-                        self._gather_columns,
-                        out=self._gather_index_base[:request_count],
-                    )
-                    self._gather_index_base[:request_count].clamp_(
-                        max=self._score_token_capacity - 1
-                    )
-                    columns = self._gather_index[:request_count]
-                    torch.gather(
-                        source,
-                        4,
-                        columns,
-                        out=self._score_output[:request_count].view(
-                            request_count,
-                            self._num_layers,
-                            self._num_kv_heads,
-                            group_size,
-                            self._selection_width_capacity,
-                        ),
                     )
             with nvtx_range("triattention.select", color="yellow"):
                 if not union:
+                    # Per-head reduces read each decode window straight out of the scratch.
                     prepare_per_head_scores(
-                        self._score_output[:request_count],
+                        self._score_scratch,
                         self._decode_lengths_device,
+                        self._prompt_lengths_device,
                         self._row_mean,
                         self._row_inv_std,
                         self._selection_scores_rows,
                         self._selection_row_lengths,
+                        request_count=request_count,
+                        num_layers=self._num_layers,
+                        num_q_heads=self._num_q_heads,
+                        padded_head_columns=self._padded_head_columns,
+                        score_token_capacity=self._score_token_capacity,
                         per_layer=self.eviction_mode == "per_layer_perhead",
                         normalize_scores=self.normalize_scores,
                     )
@@ -1003,30 +958,7 @@ class TriAttention(KVCacheCompressionManager):
         seg_out_offset = (
             torch.arange(max_segments, dtype=torch.int64, device=device) * seq_len
         ).to(torch.int32)
-        self._gather_columns = torch.arange(decode_width, dtype=torch.int64, device=device).view(
-            1, 1, 1, 1, -1
-        )
         union = self.eviction_mode == "union"
-        # Per-head gather index: per round only the token-start base is re-added in place.
-        self._gather_index_base = None
-        self._gather_index = None
-        if not union:
-            self._gather_index_base = torch.empty(
-                (max_requests, 1, 1, 1, decode_width), dtype=torch.int64, device=device
-            )
-            self._gather_index = self._gather_index_base.expand(
-                max_requests,
-                len(dense_layers),
-                self._num_kv_heads,
-                num_q_heads // self._num_kv_heads,
-                decode_width,
-            )
-        self._union_scores = None
-        if union:
-            # Bucket-wide rows; consumers mask by the per-request widths.
-            self._union_scores = torch.empty(
-                (max_requests, seq_len), dtype=torch.float32, device=device
-            )
 
         # ---- score path: compiled per request-count/page-shard ----
         anchor_pool = p0
@@ -1089,7 +1021,6 @@ class TriAttention(KVCacheCompressionManager):
         # Build-bound persistent launch operands: refreshed in place each round.
         self._cute_mean_cos = _to_cute(self._mean_cos.view(-1))
         self._cute_mean_sin = _to_cute(self._mean_sin.view(-1))
-        self._cute_union_scores = _to_cute(self._union_scores.view(-1)) if union else None
         self._compiled_score_by_request_count: Dict[int, object] = {}
         self._compiled_normalize_union: Dict[int, object] = {}
         page_shards_by_count: Dict[int, int] = {}
@@ -1182,58 +1113,6 @@ class TriAttention(KVCacheCompressionManager):
                     SMALL_WORKLOAD_PAGE_SHARDS if use_extra_score_shard else 2
                 )
 
-        if union:
-            from .triattention_cute_selection import (
-                _select_normalize_union_config,
-                _TriAttentionNormalizeUnionKernel,
-            )
-
-            compiled_configs: Dict[Tuple[int, int, int, int], object] = {}
-            for request_count in range(1, max_requests + 1):
-                page_shards = page_shards_by_count[request_count]
-                config = _select_normalize_union_config(
-                    request_count,
-                    seq_len,
-                    sm_count,
-                )
-                config_key = (page_shards, *config)
-                compiled_selection = compiled_configs.get(config_key)
-                if compiled_selection is None:
-                    cache_key = (
-                        "triattention_cute_normalize_union",
-                        static_geometry,
-                        tensor_specs,
-                        config_key,
-                        _tensor_spec(self._union_scores),
-                        _tensor_spec(self._partial_stats),
-                    )
-                    tokens_per_lane, token_subtiles, row_cluster_ctas = config
-                    compiled_selection = _compiled_kernel(
-                        cache_key,
-                        lambda page_shards=page_shards,
-                        tokens_per_lane=tokens_per_lane,
-                        token_subtiles=token_subtiles,
-                        row_cluster_ctas=row_cluster_ctas: cute.compile(
-                            _TriAttentionNormalizeUnionKernel(
-                                num_layers=self._num_layers,
-                                seq_len=seq_len,
-                                num_q_heads=num_q_heads,
-                                # The finalizer maps real head rows onto N=8-padded planes.
-                                num_kv_heads=self._num_kv_heads,
-                                page_shards=page_shards,
-                                tokens_per_lane=tokens_per_lane,
-                                token_subtiles=token_subtiles,
-                                row_cluster_ctas=row_cluster_ctas,
-                            ),
-                            self._cute_partial_stats,
-                            *self._cute_selection_prefix,
-                            self._cute_union_scores,
-                            cutlass.Int32(1),
-                            stream,
-                        ),
-                    )
-                    compiled_configs[config_key] = compiled_selection
-                self._compiled_normalize_union[request_count] = compiled_selection
         logger.info(
             f"TriAttention CuTe score enabled: {self._num_q_heads}q/{self._num_kv_heads}kv heads, "
             f"{num_freqs} freqs, {int(tokens_per_block)}-token pages"
@@ -1258,31 +1137,20 @@ class TriAttention(KVCacheCompressionManager):
             self._kept_ordinal_rows = torch.empty(
                 (max_requests, keep_count), dtype=torch.int32, device=device
             )
-            self._score_output = None
+            self._cute_selection_scores_rows = _to_cute(self._selection_scores_rows.view(-1))
         else:
             selection_rows = (
                 self._num_kv_heads
                 if self.eviction_mode == "per_head"
                 else self._num_layers * self._num_kv_heads
             )
-            # Both rectangles must stay 32-bit indexable (wraparound = wild reads).
-            score_rect = max_requests * self._num_layers * self._num_q_heads * decode_width
+            # The selection rectangle must stay 32-bit indexable (wraparound = wild reads).
             selection_rect = max_requests * selection_rows * max(decode_width, keep_count)
-            if max(score_rect, selection_rect) >= 2**31:
+            if selection_rect >= 2**31:
                 raise ValueError(
-                    f"per-head score rectangles overflow 32-bit indexing: "
-                    f"scores {score_rect}, selection {selection_rect}"
+                    f"per-head selection rectangle overflows 32-bit indexing: {selection_rect}"
                 )
             self._selection_rows_per_request = selection_rows
-            # [request, layer, head, token] layout read by the reduce kernels.
-            self._score_output = torch.empty(
-                max_requests,
-                self._num_layers,
-                self._num_q_heads,
-                decode_width,
-                dtype=torch.float32,
-                device=device,
-            )
             score_shape = (max_requests, self._num_layers, self._num_q_heads, 1)
             self._row_mean = torch.empty(score_shape, dtype=torch.float32, device=device)
             self._row_inv_std = torch.empty_like(self._row_mean)
@@ -1298,6 +1166,60 @@ class TriAttention(KVCacheCompressionManager):
             self._kept_ordinal_rows = torch.empty(
                 (max_requests * selection_rows, keep_count), dtype=torch.int32, device=device
             )
+
+        if union:
+            from .triattention_cute_selection import (
+                _select_normalize_union_config,
+                _TriAttentionNormalizeUnionKernel,
+            )
+
+            compiled_configs: Dict[Tuple[int, int, int, int], object] = {}
+            for request_count in range(1, max_requests + 1):
+                page_shards = page_shards_by_count[request_count]
+                config = _select_normalize_union_config(
+                    request_count,
+                    seq_len,
+                    sm_count,
+                )
+                config_key = (page_shards, *config)
+                compiled_selection = compiled_configs.get(config_key)
+                if compiled_selection is None:
+                    cache_key = (
+                        "triattention_cute_normalize_union",
+                        static_geometry,
+                        tensor_specs,
+                        config_key,
+                        _tensor_spec(self._selection_scores_rows),
+                        _tensor_spec(self._partial_stats),
+                    )
+                    tokens_per_lane, token_subtiles, row_cluster_ctas = config
+                    compiled_selection = _compiled_kernel(
+                        cache_key,
+                        lambda page_shards=page_shards,
+                        tokens_per_lane=tokens_per_lane,
+                        token_subtiles=token_subtiles,
+                        row_cluster_ctas=row_cluster_ctas: cute.compile(
+                            _TriAttentionNormalizeUnionKernel(
+                                num_layers=self._num_layers,
+                                seq_len=seq_len,
+                                num_q_heads=num_q_heads,
+                                # The finalizer maps real head rows onto N=8-padded planes.
+                                num_kv_heads=self._num_kv_heads,
+                                page_shards=page_shards,
+                                tokens_per_lane=tokens_per_lane,
+                                token_subtiles=token_subtiles,
+                                row_cluster_ctas=row_cluster_ctas,
+                                output_row_stride=decode_width,
+                            ),
+                            self._cute_partial_stats,
+                            *self._cute_selection_prefix,
+                            self._cute_selection_scores_rows,
+                            cutlass.Int32(1),
+                            stream,
+                        ),
+                    )
+                    compiled_configs[config_key] = compiled_selection
+                self._compiled_normalize_union[request_count] = compiled_selection
 
         # ---- compaction plans (opaque: only compact() interprets them) ---------
         compaction_params = [

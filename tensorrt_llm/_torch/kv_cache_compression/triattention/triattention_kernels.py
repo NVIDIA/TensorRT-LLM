@@ -56,22 +56,41 @@ def _gather_mean_phase_kernel(
 
 @triton.jit
 def _score_row_stats_kernel(
-    scores,
-    valid_widths,
+    score_scratch,
+    decode_lengths,
+    prompt_lengths,
     row_mean,
     row_inv_std,
+    segment_tokens,
     ROWS: tl.constexpr,
+    NUM_LAYERS: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    PADDED_COLUMNS: tl.constexpr,
+    BUCKET: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr = 256,
     # Triton rejects plain-global capture; the default binds the module float
     # at def time (STD_EPSILON itself must stay a plain float for the CuTe import).
     EPSILON: tl.constexpr = STD_EPSILON,
 ):
-    """Compute one valid-prefix mean and inverse standard deviation per score row."""
+    """Compute one valid-window mean and inverse standard deviation per score row,
+    reading each row's decode window straight out of the score scratch."""
+    QUERY_GROUP_SIZE: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
     flat_row = tl.program_id(0)
     request = flat_row // ROWS
-    valid_width = tl.load(valid_widths + request)
-    score_row = scores + flat_row * WIDTH
+    row_in_request = flat_row % ROWS
+    layer = row_in_request // NUM_Q_HEADS
+    query_head = row_in_request % NUM_Q_HEADS
+    kv_head = query_head // QUERY_GROUP_SIZE
+    plane = kv_head * PADDED_COLUMNS + query_head % QUERY_GROUP_SIZE
+    valid_width = tl.load(decode_lengths + request)
+    prompt_start = tl.load(prompt_lengths + request)
+    score_row = (
+        score_scratch
+        + plane.to(tl.int64) * segment_tokens
+        + ((request * NUM_LAYERS + layer) * BUCKET + prompt_start).to(tl.int64)
+    )
     lane = tl.arange(0, BLOCK)
     score_sum = 0.0
     for start in tl.static_range(0, WIDTH, BLOCK):
@@ -94,28 +113,34 @@ def _score_row_stats_kernel(
 
 @triton.jit
 def _score_per_head_reduce_kernel(
-    scores,
-    valid_widths,
+    score_scratch,
+    decode_lengths,
+    prompt_lengths,
     row_mean,
     row_inv_std,
     selection_scores,
     selection_seq_lens,
+    segment_tokens,
     NUM_LAYERS: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
+    PADDED_COLUMNS: tl.constexpr,
+    BUCKET: tl.constexpr,
     WIDTH: tl.constexpr,
     PER_LAYER: tl.constexpr,
     NORMALIZE: tl.constexpr,
     BLOCK: tl.constexpr = 256,
 ):
-    """Reduce query-head score rows into one selector row per KV-head domain."""
+    """Reduce each KV-head domain's decode window straight out of the score
+    scratch into one selector row."""
     QUERY_GROUP_SIZE: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
     SELECTION_ROWS: tl.constexpr = NUM_LAYERS * NUM_KV_HEADS if PER_LAYER else NUM_KV_HEADS
     request = tl.program_id(0)
     selection_row = tl.program_id(1)
     token_block = tl.program_id(2)
     token = token_block * BLOCK + tl.arange(0, BLOCK)
-    valid_width = tl.load(valid_widths + request)
+    valid_width = tl.load(decode_lengths + request)
+    prompt_start = tl.load(prompt_lengths + request)
     valid_token = token < valid_width
 
     if token_block == 0:
@@ -131,8 +156,12 @@ def _score_per_head_reduce_kernel(
         for query_in_group in tl.static_range(0, QUERY_GROUP_SIZE):
             query_head = kv_head * QUERY_GROUP_SIZE + query_in_group
             flat_row = (request * NUM_LAYERS + layer) * NUM_Q_HEADS + query_head
+            plane = kv_head * PADDED_COLUMNS + query_in_group
             value = tl.load(
-                scores + flat_row * WIDTH + token,
+                score_scratch
+                + plane.to(tl.int64) * segment_tokens
+                + ((request * NUM_LAYERS + layer) * BUCKET + prompt_start).to(tl.int64)
+                + token,
                 mask=valid_token,
                 other=-float("inf"),
             ).to(tl.float32)
@@ -148,8 +177,12 @@ def _score_per_head_reduce_kernel(
             for query_in_group in tl.static_range(0, QUERY_GROUP_SIZE):
                 query_head = kv_head * QUERY_GROUP_SIZE + query_in_group
                 flat_row = (request * NUM_LAYERS + layer) * NUM_Q_HEADS + query_head
+                plane = kv_head * PADDED_COLUMNS + query_in_group
                 value = tl.load(
-                    scores + flat_row * WIDTH + token,
+                    score_scratch
+                    + plane.to(tl.int64) * segment_tokens
+                    + ((request * NUM_LAYERS + layer) * BUCKET + prompt_start).to(tl.int64)
+                    + token,
                     mask=valid_token,
                     other=-float("inf"),
                 ).to(tl.float32)
@@ -166,48 +199,64 @@ def _score_per_head_reduce_kernel(
 
 
 def prepare_per_head_scores(
-    scores: torch.Tensor,
-    valid_widths: torch.Tensor,
+    score_scratch: torch.Tensor,
+    decode_lengths: torch.Tensor,
+    prompt_lengths: torch.Tensor,
     row_mean: torch.Tensor,
     row_inv_std: torch.Tensor,
     selection_scores_rows: torch.Tensor,
     selection_row_lengths: torch.Tensor,
     *,
+    request_count: int,
+    num_layers: int,
+    num_q_heads: int,
+    padded_head_columns: int,
+    score_token_capacity: int,
     per_layer: bool,
     normalize_scores: bool,
 ) -> None:
-    """Normalize and reduce score rows for either per-head eviction mode."""
-    request_count, num_layers, num_q_heads, width = scores.shape
-    selection_rows = int(selection_scores_rows.shape[0]) // int(valid_widths.shape[0])
+    """Normalize and reduce the scratch's decode windows for either per-head
+    eviction mode."""
+    width = int(selection_scores_rows.shape[1])
+    selection_rows = int(selection_scores_rows.shape[0]) // int(decode_lengths.shape[0])
     num_kv_heads = selection_rows // num_layers if per_layer else selection_rows
     rows = num_layers * num_q_heads
+    segment_tokens = request_count * num_layers * score_token_capacity
     if normalize_scores:
         _score_row_stats_kernel[(request_count * rows,)](
-            scores,
-            valid_widths,
+            score_scratch,
+            decode_lengths,
+            prompt_lengths,
             row_mean,
             row_inv_std,
+            segment_tokens,
             ROWS=rows,
+            NUM_LAYERS=num_layers,
+            NUM_Q_HEADS=num_q_heads,
+            NUM_KV_HEADS=num_kv_heads,
+            PADDED_COLUMNS=padded_head_columns,
+            BUCKET=score_token_capacity,
             WIDTH=width,
         )
     # 256-token tiles match the reduce kernel's BLOCK default.
     _score_per_head_reduce_kernel[(request_count, selection_rows, triton.cdiv(width, 256))](
-        scores,
-        valid_widths,
+        score_scratch,
+        decode_lengths,
+        prompt_lengths,
         row_mean,
         row_inv_std,
         selection_scores_rows,
         selection_row_lengths,
+        segment_tokens,
         NUM_LAYERS=num_layers,
         NUM_Q_HEADS=num_q_heads,
         NUM_KV_HEADS=num_kv_heads,
+        PADDED_COLUMNS=padded_head_columns,
+        BUCKET=score_token_capacity,
         WIDTH=width,
         PER_LAYER=per_layer,
         NORMALIZE=normalize_scores,
     )
-
-
-# ---- Selection finalize: settle threshold ties into the kept-ordinal rows ----
 
 
 @triton.jit

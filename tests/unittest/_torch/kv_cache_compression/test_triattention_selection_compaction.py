@@ -10,6 +10,7 @@ from conftest import make_cute_buffers as _make_cute_buffers
 from conftest import make_eviction_input as _make_eviction_input
 from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import make_staging_manager as _make_staging_manager
+from conftest import rect_to_score_scratch as _rect_to_score_scratch
 from conftest import run_compaction as _run_compaction
 from conftest import set_protected_tails as _set_protected_tails
 
@@ -99,13 +100,21 @@ def _make_selection_buffers(
 
 def _select_per_head(tri, scores, *, normalize_scores):
     """The per-head selection flow: reduce kernels, then top-k settle."""
+    request_count, num_layers, num_q_heads, width = scores.shape
+    score_scratch, prompt_lengths = _rect_to_score_scratch(scores, tri._num_kv_heads)
     prepare_per_head_scores(
-        scores,
+        score_scratch,
         tri._decode_lengths_device,
+        prompt_lengths,
         tri._row_mean,
         tri._row_inv_std,
         tri._selection_scores_rows,
         tri._selection_row_lengths,
+        request_count=request_count,
+        num_layers=num_layers,
+        num_q_heads=num_q_heads,
+        padded_head_columns=8,
+        score_token_capacity=width,
         per_layer=tri.eviction_mode == "per_layer_perhead",
         normalize_scores=normalize_scores,
     )
@@ -272,13 +281,20 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
         request_count * selection_rows, dtype=torch.int32, device=device
     )
 
+    score_scratch, prompt_lengths = _rect_to_score_scratch(scores, kv_heads)
     prepare_per_head_scores(
-        scores,
+        score_scratch,
         valid_widths,
+        prompt_lengths,
         row_mean,
         row_inv_std,
         selection_scores_rows,
         selection_row_lengths,
+        request_count=request_count,
+        num_layers=layers,
+        num_q_heads=query_heads,
+        padded_head_columns=8,
+        score_token_capacity=width,
         per_layer=per_layer,
         normalize_scores=normalize_scores,
     )

@@ -595,6 +595,24 @@ def write_block_offsets(manager, encoded):
     manager._block_offsets_device[:, : encoded.shape[1], :, : encoded.shape[-1]].copy_(encoded)
 
 
+def rect_to_score_scratch(scores, num_kv_heads, padded_head_columns=8):
+    """Scatter a [request, layer, q_head, token] rectangle into the fused
+    scorer's scratch layout (prompt starts at zero, bucket = rectangle width)."""
+    request_count, num_layers, num_q_heads, width = scores.shape
+    group = num_q_heads // num_kv_heads
+    scratch = torch.zeros(
+        num_kv_heads * padded_head_columns * request_count * num_layers * width,
+        dtype=torch.float32,
+        device=scores.device,
+    )
+    view = scratch.view(num_kv_heads, padded_head_columns, request_count, num_layers, width)
+    view[:, :group] = scores.view(request_count, num_layers, num_kv_heads, group, width).permute(
+        2, 3, 0, 1, 4
+    )
+    prompt_lengths = torch.zeros(request_count, dtype=torch.int32, device=scores.device)
+    return scratch, prompt_lengths
+
+
 def stage_score_metadata(manager, request_count, valid_seq_lens, valid_widths, token_starts):
     """Stage the per-round score metadata exactly like production (the
     compiled score launches read the staged rows via pointer capture)."""
@@ -646,9 +664,11 @@ def launch_split_scores(
         )[:, :group_size]
         .permute(2, 3, 0, 1, 4)
     )
-    columns = (
-        token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + manager._gather_columns
-    )
+    columns = token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + torch.arange(
+        manager._selection_width_capacity,
+        dtype=torch.int64,
+        device=manager._score_scratch.device,
+    ).view(1, 1, 1, 1, -1)
     columns = columns.clamp_(max=manager._score_token_capacity - 1).expand(
         request_count,
         manager._num_layers,

@@ -740,13 +740,46 @@ class TestFixedScoreMetadata:
                 for request in range(request_count)
             ]
 
+        def score_rectangle():
+            # Test-side extraction of the decode-window rectangle from the
+            # scratch (production reduces the scratch in-kernel).
+            group = tri._num_q_heads // tri._num_kv_heads
+            segments = request_count * tri._num_layers
+            source = (
+                tri._score_scratch[: tri._num_kv_heads * 8 * segments * tri._score_token_capacity]
+                .view(
+                    tri._num_kv_heads,
+                    8,
+                    request_count,
+                    tri._num_layers,
+                    tri._score_token_capacity,
+                )[:, :group]
+                .permute(2, 3, 0, 1, 4)
+                .reshape(
+                    request_count,
+                    tri._num_layers,
+                    tri._num_q_heads,
+                    tri._score_token_capacity,
+                )
+            )
+            columns = prompt_len + torch.arange(
+                tri._selection_width_capacity, dtype=torch.int64, device=device
+            ).view(1, 1, 1, -1)
+            columns = columns.clamp_(max=tri._score_token_capacity - 1).expand(
+                request_count,
+                tri._num_layers,
+                tri._num_q_heads,
+                tri._selection_width_capacity,
+            )
+            return torch.gather(source, 3, columns)
+
         score_sentinel = -12345.0
-        tri._score_output.fill_(score_sentinel)
+        tri._score_scratch.fill_(score_sentinel)
         # The compact stage is stubbed to a no-op: this test owns the score
         # buffers only, never a staged move decision.
         with mock.patch.object(module, "compact"):
             tri._execute_eviction_round(prepared_cohort())
-        fixed = tri._score_output.clone()
+        fixed = score_rectangle()
         assert tri._decode_lengths_device.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
 
         oracle = _torch_tri_score_oracle(
@@ -781,11 +814,11 @@ class TestFixedScoreMetadata:
             )
         )
         expected_second_widths = valid_seq_lens - prompt_len
-        tri._score_output.fill_(score_sentinel)
+        tri._score_scratch.fill_(score_sentinel)
         tri._decode_lengths_device.fill_(-1)
         with mock.patch.object(module, "compact"):
             tri._execute_eviction_round(prepared_cohort())
-        second_launch = tri._score_output.clone()
+        second_launch = score_rectangle()
         assert torch.equal(tri._decode_lengths_device, expected_second_widths)
         assert not torch.equal(second_launch, fixed)
 
