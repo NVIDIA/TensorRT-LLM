@@ -436,15 +436,31 @@ class KimiKDALinearAttention(nn.Module):
         projection_size = H * K_dim
         projection_v_size = HV * V_dim
 
-        q_proj_states = self.q_proj(hidden_states)
-        k_proj_states = self.k_proj(hidden_states)
-        v_proj_states = self.v_proj(hidden_states)
+        # q/k/v and the full-rank output gate all read this same normed hidden.
+        # When their weights are read at FP8 block-scale (Blackwell decode), the
+        # loader fuses them into one ``qkvg_proj`` GEMM: one activation quant and
+        # one GEMM launch replace four, which is what the launch-bound
+        # generation step needs. The split is output-identical to the per
+        # projection GEMMs (same activation, same weight slices). The forget
+        # gate (f_a/f_b), beta and low-rank output gate stay BF16, so they keep
+        # their own calls.
+        fused_qkvg = getattr(self, "qkvg_proj", None)
+        if fused_qkvg is not None:
+            parts = fused_qkvg(hidden_states).split(self.qkvg_split_sizes,
+                                                    dim=-1)
+            q_proj_states, k_proj_states, v_proj_states = parts[0], parts[
+                1], parts[2]
+            onorm_g_hidden = parts[3] if self.use_full_rank_gate else \
+                self.g_b_proj(self.g_a_proj(hidden_states))
+        else:
+            q_proj_states = self.q_proj(hidden_states)
+            k_proj_states = self.k_proj(hidden_states)
+            v_proj_states = self.v_proj(hidden_states)
+            onorm_g_hidden = self.g_proj(hidden_states) \
+                if self.use_full_rank_gate else \
+                self.g_b_proj(self.g_a_proj(hidden_states))
 
         g_hidden = self.f_b_proj(self.f_a_proj(hidden_states))
-        if self.use_full_rank_gate:
-            onorm_g_hidden = self.g_proj(hidden_states)
-        else:
-            onorm_g_hidden = self.g_b_proj(self.g_a_proj(hidden_states))
 
         beta_hidden = self.b_proj(hidden_states).float()
 
