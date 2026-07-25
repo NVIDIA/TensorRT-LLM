@@ -22,17 +22,20 @@ Covers the acceptance criteria of the SiTU cubin integration plan
 
 import dataclasses
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 from utils.util import check_accuracy
 
+from tensorrt_llm._torch.modules.fused_moe.communication import CommunicationFactory
 from tensorrt_llm._torch.modules.kimi_k3_moe import KimiK3SparseMoeBlock
 from tensorrt_llm._torch.modules.kimi_k3_moe._moe_kernels import (
     is_native_situ_supported,
     make_situ_alpha_beta,
     padded_fused_shapes,
 )
+from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
 situ_supported = pytest.mark.skipif(
@@ -132,6 +135,80 @@ def test_padded_fused_shapes():
     assert padded_fused_shapes(512, 256) == (512, 512, 256)
     assert padded_fused_shapes(128, 256) == (512, 128, 256)
     assert padded_fused_shapes(2880, 96) == (3072, 2944, 128)
+
+
+def test_kimi_gate_reuses_deepseek_v3_routing():
+    config = _K3Config(num_experts=16, num_experts_per_token=4)
+    gate = KimiK3MoEGate(config)
+    torch.manual_seed(23)
+    with torch.no_grad():
+        gate.weight.normal_(std=0.1)
+        gate.e_score_correction_bias.normal_(std=0.05)
+    hidden_states = torch.randn(2, 7, config.hidden_size)
+
+    expected_ids, expected_weights = gate(hidden_states)
+    routing_method = gate.routing_method
+    # Exercise the portable PyTorch short path; the production path keeps
+    # is_fused=True and uses the same routing contract.
+    routing_method.routing_impl.is_fused = False
+    actual_ids, actual_weights = routing_method.apply(gate.compute_logits(hidden_states))
+
+    expected_order = expected_ids.argsort(dim=-1)
+    actual_order = actual_ids.argsort(dim=-1)
+    assert actual_ids.dtype == torch.int32
+    torch.testing.assert_close(
+        expected_ids.gather(1, expected_order).to(actual_ids.dtype),
+        actual_ids.gather(1, actual_order),
+    )
+    torch.testing.assert_close(
+        expected_weights.gather(1, expected_order),
+        actual_weights.gather(1, actual_order),
+    )
+
+
+def test_communication_factory_accepts_model_selected_method(monkeypatch):
+    mapping = SimpleNamespace(
+        enable_attention_dp=True,
+        dp_size=16,
+        moe_tp_size=1,
+        moe_ep_size=16,
+    )
+    model_config = SimpleNamespace(
+        mapping=mapping,
+        pretrained_config=SimpleNamespace(hidden_size=3584),
+        torch_dtype=torch.bfloat16,
+        quant_config=None,
+        max_num_tokens=4096,
+        moe_max_num_tokens=65536,
+        use_cuda_graph=False,
+        use_low_precision_moe_combine=False,
+    )
+    selected = object()
+    method = None
+
+    def create_forced_method(force_method, *args, **kwargs):
+        nonlocal method
+        method = force_method
+        return selected
+
+    monkeypatch.delenv("TRTLLM_FORCE_COMM_METHOD", raising=False)
+    monkeypatch.setattr(
+        CommunicationFactory,
+        "_create_forced_method",
+        staticmethod(create_forced_method),
+    )
+    actual = CommunicationFactory.create_strategy(
+        model_config=model_config,
+        num_experts=896,
+        num_slots=896,
+        top_k=16,
+        expert_size_per_partition=56,
+        hidden_size=3584,
+        communication_method="ALLGATHER",
+    )
+
+    assert method == "ALLGATHER"
+    assert actual is selected
 
 
 @situ_supported

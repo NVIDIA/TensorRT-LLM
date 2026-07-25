@@ -37,7 +37,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoESchedulerKind
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
-from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import (ActType_TrtllmGen, AuxStreamType,
+                                      EventType, Fp4QuantizedTensor)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -158,6 +159,10 @@ class ConfigurableMoE(MoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         override_quant_config: Optional["QuantConfig"] = None,
+        trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
+        trtllm_gen_activation_alpha: Optional[float] = None,
+        trtllm_gen_activation_beta: Optional[float] = None,
+        communication_method: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(
@@ -178,6 +183,7 @@ class ConfigurableMoE(MoE):
         # Store model_config and aux_stream_dict for later use (e.g., backend setter)
         self.model_config = model_config
         self.aux_stream_dict = aux_stream_dict
+        self.communication_method = communication_method
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -187,6 +193,9 @@ class ConfigurableMoE(MoE):
             model_config=model_config,
             routing_method=routing_method,
             override_quant_config=override_quant_config,
+            trtllm_gen_activation_type=trtllm_gen_activation_type,
+            trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
+            trtllm_gen_activation_beta=trtllm_gen_activation_beta,
             **kwargs,
         )
 
@@ -270,6 +279,9 @@ class ConfigurableMoE(MoE):
         model_config: ModelConfig,
         routing_method: BaseMoeRoutingMethod,
         override_quant_config: Optional["QuantConfig"],
+        trtllm_gen_activation_type: Optional[ActType_TrtllmGen],
+        trtllm_gen_activation_alpha: Optional[float],
+        trtllm_gen_activation_beta: Optional[float],
         **kwargs,
     ) -> None:
         """Build the MoE backend, mirror EPLB attrs, then create weights.
@@ -326,6 +338,9 @@ class ConfigurableMoE(MoE):
                 init_load_balancer=False,
                 without_comm=True,
                 activation_type=self.activation_type,
+                trtllm_gen_activation_type=trtllm_gen_activation_type,
+                trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
+                trtllm_gen_activation_beta=trtllm_gen_activation_beta,
             )
 
         # Backend acceptance is validated at the end of ``__init__`` instead
@@ -541,6 +556,7 @@ class ConfigurableMoE(MoE):
             alltoall_result_do_sum=True,
             use_flashinfer=self.use_flashinfer,
             hidden_size=self.hidden_size,
+            communication_method=self.communication_method,
         )
 
     def forward_impl(

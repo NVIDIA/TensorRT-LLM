@@ -29,6 +29,8 @@ from typing import Any, Tuple
 import torch
 from torch import nn
 
+from ..fused_moe.routing import DeepSeekV3MoeRoutingMethod
+
 
 class KimiK3MoEGate(nn.Module):
     """K3 MoE routing — structural mirror of HF ``KimiMoEGate``.
@@ -101,15 +103,36 @@ class KimiK3MoEGate(nn.Module):
             None,
         )
 
+    @property
+    def routing_method(self) -> DeepSeekV3MoeRoutingMethod:
+        """Return the shared DeepSeekV3 router used by ConfigurableMoE."""
+        if self.moe_router_activation_func != "sigmoid":
+            raise ValueError("Kimi K3 ConfigurableMoE routing requires sigmoid scores.")
+        if not self.moe_renormalize:
+            raise ValueError(
+                "Kimi K3 ConfigurableMoE routing requires top-k weight renormalization."
+            )
+        if (
+            self.softmax_routing_mutation
+            or self.biased_weights_mutation
+            or self.omit_renormalize_mutation
+        ):
+            raise ValueError(
+                "Kimi K3 routing mutation flags are reference-test controls "
+                "and cannot be used by ConfigurableMoE."
+            )
+        return DeepSeekV3MoeRoutingMethod(
+            top_k=self.top_k,
+            n_group=self.num_expert_group,
+            topk_group=self.topk_group,
+            routed_scaling_factor=self.routed_scaling_factor,
+            callable_e_score_correction_bias=lambda: self.e_score_correction_bias,
+            is_fused=True,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
-
-        logits = torch.nn.functional.linear(
-            hidden_states.type(torch.float32),
-            self.weight.type(torch.float32),
-            None,
-        )
+        logits = self.compute_logits(hidden_states)
         scores = self._score(logits)
         scores = scores.view(bsz * seq_len, -1)
 

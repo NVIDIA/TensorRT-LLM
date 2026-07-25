@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,6 +59,7 @@ class CommunicationFactory:
         alltoall_result_do_sum: bool = True,
         use_flashinfer: bool = False,
         hidden_size: Optional[int] = None,
+        communication_method: Optional[str] = None,
     ) -> Optional[Communication]:
         """
         Create the best communication method for the given configuration
@@ -83,6 +84,8 @@ class CommunicationFactory:
             hidden_size: Actual MoE activation dimension (the A2A payload width).
                 For latent-MoE models this is moe_latent_size, not pretrained_config.hidden_size.
                 Falls back to pretrained_config.hidden_size when not provided.
+            communication_method: Optional model-selected communication method.
+                ``TRTLLM_FORCE_COMM_METHOD`` takes precedence when set.
             # TODO: Need a way to indicate whether EPLB is enabled.
 
         Returns:
@@ -113,7 +116,7 @@ class CommunicationFactory:
             return AllGatherReduceScatter(mapping)
 
         # Check if forced method is specified via environment variable
-        force_method = os.environ.get("TRTLLM_FORCE_COMM_METHOD")
+        force_method = os.environ.get("TRTLLM_FORCE_COMM_METHOD", communication_method)
 
         if force_method is not None:
             return CommunicationFactory._create_forced_method(
@@ -327,6 +330,10 @@ class CommunicationFactory:
                 use_cuda_graph,
             )
         elif method == "DEEPEPLOWLATENCY":
+            if top_k > DeepEPLowLatency.MAX_TOP_K:
+                raise ValueError(
+                    f"DeepEPLowLatency supports top_k <= {DeepEPLowLatency.MAX_TOP_K}, got {top_k}."
+                )
             return DeepEPLowLatency(
                 mapping,
                 num_slots,

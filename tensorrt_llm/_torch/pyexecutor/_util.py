@@ -21,9 +21,13 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 prefer_pinned, str_dtype_to_binding,
-                                 torch_dtype_to_str)
+from tensorrt_llm._utils import (
+    confidential_compute_enabled,
+    get_sm_version,
+    prefer_pinned,
+    str_dtype_to_binding,
+    torch_dtype_to_str,
+)
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -35,8 +39,7 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import (LoraConfig,
-                                      get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm.lora_helper import LoraConfig, get_default_trtllm_modules_to_hf_modules
 from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -44,31 +47,50 @@ from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
-from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
-                           get_spec_decoder, should_use_separate_draft_kv_cache)
-from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
-                           is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid)
+from ..speculative import (
+    get_num_extra_kv_tokens,
+    get_num_spec_layers,
+    get_spec_decoder,
+    should_use_separate_draft_kv_cache,
+)
+from .config_utils import (
+    extract_mamba_kv_cache_params,
+    is_gemma4_hybrid,
+    is_hybrid_linear,
+    is_kimi_linear,
+    is_mla,
+    is_nemotron_hybrid,
+    is_qwen3_hybrid,
+)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse, LlmRequestState
-from .mamba_cache_manager import (BaseMambaCacheManager,
-                                  CppMambaHybridCacheManager,
-                                  MixedMambaHybridCacheManager,
-                                  use_py_mamba_cache_manager)
+from .mamba_cache_manager import (
+    BaseMambaCacheManager,
+    CppMambaHybridCacheManager,
+    MixedMambaHybridCacheManager,
+    use_py_mamba_cache_manager,
+)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (BaseKVCacheCompressionManager, KVCacheManager,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
-from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
-                      TRTLLMSampler)
-from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2Scheduler, SimpleScheduler,
-                        SimpleUnifiedScheduler)
+from .resource_manager import (
+    BaseKVCacheCompressionManager,
+    KVCacheManager,
+    PeftCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
+from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler, TRTLLMSampler
+from .scheduler import (
+    BindCapacityScheduler,
+    BindMicroBatchScheduler,
+    KVCacheV2Scheduler,
+    SimpleScheduler,
+    SimpleUnifiedScheduler,
+)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -1877,15 +1899,12 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             quant_config=quant_config,
         )
-        # Kimi K3 runs EP-only parallelism: the KDA layers are fully
-        # replicated on every rank (no head sharding). The cache manager
-        # divides num_heads / n_groups / conv_dim by tp_size internally, so
-        # pre-scale them here to keep the per-rank state at full size.
-        kimi_state_tp = (mapping.tp_size
-                         if not mapping.enable_attention_dp else 1)
-        if kimi_state_tp > 1:
-            mamba_params.num_heads *= kimi_state_tp
-            mamba_params.n_groups *= kimi_state_tp
+        # Kimi K3 KDA state sharding follows the attention-family TP
+        # semantics (Qwen3-Next pattern): replicated under attention-DP,
+        # head-sharded across tp_size otherwise. That is exactly the cache
+        # manager's own internal gate (`tp_size = 1 if enable_attention_dp
+        # else tp_size`, then num_heads / n_groups / conv_dim divide by
+        # it), so the params pass through unscaled.
         # KDA fused multi-token verify (trtllm::kda_mtp_decode): when the
         # kernel can run here, allocate the per-slot replay caches instead
         # of the legacy per-step intermediate verification buffers. The
@@ -1895,8 +1914,7 @@ def _create_kv_cache_manager(
         kimi_extra_kwargs = {}
         if spec_config is not None and issubclass(
                 kv_cache_manager_cls, MixedMambaHybridCacheManager):
-            from ..modules.kimi_kda._kda_kernels import \
-                is_kda_mtp_verify_available
+            from ..modules.kimi_kda._kda_kernels import is_kda_mtp_verify_available
             if is_kda_mtp_verify_available():
                 kimi_extra_kwargs["kda_replay_num_spec"] = (
                     spec_config.tokens_per_gen_step - 1)

@@ -155,6 +155,10 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
         export HF_HOME=\${HF_HOME:-$CACHE_DIR/hf_home}
         mkdir -p \"\$FLASHINFER_WORKSPACE_BASE\" \"\$FLASHINFER_CUBIN_DIR\" \"\$HF_HOME\"
 
+        # Exercise CommunicationFactory AUTO selection rather than inheriting
+        # a caller-side forced communication strategy.
+        unset TRTLLM_FORCE_COMM_METHOD
+
         # In-place venv of the built checkout (build_wheel.py creates .venv-3.12).
         export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
 

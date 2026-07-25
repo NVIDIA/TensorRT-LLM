@@ -430,6 +430,17 @@ class KimiK3MLAAttention(nn.Module):
         the cached-decode cos was ~0 vs HF.
         """
         w = self.kv_b_proj.weight
+        # The absorb views are static after weight load but were being
+        # re-materialized (.contiguous() copies) on every prefill AND
+        # decode forward — ~2x12.6 MB per MLA layer per step. Memoize on
+        # first non-meta use (weight load precedes the first forward;
+        # keyed on the weight storage pointer so a re-allocated weight
+        # refreshes it). DeepSeek's mla.py pre-materializes the same
+        # tensors once for the same reason.
+        cache = getattr(self, "_absorb_cache", None)
+        if (cache is not None and w.device.type != "meta"
+                and cache[0] == w.data_ptr()):
+            return cache[1], cache[2]
         H = self.num_heads
         n = self.qk_nope_head_dim
         v = self.v_head_dim
@@ -437,6 +448,8 @@ class KimiK3MLAAttention(nn.Module):
         w_view = w.view(H, n + v, kv)
         k_absorb = w_view[:, :n, :].contiguous()
         v_absorb = w_view[:, n:, :].contiguous()
+        if w.device.type != "meta":
+            self._absorb_cache = (w.data_ptr(), k_absorb, v_absorb)
         return k_absorb, v_absorb
 
     # ------------------------------------------------------------------
