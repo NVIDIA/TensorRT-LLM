@@ -99,6 +99,11 @@ srun --mpi=pmix \
         # Prerequisites section (build_wheel.py creates .venv-3.12).
         export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
 
+        # Import tensorrt_llm from $REPO, not from wherever the venv's
+        # in-place install points (for git-worktree submits those differ;
+        # without this the job silently tests the main checkout's code).
+        export PYTHONPATH=\"$REPO\${PYTHONPATH:+:\$PYTHONPATH}\"
+
         exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' python3 \
             '$REPO/examples/kimi_k3/quick_start_kimi_k3.py' \
             --model \"$MODEL\" \

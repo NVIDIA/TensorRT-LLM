@@ -16,7 +16,14 @@
 #
 # Pass --reuse to additionally enable KV-cache block reuse
 # (eval_extra_llm_options_reuse.yaml); chunked prefill is enabled by
-# default. --sa and --reuse are mutually exclusive.
+# default.
+#
+# Pass --dflash /path/to/drafter to evaluate with DFlash speculative
+# decoding (selects eval_extra_llm_options_dflash.yaml with the drafter
+# path substituted in). With a synthetic drafter
+# (make_synthetic_dflash_drafter.py) this is a wiring smoke only.
+#
+# --sa, --reuse, and --dflash are mutually exclusive.
 #
 # REPO defaults to the submit directory (override by exporting REPO), and
 # must contain the built TensorRT-LLM checkout. Provide scheduler-specific
@@ -34,17 +41,31 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: sbatch $0 --model PATH --image PATH [--sa | --reuse]"
+    echo "Usage: sbatch $0 --model PATH --image PATH [--sa | --reuse | --dflash DRAFTER_PATH]"
 }
 
 MODEL=""
 CONTAINER_IMAGE=""
 MODE=default
+DFLASH_DRAFTER=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sa|--reuse)
-            [[ "$MODE" == default ]] || { echo "error: --sa and --reuse are mutually exclusive" >&2; usage >&2; exit 2; }
+            [[ "$MODE" == default ]] || { echo "error: --sa, --reuse, and --dflash are mutually exclusive" >&2; usage >&2; exit 2; }
             MODE=${1#--}
+            shift
+            ;;
+        --dflash)
+            [[ $# -ge 2 ]] || { echo "error: --dflash requires a drafter checkpoint path" >&2; usage >&2; exit 2; }
+            [[ "$MODE" == default ]] || { echo "error: --sa, --reuse, and --dflash are mutually exclusive" >&2; usage >&2; exit 2; }
+            MODE=dflash
+            DFLASH_DRAFTER=$2
+            shift 2
+            ;;
+        --dflash=*)
+            [[ "$MODE" == default ]] || { echo "error: --sa, --reuse, and --dflash are mutually exclusive" >&2; usage >&2; exit 2; }
+            MODE=dflash
+            DFLASH_DRAFTER=${1#*=}
             shift
             ;;
         --model)
@@ -89,7 +110,15 @@ REPO=${REPO:-$SLURM_SUBMIT_DIR}
 #   see the yaml) and max_batch_size <= 8 (SpeculativeState buffers).
 # - reuse: KV-cache block reuse; drops --disable_kv_cache_reuse so the
 #   yaml's enable_block_reuse takes effect.
+# - dflash: DFlash speculative decoding against the --dflash drafter; the
+#   drafter path is substituted into a per-job copy of the DFlash yaml
+#   (the checked-in file carries a placeholder). Smaller warmup/activation
+#   footprint and KV budget: drafter weights, capture buffer, and DFlash
+#   context-KV slots leave less headroom than the SA config assumes
+#   (0.25/8192 OOM'd in warmup on GB300).
 MAX_BATCH_SIZE=32
+MAX_NUM_TOKENS=8192
+KV_FRAC=0.25
 KV_REUSE_ARG="--disable_kv_cache_reuse"
 case "$MODE" in
     sa)
@@ -100,13 +129,29 @@ case "$MODE" in
         EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options_reuse.yaml
         KV_REUSE_ARG=""
         ;;
+    dflash)
+        [[ -e "$DFLASH_DRAFTER" ]] || { echo "error: drafter path does not exist: $DFLASH_DRAFTER" >&2; exit 2; }
+        EVAL_CONFIG=$REPO/examples/kimi_k3/.eval_dflash_runtime.$SLURM_JOB_ID.yaml
+        sed "s|speculative_model: .*|speculative_model: $DFLASH_DRAFTER|" \
+            "$REPO/examples/kimi_k3/eval_extra_llm_options_dflash.yaml" > "$EVAL_CONFIG"
+        MAX_BATCH_SIZE=8
+        MAX_NUM_TOKENS=4096
+        KV_FRAC=0.20
+        ;;
     *)
         EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options.yaml
         ;;
 esac
 
+# Mount every input at its host path so the paths are valid inside too.
+# EXTRA_MOUNTS (comma-separated src:dst:flags) lets git-worktree submits
+# also mount the built main checkout that the worktree's artifact
+# symlinks resolve into (submit with --export=ALL).
 MOUNTS="$REPO:$REPO:rw,$MODEL:$MODEL:ro"
-# Optional extra container mounts (srun --container-mounts syntax).
+[[ -n "$DFLASH_DRAFTER" ]] && MOUNTS="$MOUNTS,$DFLASH_DRAFTER:$DFLASH_DRAFTER:ro"
+# Optional extra container mounts (srun --container-mounts syntax). Needed
+# e.g. when $REPO is a git worktree whose build artifacts (.venv-3.12,
+# bindings *.so) are symlinks into the main checkout.
 if [ -n "${EXTRA_MOUNTS:-}" ]; then
     MOUNTS+=",$EXTRA_MOUNTS"
 fi
@@ -149,6 +194,11 @@ srun --mpi=pmix \
         # Cap in-flight requests: may cost some throughput vs submit-all, but yields steady partial scores (early failure signal) instead of one burst at the end (0 = off).
         export TLLM_EVAL_MAX_IN_FLIGHT=\"\${TLLM_EVAL_MAX_IN_FLIGHT:-0}\"
 
+        # Import tensorrt_llm from $REPO, not from wherever the venv's
+        # in-place install points (for git-worktree submits those differ;
+        # without this the job silently tests the main checkout's code).
+        export PYTHONPATH=\"$REPO\${PYTHONPATH:+:\$PYTHONPATH}\"
+
         exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' python3 \
             '$REPO/.venv-3.12/bin/trtllm-eval' \
             --model \"$MODEL\" \
@@ -156,7 +206,8 @@ srun --mpi=pmix \
             --tp_size 16 \
             --max_batch_size $MAX_BATCH_SIZE \
             --max_seq_len 8192 \
-            --max_num_tokens 8192 \
+            --max_num_tokens $MAX_NUM_TOKENS \
+            --kv_cache_free_gpu_memory_fraction $KV_FRAC \
             $KV_REUSE_ARG \
             --trust_remote_code \
             --config '$EVAL_CONFIG' \

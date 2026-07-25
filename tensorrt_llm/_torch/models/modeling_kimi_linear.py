@@ -1824,6 +1824,7 @@ class KimiLinearModel(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata=None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1849,6 +1850,16 @@ class KimiLinearModel(DecoderModel):
             hidden_states, block_residual = layer(hidden_states,
                                                   block_residual,
                                                   attn_metadata, mla_rt)
+            if spec_metadata is not None:
+                # DFlash hidden-state capture. K3's attn-residual scheme
+                # already folds the residual into the running prefix sum
+                # returned by each layer, so unlike Qwen3/Llama we pass the
+                # full hidden state with residual=None. Whether the drafter
+                # is trained against this prefix sum or some other tap point
+                # must be confirmed against the K3 drafter training recipe
+                # before real weights are used.
+                spec_metadata.maybe_capture_hidden_states(
+                    layer.layer_idx, hidden_states, None)
 
         hidden_states = _apply_attn_res(hidden_states, block_residual,
                                         self.output_attn_res_proj,
@@ -1879,13 +1890,22 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
         assert model_config.mapping.pp_size == 1, \
             "Kimi K3 does not support pipeline parallelism"
         spec_config = getattr(model_config, "spec_config", None)
-        # SA (suffix automaton) is the supported spec-dec mode: one-engine
-        # in-forward drafting, no draft weights; the KDA/MLA verify paths
-        # below implement multi-token verification for it. Modes needing
-        # draft heads (MTP/Eagle) are blocked until a draft-head
-        # checkpoint exists.
-        assert spec_config is None or spec_config.spec_dec_mode.is_sa(), \
-            "Kimi K3 supports speculative decoding only with SA"
+        # Supported spec-dec modes:
+        # - SA (suffix automaton): one-engine in-forward drafting, no draft
+        #   weights; the KDA/MLA verify paths below implement multi-token
+        #   verification for it.
+        # - DFlash: external-drafter parallel drafting; the drafter is a
+        #   separate dense checkpoint (K2.7-Code-DFlash schema) consumed by
+        #   the generic DFlashForCausalLM wrapper, and the target only has
+        #   to expose per-layer hidden states via maybe_capture_hidden_states
+        #   (see KimiLinearModel.forward). No trained K3 drafter exists yet;
+        #   this path is exercised with synthetic weights
+        #   (examples/kimi_k3/make_synthetic_dflash_drafter.py).
+        # Modes needing draft heads (MTP/Eagle) are blocked until a
+        # draft-head checkpoint exists.
+        assert spec_config is None or spec_config.spec_dec_mode.is_sa() \
+            or spec_config.spec_dec_mode.is_dflash(), \
+            "Kimi K3 supports speculative decoding only with SA or DFlash"
         super().__init__(KimiLinearModel(model_config),
                          model_config,
                          hidden_size=cfg.hidden_size,
@@ -1916,6 +1936,17 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
     # correspondingly longer load).
     # ------------------------------------------------------------------
 
+    def _trunk_parameters(self):
+        """Named parameters of the trunk only. Spec-dec draft modules
+        (e.g. the DFlash drafter attached by SpecDecOneEngineForCausalLM)
+        live in a separate checkpoint loaded by
+        ModelLoader.load_draft_weights, not in the target checkpoint."""
+        return {
+            name: param
+            for name, param in self.named_parameters()
+            if not name.startswith("draft_model.")
+        }
+
     def checkpoint_name_plan(self, prefix: str):
         """Return ``(name_map, expected_keys, expert_jobs)``.
 
@@ -1927,7 +1958,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
         for backend-owned expert slots. Exposed separately so the weight-name
         mapping can be dry-run without touching any tensor data.
         """
-        params = dict(self.named_parameters())
+        params = self._trunk_parameters()
         expected_keys = set()
         name_map: Dict[str, str] = {}
         for name in params:
@@ -1974,7 +2005,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
                   if any(k.startswith("language_model.") for k in weights)
                   else "")
 
-        params = dict(self.named_parameters())
+        params = self._trunk_parameters()
         name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
 
         # ---- key-set validation (both directions) ----

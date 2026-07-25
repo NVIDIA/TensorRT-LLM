@@ -403,7 +403,9 @@ class KimiK3MLAAttention(nn.Module):
             flashinfer_mla_backend="trtllm-gen",
         )
         # Generation backend: absorbed MQA path (same config as ctx).
-        # Called by ``forward_decode`` for single-token cached decode.
+        # Called by ``forward_decode`` for single-token cached decode only;
+        # multi-token generation (spec-dec verify) falls back to
+        # ``_backend_ctx`` (trtllm-gen) — see ``forward_decode``.
         # ``TLLM_K3_MLA_GEN_BACKEND`` (A/B experiment knob) selects the
         # FlashInfer MLA generation kernel: ``cute-dsl`` (default; needs
         # the customized FlashInfer revision from examples/kimi_k3/README.md
@@ -879,7 +881,15 @@ class KimiK3MLAAttention(nn.Module):
             # append + scheduler-buffer setup.
             skip_mla_rope_generation=True,
         )
-        attn_absorbed = self._backend_gen.forward(
+        # cute-dsl MLA decode folds seq_len_q into the 128-wide head tile;
+        # with K3's 128 (padded) query heads it can only implement T=1.
+        # Multi-token generation batches (spec-dec verify: SA, DFlash) go
+        # through the trtllm-gen backend, which supports q_len_per_req > 1.
+        num_gens = rt.metadata.num_generations
+        backend = (self._backend_gen
+                   if num_gens > 0 and num_tokens == num_gens
+                   else self._backend_ctx)
+        attn_absorbed = backend.forward(
             q_fused_flat, None, None, rt.metadata, forward_args=forward_args
         )
         # ``attn_absorbed`` shape: ``[num_tokens, num_heads * kv_lora_rank]``.
