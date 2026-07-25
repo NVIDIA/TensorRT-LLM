@@ -298,13 +298,7 @@ def test_final_state_parity_poisoned_scratch(dispatch_pair, gate_params,
     _assert_close("poisoned/state", state_opt, state_ref)
 
 
-@pytest.mark.parametrize("heads", [6, 12], ids=["tp16_heads6", "tp8_heads12"])
-@torch.no_grad()
-def test_long_sequence_parity_tp_headcount(dispatch_pair, heads):
-    """Per-rank head count under tensor parallelism: the e2e eval runs
-    tp_size=16 -> H = 96/16 = 6 heads per rank, but every other test here
-    compiles the DSL kernels at H=96 (H is a compile-time specializer).
-    Parity-check the H=6 / H=12 compiles on a GSM8K-shaped batch."""
+def _run_headcount_case(dispatch_pair, heads):
     optimized, reference = dispatch_pair
     h, k = heads, HEAD_K_DIM
     gen = torch.Generator(device="cuda").manual_seed(4711 + heads)
@@ -339,6 +333,31 @@ def test_long_sequence_parity_tp_headcount(dispatch_pair, heads):
     out_ref, state_ref = run(reference)
     _assert_close(f"h{heads}/out", out_opt, out_ref)
     _assert_close(f"h{heads}/state", state_opt, state_ref)
+
+
+@pytest.mark.parametrize("heads", [6, 12], ids=["tp16_heads6", "tp8_heads12"])
+@torch.no_grad()
+def test_long_sequence_parity_tp_headcount(dispatch_pair, heads):
+    """Per-rank head count under tensor parallelism: the e2e eval runs
+    tp_size=16 -> H = 96/16 = 6 heads per rank, but every other test here
+    compiles the DSL kernels at H=96 (H is a compile-time specializer).
+    Parity-check the H=6 / H=12 compiles on a GSM8K-shaped batch."""
+    _run_headcount_case(dispatch_pair, heads)
+
+
+@torch.no_grad()
+def test_headcount_recompile_parity(dispatch_pair):
+    """Cross-head-count compile-cache isolation, order-explicit: run two
+    different per-rank head counts back-to-back in the same process and
+    parity-check the SECOND one. Regression test for the K4 persistent
+    kernel cache key losing H (0e44bf64a6 follow-up): s_ct bakes the
+    [H, K, V] state shape/strides at compile time, so reusing the
+    first-compiled head count's kernel for a different H misaddresses
+    every (seq, head) state tile. The tp_headcount params above only catch
+    this via pytest execution order; this test pins the order even when
+    run in isolation. Heads 8 then 4 avoid cache hits from other tests."""
+    _run_headcount_case(dispatch_pair, 8)
+    _run_headcount_case(dispatch_pair, 4)
 
 
 @torch.no_grad()
