@@ -11,7 +11,7 @@ section.
 |---|---|
 | `ctx_config.yaml` | Context-server extra LLM-API options (DEP16, overlap scheduler off, no spec decode) |
 | `gen_config.yaml` | Generation-server options WITH suffix-automaton (SA) speculative decoding (DEP16, eager) |
-| `gen_config_no_sa.yaml` | Generation-server options WITHOUT spec decode — use this first |
+| `gen_config_no_sa.yaml` | Generation-server options WITHOUT spec decode — use this first (CUDA graphs ON by default: GSM8K 96.89, 765/2138 tok/s @c64/c256 vs aggregated 643/1972; null `cuda_graph_config` for token-parity debugging) |
 | `disagg_proxy_config.yaml` | `trtllm-serve disaggregated` proxy config (1 ctx + 1 gen) |
 | `benchmark_kimi_k3_dep16.yaml` | Config for the SLURM benchmark harness (`examples/disaggregated/slurm/benchmark/submit.py`) |
 

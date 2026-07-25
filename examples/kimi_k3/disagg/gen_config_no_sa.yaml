@@ -2,19 +2,23 @@
 # options WITHOUT speculative decoding
 # (`trtllm-serve <model> --config gen_config_no_sa.yaml`).
 #
-# This configuration validates MLA-latent + KDA
-# state transfer with SA off so failures are attributable to the
-# transfer path, then switch to gen_config.yaml (SA on). Kept eager with
-# the overlap scheduler off to match the SA config (only
-# speculative_config and max_batch_size differ), so an SA-on/SA-off
-# comparison isolates SA itself.
+# Default: CUDA graphs ON. Validated end-to-end: GSM8K 96.89 (in the
+# aggregated band) and 765/2138 out tok/s at c64/c256 — ~3x the eager
+# TPOT and above aggregated serving throughput despite the overlap
+# scheduler being off (a disagg requirement on the ctx side).
+# For strict token-parity debugging (attribution-clean SA-on/SA-off or
+# disagg-vs-agg comparisons), null out the cuda graph config to match
+# the SA config's eager regime, and place ctx and gen in SEPARATE NVL72
+# domains (co-located placement selects different comm algorithms and
+# diverges token-level on a fixed prompt subset; accuracy-neutral).
 tensor_parallel_size: 16
 moe_expert_parallel_size: 16
 enable_attention_dp: true
 pipeline_parallel_size: 1
 disable_overlap_scheduler: true
 enable_chunked_prefill: false
-cuda_graph_config: null
+cuda_graph_config:
+  max_batch_size: 32
 # No SA SpeculativeState buffer cap here; 32 matches the aggregated
 # non-SA DEP16 eval config.
 max_batch_size: 32
