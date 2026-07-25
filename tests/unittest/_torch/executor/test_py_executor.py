@@ -1149,18 +1149,29 @@ class TestDisaggTransferIdleProgress:
         assert "timeout_ms=10" in message
 
     @pytest.mark.parametrize(
-        ("python_ready_time", "cpp_ready_time", "ready_time_source"),
+        (
+            "global_ready_time",
+            "python_ready_time",
+            "cpp_ready_time",
+            "ready_time_source",
+            "expected_ready_time",
+            "expected_ready_to_reap_ms",
+        ),
         [
-            (9.5, None, "python-local"),
-            (0.0, 9.5, "cpp-global"),
+            (9.7, 9.5, None, "python-global-consensus", 9.7, 400.0),
+            (None, 9.5, None, "python-local", 9.5, 600.0),
+            (None, 0.0, 9.5, "cpp-global", 9.5, 600.0),
         ],
     )
     def test_transfer_status_emits_ready_to_reap_delay(
         self,
         monkeypatch,
+        global_ready_time,
         python_ready_time,
         cpp_ready_time,
         ready_time_source,
+        expected_ready_time,
+        expected_ready_to_reap_ms,
     ):
         monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
         monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
@@ -1185,6 +1196,7 @@ class TestDisaggTransferIdleProgress:
         executor.canceled_req_ids = []
         request = _make_disagg_transfer_request(8, 32, in_progress=True)
         request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        request.py_kv_transfer_global_ready_time_s = global_ready_time
         request.py_kv_transfer_ready_time_s = python_ready_time
         request.kv_cache_transfer_end = (
             None
@@ -1207,9 +1219,9 @@ class TestDisaggTransferIdleProgress:
         message = log_info.call_args.args[0]
         assert "[DISAGG_DIAG][reap]" in message
         assert "request=8" in message
-        assert "ready_t=9.500000000" in message
+        assert f"ready_t={expected_ready_time:.9f}" in message
         assert f"ready_time_source={ready_time_source}" in message
-        assert "ready_to_reap_ms=600.000000" in message
+        assert f"ready_to_reap_ms={expected_ready_to_reap_ms:.6f}" in message
         assert "poll_call_ms=100.000000" in message
         assert "outcome=completed" in message
 
@@ -1591,8 +1603,8 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     executor.scheduler = Mock()
 
     calls = []
-    executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = (
-        lambda requests: calls.append(("prepare", requests))
+    executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = lambda requests: (
+        calls.append(("prepare", requests))
     )
 
     def stop_after_schedule(requests, inflight_req_ids):
@@ -1626,8 +1638,8 @@ def test_schedule_prepares_snapshot_points_before_scheduling():
     executor.scheduler = Mock()
 
     calls = []
-    executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = (
-        lambda requests: calls.append(("prepare", requests))
+    executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = lambda requests: (
+        calls.append(("prepare", requests))
     )
 
     def stop_after_schedule(requests, inflight_req_ids):

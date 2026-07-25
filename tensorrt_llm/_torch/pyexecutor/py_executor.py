@@ -26,6 +26,8 @@ try:
 except ImportError:
     from cuda import cudart
 
+from tensorrt_llm._torch.disaggregation.diagnostics import \
+    get_diagnostic_host_identity
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  is_trace_enabled, mpi_comm, mpi_disabled,
                                  nvtx_range, set_thread_local_mpi_comm,
@@ -3443,7 +3445,7 @@ class PyExecutor:
         if wall_timestamp is None:
             wall_timestamp = time.time()
         rank = getattr(getattr(self, "dist", None), "rank", -1)
-        host = os.getenv("HOSTNAME", "unknown").replace(" ", "_")
+        host, host_source = get_diagnostic_host_identity()
         transceiver = getattr(self, "kv_cache_transceiver", None)
         instance = getattr(transceiver, "_instance_name", "-")
         if not isinstance(instance, str):
@@ -3453,7 +3455,7 @@ class PyExecutor:
         logger.info(f"[DISAGG_DIAG][{category}] t={timestamp:.9f} "
                     f"clock=local_steady wall_t={wall_timestamp:.9f} "
                     f"wall_clock=unix wall_semantics={wall_semantics} "
-                    f"source=pyexecutor host={host} "
+                    f"source=pyexecutor host={host} host_source={host_source} "
                     f"instance={instance} rank={rank} {encoded_fields}")
 
     @staticmethod
@@ -6524,13 +6526,21 @@ class PyExecutor:
                     decode_start_time = get_steady_clock_now_in_seconds()
                     arrival_time = getattr(
                         req, "py_disagg_gen_executor_arrival_time_s", None)
-                    ready_time = getattr(req, "py_kv_transfer_ready_time_s",
+                    ready_time = getattr(req,
+                                         "py_kv_transfer_global_ready_time_s",
                                          None)
-                    ready_time_source = "python-local"
+                    ready_time_source = "python-global-consensus"
                     ready_comparison_time = decode_start_time
                     if (not isinstance(ready_time, (int, float))
                             or ready_time <= 0):
                         ready_time = None
+                    if ready_time is None:
+                        ready_time = getattr(req, "py_kv_transfer_ready_time_s",
+                                             None)
+                        ready_time_source = "python-local"
+                        if (not isinstance(ready_time, (int, float))
+                                or ready_time <= 0):
+                            ready_time = None
                     if ready_time is None:
                         transfer_end = getattr(req, "kv_cache_transfer_end",
                                                None)
@@ -7046,10 +7056,18 @@ class PyExecutor:
                     outcome = "failed"
                 else:
                     outcome = "cancelled"
-                ready_time = getattr(request, "py_kv_transfer_ready_time_s",
-                                     0.0)
-                ready_time_source = "python-local"
+                ready_time = getattr(request,
+                                     "py_kv_transfer_global_ready_time_s", 0.0)
+                ready_time_source = "python-global-consensus"
                 ready_comparison_time = reap_time
+                if (not isinstance(ready_time, (int, float))
+                        or ready_time <= 0):
+                    ready_time = getattr(request, "py_kv_transfer_ready_time_s",
+                                         0.0)
+                    ready_time_source = "python-local"
+                    if (not isinstance(ready_time, (int, float))
+                            or ready_time <= 0):
+                        ready_time = 0.0
                 if not ready_time:
                     transfer_end = getattr(request, "kv_cache_transfer_end",
                                            None)

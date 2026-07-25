@@ -29,6 +29,7 @@ sys.modules[_SPEC.name] = _TELEMETRY
 _SPEC.loader.exec_module(_TELEMETRY)
 
 analyze_events = _TELEMETRY.analyze_events
+analyze_log_paths = _TELEMETRY.analyze_log_paths
 main = _TELEMETRY.main
 parse_diagnostic_line = _TELEMETRY.parse_diagnostic_line
 DiagnosticEvent = _TELEMETRY.DiagnosticEvent
@@ -383,6 +384,84 @@ def test_multi_log_block_lookup_is_scoped_by_source(tmp_path, capsys):
     assert output["ranks"][f"{gen_log}::rank=1"]["service"]["completed_blocks"] == 2
 
 
+def test_native_slot_identity_is_inferred_from_one_matching_python_emitter():
+    source = "gen-worker.log"
+    events = [
+        _parse_source_line(line, source)
+        for line in [
+            "[DISAGG_DIAG][decision] t=0 rank=0 host=gen-node instance=GEN_0 "
+            "role=gen active_blocks=0 candidate_requests=42:8 admitted=1 "
+            "admitted_requests=42:8 deferred=0 deferred_requests=- budget=8",
+            "[DISAGG_DIAG][receiver-slot] t=0.1 rank=0 action=acquired "
+            "request=42 manager=m buffer=0",
+            "[DISAGG_DIAG][receiver-slot] t=0.9 rank=0 action=released "
+            "request=42 manager=m buffer=0",
+        ]
+    ]
+
+    result = analyze_events(events)
+
+    assert result["inferred_emitter_identity_events"] == 2
+    assert result["rank_namespace"] == "rank"
+    assert result["ranks"]["0"]["receiver_slots"]["service_latency_s"]["p50"] == pytest.approx(0.8)
+
+
+def test_multi_log_source_aggregates_reuse_top_level_rank_analysis(tmp_path, monkeypatch):
+    first_log = tmp_path / "first.log"
+    second_log = tmp_path / "second.log"
+    first_log.write_text(
+        "\n".join(
+            [
+                "[DISAGG_DIAG][decision] t=0 rank=0 sequence=1 "
+                "active_blocks=0 candidate_requests=1:4 admitted=1 "
+                "admitted_requests=1:4 deferred=0 deferred_requests=- budget=4",
+                "[DISAGG_DIAG][submit] t=0.1 rank=0 request=1 blocks=4",
+                "[DISAGG_DIAG][python-transfer] t=1.1 rank=0 "
+                "action=local-ready request=1 outcome=completed",
+                "[DISAGG_DIAG][reap] t=1.2 rank=0 request=1 blocks=4 outcome=completed",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    second_log.write_text(
+        "\n".join(
+            [
+                "[DISAGG_DIAG][decision] t=2 rank=0 sequence=1 "
+                "active_blocks=0 candidate_requests=2:8 admitted=1 "
+                "admitted_requests=2:8 deferred=0 deferred_requests=- budget=8",
+                "[DISAGG_DIAG][submit] t=2.1 rank=0 request=2 blocks=8",
+                "[DISAGG_DIAG][python-transfer] t=4.1 rank=0 "
+                "action=local-ready request=2 outcome=completed",
+                "[DISAGG_DIAG][reap] t=4.2 rank=0 request=2 blocks=8 outcome=completed",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    paths = [str(first_log), str(second_log)]
+    events = _TELEMETRY.read_diagnostic_events(paths)
+    expected_aggregates = {
+        path: analyze_events(event for event in events if event.source == path)["aggregate"]
+        for path in paths
+    }
+
+    original_analyze_events = _TELEMETRY.analyze_events
+    analyze_calls = 0
+
+    def counted_analyze_events(events):
+        nonlocal analyze_calls
+        analyze_calls += 1
+        return original_analyze_events(events)
+
+    monkeypatch.setattr(_TELEMETRY, "analyze_events", counted_analyze_events)
+
+    result = analyze_log_paths(paths)
+
+    assert analyze_calls == 1
+    assert {
+        path: result["source_aggregates"][path]["aggregate"] for path in paths
+    } == expected_aggregates
+
+
 def test_cpp_lifecycle_and_remaining_work_use_same_domain_completion():
     source = "gen-worker.log"
     events = [
@@ -430,6 +509,63 @@ def test_cpp_lifecycle_and_remaining_work_use_same_domain_completion():
     assert lifecycle["gen_arrival_to_decode_start"]["duration_s"]["p50"] == pytest.approx(1.05)
     assert lifecycle["ready_to_decode_start"]["duration_s"]["p50"] == pytest.approx(0.15)
     assert lifecycle["reap_to_decode_start"]["duration_s"]["p50"] == pytest.approx(0.05)
+
+
+def test_global_ready_drives_logical_release_and_remaining_work():
+    source = "gen-worker.log"
+    events = [
+        _parse_source_line(line, source)
+        for line in [
+            "[DISAGG_DIAG][submit] t=0.1 rank=0 host=gen instance=GEN_0 request=42 blocks=8",
+            "[DISAGG_DIAG][decision] t=0.5 rank=0 host=gen instance=GEN_0 "
+            "active_requests=42:8 candidate_requests=- admitted_requests=- "
+            "deferred_requests=- admitted=0 deferred=0 budget=8",
+            "[DISAGG_DIAG][python-transfer] t=1.0 rank=0 host=gen instance=GEN_0 "
+            "role=gen action=local-ready request=42",
+            "[DISAGG_DIAG][python-transfer] t=1.2 rank=0 host=gen instance=GEN_0 "
+            "role=gen action=global-ready request=42 completion_scope=global-consensus "
+            "expected_participants=2",
+            "[DISAGG_DIAG][reap] t=1.3 rank=0 host=gen instance=GEN_0 "
+            "request=42 blocks=8 outcome=completed",
+            "[DISAGG_DIAG][gen-service] t=1.4 rank=0 host=gen instance=GEN_0 "
+            "action=decode-start-proxy request=42",
+        ]
+    ]
+
+    result = analyze_events(events)
+    rank = result["ranks"]["0"]
+    remaining = result["remaining_work_ground_truth"]["samples"][0]
+    lifecycle = result["lifecycle"]["interval_coverage"]
+
+    assert rank["release_to_admission"]["selected_release_source"] == "global-ready"
+    assert rank["python_transfer"]["global_ready_to_reap_s"]["p50"] == pytest.approx(0.1)
+    assert remaining["ready_t"] == pytest.approx(1.2)
+    assert remaining["ready_scope"] == "global-consensus"
+    assert remaining["residual_ready_s"] == pytest.approx(0.7)
+    assert lifecycle["global_ready_to_reap"]["duration_s"]["p50"] == pytest.approx(0.1)
+    assert lifecycle["global_ready_to_decode_start"]["duration_s"]["p50"] == pytest.approx(0.2)
+
+
+def test_reap_preserves_python_global_ready_scope_when_transfer_log_is_missing():
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][decision] t=0.5 rank=0 instance=GEN_0 "
+            "active_requests=42:8 candidate_requests=- admitted_requests=- "
+            "deferred_requests=- admitted=0 deferred=0 budget=8",
+            "[DISAGG_DIAG][reap] t=1.3 rank=0 instance=GEN_0 request=42 "
+            "ready_t=1.2 ready_time_source=python-global-consensus "
+            "blocks=8 outcome=completed",
+        ]
+    )
+
+    result = analyze_events(events)
+    sample = result["remaining_work_ground_truth"]["samples"][0]
+    marks = _TELEMETRY._collect_lifecycle_marks(events)
+
+    assert sample["ready_t"] == pytest.approx(1.2)
+    assert sample["ready_scope"] == "global-consensus"
+    assert any(mark.tag == "global-ready" for mark in marks)
+    assert not any(mark.tag == "local-ready" for mark in marks)
 
 
 def test_deadline_is_nonterminal_and_classified_by_sender_phase():
@@ -502,6 +638,37 @@ def test_cross_host_wall_clock_joins_ctx_deadline_to_gen_deferral():
     assert record["ctx_deadline_relationship"] == "during-gate2-deferral"
     assert record["wall_intervals_s"]["ctx_timer_to_gate2_admit"] == pytest.approx(62.0)
     assert record["wall_intervals_s"]["gate2_defer_to_ctx_deadline"] == pytest.approx(54.0)
+
+
+def test_cross_host_global_ready_uses_latest_participant_boundary():
+    events = _parse_lines(
+        [
+            "[DISAGG_DIAG][ctx-transfer] t=1 wall_t=1000 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=ctx instance=CTX_0 rank=0 "
+            "action=timer-start request=42",
+            "[DISAGG_DIAG][submit] t=2 wall_t=1005 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen instance=GEN_0 rank=0 "
+            "request=42",
+            "[DISAGG_DIAG][python-transfer] t=3 wall_t=1010 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen instance=GEN_0 rank=0 "
+            "role=gen action=global-ready request=42 completion_scope=global-consensus "
+            "expected_participants=2",
+            "[DISAGG_DIAG][python-transfer] t=4 wall_t=1011 wall_clock=unix "
+            "wall_semantics=boundary-sampled host=gen instance=GEN_0 rank=1 "
+            "role=gen action=global-ready request=42 completion_scope=global-consensus "
+            "expected_participants=2",
+        ]
+    )
+
+    record = analyze_events(events)["cross_host_correlation"]["requests"][0]
+    global_ready = record["points"]["gen-global-ready"]
+
+    assert global_ready["wall_t"] == pytest.approx(1011.0)
+    assert global_ready["observed_participants"] == 2
+    assert global_ready["expected_participants"] == 2
+    assert global_ready["participant_coverage_complete"] is True
+    assert record["wall_intervals_s"]["ctx_timer_to_gen_global_ready"] == pytest.approx(11.0)
+    assert record["wall_intervals_s"]["gen_submit_to_global_ready"] == pytest.approx(6.0)
 
 
 def test_cross_host_partial_gate2_admission_is_not_labeled_before_gate1():
@@ -1010,3 +1177,146 @@ def test_cpp_global_ready_timestamp_is_not_subtracted_from_local_reap_clock():
     assert sample["residual_ready_s"] is None
     assert sample["ready_censor_reason"] == "missing_ready"
     assert sample["residual_reap_s"] == pytest.approx(0.5)
+
+
+def test_indexed_release_matching_avoids_repeated_admission_scans(monkeypatch):
+    sample_count = 2_000
+    decisions = []
+    admissions = []
+    submits = []
+    releases = []
+    for index in range(sample_count):
+        decision_time = float(index)
+        admitted_request = str(index)
+        deferred_request = str(index + 1)
+        decisions.append(
+            _TELEMETRY.Decision(
+                decision_time,
+                str(index),
+                admitted=1,
+                deferred=1,
+                budget_blocks=4.0,
+            )
+        )
+        admissions.append(
+            _TELEMETRY.Admission(
+                decision_time,
+                str(index),
+                admitted=1,
+                deferred=1,
+                budget_blocks=4.0,
+                active_blocks=0.0,
+                candidate_requests=(
+                    (admitted_request, 4.0),
+                    (deferred_request, 4.0),
+                ),
+                admitted_requests=(admitted_request,),
+                deferred_requests=(deferred_request,),
+                candidate_requests_omitted=0,
+                admitted_requests_omitted=0,
+                deferred_requests_omitted=0,
+            )
+        )
+        submits.append(
+            _TELEMETRY.PointEvent(
+                decision_time + 0.01,
+                admitted_request,
+            )
+        )
+        if index + 1 < sample_count:
+            releases.append(
+                _TELEMETRY.ReleasePoint(
+                    decision_time + 0.5,
+                    admitted_request,
+                    "reap",
+                )
+            )
+
+    indexes = _TELEMETRY._build_release_indexes(decisions, admissions, submits)
+    monkeypatch.setattr(
+        _TELEMETRY,
+        "_matching_admission",
+        lambda *_args, **_kwargs: pytest.fail(
+            "indexed release matching fell back to a linear admission scan"
+        ),
+    )
+
+    samples = _TELEMETRY._match_release_gaps(
+        releases,
+        decisions,
+        admissions,
+        submits,
+        throughput_blocks_per_s=4.0,
+        indexes=indexes,
+    )
+
+    assert len(samples) == sample_count - 1
+    assert samples[0]["matched_backlog_request_ids"] == ["1"]
+    assert samples[-1]["matched_backlog_request_ids"] == [str(sample_count - 1)]
+
+
+def test_linear_progress_sweep_matches_interval_scan():
+    admissions = [
+        _TELEMETRY.Admission(
+            time_s=time_s,
+            sequence=str(index),
+            admitted=0,
+            deferred=1,
+            budget_blocks=8.0,
+            active_blocks=6.0,
+            candidate_requests=(),
+            admitted_requests=(),
+            deferred_requests=(),
+            candidate_requests_omitted=0,
+            admitted_requests_omitted=0,
+            deferred_requests_omitted=0,
+        )
+        for index, time_s in enumerate((2.5, 0.5, 4.0, 1.5))
+    ]
+    intervals = [
+        _TELEMETRY.ServiceInterval("a", 0.0, 2.0, 4.0, "submit", "ready"),
+        _TELEMETRY.ServiceInterval("b", 1.0, 3.0, 2.0, "submit", "ready"),
+        _TELEMETRY.ServiceInterval("c", 2.5, 5.0, 5.0, "submit", "ready"),
+    ]
+
+    expected = []
+    for admission in admissions:
+        active = [
+            interval
+            for interval in intervals
+            if interval.blocks is not None
+            and interval.start_s <= admission.time_s < interval.end_s
+            and interval.end_s > interval.start_s
+        ]
+        original_blocks = sum(interval.blocks or 0.0 for interval in active)
+        credit = sum(
+            (interval.blocks or 0.0)
+            * (admission.time_s - interval.start_s)
+            / (interval.end_s - interval.start_s)
+            for interval in active
+        )
+        expected.append(
+            {
+                "decision_t": admission.time_s,
+                "in_progress_requests": len(active),
+                "original_in_progress_blocks": original_blocks,
+                "estimated_progress_credit_blocks": credit,
+                "estimated_remaining_blocks": original_blocks - credit,
+                "estimated_progress_fraction": credit / original_blocks,
+            }
+        )
+
+    actual = _TELEMETRY._linear_progress_credit(admissions, intervals)
+
+    assert [sample["decision_t"] for sample in actual] == [
+        sample["decision_t"] for sample in expected
+    ]
+    for actual_sample, expected_sample in zip(actual, expected):
+        assert actual_sample["in_progress_requests"] == expected_sample["in_progress_requests"]
+        for field in (
+            "original_in_progress_blocks",
+            "estimated_progress_credit_blocks",
+            "estimated_remaining_blocks",
+            "estimated_progress_fraction",
+        ):
+            assert actual_sample[field] == pytest.approx(expected_sample[field])

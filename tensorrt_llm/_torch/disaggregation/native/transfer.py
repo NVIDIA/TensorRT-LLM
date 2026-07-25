@@ -54,6 +54,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
 )
+from tensorrt_llm._torch.disaggregation.diagnostics import get_diagnostic_host_identity
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
@@ -103,7 +104,7 @@ def _log_python_transfer_diagnostic(
         timestamp_s = _diagnostic_now_s()
     if wall_timestamp_s is None:
         wall_timestamp_s = time.time()
-    host = os.getenv("HOSTNAME", "unknown").replace(" ", "_")
+    host, host_source = get_diagnostic_host_identity()
     instance = instance.replace(" ", "_")
     encoded_fields = " ".join(f"{key}={value}" for key, value in fields.items())
     logger.info(
@@ -111,7 +112,8 @@ def _log_python_transfer_diagnostic(
         f"t={timestamp_s:.9f} clock=local_steady "
         f"wall_t={wall_timestamp_s:.9f} wall_clock=unix "
         f"wall_semantics={wall_semantics} runtime=Python "
-        f"host={host} instance={instance} rank={rank} role={role} "
+        f"host={host} host_source={host_source} "
+        f"instance={instance} rank={rank} role={role} "
         f"source=native action={action} "
         f"request={request} {encoded_fields}"
     )

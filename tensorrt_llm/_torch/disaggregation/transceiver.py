@@ -22,6 +22,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     WaitResult,
     get_unique_rid,
 )
+from tensorrt_llm._torch.disaggregation.diagnostics import get_diagnostic_host_identity
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
 )
@@ -135,23 +136,27 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         action: str,
         request: int,
         timestamp_s: Optional[float] = None,
+        wall_timestamp_s: Optional[float] = None,
+        wall_semantics: str = "emission",
         **fields: object,
     ) -> None:
         if not _is_disagg_transfer_diagnostics_enabled():
             return
         if timestamp_s is None:
             timestamp_s = _diagnostic_now_s()
-        wall_timestamp_s = time.time()
+        if wall_timestamp_s is None:
+            wall_timestamp_s = time.time()
         rank = getattr(getattr(self, "_dist", None), "rank", -1)
-        host = os.getenv("HOSTNAME", "unknown").replace(" ", "_")
+        host, host_source = get_diagnostic_host_identity()
         instance = getattr(self, "_instance_name", "-")
         encoded_fields = " ".join(f"{key}={value}" for key, value in fields.items())
         logger.info(
             "[DISAGG_DIAG][python-transfer] "
             f"t={timestamp_s:.9f} clock=local_steady "
             f"wall_t={wall_timestamp_s:.9f} wall_clock=unix "
-            f"wall_semantics=emission runtime=Python "
-            f"host={host} instance={instance} rank={rank} role={role} "
+            f"wall_semantics={wall_semantics} runtime=Python "
+            f"host={host} host_source={host_source} "
+            f"instance={instance} rank={rank} role={role} "
             f"source=transceiver action={action} request={request} "
             f"{encoded_fields}"
         )
@@ -892,6 +897,38 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
         if _is_disagg_transfer_diagnostics_enabled():
+            global_ready_time = _diagnostic_now_s() if completed else None
+            global_ready_wall_time = time.time() if completed else None
+            expected_participants = 1
+            if self._gen_need_sync:
+                expected_participants = (
+                    self._mapping.pp_size
+                    if self._mapping.enable_attention_dp
+                    else self._mapping.world_size
+                )
+            for rid in completed:
+                assert global_ready_time is not None
+                assert global_ready_wall_time is not None
+                session = self._recv_sessions[rid]
+                req = self._recv_reqs[rid]
+                req.py_kv_transfer_global_ready_time_s = global_ready_time
+                local_ready_time = getattr(session, "kv_ready_time_s", None)
+                self._log_python_transfer_diagnostic(
+                    role="gen",
+                    action="global-ready",
+                    request=rid,
+                    timestamp_s=global_ready_time,
+                    wall_timestamp_s=global_ready_wall_time,
+                    wall_semantics="boundary-sampled",
+                    local_request=req.py_request_id,
+                    completion_scope=("global-consensus" if self._gen_need_sync else "rank-local"),
+                    expected_participants=expected_participants,
+                    local_ready_t=(
+                        f"{local_ready_time:.9f}"
+                        if isinstance(local_ready_time, (int, float))
+                        else "-1"
+                    ),
+                )
             for action, rids in (
                 ("cancelled", cancelled),
                 ("failed", failed),

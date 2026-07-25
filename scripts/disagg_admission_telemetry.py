@@ -25,8 +25,10 @@ import argparse
 import json
 import math
 import re
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
+from heapq import heappop, heappush
 from pathlib import Path
 from statistics import fmean
 from typing import Iterable, Sequence
@@ -142,6 +144,26 @@ class _LifecycleMark:
     clock: str
 
 
+@dataclass(frozen=True)
+class _ReleaseIndexes:
+    """Chronological indexes shared by release/refill analyses on one rank."""
+
+    decision_times: tuple[float, ...]
+    admission_times: tuple[float, ...]
+    admission_by_sequence: dict[str, Admission]
+    admission_by_decision: tuple[Admission | None, ...]
+    signal_keys: tuple[tuple[float, int], ...]
+    signal_values: tuple[tuple[int, float | None], ...]
+    successful_decision_indices: tuple[int, ...]
+    successful_decision_times: tuple[float, ...]
+    successful_positions_without_detail: tuple[int, ...]
+    successful_positions_by_request: dict[str, tuple[int, ...]]
+    submits: tuple[PointEvent, ...]
+    submit_times: tuple[float, ...]
+    submit_positions_by_request: dict[str, tuple[int, ...]]
+    submits_are_chronological: bool
+
+
 _CTX_ACTIONS = {
     "queued",
     "send-queued",
@@ -170,6 +192,7 @@ _GEN_ACTIONS = {
     "peer-ready",
     "ready",
     "local-ready",
+    "global-ready",
 }
 _TERMINAL_ACTIONS = {
     "completed",
@@ -274,12 +297,20 @@ _LIFECYCLE_INTERVALS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("local-ready", "receiver-completed"),
         ("reap",),
     ),
+    "global_ready_to_reap": (
+        ("global-ready",),
+        ("reap",),
+    ),
     "gen_arrival_to_decode_start": (
         ("gen-arrival",),
         ("decode-start",),
     ),
     "ready_to_decode_start": (
         ("local-ready", "receiver-completed"),
+        ("decode-start",),
+    ),
+    "global_ready_to_decode_start": (
+        ("global-ready",),
         ("decode-start",),
     ),
     "reap_to_decode_start": (
@@ -352,6 +383,67 @@ def read_diagnostic_events(paths: Iterable[str | Path]) -> list[DiagnosticEvent]
     return events
 
 
+def _resolve_missing_emitter_identity(
+    events: list[DiagnosticEvent],
+) -> list[DiagnosticEvent]:
+    """Fill missing native host/instance fields only when one emitter fits.
+
+    Native receiver-slot records do not currently carry the Python host and
+    worker instance. A log source can still identify them safely when every
+    explicit event for the same rank and role names one emitter. Ambiguous
+    combined logs remain unresolved instead of being guessed.
+    """
+    emitters: dict[tuple[str | None, str, str], set[tuple[str, str]]] = defaultdict(set)
+    for event in events:
+        category = _normalize_diag_token(event.category)
+        action = _normalize_diag_token(event.fields.get("action", ""))
+        role = _event_role(event, category, action)
+        host = _event_host(event)
+        instance = event.fields.get("instance", "-")
+        if host == "<unspecified>" or instance in {"-", "unknown"}:
+            continue
+        emitters[(event.source, event.rank, role)].add((host, instance))
+
+    resolved: list[DiagnosticEvent] = []
+    for event in events:
+        category = _normalize_diag_token(event.category)
+        action = _normalize_diag_token(event.fields.get("action", ""))
+        role = _event_role(event, category, action)
+        host = _event_host(event)
+        instance = event.fields.get("instance", "-")
+        candidates = emitters.get((event.source, event.rank, role), set())
+        if host != "<unspecified>":
+            candidates = {candidate for candidate in candidates if candidate[0] == host}
+        if instance not in {"-", "unknown"}:
+            candidates = {candidate for candidate in candidates if candidate[1] == instance}
+        if len(candidates) != 1:
+            resolved.append(event)
+            continue
+        resolved_host, resolved_instance = next(iter(candidates))
+        inferred_fields = []
+        fields = dict(event.fields)
+        if host == "<unspecified>":
+            fields["host"] = resolved_host
+            inferred_fields.append("host")
+        if instance in {"-", "unknown"}:
+            fields["instance"] = resolved_instance
+            inferred_fields.append("instance")
+        if not inferred_fields:
+            resolved.append(event)
+            continue
+        fields["identity_inferred"] = ",".join(inferred_fields)
+        resolved.append(
+            DiagnosticEvent(
+                event.category,
+                event.time_s,
+                event.rank,
+                fields,
+                event.source,
+            )
+        )
+    return resolved
+
+
 def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
     """Calculate admission-window measurements from parsed events.
 
@@ -367,7 +459,7 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
         A JSON-serializable analysis dictionary.
     """
     sorted_events = sorted(
-        events,
+        _resolve_missing_emitter_identity(list(events)),
         key=lambda event: (event.source or "", event.rank, event.time_s),
     )
     sources = {event.source for event in sorted_events if event.source is not None}
@@ -457,21 +549,6 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
         events_by_rank[rank_key].append(event)
 
     ranks: dict[str, object] = {}
-    aggregate_service_intervals: list[ServiceInterval] = []
-    aggregate_selected_gaps: list[dict[str, object]] = []
-    aggregate_gaps_by_source: dict[str, list[dict[str, object]]] = defaultdict(list)
-    aggregate_slot_refill_gaps: list[float] = []
-    aggregate_progress_credits: list[float] = []
-    aggregate_fixed_multipliers: list[float] = []
-    aggregate_poll_durations_ms: list[float] = []
-    aggregate_progress_poll_durations_ms: list[float] = []
-    aggregate_no_progress_poll_durations_ms: list[float] = []
-    aggregate_reported_ready_to_reap_ms: list[float] = []
-    aggregate_physical_release_to_reap_s: list[float] = []
-    aggregate_invalid_ready_to_reap_samples = 0
-    aggregate_busy_s = 0.0
-    aggregate_completed_blocks = 0.0
-
     for rank in sorted(events_by_rank, key=_rank_sort_key):
         rank_events = events_by_rank[rank]
         block_scope = sorted_events
@@ -500,76 +577,168 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
                     event for event in sorted_events if event.source == representative.source
                 ]
         request_blocks = _collect_global_request_blocks(block_scope)
-        rank_analysis, rank_intervals, selected_gaps = _analyze_rank(rank_events, request_blocks)
+        rank_analysis, _, _ = _analyze_rank(rank_events, request_blocks)
         ranks[rank] = rank_analysis
-        aggregate_service_intervals.extend(rank_intervals)
-        aggregate_selected_gaps.extend(selected_gaps)
-        release_analysis = rank_analysis["release_to_admission"]
-        if isinstance(release_analysis, dict):
-            by_source = release_analysis["by_source"]
-            if isinstance(by_source, dict):
-                for source, source_analysis in by_source.items():
-                    if isinstance(source_analysis, dict):
-                        aggregate_gaps_by_source[source].extend(source_analysis["samples"])
+    lifecycle = _analyze_request_lifecycles(sorted_events)
+    cross_host_correlation = _analyze_cross_host_correlation(sorted_events)
+    remaining_work_ground_truth = _analyze_remaining_work_ground_truth(sorted_events)
+    known_backlog_release = _known_backlog_release_analysis(ranks)
 
-        service = rank_analysis["service"]
-        if isinstance(service, dict):
-            aggregate_busy_s += float(service["busy_s"])
-            aggregate_completed_blocks += float(service["completed_blocks"])
-        receiver_slots = rank_analysis["receiver_slots"]
-        if isinstance(receiver_slots, dict):
-            aggregate_slot_refill_gaps.extend(receiver_slots["backlog_refill_gap_samples_s"])
-        progress = rank_analysis["linear_progress_credit"]
-        if isinstance(progress, dict):
-            aggregate_progress_credits.extend(progress["credit_samples_blocks"])
-        counterfactual = rank_analysis["fixed_multiplier_counterfactual"]
-        if isinstance(counterfactual, dict):
-            aggregate_fixed_multipliers.extend(
-                counterfactual["next_deferred_required_multiplier_samples"]
-            )
-        status_poll = rank_analysis["status_poll"]
-        if isinstance(status_poll, dict):
-            aggregate_poll_durations_ms.extend(status_poll["duration_samples_ms"])
-            aggregate_progress_poll_durations_ms.extend(status_poll["progress_duration_samples_ms"])
-            aggregate_no_progress_poll_durations_ms.extend(
-                status_poll["no_progress_duration_samples_ms"]
-            )
-        scheduler_visibility = rank_analysis["scheduler_visibility"]
-        if isinstance(scheduler_visibility, dict):
-            aggregate_reported_ready_to_reap_ms.extend(
-                scheduler_visibility["reported_ready_to_reap_samples_ms"]
-            )
-            aggregate_physical_release_to_reap_s.extend(
-                scheduler_visibility["physical_release_to_reap_samples_s"]
-            )
-            aggregate_invalid_ready_to_reap_samples += int(
-                scheduler_visibility["invalid_reported_ready_to_reap_samples"]
-            )
+    return {
+        "schema_version": 3,
+        "rank_namespace": (
+            "source-path::rank[::host::instance::role]"
+            if split_legacy_ranks
+            else ("source-path::rank" if namespace_by_source else "rank")
+        ),
+        "aggregate_scope": "all-input-sources" if namespace_by_source else "single-source",
+        "parsed_event_count": len(sorted_events),
+        "inferred_emitter_identity_events": sum(
+            "identity_inferred" in event.fields for event in sorted_events
+        ),
+        "event_counts": dict(sorted(category_counts.items())),
+        "ranks": ranks,
+        "lifecycle": lifecycle,
+        "cross_host_correlation": cross_host_correlation,
+        "remaining_work_ground_truth": remaining_work_ground_truth,
+        "known_backlog_release": known_backlog_release,
+        "aggregate": _aggregate_rank_reports(
+            rank_report for rank_report in ranks.values() if isinstance(rank_report, dict)
+        ),
+        "model": {
+            "shadow_multiplier": "1 + throughput_blocks_per_s * refill_gap_s / budget_blocks",
+            "fixed_multiplier_counterfactual": (
+                "max(1, (active_blocks + FCFS_prefix_blocks) / budget_blocks)"
+            ),
+            "linear_progress_credit": (
+                "sum(request_blocks * elapsed_service_s / realized_service_s)"
+            ),
+            "caveat": (
+                "Retrospective service and progress use completed intervals; they are validation "
+                "estimates, not online remaining-work measurements. Python global-ready is "
+                "sampled after GEN consensus when available; local-ready is only a rank-local "
+                "bound, and reap is scheduler-visible."
+            ),
+        },
+    }
 
-    aggregate_throughput = _safe_ratio(aggregate_completed_blocks, aggregate_busy_s)
+
+def _aggregate_rank_reports(
+    rank_reports: Iterable[dict[str, object]],
+) -> dict[str, object]:
+    """Reconstruct the public aggregate from already-analyzed rank reports."""
+    service_latencies: list[float] = []
+    selected_samples: list[dict[str, object]] = []
+    gaps_by_source: dict[str, list[dict[str, object]]] = defaultdict(list)
+    slot_refill_gaps: list[float] = []
+    progress_credits: list[float] = []
+    fixed_multipliers: list[float] = []
+    poll_durations_ms: list[float] = []
+    progress_poll_durations_ms: list[float] = []
+    no_progress_poll_durations_ms: list[float] = []
+    reported_ready_to_reap_ms: list[float] = []
+    global_ready_to_reap_s: list[float] = []
+    physical_release_to_reap_s: list[float] = []
+    invalid_ready_to_reap_samples = 0
+    completed_service_intervals = 0
+    busy_s = 0.0
+    completed_blocks = 0.0
+
+    for rank_report in rank_reports:
+        service = rank_report["service"]
+        assert isinstance(service, dict)
+        intervals = service["intervals"]
+        assert isinstance(intervals, list)
+        completed_service_intervals += len(intervals)
+        service_latencies.extend(float(interval["latency_s"]) for interval in intervals)
+        busy_s += float(service["busy_s"])
+        completed_blocks += float(service["completed_blocks"])
+
+        release_analysis = rank_report["release_to_admission"]
+        assert isinstance(release_analysis, dict)
+        rank_selected_samples = release_analysis["selected_samples"]
+        assert isinstance(rank_selected_samples, list)
+        selected_samples.extend(rank_selected_samples)
+        rank_gaps_by_source = release_analysis["by_source"]
+        assert isinstance(rank_gaps_by_source, dict)
+        for source, source_report in rank_gaps_by_source.items():
+            assert isinstance(source_report, dict)
+            source_samples = source_report["samples"]
+            assert isinstance(source_samples, list)
+            gaps_by_source[str(source)].extend(source_samples)
+
+        receiver_slots = rank_report["receiver_slots"]
+        assert isinstance(receiver_slots, dict)
+        slot_refill_gaps.extend(
+            float(value) for value in receiver_slots["backlog_refill_gap_samples_s"]
+        )
+
+        progress = rank_report["linear_progress_credit"]
+        assert isinstance(progress, dict)
+        progress_credits.extend(float(value) for value in progress["credit_samples_blocks"])
+
+        counterfactual = rank_report["fixed_multiplier_counterfactual"]
+        assert isinstance(counterfactual, dict)
+        fixed_multipliers.extend(
+            float(value) for value in counterfactual["next_deferred_required_multiplier_samples"]
+        )
+
+        status_poll = rank_report["status_poll"]
+        assert isinstance(status_poll, dict)
+        poll_durations_ms.extend(float(value) for value in status_poll["duration_samples_ms"])
+        progress_poll_durations_ms.extend(
+            float(value) for value in status_poll["progress_duration_samples_ms"]
+        )
+        no_progress_poll_durations_ms.extend(
+            float(value) for value in status_poll["no_progress_duration_samples_ms"]
+        )
+
+        scheduler_visibility = rank_report["scheduler_visibility"]
+        assert isinstance(scheduler_visibility, dict)
+        python_transfer = rank_report["python_transfer"]
+        assert isinstance(python_transfer, dict)
+        global_ready_to_reap_s.extend(
+            float(value) for value in python_transfer["global_ready_to_reap_samples_s"]
+        )
+        reported_ready_to_reap_ms.extend(
+            float(value) for value in scheduler_visibility["reported_ready_to_reap_samples_ms"]
+        )
+        physical_release_to_reap_s.extend(
+            float(value) for value in scheduler_visibility["physical_release_to_reap_samples_s"]
+        )
+        invalid_ready_to_reap_samples += int(
+            scheduler_visibility["invalid_reported_ready_to_reap_samples"]
+        )
+
     selected_decision_gaps = [
         float(sample["decision_gap_s"])
-        for sample in aggregate_selected_gaps
+        for sample in selected_samples
         if sample.get("decision_gap_s") is not None
     ]
     selected_successful_admission_gaps = [
         float(sample["successful_admission_gap_s"])
-        for sample in aggregate_selected_gaps
+        for sample in selected_samples
         if sample.get("successful_admission_gap_s") is not None
     ]
     selected_refill_gaps = [
         float(sample["refill_gap_s"])
-        for sample in aggregate_selected_gaps
+        for sample in selected_samples
         if sample.get("refill_gap_s") is not None
     ]
     shadow_samples = [
         float(sample["shadow_multiplier"])
-        for sample in aggregate_selected_gaps
+        for sample in selected_samples
         if sample.get("shadow_multiplier") is not None
     ]
-    aggregate_release_bounds = {
+    release_bounds = {
         source: {
-            "decision_gap_s": _summary([float(sample["decision_gap_s"]) for sample in samples]),
+            "decision_gap_s": _summary(
+                [
+                    float(sample["decision_gap_s"])
+                    for sample in samples
+                    if sample.get("decision_gap_s") is not None
+                ]
+            ),
             "successful_admission_gap_s": _summary(
                 [
                     float(sample["successful_admission_gap_s"])
@@ -592,71 +761,34 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
                 ]
             ),
         }
-        for source, samples in sorted(aggregate_gaps_by_source.items())
+        for source, samples in sorted(gaps_by_source.items())
     }
-    lifecycle = _analyze_request_lifecycles(sorted_events)
-    cross_host_correlation = _analyze_cross_host_correlation(sorted_events)
-    remaining_work_ground_truth = _analyze_remaining_work_ground_truth(sorted_events)
-    known_backlog_release = _known_backlog_release_analysis(ranks)
-
     return {
-        "schema_version": 3,
-        "rank_namespace": (
-            "source-path::rank[::host::instance::role]"
-            if split_legacy_ranks
-            else ("source-path::rank" if namespace_by_source else "rank")
+        "completed_service_intervals": completed_service_intervals,
+        "completed_blocks": completed_blocks,
+        "busy_rank_seconds": busy_s,
+        "throughput_blocks_per_s": _safe_ratio(completed_blocks, busy_s),
+        "service_latency_s": _summary(service_latencies),
+        "selected_physical_release_to_next_decision_gap_s": _summary(selected_decision_gaps),
+        "selected_physical_release_to_successful_admission_gap_s": _summary(
+            selected_successful_admission_gaps
         ),
-        "aggregate_scope": "all-input-sources" if namespace_by_source else "single-source",
-        "parsed_event_count": len(sorted_events),
-        "event_counts": dict(sorted(category_counts.items())),
-        "ranks": ranks,
-        "lifecycle": lifecycle,
-        "cross_host_correlation": cross_host_correlation,
-        "remaining_work_ground_truth": remaining_work_ground_truth,
-        "known_backlog_release": known_backlog_release,
-        "aggregate": {
-            "completed_service_intervals": len(aggregate_service_intervals),
-            "completed_blocks": aggregate_completed_blocks,
-            "busy_rank_seconds": aggregate_busy_s,
-            "throughput_blocks_per_s": aggregate_throughput,
-            "service_latency_s": _summary(
-                [interval.end_s - interval.start_s for interval in aggregate_service_intervals]
-            ),
-            "selected_physical_release_to_next_decision_gap_s": _summary(selected_decision_gaps),
-            "selected_physical_release_to_successful_admission_gap_s": _summary(
-                selected_successful_admission_gaps
-            ),
-            "selected_physical_release_to_refill_gap_s": _summary(selected_refill_gaps),
-            "release_bounds_by_source": aggregate_release_bounds,
-            "receiver_slot_refill_gap_s": _summary(aggregate_slot_refill_gaps),
-            "selected_physical_shadow_multiplier": _summary(shadow_samples),
-            "next_deferred_required_fixed_multiplier": _summary(aggregate_fixed_multipliers),
-            "linear_progress_credit_blocks": _summary(aggregate_progress_credits),
-            "status_poll": {
-                "duration_ms": _summary(aggregate_poll_durations_ms),
-                "progress_duration_ms": _summary(aggregate_progress_poll_durations_ms),
-                "no_progress_duration_ms": _summary(aggregate_no_progress_poll_durations_ms),
-            },
-            "scheduler_visibility": {
-                "reported_ready_to_reap_ms": _summary(aggregate_reported_ready_to_reap_ms),
-                "physical_release_to_reap_s": _summary(aggregate_physical_release_to_reap_s),
-                "invalid_reported_ready_to_reap_samples": (aggregate_invalid_ready_to_reap_samples),
-            },
+        "selected_physical_release_to_refill_gap_s": _summary(selected_refill_gaps),
+        "release_bounds_by_source": release_bounds,
+        "receiver_slot_refill_gap_s": _summary(slot_refill_gaps),
+        "selected_physical_shadow_multiplier": _summary(shadow_samples),
+        "next_deferred_required_fixed_multiplier": _summary(fixed_multipliers),
+        "linear_progress_credit_blocks": _summary(progress_credits),
+        "status_poll": {
+            "duration_ms": _summary(poll_durations_ms),
+            "progress_duration_ms": _summary(progress_poll_durations_ms),
+            "no_progress_duration_ms": _summary(no_progress_poll_durations_ms),
         },
-        "model": {
-            "shadow_multiplier": "1 + throughput_blocks_per_s * refill_gap_s / budget_blocks",
-            "fixed_multiplier_counterfactual": (
-                "max(1, (active_blocks + FCFS_prefix_blocks) / budget_blocks)"
-            ),
-            "linear_progress_credit": (
-                "sum(request_blocks * elapsed_service_s / realized_service_s)"
-            ),
-            "caveat": (
-                "Retrospective service and progress use completed intervals; they are validation "
-                "estimates, not online remaining-work measurements. Python local-ready is a "
-                "rank-local bound and reap is scheduler-visible; runtime control requires "
-                "conservative cross-rank aggregation or global-ready semantics."
-            ),
+        "scheduler_visibility": {
+            "global_ready_to_reap_s": _summary(global_ready_to_reap_s),
+            "reported_ready_to_reap_ms": _summary(reported_ready_to_reap_ms),
+            "physical_release_to_reap_s": _summary(physical_release_to_reap_s),
+            "invalid_reported_ready_to_reap_samples": invalid_ready_to_reap_samples,
         },
     }
 
@@ -667,14 +799,29 @@ def analyze_log_paths(paths: Iterable[str | Path]) -> dict[str, object]:
     events = read_diagnostic_events(path_list)
     result = analyze_events(events)
     if len(path_list) > 1:
+        events_by_source: dict[str, list[DiagnosticEvent]] = defaultdict(list)
+        for event in events:
+            if event.source is not None:
+                events_by_source[event.source].append(event)
+
+        ranks = result["ranks"]
+        assert isinstance(ranks, dict)
         source_aggregates: dict[str, object] = {}
         for path_like in path_list:
             source = str(path_like)
-            source_result = analyze_events(event for event in events if event.source == source)
+            source_events = events_by_source.get(source, [])
+            source_rank_prefix = f"{source}::rank="
+            source_rank_reports = [
+                rank_report
+                for rank, rank_report in ranks.items()
+                if str(rank).startswith(source_rank_prefix) and isinstance(rank_report, dict)
+            ]
             source_aggregates[source] = {
-                "parsed_event_count": source_result["parsed_event_count"],
-                "event_counts": source_result["event_counts"],
-                "aggregate": source_result["aggregate"],
+                "parsed_event_count": len(source_events),
+                "event_counts": dict(
+                    sorted(Counter(event.category for event in source_events).items())
+                ),
+                "aggregate": _aggregate_rank_reports(source_rank_reports),
             }
         result["source_aggregates"] = source_aggregates
     return result
@@ -694,6 +841,13 @@ def _analyze_rank(
         events,
         "python-transfer",
         action="local-ready",
+        excluded_requests=unsuccessful_requests,
+        completed_only=True,
+    )
+    global_ready = _collect_points(
+        events,
+        "python-transfer",
+        action="global-ready",
         excluded_requests=unsuccessful_requests,
         completed_only=True,
     )
@@ -732,14 +886,25 @@ def _analyze_rank(
         "local-ready": [
             ReleasePoint(point.time_s, point.request, "local-ready") for point in local_ready
         ],
+        "global-ready": [
+            ReleasePoint(point.time_s, point.request, "global-ready") for point in global_ready
+        ],
         "reap": [ReleasePoint(point.time_s, point.request, "reap") for point in reaps],
         "receiver-slot": [
             ReleasePoint(interval.end_s, interval.request, "receiver-slot")
             for interval in physical_service_intervals
         ],
     }
+    release_indexes = _build_release_indexes(decisions, admissions, submits)
     gaps_by_source = {
-        source: _match_release_gaps(points, decisions, admissions, submits, throughput)
+        source: _match_release_gaps(
+            points,
+            decisions,
+            admissions,
+            submits,
+            throughput,
+            indexes=release_indexes,
+        )
         for source, points in release_points.items()
     }
     selected_source = _select_release_source(release_points)
@@ -750,10 +915,12 @@ def _analyze_rank(
         decisions,
         admissions,
         unsuccessful_requests,
+        indexes=release_indexes,
     )
     progress_samples = _linear_progress_credit(admissions, service_intervals)
     fixed_multiplier_samples = _fixed_multiplier_counterfactual(admissions)
     ready_to_reap_samples = _point_pair_gaps(local_ready, reaps)
+    global_ready_to_reap_samples = _point_pair_gaps(global_ready, reaps)
     physical_release_to_reap_samples = _point_pair_gaps(
         [PointEvent(interval.end_s, interval.request) for interval in physical_service_intervals],
         reaps,
@@ -811,6 +978,13 @@ def _analyze_rank(
                 [float(sample["gap_s"]) for sample in ready_to_reap_samples]
             ),
             "pairs": ready_to_reap_samples,
+            "global_ready_to_reap_samples_s": [
+                float(sample["gap_s"]) for sample in global_ready_to_reap_samples
+            ],
+            "global_ready_to_reap_s": _summary(
+                [float(sample["gap_s"]) for sample in global_ready_to_reap_samples]
+            ),
+            "global_ready_pairs": global_ready_to_reap_samples,
         },
         "status_poll": {
             "samples": status_poll_samples,
@@ -931,9 +1105,9 @@ def _analyze_rank(
                 for source, samples in gaps_by_source.items()
             },
             "policy_note": (
-                "Python local-ready is a rank-local idle-opportunity bound; reap is a "
-                "conservative scheduler-visible bound. An adaptive policy must aggregate "
-                "conservatively across ranks or use a global-ready signal."
+                "Python global-ready is the conservative all-rank logical release when "
+                "available. Local-ready is only a rank-local idle-opportunity bound; reap "
+                "is the later scheduler-visible bound."
             ),
         },
         "fixed_multiplier_counterfactual": {
@@ -1152,7 +1326,12 @@ def _collect_lifecycle_marks(events: list[DiagnosticEvent]) -> list[_LifecycleMa
                 and ready_time is not None
                 and 0.0 <= ready_time <= event.time_s
             ):
-                add("local-ready", time_s=ready_time, detail="ready_t")
+                ready_tag = (
+                    "global-ready"
+                    if ready_time_source == "python-global-consensus"
+                    else "local-ready"
+                )
+                add(ready_tag, time_s=ready_time, detail="ready_t")
 
         if category == "gen-service" and action == "decode-start-proxy":
             add("decode-start")
@@ -1214,6 +1393,8 @@ def _collect_lifecycle_marks(events: list[DiagnosticEvent]) -> list[_LifecycleMa
                 add("peer-ready")
             if action == "local-ready":
                 add("local-ready")
+            elif action == "global-ready":
+                add("global-ready")
             if action in _TERMINAL_ACTIONS:
                 add("receiver-terminal")
                 if action in _SUCCESS_TERMINAL_ACTIONS:
@@ -1252,6 +1433,8 @@ def _collect_lifecycle_marks(events: list[DiagnosticEvent]) -> list[_LifecycleMa
                     add("request-info")
                 if action == "local-ready":
                     add("local-ready")
+                elif action == "global-ready":
+                    add("global-ready")
                 if action in _TERMINAL_ACTIONS:
                     add("receiver-terminal")
                     if action in _SUCCESS_TERMINAL_ACTIONS:
@@ -1305,6 +1488,8 @@ def _analyze_cross_host_correlation(
                 "action": _normalize_diag_token(event.fields.get("action", "")),
                 "sequence": event.fields.get("sequence"),
                 "previous": event.fields.get("previous"),
+                "completion_scope": event.fields.get("completion_scope"),
+                "expected_participants": _as_int(event.fields.get("expected_participants")),
             }
         )
 
@@ -1389,6 +1574,8 @@ def _analyze_cross_host_correlation(
                 add(event, "gen-request-info")
             elif action == "local-ready":
                 add(event, "gen-local-ready")
+            elif action == "global-ready":
+                add(event, "gen-global-ready")
             elif action in _TERMINAL_ACTIONS:
                 add(event, "gen-terminal")
 
@@ -1433,6 +1620,16 @@ def _analyze_cross_host_correlation(
                         ("ctx_timer_to_first_gate2_defer", "ctx-timer-start", "gate2-deferred"),
                         ("ctx_timer_to_gate2_admit", "ctx-timer-start", "gate2-admitted"),
                         ("ctx_timer_to_gen_submit", "ctx-timer-start", "gen-submit"),
+                        (
+                            "ctx_timer_to_gen_global_ready",
+                            "ctx-timer-start",
+                            "gen-global-ready",
+                        ),
+                        (
+                            "gen_submit_to_global_ready",
+                            "gen-submit",
+                            "gen-global-ready",
+                        ),
                         ("ctx_timer_to_deadline", "ctx-timer-start", "ctx-deadline"),
                         ("gate2_defer_to_ctx_deadline", "gate2-deferred", "ctx-deadline"),
                     )
@@ -1502,6 +1699,16 @@ def _select_cross_host_point(
         key=_rank_sort_key,
     )
     selected["wall_semantics_seen"] = sorted({str(point["wall_semantics"]) for point in tag_points})
+    expected_participants = [
+        int(point["expected_participants"])
+        for point in tag_points
+        if point.get("expected_participants") is not None
+    ]
+    if expected_participants:
+        expected = max(expected_participants)
+        selected["expected_participants"] = expected
+        selected["observed_participants"] = len(emitter_points)
+        selected["participant_coverage_complete"] = len(emitter_points) >= expected
     return selected
 
 
@@ -1948,10 +2155,15 @@ def _analyze_remaining_work_ground_truth(
                 continue
             seen.add(identity)
             tags = timelines.get((domain, request), {})
+            ready_tags = (
+                ("global-ready",)
+                if tags.get("global-ready")
+                else ("local-ready", "receiver-completed")
+            )
             ready = min(
                 (
                     mark
-                    for tag in ("local-ready", "receiver-completed")
+                    for tag in ready_tags
                     for mark in tags.get(tag, ())
                     if mark.time_s >= event.time_s
                 ),
@@ -1967,7 +2179,7 @@ def _analyze_remaining_work_ground_truth(
             ready_reason = _remaining_endpoint_censor_reason(
                 request,
                 domain,
-                ("local-ready", "receiver-completed"),
+                ready_tags,
                 event.time_s,
                 tags,
                 tag_domains,
@@ -2000,6 +2212,11 @@ def _analyze_remaining_work_ground_truth(
                         f"{ready.category}:{ready.action or ready.tag}"
                         if ready is not None
                         else None
+                    ),
+                    "ready_scope": (
+                        "global-consensus"
+                        if ready_tags == ("global-ready",)
+                        else "rank-local-or-terminal"
                     ),
                     "residual_ready_s": (
                         ready.time_s - event.time_s if ready is not None else None
@@ -2049,7 +2266,9 @@ def _analyze_remaining_work_ground_truth(
         "definition": (
             "For each Gate-2 admission snapshot and active request, residual_ready_s and "
             "residual_reap_s use only later GEN events in the identical input source, "
-            "instance, and clock domain. CTX timestamps are never used."
+            "instance, and clock domain. Global-ready is preferred per request; older "
+            "logs fall back to rank-local or terminal completion. CTX timestamps are "
+            "never used."
         ),
         "active_decision_samples": len(samples),
         "active_request_ids_omitted": active_request_ids_omitted,
@@ -2998,50 +3217,196 @@ def _submit_to_interval_start_gaps(
     return samples
 
 
+def _build_release_indexes(
+    decisions: list[Decision],
+    admissions: list[Admission],
+    submits: list[PointEvent],
+) -> _ReleaseIndexes:
+    """Build immutable indexes reused by release/refill analyses."""
+    decision_times = tuple(decision.time_s for decision in decisions)
+    admission_times = tuple(admission.time_s for admission in admissions)
+
+    admission_by_sequence: dict[str, Admission] = {}
+    for admission in admissions:
+        if admission.sequence is not None:
+            admission_by_sequence.setdefault(admission.sequence, admission)
+
+    def matching_admission(decision: Decision) -> Admission | None:
+        if decision.sequence is not None:
+            match = admission_by_sequence.get(decision.sequence)
+            if match is not None:
+                return match
+        start = bisect_left(admission_times, decision.time_s - 1e-9)
+        for position in range(start, len(admissions)):
+            admission = admissions[position]
+            if admission.time_s > decision.time_s + 1e-9:
+                break
+            if math.isclose(
+                admission.time_s,
+                decision.time_s,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                return admission
+        return None
+
+    admission_by_decision = tuple(matching_admission(decision) for decision in decisions)
+
+    signal_by_key: dict[tuple[float, int], tuple[int, float | None]] = {}
+    for decision in decisions:
+        signal_by_key.setdefault(
+            (decision.time_s, 1),
+            (decision.deferred, decision.budget_blocks),
+        )
+    for admission in admissions:
+        signal_by_key.setdefault(
+            (admission.time_s, 0),
+            (admission.deferred, admission.budget_blocks),
+        )
+    signal_keys = tuple(sorted(signal_by_key))
+    signal_values = tuple(signal_by_key[key] for key in signal_keys)
+
+    successful_decision_indices = tuple(
+        index for index, decision in enumerate(decisions) if decision.admitted > 0
+    )
+    successful_decision_times = tuple(
+        decisions[index].time_s for index in successful_decision_indices
+    )
+    successful_positions_without_detail: list[int] = []
+    successful_positions_by_request: dict[str, list[int]] = defaultdict(list)
+    for successful_position, decision_index in enumerate(successful_decision_indices):
+        admission = admission_by_decision[decision_index]
+        if admission is None:
+            successful_positions_without_detail.append(successful_position)
+            continue
+        for request in set(admission.admitted_requests):
+            successful_positions_by_request[request].append(successful_position)
+
+    ordered_submits = tuple(submits)
+    submit_times = tuple(submit.time_s for submit in ordered_submits)
+    submit_positions_by_request: dict[str, list[int]] = defaultdict(list)
+    for position, submit in enumerate(ordered_submits):
+        submit_positions_by_request[submit.request].append(position)
+
+    return _ReleaseIndexes(
+        decision_times=decision_times,
+        admission_times=admission_times,
+        admission_by_sequence=admission_by_sequence,
+        admission_by_decision=admission_by_decision,
+        signal_keys=signal_keys,
+        signal_values=signal_values,
+        successful_decision_indices=successful_decision_indices,
+        successful_decision_times=successful_decision_times,
+        successful_positions_without_detail=tuple(successful_positions_without_detail),
+        successful_positions_by_request={
+            request: tuple(positions)
+            for request, positions in successful_positions_by_request.items()
+        },
+        submits=ordered_submits,
+        submit_times=submit_times,
+        submit_positions_by_request={
+            request: tuple(positions) for request, positions in submit_positions_by_request.items()
+        },
+        submits_are_chronological=all(
+            previous <= current for previous, current in zip(submit_times, submit_times[1:])
+        ),
+    )
+
+
+def _first_position_at_or_after(
+    positions: tuple[int, ...],
+    minimum_position: int,
+) -> int | None:
+    offset = bisect_left(positions, minimum_position)
+    return positions[offset] if offset < len(positions) else None
+
+
+def _next_successful_decision(
+    release_time_s: float,
+    backlog_requests: set[str] | None,
+    decisions: list[Decision],
+    indexes: _ReleaseIndexes,
+) -> tuple[Decision | None, Admission | None]:
+    minimum_position = bisect_right(indexes.successful_decision_times, release_time_s)
+    if minimum_position >= len(indexes.successful_decision_indices):
+        return None, None
+
+    if backlog_requests is None:
+        successful_position = minimum_position
+    else:
+        candidates: list[int] = []
+        missing_detail_position = _first_position_at_or_after(
+            indexes.successful_positions_without_detail,
+            minimum_position,
+        )
+        if missing_detail_position is not None:
+            candidates.append(missing_detail_position)
+        for request in backlog_requests:
+            request_position = _first_position_at_or_after(
+                indexes.successful_positions_by_request.get(request, ()),
+                minimum_position,
+            )
+            if request_position is not None:
+                candidates.append(request_position)
+        if not candidates:
+            return None, None
+        successful_position = min(candidates)
+
+    decision_index = indexes.successful_decision_indices[successful_position]
+    return decisions[decision_index], indexes.admission_by_decision[decision_index]
+
+
 def _match_release_gaps(
     releases: list[ReleasePoint],
     decisions: list[Decision],
     admissions: list[Admission],
     submits: list[PointEvent],
     throughput_blocks_per_s: float | None,
+    *,
+    indexes: _ReleaseIndexes | None = None,
 ) -> list[dict[str, object]]:
+    indexes = indexes or _build_release_indexes(decisions, admissions, submits)
     samples: list[dict[str, object]] = []
     for release in sorted(releases, key=lambda point: point.time_s):
-        prior = _latest_backlog_signal(decisions, admissions, release.time_s)
+        prior = _latest_backlog_signal(
+            decisions,
+            admissions,
+            release.time_s,
+            indexes=indexes,
+        )
         if prior is None or prior[0] <= 0:
             continue
-        next_decision = next(
-            (decision for decision in decisions if decision.time_s > release.time_s),
-            None,
-        )
-        if next_decision is None:
+        next_decision_position = bisect_right(indexes.decision_times, release.time_s)
+        if next_decision_position >= len(decisions):
             continue
-        backlog_requests = _backlog_request_ids_at(admissions, release.time_s)
+        next_decision = decisions[next_decision_position]
+        backlog_requests = _backlog_request_ids_at(
+            admissions,
+            release.time_s,
+            indexes=indexes,
+        )
         backlog_identity_unknown = not backlog_requests
-        successful_admission = None
+        successful_admission, detailed_admission = _next_successful_decision(
+            release.time_s,
+            None if backlog_identity_unknown else backlog_requests,
+            decisions,
+            indexes,
+        )
         matched_backlog_requests: set[str] = set()
-        for decision in decisions:
-            if decision.time_s <= release.time_s or decision.admitted <= 0:
-                continue
-            if backlog_identity_unknown:
-                successful_admission = decision
-                break
-            detailed_admission = _matching_admission(decision, admissions)
+        if successful_admission is not None and not backlog_identity_unknown:
             if detailed_admission is None:
                 backlog_identity_unknown = True
-                successful_admission = decision
-                break
-            matched = set(detailed_admission.admitted_requests).intersection(backlog_requests)
-            if matched:
-                successful_admission = decision
-                matched_backlog_requests = matched
-                break
+            else:
+                matched_backlog_requests = set(detailed_admission.admitted_requests).intersection(
+                    backlog_requests
+                )
         refill = (
             _find_refill_submit(
                 submits,
                 successful_admission,
                 admissions,
                 matched_backlog_requests or None,
+                indexes=indexes,
             )
             if successful_admission is not None
             else None
@@ -3105,31 +3470,87 @@ def _find_refill_submit(
     decision: Decision,
     admissions: list[Admission],
     required_requests: set[str] | None = None,
+    *,
+    indexes: _ReleaseIndexes | None = None,
 ) -> PointEvent | None:
-    candidates = [submit for submit in submits if submit.time_s >= decision.time_s]
+    indexes = indexes or _build_release_indexes([decision], admissions, submits)
+    if not indexes.submits_are_chronological:
+        candidates = [submit for submit in indexes.submits if submit.time_s >= decision.time_s]
+        if required_requests:
+            return next(
+                (submit for submit in candidates if submit.request in required_requests),
+                None,
+            )
+        admission = _matching_admission(decision, admissions, indexes=indexes)
+        if admission is not None and admission.admitted_requests:
+            admitted = set(admission.admitted_requests)
+            return next(
+                (submit for submit in candidates if submit.request in admitted),
+                None,
+            )
+        return candidates[0] if candidates else None
+
+    minimum_position = bisect_left(indexes.submit_times, decision.time_s)
+    if minimum_position >= len(indexes.submits):
+        return None
+
+    def first_submit_for(requests: set[str]) -> PointEvent | None:
+        positions = []
+        for request in requests:
+            position = _first_position_at_or_after(
+                indexes.submit_positions_by_request.get(request, ()),
+                minimum_position,
+            )
+            if position is not None:
+                positions.append(position)
+        return indexes.submits[min(positions)] if positions else None
+
     if required_requests:
-        return next(
-            (submit for submit in candidates if submit.request in required_requests),
-            None,
-        )
-    admission = _matching_admission(decision, admissions)
+        return first_submit_for(required_requests)
+    admission = _matching_admission(decision, admissions, indexes=indexes)
     if admission is not None and admission.admitted_requests:
-        admitted = set(admission.admitted_requests)
-        return next((submit for submit in candidates if submit.request in admitted), None)
-    return candidates[0] if candidates else None
+        return first_submit_for(set(admission.admitted_requests))
+    return indexes.submits[minimum_position]
 
 
-def _backlog_request_ids_at(admissions: list[Admission], time_s: float) -> set[str]:
-    admission = next(
-        (candidate for candidate in reversed(admissions) if candidate.time_s <= time_s),
-        None,
-    )
+def _backlog_request_ids_at(
+    admissions: list[Admission],
+    time_s: float,
+    *,
+    indexes: _ReleaseIndexes | None = None,
+) -> set[str]:
+    indexes = indexes or _build_release_indexes([], admissions, [])
+    position = bisect_right(indexes.admission_times, time_s) - 1
+    admission = admissions[position] if position >= 0 else None
     if admission is None or admission.deferred <= 0 or admission.deferred_requests_omitted > 0:
         return set()
     return set(admission.deferred_requests)
 
 
-def _matching_admission(decision: Decision, admissions: list[Admission]) -> Admission | None:
+def _matching_admission(
+    decision: Decision,
+    admissions: list[Admission],
+    *,
+    indexes: _ReleaseIndexes | None = None,
+) -> Admission | None:
+    if indexes is not None:
+        if decision.sequence is not None:
+            match = indexes.admission_by_sequence.get(decision.sequence)
+            if match is not None:
+                return match
+        start = bisect_left(indexes.admission_times, decision.time_s - 1e-9)
+        for position in range(start, len(admissions)):
+            admission = admissions[position]
+            if admission.time_s > decision.time_s + 1e-9:
+                break
+            if math.isclose(
+                admission.time_s,
+                decision.time_s,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                return admission
+        return None
     if decision.sequence is not None:
         match = next(
             (admission for admission in admissions if admission.sequence == decision.sequence),
@@ -3153,29 +3574,26 @@ def _matching_admission(decision: Decision, admissions: list[Admission]) -> Admi
 
 
 def _latest_backlog_signal(
-    decisions: list[Decision], admissions: list[Admission], time_s: float
+    decisions: list[Decision],
+    admissions: list[Admission],
+    time_s: float,
+    *,
+    indexes: _ReleaseIndexes | None = None,
 ) -> tuple[int, float | None] | None:
-    signals = [
-        (decision.time_s, 1, decision.deferred, decision.budget_blocks)
-        for decision in decisions
-        if decision.time_s <= time_s
-    ]
-    signals.extend(
-        (admission.time_s, 0, admission.deferred, admission.budget_blocks)
-        for admission in admissions
-        if admission.time_s <= time_s
-    )
-    if not signals:
+    indexes = indexes or _build_release_indexes(decisions, admissions, [])
+    position = bisect_right(indexes.signal_keys, (time_s, 2)) - 1
+    if position < 0:
         return None
-    _, _, deferred, budget = max(signals, key=lambda signal: (signal[0], signal[1]))
-    return deferred, budget
+    return indexes.signal_values[position]
 
 
 def _select_release_source(release_points: dict[str, list[ReleasePoint]]) -> str | None:
-    # Only the C++ path has a directly observed physical release signal.
-    # Python local-ready and consensus reap are complementary bounds, so the
-    # report intentionally does not collapse them into one selected source.
-    return "receiver-slot" if release_points["receiver-slot"] else None
+    # Prefer the directly observed physical release. Global-ready is a safe
+    # logical fallback because it is sampled only after GEN consensus. A
+    # rank-local ready event is not sufficient to declare reusable capacity.
+    if release_points["receiver-slot"]:
+        return "receiver-slot"
+    return "global-ready" if release_points["global-ready"] else None
 
 
 def _slot_refill_gaps(
@@ -3183,7 +3601,10 @@ def _slot_refill_gaps(
     decisions: list[Decision],
     admissions: list[Admission],
     excluded_requests: set[str],
+    *,
+    indexes: _ReleaseIndexes | None = None,
 ) -> list[float]:
+    indexes = indexes or _build_release_indexes(decisions, admissions, [])
     by_slot: dict[tuple[str, str], list[SlotInterval]] = defaultdict(list)
     for interval in intervals:
         by_slot[(interval.manager, interval.buffer)].append(interval)
@@ -3193,7 +3614,12 @@ def _slot_refill_gaps(
         for current, following in zip(slot_intervals, slot_intervals[1:]):
             if current.request in excluded_requests or following.request in excluded_requests:
                 continue
-            prior = _latest_backlog_signal(decisions, admissions, current.end_s)
+            prior = _latest_backlog_signal(
+                decisions,
+                admissions,
+                current.end_s,
+                indexes=indexes,
+            )
             if prior is not None and prior[0] > 0 and following.start_s >= current.end_s:
                 gaps.append(following.start_s - current.end_s)
     return gaps
@@ -3272,39 +3698,74 @@ def _fixed_multiplier_counterfactual(
 def _linear_progress_credit(
     admissions: list[Admission], intervals: list[ServiceInterval]
 ) -> list[dict[str, object]]:
-    samples: list[dict[str, object]] = []
-    for admission in admissions:
-        if admission.deferred <= 0:
-            continue
-        in_progress = [
-            interval
-            for interval in intervals
-            if interval.blocks is not None
-            and interval.start_s <= admission.time_s < interval.end_s
-            and interval.end_s > interval.start_s
-        ]
-        if not in_progress:
-            continue
-        original_blocks = sum(interval.blocks or 0.0 for interval in in_progress)
-        credit = sum(
-            (interval.blocks or 0.0)
-            * (admission.time_s - interval.start_s)
-            / (interval.end_s - interval.start_s)
-            for interval in in_progress
+    deferred_admissions = sorted(
+        (
+            (admission.time_s, original_position, admission)
+            for original_position, admission in enumerate(admissions)
+            if admission.deferred > 0
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
+    service_starts = sorted(
+        (
+            interval.start_s,
+            interval_index,
+            interval,
         )
+        for interval_index, interval in enumerate(intervals)
+        if interval.blocks is not None and interval.end_s > interval.start_s
+    )
+
+    samples_by_position: dict[int, dict[str, object]] = {}
+    active_ends: list[tuple[float, int, float, float, float]] = []
+    next_start = 0
+    active_count = 0
+    original_blocks = 0.0
+    progress_rate = 0.0
+    progress_offset = 0.0
+    for decision_time_s, original_position, admission in deferred_admissions:
+        while next_start < len(service_starts) and service_starts[next_start][0] <= decision_time_s:
+            _, interval_index, interval = service_starts[next_start]
+            blocks = interval.blocks or 0.0
+            duration_s = interval.end_s - interval.start_s
+            rate = blocks / duration_s
+            offset = rate * interval.start_s
+            heappush(
+                active_ends,
+                (interval.end_s, interval_index, blocks, rate, offset),
+            )
+            active_count += 1
+            original_blocks += blocks
+            progress_rate += rate
+            progress_offset += offset
+            next_start += 1
+
+        while active_ends and active_ends[0][0] <= decision_time_s:
+            _, _, blocks, rate, offset = heappop(active_ends)
+            active_count -= 1
+            original_blocks -= blocks
+            progress_rate -= rate
+            progress_offset -= offset
+
+        if active_count <= 0:
+            continue
+
+        credit = decision_time_s * progress_rate - progress_offset
         fraction = _safe_ratio(credit, original_blocks) or 0.0
-        samples.append(
-            {
-                "decision_t": admission.time_s,
-                "in_progress_requests": len(in_progress),
-                "logged_active_blocks": admission.active_blocks,
-                "original_in_progress_blocks": original_blocks,
-                "estimated_progress_credit_blocks": credit,
-                "estimated_remaining_blocks": original_blocks - credit,
-                "estimated_progress_fraction": fraction,
-            }
-        )
-    return samples
+        samples_by_position[original_position] = {
+            "decision_t": admission.time_s,
+            "in_progress_requests": active_count,
+            "logged_active_blocks": admission.active_blocks,
+            "original_in_progress_blocks": original_blocks,
+            "estimated_progress_credit_blocks": credit,
+            "estimated_remaining_blocks": original_blocks - credit,
+            "estimated_progress_fraction": fraction,
+        }
+    return [
+        samples_by_position[position]
+        for position in range(len(admissions))
+        if position in samples_by_position
+    ]
 
 
 def _union_duration(intervals: list[ServiceInterval]) -> float:

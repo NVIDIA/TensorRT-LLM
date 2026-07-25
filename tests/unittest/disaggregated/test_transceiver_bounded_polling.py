@@ -72,6 +72,8 @@ class _FakeSession:
         self.kv_transfer_start_time_s = kv_transfer_start_time_s
         self.request_info_sent_time_s = request_info_sent_time_s
         self.kv_ready_time_s = kv_ready_time_s
+        self.transfer_end_time = None
+        self.kv_cache_size_bytes = 0
         self.blocking_calls: list[bool] = []
         self.closed = False
 
@@ -294,6 +296,7 @@ def test_gen_transfer_status_stamps_first_local_ready_time(
 ) -> None:
     monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
     monkeypatch.setattr(transceiver_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(transceiver_module, "_diagnostic_now_s", lambda: 12.6)
     log_info = Mock()
     monkeypatch.setattr(transceiver_module.logger, "info", log_info)
     session = _FakeSession(
@@ -311,7 +314,8 @@ def test_gen_transfer_status_stamps_first_local_ready_time(
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
-    transceiver._gen_need_sync = False
+    transceiver._gen_need_sync = True
+    transceiver._mapping = Mock(enable_attention_dp=False, world_size=4)
     transceiver._recv_sessions = {21: session}
     transceiver._recv_reqs = {21: request}
     transceiver._diagnostic_ready_rids = set()
@@ -332,6 +336,7 @@ def test_gen_transfer_status_stamps_first_local_ready_time(
     assert request.py_kv_transfer_service_start_time_s == 10.25
     assert request.py_kv_request_info_sent_time_s == 10.25
     assert request.py_kv_transfer_ready_time_s == 12.5
+    assert request.py_kv_transfer_global_ready_time_s == 12.6
     message = next(
         call.args[0] for call in log_info.call_args_list if "action=local-ready" in call.args[0]
     )
@@ -341,6 +346,72 @@ def test_gen_transfer_status_stamps_first_local_ready_time(
     assert "bytes=8192" in message
     assert "request_info_sent_t=10.250000000" in message
     assert "receive_ms=2250.000" in message
+    global_ready_message = next(
+        call.args[0] for call in log_info.call_args_list if "action=global-ready" in call.args[0]
+    )
+    assert "t=12.600000000" in global_ready_message
+    assert "completion_scope=global-consensus" in global_ready_message
+    assert "expected_participants=4" in global_ready_message
+    assert "local_ready_t=12.500000000" in global_ready_message
+
+
+def test_gen_global_ready_uses_one_consensus_boundary_for_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transceiver_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    diagnostic_clock = Mock(side_effect=(12.6, 12.7, 12.8))
+    monkeypatch.setattr(transceiver_module, "_diagnostic_now_s", diagnostic_clock)
+    wall_clock = Mock(side_effect=(100.1, 100.2, 100.3, 100.4, 100.5))
+    monkeypatch.setattr(transceiver_module.time, "time", wall_clock)
+    log_info = Mock()
+    monkeypatch.setattr(transceiver_module.logger, "info", log_info)
+    sessions = {
+        rid: _FakeSession(
+            rid=rid,
+            wait_result=WaitResult.COMPLETED,
+            is_completed=True,
+            request_info_sent_time_s=10.0,
+            kv_ready_time_s=12.5,
+        )
+        for rid in (21, 22)
+    }
+    requests = {
+        rid: Mock(
+            py_request_id=rid,
+            py_kv_cache_xfer_bytes=8192,
+            state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        )
+        for rid in sessions
+    }
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = True
+    transceiver._mapping = Mock(enable_attention_dp=False, world_size=4)
+    transceiver._recv_sessions = sessions
+    transceiver._recv_reqs = requests
+    transceiver._diagnostic_ready_rids = set(sessions)
+    transceiver._dist = Mock(rank=2)
+    transceiver._collect_done = Mock(return_value=(list(sessions), []))
+    transceiver._gen_consensus = Mock(return_value=list(sessions))
+    transceiver._build_to_process = Mock(return_value=list(sessions))
+    transceiver._gen_consensus_outcome = Mock(return_value=([], [], list(sessions)))
+    transceiver._need_aux_transfer = Mock(return_value=False)
+    transceiver._assert_disagg_history_declared = Mock()
+    transceiver._close_failed_sessions = Mock()
+
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
+
+    assert completed == [21, 22]
+    assert failed == []
+    assert cancelled == []
+    assert {request.py_kv_transfer_global_ready_time_s for request in requests.values()} == {12.6}
+    assert diagnostic_clock.call_count == 3
+    global_ready_messages = [
+        call.args[0] for call in log_info.call_args_list if "action=global-ready" in call.args[0]
+    ]
+    assert len(global_ready_messages) == 2
+    assert all("wall_t=100.100000000" in message for message in global_ready_messages)
+    assert all("wall_semantics=boundary-sampled" in message for message in global_ready_messages)
 
 
 def test_kv_recv_task_records_native_transfer_boundaries(
