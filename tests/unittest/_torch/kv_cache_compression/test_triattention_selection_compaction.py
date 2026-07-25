@@ -51,20 +51,22 @@ def _make_selection_buffers(
     allocation; ``_settle_top_tokens`` reads exactly these attributes."""
     tri = TriAttention.__new__(TriAttention)
     tri.eviction_mode = eviction_mode
-    tri._max_requests = max_requests
-    tri._decode_width = width
+    tri._request_capacity = max_requests
+    tri._selection_width_capacity = width
     tri._keep_count = keep_count
     tri._num_layers = num_layers
     tri._num_q_heads = num_query_heads
     tri._num_kv_heads = num_kv_heads
-    tri._valid_widths = torch.full((max_requests,), width, dtype=torch.int32, device=device)
-    tri._token_starts_device = torch.zeros(max_requests, dtype=torch.int32, device=device)
+    tri._decode_lengths_device = torch.full(
+        (max_requests,), width, dtype=torch.int32, device=device
+    )
+    tri._prompt_lengths_device = torch.zeros(max_requests, dtype=torch.int32, device=device)
     if eviction_mode == "union":
         tri._selection_rows_per_request = 1
         tri._selection_scores_rows = torch.empty(
             (max_requests, width), dtype=torch.float32, device=device
         )
-        tri._selection_row_lengths = tri._valid_widths
+        tri._selection_row_lengths = tri._decode_lengths_device
         # Padded rows carry zero valid width; their provisional TopK entries
         # must still be in-range ordinals for the finalizer's score gather.
         tri._provisional_rows = torch.zeros(
@@ -99,7 +101,7 @@ def _select_per_head(tri, scores, *, normalize_scores):
     """The per-head selection flow: reduce kernels, then top-k settle."""
     prepare_per_head_scores(
         scores,
-        tri._valid_widths,
+        tri._decode_lengths_device,
         tri._row_mean,
         tri._row_inv_std,
         tri._selection_scores_rows,
@@ -107,7 +109,7 @@ def _select_per_head(tri, scores, *, normalize_scores):
         per_layer=tri.eviction_mode == "per_layer_perhead",
         normalize_scores=normalize_scores,
     )
-    tri._settle_top_tokens(tri._max_requests)
+    tri._settle_top_tokens(tri._request_capacity)
 
 
 def _stable_topk(row: torch.Tensor, width: int, keep_count: int) -> torch.Tensor:
@@ -187,7 +189,7 @@ def test_per_head_selection_matches_torch_oracle_on_selector_stream(
             num_query_heads=query_heads,
             num_kv_heads=kv_heads,
         )
-        tri._valid_widths.copy_(valid_widths.to(device))
+        tri._decode_lengths_device.copy_(valid_widths.to(device))
         scores = scores_cpu.to(device)
         keep_shape = (request_count, tri._selection_rows_per_request, keep_count)
         _select_per_head(tri, scores, normalize_scores=normalize_scores)
@@ -225,12 +227,12 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         device=device,
         max_requests=request_count,
     )
-    tri._valid_widths.copy_(torch.tensor(valid_widths, dtype=torch.int32, device=device))
-    tri._token_starts_device[:request_count].copy_(
+    tri._decode_lengths_device.copy_(torch.tensor(valid_widths, dtype=torch.int32, device=device))
+    tri._prompt_lengths_device[:request_count].copy_(
         torch.tensor([prompt_len] * request_count, dtype=torch.int32, device=device)
     )
     tri._selection_scores_rows.copy_(scores.amax(dim=1))
-    tri._settle_top_tokens(tri._max_requests)
+    tri._settle_top_tokens(tri._request_capacity)
     actual = tri._kept_ordinal_rows.cpu()
 
     combined = scores.amax(dim=1).cpu()
@@ -428,7 +430,6 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     tokens_per_block = 32
     head_dim = 64
     num_freqs = head_dim // 2
-    dense_groups = [[0, 2], [1]]
     page_tables = (
         torch.tensor([[1, 0]], dtype=torch.int32, device=device),
         torch.tensor([[0, 1]], dtype=torch.int32, device=device),
@@ -470,10 +471,6 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         offsets=torch.zeros(1, dtype=torch.float32, device=device),
         decode_width=bucket_capacity,
         keep_count=keep_count,
-        storage_groups={
-            0: dense_groups[0],
-            1: dense_groups[1],
-        },
         layer_pool_ids=[0, 1, 0],
         normalize_scores=False,
     )
@@ -753,7 +750,6 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
         layer_pools=pools,
         dense_layers=[0],
         swa_layers=[1],
-        layer_group_representative={0: 0},
         # Dense layer 0 stages in plane 0, the SWA layer in its own plane 1.
         layer_pool_ids=[0, 1],
         kept_token_ordinals=keep.to(torch.int32),

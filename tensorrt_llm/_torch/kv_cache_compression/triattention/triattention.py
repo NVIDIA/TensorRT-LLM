@@ -193,7 +193,9 @@ class TriAttention(KVCacheCompressionManager):
 
         from transformers import AutoConfig
 
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
+        config = AutoConfig.from_pretrained(
+            model_path, trust_remote_code=True, local_files_only=True
+        )
         config_values = config.get_text_config().to_dict()
         layer_types = config_values.get("layer_types")
         if not layer_types:
@@ -562,15 +564,15 @@ class TriAttention(KVCacheCompressionManager):
             with nvtx_range("triattention.score", color="blue"):
                 # In-place refresh: the compiled score launches captured these pointers.
                 _gather_mean_phase_kernel[(request_count,)](
-                    self._round_starts_device,
+                    self._logical_source_lengths_device,
                     self._phase["cos"],
                     self._phase["sin"],
                     self._phase["rows"],
-                    self._valid_seq_lens_device,
-                    self._token_starts_device,
+                    self._source_lengths_device,
+                    self._prompt_lengths_device,
                     self._mean_cos,
                     self._mean_sin,
-                    self._valid_widths,
+                    self._decode_lengths_device,
                     self._swa_destination_bases,
                     self._swa_rebase_delta,
                     NUM_FREQS=self._phase_num_freqs,
@@ -581,7 +583,7 @@ class TriAttention(KVCacheCompressionManager):
                 if union:
                     # Union path: fused score+stats, then the normalized union reduction.
                     cu_stream = cuda_driver.CUstream(stream.cuda_stream)
-                    self._compiled_score_stats[request_count](
+                    self._compiled_score_by_request_count[request_count](
                         *self._cute_score_prefix,
                         self._cute_mean_cos,
                         self._cute_mean_sin,
@@ -602,7 +604,7 @@ class TriAttention(KVCacheCompressionManager):
                     )
                 else:
                     cu_stream = cuda_driver.CUstream(stream.cuda_stream)
-                    self._compiled_score[request_count](
+                    self._compiled_score_by_request_count[request_count](
                         *self._cute_score_prefix,
                         self._cute_mean_cos,
                         self._cute_mean_sin,
@@ -616,23 +618,25 @@ class TriAttention(KVCacheCompressionManager):
                     pad = self._padded_head_columns
                     source = (
                         self._score_scratch[
-                            : self._num_kv_heads * pad * num_segments * self._bucket_seq_len
+                            : self._num_kv_heads * pad * num_segments * self._score_token_capacity
                         ]
                         .view(
                             self._num_kv_heads,
                             pad,
                             request_count,
                             self._num_layers,
-                            self._bucket_seq_len,
+                            self._score_token_capacity,
                         )[:, :group_size]
                         .permute(2, 3, 0, 1, 4)
                     )
                     torch.add(
-                        self._token_starts_device[:request_count].view(-1, 1, 1, 1, 1),
+                        self._prompt_lengths_device[:request_count].view(-1, 1, 1, 1, 1),
                         self._gather_columns,
                         out=self._gather_index_base[:request_count],
                     )
-                    self._gather_index_base[:request_count].clamp_(max=self._bucket_seq_len - 1)
+                    self._gather_index_base[:request_count].clamp_(
+                        max=self._score_token_capacity - 1
+                    )
                     columns = self._gather_index[:request_count]
                     torch.gather(
                         source,
@@ -643,14 +647,14 @@ class TriAttention(KVCacheCompressionManager):
                             self._num_layers,
                             self._num_kv_heads,
                             group_size,
-                            self._decode_width,
+                            self._selection_width_capacity,
                         ),
                     )
             with nvtx_range("triattention.select", color="yellow"):
                 if not union:
                     prepare_per_head_scores(
                         self._score_output[:request_count],
-                        self._valid_widths,
+                        self._decode_lengths_device,
                         self._row_mean,
                         self._row_inv_std,
                         self._selection_scores_rows,
@@ -680,7 +684,7 @@ class TriAttention(KVCacheCompressionManager):
             offsets = [0]
             for moves in moves_per_request:
                 offsets.append(offsets[-1] + moves)
-            offsets.extend(offsets[-1:] * (self._max_requests - len(moves_per_request)))
+            offsets.extend(offsets[-1:] * (self._request_capacity - len(moves_per_request)))
             return offsets
 
         tails = [int(item["target_tail_length"]) for item in eviction_inputs]
@@ -710,7 +714,6 @@ class TriAttention(KVCacheCompressionManager):
             request_ids,
             host_block_offsets.shape[-1],
         )
-        manager._stream.wait_event(self._staging_reuse_event)
         copy_batch_block_offsets_to_device(
             host_block_offsets,
             device_block_offsets,
@@ -739,10 +742,10 @@ class TriAttention(KVCacheCompressionManager):
         _settle_ties_kernel[(request_count, self._selection_rows_per_request)](
             self._selection_scores_rows,
             self._selection_row_lengths,
-            self._token_starts_device,
+            self._prompt_lengths_device,
             self._provisional_rows,
             self._kept_ordinal_rows,
-            WIDTH=self._decode_width,
+            WIDTH=self._selection_width_capacity,
             KEEP_COUNT=self._keep_count,
             SELECTION_ROWS=self._selection_rows_per_request,
         )
@@ -794,9 +797,9 @@ class TriAttention(KVCacheCompressionManager):
         needed_requests = len(eviction_inputs)
         if self._buffers_built:
             if (
-                needed_width <= self._decode_width
-                and needed_score_tokens <= self._bucket_seq_len
-                and needed_requests <= self._max_requests
+                needed_width <= self._selection_width_capacity
+                and needed_score_tokens <= self._score_token_capacity
+                and needed_requests <= self._request_capacity
             ):
                 return
             # This round outgrew the runtime: wait out the prior round (its
@@ -873,10 +876,9 @@ class TriAttention(KVCacheCompressionManager):
         dense_layers = list(target_layout["dense_layers"])
         swa_layers = list(target_layout["swa_layers"])
         swa_window = target_layout["swa_window"]
-        layer_group_representative = target_layout["layer_group_representative"]
         # Canonical layer -> V2 pool id tuple; it IS the staged plane slot map.
         layer_pool_ids = tuple(target_layout["layer_pool_ids"])
-        num_page_table_slots = int(target_layout["manager"].num_pools)
+        num_page_table_slots = int(self.kv_cache_manager.num_pools)
 
         # The first dense layer anchors device and staging geometry.
         p0 = layer_pools[dense_layers[0]]
@@ -896,9 +898,9 @@ class TriAttention(KVCacheCompressionManager):
         num_q_heads = int(q_real.shape[1])
         num_freqs = int(q_real.shape[2])
 
-        self._max_requests = max_requests
-        self._bucket_seq_len = seq_len
-        self._decode_width = decode_width
+        self._request_capacity = max_requests
+        self._score_token_capacity = seq_len
+        self._selection_width_capacity = decode_width
         self._keep_count = keep_count
 
         # ---- block-offset staging (target, plus the co-compressed draft) -------
@@ -907,7 +909,7 @@ class TriAttention(KVCacheCompressionManager):
             num_pools=num_page_table_slots,
             max_requests=max_requests,
             token_capacity=page_table_token_capacity,
-            max_source_blocks=int(target_layout["manager"].host_kv_cache_block_offsets.shape[-1]),
+            max_source_blocks=int(self.kv_cache_manager.host_kv_cache_block_offsets.shape[-1]),
         )
         # The draft is never scored: these offsets feed only the draft compacts.
         self._draft_block_offsets_device = None
@@ -924,11 +926,11 @@ class TriAttention(KVCacheCompressionManager):
             self._draft_block_offsets_host, self._draft_block_offsets_device = (
                 _allocate_block_offset_staging(
                     draft_anchor_pool,
-                    num_pools=int(draft_layout["manager"].num_pools),
+                    num_pools=int(self.draft_kv_cache_manager.num_pools),
                     max_requests=max_requests,
                     token_capacity=seq_len + int(self._draft_protected_tail_capacity),
                     max_source_blocks=int(
-                        draft_layout["manager"].host_kv_cache_block_offsets.shape[-1]
+                        self.draft_kv_cache_manager.host_kv_cache_block_offsets.shape[-1]
                     ),
                 )
             )
@@ -946,10 +948,10 @@ class TriAttention(KVCacheCompressionManager):
         self._request_metadata_device = torch.zeros(
             (6, max_requests + 1), dtype=torch.int32, device=device
         )
-        self._round_starts_device = self._request_metadata_device[0, :max_requests]
-        self._valid_seq_lens_device = self._request_metadata_device[1, :max_requests]
+        self._logical_source_lengths_device = self._request_metadata_device[0, :max_requests]
+        self._source_lengths_device = self._request_metadata_device[1, :max_requests]
         # Pinned per-request decode-window starts.
-        self._token_starts_device = self._request_metadata_device[2, :max_requests]
+        self._prompt_lengths_device = self._request_metadata_device[2, :max_requests]
         dense_move_offsets_row = self._request_metadata_device[3]
         swa_move_offsets_row = self._request_metadata_device[4]
         draft_move_offsets_row = self._request_metadata_device[5]
@@ -957,7 +959,7 @@ class TriAttention(KVCacheCompressionManager):
         # the phase gather rebases each request's SWA destination base in place.
         self._swa_window = int(swa_window) if swa_layers else None
         self._swa_destination_bases = (
-            torch.empty_like(self._token_starts_device) if swa_layers else None
+            torch.empty_like(self._prompt_lengths_device) if swa_layers else None
         )
         self._swa_rebase_delta = keep_count - self._swa_window if swa_layers else 0
         self._mean_cos = torch.empty((max_requests, num_freqs), dtype=torch.float32, device=device)
@@ -970,11 +972,7 @@ class TriAttention(KVCacheCompressionManager):
         self._num_layers = len(dense_layers)
         self._num_q_heads = int(num_q_heads)
         self._num_kv_heads = int(num_kv_heads)
-        self._num_freqs = int(num_freqs)
-        self._tokens_per_block = int(tokens_per_block)
-        dense_layer_slots = [
-            layer_pool_ids[layer_group_representative[layer]] for layer in dense_layers
-        ]
+        dense_layer_slots = [layer_pool_ids[layer] for layer in dense_layers]
         seg_req_id = torch.arange(max_requests, dtype=torch.int32, device=device).repeat_interleave(
             self._num_layers
         )
@@ -1061,9 +1059,9 @@ class TriAttention(KVCacheCompressionManager):
             (seg_page_off, 16),
             (seg_req_id, 16),
             (seg_layer_id, 16),
-            (self._valid_seq_lens_device, 4),
+            (self._source_lengths_device, 4),
             (seg_out_offset, 16),
-            (self._token_starts_device, 4),
+            (self._prompt_lengths_device, 4),
             (q_real.view(-1), 16),
             (q_imag.view(-1), 16),
             (mlr_coef.view(-1), 16),
@@ -1088,19 +1086,18 @@ class TriAttention(KVCacheCompressionManager):
             _to_cute(anchor_pool),
             _to_cute(self._tma_descriptors, assumed_align=128),
         )
-        # Ctor-bound persistent launch operands: refreshed in place each round.
+        # Build-bound persistent launch operands: refreshed in place each round.
         self._cute_mean_cos = _to_cute(self._mean_cos.view(-1))
         self._cute_mean_sin = _to_cute(self._mean_sin.view(-1))
         self._cute_union_scores = _to_cute(self._union_scores.view(-1)) if union else None
-        self._compiled_score: Dict[int, object] = {}
-        self._compiled_score_stats: Dict[int, object] = {}
+        self._compiled_score_by_request_count: Dict[int, object] = {}
         self._compiled_normalize_union: Dict[int, object] = {}
         page_shards_by_count: Dict[int, int] = {}
         self._cute_selection_prefix = (
             _to_cute(self._score_scratch),
-            _to_cute(self._valid_seq_lens_device, assumed_align=4),
+            _to_cute(self._source_lengths_device, assumed_align=4),
             _to_cute(seg_out_offset),
-            _to_cute(self._token_starts_device, assumed_align=4),
+            _to_cute(self._prompt_lengths_device, assumed_align=4),
         )
         self._cute_partial_stats = _to_cute(self._partial_stats)
         static_geometry = (
@@ -1110,7 +1107,7 @@ class TriAttention(KVCacheCompressionManager):
             num_q_heads,
             self._num_kv_heads,
             num_freqs,
-            self._tokens_per_block,
+            int(tokens_per_block),
             tuple(int(value) for value in anchor_pool.shape),
             tuple(int(value) for value in anchor_pool.stride()),
         )
@@ -1145,12 +1142,8 @@ class TriAttention(KVCacheCompressionManager):
                     _COMPILED_KERNELS[cache_key] = compiled
             return compiled
 
-        if union:
-            variant_key = "triattention_cute_score_stats"
-            compiled_entries = self._compiled_score_stats
-        else:
-            variant_key = "triattention_cute_score"
-            compiled_entries = self._compiled_score
+        variant_key = "triattention_cute_score_stats" if union else "triattention_cute_score"
+        compiled_entries = self._compiled_score_by_request_count
         for request_count, page_shards in variants:
             cache_key = (
                 variant_key,
@@ -1243,11 +1236,11 @@ class TriAttention(KVCacheCompressionManager):
                 self._compiled_normalize_union[request_count] = compiled_selection
         logger.info(
             f"TriAttention CuTe score enabled: {self._num_q_heads}q/{self._num_kv_heads}kv heads, "
-            f"{self._num_freqs} freqs, {self._tokens_per_block}-token pages"
+            f"{num_freqs} freqs, {int(tokens_per_block)}-token pages"
         )
 
         # ---- selection buffers (canonical row-major, one name per storage) -----
-        self._valid_widths = torch.full(
+        self._decode_lengths_device = torch.full(
             (max_requests,), decode_width, dtype=torch.int32, device=device
         )
         if union:
@@ -1256,7 +1249,7 @@ class TriAttention(KVCacheCompressionManager):
                 (max_requests, decode_width), dtype=torch.float32, device=device
             )
             # One selection row per request: its length IS the staged valid width.
-            self._selection_row_lengths = self._valid_widths
+            self._selection_row_lengths = self._decode_lengths_device
             # Padded rows still need in-range ordinals for the finalizer's gather.
             self._provisional_rows = torch.zeros(
                 (max_requests, keep_count), dtype=torch.int32, device=device
@@ -1312,8 +1305,8 @@ class TriAttention(KVCacheCompressionManager):
                 target_layout,
                 block_offsets=self._block_offsets_device,
                 kept_ordinals=self._kept_ordinal_rows,
-                source_lengths=self._valid_seq_lens_device,
-                dense_destination_bases=self._token_starts_device,
+                source_lengths=self._source_lengths_device,
+                dense_destination_bases=self._prompt_lengths_device,
                 # Per-round tails: the move offsets ride the staged metadata rows.
                 dense_move_offsets=dense_move_offsets_row,
                 protected_tail_capacity=protected_tail_capacity,
@@ -1327,8 +1320,8 @@ class TriAttention(KVCacheCompressionManager):
                     draft_layout,
                     block_offsets=self._draft_block_offsets_device,
                     kept_ordinals=self._kept_ordinal_rows,
-                    source_lengths=self._valid_seq_lens_device,
-                    dense_destination_bases=self._token_starts_device,
+                    source_lengths=self._source_lengths_device,
+                    dense_destination_bases=self._prompt_lengths_device,
                     dense_move_offsets=draft_move_offsets_row,
                     protected_tail_capacity=int(self._draft_protected_tail_capacity),
                 )
@@ -1443,24 +1436,13 @@ class TriAttention(KVCacheCompressionManager):
         all_storage_groups: Dict[int, List[int]] = {}
         for layer, pool_id in enumerate(layer_pool_ids):
             all_storage_groups.setdefault(pool_id, []).append(layer)
-        # Scored/compacted groups cover the dense layers only; SWA layers
-        # stage and compact as their own representatives.
-        storage_groups: Dict[int, List[int]] = {}
-        for layer in dense_layers:
-            storage_groups.setdefault(layer_pool_ids[layer], []).append(layer)
-        layer_group_representative = {
-            layer: layers[0] for layers in storage_groups.values() for layer in layers
-        }
         pool_representatives = tuple(layers[0] for layers in all_storage_groups.values())
         return dict(
-            manager=manager,
             global_layers=global_layers,
             layer_pools=layer_pools,
             dense_layers=dense_layers,
             swa_layers=swa_layers,
             swa_window=swa_window,
-            storage_groups=storage_groups,
-            layer_group_representative=layer_group_representative,
             layer_pool_ids=layer_pool_ids,
             pool_representatives=pool_representatives,
             pool_page_counts=tuple(

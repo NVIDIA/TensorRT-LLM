@@ -128,7 +128,6 @@ def build_compaction(**overrides):
         eviction_mode="union",
         dense_layers=[0, 1],
         swa_layers=[],
-        layer_group_representative={0: 0, 1: 1},
         layer_pool_ids=[0, 0],
         request_count=2,
         decode_keep_count=4,
@@ -234,7 +233,7 @@ def make_bare_staging(device, *, max_requests, staged_blocks_per_seq):
     staging = TriAttention.__new__(TriAttention)
     staging.kv_cache_manager = None
     staging.draft_kv_cache_manager = None
-    staging._max_requests = max_requests
+    staging._request_capacity = max_requests
     staging._keep_count = 4
     staging._swa_window = None
     staging._draft_protected_tail_capacity = None
@@ -276,22 +275,19 @@ def make_buffer_stubs(manager, *, decode_width=260):
     manager._local_score_calibration = mock.Mock(return_value=(torch.ones(2, 2, 2),) * 3)
     pool = torch.empty(8, 2, 1, 4, 4)
     layout = dict(
-        manager=SimpleNamespace(num_pools=1),
         global_layers=[0, 1],
         layer_pools=[pool, pool],
         dense_layers=[0, 1],
         swa_layers=[],
         swa_window=None,
-        storage_groups={0: [0, 1]},
-        layer_group_representative={0: 0, 1: 0},
         layer_pool_ids=(0, 0),
     )
     built_attributes = dict(
-        _decode_width=decode_width,
-        _bucket_seq_len=1024,
-        _max_requests=8,
-        _token_starts_device=torch.zeros(8, dtype=torch.int32),
-        _valid_widths=torch.empty(8, dtype=torch.int32),
+        _selection_width_capacity=decode_width,
+        _score_token_capacity=1024,
+        _request_capacity=8,
+        _prompt_lengths_device=torch.zeros(8, dtype=torch.int32),
+        _decode_lengths_device=torch.empty(8, dtype=torch.int32),
     )
     return layout, built_attributes
 
@@ -530,15 +526,13 @@ def make_cute_buffers(
     decode_width=None,
     keep_count=1,
     protected_tail_capacity=0,
-    storage_groups=None,
     layer_pool_ids=None,
     normalize_scores=True,
 ):
     """A bare manager with real eviction buffers built over the one-shared-slot
     default layout; split reference legs use ``eviction_mode="per_head"`` over
-    the same pools. ``storage_groups``/``layer_pool_ids`` override the
-    page-table grouping (``layer_pool_ids`` is the canonical per-layer V2 pool
-    id list)."""
+    the same pools. ``layer_pool_ids`` is the canonical per-layer V2 pool id
+    list and drives the page-table grouping."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
     num_layers = len(layer_pools)
@@ -547,8 +541,6 @@ def make_cute_buffers(
     # path); the widest window defaults keep old call sites.
     if decode_width is None:
         decode_width = seq_len
-    if storage_groups is None:
-        storage_groups = {0: list(range(num_layers))}
     if layer_pool_ids is None:
         layer_pool_ids = [0] * num_layers
     # A live-manager source table exactly wide enough for the requested
@@ -558,23 +550,19 @@ def make_cute_buffers(
     source_blocks = -(-int(requested_tokens) // tokens_per_block)
     source_blocks = (source_blocks + 3) // 4 * 4
     layout = dict(
-        manager=SimpleNamespace(
-            num_pools=max(layer_pool_ids) + 1,
-            host_kv_cache_block_offsets=torch.empty(1, 1, 2, source_blocks, dtype=torch.int32),
-        ),
         global_layers=list(range(num_layers)),
         layer_pools=layer_pools,
         dense_layers=list(range(num_layers)),
         swa_layers=[],
         swa_window=None,
-        storage_groups=storage_groups,
-        layer_group_representative={
-            layer: layers[0] for layers in storage_groups.values() for layer in layers
-        },
         layer_pool_ids=layer_pool_ids,
     )
     manager = TriAttention.__new__(TriAttention)
-    manager.kv_cache_manager = None
+    # The cold builder reads staging geometry from the owning manager.
+    manager.kv_cache_manager = SimpleNamespace(
+        num_pools=max(layer_pool_ids) + 1,
+        host_kv_cache_block_offsets=torch.empty(1, 1, 2, source_blocks, dtype=torch.int32),
+    )
     manager.draft_kv_cache_manager = None
     manager._draft_protected_tail_capacity = None
     manager.eviction_mode = eviction_mode
@@ -615,8 +603,8 @@ def stage_score_metadata(manager, request_count, valid_seq_lens, valid_widths, t
         token_starts[:request_count],
         out=valid_widths[:request_count],
     )
-    manager._valid_seq_lens_device[:request_count].copy_(valid_seq_lens[:request_count])
-    manager._token_starts_device[:request_count].copy_(token_starts[:request_count])
+    manager._source_lengths_device[:request_count].copy_(valid_seq_lens[:request_count])
+    manager._prompt_lengths_device[:request_count].copy_(token_starts[:request_count])
 
 
 def launch_split_scores(
@@ -631,11 +619,11 @@ def launch_split_scores(
     stage_score_metadata(manager, request_count, valid_seq_lens, valid_widths, token_starts)
     manager._mean_cos[:request_count].copy_(mean_cos[:request_count])
     manager._mean_sin[:request_count].copy_(mean_sin[:request_count])
-    assert request_count in manager._compiled_score
+    assert request_count in manager._compiled_score_by_request_count
     stream = cuda_driver.CUstream(
         torch.cuda.current_stream(manager._score_scratch.device).cuda_stream
     )
-    manager._compiled_score[request_count](
+    manager._compiled_score_by_request_count[request_count](
         *manager._cute_score_prefix,
         manager._cute_mean_cos,
         manager._cute_mean_sin,
@@ -646,24 +634,35 @@ def launch_split_scores(
     num_segments = request_count * manager._num_layers
     group_size = manager._num_q_heads // manager._num_kv_heads
     source = (
-        manager._score_scratch[: manager._num_kv_heads * 8 * num_segments * manager._bucket_seq_len]
+        manager._score_scratch[
+            : manager._num_kv_heads * 8 * num_segments * manager._score_token_capacity
+        ]
         .view(
-            manager._num_kv_heads, 8, request_count, manager._num_layers, manager._bucket_seq_len
+            manager._num_kv_heads,
+            8,
+            request_count,
+            manager._num_layers,
+            manager._score_token_capacity,
         )[:, :group_size]
         .permute(2, 3, 0, 1, 4)
     )
     columns = (
         token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + manager._gather_columns
     )
-    columns = columns.clamp_(max=manager._bucket_seq_len - 1).expand(
+    columns = columns.clamp_(max=manager._score_token_capacity - 1).expand(
         request_count,
         manager._num_layers,
         manager._num_kv_heads,
         group_size,
-        manager._decode_width,
+        manager._selection_width_capacity,
     )
     output = torch.full(
-        (request_count, manager._num_layers, manager._num_q_heads, manager._decode_width),
+        (
+            request_count,
+            manager._num_layers,
+            manager._num_q_heads,
+            manager._selection_width_capacity,
+        ),
         float("nan"),
         dtype=torch.float32,
         device=manager._score_scratch.device,
@@ -677,7 +676,7 @@ def launch_split_scores(
             manager._num_layers,
             manager._num_kv_heads,
             group_size,
-            manager._decode_width,
+            manager._selection_width_capacity,
         ),
     )
     return output

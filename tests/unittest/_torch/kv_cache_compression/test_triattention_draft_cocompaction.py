@@ -69,7 +69,6 @@ def _launched_draft_compaction(draft_protected_tails):
         protected_tail_capacity=max(target_protected_tails),
         draft_layer_pools=[draft_pool],
         draft_layers=[0],
-        draft_layer_group_representative={0: 0},
         draft_layer_pool_ids=[0],
         draft_protected_tail_capacity=max(draft_protected_tails),
         draft_kv_block_offsets=_encode_block_offsets(draft_tables),
@@ -173,7 +172,7 @@ def test_execute_eviction_round_orders_both_manager_streams():
     event = mock.Mock()
     host = torch.zeros(6, 9, dtype=torch.int32)
     tri = TriAttention.__new__(TriAttention)
-    tri._max_requests = 8
+    tri._request_capacity = 8
     tri._keep_count = 4
     tri.eviction_mode = "union"
     tri._swa_window = None
@@ -187,10 +186,10 @@ def test_execute_eviction_round_orders_both_manager_streams():
     tri._phase = {"cos": None, "sin": None, "rows": 8}
     tri._phase_num_freqs = 1
     tri._phase_f_block = 1
-    tri._round_starts_device = None
-    tri._valid_seq_lens_device = None
-    tri._token_starts_device = None
-    tri._valid_widths = None
+    tri._logical_source_lengths_device = None
+    tri._source_lengths_device = None
+    tri._prompt_lengths_device = None
+    tri._decode_lengths_device = None
     tri._mean_cos = None
     tri._mean_sin = None
     tri._swa_destination_bases = None
@@ -349,7 +348,6 @@ def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
     draft_layout = dict(
         layer_pools=[],
         dense_layers=[],
-        layer_group_representative={},
         pool_representatives=(),
         layer_pool_ids=(),
         pool_page_counts=(4,),
@@ -374,7 +372,7 @@ def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
         # 1024 floor) instead of pinning tens-of-GiB scratch to max_seq_len.
         # The stubbed build's capacities became the resident manager state.
         assert manager._buffers_built
-        assert manager._decode_width == built_attributes["_decode_width"]
+        assert manager._selection_width_capacity == built_attributes["_selection_width_capacity"]
         # The mode and the shared phase-table dict live on the manager itself
         # and thread through unchanged (no longer build arguments).
         assert manager.eviction_mode == "union"
@@ -398,19 +396,21 @@ def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
             _make_eviction_input(
                 _make_request(7),
                 request_id=7,
-                source_length=8 + built_attributes["_decode_width"],
+                source_length=8 + built_attributes["_selection_width_capacity"],
             )
         ]
 
         def apply_rebuilt(*args, **kwargs):
             apply_built()
-            manager._decode_width = built_attributes["_decode_width"] + 8
+            manager._selection_width_capacity = built_attributes["_selection_width_capacity"] + 8
 
         prepare.side_effect = apply_rebuilt
         manager._ensure_eviction_runtime(layout, draft_layout, grown)
         assert prepare.call_count == 2
         assert manager._buffers_built
-        assert manager._decode_width == built_attributes["_decode_width"] + 8
+        assert (
+            manager._selection_width_capacity == built_attributes["_selection_width_capacity"] + 8
+        )
 
 
 def test_source_growth_beyond_score_bucket_rebuilds_buffers():

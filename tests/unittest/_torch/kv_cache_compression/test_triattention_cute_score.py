@@ -158,7 +158,7 @@ def test_cute_kernel_matches_torch_oracle(case):
     )
 
     # Every count up to capacity is served, nothing beyond.
-    assert max_requests + 1 not in tri._compiled_score
+    assert max_requests + 1 not in tri._compiled_score_by_request_count
     for request_count in dict.fromkeys((1, max_requests - 1, max_requests)):
         valid_widths = torch.full((max_requests,), -1, dtype=torch.int32, device=device)
         scores = _launch_split_scores(
@@ -174,7 +174,7 @@ def test_cute_kernel_matches_torch_oracle(case):
             request_count,
             num_layers,
             case["num_q_heads"],
-            tri._decode_width,
+            tri._selection_width_capacity,
         )
         # The score leg owns the per-request decode widths the selection
         # reduce kernels consume.

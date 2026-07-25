@@ -109,14 +109,11 @@ class TestTriAttentionClass:
         triattention = _make_triattention()
         triattention.kv_cache_manager = manager
         cached = dict(
-            manager=manager,
             global_layers=[10, 11, 12],
             layer_pools=[torch.empty(4), torch.empty(8), torch.empty(4)],
             dense_layers=[0, 1, 2],
             swa_layers=[],
             swa_window=None,
-            storage_groups={0: [0, 2], 1: [1]},
-            layer_group_representative={0: 0, 1: 1, 2: 0},
             layer_pool_ids=(0, 1, 0),
             # These are local layer slots. Layer 2 shares layer 0's pool.
             pool_representatives=(0, 1),
@@ -629,7 +626,7 @@ class TestFixedScoreMetadata:
         # final offset and contribute no moves. (The executor-call contract
         # itself is pinned by the overlap-tail and draft publication tests.)
         offsets_manager = TriAttention.__new__(TriAttention)
-        offsets_manager._max_requests = 8
+        offsets_manager._request_capacity = 8
         offsets_manager._keep_count = 4
         offsets_manager._swa_window = None
         offsets_manager._draft_protected_tail_capacity = None
@@ -709,8 +706,7 @@ class TestFixedScoreMetadata:
             offsets=offsets,
             decode_width=seq_len - prompt_len,
             keep_count=4,
-            # One storage group and page-table slot per layer (distinct pools).
-            storage_groups={layer: [layer] for layer in layer_order},
+            # One page-table slot per layer (distinct pools).
             layer_pool_ids=list(layer_order),
             normalize_scores=False,
         )
@@ -751,7 +747,7 @@ class TestFixedScoreMetadata:
         with mock.patch.object(module, "compact"):
             tri._execute_eviction_round(prepared_cohort())
         fixed = tri._score_output.clone()
-        assert tri._valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
+        assert tri._decode_lengths_device.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
 
         oracle = _torch_tri_score_oracle(
             pools,
@@ -786,11 +782,11 @@ class TestFixedScoreMetadata:
         )
         expected_second_widths = valid_seq_lens - prompt_len
         tri._score_output.fill_(score_sentinel)
-        tri._valid_widths.fill_(-1)
+        tri._decode_lengths_device.fill_(-1)
         with mock.patch.object(module, "compact"):
             tri._execute_eviction_round(prepared_cohort())
         second_launch = tri._score_output.clone()
-        assert torch.equal(tri._valid_widths, expected_second_widths)
+        assert torch.equal(tri._decode_lengths_device, expected_second_widths)
         assert not torch.equal(second_launch, fixed)
 
 

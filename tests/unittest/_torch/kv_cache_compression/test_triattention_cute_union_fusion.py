@@ -32,11 +32,11 @@ def _run_fused_union(
     tri._mean_cos[:request_count].copy_(mean_cos[:request_count])
     tri._mean_sin[:request_count].copy_(mean_sin[:request_count])
     assert (
-        request_count in tri._compiled_score_stats
+        request_count in tri._compiled_score_by_request_count
         and request_count in tri._compiled_normalize_union
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(tri._score_scratch.device).cuda_stream)
-    tri._compiled_score_stats[request_count](
+    tri._compiled_score_by_request_count[request_count](
         *tri._cute_score_prefix,
         tri._cute_mean_cos,
         tri._cute_mean_sin,
