@@ -146,14 +146,15 @@ def _apply_attn_res_fused(prefix_sum: torch.Tensor,
     """Fused attn_res via the in-tree ``trtllm::attn_res_fwd`` op.
 
     Returns ``None`` when the call falls outside the fused kernel's
-    contract (dtype/shape/arch) so the caller can use the exact fp32
-    reference instead. Candidate order matches the reference: snapshots
-    first, the running prefix sum last.
+    contract (dtype/shape/arch) so the caller can use the exact fp32 reference
+    instead. ``block_residual`` is kept in the kernel-native ``[K, M, H]``
+    layout. Candidate order matches the reference: snapshots first, the
+    running prefix sum last.
     """
     if prefix_sum.dtype is not torch.bfloat16:
         return None
     M, H = prefix_sum.shape
-    K = int(block_residual.shape[1])
+    K = int(block_residual.shape[0])
     if K + 1 > 12 or M > 16384 or not (4096 <= H <= 8192 and H % 1024 == 0):
         return None
     try:
@@ -161,8 +162,7 @@ def _apply_attn_res_fused(prefix_sum: torch.Tensor,
     except (AttributeError, RuntimeError):
         return None
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
-    block_kernel = block_residual.transpose(0, 1).reshape(K, M, 1,
-                                                          H).contiguous()
+    block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
     output, _rsigma, _probs, _logits = attn_res_op(
         layer_kernel, block_kernel,
         proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
@@ -175,16 +175,18 @@ def _apply_attn_res(prefix_sum: torch.Tensor, block_residual: torch.Tensor,
     """Exact port of HF ``modeling_kimi._apply_attn_res`` (fp32 math).
 
     prefix_sum:     ``[num_tokens, hidden_size]``
-    block_residual: ``[num_tokens, num_snapshots, hidden_size]``
+    block_residual: ``[num_snapshots, num_tokens, hidden_size]``
 
     Unless ``KIMI_K3_FUSED_ATTN_RES=0``, inputs fitting the fused kernel's
-    contract dispatch to the in-tree ``trtllm::attn_res_fwd`` op.
+    contract dispatch directly to the in-tree ``trtllm::attn_res_fwd`` op.
+    Only the fallback boundary restores the HF ``[M, K, H]`` layout.
     """
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_fused(prefix_sum, block_residual, proj, norm)
         if fused is not None:
             return fused
-    v = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
+    block_residual_hf = block_residual.transpose(0, 1)
+    v = torch.cat((block_residual_hf, prefix_sum.unsqueeze(1)), dim=1)
     v_float = v.float()
     variance = v_float.pow(2).mean(-1, keepdim=True)
     k = v_float * torch.rsqrt(variance + norm.eps)
@@ -1145,19 +1147,20 @@ class KimiLinearDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
-        Returns ``(prefix_sum, block_residual)``; the running prefix sum is
-        the hidden state handed to the next layer.
+        Returns ``(prefix_sum, block_residual)`` with the snapshot stack in
+        kernel-native ``[K, M, H]`` layout; the running prefix sum is the
+        hidden state handed to the next layer.
         """
         prefix_sum = hidden_states
 
-        if block_residual.shape[1] > 0:
+        if block_residual.shape[0] > 0:
             hidden_states = _apply_attn_res(prefix_sum, block_residual,
                                             self.self_attention_res_proj,
                                             self.self_attention_res_norm)
 
         if self.layer_idx % self.attn_res_block_size == 0:
             block_residual = torch.cat(
-                [block_residual, prefix_sum.unsqueeze(1)], dim=1)
+                (block_residual, prefix_sum.unsqueeze(0)), dim=0)
             prefix_sum = None
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -1257,7 +1260,7 @@ class KimiLinearModel(DecoderModel):
         mla_rt = (_build_mla_step_runtime(attn_metadata)
                   if self.has_mla else None)
 
-        block_residual = hidden_states.new_zeros(hidden_states.shape[0], 0,
+        block_residual = hidden_states.new_zeros(0, hidden_states.shape[0],
                                                  hidden_states.shape[1])
         for layer in self.layers:
             hidden_states, block_residual = layer(hidden_states,
