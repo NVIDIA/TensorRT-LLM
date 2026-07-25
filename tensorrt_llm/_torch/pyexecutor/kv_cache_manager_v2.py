@@ -37,7 +37,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     IndexMapper,
     copy_batch_block_offsets_to_device,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KVEventsConfig, KvCacheConfig
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
@@ -82,6 +82,7 @@ from ...logger import logger
 from ...mapping import CpType, Mapping
 from ..utils import maybe_compile
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .kv_cache_events import KVEventAdapter
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
@@ -767,6 +768,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_disagg: bool = False,
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
+        kv_events_config: Optional[KVEventsConfig] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -867,7 +869,36 @@ class KVCacheManagerV2(BaseResourceManager):
             for window_size in self.max_attention_window_vec
         )
         self.event_manager: Optional[KVCacheEventManager] = None
-        if self.event_buffer_max_size > 0:
+        self.kv_event_adapter: Optional[KVEventAdapter] = None
+        native_events_enabled = (
+            kv_events_config is not None
+            and kv_events_config.enable_kv_cache_events
+        )
+        if native_events_enabled:
+            if mapping.pp_size > 1:
+                raise ValueError(
+                    "Native KV events do not support pipeline parallelism")
+            if mapping.cp_size > 1:
+                raise ValueError(
+                    "Native KV events do not support context parallelism")
+            assert kv_events_config is not None
+            if mapping.enable_attention_dp or mpi_rank() == 0:
+                event_rank = mapping.rank if mapping.enable_attention_dp else 0
+                self.kv_event_adapter = KVEventAdapter(
+                    kv_events_config,
+                    data_parallel_rank=event_rank,
+                    block_size=self.tokens_per_block,
+                    max_window_size=event_window_size,
+                )
+                self.event_manager = KVCacheEventManager(
+                    50_000,
+                    window_size=event_window_size,
+                    attention_dp_rank=event_rank,
+                    attention_dp_gather=self.kv_event_adapter.
+                    publish_local_events,
+                    hash_algo=kv_cache_event_hash_algo,
+                )
+        elif self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
                 self.event_manager = KVCacheEventManager(
                     self.event_buffer_max_size,
@@ -2897,6 +2928,10 @@ class KVCacheManagerV2(BaseResourceManager):
             self.event_manager.flush_iteration_events()
 
     def get_latest_events(self, timeout_ms: Optional[float] = None):
+        if self.kv_event_adapter is not None:
+            raise RuntimeError(
+                "KV cache event polling is unavailable while native publishing is enabled"
+            )
         if self.event_manager is None:
             return []
         return self.event_manager.get_latest_events(timeout_ms)
@@ -3423,6 +3458,10 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
+        if self.kv_event_adapter is not None:
+            self.flush_iteration_events()
+            self.kv_event_adapter.shutdown()
+            self.kv_event_adapter = None
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
