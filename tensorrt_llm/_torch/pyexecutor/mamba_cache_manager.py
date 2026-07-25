@@ -676,6 +676,59 @@ class PythonMambaCacheManager(BaseResourceManager):
                         self._seed_request_counter, block,
                         self._seed_rank_offset))
 
+    @torch.inference_mode()
+    def seed_kda_replay_caches_for_disagg_gen(
+            self, request_ids: List[int]) -> None:
+        """Seed the fused-verify KDA replay conv caches from the conv pool.
+
+        On a disaggregated generation server the ctx->gen transfer populates
+        only the base ``conv`` / ``temporal`` pools (see
+        ``disaggregation/resource/page.py``); the per-slot ``kda_conv_*``
+        replay caches consumed by ``trtllm::kda_mtp_decode`` are normally
+        seeded by a *local* prefill/decode via
+        ``_sync_kda_replay_conv_window`` and would otherwise hold zeros (or a
+        previous occupant's window) for a transferred request — corrupting
+        the recurrent state from the first verify step onward. Call this
+        after the state transfer completes, before the first generation
+        forward. Mirrors ``_sync_kda_replay_conv_window``: the conv pool row
+        stores the full FLA window (width W); its last ``W - 1`` columns are
+        the committed window of the replay caches. Pending-draft scratch is
+        cleared (no drafts are pending for a freshly transferred request).
+        """
+        if not (self._use_kda_replay_update
+                and isinstance(self.mamba_cache, self.SpeculativeState)):
+            return
+        blocks = [
+            self.mamba_cache_index[rid] for rid in request_ids
+            if rid in self.mamba_cache_index
+        ]
+        if not blocks:
+            return
+        conv = self.mamba_cache.conv  # [L, slots, 3D, W]
+        idx = torch.tensor(sorted(set(blocks)),
+                           dtype=torch.long,
+                           device=conv.device)
+        d = conv.shape[2] // 3
+        committed = conv.shape[3] - 1  # W - 1
+        cs = conv.index_select(1, idx)
+        for cache, section in (
+            (self.mamba_cache.kda_conv_q, cs[:, :, :d]),
+            (self.mamba_cache.kda_conv_k, cs[:, :, d:2 * d]),
+            (self.mamba_cache.kda_conv_v, cs[:, :, 2 * d:]),
+        ):
+            # cache: [L, slots, D, committed + num_spec]; zero the draft
+            # tail columns and seed the committed window in one copy.
+            seeded = torch.zeros((cache.shape[0], idx.numel()) +
+                                 cache.shape[2:],
+                                 dtype=cache.dtype,
+                                 device=cache.device)
+            seeded[:, :, :, :committed] = section[:, :, :, 1:].to(cache.dtype)
+            cache.index_copy_(1, idx, seeded)
+        for buf in (self.mamba_cache.kda_qkg_cache, self.mamba_cache.kda_v_cache,
+                    self.mamba_cache.kda_beta_cache):
+            buf.index_fill_(1, idx, 0)
+        self.mamba_cache.prev_num_accepted_tokens[idx] = 0
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         requests = (scheduled_batch.context_requests +
                     scheduled_batch.generation_requests)
@@ -1059,6 +1112,11 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         return self._impl.get_conv_states(layer_idx)
+
+    def seed_kda_replay_caches_for_disagg_gen(
+            self, request_ids: List[int]) -> None:
+        self._impl.seed_kda_replay_caches_for_disagg_gen(request_ids)
+
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
         return self._impl.get_ssm_states(layer_idx)
