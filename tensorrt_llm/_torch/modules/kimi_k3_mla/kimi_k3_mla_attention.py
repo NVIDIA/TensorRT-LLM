@@ -20,8 +20,9 @@ context and generation:
 * Generation (absorbed): ``head_dim = kv_lora_rank + qk_rope = 576``,
   ``num_kv_heads = 1`` (single MQA-shared latent head).
 
-Both backends share the same MLA params, KV cache manager, and identity
-RoPE table so K3 NoPE holds.
+Both backends share the same MLA params and KV cache manager, but own
+independent identity RoPE state so either backend can resize its table
+without invalidating the other's resize state.
 
 NoPE via identity cos/sin cache
 -------------------------------
@@ -68,6 +69,7 @@ Mutation controls (module-level)
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -225,28 +227,14 @@ def _make_fixed_rotation(dim: int) -> torch.Tensor:
     return R
 
 
-def _install_identity_rope_table(backend: TrtllmAttention) -> None:
-    """Overwrite backend's rotary cos/sin table with identity values.
+def _write_identity_rope_values(cos_sin: torch.Tensor) -> None:
+    """Overwrite a rotary cos/sin table with identity values in place.
 
-    The C++ MLA context / generation kernels read this table
-    unconditionally and apply the rotation. Setting cos=1 and sin=0
-    per position makes the rotation the identity — a mathematical
-    no-op — which preserves K3's NoPE semantics without patching the
-    backend.
-
-    The tensor SHAPE produced by ``create_rope_const_params`` is kept
-    intact so the C++ ``float2`` indexing stays valid. Only the values
-    are overwritten in place. We also monkey-patch
-    ``_ensure_rope_table_size`` to a no-op so a later resize does not
-    regenerate the real sinusoids.
+    Interleaved (cos, sin) pairs: index [::2] = cos, [1::2] = sin.
+    Setting cos=1 and sin=0 per position makes the rotation the
+    identity — a mathematical no-op — which preserves K3's NoPE
+    semantics without patching the backend.
     """
-    cos_sin = backend.rotary_cos_sin
-    if cos_sin is None:
-        raise RuntimeError(
-            "backend.rotary_cos_sin is None after construction; check "
-            "pos_embd_params has a valid RopeParams with dim > 0."
-        )
-    # Interleaved (cos, sin) pairs: index [::2] = cos, [1::2] = sin.
     flat = cos_sin.reshape(-1)
     with torch.no_grad():
         flat[0::2] = 1.0
@@ -255,8 +243,40 @@ def _install_identity_rope_table(backend: TrtllmAttention) -> None:
     # launched from a different stream can read the table.
     if cos_sin.is_cuda:
         torch.cuda.synchronize(cos_sin.device)
-    # Freeze the table against later regenerations.
-    backend._ensure_rope_table_size = lambda required_max_positions: None
+
+
+def _install_identity_rope_table(backend: TrtllmAttention) -> None:
+    """Install an identity rotary cos/sin table on ``backend``.
+
+    The C++ MLA rope kernels (``mla_rope_generation`` and the context
+    preprocess) read this table and apply the rotation; identity values
+    make that a copy, preserving K3's NoPE.
+
+    The tensor SHAPE produced by ``create_rope_const_params`` is kept
+    intact so the C++ ``float2`` indexing stays valid. Only the values
+    are overwritten in place. ``_ensure_rope_table_size`` is replaced
+    with an identity-preserving resize: the table may GROW (so the
+    fused rope-generation op can never index out of bounds for long
+    sequences) but its values are always rewritten to identity right
+    after a regeneration, so the real sinusoids never leak in.
+    """
+    cos_sin = backend.rotary_cos_sin
+    if cos_sin is None:
+        raise RuntimeError(
+            "backend.rotary_cos_sin is None after construction; check "
+            "pos_embd_params has a valid RopeParams with dim > 0."
+        )
+    _write_identity_rope_values(cos_sin)
+
+    orig_resize = backend._ensure_rope_table_size  # bound method
+
+    def _identity_preserving_resize(required_max_positions: int) -> None:
+        if required_max_positions <= backend.rope_params.max_positions:
+            return
+        orig_resize(required_max_positions)
+        _write_identity_rope_values(backend.rotary_cos_sin)
+
+    backend._ensure_rope_table_size = _identity_preserving_resize
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +379,11 @@ class KimiK3MLAAttention(nn.Module):
             v_head_dim=v_head_dim,
             hidden_size=hidden_size,
         )
-        pos_embd_params = _make_pos_embd_params(
+        ctx_pos_embd_params = _make_pos_embd_params(
+            qk_rope_head_dim=qk_rope_head_dim,
+            max_position_embeddings=max_position_embeddings,
+        )
+        gen_pos_embd_params = _make_pos_embd_params(
             qk_rope_head_dim=qk_rope_head_dim,
             max_position_embeddings=max_position_embeddings,
         )
@@ -375,19 +399,24 @@ class KimiK3MLAAttention(nn.Module):
             head_dim=kv_lora_rank + qk_rope_head_dim,
             num_kv_heads=1,
             mla_params=mla_params,
-            pos_embd_params=pos_embd_params,
+            pos_embd_params=ctx_pos_embd_params,
             flashinfer_mla_backend="trtllm-gen",
         )
         # Generation backend: absorbed MQA path (same config as ctx).
         # Called by ``forward_decode`` for single-token cached decode.
+        # ``TLLM_K3_MLA_GEN_BACKEND`` (A/B experiment knob) selects the
+        # FlashInfer MLA generation kernel: ``cute-dsl`` (default; needs
+        # the customized FlashInfer revision from examples/kimi_k3/README.md
+        # for full performance) or ``trtllm-gen``.
         self._backend_gen = TrtllmAttention(
             layer_idx=layer_idx,
             num_heads=num_heads,
             head_dim=kv_lora_rank + qk_rope_head_dim,
             num_kv_heads=1,
             mla_params=mla_params,
-            pos_embd_params=pos_embd_params,
-            flashinfer_mla_backend="cute-dsl",
+            pos_embd_params=gen_pos_embd_params,
+            flashinfer_mla_backend=os.environ.get(
+                "TLLM_K3_MLA_GEN_BACKEND", "cute-dsl"),
         )
 
         # K3 NoPE contract — overwrite the actual cos/sin values with
@@ -684,9 +713,131 @@ class KimiK3MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         rt: KimiK3MLARuntimeInputs,
     ) -> torch.Tensor:
-        """Cached T=1 decode via absorbed generation.
+        """Cached decode via absorbed generation.
 
-        ``hidden_states`` shape ``[1, hidden_size]``. Returns ``[1, hidden_size]``.
+        ``hidden_states`` shape ``[num_tokens, hidden_size]``. Returns
+        ``[num_tokens, hidden_size]``.
+
+        Plain decode batches (one token per generation request — the
+        TPOT/CUDA-graph hot path) take the fused DeepSeek-pattern path;
+        speculative-verification batches (q_len > 1 per request) keep the
+        legacy python path, whose latent-append helper handles q_len > 1.
+        """
+        metadata = rt.metadata
+        if (hidden_states.shape[0] == metadata.num_generations
+                and metadata.kv_cache_manager is not None):
+            return self._forward_decode_fused(hidden_states, rt)
+        return self._forward_decode_legacy(hidden_states, rt)
+
+    def _forward_decode_fused(
+        self,
+        hidden_states: torch.Tensor,
+        rt: KimiK3MLARuntimeInputs,
+    ) -> torch.Tensor:
+        """Absorbed decode, DeepSeek ``forward_absorption_generation`` pattern.
+
+        Removes ~20 tiny per-layer device kernels vs the legacy path (all of
+        which replay inside the decode CUDA graph and are pure serial latency
+        at small batch):
+
+        * ``bmm_out`` writes the absorbed ``q_nope @ k_absorb`` straight into
+          the latent slice of a preallocated ``fused_q`` (no einsum permute
+          copies, no ``torch.cat``, no ``.contiguous()``).
+        * One fused C++ op, ``mla_rope_generation``, rotates ``q_pe``/``k_pe``
+          by the identity table (a copy — NoPE preserved), writes ``q_pe``
+          into ``fused_q``'s rope tail, appends the latent row to the paged
+          cache, and fills the trtllm-gen scheduler buffers
+          (cu_q/cu_kv/counter) in-kernel — replacing the ~10-kernel python
+          ``skip_mla_rope_generation`` block in ``TrtllmAttention.forward``.
+        * ``bmm_out`` un-absorbs the FMHA output straight into the
+          gate/o_proj input buffer.
+        """
+        num_tokens = hidden_states.shape[0]
+        metadata = rt.metadata
+        q_nope, q_rot = self._project_q_unabsorbed(hidden_states)
+        _, _, latent_cache = self._project_kv_and_latent(hidden_states)
+
+        k_absorb, v_absorb = self._kv_b_absorb_split()
+
+        # Mutation rotation on q_rot only (k side is the cached latent,
+        # we cannot rotate that without breaking the cache contract).
+        q_rot_use, _ = self._maybe_rotate_qk(q_rot, None)
+
+        fused_q = hidden_states.new_empty(
+            (num_tokens, self.num_heads,
+             self.kv_lora_rank + self.qk_rope_head_dim))
+        # Absorb: [H, T, m] × [H, m, kv] -> [H, T, kv] (m = qk_nope_head_dim),
+        # written directly into fused_q's latent slice.
+        torch.ops.trtllm.bmm_out(
+            q_nope.transpose(0, 1), k_absorb,
+            fused_q[..., :self.kv_lora_rank].transpose(0, 1))
+
+        num_seqs = metadata.num_seqs
+        cu_q_seqlens = torch.empty(num_seqs + 1,
+                                   dtype=torch.int32,
+                                   device=hidden_states.device)
+        cu_kv_seqlens = torch.empty(num_seqs + 1,
+                                    dtype=torch.int32,
+                                    device=hidden_states.device)
+        fmha_scheduler_counter = torch.empty(1,
+                                             dtype=torch.uint32,
+                                             device=hidden_states.device)
+        # Identity rope (NoPE): writes q_rot into fused_q's rope tail,
+        # appends the latent row to the paged cache, and fills the
+        # scheduler buffers — one op, CUDA-graph-safe (the DeepSeek MLA
+        # generation path uses it under graphs in production).
+        self._backend_gen.mla_rope_generation(
+            fused_q,
+            q_rot_use,
+            latent_cache,
+            metadata,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            fmha_scheduler_counter,
+            None,  # mla_bmm1_scale (fp8-KV only)
+            None,  # mla_bmm2_scale (fp8-KV only)
+            None,  # quant_q_buffer (fp8-KV only)
+        )
+
+        forward_args = AttentionForwardArgs(
+            latent_cache=latent_cache,
+            attention_input_type=AttentionInputType.generation_only,
+            attention_mask=PredefinedAttentionMask.CAUSAL,
+            q_pe=q_rot_use,
+            cu_q_seqlens=cu_q_seqlens,
+            cu_kv_seqlens=cu_kv_seqlens,
+            fmha_scheduler_counter=fmha_scheduler_counter,
+        )
+        attn_absorbed = self._backend_gen.forward(
+            fused_q.view(num_tokens, -1),
+            None,
+            None,
+            metadata,
+            forward_args=forward_args,
+        )
+        # ``attn_absorbed`` shape: ``[num_tokens, num_heads * kv_lora_rank]``.
+        attn_absorbed = attn_absorbed.view(num_tokens, self.num_heads,
+                                           self.kv_lora_rank)
+        attn_out = hidden_states.new_empty(
+            (num_tokens, self.num_heads * self.v_head_dim))
+        # Un-absorb: [H, T, kv] × [H, kv, v] -> [H, T, v], written directly
+        # into the gate/o_proj input buffer.
+        torch.ops.trtllm.bmm_out(
+            attn_absorbed.transpose(0, 1), v_absorb.transpose(1, 2),
+            attn_out.view(num_tokens, self.num_heads,
+                          self.v_head_dim).transpose(0, 1))
+        return self._apply_output_gate_and_o_proj(hidden_states, attn_out)
+
+    def _forward_decode_legacy(
+        self,
+        hidden_states: torch.Tensor,
+        rt: KimiK3MLARuntimeInputs,
+    ) -> torch.Tensor:
+        """Legacy absorbed decode (einsum + python latent-append path).
+
+        Kept for speculative-verification batches (q_len > 1 per request),
+        where ``append_mla_latent_cache_generation_cuda_graph_safe`` handles
+        the multi-token append.
         """
         num_tokens = hidden_states.shape[0]
         q_nope, q_rot = self._project_q_unabsorbed(hidden_states)

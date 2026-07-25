@@ -1184,6 +1184,20 @@ class TestMoeFp4:
                 id="RoutingDSv3"),
             pytest.param(
                 {
+                    # Kimi-K3 shape: 896 experts / topK 16 without expert groups.
+                    # Exercises the (1024, 32) tier of the custom routing kernels,
+                    # including the cooperative small-batch kernel at num_tokens 1.
+                    "num_experts": 896,
+                    "top_k": 16,
+                    "n_groups": 1,
+                    "top_k_groups": 1,
+                    "routed_scaling": 2.5,
+                    "has_routing_bias": True,
+                    "routing_method_type": RoutingMethodType.DeepSeekV3
+                },
+                id="RoutingDSv3_noGroups_896x16"),
+            pytest.param(
+                {
                     "num_experts": 128,
                     "top_k": 4,
                     "n_groups": None,

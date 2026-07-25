@@ -76,8 +76,9 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     int const hidden_dim = mat_a.sizes()[1];
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
     auto const data_type = mat_a.scalar_type();
-    constexpr int kNumExperts = 256;
-    constexpr int kHiddenDim7168 = 7168; // DeepSeek-V3 / DeepSeek-V3.2
+    constexpr int kNumExperts256 = 256; // DeepSeek-V3 family / GLM-5
+    constexpr int kNumExperts896 = 896; // Kimi K3
+    constexpr int kHiddenDim7168 = 7168; // DeepSeek-V3 / DeepSeek-V3.2 / Kimi K3
     constexpr int kHiddenDim6144 = 6144; // GLM-5
     constexpr int kHiddenDim4096 = 4096; // DeepSeek-V4
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
@@ -87,24 +88,30 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
     bool const shape_ok
-        = (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts && mat_b.sizes()[0] == hidden_dim
-            && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32 && !bias.has_value());
+        = (num_tokens >= 1 && num_tokens <= 16 && mat_b.sizes()[0] == hidden_dim && data_type == torch::kBFloat16
+            && out_dtype_ == torch::kFloat32 && !bias.has_value());
 
-    if (shape_ok && hidden_dim == kHiddenDim7168)
+    if (shape_ok && num_experts == kNumExperts256 && hidden_dim == kHiddenDim7168)
     {
-        LoopUnroller<1, 16, kNumExperts, kHiddenDim7168>::unroll(num_tokens,
+        LoopUnroller<1, 16, kNumExperts256, kHiddenDim7168>::unroll(num_tokens,
             reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
             reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
     }
-    else if (shape_ok && hidden_dim == kHiddenDim6144)
+    else if (shape_ok && num_experts == kNumExperts896 && hidden_dim == kHiddenDim7168)
     {
-        LoopUnroller<1, 16, kNumExperts, kHiddenDim6144>::unroll(num_tokens,
+        LoopUnroller<1, 16, kNumExperts896, kHiddenDim7168>::unroll(num_tokens,
             reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
             reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
     }
-    else if (shape_ok && hidden_dim == kHiddenDim4096)
+    else if (shape_ok && num_experts == kNumExperts256 && hidden_dim == kHiddenDim6144)
     {
-        LoopUnroller<1, 16, kNumExperts, kHiddenDim4096>::unroll(num_tokens,
+        LoopUnroller<1, 16, kNumExperts256, kHiddenDim6144>::unroll(num_tokens,
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+    }
+    else if (shape_ok && num_experts == kNumExperts256 && hidden_dim == kHiddenDim4096)
+    {
+        LoopUnroller<1, 16, kNumExperts256, kHiddenDim4096>::unroll(num_tokens,
             reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
             reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
     }

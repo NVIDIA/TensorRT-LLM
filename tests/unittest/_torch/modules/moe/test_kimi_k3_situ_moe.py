@@ -411,3 +411,273 @@ def test_fused_forward_without_weights_raises():
     x = torch.randn(1, 4, config.hidden_size, dtype=torch.bfloat16, device=device)
     with pytest.raises(RuntimeError, match="fused weights were never built"):
         block(x)
+
+
+# ---------------------------------------------------------------------------
+# Routed MoE TP/EP split selection (CPU-only).
+# ---------------------------------------------------------------------------
+
+
+def test_mapping_records_moe_tp_ep_user_specified():
+    from tensorrt_llm.mapping import Mapping
+
+    # Auto default: -1 sentinels resolve to (moe_tp=tp, moe_ep=1) but must
+    # NOT be flagged as a user request.
+    auto = Mapping(world_size=8, tp_size=8)
+    assert auto.moe_tp_size == 8 and auto.moe_ep_size == 1
+    assert not auto.moe_tp_ep_user_specified
+
+    tp = Mapping(world_size=8, tp_size=8, moe_tp_size=8, moe_ep_size=1)
+    assert tp.moe_tp_ep_user_specified
+
+    # Setting only one side still counts as explicit.
+    ep = Mapping(world_size=8, tp_size=8, moe_ep_size=8)
+    assert ep.moe_tp_ep_user_specified
+    assert ep.moe_tp_size == 1 and ep.moe_ep_size == 8
+
+
+def test_kimi_k3_moe_split_selection(monkeypatch):
+    from tensorrt_llm._torch.models.modeling_kimi_linear import (
+        _K3_MOE_EP_ENV,
+        _K3_MOE_TP_ENV,
+        KimiK3MoERuntime,
+    )
+    from tensorrt_llm.mapping import Mapping
+
+    monkeypatch.delenv(_K3_MOE_TP_ENV, raising=False)
+    monkeypatch.delenv(_K3_MOE_EP_ENV, raising=False)
+
+    # Auto mapping default stays EP-only (the historical K3 layout), even
+    # though the resolved mapping says moe_tp=8.
+    auto = Mapping(world_size=8, tp_size=8)
+    assert KimiK3MoERuntime._select_moe_tp_ep(auto) == (1, 8)
+
+    # Explicit pure-TP and hybrid requests are honored.
+    tp = Mapping(world_size=8, tp_size=8, moe_tp_size=8, moe_ep_size=1)
+    assert KimiK3MoERuntime._select_moe_tp_ep(tp) == (8, 1)
+    tep = Mapping(world_size=8, tp_size=8, moe_tp_size=4, moe_ep_size=2)
+    assert KimiK3MoERuntime._select_moe_tp_ep(tep) == (4, 2)
+
+    # Env override wins; a single side derives the other from tp_size.
+    monkeypatch.setenv(_K3_MOE_TP_ENV, "4")
+    assert KimiK3MoERuntime._select_moe_tp_ep(auto) == (4, 2)
+    monkeypatch.delenv(_K3_MOE_TP_ENV)
+    monkeypatch.setenv(_K3_MOE_EP_ENV, "2")
+    assert KimiK3MoERuntime._select_moe_tp_ep(auto) == (4, 2)
+
+
+# ---------------------------------------------------------------------------
+# MoE tensor-parallel shard parity (ConfigurableMoE / TRTLLM-Gen, GPU).
+#
+# Production K3 TP8 geometry per rank: ALL experts, intermediate 3072/8=384,
+# latent hidden 3584, group-32 packed MXFP4 weights column-sharded (w1/w3)
+# and row-sharded (w2) by the stock TRTLLM-Gen quant-method loaders. These
+# tests run the identical shard shapes on ONE GPU by loading each simulated
+# rank through the real `load_packed_mxfp4_expert` path with a proxy module
+# exposing (tp_size, tp_rank), then summing the per-rank partial outputs.
+# ---------------------------------------------------------------------------
+
+_TP_HIDDEN = 3584
+_TP_INTERMEDIATE = 3072
+_TP_EXPERTS = 8
+_TP_TOPK = 2
+
+
+def _make_packed_expert_bank(num_experts, intermediate, hidden, seed=101):
+    """Random group-32 packed MXFP4 tensors in checkpoint layout (uint8)."""
+    gen = torch.Generator().manual_seed(seed)
+
+    def nibbles(*shape):
+        return torch.randint(0, 256, shape, generator=gen, dtype=torch.uint8)
+
+    def scales(*shape):
+        # UE8M0 exponents 2^-9..2^-4 keep bf16 outputs well-conditioned.
+        return torch.randint(118, 124, shape, generator=gen, dtype=torch.uint8)
+
+    bank = []
+    for _ in range(num_experts):
+        bank.append({
+            "w1": nibbles(intermediate, hidden // 2),
+            "w1_sf": scales(intermediate, hidden // 32),
+            "w3": nibbles(intermediate, hidden // 2),
+            "w3_sf": scales(intermediate, hidden // 32),
+            "w2": nibbles(hidden, intermediate // 2),
+            "w2_sf": scales(hidden, intermediate // 32),
+        })
+    return bank
+
+
+def _make_test_gate(num_experts=_TP_EXPERTS, seed=71):
+    """One deterministically-initialized gate SHARED by all modules under
+    comparison: the fused routing kernel applies the gate's
+    e_score_correction_bias per module, so a per-module `torch.empty`
+    (garbage) bias would silently route the shard and whole-expert modules
+    to different experts."""
+    cfg = _K3Config(
+        hidden_size=_TP_HIDDEN,
+        num_experts=num_experts,
+        num_experts_per_token=min(_TP_TOPK, num_experts),
+    )
+    gate = KimiK3MoEGate(cfg)
+    gen = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        gate.weight.copy_(
+            torch.randn(gate.weight.shape, generator=gen,
+                        dtype=torch.float32) * 0.05)
+        gate.e_score_correction_bias.copy_(
+            torch.randn(gate.e_score_correction_bias.shape, generator=gen,
+                        dtype=torch.float32) * 0.1)
+    return gate.cuda()
+
+
+def _make_routed_moe(intermediate_size, gate, num_experts=_TP_EXPERTS):
+    """Mirror KimiK3MoERuntime's create_moe call on a single-rank mapping."""
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.fused_moe import ConfigurableMoE, create_moe
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = num_experts
+    pretrained_config.hidden_size = _TP_HIDDEN
+    pretrained_config.intermediate_size = intermediate_size
+    pretrained_config.torch_dtype = torch.bfloat16
+    model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        mapping=Mapping(),
+        moe_backend="TRTLLM",
+    )
+    moe = create_moe(
+        routing_method=gate.routing_method,
+        num_experts=num_experts,
+        hidden_size=_TP_HIDDEN,
+        intermediate_size=intermediate_size,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=model_config,
+        override_quant_config=QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8),
+        layer_idx=0,
+        trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
+        trtllm_gen_activation_alpha=4.0,
+        trtllm_gen_activation_beta=25.0,
+        communication_method=None,
+    ).cuda()
+    assert isinstance(moe, ConfigurableMoE)
+    return moe
+
+
+def _load_bank(moe, bank, tp_size=1, tp_rank=0):
+    """Load packed experts through the production per-expert adapter.
+
+    ``tp_size > 1`` simulates one MoE-TP rank: the proxy exposes the shard
+    coordinates so the stock `load_weight_shard` slicing runs exactly as it
+    would on a real multi-rank mapping, while the backing module holds the
+    shard-sized parameters.
+    """
+    backend = moe.backend
+    proxy = SimpleNamespace(
+        expert_size_per_partition=backend.expert_size_per_partition,
+        initial_local_expert_ids=backend.initial_local_expert_ids,
+        scaling_vector_size=backend.scaling_vector_size,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        w3_w1_weight=backend.w3_w1_weight,
+        w2_weight=backend.w2_weight,
+        w3_w1_weight_scale=backend.w3_w1_weight_scale,
+        w2_weight_scale=backend.w2_weight_scale,
+    )
+    for expert_id, tensors in enumerate(bank):
+        backend.quant_method.load_packed_mxfp4_expert(
+            proxy,
+            global_expert_id=expert_id,
+            local_slot_id=expert_id,
+            w1_weight=tensors["w1"],
+            w1_weight_scale=tensors["w1_sf"],
+            w2_weight=tensors["w2"],
+            w2_weight_scale=tensors["w2_sf"],
+            w3_weight=tensors["w3"],
+            w3_weight_scale=tensors["w3_sf"],
+        )
+    backend._weights_transformed = False
+    moe.post_load_weights()
+    return moe
+
+
+@situ_supported
+@pytest.mark.parametrize("tp_size", [2, 8], ids=lambda n: f"tp{n}")
+def test_tp_shard_loader_matches_manual_slice(tp_size):
+    """The stock shard loaders must equal a manual contiguous slice.
+
+    Guards the group-32 packed-byte / scale slicing assumptions: w1/w3
+    column-shard along intermediate rows, w2 row-shard along the packed
+    intermediate bytes and per-32-group scales.
+    """
+    ipp = _TP_INTERMEDIATE // tp_size
+    num_experts = 2
+    bank = _make_packed_expert_bank(num_experts, _TP_INTERMEDIATE, _TP_HIDDEN)
+    gate = _make_test_gate(num_experts=num_experts)
+
+    for tp_rank in (0, tp_size - 1):
+        via_shard = _make_routed_moe(ipp, gate, num_experts=num_experts)
+        _load_bank(via_shard, bank, tp_size=tp_size, tp_rank=tp_rank)
+
+        rows = slice(tp_rank * ipp, (tp_rank + 1) * ipp)
+        cols_packed = slice(tp_rank * (ipp // 2), (tp_rank + 1) * (ipp // 2))
+        cols_sf = slice(tp_rank * (ipp // 32), (tp_rank + 1) * (ipp // 32))
+        manual_bank = [{
+            "w1": e["w1"][rows].contiguous(),
+            "w1_sf": e["w1_sf"][rows].contiguous(),
+            "w3": e["w3"][rows].contiguous(),
+            "w3_sf": e["w3_sf"][rows].contiguous(),
+            "w2": e["w2"][:, cols_packed].contiguous(),
+            "w2_sf": e["w2_sf"][:, cols_sf].contiguous(),
+        } for e in bank]
+        via_manual = _make_routed_moe(ipp, gate, num_experts=num_experts)
+        _load_bank(via_manual, manual_bank)
+
+        for name in ("w3_w1_weight", "w2_weight", "w3_w1_weight_scale",
+                     "w2_weight_scale"):
+            a = getattr(via_shard.backend, name).data
+            b = getattr(via_manual.backend, name).data
+            assert torch.equal(a, b), (
+                f"{name} mismatch for tp_size={tp_size} tp_rank={tp_rank}")
+
+
+@situ_supported
+@pytest.mark.parametrize("num_tokens", [1, 16], ids=lambda n: f"tokens{n}")
+def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
+    """Sum of 8 TP-shard partial outputs == whole-expert reference.
+
+    Per-element MXFP4/MXFP8 numerics are identical between the two layouts
+    (group-32 boundaries align: 384 % 32 == 0), so the only expected error
+    is bf16 rounding of the per-shard FC2 partial sums.
+    """
+    tp_size = 8
+    ipp = _TP_INTERMEDIATE // tp_size  # 384 — the production TP8 shard size
+    bank = _make_packed_expert_bank(_TP_EXPERTS, _TP_INTERMEDIATE, _TP_HIDDEN)
+    gate = _make_test_gate()
+
+    whole = _make_routed_moe(_TP_INTERMEDIATE, gate)
+    _load_bank(whole, bank)
+
+    torch.manual_seed(3)
+    x = torch.randn(
+        num_tokens, _TP_HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.5
+    router_logits = gate.compute_logits(x)
+
+    out_whole = whole.forward(x, router_logits, all_rank_num_tokens=None)
+
+    partial_sum = torch.zeros(num_tokens, _TP_HIDDEN, dtype=torch.float32,
+                              device="cuda")
+    for tp_rank in range(tp_size):
+        shard = _make_routed_moe(ipp, gate)
+        _load_bank(shard, bank, tp_size=tp_size, tp_rank=tp_rank)
+        out_shard = shard.forward(x, router_logits, all_rank_num_tokens=None)
+        partial_sum += out_shard.float()
+        del shard
+        torch.cuda.empty_cache()
+
+    check_accuracy(partial_sum.to(torch.bfloat16), out_whole,
+                   atol=0.08, rtol=0.08, percent=0.98)

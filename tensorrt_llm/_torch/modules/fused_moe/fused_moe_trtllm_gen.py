@@ -387,9 +387,22 @@ class TRTLLMGenFusedMoE(MoE):
             raise ValueError(
                 "TRTLLM-Gen SiTu requires W4A8_MXFP4_MXFP8 quantization, "
                 f"got {quant_algo}.")
-        if self.tp_size != 1:
-            raise ValueError(
-                f"TRTLLM-Gen SiTu requires MoE TP size 1, got {self.tp_size}.")
+        if self.tp_size > 1:
+            # Intra-expert MoE TP: w1/w3 column-shard and w2 row-shard along
+            # the intermediate dim (the stock MXFP4 quant-method loaders slice
+            # the group-32 packed bytes and scales per rank). Require the
+            # per-rank shard to stay a whole multiple of the quant method's
+            # weight alignment so per-shard scale groups and the padded
+            # weight buffers line up without fractional groups.
+            alignment = W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.weight_alignment
+            if (self.intermediate_size % self.tp_size != 0
+                    or self.intermediate_size_per_partition % alignment != 0):
+                raise ValueError(
+                    "TRTLLM-Gen SiTu MoE TP requires intermediate_size "
+                    f"({self.intermediate_size}) divisible by moe_tp_size "
+                    f"({self.tp_size}) with the per-rank shard a multiple of "
+                    f"{alignment}, got "
+                    f"{self.intermediate_size_per_partition}.")
         if self.activation_type != ActivationType.Swiglu:
             raise ValueError(
                 "TRTLLM-Gen SiTu must use generic SwiGLU geometry so FC1 "

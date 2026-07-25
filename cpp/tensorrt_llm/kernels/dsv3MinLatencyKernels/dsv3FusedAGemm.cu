@@ -684,6 +684,19 @@ template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8>(
 
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+
+// Kimi K3 latent MoE projections (hidden 7168 <-> MoE latent 3584).
+template void invokeFusedAGemm<__nv_bfloat16, 7168, 3584, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+
+template void invokeFusedAGemm<__nv_bfloat16, 7168, 3584, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+
+template void invokeFusedAGemm<__nv_bfloat16, 3584, 7168, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+
+template void invokeFusedAGemm<__nv_bfloat16, 3584, 7168, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 } // namespace kernels::dsv3MinLatencyKernels
 
 TRTLLM_NAMESPACE_END
