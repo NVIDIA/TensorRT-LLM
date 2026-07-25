@@ -137,7 +137,7 @@ __device__ __forceinline__ void cp_async_wait_oldest(int outstanding_groups)
 
 template <int kStageChunkV>
 __device__ __forceinline__ void cp_async_state_chunk_stage(
-    float* s_state, float const* state, int slot, int i_hv, int HV, int chunk, int stage)
+    float* s_state, float const* state, int slot, int i_hv, int64_t state_slot_stride, int chunk, int stage)
 {
     constexpr int kFloat4PerChunk = kStageChunkV * kDimK / 4;
     int const tid = threadIdx.x;
@@ -148,7 +148,9 @@ __device__ __forceinline__ void cp_async_state_chunk_stage(
         int const row = elem / kDimK;
         int const k = elem - row * kDimK;
         float* dst = s_state + (stage * kStageChunkV + row) * kDimK + k;
-        float const* src = state + ((slot * HV + i_hv) * kDimV + v_base + row) * kDimK + k;
+        int64_t const state_offset = static_cast<int64_t>(slot) * state_slot_stride
+            + (static_cast<int64_t>(i_hv) * kDimV + v_base + row) * kDimK + k;
+        float const* src = state + state_offset;
         cp_async_cg_16b(dst, src);
     }
     cp_async_commit();
@@ -156,7 +158,7 @@ __device__ __forceinline__ void cp_async_state_chunk_stage(
 
 template <int kCopyThreads>
 __device__ __forceinline__ void cp_async_state_chunk_for(
-    float* s_state, float const* state, int slot, int i_hv, int HV, int chunk)
+    float* s_state, float const* state, int slot, int i_hv, int64_t state_slot_stride, int chunk)
 {
     constexpr int kFloat4PerChunk = kChunkV * kDimK / 4;
     int const tid = threadIdx.x;
@@ -168,16 +170,18 @@ __device__ __forceinline__ void cp_async_state_chunk_for(
         int const row = elem / kDimK;
         int const k = elem - row * kDimK;
         float* dst = s_state + (stage * kChunkV + row) * kDimK + k;
-        float const* src = state + ((slot * HV + i_hv) * kDimV + v_base + row) * kDimK + k;
+        int64_t const state_offset = static_cast<int64_t>(slot) * state_slot_stride
+            + (static_cast<int64_t>(i_hv) * kDimV + v_base + row) * kDimK + k;
+        float const* src = state + state_offset;
         cp_async_cg_16b(dst, src);
     }
     cp_async_commit();
 }
 
 __device__ __forceinline__ void cp_async_state_chunk(
-    float* s_state, float const* state, int slot, int i_hv, int HV, int chunk)
+    float* s_state, float const* state, int slot, int i_hv, int64_t state_slot_stride, int chunk)
 {
-    cp_async_state_chunk_for<kThreads>(s_state, state, slot, i_hv, HV, chunk);
+    cp_async_state_chunk_for<kThreads>(s_state, state, slot, i_hv, state_slot_stride, chunk);
 }
 
 __device__ __forceinline__ float block_reduce_sum(float value, float* scratch)
@@ -366,8 +370,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
     float const* __restrict__ a_log, __nv_bfloat16 const* __restrict__ g, float const* __restrict__ dt_bias,
     __nv_bfloat16 const* __restrict__ beta, __nv_bfloat16 const* __restrict__ onorm_g,
     float const* __restrict__ onorm_weight, int const* __restrict__ ssm_state_indices,
-    int const* __restrict__ cu_seqlens, float* __restrict__ state, __nv_bfloat16* __restrict__ out, int B, int H,
-    int HV, float lower_bound, float scale, float onorm_eps)
+    int const* __restrict__ cu_seqlens, float* __restrict__ state, int64_t state_slot_stride,
+    __nv_bfloat16* __restrict__ out, int B, int H, int HV, float lower_bound, float scale, float onorm_eps)
 {
     int const tid = threadIdx.x;
     int const lane = tid & 31;
@@ -408,7 +412,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
         {
             return;
         }
-        slot = ssm_state_indices == nullptr ? i_n : ssm_state_indices[i_n];
+        slot = ssm_state_indices[i_n];
     }
 
     int const hk_off = i_h * kDimK;
@@ -417,6 +421,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
     int const hv_count = kUseStaticDecodeLayout ? kFixedValueHeads : HV;
     int const hkv_dim = h_count * kDimK;
     int const hvv_dim = hv_count * kDimV;
+    int const conv_slot = kUpdateConvState ? slot : i_n;
 
     constexpr int kStageChunkV = 32;
     constexpr int kStageCount = 3;
@@ -432,8 +437,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
     float pre_onorm_gate = 0.0f;
     float pre_onorm_weight = 0.0f;
 
-    cp_async_state_chunk_stage<kStageChunkV>(s_state, state, slot, i_hv, hv_count, 0, 0);
-    cp_async_state_chunk_stage<kStageChunkV>(s_state, state, slot, i_hv, hv_count, 1, 1);
+    cp_async_state_chunk_stage<kStageChunkV>(s_state, state, slot, i_hv, state_slot_stride, 0, 0);
+    cp_async_state_chunk_stage<kStageChunkV>(s_state, state, slot, i_hv, state_slot_stride, 1, 1);
 
     if constexpr (kUpdateConvState)
     {
@@ -508,7 +513,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
 #pragma unroll
             for (int w = 0; w < kConvStateWidth; ++w)
             {
-                int const cs_idx = (slot * hkv_dim + hk) * kConvStateWidth + w;
+                int const cs_idx = (conv_slot * hkv_dim + hk) * kConvStateWidth + w;
                 q_acc += bf16_load(cs_q, cs_idx) * bf16_load(w_q_t, w * hkv_dim + hk);
                 k_acc += bf16_load(cs_k, cs_idx) * bf16_load(w_k_t, w * hkv_dim + hk);
             }
@@ -584,7 +589,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
 #pragma unroll
             for (int w = 0; w < kConvStateWidth; ++w)
             {
-                int const cs_idx = (slot * hvv_dim + hvv) * kConvStateWidth + w;
+                int const cs_idx = (conv_slot * hvv_dim + hvv) * kConvStateWidth + w;
                 v_acc += bf16_load(cs_v, cs_idx) * bf16_load(w_v_t, w * hvv_dim + hvv);
             }
             v_acc += bf16_load(x_v, (bos * hv_count + i_hv) * kDimV + v)
@@ -616,7 +621,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
 
     if constexpr (kIssueThirdStatePrefetchEarly && kStageNumChunks > 2)
     {
-        cp_async_state_chunk_stage<kStageChunkV>(s_state, state, slot, i_hv, hv_count, 2, 2);
+        cp_async_state_chunk_stage<kStageChunkV>(s_state, state, slot, i_hv, state_slot_stride, 2, 2);
     }
 
     float const q_sq = tid < kDimK ? s_q[tid] * s_q[tid] : 0.0f;
@@ -683,7 +688,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
             if (prefetch < kStageNumChunks && prefetch >= 3)
             {
                 cp_async_state_chunk_stage<kStageChunkV>(
-                    s_state, state, slot, i_hv, hv_count, prefetch, prefetch % kStageCount);
+                    s_state, state, slot, i_hv, state_slot_stride, prefetch, prefetch % kStageCount);
             }
         }
         else
@@ -691,7 +696,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
             if (prefetch < kStageNumChunks)
             {
                 cp_async_state_chunk_stage<kStageChunkV>(
-                    s_state, state, slot, i_hv, hv_count, prefetch, prefetch % kStageCount);
+                    s_state, state, slot, i_hv, state_slot_stride, prefetch, prefetch % kStageCount);
             }
         }
 
@@ -748,10 +753,12 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
         float dot_hq_b = 0.0f;
         float dot_hq_c = 0.0f;
         float dot_hq_d = 0.0f;
-        int const state_idx_a = ((slot * hv_count + i_hv) * kDimV + v0) * kDimK + k_base;
-        int const state_idx_b = ((slot * hv_count + i_hv) * kDimV + v1) * kDimK + k_base;
-        int const state_idx_c = ((slot * hv_count + i_hv) * kDimV + v2) * kDimK + k_base;
-        int const state_idx_d = ((slot * hv_count + i_hv) * kDimV + v3) * kDimK + k_base;
+        int64_t const state_head_offset
+            = static_cast<int64_t>(slot) * state_slot_stride + static_cast<int64_t>(i_hv) * kDimV * kDimK;
+        int64_t const state_idx_a = state_head_offset + static_cast<int64_t>(v0) * kDimK + k_base;
+        int64_t const state_idx_b = state_head_offset + static_cast<int64_t>(v1) * kDimK + k_base;
+        int64_t const state_idx_c = state_head_offset + static_cast<int64_t>(v2) * kDimK + k_base;
+        int64_t const state_idx_d = state_head_offset + static_cast<int64_t>(v3) * kDimK + k_base;
         float const h_a_0 = h_a_vals[0] + r_k[0] * v_new0;
         float const h_a_1 = h_a_vals[1] + r_k[1] * v_new0;
         float const h_a_2 = h_a_vals[2] + r_k[2] * v_new0;
@@ -900,8 +907,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     float const* __restrict__ a_log, __nv_bfloat16 const* __restrict__ g, float const* __restrict__ dt_bias,
     __nv_bfloat16 const* __restrict__ beta, __nv_bfloat16 const* __restrict__ onorm_g,
     float const* __restrict__ onorm_weight, int const* __restrict__ ssm_state_indices,
-    int const* __restrict__ cu_seqlens, float* __restrict__ state, __nv_bfloat16* __restrict__ out, int B, int H,
-    int HV, float lower_bound, float scale, float onorm_eps)
+    int const* __restrict__ cu_seqlens, float* __restrict__ state, int64_t state_slot_stride,
+    __nv_bfloat16* __restrict__ out, int B, int H, int HV, float lower_bound, float scale, float onorm_eps)
 {
     int const tid = threadIdx.x;
     int const lane = tid & 31;
@@ -942,7 +949,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
         {
             return;
         }
-        slot = ssm_state_indices == nullptr ? i_n : ssm_state_indices[i_n];
+        slot = ssm_state_indices[i_n];
     }
 
     int const hk_off = i_h * kDimK;
@@ -951,6 +958,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     int const hv_count = kUseStaticDecodeLayout ? kFixedValueHeads : HV;
     int const hkv_dim = h_count * kDimK;
     int const hvv_dim = hv_count * kDimV;
+    int const conv_slot = kUpdateConvState ? slot : i_n;
 
     __shared__ float s_state[2][kChunkV][kDimK];
     __shared__ float s_q[kDimK];
@@ -963,7 +971,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     float pre_onorm_gate = 0.0f;
     float pre_onorm_weight = 0.0f;
 
-    cp_async_state_chunk(&s_state[0][0][0], state, slot, i_hv, hv_count, 0);
+    cp_async_state_chunk(&s_state[0][0][0], state, slot, i_hv, state_slot_stride, 0);
 
     if constexpr (kUpdateConvState)
     {
@@ -1038,7 +1046,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 #pragma unroll
             for (int w = 0; w < kConvStateWidth; ++w)
             {
-                int const cs_idx = (slot * hkv_dim + hk) * kConvStateWidth + w;
+                int const cs_idx = (conv_slot * hkv_dim + hk) * kConvStateWidth + w;
                 q_acc += bf16_load(cs_q, cs_idx) * bf16_load(w_q_t, w * hkv_dim + hk);
                 k_acc += bf16_load(cs_k, cs_idx) * bf16_load(w_k_t, w * hkv_dim + hk);
             }
@@ -1114,7 +1122,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 #pragma unroll
             for (int w = 0; w < kConvStateWidth; ++w)
             {
-                int const cs_idx = (slot * hvv_dim + hvv) * kConvStateWidth + w;
+                int const cs_idx = (conv_slot * hvv_dim + hvv) * kConvStateWidth + w;
                 v_acc += bf16_load(cs_v, cs_idx) * bf16_load(w_v_t, w * hvv_dim + hvv);
             }
             v_acc += bf16_load(x_v, (bos * hv_count + i_hv) * kDimV + v)
@@ -1146,7 +1154,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
     if constexpr (kPrefetchNextStateChunk && kNumChunks > 1)
     {
-        cp_async_state_chunk(&s_state[0][0][0], state, slot, i_hv, hv_count, 1);
+        cp_async_state_chunk(&s_state[0][0][0], state, slot, i_hv, state_slot_stride, 1);
     }
 
     float const q_sq = tid < kDimK ? s_q[tid] * s_q[tid] : 0.0f;
@@ -1203,7 +1211,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
         {
             if (chunk + 1 < kNumChunks)
             {
-                cp_async_state_chunk(&s_state[0][0][0], state, slot, i_hv, hv_count, chunk + 1);
+                cp_async_state_chunk(&s_state[0][0][0], state, slot, i_hv, state_slot_stride, chunk + 1);
             }
         }
 
@@ -1238,8 +1246,10 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
             float dot_hq_a = 0.0f;
             float dot_hq_b = 0.0f;
-            int const state_idx_a = ((slot * hv_count + i_hv) * kDimV + v0) * kDimK + k_base;
-            int const state_idx_b = ((slot * hv_count + i_hv) * kDimV + v1) * kDimK + k_base;
+            int64_t const state_head_offset
+                = static_cast<int64_t>(slot) * state_slot_stride + static_cast<int64_t>(i_hv) * kDimV * kDimK;
+            int64_t const state_idx_a = state_head_offset + static_cast<int64_t>(v0) * kDimK + k_base;
+            int64_t const state_idx_b = state_head_offset + static_cast<int64_t>(v1) * kDimK + k_base;
             float const h_a_0 = h_a_vals[0] + r_k[0] * v_new0;
             float const h_a_1 = h_a_vals[1] + r_k[1] * v_new0;
             float const h_a_2 = h_a_vals[2] + r_k[2] * v_new0;
@@ -1279,7 +1289,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
         {
             if (chunk + 2 < kNumChunks)
             {
-                cp_async_state_chunk(&s_state[0][0][0], state, slot, i_hv, hv_count, chunk + 2);
+                cp_async_state_chunk(&s_state[0][0][0], state, slot, i_hv, state_slot_stride, chunk + 2);
             }
         }
     }
@@ -1373,20 +1383,23 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     }
 }
 
-template <int kHeads, bool kApplyOnorm, bool kUpdateConvState, bool kUseLowerBound, bool kApplyBetaSigmoid>
+template <int kHeads, bool kUseStaticDecodeLayout, bool kApplyOnorm, bool kUpdateConvState, bool kUseLowerBound,
+    bool kApplyBetaSigmoid>
 void launch_kda_decode_compact_heads_raw(void const* x_q, void const* x_k, void const* x_v, void const* w_q_t,
     void const* w_k_t, void const* w_v_t, void const* bias_q, void const* bias_k, void const* bias_v, void* cs_q,
     void* cs_k, void* cs_v, float const* a_log, void const* g, float const* dt_bias, void const* beta,
     void const* onorm_g, float const* onorm_weight, int const* ssm_state_indices, int const* cu_seqlens, float* state,
-    void* out, int B, int H, int HV, float lower_bound, float scale, float onorm_eps, cudaStream_t stream)
+    int64_t state_slot_stride, void* out, int B, int H, int HV, float lower_bound, float scale, float onorm_eps,
+    cudaStream_t stream)
 {
     constexpr int kStageDynamicSmemBytes = 3 * 32 * kDimK * static_cast<int>(sizeof(float));
     TLLM_CUDA_CHECK(
-        cudaFuncSetAttribute(kda_decode_fusion_compact_heads_kernel<kApplyOnorm, true, true, kHeads, kHeads, false,
-                                 false, false, true, false, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>,
+        cudaFuncSetAttribute(kda_decode_fusion_compact_heads_kernel<kApplyOnorm, true, kUseStaticDecodeLayout, kHeads,
+                                 kHeads, false, false, false, true, false, true, kUpdateConvState, kUseLowerBound,
+                                 kApplyBetaSigmoid>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, kStageDynamicSmemBytes));
-    kda_decode_fusion_compact_heads_kernel<kApplyOnorm, true, true, kHeads, kHeads, false, false, false, true, false,
-        true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>
+    kda_decode_fusion_compact_heads_kernel<kApplyOnorm, true, kUseStaticDecodeLayout, kHeads, kHeads, false, false,
+        false, true, false, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>
         <<<dim3(B * HV), dim3(kThreads), kStageDynamicSmemBytes, stream>>>(reinterpret_cast<__nv_bfloat16 const*>(x_q),
             reinterpret_cast<__nv_bfloat16 const*>(x_k), reinterpret_cast<__nv_bfloat16 const*>(x_v),
             reinterpret_cast<__nv_bfloat16 const*>(w_q_t), reinterpret_cast<__nv_bfloat16 const*>(w_k_t),
@@ -1395,20 +1408,24 @@ void launch_kda_decode_compact_heads_raw(void const* x_q, void const* x_k, void 
             reinterpret_cast<__nv_bfloat16*>(cs_q), reinterpret_cast<__nv_bfloat16*>(cs_k),
             reinterpret_cast<__nv_bfloat16*>(cs_v), a_log, reinterpret_cast<__nv_bfloat16 const*>(g), dt_bias,
             reinterpret_cast<__nv_bfloat16 const*>(beta), reinterpret_cast<__nv_bfloat16 const*>(onorm_g), onorm_weight,
-            ssm_state_indices, cu_seqlens, state, reinterpret_cast<__nv_bfloat16*>(out), B, H, HV, lower_bound, scale,
-            onorm_eps);
+            ssm_state_indices, cu_seqlens, state, state_slot_stride, reinterpret_cast<__nv_bfloat16*>(out), B, H, HV,
+            lower_bound, scale, onorm_eps);
 }
 
-template <int kHeads, bool kApplyOnorm, bool kUpdateConvState, bool kUseLowerBound, bool kApplyBetaSigmoid>
+template <int kHeads, bool kUseStaticDecodeLayout, bool kApplyOnorm, bool kUpdateConvState, bool kUseLowerBound,
+    bool kApplyBetaSigmoid>
 void launch_kda_decode_many_heads_raw(void const* x_q, void const* x_k, void const* x_v, void const* w_q_t,
     void const* w_k_t, void const* w_v_t, void const* bias_q, void const* bias_k, void const* bias_v, void* cs_q,
     void* cs_k, void* cs_v, float const* a_log, void const* g, float const* dt_bias, void const* beta,
     void const* onorm_g, float const* onorm_weight, int const* ssm_state_indices, int const* cu_seqlens, float* state,
-    void* out, int B, int H, int HV, float lower_bound, float scale, float onorm_eps, cudaStream_t stream)
+    int64_t state_slot_stride, void* out, int B, int H, int HV, float lower_bound, float scale, float onorm_eps,
+    cudaStream_t stream)
 {
-    kda_decode_fusion_many_heads_kernel<kApplyOnorm, true, kHeads, kHeads, true, false, false, false, false, false,
-        true, true, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>
-        <<<dim3(B, HV), dim3(kThreads), 0, stream>>>(reinterpret_cast<__nv_bfloat16 const*>(x_q),
+    constexpr bool kUseHeadGrid = kUseStaticDecodeLayout;
+    dim3 const grid = kUseStaticDecodeLayout ? dim3(B, HV) : dim3(B * HV);
+    kda_decode_fusion_many_heads_kernel<kApplyOnorm, kUseStaticDecodeLayout, kHeads, kHeads, kUseHeadGrid, false,
+        false, false, false, false, true, true, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>
+        <<<grid, dim3(kThreads), 0, stream>>>(reinterpret_cast<__nv_bfloat16 const*>(x_q),
             reinterpret_cast<__nv_bfloat16 const*>(x_k), reinterpret_cast<__nv_bfloat16 const*>(x_v),
             reinterpret_cast<__nv_bfloat16 const*>(w_q_t), reinterpret_cast<__nv_bfloat16 const*>(w_k_t),
             reinterpret_cast<__nv_bfloat16 const*>(w_v_t), reinterpret_cast<__nv_bfloat16 const*>(bias_q),
@@ -1416,51 +1433,55 @@ void launch_kda_decode_many_heads_raw(void const* x_q, void const* x_k, void con
             reinterpret_cast<__nv_bfloat16*>(cs_q), reinterpret_cast<__nv_bfloat16*>(cs_k),
             reinterpret_cast<__nv_bfloat16*>(cs_v), a_log, reinterpret_cast<__nv_bfloat16 const*>(g), dt_bias,
             reinterpret_cast<__nv_bfloat16 const*>(beta), reinterpret_cast<__nv_bfloat16 const*>(onorm_g), onorm_weight,
-            ssm_state_indices, cu_seqlens, state, reinterpret_cast<__nv_bfloat16*>(out), B, H, HV, lower_bound, scale,
-            onorm_eps);
+            ssm_state_indices, cu_seqlens, state, state_slot_stride, reinterpret_cast<__nv_bfloat16*>(out), B, H, HV,
+            lower_bound, scale, onorm_eps);
 }
 
-template <int kHeads, bool kApplyOnorm, bool kUseLowerBound, bool kApplyBetaSigmoid>
+template <int kHeads, bool kUseStaticDecodeLayout, bool kApplyOnorm, bool kUseLowerBound, bool kApplyBetaSigmoid>
 void launch_kda_decode_compact_heads_selected(void const* x_q, void const* x_k, void const* x_v, void const* w_q_t,
     void const* w_k_t, void const* w_v_t, void const* bias_q, void const* bias_k, void const* bias_v, void* cs_q,
     void* cs_k, void* cs_v, float const* a_log, void const* g, float const* dt_bias, void const* beta,
     void const* onorm_g, float const* onorm_weight, int const* ssm_state_indices, int const* cu_seqlens, float* state,
-    void* out, int B, int H, int HV, bool update_conv_cache, float lower_bound, float scale, float onorm_eps,
-    cudaStream_t stream)
+    int64_t state_slot_stride, void* out, int B, int H, int HV, bool update_conv_cache, float lower_bound, float scale,
+    float onorm_eps, cudaStream_t stream)
 {
     if (update_conv_cache)
     {
-        launch_kda_decode_compact_heads_raw<kHeads, kApplyOnorm, true, kUseLowerBound, kApplyBetaSigmoid>(x_q, x_k, x_v,
-            w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log, g, dt_bias, beta, onorm_g,
-            onorm_weight, ssm_state_indices, cu_seqlens, state, out, B, H, HV, lower_bound, scale, onorm_eps, stream);
+        launch_kda_decode_compact_heads_raw<kHeads, kUseStaticDecodeLayout, kApplyOnorm, true, kUseLowerBound,
+            kApplyBetaSigmoid>(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log,
+            g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B, H,
+            HV, lower_bound, scale, onorm_eps, stream);
     }
     else
     {
-        launch_kda_decode_compact_heads_raw<kHeads, kApplyOnorm, false, kUseLowerBound, kApplyBetaSigmoid>(x_q, x_k,
-            x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log, g, dt_bias, beta, onorm_g,
-            onorm_weight, ssm_state_indices, cu_seqlens, state, out, B, H, HV, lower_bound, scale, onorm_eps, stream);
+        launch_kda_decode_compact_heads_raw<kHeads, kUseStaticDecodeLayout, kApplyOnorm, false, kUseLowerBound,
+            kApplyBetaSigmoid>(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log,
+            g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B, H,
+            HV, lower_bound, scale, onorm_eps, stream);
     }
 }
 
-template <int kHeads, bool kApplyOnorm, bool kUseLowerBound, bool kApplyBetaSigmoid>
+template <int kHeads, bool kUseStaticDecodeLayout, bool kApplyOnorm, bool kUseLowerBound, bool kApplyBetaSigmoid>
 void launch_kda_decode_many_heads_selected(void const* x_q, void const* x_k, void const* x_v, void const* w_q_t,
     void const* w_k_t, void const* w_v_t, void const* bias_q, void const* bias_k, void const* bias_v, void* cs_q,
     void* cs_k, void* cs_v, float const* a_log, void const* g, float const* dt_bias, void const* beta,
     void const* onorm_g, float const* onorm_weight, int const* ssm_state_indices, int const* cu_seqlens, float* state,
-    void* out, int B, int H, int HV, bool update_conv_cache, float lower_bound, float scale, float onorm_eps,
-    cudaStream_t stream)
+    int64_t state_slot_stride, void* out, int B, int H, int HV, bool update_conv_cache, float lower_bound, float scale,
+    float onorm_eps, cudaStream_t stream)
 {
     if (update_conv_cache)
     {
-        launch_kda_decode_many_heads_raw<kHeads, kApplyOnorm, true, kUseLowerBound, kApplyBetaSigmoid>(x_q, x_k, x_v,
-            w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log, g, dt_bias, beta, onorm_g,
-            onorm_weight, ssm_state_indices, cu_seqlens, state, out, B, H, HV, lower_bound, scale, onorm_eps, stream);
+        launch_kda_decode_many_heads_raw<kHeads, kUseStaticDecodeLayout, kApplyOnorm, true, kUseLowerBound,
+            kApplyBetaSigmoid>(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log,
+            g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B, H,
+            HV, lower_bound, scale, onorm_eps, stream);
     }
     else
     {
-        launch_kda_decode_many_heads_raw<kHeads, kApplyOnorm, false, kUseLowerBound, kApplyBetaSigmoid>(x_q, x_k, x_v,
-            w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log, g, dt_bias, beta, onorm_g,
-            onorm_weight, ssm_state_indices, cu_seqlens, state, out, B, H, HV, lower_bound, scale, onorm_eps, stream);
+        launch_kda_decode_many_heads_raw<kHeads, kUseStaticDecodeLayout, kApplyOnorm, false, kUseLowerBound,
+            kApplyBetaSigmoid>(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log,
+            g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B, H,
+            HV, lower_bound, scale, onorm_eps, stream);
     }
 }
 
@@ -1487,6 +1508,7 @@ struct KdaDecodeLaunchParams
     int const* ssm_state_indices;
     int const* cu_seqlens;
     float* state;
+    int64_t state_slot_stride;
     void* out;
     int B;
     int H;
@@ -1498,62 +1520,85 @@ struct KdaDecodeLaunchParams
     cudaStream_t stream;
 };
 
-template <bool kCompact, int kHeads, bool kApplyOnorm, bool kUseLowerBound, bool kApplyBetaSigmoid>
+template <bool kCompact, int kHeads, bool kUseStaticDecodeLayout, bool kApplyOnorm, bool kUseLowerBound,
+    bool kApplyBetaSigmoid>
 void launch_kda_decode_selected_backend(KdaDecodeLaunchParams const& p)
 {
     if constexpr (kCompact)
     {
-        launch_kda_decode_compact_heads_selected<kHeads, kApplyOnorm, kUseLowerBound, kApplyBetaSigmoid>(p.x_q, p.x_k,
-            p.x_v, p.w_q_t, p.w_k_t, p.w_v_t, p.bias_q, p.bias_k, p.bias_v, p.cs_q, p.cs_k, p.cs_v, p.a_log, p.g,
-            p.dt_bias, p.beta, p.onorm_g, p.onorm_weight, p.ssm_state_indices, p.cu_seqlens, p.state, p.out, p.B, p.H,
-            p.HV, p.update_conv_cache, p.lower_bound, p.scale, p.onorm_eps, p.stream);
+        launch_kda_decode_compact_heads_selected<kHeads, kUseStaticDecodeLayout, kApplyOnorm, kUseLowerBound,
+            kApplyBetaSigmoid>(p.x_q, p.x_k, p.x_v, p.w_q_t, p.w_k_t, p.w_v_t, p.bias_q, p.bias_k, p.bias_v, p.cs_q,
+            p.cs_k, p.cs_v, p.a_log, p.g, p.dt_bias, p.beta, p.onorm_g, p.onorm_weight, p.ssm_state_indices,
+            p.cu_seqlens, p.state, p.state_slot_stride, p.out, p.B, p.H, p.HV, p.update_conv_cache, p.lower_bound,
+            p.scale, p.onorm_eps, p.stream);
     }
     else
     {
-        launch_kda_decode_many_heads_selected<kHeads, kApplyOnorm, kUseLowerBound, kApplyBetaSigmoid>(p.x_q, p.x_k,
-            p.x_v, p.w_q_t, p.w_k_t, p.w_v_t, p.bias_q, p.bias_k, p.bias_v, p.cs_q, p.cs_k, p.cs_v, p.a_log, p.g,
-            p.dt_bias, p.beta, p.onorm_g, p.onorm_weight, p.ssm_state_indices, p.cu_seqlens, p.state, p.out, p.B, p.H,
-            p.HV, p.update_conv_cache, p.lower_bound, p.scale, p.onorm_eps, p.stream);
+        launch_kda_decode_many_heads_selected<kHeads, kUseStaticDecodeLayout, kApplyOnorm, kUseLowerBound,
+            kApplyBetaSigmoid>(p.x_q, p.x_k, p.x_v, p.w_q_t, p.w_k_t, p.w_v_t, p.bias_q, p.bias_k, p.bias_v, p.cs_q,
+            p.cs_k, p.cs_v, p.a_log, p.g, p.dt_bias, p.beta, p.onorm_g, p.onorm_weight, p.ssm_state_indices,
+            p.cu_seqlens, p.state, p.state_slot_stride, p.out, p.B, p.H, p.HV, p.update_conv_cache, p.lower_bound,
+            p.scale, p.onorm_eps, p.stream);
     }
 }
 
-template <bool kCompact, int kHeads, bool kApplyOnorm, bool kUseLowerBound>
+template <bool kCompact, int kHeads, bool kUseStaticDecodeLayout, bool kApplyOnorm, bool kUseLowerBound>
 void dispatch_kda_decode_beta(KdaDecodeLaunchParams const& p, bool apply_beta_sigmoid)
 {
     if (apply_beta_sigmoid)
     {
-        launch_kda_decode_selected_backend<kCompact, kHeads, kApplyOnorm, kUseLowerBound, true>(p);
+        launch_kda_decode_selected_backend<kCompact, kHeads, kUseStaticDecodeLayout, kApplyOnorm, kUseLowerBound,
+            true>(p);
     }
     else
     {
-        launch_kda_decode_selected_backend<kCompact, kHeads, kApplyOnorm, kUseLowerBound, false>(p);
+        launch_kda_decode_selected_backend<kCompact, kHeads, kUseStaticDecodeLayout, kApplyOnorm, kUseLowerBound,
+            false>(p);
     }
 }
 
-template <bool kCompact, int kHeads, bool kApplyOnorm>
+template <bool kCompact, int kHeads, bool kUseStaticDecodeLayout, bool kApplyOnorm>
 void dispatch_kda_decode_decay(KdaDecodeLaunchParams const& p, bool use_lower_bound, bool apply_beta_sigmoid)
 {
     if (use_lower_bound)
     {
-        dispatch_kda_decode_beta<kCompact, kHeads, kApplyOnorm, true>(p, apply_beta_sigmoid);
+        dispatch_kda_decode_beta<kCompact, kHeads, kUseStaticDecodeLayout, kApplyOnorm, true>(p, apply_beta_sigmoid);
     }
     else
     {
-        dispatch_kda_decode_beta<kCompact, kHeads, kApplyOnorm, false>(p, apply_beta_sigmoid);
+        dispatch_kda_decode_beta<kCompact, kHeads, kUseStaticDecodeLayout, kApplyOnorm, false>(p, apply_beta_sigmoid);
     }
 }
 
-template <bool kCompact, int kHeads>
+template <bool kCompact, int kHeads, bool kUseStaticDecodeLayout>
 void dispatch_kda_decode_features(
     KdaDecodeLaunchParams const& p, bool apply_onorm, bool use_lower_bound, bool apply_beta_sigmoid)
 {
     if (apply_onorm)
     {
-        dispatch_kda_decode_decay<kCompact, kHeads, true>(p, use_lower_bound, apply_beta_sigmoid);
+        dispatch_kda_decode_decay<kCompact, kHeads, kUseStaticDecodeLayout, true>(
+            p, use_lower_bound, apply_beta_sigmoid);
     }
     else
     {
-        dispatch_kda_decode_decay<kCompact, kHeads, false>(p, use_lower_bound, apply_beta_sigmoid);
+        dispatch_kda_decode_decay<kCompact, kHeads, kUseStaticDecodeLayout, false>(
+            p, use_lower_bound, apply_beta_sigmoid);
+    }
+}
+
+template <bool kCompact, int kHeads>
+void dispatch_kda_decode_layout(
+    KdaDecodeLaunchParams const& p, bool apply_onorm, bool use_lower_bound, bool apply_beta_sigmoid)
+{
+    if (p.ssm_state_indices == nullptr)
+    {
+        dispatch_kda_decode_features<kCompact, kHeads, true>(
+            p, apply_onorm, use_lower_bound, apply_beta_sigmoid);
+    }
+    else
+    {
+        dispatch_kda_decode_features<kCompact, kHeads, false>(
+            p, apply_onorm, use_lower_bound, apply_beta_sigmoid);
     }
 }
 
@@ -1561,39 +1606,39 @@ void launch_kda_decode_compact_heads_cuda(void const* x_q, void const* x_k, void
     void const* w_k_t, void const* w_v_t, void const* bias_q, void const* bias_k, void const* bias_v, void* cs_q,
     void* cs_k, void* cs_v, float const* a_log, void const* g, float const* dt_bias, void const* beta,
     void const* onorm_g, float const* onorm_weight, int const* ssm_state_indices, int const* cu_seqlens, float* state,
-    void* out, int B, int H, int HV, bool apply_onorm, bool update_conv_cache, bool use_lower_bound,
-    bool apply_beta_sigmoid, float lower_bound, float scale, float onorm_eps, cudaStream_t stream)
+    int64_t state_slot_stride, void* out, int B, int H, int HV, bool apply_onorm, bool update_conv_cache,
+    bool use_lower_bound, bool apply_beta_sigmoid, float lower_bound, float scale, float onorm_eps, cudaStream_t stream)
 {
     KdaDecodeLaunchParams const params{x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v,
-        a_log, g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, out, B, H, HV,
-        update_conv_cache, lower_bound, scale, onorm_eps, stream};
-    dispatch_kda_decode_features<true, 2>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid);
+        a_log, g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B,
+        H, HV, update_conv_cache, lower_bound, scale, onorm_eps, stream};
+    dispatch_kda_decode_layout<true, 2>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid);
 }
 
 void launch_kda_decode_many_heads_cuda(void const* x_q, void const* x_k, void const* x_v, void const* w_q_t,
     void const* w_k_t, void const* w_v_t, void const* bias_q, void const* bias_k, void const* bias_v, void* cs_q,
     void* cs_k, void* cs_v, float const* a_log, void const* g, float const* dt_bias, void const* beta,
     void const* onorm_g, float const* onorm_weight, int const* ssm_state_indices, int const* cu_seqlens, float* state,
-    void* out, int B, int H, int HV, bool apply_onorm, bool update_conv_cache, bool use_lower_bound,
-    bool apply_beta_sigmoid, float lower_bound, float scale, float onorm_eps, cudaStream_t stream)
+    int64_t state_slot_stride, void* out, int B, int H, int HV, bool apply_onorm, bool update_conv_cache,
+    bool use_lower_bound, bool apply_beta_sigmoid, float lower_bound, float scale, float onorm_eps, cudaStream_t stream)
 {
     KdaDecodeLaunchParams const params{x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v,
-        a_log, g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, out, B, H, HV,
-        update_conv_cache, lower_bound, scale, onorm_eps, stream};
+        a_log, g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B,
+        H, HV, update_conv_cache, lower_bound, scale, onorm_eps, stream};
     switch (H)
     {
-    case 1: dispatch_kda_decode_features<false, 1>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
-    case 2: dispatch_kda_decode_features<false, 2>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
-    case 3: dispatch_kda_decode_features<false, 3>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
-    case 4: dispatch_kda_decode_features<false, 4>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
-    case 6: dispatch_kda_decode_features<false, 6>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
-    case 8: dispatch_kda_decode_features<false, 8>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
-    case 12: dispatch_kda_decode_features<false, 12>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
-    case 16: dispatch_kda_decode_features<false, 16>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
-    case 24: dispatch_kda_decode_features<false, 24>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
-    case 32: dispatch_kda_decode_features<false, 32>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
-    case 48: dispatch_kda_decode_features<false, 48>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
-    case 96: dispatch_kda_decode_features<false, 96>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 1: dispatch_kda_decode_layout<false, 1>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 2: dispatch_kda_decode_layout<false, 2>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 3: dispatch_kda_decode_layout<false, 3>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 4: dispatch_kda_decode_layout<false, 4>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 6: dispatch_kda_decode_layout<false, 6>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 8: dispatch_kda_decode_layout<false, 8>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 12: dispatch_kda_decode_layout<false, 12>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 16: dispatch_kda_decode_layout<false, 16>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 24: dispatch_kda_decode_layout<false, 24>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 32: dispatch_kda_decode_layout<false, 32>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 48: dispatch_kda_decode_layout<false, 48>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 96: dispatch_kda_decode_layout<false, 96>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
     default: TLLM_CHECK_WITH_INFO(false, "KDA decode does not support numHeads=%d", H);
     }
 }
@@ -1609,18 +1654,20 @@ void invokeKdaDecode(KdaDecodeParams const& params, cudaStream_t stream)
         launch_kda_decode_compact_heads_cuda(params.xQ, params.xK, params.xV, params.wQT, params.wKT, params.wVT,
             params.biasQ, params.biasK, params.biasV, params.convStateQ, params.convStateK, params.convStateV,
             params.logA, params.gate, params.dtBias, params.beta, params.outputNormGate, params.outputNormWeight,
-            params.ssmStateIndices, params.cuSeqlens, params.state, params.output, params.batchSize, params.numHeads,
-            params.numValueHeads, params.applyOutputNorm, params.updateConvCache, params.useLowerBound,
-            params.applyBetaSigmoid, params.lowerBound, params.scale, params.outputNormEps, stream);
+            params.ssmStateIndices, params.cuSeqlens, params.state, params.stateSlotStride, params.output,
+            params.batchSize, params.numHeads, params.numValueHeads, params.applyOutputNorm, params.updateConvCache,
+            params.useLowerBound, params.applyBetaSigmoid, params.lowerBound, params.scale, params.outputNormEps,
+            stream);
     }
     else
     {
         launch_kda_decode_many_heads_cuda(params.xQ, params.xK, params.xV, params.wQT, params.wKT, params.wVT,
             params.biasQ, params.biasK, params.biasV, params.convStateQ, params.convStateK, params.convStateV,
             params.logA, params.gate, params.dtBias, params.beta, params.outputNormGate, params.outputNormWeight,
-            params.ssmStateIndices, params.cuSeqlens, params.state, params.output, params.batchSize, params.numHeads,
-            params.numValueHeads, params.applyOutputNorm, params.updateConvCache, params.useLowerBound,
-            params.applyBetaSigmoid, params.lowerBound, params.scale, params.outputNormEps, stream);
+            params.ssmStateIndices, params.cuSeqlens, params.state, params.stateSlotStride, params.output,
+            params.batchSize, params.numHeads, params.numValueHeads, params.applyOutputNorm, params.updateConvCache,
+            params.useLowerBound, params.applyBetaSigmoid, params.lowerBound, params.scale, params.outputNormEps,
+            stream);
     }
     TLLM_CUDA_CHECK(cudaGetLastError());
 }

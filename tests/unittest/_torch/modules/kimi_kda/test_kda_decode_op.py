@@ -53,12 +53,12 @@ def _make_attention_pair() -> tuple[KimiKDALinearAttention, KimiKDALinearAttenti
     return optimized, reference
 
 
-def _make_cache() -> KimiKDACachedState:
+def _make_cache(batch_size: int = BATCH_SIZE) -> KimiKDACachedState:
     projection_size = NUM_HEADS * HEAD_DIM
     return KimiKDACachedState(
         conv_state_q=(
             torch.randn(
-                BATCH_SIZE,
+                batch_size,
                 projection_size,
                 CONV_KERNEL_SIZE,
                 dtype=torch.bfloat16,
@@ -68,7 +68,7 @@ def _make_cache() -> KimiKDACachedState:
         ),
         conv_state_k=(
             torch.randn(
-                BATCH_SIZE,
+                batch_size,
                 projection_size,
                 CONV_KERNEL_SIZE,
                 dtype=torch.bfloat16,
@@ -78,7 +78,7 @@ def _make_cache() -> KimiKDACachedState:
         ),
         conv_state_v=(
             torch.randn(
-                BATCH_SIZE,
+                batch_size,
                 projection_size,
                 CONV_KERNEL_SIZE,
                 dtype=torch.bfloat16,
@@ -88,7 +88,7 @@ def _make_cache() -> KimiKDACachedState:
         ),
         recurrent_state=(
             torch.randn(
-                BATCH_SIZE,
+                batch_size,
                 NUM_HEADS,
                 HEAD_DIM,
                 HEAD_DIM,
@@ -140,3 +140,76 @@ def test_optimized_decode_matches_fla_reference() -> None:
     _assert_close(actual_cache.conv_state_k, expected_cache.conv_state_k)
     _assert_close(actual_cache.conv_state_v, expected_cache.conv_state_v)
     assert optimized.decode_kernel_source()
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("slot_gap", [0, 4096], ids=["dense-pool", "strided-pool"])
+def test_optimized_decode_updates_indexed_recurrent_state_pool_in_place(
+    slot_gap: int,
+) -> None:
+    torch.manual_seed(1)
+    batch_size = 3
+    optimized, _ = _make_attention_pair()
+    hidden_states = (
+        torch.randn(
+            batch_size,
+            1,
+            HIDDEN_SIZE,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.05
+    )
+    initial_cache = _make_cache(batch_size)
+
+    local_output, local_cache = optimized.forward_decode(
+        hidden_states, copy.deepcopy(initial_cache))
+
+    slots = batch_size + 3
+    slot_indices = torch.tensor([5, 4, 3],
+                                dtype=torch.int32,
+                                device="cuda")
+    dense_slot_stride = NUM_HEADS * HEAD_DIM * HEAD_DIM
+    state_storage = torch.randn(
+        slots * (dense_slot_stride + slot_gap),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    state_pool = state_storage.as_strided(
+        (slots, NUM_HEADS, HEAD_DIM, HEAD_DIM),
+        (dense_slot_stride + slot_gap, HEAD_DIM * HEAD_DIM, HEAD_DIM, 1),
+    )
+    state_pool.mul_(0.2)
+    assert state_pool.is_contiguous() is (slot_gap == 0)
+    state_pool.index_copy_(0, slot_indices.long(),
+                           initial_cache.recurrent_state)
+    unselected_indices = torch.tensor([0, 1, 2], device="cuda")
+    unselected_before = state_pool.index_select(0,
+                                                unselected_indices).clone()
+    indexed_cache = KimiKDACachedState(
+        conv_state_q=initial_cache.conv_state_q.clone(),
+        conv_state_k=initial_cache.conv_state_k.clone(),
+        conv_state_v=initial_cache.conv_state_v.clone(),
+        recurrent_state=state_pool,
+    )
+
+    indexed_output, indexed_cache = optimized.forward_decode(
+        hidden_states,
+        indexed_cache,
+        ssm_state_indices=slot_indices,
+    )
+
+    assert indexed_cache.recurrent_state is state_pool
+    torch.testing.assert_close(indexed_output, local_output, rtol=0, atol=0)
+    torch.testing.assert_close(
+        state_pool.index_select(0, slot_indices.long()),
+        local_cache.recurrent_state,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        state_pool.index_select(0, unselected_indices),
+        unselected_before,
+        rtol=0,
+        atol=0,
+    )

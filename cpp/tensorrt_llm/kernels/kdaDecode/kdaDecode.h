@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/config.h"
 
+#include <cstdint>
 #include <cuda_runtime_api.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -49,6 +50,7 @@ struct KdaDecodeParams
     int const* ssmStateIndices;
     int const* cuSeqlens;
     float* state;
+    int64_t stateSlotStride;
     void* output;
     int batchSize;
     int numHeads;

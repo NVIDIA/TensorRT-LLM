@@ -38,8 +38,8 @@ constexpr int kKernelWidth = 4;
 void validate_kda_decode_fusion_inputs(at::Tensor x_q, at::Tensor x_k, at::Tensor x_v, at::Tensor w_q_t,
     at::Tensor w_k_t, at::Tensor w_v_t, at::Tensor bias_q, at::Tensor bias_k, at::Tensor bias_v, at::Tensor cs_q,
     at::Tensor cs_k, at::Tensor cs_v, at::Tensor a_log, at::Tensor g, at::Tensor dt_bias, at::Tensor beta,
-    at::Tensor onorm_g, at::Tensor onorm_weight, at::Tensor ssm_state_indices, at::Tensor cu_seqlens, at::Tensor state,
-    at::Tensor out, bool update_conv_cache)
+    at::Tensor onorm_g, at::Tensor onorm_weight, std::optional<at::Tensor> const& ssm_state_indices,
+    at::Tensor cu_seqlens, at::Tensor state, at::Tensor out, bool update_conv_cache)
 {
     TORCH_CHECK(x_q.is_cuda() && x_q.scalar_type() == at::kBFloat16, "x_q must be a CUDA bfloat16 tensor");
     TORCH_CHECK(x_k.is_cuda() && x_k.scalar_type() == at::kBFloat16, "x_k must be a CUDA bfloat16 tensor");
@@ -80,20 +80,43 @@ void validate_kda_decode_fusion_inputs(at::Tensor x_q, at::Tensor x_k, at::Tenso
     TORCH_CHECK(x_k.size(1) == B && x_k.size(2) == H && x_v.size(1) == B,
         "x_q, x_k, and x_v batch/head dimensions are inconsistent");
     TORCH_CHECK(HV % H == 0, "HV must be divisible by H");
-    TORCH_CHECK(state.is_contiguous(), "state must be contiguous");
-    TORCH_CHECK(state.size(0) >= B && state.size(1) == HV && state.size(2) == kDimV && state.size(3) == kDimK,
+    TORCH_CHECK(state.dim() == 4 && state.size(0) >= B && state.size(1) == HV && state.size(2) == kDimV
+            && state.size(3) == kDimK,
         "state must have shape [slots, HV, 128, 128] with slots >= B");
+    TORCH_CHECK(state.stride(3) == 1 && state.stride(2) == kDimK && state.stride(1) == kDimV * kDimK
+            && state.stride(0) >= HV * kDimV * kDimK,
+        "state must be contiguous within each [HV, 128, 128] slot and have a non-overlapping slot stride");
     TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
     TORCH_CHECK(out.size(0) == B && out.size(1) == 1 && out.size(2) == HV && out.size(3) == kDimV,
         "out must have shape [B, 1, HV, 128]");
 
-    TORCH_CHECK(ssm_state_indices.is_cuda() && ssm_state_indices.scalar_type() == at::kInt,
-        "ssm_state_indices must be a CUDA int32 tensor");
+    if (ssm_state_indices.has_value())
+    {
+        TORCH_CHECK(ssm_state_indices->is_cuda() && ssm_state_indices->scalar_type() == at::kInt,
+            "ssm_state_indices must be a CUDA int32 tensor");
+        TORCH_CHECK(
+            ssm_state_indices->is_contiguous() && ssm_state_indices->dim() == 1 && ssm_state_indices->size(0) == B,
+            "ssm_state_indices must be contiguous with shape [B]");
+    }
     TORCH_CHECK(cu_seqlens.is_cuda() && cu_seqlens.scalar_type() == at::kInt, "cu_seqlens must be a CUDA int32 tensor");
+    TORCH_CHECK(cu_seqlens.is_contiguous() && cu_seqlens.dim() == 1 && cu_seqlens.size(0) == B + 1,
+        "cu_seqlens must be contiguous with shape [B + 1]");
 
     if (update_conv_cache)
     {
         TORCH_CHECK(H == HV, "conv state update currently assumes H == HV");
+        TORCH_CHECK(cs_q.dim() == 3 && cs_k.dim() == 3 && cs_v.dim() == 3,
+            "update_conv_cache expects rank-3 conv-state pools");
+        TORCH_CHECK(cs_q.size(0) >= state.size(0) && cs_k.size(0) >= state.size(0)
+                && cs_v.size(0) >= state.size(0),
+            "conv-state pools must cover every recurrent-state slot");
+        TORCH_CHECK(cs_q.size(1) == H * kDimK && cs_k.size(1) == H * kDimK
+                && cs_v.size(1) == HV * kDimV && cs_q.size(2) == kKernelWidth - 1
+                && cs_k.size(2) == kKernelWidth - 1 && cs_v.size(2) == kKernelWidth - 1,
+            "update_conv_cache expects [slots, dim, 3] conv-state pools");
+        TORCH_CHECK(cs_q.stride(0) == 3 * H * kDimK && cs_k.stride(0) == 3 * H * kDimK
+                && cs_v.stride(0) == 3 * HV * kDimV,
+            "update_conv_cache expects densely packed conv-state slots");
         TORCH_CHECK(cs_q.stride(1) == 1 && cs_k.stride(1) == 1,
             "update_conv_cache expects cs_q/cs_k transposed layout with "
             "contiguous dim axis");
@@ -106,6 +129,14 @@ void validate_kda_decode_fusion_inputs(at::Tensor x_q, at::Tensor x_k, at::Tenso
     }
     else
     {
+        TORCH_CHECK(cs_q.dim() == 3 && cs_k.dim() == 3 && cs_v.dim() == 3,
+            "batch-local conv states must be rank-3");
+        TORCH_CHECK(cs_q.size(0) == B && cs_k.size(0) == B && cs_v.size(0) == B
+                && cs_q.size(1) == H * kDimK && cs_k.size(1) == H * kDimK
+                && cs_v.size(1) == HV * kDimV && cs_q.size(2) == kKernelWidth - 1
+                && cs_k.size(2) == kKernelWidth - 1 && cs_v.size(2) == kKernelWidth - 1,
+            "batch-local conv states must have shapes [B, H*128, 3], "
+            "[B, H*128, 3], and [B, HV*128, 3]");
         TORCH_CHECK(cs_q.is_contiguous(), "cs_q must be contiguous [B, H*K, 3]");
         TORCH_CHECK(cs_k.is_contiguous(), "cs_k must be contiguous [B, H*K, 3]");
         TORCH_CHECK(cs_v.is_contiguous(), "cs_v must be contiguous [B, HV*V, 3]");
@@ -115,9 +146,9 @@ void validate_kda_decode_fusion_inputs(at::Tensor x_q, at::Tensor x_k, at::Tenso
 void launch_selected_kernel(at::Tensor x_q, at::Tensor x_k, at::Tensor x_v, at::Tensor w_q_t, at::Tensor w_k_t,
     at::Tensor w_v_t, at::Tensor bias_q, at::Tensor bias_k, at::Tensor bias_v, at::Tensor cs_q, at::Tensor cs_k,
     at::Tensor cs_v, at::Tensor a_log, at::Tensor g, at::Tensor dt_bias, at::Tensor beta, at::Tensor onorm_g,
-    at::Tensor onorm_weight, at::Tensor ssm_state_indices, at::Tensor cu_seqlens, at::Tensor state, at::Tensor out,
-    bool apply_onorm, bool update_conv_cache, bool use_lower_bound, bool apply_beta_sigmoid, double lower_bound,
-    double scale, double onorm_eps)
+    at::Tensor onorm_weight, std::optional<at::Tensor> const& ssm_state_indices, at::Tensor cu_seqlens, at::Tensor state,
+    at::Tensor out, bool apply_onorm, bool update_conv_cache, bool use_lower_bound, bool apply_beta_sigmoid,
+    double lower_bound, double scale, double onorm_eps)
 {
     int const B = static_cast<int>(x_q.size(1));
     int const H = static_cast<int>(x_q.size(2));
@@ -127,9 +158,10 @@ void launch_selected_kernel(at::Tensor x_q, at::Tensor x_k, at::Tensor x_v, at::
         w_q_t.data_ptr(), w_k_t.data_ptr(), w_v_t.data_ptr(), bias_q.data_ptr(), bias_k.data_ptr(), bias_v.data_ptr(),
         cs_q.data_ptr(), cs_k.data_ptr(), cs_v.data_ptr(), a_log.data_ptr<float>(), g.data_ptr(),
         dt_bias.data_ptr<float>(), beta.data_ptr(), onorm_g.data_ptr(), onorm_weight.data_ptr<float>(),
-        ssm_state_indices.data_ptr<int>(), cu_seqlens.data_ptr<int>(), state.data_ptr<float>(), out.data_ptr(), B, H,
-        HV, apply_onorm, update_conv_cache, use_lower_bound, apply_beta_sigmoid, static_cast<float>(lower_bound),
-        static_cast<float>(scale), static_cast<float>(onorm_eps)};
+        ssm_state_indices.has_value() ? ssm_state_indices->data_ptr<int>() : nullptr, cu_seqlens.data_ptr<int>(),
+        state.data_ptr<float>(), state.stride(0), out.data_ptr(), B, H, HV, apply_onorm, update_conv_cache,
+        use_lower_bound, apply_beta_sigmoid, static_cast<float>(lower_bound), static_cast<float>(scale),
+        static_cast<float>(onorm_eps)};
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     tensorrt_llm::kernels::kdaDecode::invokeKdaDecode(params, stream);
@@ -139,9 +171,9 @@ void launch_selected_kernel(at::Tensor x_q, at::Tensor x_k, at::Tensor x_v, at::
 at::Tensor kda_decode_fusion_forward(at::Tensor x_q, at::Tensor x_k, at::Tensor x_v, at::Tensor w_q_t, at::Tensor w_k_t,
     at::Tensor w_v_t, at::Tensor bias_q, at::Tensor bias_k, at::Tensor bias_v, at::Tensor cs_q, at::Tensor cs_k,
     at::Tensor cs_v, at::Tensor a_log, at::Tensor g, at::Tensor dt_bias, at::Tensor beta, at::Tensor onorm_g,
-    at::Tensor onorm_weight, at::Tensor ssm_state_indices, at::Tensor cu_seqlens, at::Tensor state, bool apply_onorm,
-    bool update_conv_cache, bool use_lower_bound, bool apply_beta_sigmoid, double lower_bound, double scale,
-    double onorm_eps, std::optional<at::Tensor> output)
+    at::Tensor onorm_weight, std::optional<at::Tensor> ssm_state_indices, at::Tensor cu_seqlens, at::Tensor state,
+    bool apply_onorm, bool update_conv_cache, bool use_lower_bound, bool apply_beta_sigmoid, double lower_bound,
+    double scale, double onorm_eps, std::optional<at::Tensor> output)
 {
     int const B = static_cast<int>(x_q.size(1));
     int const HV = static_cast<int>(x_v.size(2));
@@ -168,7 +200,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor bias_v, Tensor(a!) conv_state_q, Tensor(b!) conv_state_k, "
         "Tensor(c!) conv_state_v, Tensor a_log, Tensor g, Tensor dt_bias, "
         "Tensor beta, Tensor onorm_g, Tensor onorm_weight, "
-        "Tensor ssm_state_indices, Tensor cu_seqlens, Tensor(d!) state, "
+        "Tensor? ssm_state_indices, Tensor cu_seqlens, Tensor(d!) state, "
         "bool apply_onorm, bool update_conv_cache, bool use_lower_bound, "
         "bool apply_beta_sigmoid, float lower_bound, float scale, "
         "float onorm_eps, Tensor(e!)? output=None) -> Tensor(e!)");

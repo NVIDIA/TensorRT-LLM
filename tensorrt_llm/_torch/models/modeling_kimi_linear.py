@@ -106,6 +106,9 @@ from .modeling_utils import DecoderModel, register_auto_model
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = os.environ.get(
     "TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", "0") == "1"
 
+_KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get(
+    "TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
+
 # Routed-expert MoE TP/EP split overrides (read per model init, not import).
 # Highest precedence; either one may be set alone, the other is derived from
 # tp_size. Without them, an explicit moe_tensor_parallel_size /
@@ -818,6 +821,7 @@ class KimiKDARuntime(nn.Module):
         from ..modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
         lin = cfg.linear_attn_config
         self.layer_idx = layer_idx
+        self._use_indexed_ssm_pool = _KDA_INDEXED_STATE_POOL_ENABLED
         # Attention-family TP semantics (Qwen3-Next GatedDeltaNet pattern,
         # gdn_mixer.py): replicated under attention-DP — each rank runs
         # its own batch with the full head set — and head-sharded across
@@ -956,6 +960,9 @@ class KimiKDARuntime(nn.Module):
                         state_indices[num_prefills:],
                         mamba_metadata,
                         layer_cache,
+                        ssm_state_indices=(
+                            mamba_metadata.state_indices[num_prefills:batch_size]
+                            if self._use_indexed_ssm_pool else None),
                     ))
             else:
                 # Speculative verification: each generation request carries
@@ -1087,7 +1094,8 @@ class KimiKDARuntime(nn.Module):
         return self._output_gate_and_proj(x, o)
 
     def _forward_decode(self, x2d, conv_pool, ssm_pool, slot_indices,
-                        mamba_metadata=None, layer_cache=None) -> torch.Tensor:
+                        mamba_metadata=None, layer_cache=None,
+                        ssm_state_indices=None) -> torch.Tensor:
         """Plain T=1 decode, fast path.
 
         Calls ``trtllm::kda_decode`` directly with kernel-native layouts
@@ -1104,18 +1112,28 @@ class KimiKDARuntime(nn.Module):
         * constant tensors (transposed conv weights, fp32 A_log/dt_bias/
           o_norm weight) reused instead of rebuilt per step.
 
-        NOTE: every compiled launch of the decode kernel uses the static
-        layout (``slot = bos = batch row``; ``ssm_state_indices`` /
-        ``cu_seqlens`` are dead), so state and conv windows must be
-        gathered batch-row-dense here. Passing the pools directly (saving
-        the fp32 state gather+scatter, ~5 us/layer) needs a CUDA-side
-        dynamic-layout dispatch flag — documented follow-up.
+        The conv windows remain gathered batch-row-dense. When stable
+        int32 slot indices are supplied, the recurrent-state pool is passed
+        directly and the CUDA wrapper selects its indexed-state launch;
+        otherwise the state uses the batch-row-dense static layout.
         """
         mixer = self.mixer
+        if (mixer.decode_kernel_path != "optimized"
+                or mixer.wrong_state_layout):
+            ssm_state_indices = None
+        if ssm_state_indices is not None:
+            logger.info_once(
+                "Kimi K3 KDA indexed recurrent-state pool path is active",
+                key="kimi_k3_kda_indexed_state_pool")
+        else:
+            logger.info_once(
+                "Kimi K3 KDA static recurrent-state path is active",
+                key="kimi_k3_kda_static_state")
         if (self._in_proj_weight is None or mamba_metadata is None
                 or ssm_pool.dtype != torch.float32):
             return self._forward_decode_ref(x2d, conv_pool, ssm_pool,
-                                            slot_indices, layer_cache)
+                                            slot_indices, layer_cache,
+                                            ssm_state_indices)
 
         d = self.proj_size
         hd = mixer.head_dim
@@ -1134,7 +1152,8 @@ class KimiKDARuntime(nn.Module):
                 # Never allocate inside CUDA graph capture; the reference
                 # path is capture-safe (just slower).
                 return self._forward_decode_ref(x2d, conv_pool, ssm_pool,
-                                                slot_indices, layer_cache)
+                                                slot_indices, layer_cache,
+                                                ssm_state_indices)
             buf = torch.empty(3,
                               max(conv_pool.shape[0], B),
                               d,
@@ -1158,9 +1177,8 @@ class KimiKDARuntime(nn.Module):
         cs_dense = buf[:, :B]
         cs_dense.copy_(cs.view(B, 3, d, W)[:, :, :, 1:].permute(1, 0, 2, 3))
 
-        # Recurrent state: gathered batch-row-dense copy, updated in place
-        # by the kernel, written back below.
-        state = ssm_pool.index_select(0, slot_indices)
+        state = (ssm_pool if ssm_state_indices is not None else
+                 ssm_pool.index_select(0, slot_indices))
 
         o = mixer._dispatch.decode_kda(
             x_q=x_qkv[:, :d].unflatten(-1, (H, hd)).unsqueeze(0),
@@ -1183,9 +1201,7 @@ class KimiKDARuntime(nn.Module):
             onorm_g=onorm_g.unflatten(-1, (H, hd)).unsqueeze(0),
             onorm_weight=self._onorm_w_f32,
             out=None,
-            # Dead in the static-layout kernel; persistent buffers keep
-            # the wrapper from launching torch.arange every call.
-            ssm_state_indices=mamba_metadata._arange_buffer[:B],
+            ssm_state_indices=ssm_state_indices,
             cu_seqlens=mamba_metadata._arange_buffer[:B + 1],
             scale=hd**-0.5,
             onorm_eps=mixer.o_norm.eps,
@@ -1194,7 +1210,8 @@ class KimiKDARuntime(nn.Module):
             verbose=False,
             update_conv_cache=False,
         )
-        ssm_pool.index_copy_(0, slot_indices, state)
+        if ssm_state_indices is None:
+            ssm_pool.index_copy_(0, slot_indices, state)
 
         # Roll the HF-layout conv pool by one token: new window =
         # [old columns 1..W-1, x_new]. One cat + one scatter.
@@ -1212,7 +1229,8 @@ class KimiKDARuntime(nn.Module):
         return mixer.o_proj(o.view(B, d))
 
     def _forward_decode_ref(self, x2d, conv_pool, ssm_pool, slot_indices,
-                            layer_cache=None) -> torch.Tensor:
+                            layer_cache=None,
+                            ssm_state_indices=None) -> torch.Tensor:
         from ..modules.kimi_kda.kimi_kda_mixer import KimiKDACachedState
 
         mixer = self.mixer
@@ -1225,9 +1243,14 @@ class KimiKDARuntime(nn.Module):
             conv_state_q=conv_q,
             conv_state_k=conv_k,
             conv_state_v=conv_v,
-            recurrent_state=ssm_pool.index_select(0, slot_indices),
+            recurrent_state=(ssm_pool if ssm_state_indices is not None else
+                             ssm_pool.index_select(0, slot_indices)),
         )
-        out, new_cache = mixer.forward_decode(x, cache)
+        out, new_cache = mixer.forward_decode(
+            x,
+            cache,
+            ssm_state_indices=ssm_state_indices,
+        )
 
         conv_pool.index_copy_(
             0,
@@ -1241,8 +1264,9 @@ class KimiKDARuntime(nn.Module):
                 dim=1,
             ).to(conv_pool.dtype),
         )
-        ssm_pool.index_copy_(
-            0, slot_indices, new_cache.recurrent_state.to(ssm_pool.dtype))
+        if ssm_state_indices is None:
+            ssm_pool.index_copy_(
+                0, slot_indices, new_cache.recurrent_state.to(ssm_pool.dtype))
         # Fused-verify replay caches: keep the committed conv window in
         # sync with the plain-decode advance. NOTE: this path is only
         # correct for requests with no pending accepted drafts

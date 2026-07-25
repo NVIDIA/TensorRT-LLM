@@ -86,7 +86,11 @@ def run_kda_decode_fusion_cuda(
     verbose: bool = False,
     update_conv_cache: bool = False,
 ) -> torch.Tensor:
-    """Run CUDA KDA decode fusion for the tuned decode shapes."""
+    """Run CUDA KDA decode fusion for the tuned decode shapes.
+
+    ``ssm_state_indices=None`` selects the tuned batch-local static layout,
+    while a tensor selects the indexed state-pool layout.
+    """
     for name, tensor in (
         ("x_q", x_q),
         ("x_k", x_k),
@@ -120,8 +124,9 @@ def run_kda_decode_fusion_cuda(
         raise ValueError(
             "CUDA KDA decode fusion supports H == HV in {1,2,3,4,6,8,12,16,24,32,48,96}"
         )
-    if not state.is_contiguous():
-        raise ValueError("state must be contiguous because it is updated in place")
+    if ssm_state_indices is None and not state.is_contiguous():
+        raise ValueError(
+            "state must be contiguous because it is updated in place")
     if out is not None:
         _require_cuda_bf16("out", out)
         if not out.is_contiguous():
@@ -169,15 +174,6 @@ def run_kda_decode_fusion_cuda(
                 "update_conv_cache expects transposed conv-state layout: "
                 "shape [B, dim, 3], stride(1)=1, stride(2)=dim"
             )
-
-    if ssm_state_indices is None:
-        ssm_state_indices = torch.arange(B, dtype=torch.int32, device=device)
-    else:
-        if not ssm_state_indices.is_cuda or ssm_state_indices.dtype is not torch.int32:
-            raise TypeError("ssm_state_indices must be a CUDA int32 tensor")
-        if tuple(ssm_state_indices.shape) != (B,):
-            raise ValueError("ssm_state_indices must have shape [B]")
-        ssm_state_indices = ssm_state_indices.contiguous()
 
     if cu_seqlens is None:
         cu_seqlens = torch.arange(B + 1, dtype=torch.int32, device=device)
