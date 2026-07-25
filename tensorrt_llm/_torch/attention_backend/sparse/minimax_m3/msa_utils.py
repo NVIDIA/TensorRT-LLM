@@ -51,27 +51,32 @@ def msa_package_available() -> bool:
     return importlib.util.find_spec("fmha_sm100") is not None
 
 
-# Symbol added by 3rdparty/patches/msa_strided_paged_kv.patch. Its presence in
-# the imported module confirms the downstream MSA patch was applied to the
-# loaded fmha_sm100 sources.
-_MSA_PATCH_MARKER = "_prepare_paged_hnd_input"
+# One symbol per module touched by 3rdparty/patches/msa_strided_paged_kv.patch.
+_MSA_PATCH_MARKERS = (
+    ("fmha_sm100.cute.interface", "_prepare_paged_hnd_input"),
+    ("fmha_sm100.sparse_fmha_adapter", "_page_table_for_plan"),
+)
 
 
 def _require_msa_patch() -> None:
     """Fail fast if the loaded fmha_sm100 is missing the downstream patch.
 
-    The patch avoids paged K/V materialization during prefill and is applied in
-    place on the 3rdparty/MSA submodule by scripts/build_wheel.py. An unpatched
-    copy would silently regress prefill, so raise an actionable error that names
-    the loaded module file.
+    The patch keeps prefill from materializing the paged K/V cache and builds
+    the sparse page table with one gather per step. scripts/build_wheel.py
+    applies it in place on the 3rdparty/MSA submodule. A copy missing either
+    marker would silently regress prefill or per-step host time, so report
+    every absent symbol with the file it was expected in.
     """
-    from fmha_sm100.cute import interface
+    missing = []
+    for module_name, symbol in _MSA_PATCH_MARKERS:
+        module = importlib.import_module(module_name)
+        if not hasattr(module, symbol):
+            missing.append(f"'{symbol}' in '{getattr(module, '__file__', '<unknown>')}'")
 
-    if not hasattr(interface, _MSA_PATCH_MARKER):
+    if missing:
         raise RuntimeError(
             "The imported fmha_sm100 is missing the TensorRT-LLM MSA patch "
-            f"(expected symbol '{_MSA_PATCH_MARKER}' in "
-            f"'{getattr(interface, '__file__', '<unknown>')}'). Rebuild with "
+            f"(expected {', '.join(missing)}). Rebuild with "
             "scripts/build_wheel.py, which applies "
             "3rdparty/patches/msa_strided_paged_kv.patch in place, or apply the "
             "patch to 3rdparty/MSA manually."
