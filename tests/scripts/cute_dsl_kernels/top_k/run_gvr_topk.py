@@ -72,6 +72,8 @@ def _compile(
     cand_cap: int = 5120,
     accept_cap: "int | None" = None,
     kc_override: "int | None" = None,
+    self_scan: bool = False,
+    cap_c: "int | None" = None,
 ):
     """JIT-compile the GVR kernel for a specific knob combination.
 
@@ -165,7 +167,7 @@ def _compile(
         cute.runtime.make_fake_compact_tensor(
             cutlass.Int32, (n_rows, cand_cap), stride_order=(1, 0), assumed_align=4
         )
-        if use_ext_cand
+        if (use_ext_cand or self_scan)
         else None
     )
     cand_ctl_fake = (
@@ -207,6 +209,8 @@ def _compile(
         cand_cap=cand_cap,
         accept_cap=accept_cap,
         kc_override=kc_override,
+        self_scan=self_scan,
+        cap_c=cap_c,
         # ext counts need 3 rung slots (M_thr == 3): 2 qfracs + vseed. The
         # qfrac VALUES are irrelevant on this path (P1b is skipped) — only
         # the slot count matters.
@@ -647,6 +651,8 @@ def gvr_topk_decode(
     cand_vals: Optional[torch.Tensor] = None,
     cand_idx: Optional[torch.Tensor] = None,
     cand_ctl: Optional[torch.Tensor] = None,
+    self_scan: bool = False,
+    cap_c: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
 
@@ -729,6 +735,32 @@ def gvr_topk_decode(
     # cs1/cs8 vs stock cs8 19.7us) -> keep the stock path.
     if block_max is not None and num_rows < 8 and top_k > 512:
         block_max = None
+    if self_scan:
+        # fused self-contained mode: kernel scans/buckets the row itself.
+        # Inputs: seed_thr (three closed-loop lines) + a write-only gmem
+        # POSITION column passed through the cand_idx slot. seed_counts is
+        # a dummy (the ext-counts preview reads it but zeros never pass
+        # the [K, kC] admission, so routing is owned by the phase-0 gate).
+        assert seed_thr is not None, "self_scan requires seed_thr"
+        assert cand_vals is None and cand_ctl is None, (
+            "self_scan excludes external candidate values/control"
+        )
+        assert "GVR_BSTAR" in os.environ, (
+            "self_scan requires GVR_BSTAR (accept_cap) to size the position column"
+        )
+        if seed_counts is None:
+            seed_counts = torch.zeros((num_rows, 3), dtype=torch.int32, device=logits.device)
+        _bstar = int(os.environ["GVR_BSTAR"])
+        _capc = cap_c if cap_c is not None else int(os.environ.get("GVR_CAPC", "24576"))
+        _segtot = 2 * _bstar + _capc
+        if cand_idx is None:
+            cand_idx = torch.empty((num_rows, _segtot), dtype=torch.int32, device=logits.device)
+        assert (
+            cand_idx.dtype == torch.int32
+            and cand_idx.is_cuda
+            and cand_idx.is_contiguous()
+            and cand_idx.shape == (num_rows, _segtot)
+        ), f"self_scan position column must be int32 [num_rows, {_segtot}]"
     use_ext_counts = seed_thr is not None and seed_counts is not None
     if use_ext_counts:
         assert (
@@ -745,6 +777,8 @@ def gvr_topk_decode(
         ), "seed_counts must be contiguous CUDA int32 [num_rows, 3]"
     use_ext_cand = cand_vals is not None and cand_idx is not None and cand_ctl is not None
     cand_cap = 5120
+    if self_scan:
+        cand_cap = cand_idx.shape[1]
     if use_ext_cand:
         assert (
             cand_vals.dtype == torch.float32
@@ -858,6 +892,10 @@ def gvr_topk_decode(
         cand_cap,
         int(os.environ["GVR_BSTAR"]) if "GVR_BSTAR" in os.environ else None,
         int(os.environ["GVR_KC"]) if "GVR_KC" in os.environ else None,
+        self_scan,
+        cap_c
+        if cap_c is not None
+        else (int(os.environ.get("GVR_CAPC", "24576")) if self_scan else None),
     )
     # When return_output_values=False the kernel was compiled to skip
     # STG.value and accepts None for the value-output slot.
@@ -875,7 +913,7 @@ def gvr_topk_decode(
         seed_counts if use_ext_counts else None,
         xstate if emit_xstate else None,
         cand_vals if use_ext_cand else None,
-        cand_idx if use_ext_cand else None,
+        cand_idx if (use_ext_cand or self_scan) else None,
         cand_ctl if use_ext_cand else None,
     )
     if return_output_values:
