@@ -3306,6 +3306,16 @@ class Linear(nn.Module):
                 f"Invalid tp_mode {self.tp_mode!r}; expected ROW, COLUMN, or None."
             )
 
+        # gather_output requires a uniform NCCL AllGather; uneven column shards
+        # would produce mismatched local buffers and hang the collective. Reject
+        # this configuration up front rather than fail mid-collective.
+        if (gather_output and self.tp_size > 1
+                and self.tp_mode == TensorParallelMode.COLUMN):
+            assert out_features % self.tp_size == 0, (
+                f"gather_output=True is not supported with uneven TP. "
+                f"out_features={out_features} must be divisible by tp_size={self.tp_size}."
+            )
+
         # Init TP sharding either from override or auto generated
         _uneven_tp_unsupported = {QuantAlgo.NVFP4_ARC}
         _quant_algo = quant_config.quant_algo if quant_config else None
