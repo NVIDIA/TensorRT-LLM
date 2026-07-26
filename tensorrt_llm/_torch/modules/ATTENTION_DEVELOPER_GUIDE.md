@@ -257,6 +257,13 @@ FlashInfer into the `TRTLLM` backend, and `FallbackFmha` calls the regular
 library exposes `is_available()` for module/static environment checks and
 `is_supported()` for per-forward request checks.
 
+The `TrtllmAttention` constructor's `flashinfer_mla_backend` argument selects
+the FlashInfer MLA generation kernel for that attention instance. It accepts
+`trtllm-gen` (default) or `cute-dsl`; the latter uses the monolithic CuTeDSL
+decode implementation. Selecting `cute-dsl` for an MLA layer using FP8 KV
+cache raises an exception because the current CuTeDSL kernel does not accept
+the device-resident BMM scale tensors produced for FP8 KV.
+
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.

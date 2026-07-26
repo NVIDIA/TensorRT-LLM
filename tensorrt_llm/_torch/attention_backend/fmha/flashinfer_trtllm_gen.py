@@ -16,9 +16,9 @@
 """
 FlashInfer TRTLLM-Gen FMHA
 
-This module implements attention computation using flashinfer's trtllm-gen kernels.
-It provides a TRT-LLM attention FMHA library for trtllm-gen kernels
-(Blackwell architecture: SM100/SM103). Enable or disable it through
+This module implements attention computation using flashinfer's trtllm-gen kernels,
+with an optional CuTeDSL kernel for MLA generation. It provides a TRT-LLM attention
+FMHA library for Blackwell architecture (SM100/SM103). Enable or disable it through
 ``TLLM_FMHA_LIBS``.
 
 Architecture:
@@ -66,6 +66,17 @@ if TYPE_CHECKING:
         TrtllmAttentionMetadata,
     )
 
+_SUPPORTED_MLA_BACKENDS = {"cute-dsl", "trtllm-gen"}
+
+
+def _get_mla_backend(backend: str) -> str:
+    backend = backend.strip().lower()
+    if backend not in _SUPPORTED_MLA_BACKENDS:
+        raise ValueError(
+            f"flashinfer_mla_backend must be one of {_SUPPORTED_MLA_BACKENDS}, got {backend!r}."
+        )
+    return backend
+
 
 def _clear_multi_ctas_kv_counter_workspace(
     fmha_workspace: torch.Tensor,
@@ -93,6 +104,84 @@ def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
     if bmm1_scale.numel() < 2:
         raise RuntimeError("trtllm-gen bmm1_scale workspace must contain raw and log2 scales.")
     return bmm1_scale.narrow(0, 1, 1)
+
+
+@lru_cache(maxsize=128)
+def _get_cute_dsl_mla_workspace_size(
+    max_batch_size: int,
+    q_len: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    multi_processor_count: int,
+) -> int:
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode import _get_split_kv_and_workspace_size
+
+    return max(
+        _get_split_kv_and_workspace_size(
+            batch_size,
+            q_len,
+            num_heads,
+            kv_lora_rank,
+            multi_processor_count,
+        )[1]
+        for batch_size in range(1, max_batch_size + 1)
+    )
+
+
+def _get_cute_dsl_mla_buffer_layout(
+    batch_size: int,
+    padded_num_pages: int,
+) -> Tuple[int, int, int]:
+    buffer_alignment_bytes = 32
+    page_table_bytes = batch_size * padded_num_pages * torch.int32.itemsize
+    sequence_lengths_offset = (
+        math.ceil(page_table_bytes / buffer_alignment_bytes) * buffer_alignment_bytes
+    )
+    kernel_workspace_offset = (
+        math.ceil(
+            (sequence_lengths_offset + batch_size * torch.int32.itemsize) / buffer_alignment_bytes
+        )
+        * buffer_alignment_bytes
+    )
+    return page_table_bytes, sequence_lengths_offset, kernel_workspace_offset
+
+
+def _prepare_cute_dsl_mla_buffers(
+    workspace: torch.Tensor,
+    block_tables: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    padded_num_pages: int,
+    skip_copy: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if block_tables.size(-1) > padded_num_pages:
+        raise RuntimeError("CuTeDSL MLA page table exceeds its pre-allocated shape.")
+    batch_size = block_tables.size(0)
+    if sequence_lengths.numel() < batch_size:
+        raise RuntimeError("CuTeDSL MLA sequence lengths are smaller than the batch size.")
+
+    page_table_bytes, sequence_lengths_offset, kernel_workspace_offset = (
+        _get_cute_dsl_mla_buffer_layout(batch_size, padded_num_pages)
+    )
+    workspace_bytes = workspace.view(torch.uint8).flatten()
+    page_table_storage = (
+        workspace_bytes[:page_table_bytes].view(torch.int32).view(batch_size, padded_num_pages)
+    )
+    if not skip_copy:
+        page_table_storage.zero_()
+        page_table_storage[:, : block_tables.size(-1)].copy_(block_tables[:, 0, :])
+
+    sequence_lengths_storage = workspace_bytes[
+        sequence_lengths_offset:kernel_workspace_offset
+    ].view(torch.int32)
+    aligned_sequence_lengths = sequence_lengths_storage[:batch_size]
+    if not skip_copy:
+        aligned_sequence_lengths.copy_(sequence_lengths.flatten()[:batch_size])
+
+    kernel_workspace_bytes = (workspace_bytes.numel() - kernel_workspace_offset) // 4 * 4
+    kernel_workspace = workspace_bytes[
+        kernel_workspace_offset : kernel_workspace_offset + kernel_workspace_bytes
+    ].view(-1, 4)
+    return kernel_workspace, page_table_storage, aligned_sequence_lengths
 
 
 def _trtllm_gen_batch_decode_with_kv_cache(
@@ -355,7 +444,7 @@ def _get_workspace_size(
 
 class FlashInferTrtllmGenFmha(PhasedFmha):
     """
-    An attention backend using pure trtllm-gen kernels from flashinfer.
+    An attention backend using FlashInfer trtllm-gen and optional MLA CuTeDSL kernels.
     """
 
     # Default KV layout for flashinfer
@@ -415,6 +504,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
         self._layout = self.DEFAULT_KV_LAYOUT
+        requested_mla_backend = _get_mla_backend(attn.flashinfer_mla_backend)
+        if requested_mla_backend == "cute-dsl" and attn.is_mla_enable and attn.has_fp8_kv_cache:
+            raise ValueError(
+                "flashinfer_mla_backend='cute-dsl' does not support FP8 KV cache device scales; "
+                "use 'trtllm-gen' instead."
+            )
+        self._mla_backend = requested_mla_backend
         # Read once so the hot path is not sensitive to later environment changes.
         self._enable_pdl = get_env_enable_pdl()
 
@@ -532,6 +628,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         tokens_per_block: int,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
+        backend: str,
     ) -> Tuple[bool, str]:
         missing_params = [
             name
@@ -567,7 +664,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
             )
 
-        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
+        if (
+            backend == "trtllm-gen"
+            and (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS
+        ):
             return (
                 False,
                 f"[Generation][MLA] slower TRTLLM-GEN decode kernel for "
@@ -744,6 +844,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                     tokens_per_block=tokens_per_block,
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
+                    backend=self._mla_backend,
                 )
                 if not supported:
                     return False, reason
@@ -825,12 +926,38 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             fp8_context_fmha=fp8_context_fmha,
         )
 
+        if is_gen_only and attn.is_mla_enable and self._mla_backend == "cute-dsl":
+            if metadata.kv_cache_manager is None:
+                raise RuntimeError("CuTeDSL MLA requires a paged KV cache manager.")
+            max_batch_size = metadata.max_num_sequences or metadata.max_num_requests
+            max_num_pages = metadata.kv_cache_manager.max_blocks_per_seq
+            tokens_per_block = metadata.tokens_per_block or 64
+            pages_per_superblock = 128 // tokens_per_block
+            padded_num_pages = (
+                math.ceil(max_num_pages / pages_per_superblock) * pages_per_superblock
+            )
+            _, _, buffer_metadata_size = _get_cute_dsl_mla_buffer_layout(
+                max_batch_size, padded_num_pages
+            )
+            assert self._multi_processor_count is not None
+            cute_dsl_workspace_size = _get_cute_dsl_mla_workspace_size(
+                max_batch_size,
+                max(1, attn.predicted_tokens_per_seq),
+                attn.num_heads,
+                int(attn.kv_lora_rank or 0),
+                self._multi_processor_count,
+            )
+            required_workspace_size = max(
+                required_workspace_size, buffer_metadata_size + cute_dsl_workspace_size
+            )
+            required_workspace_size = math.ceil(required_workspace_size / 4) * 4
+
         current_workspace_size = workspace.numel() * workspace.element_size()
         if current_workspace_size < required_workspace_size:
             if metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "Attention CUDA graph workspace is smaller than the "
-                    "required size for trtllm-gen."
+                    f"required size for {self._mla_backend}."
                 )
             required_workspace_numel = math.ceil(required_workspace_size / workspace.element_size())
             workspace.resize_((required_workspace_numel,))
@@ -1182,7 +1309,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
 
         pages_per_superblock = 128 // params.tokens_per_block
-        if pages_per_superblock > 1:
+        if pages_per_superblock > 1 and self._mla_backend != "cute-dsl":
+            # The cute-dsl branch stages the page table into a
+            # zero-initialized workspace region already padded to
+            # ``padded_num_pages`` below, so padding here would launch a
+            # redundant device kernel per layer.
             num_blocks = block_tables.size(-1)
             remainder = num_blocks % pages_per_superblock
             if remainder != 0:
@@ -1232,10 +1363,57 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             )
             bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
             bmm2_scale = 1.0
-        workspace_buffer = params.workspace.view(-1, 4)
-        _clear_multi_ctas_kv_counter_workspace(
-            workspace_buffer, attn.num_heads, meta.max_num_requests, self._multi_processor_count
-        )
+        if self._mla_backend == "cute-dsl":
+            padded_num_pages = (
+                math.ceil(block_tables.size(-1) / pages_per_superblock) * pages_per_superblock
+            )
+            # Every MLA layer of one forward step shares this metadata, its
+            # workspace, and (for a single paged pool) identical block tables
+            # and sequence lengths — so the staged copies are byte-identical
+            # across layers. Stage once per step: the first generation-only
+            # call copies, subsequent layers with a matching key skip the 3
+            # copy kernels. ``prepare()`` / ``update_spec_dec_param`` reset
+            # the key each step so eager forwards always re-stage; under CUDA
+            # graphs the first layer's captured copies replay once per step.
+            # The capture flag is part of the key: CUDA-graph capture is
+            # preceded by warmup forwards on the same metadata without an
+            # intervening prepare(), and the capture pass MUST re-record the
+            # staging copies (a skip would freeze stale page tables into the
+            # graph).
+            staging_key = (
+                torch.cuda.is_current_stream_capturing(),
+                params.workspace.data_ptr(),
+                block_tables.data_ptr(),
+                tuple(block_tables.shape),
+                params.sequence_lengths.data_ptr(),
+                params.seq_offset,
+                batch_beam,
+                padded_num_pages,
+            )
+            skip_staging_copy = (
+                meta.num_contexts == 0
+                and getattr(meta, "_cute_dsl_mla_staging_key", None) == staging_key
+            )
+            workspace_buffer, block_tables, sequence_lengths = _prepare_cute_dsl_mla_buffers(
+                params.workspace,
+                block_tables,
+                params.sequence_lengths,
+                padded_num_pages,
+                skip_copy=skip_staging_copy,
+            )
+            if meta.num_contexts == 0:
+                meta._cute_dsl_mla_staging_key = staging_key
+            uses_shared_paged_kv_idx = True
+        else:
+            sequence_lengths = params.sequence_lengths
+            workspace_buffer = params.workspace.view(-1, 4)
+            _clear_multi_ctas_kv_counter_workspace(
+                workspace_buffer,
+                attn.num_heads,
+                meta.max_num_requests,
+                self._multi_processor_count,
+            )
+            uses_shared_paged_kv_idx = self.USE_SHARED_PAGED_KV_IDX
 
         flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
             query,  # query
@@ -1245,7 +1423,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             kv_lora_rank,  # kv_lora_rank
             qk_rope_head_dim,  # qk_rope_head_dim
             block_tables,  # block_tables
-            params.sequence_lengths,  # seq_lens
+            sequence_lengths,  # seq_lens
             params.max_past_kv_length,  # max_seq_len
             0,  # sparse_mla_top_k
             params.context_buf.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank),  # out
@@ -1254,7 +1432,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             fwd.attention_sinks,  # sinks
             None,  # skip_softmax_threshold_scale_factor
             self._enable_pdl,  # enable_pdl
-            "trtllm-gen",  # backend
-            True,  # is_var_seq
-            self.USE_SHARED_PAGED_KV_IDX,  # uses_shared_paged_kv_idx
+            backend=self._mla_backend,
+            is_var_seq=True,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            cute_dsl_impl="monolithic",
         )

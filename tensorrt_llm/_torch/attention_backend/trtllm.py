@@ -169,6 +169,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                             init=False,
                                             repr=False)
 
+    # Per-forward-pass staging key for the CuTeDSL MLA generation workspace
+    # (page table + sequence lengths). All MLA layers of one step stage
+    # byte-identical data into the shared workspace, so the first layer
+    # copies and later layers skip. Reset whenever kv lens can change so
+    # eager forwards always re-stage (under CUDA graphs the first layer's
+    # captured copies replay once per step).
+    _cute_dsl_mla_staging_key: Optional[tuple] = field(default=None,
+                                                       init=False,
+                                                       repr=False)
+
     use_paged_context_fmha: bool = field(init=False, default=False, repr=False)
 
     # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
@@ -461,6 +471,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
+        self._cute_dsl_mla_staging_key = None
 
     def update_for_spec_dec(self) -> None:
         # MTP updates kv_lens_cuda in-place between sub-steps, which changes
@@ -468,6 +479,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # so that forward() recomputes it for the next sub-step.
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
+        self._cute_dsl_mla_staging_key = None
 
     def update_helix_param(
         self,
@@ -517,6 +529,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def prepare(self) -> None:
         super().prepare()
+        # New forward pass: the CuTeDSL MLA workspace must be re-staged by
+        # the first generation MLA layer.
+        self._cute_dsl_mla_staging_key = None
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:
@@ -1185,6 +1200,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_create_weights_in_init: bool = False,
         attention_chunk_size: Optional[int] = None,
         sparse_params: Optional[SparseParams] = None,
+        flashinfer_mla_backend: str = "trtllm-gen",
         **kwargs,
     ):
         """
@@ -1200,10 +1216,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
             mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
+            flashinfer_mla_backend (str): FlashInfer MLA backend selected for
+                                         this attention instance.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
+        self.flashinfer_mla_backend = flashinfer_mla_backend
 
         self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params or MLAParams()
@@ -1565,16 +1584,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             else:
                 forward_args.fmha_scheduler_counter.zero_()
             assert forward_args.latent_cache is not None
-            from .utils import append_mla_latent_cache
-            append_mla_latent_cache(
-                metadata.kv_cache_manager,
-                self.get_local_layer_idx(metadata),
-                metadata.request_ids,
-                metadata.seq_lens.tolist(),
-                metadata.kv_cache_params.num_cached_tokens_per_seq,
+            from .utils import \
+                append_mla_latent_cache_generation_cuda_graph_safe
+            # The write positions must come from device tensors: the host
+            # lists (request ids, seq lens, cached-token counts) are frozen
+            # into the graph at capture time and corrupt the cache on replay.
+            # The helper falls back to the host-side loop for eager forwards
+            # and q_len > 1 (speculative decoding).
+            append_mla_latent_cache_generation_cuda_graph_safe(
+                metadata,
+                # NOTE: get_buffers / layer_offsets take the GLOBAL layer
+                # index (they map through layer_offsets internally). Passing
+                # the local offset double-maps and breaks hybrid models whose
+                # KV manager covers a masked layer subset (e.g. Kimi K3);
+                # identical for dense-attention models.
+                self.layer_idx,
                 forward_args.latent_cache,
-                kv_layout=metadata.kv_layout,
-                seq_start=num_ctx,
             )
 
         # RocketKV and DSA predict which blocks to keep, so build their sparse
