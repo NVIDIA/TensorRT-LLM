@@ -622,6 +622,82 @@ class TestVerifyCtxResponseDiagnostics:
         assert result is resp
 
 
+@pytest.mark.asyncio
+async def test_gen_first_nonstream_cancel_on_ctx_failure(monkeypatch):
+    """Fable §13 fix 2: when CTX fails, GEN must be cancelled.
+
+    In gen-first non-streaming gather, if CTX raises the GEN task must be
+    cancelled rather than left running to completion.
+    """
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service("generation_first")
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {}))
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {}))
+
+    gen_task_cancelled = asyncio.Event()
+
+    async def _ctx_raises(*_a, **_kw):
+        raise RuntimeError("ctx boom")
+
+    async def _gen_hangs(*_a, **_kw):
+        try:
+            await asyncio.sleep(10)  # would never finish naturally
+        except asyncio.CancelledError:
+            gen_task_cancelled.set()
+            raise
+        return _make_completion_response("gen", "stop", context_only=False)
+
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx_raises)
+    service._gen_client.send_request = AsyncMock(side_effect=_gen_hangs)
+
+    request = CompletionRequest(model="test-model", prompt="hi", stream=False)
+    with pytest.raises(RuntimeError, match="ctx boom"):
+        await service._send_disagg_request_gen_first(request)
+
+    assert gen_task_cancelled.is_set(), "GEN task was not cancelled after CTX failure"
+
+
+@pytest.mark.asyncio
+async def test_gen_first_nonstream_cancel_on_gen_failure(monkeypatch):
+    """When GEN fails in gen-first gather, CTX must be cancelled.
+
+    In gen-first non-streaming mode, if GEN raises the CTX task must be
+    cancelled rather than left running.
+    """
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service("generation_first")
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {}))
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {}))
+
+    ctx_task_cancelled = asyncio.Event()
+
+    async def _gen_raises(*_a, **_kw):
+        raise RuntimeError("gen boom")
+
+    async def _ctx_hangs(*_a, **_kw):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            ctx_task_cancelled.set()
+            raise
+        return _make_completion_response("ctx", "length", context_only=True)
+
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx_hangs)
+    service._gen_client.send_request = AsyncMock(side_effect=_gen_raises)
+
+    request = CompletionRequest(model="test-model", prompt="hi", stream=False)
+    with pytest.raises(RuntimeError, match="gen boom"):
+        await service._send_disagg_request_gen_first(request)
+
+    assert ctx_task_cancelled.is_set(), "CTX task was not cancelled after GEN failure"
+
+
 class TestFirstGenLogProbsSerializeRoundtrip:
     """Roundtrip tests for _serialize/_deserialize_first_gen_log_probs."""
 

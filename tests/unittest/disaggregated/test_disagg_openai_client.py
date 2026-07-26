@@ -277,6 +277,55 @@ class TestOpenAIHttpClient:
         with pytest.raises(ValueError, match="Invalid request type"):
             await openai_client.send_request("invalid_request")
 
+    # ------------------------------------------------------------------
+    # Fable lifecycle design §13 pull-forward fix 1:
+    # HTTP 4xx/5xx from a worker must NOT be retried as a network error.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [400, 422, 429, 500, 503])
+    async def test_http_error_not_retried(
+        self, openai_client, completion_request, mock_session, mock_router, status_code
+    ):
+        """ClientResponseError (4xx/5xx) must raise immediately without retry."""
+        request_info = Mock()
+        exc = aiohttp.ClientResponseError(
+            request_info, history=(), status=status_code, message="worker rejected"
+        )
+        mock_session.post.side_effect = exc
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            await openai_client.send_request(completion_request)
+
+        assert exc_info.value.status == status_code
+        # Must be exactly one attempt — no retry on HTTP errors.
+        assert mock_session.post.call_count == 1
+        mock_router.finish_request.assert_called_once_with(completion_request)
+
+    @pytest.mark.asyncio
+    async def test_network_error_still_retried(
+        self, openai_client, completion_request, mock_session, mock_router
+    ):
+        """Plain ClientError (TCP-level) continues to be retried as before."""
+        mock_response = self.dummy_response()
+        mock_http_response = AsyncMock()
+        mock_http_response.headers = {"Content-Type": "application/json"}
+        mock_http_response.json = AsyncMock(return_value=mock_response.model_dump())
+        mock_http_response.raise_for_status = Mock()
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock()
+
+        mock_session.post.side_effect = [
+            aiohttp.ClientError("TCP reset"),
+            mock_http_response,
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            response = await openai_client.send_request(completion_request)
+
+        assert isinstance(response, CompletionResponse)
+        assert mock_session.post.call_count == 2
+
 
 class TestHttpErrorBodyPreservation:
     """Test that HTTP 4xx/5xx errors include the response body (TRTLLM-11123)."""

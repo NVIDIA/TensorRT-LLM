@@ -269,6 +269,14 @@ class OpenAIHttpClient(OpenAIClient):
                         )
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
+                # HTTP 4xx/5xx from a worker is a deterministic rejection — do
+                # not retry as a transient network error.  In disaggregated
+                # serving a GEN worker rejection (e.g. 503 over capacity) must
+                # surface immediately so the orchestrator can reroute or fail
+                # fast rather than consuming retry budget against the same
+                # server.  (Fable lifecycle design §13 pull-forward fix.)
+                if isinstance(e, aiohttp.ClientResponseError):
+                    raise
                 if lines_yielded > 0:
                     logger.error(
                         f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",

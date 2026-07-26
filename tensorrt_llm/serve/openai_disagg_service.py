@@ -16,9 +16,16 @@ import asyncio
 import os
 from typing import Callable, Optional
 
+import aiohttp
+
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
+from tensorrt_llm.serve.disagg_lifecycle import (
+    DisaggOrchestratorLifecycle,
+    OrchestratorEvent,
+    OrchestratorScheduleStyle,
+)
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -70,6 +77,11 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._gen_client = None
         self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
 
+        # Opt-in orchestrator lifecycle emitter (TRTLLM_DISAGG_ORCHESTRATOR_DIAGNOSTICS=1).
+        self._lifecycle = DisaggOrchestratorLifecycle.from_environment(
+            node_id=str(config.node_id) if config.node_id is not None else None
+        )
+
         match self._config.schedule_style:
             case "generation_first":
                 self._send_disagg_request = self._send_disagg_request_gen_first
@@ -104,14 +116,22 @@ class OpenAIDisaggregatedService(OpenAIService):
                     "Disaggregated server currently only supports single string prompt or list of integers in request"
                 )
 
-        return await self._send_disagg_request(request, hooks)
+        try:
+            return await self._send_disagg_request(request, hooks)
+        except asyncio.CancelledError:
+            self._lifecycle.emit(OrchestratorEvent.CLIENT_DISCONNECT)
+            raise
 
     async def openai_chat_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
-        return await self._send_disagg_request(request, hooks)
+        try:
+            return await self._send_disagg_request(request, hooks)
+        except asyncio.CancelledError:
+            self._lifecycle.emit(OrchestratorEvent.CLIENT_DISCONNECT)
+            raise
 
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
@@ -132,6 +152,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
         ctx_response = None
         gen_req = request
+        tracer = self._lifecycle.tracer(
+            disagg_request_id=disagg_request_id,
+            schedule_style=OrchestratorScheduleStyle.CONTEXT_FIRST,
+        )
         if need_ctx:
             try:
                 # Mark ctx-dispatch start: arrival->here is the pre-ctx wait in the
@@ -143,9 +167,20 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_server, _ = await self._ctx_router.get_next_server(
                     ctx_req, exclude_server=gen_server, req_id=disagg_request_id
                 )
-                ctx_response = await self._ctx_client.send_request(
-                    ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
-                )
+                tracer.ctx_dispatch(ctx_server or "")
+                try:
+                    ctx_response = await self._ctx_client.send_request(
+                        ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
+                    )
+                except Exception as exc:
+                    if isinstance(exc, aiohttp.ClientResponseError):
+                        tracer.ctx_error(
+                            str(exc), ctx_server=ctx_server or "", http_status=exc.status
+                        )
+                    else:
+                        tracer.ctx_error(str(exc), ctx_server=ctx_server or "")
+                    raise
+                tracer.ctx_complete(ctx_server=ctx_server or "")
                 await self._verify_ctx_response(ctx_response)
                 ctx_response_disagg_params = ctx_response.choices[0].disaggregated_params
                 if ctx_response_disagg_params.disagg_request_id is not None:
@@ -173,9 +208,19 @@ class OpenAIDisaggregatedService(OpenAIService):
                     gen_req, exclude_server=ctx_server, req_id=disagg_request_id
                 )
                 gen_reservation_id = disagg_request_id
-            gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
-            )
+            tracer.gen_dispatch(gen_server or "")
+            try:
+                gen_response = await self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
+                )
+            except Exception as exc:
+                if isinstance(exc, aiohttp.ClientResponseError):
+                    tracer.gen_error(str(exc), gen_server=gen_server or "", http_status=exc.status)
+                else:
+                    tracer.gen_error(str(exc), gen_server=gen_server or "")
+                raise
+            if not request.stream:
+                tracer.gen_complete(gen_server=gen_server or "")
             return gen_response
         else:
             if gen_server:
@@ -392,6 +437,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         # Single-issuer disagg id (see _send_disagg_request_ctx_first): fetch from
         # the coordinator so fleet workers never mint colliding ids.
         disagg_request_id = await self._coordinator.get_disagg_request_id()
+        tracer = self._lifecycle.tracer(
+            disagg_request_id=disagg_request_id,
+            schedule_style=OrchestratorScheduleStyle.GENERATION_FIRST,
+        )
         if need_ctx:
             # arrival->here = pre-ctx wait in the orchestrator/fleet.
             if hooks:
@@ -417,6 +466,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             #
             # Fix: eagerly start consuming the gen generator in a background
             # task so the HTTP POST fires, then pipe chunks through a queue.
+            tracer.gen_dispatch(gen_server or "")
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
             )
@@ -434,6 +484,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
 
             # Now send ctx request — gen server has received its request
+            tracer.ctx_dispatch(ctx_server or "")
             try:
                 await self._ctx_client.send_request(
                     ctx_req,
@@ -441,13 +492,15 @@ class OpenAIDisaggregatedService(OpenAIService):
                     hooks=hooks,
                     req_id=disagg_request_id,
                 )
-            except Exception:
+            except Exception as exc:
+                tracer.ctx_error(str(exc), ctx_server=ctx_server or "")
                 consume_task.cancel()
                 try:
                     await consume_task
                 except (asyncio.CancelledError, Exception):
                     pass
                 raise
+            tracer.ctx_complete(ctx_server=ctx_server or "")
 
             async def _yield_from_queue():
                 try:
@@ -470,6 +523,9 @@ class OpenAIDisaggregatedService(OpenAIService):
         else:
             # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
             # through generator consumption, so asyncio.gather works fine.
+            if need_ctx:
+                tracer.ctx_dispatch(ctx_server or "")
+            tracer.gen_dispatch(gen_server or "")
             tasks = []
             if need_ctx:
                 tasks.append(
@@ -492,5 +548,18 @@ class OpenAIDisaggregatedService(OpenAIService):
                     )
                 )
             )
-            responses = await asyncio.gather(*tasks)
+            # Cancel the surviving leg if the other fails.  Without this, a
+            # failed CTX leg leaves the GEN worker holding a KV-receive session
+            # until its own timeout, consuming transfer budget needlessly.
+            # (Fable lifecycle design §13 pull-forward fix.)
+            try:
+                responses = await asyncio.gather(*tasks)
+            except Exception as exc:
+                tracer.abort(str(exc))
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            tracer.gen_complete(gen_server=gen_server or "")
             return responses[-1]

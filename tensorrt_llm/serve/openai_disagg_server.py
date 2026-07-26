@@ -57,6 +57,43 @@ _LOG_CONTROL_CHARACTERS = {
     code: f"\\x{code:02x}"
     for code in (*range(32), 127)
 }
+_DISCONNECT_POLL_INTERVAL_SECS = 0.5
+
+
+async def _poll_disconnect(raw_req: Request) -> None:
+    """Return when the client has disconnected (detected via ASGI receive)."""
+    while not await raw_req.is_disconnected():
+        await asyncio.sleep(_DISCONNECT_POLL_INTERVAL_SECS)
+
+
+async def _run_with_disconnect_guard(coro, raw_req: Request):
+    """Await *coro* and cancel it when the HTTP client disconnects.
+
+    Raises ``asyncio.CancelledError`` when the disconnect fires before the
+    coroutine completes so the caller can convert it to an HTTP 499 response.
+    Workers are not explicitly cancelled here (that requires WS4 abort RPCs);
+    this guard ensures the orchestrator stops consuming resources and releases
+    router load as soon as the client is gone.
+    """
+    main_task = asyncio.ensure_future(coro)
+    disconnect_task = asyncio.ensure_future(_poll_disconnect(raw_req))
+    try:
+        done, pending = await asyncio.wait(
+            {main_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if disconnect_task in done and main_task not in done:
+            logger.info("Disagg orchestrator: client disconnected, aborting request")
+            raise asyncio.CancelledError("client disconnected")
+        return main_task.result()
+    except asyncio.CancelledError:
+        main_task.cancel()
+        disconnect_task.cancel()
+        await asyncio.gather(main_task, disconnect_task, return_exceptions=True)
+        raise
 
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, perf_metrics_collector: DisaggPerfMetricsCollector):
@@ -287,12 +324,25 @@ class OpenAIDisaggServer:
                     raise HTTPException(status_code=400, detail=str(e)) from e
                 self._extract_conversation_id(req, raw_req)
                 hooks = RawRequestResponseHooks(raw_req, self._perf_metrics_collector)
-                response_or_generator = await entry_point(req, hooks)
-                self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
-                    return StreamingResponse(content=response_or_generator, media_type="text/event-stream")
+                    response_or_generator = await entry_point(req, hooks)
+                    self._perf_metrics_collector.total_responses.inc()
+                    return StreamingResponse(
+                        content=response_or_generator, media_type="text/event-stream"
+                    )
                 else:
+                    # Non-streaming: race the disagg handler against client
+                    # disconnect so an abandoned request does not hold a CTX KV
+                    # pin or a GEN transfer-block slot after the client is gone.
+                    # (Fable lifecycle design §13 pull-forward fix.)
+                    response_or_generator = await _run_with_disconnect_guard(
+                        entry_point(req, hooks), raw_req
+                    )
+                    self._perf_metrics_collector.total_responses.inc()
                     return JSONResponse(content=response_or_generator.model_dump())
+            except asyncio.CancelledError:
+                self._perf_metrics_collector.cancelled_requests.inc()
+                raise HTTPException(status_code=499, detail="Client disconnected")
             except Exception as e:
                 self._handle_exception(e)
         return wrapper

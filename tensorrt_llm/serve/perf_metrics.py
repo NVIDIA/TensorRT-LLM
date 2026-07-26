@@ -136,6 +136,9 @@ SERVER_METRICS_DEFINITIONS = [
     MetricsDefinition("internal_errors", "Total number of internal errors", "counter"),
     MetricsDefinition("total_responses", "Total number of responses", "counter"),
     MetricsDefinition(
+        "cancelled_requests", "Total number of requests cancelled by client disconnect", "counter"
+    ),
+    MetricsDefinition(
         "queue_latency_seconds",
         "Histogram of latency from request arrival to being processed in seconds",
         "histogram",
