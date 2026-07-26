@@ -4855,11 +4855,12 @@ class GvrTopKKernel:
             block_max_row = block_max[row_idx, None]
         else:
             block_max_row = None
-        if cutlass.const_expr(
-            self.use_ext_counts and seed_thr is not None and seed_counts is not None
-        ):
+        if cutlass.const_expr(self.use_ext_counts and seed_thr is not None):
+            # packed seed row [>=6] fp32: [0..2] lines, [3..5] counts as
+            # floats (exact to 2^24) - ONE 32B sector serves both, halving
+            # the serial cold loads of the admission preview
             seed_thr_row = seed_thr[row_idx, None]
-            seed_counts_row = seed_counts[row_idx, None]
+            seed_counts_row = None
         elif cutlass.const_expr(self.ext_rungs and seed_thr is not None):
             seed_thr_row = seed_thr[row_idx, None]
             seed_counts_row = None
@@ -5406,7 +5407,7 @@ class GvrTopKKernel:
         if cutlass.const_expr(self.use_ext_counts):
             if seed_thr_row[0] < cutlass.Float32(1e37):
                 for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
-                    cm_e = cutlass.Int32(seed_counts_row[m])
+                    cm_e = cutlass.Int32(seed_thr_row[3 + m])
                     if cm_e >= cutlass.Int32(self.top_k) and cm_e <= cutlass.Int32(self.kC):
                         ext_row = cutlass.Int32(1)
             # list path preview: when the SoA candidate list will be taken
@@ -6062,7 +6063,7 @@ class GvrTopKKernel:
                                 bx_m = cutlass.Int32(-1)
                                 bx_c = cutlass.Int32(2147483647)
                                 for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
-                                    cx = cutlass.Int32(seed_counts_row[m])
+                                    cx = cutlass.Int32(seed_thr_row[3 + m])
                                     if (
                                         cx >= cutlass.Int32(self.top_k)
                                         and cx <= cutlass.Int32(self.kC)

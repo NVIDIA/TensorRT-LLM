@@ -143,20 +143,19 @@ def _compile(
         if enable_block_skip
         else None
     )
+    # ext counts ride PACKED with the lines ([rows, 8] fp32: lines at
+    # [0..2], counts as floats at [3..5]) - one 32B sector per row
     seed_thr_fake = (
         cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (n_rows, 3), stride_order=(1, 0), assumed_align=4
+            cutlass.Float32,
+            (n_rows, 8 if use_ext_counts else 3),
+            stride_order=(1, 0),
+            assumed_align=4,
         )
         if (use_ext_counts or ext_rungs)
         else None
     )
-    seed_counts_fake = (
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (n_rows, 3), stride_order=(1, 0), assumed_align=4
-        )
-        if use_ext_counts
-        else None
-    )
+    seed_counts_fake = None
     cand_vals_fake = (
         cute.runtime.make_fake_compact_tensor(
             cutlass.Float32, (n_rows, cand_cap), stride_order=(1, 0), assumed_align=4
@@ -521,6 +520,19 @@ def derive_seed_lines_v4(
     return out.contiguous()
 
 
+def pack_seed(seed_thr: torch.Tensor, seed_counts: torch.Tensor) -> torch.Tensor:
+    """Pack lines + exact counts into one [rows, 8] fp32 seed row.
+
+    Lines land at [0..2], counts as floats at [3..5] (exact to 2^24);
+    one 32B sector per row. Build ONCE per step, outside any timed
+    region.
+    """
+    pack = torch.zeros((seed_thr.shape[0], 8), dtype=torch.float32, device=seed_thr.device)
+    pack[:, 0:3] = seed_thr
+    pack[:, 3:6] = seed_counts.float()
+    return pack.contiguous()
+
+
 def emu_seed_counts(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -765,18 +777,23 @@ def gvr_topk_decode(
             and cand_idx.is_contiguous()
             and cand_idx.shape == (num_rows, _segtot)
         ), f"self_scan position column must be int32 [num_rows, {_segtot}]"
-    use_ext_counts = seed_thr is not None and seed_counts is not None
+    # packed seed row ([rows, >=6] fp32: lines + counts-as-floats) is the
+    # native ext-counts input; separate seed_counts is the compat path and
+    # pays a per-call pack build - pre-pack with pack_seed() instead.
+    pre_packed = seed_thr is not None and seed_thr.shape[1] >= 6
+    use_ext_counts = seed_thr is not None and (seed_counts is not None or pre_packed)
     # variant B (two-pass): thresholds without counts -> the kernel counts
     # the rungs itself (stock R0 multi-count) and admits in-kernel
-    ext_rungs = seed_thr is not None and seed_counts is None
+    ext_rungs = seed_thr is not None and seed_counts is None and not pre_packed
     if use_ext_counts:
         assert (
             seed_thr.dtype == torch.float32
             and seed_thr.is_cuda
             and seed_thr.is_contiguous()
-            and seed_thr.shape == (num_rows, 3)
-        ), "seed_thr must be contiguous CUDA fp32 [num_rows, 3]"
-        assert (
+            and seed_thr.shape[0] == num_rows
+            and (pre_packed or seed_thr.shape[1] == 3)
+        ), "seed_thr must be contiguous CUDA fp32 [num_rows, 3|8]"
+        assert pre_packed or (
             seed_counts.dtype == torch.int32
             and seed_counts.is_cuda
             and seed_counts.is_contiguous()
@@ -882,6 +899,13 @@ def gvr_topk_decode(
             else:
                 min_blocks_per_mp = 1
 
+    seed_pack = None
+    if use_ext_counts:
+        if pre_packed:
+            seed_pack = seed_thr
+        else:
+            seed_pack = pack_seed(seed_thr, seed_counts)
+
     compiled = _compile(
         cute_dtype,
         top_k,
@@ -924,8 +948,8 @@ def gvr_topk_decode(
         out_indices,
         order_row if seqlen_sorted else None,
         block_max if enable_block_skip else None,
-        seed_thr if (use_ext_counts or ext_rungs) else None,
-        seed_counts if use_ext_counts else None,
+        seed_pack if use_ext_counts else (seed_thr if ext_rungs else None),
+        None,
         xstate if emit_xstate else None,
         cand_vals if use_ext_cand else None,
         cand_idx if (use_ext_cand or self_scan) else None,
