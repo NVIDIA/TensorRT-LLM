@@ -12,9 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import concurrent.futures
 import copy
 import json
 import os
+from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -50,6 +52,99 @@ from .interface import (Evaluator, dump_inference_results,
 # https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L25
 LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER = "<image>"
 
+# Interval (in completed responses) for logging running metric estimates
+# during long evals; see _RunningScoreTracker. 0/unset disables the feature.
+PARTIAL_SCORES_ENV_VAR = "TLLM_EVAL_PARTIAL_SCORES_EVERY"
+
+# Cap on concurrently in-flight requests during LmEvalWrapper.generate_until.
+# 0/unset disables windowing (submit everything up front — current behavior).
+# See generate_until for the throughput/early-signal tradeoff.
+MAX_IN_FLIGHT_ENV_VAR = "TLLM_EVAL_MAX_IN_FLIGHT"
+
+# When "1", request per-request perf metrics and log an aggregate
+# speculative-decoding summary (acceptance length AL as mean decoded
+# tokens/step, acceptance rate AR as accepted/drafted draft tokens) at the
+# end of generate_until. No-op output on non-speculative runs; unset/0
+# leaves sampling params untouched (no perf-metrics overhead).
+SPEC_STATS_ENV_VAR = "TLLM_EVAL_SPEC_STATS"
+
+
+class _RunningScoreTracker:
+    """Best-effort running metric estimates over completed eval responses.
+
+    lm-eval computes metrics only after every response is collected, so a
+    multi-hour eval gives no quality signal until the very end. This tracker
+    scores each response as it completes — applying the owning task's filter
+    ensembles and ``process_results`` to a throwaway copy of the instance —
+    and logs a running aggregate every ``interval`` responses, so an operator
+    can tell whether a long job is on track or should be killed early.
+
+    The running numbers are estimates: per-sample filtering happens outside
+    the harness's batch path, and only per-sample-decomposable metrics (e.g.
+    exact_match) aggregate meaningfully as a mean. The final score reported
+    by lm-eval is unaffected — scoring here happens on copies. Any failure
+    (exotic task/filter/metric shapes) permanently disables the tracker for
+    the run and never fails the eval itself.
+    """
+
+    def __init__(self, task_dict: dict, interval: int):
+        self.interval = interval
+        self.tasks = {}
+        self._collect_tasks(task_dict)
+        self.metric_sums = defaultdict(float)
+        self.metric_counts = defaultdict(int)
+        self.disabled = False
+
+    def _collect_tasks(self, task_dict: dict) -> None:
+        for name, obj in task_dict.items():
+            if isinstance(obj, dict):  # task group
+                self._collect_tasks(obj)
+            else:
+                self.tasks[name] = obj
+
+    def update(self, instance, text: str) -> None:
+        if self.disabled:
+            return
+        try:
+            task = self.tasks.get(instance.task_name)
+            if task is None or not getattr(task, "_filters", None):
+                raise ValueError(
+                    f"no scorable task for {instance.task_name!r}")
+            # Score a shallow copy: the harness appends resps / applies
+            # filters to the real instance later, and must see it untouched.
+            probe = copy.copy(instance)
+            probe.resps = [text]
+            probe.filtered_resps = {}
+            for ensemble in task._filters:
+                ensemble.apply([probe])
+                # lm-eval evaluator passes a list of filtered responses (one
+                # per repeat/request), so process_results does results[0] to
+                # get the prediction.  Match that contract here — wrapping in
+                # a list gives the same calling convention.
+                metrics = task.process_results(
+                    probe.doc, [probe.filtered_resps[ensemble.name]])
+                for metric, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        key = f"{metric},{ensemble.name}"
+                        self.metric_sums[key] += value
+                        self.metric_counts[key] += 1
+        except Exception as e:
+            logger.info(
+                f"Partial scoring disabled for this run ({type(e).__name__}: {e})"
+            )
+            self.disabled = True
+
+    def maybe_log(self, done: int, total: int) -> None:
+        if self.disabled or not self.metric_counts:
+            return
+        if done % self.interval != 0 and done != total:
+            return
+        stats = " | ".join(
+            f"{key} ~ {100 * self.metric_sums[key] / count:.2f}"
+            for key, count in self.metric_counts.items())
+        logger.info(f"Partial scores after {done}/{total} responses "
+                    f"(estimate, 0~100): {stats}")
+
 
 class LmEvalWrapper(TemplateLM):
 
@@ -62,7 +157,9 @@ class LmEvalWrapper(TemplateLM):
                  is_force_single_image: bool = False,
                  output_dir: Optional[str] = None,
                  sampling_override: bool = False,
-                 preserve_caller_max_tokens: bool = False):
+                 preserve_caller_max_tokens: bool = False,
+                 partial_scores_every: Optional[int] = None,
+                 partial_scoring_task_dict: Optional[dict] = None):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
@@ -77,6 +174,28 @@ class LmEvalWrapper(TemplateLM):
         # task yaml's max_gen_toks. Opt-in for thinking models (e.g. Kimi K2.5)
         # whose chain-of-thought output exceeds lm-eval's default (~512).
         self.preserve_caller_max_tokens = preserve_caller_max_tokens
+        # When set (with the task_dict), log running metric estimates every
+        # N completed responses during generate_until — a liveness/quality
+        # signal for long evals. See _RunningScoreTracker.
+        self.partial_scores_every = partial_scores_every
+        self.partial_scoring_task_dict = partial_scoring_task_dict
+        # Env-gated cap on concurrently in-flight requests (0/unset = no cap,
+        # submit everything up front). See generate_until for the tradeoff.
+        env_window = os.environ.get(MAX_IN_FLIGHT_ENV_VAR)
+        if env_window:
+            try:
+                self.max_in_flight = int(env_window)
+            except ValueError:
+                raise ValueError(
+                    f"{MAX_IN_FLIGHT_ENV_VAR} must be an integer, got "
+                    f"{env_window!r}") from None
+            if self.max_in_flight < 0:
+                self.max_in_flight = 0
+        else:
+            self.max_in_flight = 0
+        # Env-gated speculative-decoding stats (AL/AR) aggregation over the
+        # eval corpus; forces return_perf_metrics on generated requests.
+        self.spec_stats = os.environ.get(SPEC_STATS_ENV_VAR) == "1"
 
     @property
     def eot_token_id(self) -> int:
@@ -156,30 +275,161 @@ class LmEvalWrapper(TemplateLM):
                     if current is not None and current > value:
                         continue
                 setattr(sampling_params, trtllm_key, value)
+        if self.spec_stats:
+            sampling_params.return_perf_metrics = True
         return sampling_params
 
-    def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
-        profiler.start("trtllm exec")
-        results = []
-        for request in tqdm(requests,
-                            desc="Submitting requests",
-                            disable=disable_tqdm):
-            prompt, gen_kwargs = request.args
+    def _log_spec_stats(self, outputs: List[RequestOutput]) -> None:
+        """Log corpus-aggregate speculative-decoding stats (TLLM_EVAL_SPEC_STATS=1).
+
+        AL (acceptance length) is reported as the mean of per-request
+        ``avg_decoded_tokens_per_iter`` (target token + accepted draft tokens
+        per decode step); AR (acceptance rate) as total accepted / total
+        drafted draft tokens from the per-request perf metrics. Skips silently
+        when the run produced no speculative metrics (non-spec-dec config).
+        """
+        tokens_per_iter = [
+            output.avg_decoded_tokens_per_iter for output in outputs
+            if getattr(output, "avg_decoded_tokens_per_iter", None) is not None
+        ]
+        accepted = drafted = 0
+        for output in outputs:
+            perf_metrics = getattr(output.outputs[0], "request_perf_metrics",
+                                   None)
+            spec_dec = getattr(perf_metrics, "speculative_decoding",
+                               None) if perf_metrics else None
+            if spec_dec is not None:
+                accepted += spec_dec.total_accepted_draft_tokens
+                drafted += spec_dec.total_draft_tokens
+        if tokens_per_iter:
+            mean_tpi = sum(tokens_per_iter) / len(tokens_per_iter)
+            logger.info(
+                f"Spec-dec stats: AL (mean decoded tokens/step) {mean_tpi:.3f} "
+                f"(min {min(tokens_per_iter):.3f}, "
+                f"max {max(tokens_per_iter):.3f}, n={len(tokens_per_iter)})")
+        if drafted > 0:
+            logger.info(
+                f"Spec-dec stats: AR (accepted/drafted draft tokens) "
+                f"{accepted}/{drafted} = {accepted / drafted:.2%}")
+
+    def _generate_until_windowed(self, requests, scorer,
+                                 disable_tqdm: bool) -> List[RequestOutput]:
+        """Submit requests through a sliding window of ``max_in_flight``.
+
+        With unlimited submission and GUARANTEED_NO_EVICT scheduling on large
+        attention-DP deployments, the engine admits ~all requests concurrently
+        and every response completes in a burst at the very end, so the
+        partial-score tracker gives zero mid-run signal. Capping in-flight
+        requests to W makes responses complete steadily throughout the run:
+        as each request finishes, it is scored immediately and the window is
+        topped up with the next unsubmitted request.
+
+        TRADEOFF: windowing can reduce end-to-end throughput — waves of W
+        requests may under-fill the scheduler compared with all-at-once
+        admission. The payoff is EARLY FAILURE SIGNAL via steady partial
+        scores, which is the right default for accuracy testing (kill a bad
+        run in minutes instead of hours). Suggested W: 256-512 for 16-rank
+        deployments.
+
+        Completion (and therefore partial-scoring) order is arbitrary, but
+        outputs are collected into an index-addressed list so the returned
+        order matches submission order — downstream handling is unchanged.
+        """
+        total = len(requests)
+        outputs: List[Optional[RequestOutput]] = [None] * total
+        next_idx = 0
+        done_count = 0
+
+        def _submit_next(pool):
+            # generate_async stays on the caller thread (submission order is
+            # deterministic); only the blocking .result() wait is offloaded,
+            # one waiter thread per in-flight request, so completions surface
+            # in completion order via FIRST_COMPLETED below.
+            nonlocal next_idx
+            idx = next_idx
+            next_idx += 1
+            prompt, gen_kwargs = requests[idx].args
             sampling_params = self._get_sampling_params(gen_kwargs)
             output = self.llm.generate_async(prompt,
                                              sampling_params=sampling_params,
                                              streaming=self.streaming)
-            results.append(output)
+            return pool.submit(lambda: (idx, output.result()))
 
-        outputs = []
-        for output in tqdm(results,
-                           desc="Fetching responses",
-                           disable=disable_tqdm):
-            outputs.append(output.result())
+        pbar = tqdm(total=total, desc="Fetching responses (windowed)",
+                    disable=disable_tqdm)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.max_in_flight) as pool:
+                pending = {
+                    _submit_next(pool)
+                    for _ in range(min(self.max_in_flight, total))
+                }
+                while pending:
+                    done, pending = concurrent.futures.wait(
+                        pending,
+                        return_when=concurrent.futures.FIRST_COMPLETED)
+                    for fut in done:
+                        # A failed request re-raises here (same as the
+                        # non-windowed path's output.result()); no deadlock —
+                        # pool shutdown just drains the remaining in-flight
+                        # waiters, which the engine unblocks on completion or
+                        # via EngineDeadError.
+                        idx, output = fut.result()
+                        outputs[idx] = output
+                        done_count += 1
+                        pbar.update(1)
+                        if scorer is not None:
+                            scorer.update(requests[idx],
+                                          output.outputs[0].text)
+                            scorer.maybe_log(done_count, total)
+                        if next_idx < total:
+                            pending.add(_submit_next(pool))
+        finally:
+            pbar.close()
+        return outputs
+
+    def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
+        profiler.start("trtllm exec")
+
+        scorer = None
+        if self.partial_scores_every and self.partial_scoring_task_dict:
+            scorer = _RunningScoreTracker(self.partial_scoring_task_dict,
+                                          self.partial_scores_every)
+
+        if self.max_in_flight > 0 and not self.streaming:
+            # Env-gated (TLLM_EVAL_MAX_IN_FLIGHT) submission windowing for the
+            # standard non-streaming path only; streaming (and the multimodal
+            # override below) keep the submit-all behavior untouched.
+            outputs = self._generate_until_windowed(requests, scorer,
+                                                    disable_tqdm)
+        else:
+            results = []
+            for request in tqdm(requests,
+                                desc="Submitting requests",
+                                disable=disable_tqdm):
+                prompt, gen_kwargs = request.args
+                sampling_params = self._get_sampling_params(gen_kwargs)
+                output = self.llm.generate_async(
+                    prompt,
+                    sampling_params=sampling_params,
+                    streaming=self.streaming)
+                results.append(output)
+
+            outputs = []
+            for output, request in zip(
+                    tqdm(results, desc="Fetching responses",
+                         disable=disable_tqdm), requests):
+                outputs.append(output.result())
+                if scorer is not None:
+                    scorer.update(request, outputs[-1].outputs[0].text)
+                    scorer.maybe_log(len(outputs), len(requests))
 
         if self.output_dir:
             dump_inference_results(self.output_dir, outputs,
                                    getattr(self.llm, 'tokenizer', None))
+
+        if self.spec_stats:
+            self._log_spec_stats(outputs)
 
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
@@ -208,7 +458,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  output_dir: Optional[str] = None,
                  sampling_override: bool = False,
                  preserve_caller_max_tokens: bool = False,
-                 post_process_fn: Optional[Callable[[str], str]] = None):
+                 post_process_fn: Optional[Callable[[str], str]] = None,
+                 partial_scores_every: Optional[int] = None,
+                 partial_scoring_task_dict: Optional[dict] = None):
         """
         Initialize the multimodal wrapper.
 
@@ -227,6 +479,10 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                 to model outputs before scoring. Used by Kimi K2.5 to strip
                 ``<think>...</think>`` and extract the final answer (see
                 ``tensorrt_llm.evaluate.post_processing``).
+            partial_scores_every: Accepted for interface parity with
+                LmEvalWrapper; the multimodal generate_until override does
+                not implement partial scoring yet.
+            partial_scoring_task_dict: See partial_scores_every.
         """
         super().__init__(
             llm,
@@ -238,6 +494,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             output_dir=output_dir,
             sampling_override=sampling_override,
             preserve_caller_max_tokens=preserve_caller_max_tokens,
+            partial_scores_every=partial_scores_every,
+            partial_scoring_task_dict=partial_scoring_task_dict,
         )
 
         # NOTE: Required by lm_eval to identify this as a multimodal model
@@ -403,6 +661,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             List of generated text responses
         """
         profiler.start("trtllm exec")
+        # NOTE: TLLM_EVAL_MAX_IN_FLIGHT submission windowing (see
+        # LmEvalWrapper.generate_until) is intentionally NOT applied to this
+        # multimodal path; it keeps the original submit-all behavior.
         results = []
         for request in tqdm(requests,
                             desc="Submitting requests",
@@ -438,6 +699,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         if self.output_dir:
             dump_inference_results(self.output_dir, outputs,
                                    getattr(self.llm, 'tokenizer', None))
+
+        if self.spec_stats:
+            self._log_spec_stats(outputs)
 
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
@@ -611,6 +875,22 @@ class LmEvalEvaluator(Evaluator):
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
 
+        # Opt-in running metric estimates for long evals: log a partial
+        # score every N completed responses (see _RunningScoreTracker).
+        # Env-var driven so it uniformly covers every lm-eval-backed task
+        # without per-task CLI plumbing.
+        partial_scores_every = None
+        env_interval = os.environ.get(PARTIAL_SCORES_ENV_VAR)
+        if env_interval:
+            try:
+                partial_scores_every = int(env_interval)
+            except ValueError:
+                raise ValueError(
+                    f"{PARTIAL_SCORES_ENV_VAR} must be an integer, got "
+                    f"{env_interval!r}") from None
+            if partial_scores_every <= 0:
+                partial_scores_every = None
+
         lm_kwargs: Dict[str, Any] = dict(
             sampling_params=sampling_params,
             streaming=streaming,
@@ -619,6 +899,9 @@ class LmEvalEvaluator(Evaluator):
             is_force_single_image=is_force_single_image,
             output_dir=self.output_dir,
             sampling_override=sampling_override,
+            partial_scores_every=partial_scores_every,
+            partial_scoring_task_dict=self.task_dict
+            if partial_scores_every else None,
         )
         # post_process_fn / preserve_caller_max_tokens only consumed by multimodal.
         if self.MULTIMODAL:
