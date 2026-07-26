@@ -47,6 +47,7 @@ from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import LLM, RequestOutput
+from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
@@ -1504,6 +1505,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 tokenizer=self.tokenizer,
                 chat_template_kwargs=request.chat_template_kwargs,
             )
+            reasoning_parser_name = self.generator.args.reasoning_parser
+            if reasoning_parser_name and ReasoningParserFactory.needs_raw_special_tokens(
+                    reasoning_parser_name):
+                # Unlike the tool-parser flag below, this applies to every
+                # chat request: the reasoning delimiters are special tokens
+                # regardless of whether tools are attached.
+                sampling_params.skip_special_tokens = False
             if self.tool_parser and request.tools:
                 tool_parser_cls = ToolParserFactory.parsers.get(
                     self.tool_parser.lower())
