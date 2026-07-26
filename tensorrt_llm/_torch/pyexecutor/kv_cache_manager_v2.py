@@ -82,7 +82,7 @@ from ...logger import logger
 from ...mapping import CpType, Mapping
 from ..utils import maybe_compile
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .kv_cache_events import KVEventAdapter
+from .kv_cache_events import KVEventAdapter, NativeKVCacheEventManager
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
@@ -890,14 +890,13 @@ class KVCacheManagerV2(BaseResourceManager):
                     block_size=self.tokens_per_block,
                     max_window_size=event_window_size,
                 )
-                self.event_manager = KVCacheEventManager(
-                    50_000,
-                    window_size=event_window_size,
-                    attention_dp_rank=event_rank,
-                    attention_dp_gather=self.kv_event_adapter.
-                    publish_local_events,
-                    hash_algo=kv_cache_event_hash_algo,
+                self.event_manager = NativeKVCacheEventManager(
+                    self.kv_event_adapter,
+                    block_size=self.tokens_per_block,
+                    max_window_size=event_window_size,
                 )
+                logger.info(
+                    "Native KV event fast path reuses V2 radix block hashes")
         elif self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
                 self.event_manager = KVCacheEventManager(
@@ -3460,6 +3459,8 @@ class KVCacheManagerV2(BaseResourceManager):
     def shutdown(self):
         if self.kv_event_adapter is not None:
             self.flush_iteration_events()
+            if isinstance(self.event_manager, NativeKVCacheEventManager):
+                self.event_manager.shutdown()
             self.kv_event_adapter.shutdown()
             self.kv_event_adapter = None
         for kv_cache in self.kv_cache_map.values():
