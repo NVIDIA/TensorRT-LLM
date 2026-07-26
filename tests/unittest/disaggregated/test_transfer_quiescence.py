@@ -890,6 +890,54 @@ def test_closed_tombstones_are_bounded() -> None:
     assert list(tombstones) == [2, 3, 4]
 
 
+def test_sender_classifies_waiter_metadata_counts_under_lock() -> None:
+    sender = object.__new__(Sender)
+    peer_info = SimpleNamespace(dp_rank=0)
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda _name, _rank: peer_info,
+        get_peer_overlap=lambda _peer, _dp_rank: SimpleNamespace(ranks=[0, 1]),
+    )
+    sender._peer_requests = {
+        2: {0: SimpleNamespace(instance_name="gen", instance_rank=0)},
+        3: {
+            0: SimpleNamespace(instance_name="gen", instance_rank=0),
+            1: SimpleNamespace(instance_name="gen", instance_rank=1),
+        },
+    }
+    sender._peer_requests_lock = threading.Lock()
+
+    assert sender._classify_peer_req_infos([1, 2, 3]) == (1, 1, 1)
+
+
+def test_receiver_fanout_diagnostics_are_opt_in_and_noninterfering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receiver = object.__new__(Receiver)
+    receiver._registrar = SimpleNamespace(self_rank_info=SimpleNamespace(instance_rank=5))
+    receiver._fanout_instrumentation_lock = threading.Lock()
+    receiver._fanout_dispatch_count = 0
+    receiver._fanout_target_frame_count = 0
+    receiver._fanout_sent_frame_count = 0
+    receiver._fanout_failure_count = 0
+    messages: list[str] = []
+    monkeypatch.setattr(transfer_module.logger, "info", messages.append)
+    monkeypatch.delenv(transfer_module._CONTEXT_ACTIVATION_DIGEST_ENV, raising=False)
+
+    receiver._record_request_data_fanout(target_frames=4, sent_frames=3, failed=True)
+    assert receiver._fanout_dispatch_count == 0
+    assert messages == []
+
+    monkeypatch.setenv(transfer_module._CONTEXT_ACTIVATION_DIGEST_ENV, "1")
+    receiver._record_request_data_fanout(target_frames=4, sent_frames=3, failed=True)
+    assert "dispatches=1 target_frames=4 sent_frames=3 failures=1" in messages[-1]
+
+    def fail_instrumentation(**_kwargs) -> None:
+        raise RuntimeError("diagnostic failure")
+
+    receiver._record_request_data_fanout = fail_instrumentation
+    receiver._try_record_request_data_fanout(target_frames=4, sent_frames=0, failed=True)
+
+
 def test_receiver_epoch_tombstone_drops_only_matching_delayed_result() -> None:
     receiver = object.__new__(Receiver)
     receiver._sessions = {}

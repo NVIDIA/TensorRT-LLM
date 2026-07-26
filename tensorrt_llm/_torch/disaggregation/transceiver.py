@@ -79,6 +79,7 @@ _MAX_RETIRED_CONSENSUS_REQUESTS = 65536
 _STARTUP_ROLLBACK_TIMEOUT_S = 30.0
 _CONSENSUS_STARTUP_CLOSE_TIMEOUT_S = 1.0
 _ASYNC_READY_MAX_IDLE_SLEEP_S = 0.01
+_CONTEXT_READINESS_PROBE_INTERVAL_S = 5.0
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
@@ -207,6 +208,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._context_activation_digest = hashlib.sha256() if enabled else None
         self._context_activation_count = 0
         self._context_activation_digest_logged = False
+        self._context_readiness_last_snapshot: Optional[tuple[str, int, int, int, int, int]] = None
+        self._context_readiness_last_probe_key: Optional[tuple[str, int, int]] = None
+        self._context_readiness_last_probe_at = 0.0
 
     def _record_context_activation_ids(self, request_ids: List[int]) -> None:
         """Record an order-sensitive digest without logging request IDs."""
@@ -2155,7 +2159,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._async_ready_activated[key] = prepared_req
             coordinator.acknowledge_ready_activation(rid, epoch)
             self._record_async_transition("ready_activate", rid, epoch)
-        self._record_context_activation_ids([rid for rid, _, _, _ in activations])
+        activation_ids = [rid for rid, _, _, _ in activations]
+        self._record_context_activation_ids(activation_ids)
+        self._maybe_log_context_readiness_snapshot(
+            activation_ids,
+            "async_activation",
+            len(activation_ids),
+        )
 
     def supports_pre_active_context_requests(self) -> bool:
         return bool(getattr(self, "_async_peer_ready_consensus_enabled", False))
@@ -2183,6 +2193,52 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if cancelled:
             self._async_ready_metadata_leases.discard(rid)
         return cancelled
+
+    def _maybe_log_context_readiness_snapshot(
+        self,
+        cohort_ids: List[int],
+        progress_label: str,
+        progress_count: int,
+    ) -> None:
+        if getattr(self, "_context_activation_digest", None) is None or not cohort_ids:
+            return
+        try:
+            probe_key = (progress_label, len(cohort_ids), progress_count)
+            now = time.monotonic()
+            if (
+                getattr(self, "_context_readiness_last_probe_key", None) == probe_key
+                and now - getattr(self, "_context_readiness_last_probe_at", 0.0)
+                < _CONTEXT_READINESS_PROBE_INTERVAL_S
+            ):
+                return
+            self._context_readiness_last_probe_key = probe_key
+            self._context_readiness_last_probe_at = now
+            absent, partial, complete = self._transfer_worker._classify_peer_req_infos_for_send(
+                cohort_ids
+            )
+            snapshot = (
+                progress_label,
+                len(cohort_ids),
+                absent,
+                partial,
+                complete,
+                progress_count,
+            )
+            if getattr(self, "_context_readiness_last_snapshot", None) == snapshot:
+                return
+            self._context_readiness_last_snapshot = snapshot
+            logger.info(
+                "PYTHON_CTX_READINESS_SNAPSHOT "
+                f"rank={self._dist.rank} "
+                f"cohort={snapshot[1]} "
+                f"absent={snapshot[2]} "
+                f"partial={snapshot[3]} "
+                f"complete={snapshot[4]} "
+                f"{snapshot[0]}={snapshot[5]}"
+            )
+        except Exception:
+            # Diagnostics must never alter readiness or scheduling.
+            return
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # Place new generation-first context requests into wait state, then
@@ -2219,6 +2275,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if not self._wait_reqs:
             return
 
+        instrumented_cohort_ids = (
+            list(self._wait_reqs)
+            if getattr(self, "_context_activation_digest", None) is not None
+            else []
+        )
         # Check which waiting requests have peer info locally, then allgather
         # consensus so all TP/PP ranks agree before promoting.
         # Without consensus, background peer info arriving at different times on
@@ -2233,6 +2294,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._wait_reqs[rid].state = LlmRequestState.CONTEXT_INIT
             del self._wait_reqs[rid]
         self._record_context_activation_ids(ready_request_ids)
+        self._maybe_log_context_readiness_snapshot(
+            instrumented_cohort_ids,
+            "pp_intersection",
+            len(ready_request_ids),
+        )
 
     def _prepare_context_requests_async(self) -> None:
         coordinator = cast(AsyncConsensusCoordinator, self._async_consensus)

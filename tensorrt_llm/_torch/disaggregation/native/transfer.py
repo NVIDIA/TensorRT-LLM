@@ -90,6 +90,7 @@ _NATIVE_CAPABILITY_PREFIX = b"TRTLLM_NATIVE_TRANSFER_CAPABILITIES\0"
 _CONTROL_RETRY_INTERVAL_S = 0.01
 _CONTROL_QUEUE_LIMIT = 65_536
 _LIVE_PROTOCOL_STATE_LIMIT = 65_536
+_CONTEXT_ACTIVATION_DIGEST_ENV = "TRTLLM_PYTHON_TRANSCEIVER_CONTEXT_ACTIVATION_DIGEST"
 
 
 @dataclass(frozen=True)
@@ -648,6 +649,29 @@ class Sender(SenderBase):
             if not reqs:
                 return None
             return next(iter(reqs.values()))
+
+    def _classify_peer_req_infos(self, unique_rids: List[int]) -> tuple[int, int, int]:
+        """Count metadata states for local waiters under the ingress lock."""
+        absent = 0
+        partial = 0
+        complete = 0
+        present = []
+        with self._peer_requests_lock:
+            for unique_rid in unique_rids:
+                req_infos = self._peer_requests.get(unique_rid)
+                if not req_infos:
+                    absent += 1
+                    continue
+                req_info = next(iter(req_infos.values()))
+                present.append((len(req_infos), req_info.instance_name, req_info.instance_rank))
+        for actual_count, instance_name, instance_rank in present:
+            peer_ri = self._registrar.get_peer_rank_info(instance_name, instance_rank)
+            expected_count = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
+            if actual_count == expected_count:
+                complete += 1
+            else:
+                partial += 1
+        return absent, partial, complete
 
     def _remove_req_info(self, unique_rid: int):
         with self._peer_requests_lock:
@@ -2671,6 +2695,11 @@ class Receiver(ReceiverBase):
         self._registrar = peer_registrar
         self._agent = agent
         self._bounce = bounce
+        self._fanout_instrumentation_lock = threading.Lock()
+        self._fanout_dispatch_count = 0
+        self._fanout_target_frame_count = 0
+        self._fanout_sent_frame_count = 0
+        self._fanout_failure_count = 0
         self._control = _ControlPlane("native-receiver")
         self._sender_ep_instance_map = {}
         self._sender_info_capabilities: dict[str, _NativeProtocolCapabilities] = {}
@@ -2946,6 +2975,56 @@ class Receiver(ReceiverBase):
                         return False
         return True
 
+    def _record_request_data_fanout(
+        self,
+        *,
+        target_frames: int,
+        sent_frames: int,
+        failed: bool,
+    ) -> None:
+        if os.environ.get(_CONTEXT_ACTIVATION_DIGEST_ENV, "0") != "1":
+            return
+        with self._fanout_instrumentation_lock:
+            self._fanout_dispatch_count += 1
+            self._fanout_target_frame_count += target_frames
+            self._fanout_sent_frame_count += sent_frames
+            if failed:
+                self._fanout_failure_count += 1
+            dispatches = self._fanout_dispatch_count
+            failures = self._fanout_failure_count
+            if dispatches & (dispatches - 1) != 0 and (
+                not failed or failures & (failures - 1) != 0
+            ):
+                return
+            snapshot = (
+                dispatches,
+                self._fanout_target_frame_count,
+                self._fanout_sent_frame_count,
+                failures,
+            )
+
+        logger.info(
+            "PYTHON_GEN_REQUEST_DATA_FANOUT "
+            f"rank={self._registrar.self_rank_info.instance_rank} "
+            f"dispatches={snapshot[0]} "
+            f"target_frames={snapshot[1]} "
+            f"sent_frames={snapshot[2]} "
+            f"failures={snapshot[3]}"
+        )
+
+    def _try_record_request_data_fanout(
+        self, *, target_frames: int, sent_frames: int, failed: bool
+    ) -> None:
+        try:
+            self._record_request_data_fanout(
+                target_frames=target_frames,
+                sent_frames=sent_frames,
+                failed=failed,
+            )
+        except Exception:
+            # Diagnostics must never alter dispatch, including through logging.
+            return
+
     def dispatch_task(self, task: KVRecvTask):
         params = task._params
         logger.debug(
@@ -3073,6 +3152,7 @@ class Receiver(ReceiverBase):
         key = (receiver_req.unique_rid, receiver_req.slice_id)
         receiver_req_bytes = None
         sent_ranks: set[int] = set()
+        fanout_failed = False
         try:
             if bounced:
                 # Install the lifetime callback before advertising any address.
@@ -3098,6 +3178,7 @@ class Receiver(ReceiverBase):
                 self._request_sender_data(endpoint, receiver_req_bytes)
                 sent_ranks.add(rank)
         except Exception as error:
+            fanout_failed = True
             logger.error(
                 "REQUEST_DATA fan-out failed for request %s slice=%s after %s/%s endpoint(s): %s",
                 receiver_req.unique_rid,
@@ -3134,6 +3215,12 @@ class Receiver(ReceiverBase):
                     cancel_endpoints,
                     cancel_operations,
                 )
+        finally:
+            self._try_record_request_data_fanout(
+                target_frames=len(peer_overlap.ranks),
+                sent_frames=len(sent_ranks),
+                failed=fanout_failed,
+            )
         return
 
     @staticmethod
@@ -4554,6 +4641,9 @@ class TransferWorker:
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:
         return self._sender.has_all_peer_req_infos(unique_rid)
+
+    def _classify_peer_req_infos_for_send(self, unique_rids: List[int]) -> tuple[int, int, int]:
+        return self._sender._classify_peer_req_infos(unique_rids)
 
     def pin_peer_req_infos_for_send(self, unique_rid: int) -> None:
         self._sender.pin_peer_req_infos(unique_rid)
