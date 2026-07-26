@@ -47,6 +47,7 @@ usage() {
 MODEL=""
 CONTAINER_IMAGE=""
 MODE=default
+SPEC_STATS_DEFAULT=0
 DFLASH_DRAFTER=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -124,6 +125,7 @@ case "$MODE" in
     sa)
         EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options_sa.yaml
         MAX_BATCH_SIZE=8
+        SPEC_STATS_DEFAULT=1
         ;;
     reuse)
         EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options_reuse.yaml
@@ -137,6 +139,7 @@ case "$MODE" in
         MAX_BATCH_SIZE=8
         MAX_NUM_TOKENS=4096
         KV_FRAC=0.20
+        SPEC_STATS_DEFAULT=1
         ;;
     *)
         EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options.yaml
@@ -193,6 +196,9 @@ srun --mpi=pmix \
         export TLLM_EVAL_PARTIAL_SCORES_EVERY=\"\${TLLM_EVAL_PARTIAL_SCORES_EVERY:-100}\"
         # Cap in-flight requests: may cost some throughput vs submit-all, but yields steady partial scores (early failure signal) instead of one burst at the end (0 = off).
         export TLLM_EVAL_MAX_IN_FLIGHT=\"\${TLLM_EVAL_MAX_IN_FLIGHT:-0}\"
+        # Spec-dec acceptance summary (AL/AR) at eval end; default ON for the
+        # sa/dflash modes, off otherwise (explicit env still wins either way).
+        export TLLM_EVAL_SPEC_STATS=\"\${TLLM_EVAL_SPEC_STATS:-$SPEC_STATS_DEFAULT}\"
 
         # Import tensorrt_llm from $REPO, not from wherever the venv's
         # in-place install points (for git-worktree submits those differ;
