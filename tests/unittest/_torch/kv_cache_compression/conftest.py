@@ -271,7 +271,7 @@ def make_buffer_stubs(manager, *, decode_width=260):
     ``_rebuild_eviction_runtime`` should set (production sets them in place)."""
     manager._freq_scale_sq = torch.ones(2)
     manager._phase = {"rows": 8}
-    manager.calibration = {"omega": torch.ones(2)}
+    manager._omega = torch.ones(2)
     manager._local_score_calibration = mock.Mock(return_value=(torch.ones(2, 2, 2),) * 3)
     pool = torch.empty(8, 2, 1, 4, 4)
     layout = dict(
@@ -391,21 +391,25 @@ def make_eviction_input(
     target_tail_length=0,
     target_cache=None,
     draft_cache=None,
+    state=None,
 ):
     """One due-cohort item shaped exactly like ``_evict_due_requests`` builds."""
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import _EvictionInput
+
     if request is None:
         request = SimpleNamespace(py_request_id=request_id, py_num_compressed_tokens=0)
-    return {
-        "request": request,
-        "target_cache": target_cache,
-        "draft_cache": draft_cache,
-        "source_length": int(source_length),
-        "logical_source_length": int(
+    return _EvictionInput(
+        request=request,
+        target_cache=target_cache,
+        draft_cache=draft_cache,
+        state={"generation_steps": 0, "evicted_tokens": 0} if state is None else state,
+        source_length=int(source_length),
+        logical_source_length=int(
             source_length if logical_source_length is None else logical_source_length
         ),
-        "prompt_length": int(prompt_length),
-        "target_tail_length": int(target_tail_length),
-    }
+        prompt_length=int(prompt_length),
+        target_tail_length=int(target_tail_length),
+    )
 
 
 def make_request(request_id, **overrides):
@@ -441,7 +445,7 @@ def torch_tri_score_oracle(
     layer_pools,
     page_ids,
     seq_lens,
-    round_starts,
+    logical_source_lengths,
     q_real,
     q_imag,
     mlr_coef,
@@ -455,7 +459,7 @@ def torch_tri_score_oracle(
     scores = []
     num_q_heads = int(q_real.shape[1])
     for request, seq_len in enumerate(seq_lens):
-        phase = (round_starts[request] + offsets[:, None]) * omega[None, :]
+        phase = (logical_source_lengths[request] + offsets[:, None]) * omega[None, :]
         mean_cos = torch.cos(phase).mean(dim=0)
         mean_sin = torch.sin(phase).mean(dim=0)
         for layer in layer_indices:
@@ -577,9 +581,9 @@ def make_cute_buffers(
     manager.budget = keep_count
     manager._protected_tail_capacity = protected_tail_capacity
     manager._freq_scale_sq = freq_scale_sq
-    manager._triattn_q_real = q_real
-    manager._triattn_q_imag = q_imag
-    manager._triattn_mlr_coef = mlr_coef
+    manager._calibration_q_real = q_real
+    manager._calibration_q_imag = q_imag
+    manager._calibration_mlr_coef = mlr_coef
     manager._rebuild_eviction_runtime(
         layout,
         None,
@@ -614,20 +618,20 @@ def rect_to_score_scratch(scores, num_kv_heads, padded_head_columns=8):
     return scratch, prompt_lengths
 
 
-def stage_score_metadata(manager, request_count, valid_seq_lens, valid_widths, token_starts):
+def stage_score_metadata(manager, request_count, source_lengths, decode_lengths, prompt_lengths):
     """Stage the per-round score metadata exactly like production (the
     compiled score launches read the staged rows via pointer capture)."""
     torch.sub(
-        valid_seq_lens[:request_count],
-        token_starts[:request_count],
-        out=valid_widths[:request_count],
+        source_lengths[:request_count],
+        prompt_lengths[:request_count],
+        out=decode_lengths[:request_count],
     )
-    manager._source_lengths_device[:request_count].copy_(valid_seq_lens[:request_count])
-    manager._prompt_lengths_device[:request_count].copy_(token_starts[:request_count])
+    manager._source_lengths_device[:request_count].copy_(source_lengths[:request_count])
+    manager._prompt_lengths_device[:request_count].copy_(prompt_lengths[:request_count])
 
 
 def launch_split_scores(
-    manager, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
+    manager, request_count, source_lengths, decode_lengths, prompt_lengths, mean_cos, mean_sin
 ):
     """The production score-only leg plus the decode-window gather (the round
     executor's per-head sequence, parameterized by count). Test mean phases
@@ -635,7 +639,7 @@ def launch_split_scores(
     gather refresh; the compiled entry fires directly, like the round does."""
     import cuda.bindings.driver as cuda_driver
 
-    stage_score_metadata(manager, request_count, valid_seq_lens, valid_widths, token_starts)
+    stage_score_metadata(manager, request_count, source_lengths, decode_lengths, prompt_lengths)
     manager._mean_cos[:request_count].copy_(mean_cos[:request_count])
     manager._mean_sin[:request_count].copy_(mean_sin[:request_count])
     assert request_count in manager._compiled_score_by_request_count
@@ -665,7 +669,7 @@ def launch_split_scores(
         )[:, :group_size]
         .permute(2, 3, 0, 1, 4)
     )
-    columns = token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + torch.arange(
+    columns = prompt_lengths[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + torch.arange(
         manager._selection_width_capacity,
         dtype=torch.int64,
         device=manager._score_scratch.device,

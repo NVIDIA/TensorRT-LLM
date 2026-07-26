@@ -20,7 +20,14 @@ _SM100_ONLY = pytest.mark.skipif(
 
 
 def _run_fused_union(
-    tri, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin, union_out
+    tri,
+    request_count,
+    source_lengths,
+    decode_lengths,
+    prompt_lengths,
+    mean_cos,
+    mean_sin,
+    union_out,
 ):
     """The fused score+stats+normalized-union pipeline (THE union path), fired
     directly off the compiled entries exactly like the round. Test mean phases
@@ -28,12 +35,12 @@ def _run_fused_union(
     build-bound ``tri._selection_scores_rows``."""
     import cuda.bindings.driver as cuda_driver
 
-    _stage_score_metadata(tri, request_count, valid_seq_lens, valid_widths, token_starts)
+    _stage_score_metadata(tri, request_count, source_lengths, decode_lengths, prompt_lengths)
     tri._mean_cos[:request_count].copy_(mean_cos[:request_count])
     tri._mean_sin[:request_count].copy_(mean_sin[:request_count])
     assert (
         request_count in tri._compiled_score_by_request_count
-        and request_count in tri._compiled_normalize_union
+        and request_count in tri._compiled_normalize_union_by_request_count
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(tri._score_scratch.device).cuda_stream)
     tri._compiled_score_by_request_count[request_count](
@@ -44,7 +51,7 @@ def _run_fused_union(
         request_count,
         stream,
     )
-    tri._compiled_normalize_union[request_count](
+    tri._compiled_normalize_union_by_request_count[request_count](
         tri._cute_partial_stats,
         *tri._cute_selection_prefix,
         tri._cute_selection_scores_rows,
@@ -55,7 +62,9 @@ def _run_fused_union(
     union_out[:request_count, :columns].copy_(tri._selection_scores_rows[:request_count, :columns])
 
 
-def _reference_union_scores(scores_rows: torch.Tensor, valid_widths: torch.Tensor) -> torch.Tensor:
+def _reference_union_scores(
+    scores_rows: torch.Tensor, decode_lengths: torch.Tensor
+) -> torch.Tensor:
     """Union oracle: per-row mean/biased-std z-norm over the valid prefix
     (std clamped at 1e-6), union-max across rows, ``-inf`` past the width."""
     request_count, _, width = scores_rows.shape
@@ -63,13 +72,13 @@ def _reference_union_scores(scores_rows: torch.Tensor, valid_widths: torch.Tenso
         (request_count, width), float("-inf"), dtype=torch.float32, device=scores_rows.device
     )
     for request in range(request_count):
-        valid_width = int(valid_widths[request])
-        if valid_width <= 0:
+        decode_length = int(decode_lengths[request])
+        if decode_length <= 0:
             continue
-        valid = scores_rows[request, :, :valid_width].to(torch.float32)
+        valid = scores_rows[request, :, :decode_length].to(torch.float32)
         mean = valid.mean(dim=1, keepdim=True)
-        std = ((valid - mean).square().sum(dim=1, keepdim=True) / valid_width).sqrt()
-        combined[request, :valid_width] = ((valid - mean) / std.clamp_min(1e-6)).amax(dim=0)
+        std = ((valid - mean).square().sum(dim=1, keepdim=True) / decode_length).sqrt()
+        combined[request, :decode_length] = ((valid - mean) / std.clamp_min(1e-6)).amax(dim=0)
     return combined
 
 
@@ -125,8 +134,8 @@ def test_union_fusion_matches_split_pipeline(
     freq_scale_sq = torch.linspace(0.5, 1.5, num_freqs, device=device)
     omega = torch.linspace(0.01, 0.03, num_freqs, device=device)
     offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
-    round_starts = torch.tensor([float(seq_len), float(seq_len + 1)], device=device)
-    phase = (round_starts[:, None, None] + offsets[None, :, None]) * omega[None, None]
+    logical_source_lengths = torch.tensor([float(seq_len), float(seq_len + 1)], device=device)
+    phase = (logical_source_lengths[:, None, None] + offsets[None, :, None]) * omega[None, None]
     mean_cos = torch.cos(phase).mean(dim=1).contiguous()
     mean_sin = torch.sin(phase).mean(dim=1).contiguous()
 
@@ -154,7 +163,7 @@ def test_union_fusion_matches_split_pipeline(
     _write_block_offsets(ref_tri, encoded)
     if valid_lens is None:
         valid_lens = [seq_len, seq_len]
-    valid_seq_lens = torch.tensor(valid_lens, dtype=torch.int32, device=device)
+    source_lengths = torch.tensor(valid_lens, dtype=torch.int32, device=device)
     request_count = 2
     if isinstance(score_starts, int):
         score_starts = [score_starts] * request_count
@@ -163,13 +172,13 @@ def test_union_fusion_matches_split_pipeline(
     # Reference: the production score gather over the same decode windows,
     # then the pure-torch union oracle.
     split_widths = torch.empty(request_count, dtype=torch.int32, device=device)
-    token_starts = torch.tensor(score_starts, dtype=torch.int32, device=device)
+    prompt_lengths = torch.tensor(score_starts, dtype=torch.int32, device=device)
     per_head = _launch_split_scores(
         ref_tri,
         request_count,
-        valid_seq_lens,
+        source_lengths,
         split_widths,
-        token_starts,
+        prompt_lengths,
         mean_cos,
         mean_sin,
     )
@@ -184,9 +193,9 @@ def test_union_fusion_matches_split_pipeline(
     _run_fused_union(
         tri,
         request_count,
-        valid_seq_lens,
+        source_lengths,
         fused_widths,
-        token_starts,
+        prompt_lengths,
         mean_cos,
         mean_sin,
         fused_out,
@@ -215,7 +224,7 @@ def test_union_fusion_frequency_count_guard_raises() -> None:
     with pytest.raises(ValueError, match="frequencies"):
         _TriAttentionScoreKernel(
             num_layers=1,
-            seq_len=256,
+            score_token_capacity=256,
             num_q_heads=8,
             num_freqs=16,
             pool_shape=(2, 2, 1, 128, 32),
@@ -288,8 +297,10 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     freq_scale_sq = torch.linspace(0.5, 1.5, num_freqs, device=device)
     omega = torch.linspace(0.01, 0.03, num_freqs, device=device)
     offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
-    round_starts = torch.arange(max_requests, dtype=torch.float32, device=device) + seq_len
-    phase = (round_starts[:, None, None] + offsets[None, :, None]) * omega[None, None]
+    logical_source_lengths = (
+        torch.arange(max_requests, dtype=torch.float32, device=device) + seq_len
+    )
+    phase = (logical_source_lengths[:, None, None] + offsets[None, :, None]) * omega[None, None]
     mean_cos = torch.cos(phase).mean(dim=1).contiguous()
     mean_sin = torch.sin(phase).mean(dim=1).contiguous()
 
@@ -316,10 +327,10 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
         staged._block_offsets_device[0, :request_count, 0, :num_pages] = 2 * page_ids
         staged._block_offsets_device[0, :request_count, 1, :num_pages] = 2 * page_ids + 1
 
-    valid_seq_lens = torch.zeros(max_requests, dtype=torch.int32, device=device)
-    token_starts = torch.zeros(max_requests, dtype=torch.int32, device=device)
-    valid_seq_lens[:request_count] = torch.tensor(valid_lens, dtype=torch.int32, device=device)
-    token_starts[:request_count] = torch.tensor(score_starts, dtype=torch.int32, device=device)
+    source_lengths = torch.zeros(max_requests, dtype=torch.int32, device=device)
+    prompt_lengths = torch.zeros(max_requests, dtype=torch.int32, device=device)
+    source_lengths[:request_count] = torch.tensor(valid_lens, dtype=torch.int32, device=device)
+    prompt_lengths[:request_count] = torch.tensor(score_starts, dtype=torch.int32, device=device)
 
     # Reference: the split score gather over the same decode windows, then
     # the pure-torch union oracle.
@@ -327,9 +338,9 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     per_head = _launch_split_scores(
         ref_tri,
         request_count,
-        valid_seq_lens,
+        source_lengths,
         split_widths,
-        token_starts,
+        prompt_lengths,
         mean_cos,
         mean_sin,
     )
@@ -345,9 +356,9 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     _run_fused_union(
         tri,
         max_requests,
-        valid_seq_lens,
+        source_lengths,
         fused_widths,
-        token_starts,
+        prompt_lengths,
         mean_cos,
         mean_sin,
         fused_out,

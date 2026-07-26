@@ -113,8 +113,10 @@ def _select_per_head(tri, scores, *, normalize_scores):
         request_count=request_count,
         num_layers=num_layers,
         num_q_heads=num_q_heads,
+        num_kv_heads=tri._num_kv_heads,
         padded_head_columns=8,
         score_token_capacity=width,
+        selection_width=tri._selection_width_capacity,
         per_layer=tri.eviction_mode == "per_layer_perhead",
         normalize_scores=normalize_scores,
     )
@@ -129,7 +131,7 @@ def _stable_topk(row: torch.Tensor, width: int, keep_count: int) -> torch.Tensor
 
 def _per_head_keep_oracle(
     scores: torch.Tensor,
-    valid_widths: torch.Tensor,
+    decode_lengths: torch.Tensor,
     keep_count: int,
     eviction_mode: str,
     normalize_scores: bool,
@@ -139,23 +141,26 @@ def _per_head_keep_oracle(
     num_kv_heads = 2
     rows = []
     for request in range(request_count):
-        valid_width = int(valid_widths[request])
-        valid = scores[request, ..., :valid_width].clone()
+        decode_length = int(decode_lengths[request])
+        valid = scores[request, ..., :decode_length].clone()
         if normalize_scores:
             mean = valid.mean(dim=-1, keepdim=True)
             valid = valid - mean
-            std = valid.norm(dim=-1, keepdim=True) / (valid_width**0.5)
+            std = valid.norm(dim=-1, keepdim=True) / (decode_length**0.5)
             valid = valid / std.clamp_min(1e-6)
         grouped = valid.view(
-            num_layers, num_kv_heads, num_query_heads // num_kv_heads, valid_width
+            num_layers, num_kv_heads, num_query_heads // num_kv_heads, decode_length
         ).amax(dim=2)
         if eviction_mode == "per_head":
             selection = grouped.mean(dim=0)
         else:
-            selection = grouped.reshape(num_layers * num_kv_heads, valid_width)
+            selection = grouped.reshape(num_layers * num_kv_heads, decode_length)
         rows.append(
             torch.stack(
-                [torch.sort(_stable_topk(row, valid_width, keep_count)).values for row in selection]
+                [
+                    torch.sort(_stable_topk(row, decode_length, keep_count)).values
+                    for row in selection
+                ]
             )
         )
     return torch.stack(rows)
@@ -179,10 +184,10 @@ def test_per_head_selection_matches_torch_oracle_on_selector_stream(
         generator=generator,
         dtype=torch.int32,
     ).to(torch.float32)
-    valid_widths = torch.tensor([83, 91], dtype=torch.int32)
+    decode_lengths = torch.tensor([83, 91], dtype=torch.int32)
 
     expected = _per_head_keep_oracle(
-        scores_cpu, valid_widths, keep_count, eviction_mode, normalize_scores
+        scores_cpu, decode_lengths, keep_count, eviction_mode, normalize_scores
     )
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -198,7 +203,7 @@ def test_per_head_selection_matches_torch_oracle_on_selector_stream(
             num_query_heads=query_heads,
             num_kv_heads=kv_heads,
         )
-        tri._decode_lengths_device.copy_(valid_widths.to(device))
+        tri._decode_lengths_device.copy_(decode_lengths.to(device))
         scores = scores_cpu.to(device)
         keep_shape = (request_count, tri._selection_rows_per_request, keep_count)
         _select_per_head(tri, scores, normalize_scores=normalize_scores)
@@ -228,7 +233,7 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         dtype=torch.int32,
         device=device,
     ).to(torch.float32)
-    valid_widths = (width, width - 32)
+    decode_lengths = (width, width - 32)
     tri = _make_selection_buffers(
         eviction_mode="union",
         width=width,
@@ -236,7 +241,7 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         device=device,
         max_requests=request_count,
     )
-    tri._decode_lengths_device.copy_(torch.tensor(valid_widths, dtype=torch.int32, device=device))
+    tri._decode_lengths_device.copy_(torch.tensor(decode_lengths, dtype=torch.int32, device=device))
     tri._prompt_lengths_device[:request_count].copy_(
         torch.tensor([prompt_len] * request_count, dtype=torch.int32, device=device)
     )
@@ -245,9 +250,9 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
     actual = tri._kept_ordinal_rows.cpu()
 
     combined = scores.amax(dim=1).cpu()
-    for request, valid_width in enumerate(valid_widths):
+    for request, decode_length in enumerate(decode_lengths):
         expected_decode = torch.sort(
-            _stable_topk(combined[request], valid_width, keep_count).to(torch.int32) + prompt_len
+            _stable_topk(combined[request], decode_length, keep_count).to(torch.int32) + prompt_len
         ).values
         assert torch.equal(actual[request], expected_decode)
 
@@ -267,7 +272,7 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
         dtype=torch.float32,
         device=device,
     )
-    valid_widths = torch.tensor([83, 91], dtype=torch.int32, device=device)
+    decode_lengths = torch.tensor([83, 91], dtype=torch.int32, device=device)
     row_mean = torch.empty(
         request_count, layers, query_heads, 1, dtype=torch.float32, device=device
     )
@@ -284,7 +289,7 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
     score_scratch, prompt_lengths = _rect_to_score_scratch(scores, kv_heads)
     prepare_per_head_scores(
         score_scratch,
-        valid_widths,
+        decode_lengths,
         prompt_lengths,
         row_mean,
         row_inv_std,
@@ -293,8 +298,10 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
         request_count=request_count,
         num_layers=layers,
         num_q_heads=query_heads,
+        num_kv_heads=kv_heads,
         padded_head_columns=8,
         score_token_capacity=width,
+        selection_width=width,
         per_layer=per_layer,
         normalize_scores=normalize_scores,
     )
@@ -303,26 +310,26 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
     selection_scores = selection_scores_rows.view(request_count, selection_rows, width)
     assert torch.equal(
         selection_row_lengths.view(request_count, selection_rows).cpu(),
-        valid_widths.cpu().view(request_count, 1).expand(-1, selection_rows),
+        decode_lengths.cpu().view(request_count, 1).expand(-1, selection_rows),
     )
     query_group_size = query_heads // kv_heads
-    for request, valid_width in enumerate(valid_widths.tolist()):
-        valid = scores[request, :, :, :valid_width]
+    for request, decode_length in enumerate(decode_lengths.tolist()):
+        valid = scores[request, :, :, :decode_length]
         if normalize_scores:
             mean = valid.mean(dim=-1, keepdim=True)
             std = torch.linalg.vector_norm(valid - mean, dim=-1, keepdim=True)
-            std = (std / valid_width**0.5).clamp_min(1e-6)
+            std = (std / decode_length**0.5).clamp_min(1e-6)
             valid = (valid - mean) / std
-        grouped = valid.view(layers, kv_heads, query_group_size, valid_width).amax(dim=2)
+        grouped = valid.view(layers, kv_heads, query_group_size, decode_length).amax(dim=2)
         expected = grouped if per_layer else grouped.mean(dim=0)
-        expected = expected.reshape(selection_rows, valid_width)
+        expected = expected.reshape(selection_rows, decode_length)
         assert torch.allclose(
-            selection_scores[request, :, :valid_width],
+            selection_scores[request, :, :decode_length],
             expected,
             rtol=2e-5,
             atol=2e-5,
         )
-        assert torch.isneginf(selection_scores[request, :, valid_width:]).all()
+        assert torch.isneginf(selection_scores[request, :, decode_length:]).all()
 
 
 @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
@@ -760,7 +767,7 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
         dtype=torch.int64,
         device=device,
     )
-    valid_seq_lens = torch.tensor([64, 56], dtype=torch.int32, device=device)
+    source_lengths = torch.tensor([64, 56], dtype=torch.int32, device=device)
     protected_tails = [2, 1]
     compaction = _build_compaction(
         layer_pools=pools,
@@ -769,7 +776,7 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
         # Dense layer 0 stages in plane 0, the SWA layer in its own plane 1.
         layer_pool_ids=[0, 1],
         kept_token_ordinals=keep.to(torch.int32),
-        valid_sequence_lengths=valid_seq_lens,
+        valid_sequence_lengths=source_lengths,
         kv_block_offsets=_encode_block_offsets(torch.stack((dense_tables, swa_tables))),
         prompt_offsets=torch.tensor([2, 2], dtype=torch.int32, device=device),
         swa_window=2,
@@ -779,8 +786,8 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
     _run_compaction(compaction)
     torch.cuda.synchronize(device)
 
-    for request, (valid_seq_len, tail_length) in enumerate(
-        zip(valid_seq_lens.tolist(), protected_tails)
+    for request, (source_length, tail_length) in enumerate(
+        zip(source_lengths.tolist(), protected_tails)
     ):
         dense_pages = dense_tables[request].to(torch.long)
         swa_pages = swa_tables[request].to(torch.long)
@@ -789,8 +796,8 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
         swa_before = initial_pools[1][swa_pages].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 64)
         swa_after = pools[1][swa_pages].permute(1, 2, 0, 3, 4).reshape_as(swa_before)
         tail = torch.arange(
-            valid_seq_len,
-            valid_seq_len + tail_length,
+            source_length,
+            source_length + tail_length,
             dtype=torch.int64,
             device=device,
         )
@@ -799,8 +806,8 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
             2, 2 + dense_source.numel(), dtype=torch.int64, device=device
         )
         swa_source = torch.arange(
-            valid_seq_len - 2,
-            valid_seq_len + tail_length,
+            source_length - 2,
+            source_length + tail_length,
             dtype=torch.int64,
             device=device,
         )

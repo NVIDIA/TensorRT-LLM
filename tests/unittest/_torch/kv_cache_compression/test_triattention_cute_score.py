@@ -73,13 +73,17 @@ def _build_case(
         decode_width=capacity - prompt_len,
     )
     _write_block_offsets(tri, _encode_block_offsets(page_ids))
-    round_starts = (torch.arange(max_requests, dtype=torch.int32, device=device) + 9).contiguous()
-    token_starts = torch.full((max_requests,), prompt_len, dtype=torch.int32, device=device)
+    logical_source_lengths = (
+        torch.arange(max_requests, dtype=torch.int32, device=device) + 9
+    ).contiguous()
+    prompt_lengths = torch.full((max_requests,), prompt_len, dtype=torch.int32, device=device)
     # Mid-page/mid-tile tails; 58 leaves a fully-invalid trailing fragment.
     tail_cuts = (0, 58, 3, 33)
     seq_lens = [capacity - tail_cuts[request % len(tail_cuts)] for request in range(max_requests)]
-    valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-    phase = (round_starts.float()[:, None, None] + offsets_t[None, :, None]) * omega[None, None, :]
+    source_lengths = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    phase = (logical_source_lengths.float()[:, None, None] + offsets_t[None, :, None]) * omega[
+        None, None, :
+    ]
     mean_cos = torch.cos(phase).mean(dim=1).contiguous()
     mean_sin = torch.sin(phase).mean(dim=1).contiguous()
     oracle_inputs = dict(
@@ -94,8 +98,8 @@ def _build_case(
     return (
         tri,
         pools,
-        token_starts,
-        valid_seq_lens,
+        prompt_lengths,
+        source_lengths,
         seq_lens,
         mean_cos,
         mean_sin,
@@ -134,8 +138,8 @@ def test_cute_kernel_matches_torch_oracle(case):
     (
         tri,
         pools,
-        token_starts,
-        valid_seq_lens,
+        prompt_lengths,
+        source_lengths,
         seq_lens,
         mean_cos,
         mean_sin,
@@ -160,13 +164,13 @@ def test_cute_kernel_matches_torch_oracle(case):
     # Every count up to capacity is served, nothing beyond.
     assert max_requests + 1 not in tri._compiled_score_by_request_count
     for request_count in dict.fromkeys((1, max_requests - 1, max_requests)):
-        valid_widths = torch.full((max_requests,), -1, dtype=torch.int32, device=device)
+        decode_lengths = torch.full((max_requests,), -1, dtype=torch.int32, device=device)
         scores = _launch_split_scores(
             tri,
             request_count,
-            valid_seq_lens,
-            valid_widths,
-            token_starts,
+            source_lengths,
+            decode_lengths,
+            prompt_lengths,
             mean_cos,
             mean_sin,
         )
@@ -178,7 +182,7 @@ def test_cute_kernel_matches_torch_oracle(case):
         )
         # The score leg owns the per-request decode widths the selection
         # reduce kernels consume.
-        assert valid_widths[:request_count].tolist() == [
+        assert decode_lengths[:request_count].tolist() == [
             seq_lens[request] - prompt_len for request in range(request_count)
         ]
         for request in range(request_count):

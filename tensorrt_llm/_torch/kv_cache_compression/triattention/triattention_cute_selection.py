@@ -25,11 +25,9 @@ from cutlass.cute.typing import Int32 as CuteInt32
 from cutlass.cute.typing import Pointer as CutePointer
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from .triattention_cute_score_fused import STATS_FIELDS as _STATS_FIELDS
-from .triattention_cute_score_fused import STATS_M2, STATS_MEAN
-
 # Single-sourced constants: the score file owns N and the stats layout; Triton owns the epsilon.
-from .triattention_cute_score_fused import N as _PADDED_HEAD_COLUMNS
+from .triattention_cute_score_fused import PADDED_HEAD_COLUMNS, STATS_M2, STATS_MEAN
+from .triattention_cute_score_fused import STATS_FIELDS as _STATS_FIELDS
 from .triattention_kernels import STD_EPSILON as _STD_EPSILON
 
 _REDUCE_THREADS = 256
@@ -82,11 +80,6 @@ def _mapa_shared_cluster(
     )
 
 
-@cute.jit
-def _mapa_cluster(smem_ptr, peer_rank):
-    return _mapa_shared_cluster(smem_ptr, peer_rank)
-
-
 @dsl_user_op
 def _ld_shared_cluster_f32(
     mapped_addr: CuteInt32,
@@ -109,11 +102,6 @@ def _ld_shared_cluster_f32(
     )
 
 
-@cute.jit
-def _ld_cluster_f32(mapped_addr):
-    return _ld_shared_cluster_f32(mapped_addr)
-
-
 def _gmem_lane_tile(iterator, flat_index, tokens_per_lane, assumed_align):
     """One lane's fp32 gmem tile; folds the 64-bit index into the pointer before access."""
     return cute.make_tensor(
@@ -134,7 +122,7 @@ class _TriAttentionNormalizeUnionKernel:
         self,
         *,
         num_layers: int,
-        seq_len: int,
+        score_token_capacity: int,
         num_q_heads: int,
         num_kv_heads: int,
         page_shards: int,
@@ -145,12 +133,9 @@ class _TriAttentionNormalizeUnionKernel:
     ) -> None:
         # Real head row q_head lives in score plane kv*8 + qg; partial-stats rows stay compact.
         self.score_group_size = num_q_heads // num_kv_heads
-        self.score_head_pad = _PADDED_HEAD_COLUMNS - self.score_group_size
+        self.score_head_pad = PADDED_HEAD_COLUMNS - self.score_group_size
         self.num_layers = num_layers
-        self.seq_len = seq_len
-        # The widest score window (the whole bucket) sizes the token-tile grid;
-        # output rows are the TopK selection rows with their own stride.
-        self.width = seq_len
+        self.score_token_capacity = score_token_capacity
         self.output_row_stride = output_row_stride
         self.num_q_heads = num_q_heads
         self.num_rows = num_layers * num_q_heads
@@ -162,16 +147,18 @@ class _TriAttentionNormalizeUnionKernel:
         self.reduce_threads = _REDUCE_THREADS
         self.reduce_warps = _REDUCE_WARPS
         self.row_cluster_ctas = row_cluster_ctas
-        self.num_token_tiles = (self.width + self.token_tile - 1) // self.token_tile
+        # The widest score window (the whole bucket) sizes the token-tile grid;
+        # output rows are the TopK selection rows with their own stride.
+        self.num_token_tiles = (self.score_token_capacity + self.token_tile - 1) // self.token_tile
 
     @cute.jit
     def __call__(
         self,
         partial_stats: cute.Tensor,
         scores: cute.Tensor,
-        valid_seq_lens: cute.Tensor,
+        source_lengths: cute.Tensor,
         seg_out_offset: cute.Tensor,
-        token_starts: cute.Tensor,
+        prompt_lengths: cute.Tensor,
         union_scores: cute.Tensor,
         request_count: cutlass.Int32,
         stream: cuda.CUstream,
@@ -179,9 +166,9 @@ class _TriAttentionNormalizeUnionKernel:
         kernel = self.kernel(
             partial_stats,
             scores,
-            valid_seq_lens,
+            source_lengths,
             seg_out_offset,
-            token_starts,
+            prompt_lengths,
             union_scores,
             request_count,
         )
@@ -213,7 +200,7 @@ class _TriAttentionNormalizeUnionKernel:
         warp_max_ptr,
         score_copy_atom,
         request_idx: cutlass.Int32,
-        valid_width: cutlass.Int32,
+        decode_length: cutlass.Int32,
         first_token: cutlass.Int32,
         lane_idx: cutlass.Int32,
         from_cluster_peers: cutlass.Constexpr,
@@ -229,10 +216,10 @@ class _TriAttentionNormalizeUnionKernel:
                         (0, token_subtile, token_slot, lane_idx), warp_max.layout
                     )
                     for peer_rank in cutlass.range_constexpr(1, self.row_cluster_ctas):
-                        remote_addr = _mapa_cluster(warp_max_ptr, cutlass.Int32(peer_rank))
+                        remote_addr = _mapa_shared_cluster(warp_max_ptr, cutlass.Int32(peer_rank))
                         union_value = cute.arch.fmax(
                             union_value,
-                            _ld_cluster_f32(
+                            _ld_shared_cluster_f32(
                                 remote_addr + shared_offset * (cutlass.Float32.width // 8)
                             ),
                         )
@@ -248,7 +235,7 @@ class _TriAttentionNormalizeUnionKernel:
             # Straddling subtiles store per token; the selection rows stay < 2^31 so i32 cannot wrap.
             if cutlass.const_expr(
                 self.output_row_stride % self.tokens_per_lane == 0
-            ) and cutlass.dynamic_expr(subtile_first_token + self.tokens_per_lane <= valid_width):
+            ) and cutlass.dynamic_expr(subtile_first_token + self.tokens_per_lane <= decode_length):
                 union_index = request_idx * self.output_row_stride + subtile_first_token
                 union_tile = _gmem_lane_tile(
                     union_scores.iterator,
@@ -264,7 +251,7 @@ class _TriAttentionNormalizeUnionKernel:
             else:
                 for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
                     token = subtile_first_token + token_slot
-                    if cutlass.dynamic_expr(token < valid_width):
+                    if cutlass.dynamic_expr(token < decode_length):
                         union_scores[request_idx * self.output_row_stride + token] = reduced_values[
                             token_slot
                         ]
@@ -274,9 +261,9 @@ class _TriAttentionNormalizeUnionKernel:
         self,
         partial_stats: cute.Tensor,
         scores: cute.Tensor,
-        valid_seq_lens: cute.Tensor,
+        source_lengths: cute.Tensor,
         seg_out_offset: cute.Tensor,
-        token_starts: cute.Tensor,
+        prompt_lengths: cute.Tensor,
         union_scores: cute.Tensor,
         request_count: cutlass.Int32,
     ):
@@ -296,8 +283,8 @@ class _TriAttentionNormalizeUnionKernel:
         first_token = token_tile_idx * self.token_tile + lane_idx * self.tokens_per_lane
         first_segment = request_idx * self.num_layers
         # The normalization domain and the union output row both cover [0, valid - start).
-        score_start = cutlass.Int32(token_starts[request_idx])
-        valid_width = valid_seq_lens[request_idx] - score_start
+        score_start = cutlass.Int32(prompt_lengths[request_idx])
+        decode_length = source_lengths[request_idx] - score_start
         warp_max_ptr = cute.arch.alloc_smem(
             cutlass.Float32,
             self.reduce_threads * self.tokens_per_lane * self.token_subtiles,
@@ -416,17 +403,20 @@ class _TriAttentionNormalizeUnionKernel:
             for token_subtile in cutlass.range_constexpr(self.token_subtiles):
                 subtile_first_token = first_token + token_subtile * self.subtile_token_tile
                 score_index = (
-                    cutlass.Int64(score_plane) * request_count * self.num_layers * self.seq_len
+                    cutlass.Int64(score_plane)
+                    * request_count
+                    * self.num_layers
+                    * self.score_token_capacity
                     + seg_out_offset[segment]
                     + score_start
                     + subtile_first_token
                 )
                 # The vectorized load needs the runtime start aligned to the lane width.
                 if cutlass.const_expr(
-                    self.seq_len % self.tokens_per_lane == 0
+                    self.score_token_capacity % self.tokens_per_lane == 0
                 ) and cutlass.dynamic_expr(
                     score_start % self.tokens_per_lane == 0
-                    and subtile_first_token + self.tokens_per_lane <= valid_width
+                    and subtile_first_token + self.tokens_per_lane <= decode_length
                 ):
                     score_tile = _gmem_lane_tile(
                         scores.iterator,
@@ -446,7 +436,7 @@ class _TriAttentionNormalizeUnionKernel:
                     )
                     for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
                         token = subtile_first_token + token_slot
-                        if cutlass.dynamic_expr(token < valid_width):
+                        if cutlass.dynamic_expr(token < decode_length):
                             score_value_tiles[token_subtile][token_slot] = score_tail[token_slot]
                         else:
                             score_value_tiles[token_subtile][token_slot] = cutlass.Float32(
@@ -505,7 +495,7 @@ class _TriAttentionNormalizeUnionKernel:
                     warp_max_ptr,
                     score_copy_atom,
                     request_idx,
-                    valid_width,
+                    decode_length,
                     first_token,
                     lane_idx,
                     False,
@@ -533,7 +523,7 @@ class _TriAttentionNormalizeUnionKernel:
                     warp_max_ptr,
                     score_copy_atom,
                     request_idx,
-                    valid_width,
+                    decode_length,
                     first_token,
                     lane_idx,
                     True,

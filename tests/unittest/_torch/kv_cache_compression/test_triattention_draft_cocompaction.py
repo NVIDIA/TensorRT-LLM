@@ -270,7 +270,6 @@ def test_draft_admission_gates_raise(gate, match):
 
 def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     manager = _make_triattention(budget=4, beta=4)
-    manager.calibration = {}
     manager._layer_partition = ([0, 1], [], None)
     target = manager.kv_cache_manager
     target._stream = mock.Mock()
@@ -321,7 +320,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
                 # length: physical confirmed plus everything evicted so far
                 # (the eviction input's logical_source_length).
                 prepared = internals.execute.call_args.args[0]
-                assert prepared[0]["logical_source_length"] == uncompressed
+                assert prepared[0].logical_source_length == uncompressed
             # The published count equals the uncompressed confirmed logical
             # length minus the physical confirmed length, and never decreases.
             assert request.py_num_compressed_tokens == uncompressed - confirmed
@@ -462,7 +461,7 @@ def test_staged_block_width_clamps_to_manager_source_width():
     host, device_table = _allocate_block_offset_staging(
         anchor_pool,
         num_pools=1,
-        max_requests=2,
+        request_capacity=2,
         token_capacity=129,
         max_source_blocks=4,
     )
@@ -470,7 +469,7 @@ def test_staged_block_width_clamps_to_manager_source_width():
     host, device_table = _allocate_block_offset_staging(
         anchor_pool,
         num_pools=1,
-        max_requests=2,
+        request_capacity=2,
         token_capacity=129,
         max_source_blocks=64,
     )

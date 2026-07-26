@@ -39,8 +39,9 @@ def _sqrt_approx_ftz(value: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Fl
 
 
 CTA_M = 128
-# Minimum tcgen05 MMA tile N; GQA groups below 8 ride zero-padded head columns.
-N = 8
+# PADDED_HEAD_COLUMNS is the minimum tcgen05 MMA tile N; GQA groups below 8
+# ride zero-padded head columns.
+PADDED_HEAD_COLUMNS = 8
 THREADS = 256
 EPILOGUE_THREADS = 128
 RAW_PAGE_BUFFERS = 2
@@ -48,9 +49,9 @@ RAW_PAGE_BUFFERS = 2
 STATS_FIELDS = 3
 STATS_MEAN = 1
 STATS_M2 = 2
-# Stats smem scratch: N score origins + one (sum, square-sum) pair per (warp, head column).
-STATS_ORIGIN_SLOTS = N
-STATS_SCRATCH_ELEMENTS = STATS_ORIGIN_SLOTS + (EPILOGUE_THREADS // 32) * N * 2
+# Stats smem scratch: PADDED_HEAD_COLUMNS score origins + one (sum, square-sum) pair per (warp, head column).
+STATS_ORIGIN_SLOTS = PADDED_HEAD_COLUMNS
+STATS_SCRATCH_ELEMENTS = STATS_ORIGIN_SLOTS + (EPILOGUE_THREADS // 32) * PADDED_HEAD_COLUMNS * 2
 # Staged block-offset entries encode physical_page * K_PLANES_PER_POOL_PAGE + plane.
 K_PLANES_PER_POOL_PAGE = 2
 
@@ -71,7 +72,7 @@ class _TriAttentionScoreKernel:
         self,
         *,
         num_layers: int,
-        seq_len: int,
+        score_token_capacity: int,
         num_q_heads: int,
         num_freqs: int,
         pool_shape: tuple[int, int, int, int, int],
@@ -95,7 +96,7 @@ class _TriAttentionScoreKernel:
         if page_shards not in _SUPPORTED_PAGE_SHARDS:
             raise ValueError("TriAttention CuTe score has unsupported page shards")
 
-        self.seq_len = seq_len
+        self.score_token_capacity = score_token_capacity
         self.num_layers = num_layers
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
@@ -109,7 +110,7 @@ class _TriAttentionScoreKernel:
         # One tile = one page (128-token) or four page fragments (32-token), one TMA box each.
         self.box_tokens = min(CTA_M, tokens_per_block)
         self.fragments_per_phase = CTA_M // self.box_tokens
-        self.max_tiles = (seq_len + CTA_M - 1) // CTA_M
+        self.max_tiles = (score_token_capacity + CTA_M - 1) // CTA_M
 
         # Producer staging constants baked into the generated code.
         self.prefetch_depth = 4
@@ -125,67 +126,11 @@ class _TriAttentionScoreKernel:
 
         if pool_dim != 2 * num_freqs:
             raise ValueError("K pool shape does not match the CuTe score specialization")
-        self.s_page, _, self.s_kv_head, self.s_slot, self.s_dim = pool_strides
-        if self.s_slot != 2 * num_freqs or self.s_dim != 1:
+        self.s_page, _, self.s_kv_head, self.s_token, self.s_dim = pool_strides
+        if self.s_token != 2 * num_freqs or self.s_dim != 1:
             raise ValueError(f"K pages must be contiguous [{tokens_per_block}, {2 * num_freqs}]")
         if self.s_page % RAW_K_VECTOR_ELEMENTS or self.s_kv_head % RAW_K_VECTOR_ELEMENTS:
             raise ValueError("K page and KV-head strides must preserve 16-byte alignment")
-
-    def epilog_tmem_copy_and_partition(
-        self,
-        tidx: cutlass.Int32,
-        accumulator: cute.Tensor,
-        output: cute.Tensor,
-        epilogue_tile: cute.Tile,
-    ) -> tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
-        copy_atom = sm100_utils.get_tmem_load_op(
-            self.cta_tile_shape_mnk,
-            self.c_layout,
-            self.c_dtype,
-            self.acc_dtype,
-            epilogue_tile,
-            False,
-        )
-        accumulator_epilogue = cute.flat_divide(
-            accumulator[((None, None), 0, 0)],
-            epilogue_tile,
-        )
-        tiled_copy = tcgen05.make_tmem_copy(
-            copy_atom,
-            accumulator_epilogue[(None, None, 0, 0)],
-        )
-        thread_copy = tiled_copy.get_slice(tidx)
-        thread_accumulator = thread_copy.partition_S(accumulator_epilogue)
-        output_epilogue = cute.flat_divide(
-            output[((None, None), 0, 0, None, None, None)],
-            epilogue_tile,
-        )
-        thread_output = thread_copy.partition_D(output_epilogue)
-        register_accumulator = cute.make_rmem_tensor(
-            thread_output[(None, None, None, 0, 0, 0, 0, 0)].shape,
-            self.acc_dtype,
-        )
-        return tiled_copy, thread_accumulator, register_accumulator
-
-    def epilog_gmem_copy_and_partition(
-        self,
-        tidx: cutlass.Int32,
-        tiled_copy: cute.TiledCopy,
-        output: cute.Tensor,
-        epilogue_tile: cute.Tile,
-    ) -> tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
-        output_epilogue = cute.flat_divide(
-            output[((None, None), 0, 0, None, None, None)],
-            epilogue_tile,
-        )
-        thread_copy = tiled_copy.get_slice(tidx)
-        thread_output = thread_copy.partition_D(output_epilogue)
-        register_output = cute.make_rmem_tensor(
-            thread_output[(None, None, None, 0, 0, 0, 0, 0)].shape,
-            self.c_dtype,
-        )
-        copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.c_dtype)
-        return copy_atom, register_output, thread_output
 
     @cute.jit
     def _stage_raw_band_copies(
@@ -222,13 +167,13 @@ class _TriAttentionScoreKernel:
     @cute.jit
     def __call__(
         self,
-        page_ids: cute.Tensor,
+        block_offset_entries: cute.Tensor,
         seg_page_off: cute.Tensor,
         seg_req_id: cute.Tensor,
         seg_layer_id: cute.Tensor,
-        valid_seq_lens: cute.Tensor,
+        source_lengths: cute.Tensor,
         seg_out_offset: cute.Tensor,
-        token_starts: cute.Tensor,
+        prompt_lengths: cute.Tensor,
         q_real: cute.Tensor,
         q_imag: cute.Tensor,
         mlr_coef: cute.Tensor,
@@ -237,16 +182,16 @@ class _TriAttentionScoreKernel:
         freq_scale_sq: cute.Tensor,
         output: cute.Tensor,
         partial_stats: cute.Tensor,
-        pool_template: cute.Tensor,
+        anchor_pool: cute.Tensor,
         raw_tma_descriptors: cute.Tensor,
         request_count: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         self.c_dtype = output.element_type
         self.c_layout = utils.LayoutEnum.COL_MAJOR
-        self.mma_tiler = (CTA_M, N, self.k_coeff)
+        self.mma_tiler = (CTA_M, PADDED_HEAD_COLUMNS, self.k_coeff)
         self.cta_tile_shape_mnk = self.mma_tiler
-        self.epi_tile = (CTA_M, N)
+        self.epi_tile = (CTA_M, PADDED_HEAD_COLUMNS)
 
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             cutlass.Float32,
@@ -267,7 +212,7 @@ class _TriAttentionScoreKernel:
         # Real + imag bf16 stages per raw-page buffer; swizzle follows the num_freqs row width.
         raw_bf16_direct_a_smem_layout = sm100_utils.make_smem_layout_a(
             raw_bf16_tiled_mma,
-            (CTA_M, N, self.num_freqs),
+            (CTA_M, PADDED_HEAD_COLUMNS, self.num_freqs),
             cutlass.BFloat16,
             2 * self.raw_page_buffers,
         )
@@ -287,12 +232,12 @@ class _TriAttentionScoreKernel:
             ),
             stride=(
                 self.s_dim,
-                self.s_slot,
+                self.s_token,
                 (self.s_kv_head, self.s_page),
             ),
         )
         raw_tma_source = cute.make_tensor(
-            pool_template.iterator,
+            anchor_pool.iterator,
             raw_tma_source_layout,
         )
         raw_tma_atom, raw_tma_tensor = cpasync.make_tiled_tma_atom(
@@ -303,7 +248,7 @@ class _TriAttentionScoreKernel:
         )
         raw_bf16_b_smem_layout = sm100_utils.make_smem_layout_b(
             raw_bf16_tiled_mma,
-            (CTA_M, N, 2 * self.num_freqs),
+            (CTA_M, PADDED_HEAD_COLUMNS, 2 * self.num_freqs),
             cutlass.BFloat16,
             1,
         )
@@ -317,13 +262,13 @@ class _TriAttentionScoreKernel:
         )
         magnitude_fp16_a_smem_layout = sm100_utils.make_smem_layout_a(
             magnitude_lo_tiled_mma,
-            (CTA_M, N, self.num_freqs),
+            (CTA_M, PADDED_HEAD_COLUMNS, self.num_freqs),
             cutlass.Float16,
             1,
         )
         magnitude_fp16_b_smem_layout = sm100_utils.make_smem_layout_b(
             magnitude_lo_tiled_mma,
-            (CTA_M, N, self.num_freqs),
+            (CTA_M, PADDED_HEAD_COLUMNS, self.num_freqs),
             cutlass.Float16,
             1,
         )
@@ -384,7 +329,7 @@ class _TriAttentionScoreKernel:
 
         self.shared_storage = SharedStorage
         # The score-plane stride product can exceed 2^31, so it must reach the kernel as Int64.
-        sum_seq = cutlass.Int64(request_count * self.num_layers * self.seq_len)
+        segment_tokens = cutlass.Int64(request_count * self.num_layers * self.score_token_capacity)
         num_ctas = request_count * self.num_layers * self.num_kv_heads * self.page_shards
         self.kernel(
             tiled_mma,
@@ -393,13 +338,13 @@ class _TriAttentionScoreKernel:
             raw_tma_atom,
             raw_tma_tensor,
             raw_tma_descriptors,
-            page_ids,
+            block_offset_entries,
             seg_page_off,
             seg_req_id,
             seg_layer_id,
-            valid_seq_lens,
+            source_lengths,
             seg_out_offset,
-            token_starts,
+            prompt_lengths,
             q_real,
             q_imag,
             mlr_coef,
@@ -408,7 +353,7 @@ class _TriAttentionScoreKernel:
             freq_scale_sq,
             output,
             partial_stats,
-            sum_seq,
+            segment_tokens,
             raw_bf16_direct_a_smem_layout,
             raw_tma_smem_layout,
             raw_bf16_b_smem_layout,
@@ -429,13 +374,13 @@ class _TriAttentionScoreKernel:
         raw_tma_atom: cute.CopyAtom,
         raw_tma_source: cute.Tensor,
         raw_tma_descriptors: cute.Tensor,
-        page_ids: cute.Tensor,
+        block_offset_entries: cute.Tensor,
         seg_page_off: cute.Tensor,
         seg_req_id: cute.Tensor,
         seg_layer_id: cute.Tensor,
-        valid_seq_lens: cute.Tensor,
+        source_lengths: cute.Tensor,
         seg_out_offset: cute.Tensor,
-        token_starts: cute.Tensor,
+        prompt_lengths: cute.Tensor,
         q_real: cute.Tensor,
         q_imag: cute.Tensor,
         mlr_coef: cute.Tensor,
@@ -444,7 +389,7 @@ class _TriAttentionScoreKernel:
         freq_scale_sq: cute.Tensor,
         output: cute.Tensor,
         partial_stats: cute.Tensor,
-        sum_seq: cutlass.Int64,
+        segment_tokens: cutlass.Int64,
         raw_bf16_direct_a_smem_layout: cute.ComposedLayout,
         raw_tma_smem_layout: cute.ComposedLayout,
         raw_bf16_b_smem_layout: cute.ComposedLayout,
@@ -461,11 +406,11 @@ class _TriAttentionScoreKernel:
         kv_head = task % self.num_kv_heads
         req_id = seg_req_id[segment]
         layer_id = seg_layer_id[segment]
-        valid_seq_len = valid_seq_lens[req_id]
+        source_length = source_lengths[req_id]
         page_off = seg_page_off[segment]
         out_base = seg_out_offset[segment]
         # Per-request score window start; scratch writes stay absolute.
-        score_start = cutlass.Int32(token_starts[req_id])
+        score_start = cutlass.Int32(prompt_lengths[req_id])
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -588,11 +533,11 @@ class _TriAttentionScoreKernel:
         shard_first_tile_start_token = tile_start_token
         tiles_processed = cutlass.Int32(0)
         if cutlass.const_expr(self.write_partial_stats):
-            stats_page_scores_m128 = cute.make_rmem_tensor((N,), cutlass.Float32)
-            stats_origins_m128 = cute.make_rmem_tensor((N,), cutlass.Float32)
-            stats_sums_m128 = cute.make_rmem_tensor((N,), cutlass.Float32)
-            stats_square_sums_m128 = cute.make_rmem_tensor((N,), cutlass.Float32)
-            for stats_head in cutlass.range_constexpr(N):
+            stats_page_scores_m128 = cute.make_rmem_tensor((PADDED_HEAD_COLUMNS,), cutlass.Float32)
+            stats_origins_m128 = cute.make_rmem_tensor((PADDED_HEAD_COLUMNS,), cutlass.Float32)
+            stats_sums_m128 = cute.make_rmem_tensor((PADDED_HEAD_COLUMNS,), cutlass.Float32)
+            stats_square_sums_m128 = cute.make_rmem_tensor((PADDED_HEAD_COLUMNS,), cutlass.Float32)
+            for stats_head in cutlass.range_constexpr(PADDED_HEAD_COLUMNS):
                 stats_sums_m128[stats_head] = cutlass.Float32(0.0)
                 stats_square_sums_m128[stats_head] = cutlass.Float32(0.0)
         producer_prefetched_page_id_lane0 = cutlass.Int32(0)
@@ -611,24 +556,26 @@ class _TriAttentionScoreKernel:
             )
             physical_fragments_arg = physical_page_fragments
             prefetched_fragments_arg = prefetched_page_fragments
-        shard_has_page = valid_seq_len > score_start and tile_start_token < valid_seq_len
-        empty_shard = valid_seq_len <= score_start or tile_start_token >= valid_seq_len
+        shard_has_page = source_length > score_start and tile_start_token < source_length
+        empty_shard = source_length <= score_start or tile_start_token >= source_length
         if cutlass.dynamic_expr(shard_has_page):
             if warp_idx == self.producer_warp_id:
                 if lane_idx == 0:
                     # Staged entries encode physical_page * kv_factor; decode to the pool page.
                     producer_prefetched_page_id_lane0 = (
-                        cutlass.Int32(page_ids[page_off + tile_index * self.fragments_per_phase])
+                        cutlass.Int32(
+                            block_offset_entries[page_off + tile_index * self.fragments_per_phase]
+                        )
                         // K_PLANES_PER_POOL_PAGE
                     )
                     if cutlass.const_expr(self.fragments_per_phase > 1):
                         for fragment in cutlass.range_constexpr(1, self.fragments_per_phase):
                             # Clamp tail-fragment pages so the TMA never reads an unstaged entry.
                             fragment_page_id = producer_prefetched_page_id_lane0
-                            if tile_start_token + fragment * self.box_tokens < valid_seq_len:
+                            if tile_start_token + fragment * self.box_tokens < source_length:
                                 fragment_page_id = (
                                     cutlass.Int32(
-                                        page_ids[
+                                        block_offset_entries[
                                             page_off
                                             + tile_index * self.fragments_per_phase
                                             + fragment
@@ -682,7 +629,7 @@ class _TriAttentionScoreKernel:
         )
         cute.arch.mbarrier_init_fence()
         # Per-(head, frequency) score coefficients, split into bf16/fp16 value+residual pairs.
-        for weight_round in cutlass.range_constexpr(N * self.k_coeff // THREADS):
+        for weight_round in cutlass.range_constexpr(PADDED_HEAD_COLUMNS * self.k_coeff // THREADS):
             linear_index = tidx + weight_round * THREADS
             qg = linear_index // self.k_coeff
             feature = linear_index % self.k_coeff
@@ -691,7 +638,7 @@ class _TriAttentionScoreKernel:
             mean_offset = req_id * self.num_freqs + frequency
             # Padded GQA columns read the group's first head and force zero coefficients.
             qg_read = qg
-            if cutlass.const_expr(self.group_size < N):
+            if cutlass.const_expr(self.group_size < PADDED_HEAD_COLUMNS):
                 if qg_read >= self.group_size:
                     qg_read = cutlass.Int32(0)
             q_head = kv_head * self.group_size + qg_read
@@ -708,7 +655,7 @@ class _TriAttentionScoreKernel:
                 value = scale * (qr * msin + qi * mcos)
             else:
                 value = scale * cutlass.Float32(mlr_coef[calib_offset])
-            if cutlass.const_expr(self.group_size < N):
+            if cutlass.const_expr(self.group_size < PADDED_HEAD_COLUMNS):
                 if qg >= self.group_size:
                     value = cutlass.Float32(0.0)
             raw_k_block = feature // 16
@@ -795,8 +742,8 @@ class _TriAttentionScoreKernel:
                     )
                     raw_tma_producer_state.advance()
         while (
-            valid_seq_len > score_start
-            and tile_start_token < valid_seq_len
+            source_length > score_start
+            and tile_start_token < source_length
             and tiles_processed < self.max_tiles
         ):
             physical_page = cutlass.Int32(0)
@@ -853,12 +800,12 @@ class _TriAttentionScoreKernel:
                     next_tile_start_token = tile_start_token + CTA_M * self.page_shards
                     next_pages_processed = tiles_processed + 1
                     if (
-                        next_tile_start_token < valid_seq_len
+                        next_tile_start_token < source_length
                         and next_pages_processed < self.max_tiles
                     ):
                         next_page_id_lane0 = (
                             cutlass.Int32(
-                                page_ids[
+                                block_offset_entries[
                                     page_off
                                     + (tile_index + self.page_shards) * self.fragments_per_phase
                                 ]
@@ -871,11 +818,11 @@ class _TriAttentionScoreKernel:
                                 next_fragment_page_id = next_page_id_lane0
                                 if (
                                     next_tile_start_token + fragment * self.box_tokens
-                                    < valid_seq_len
+                                    < source_length
                                 ):
                                     next_fragment_page_id = (
                                         cutlass.Int32(
-                                            page_ids[
+                                            block_offset_entries[
                                                 page_off
                                                 + (tile_index + self.page_shards)
                                                 * self.fragments_per_phase
@@ -913,7 +860,7 @@ class _TriAttentionScoreKernel:
                     next_tile_start_token = tile_start_token + CTA_M * self.page_shards
                     next_pages_processed = tiles_processed + 1
                     prefetch_next_raw = (
-                        next_tile_start_token < valid_seq_len
+                        next_tile_start_token < source_length
                         and next_pages_processed < self.max_tiles
                     )
                     prefetched_physical_page = cute.arch.shuffle_sync(
@@ -1105,28 +1052,53 @@ class _TriAttentionScoreKernel:
                 # Release only the current imag phase after all of its async consumers finish.
                 raw_tma_pipeline.consumer_release(raw_tma_consumer_state)
                 raw_tma_consumer_state.advance()
-            # Every term multiplying sum_seq must stay 64-bit; the plane stride can exceed 2^31.
-            output_offset = cutlass.Int64(kv_head * N) * sum_seq + out_base + tile_start_token
+            # Every term multiplying segment_tokens must stay 64-bit; the plane stride can exceed 2^31.
+            output_offset = (
+                cutlass.Int64(kv_head * PADDED_HEAD_COLUMNS) * segment_tokens
+                + out_base
+                + tile_start_token
+            )
             page_output = cute.make_tensor(
                 output.iterator + output_offset,
                 cute.make_layout(
-                    (CTA_M, N, 1),
+                    (CTA_M, PADDED_HEAD_COLUMNS, 1),
                     stride=(
                         1,
-                        sum_seq,
-                        N * sum_seq,
+                        segment_tokens,
+                        PADDED_HEAD_COLUMNS * segment_tokens,
                     ),
                 ),
             )
             gC_mnl = cute.local_tile(page_output, self.epi_tile, (None, None, None))
             tCgC = thr_mma.partition_C(gC_mnl)
             epilogue_tidx = tidx % EPILOGUE_THREADS
-            tiled_copy_t2r, tTR_tAcc, tTR_rAcc = self.epilog_tmem_copy_and_partition(
-                epilogue_tidx, tCtAcc, tCgC, self.epi_tile
+            copy_atom_t2r = sm100_utils.get_tmem_load_op(
+                self.cta_tile_shape_mnk,
+                self.c_layout,
+                self.c_dtype,
+                self.acc_dtype,
+                self.epi_tile,
+                False,
             )
-            simt_atom, tTR_rC, tTR_gC = self.epilog_gmem_copy_and_partition(
-                epilogue_tidx, tiled_copy_t2r, tCgC, self.epi_tile
+            accumulator_epilogue = cute.flat_divide(
+                tCtAcc[((None, None), 0, 0)],
+                self.epi_tile,
             )
+            tiled_copy_t2r = tcgen05.make_tmem_copy(
+                copy_atom_t2r,
+                accumulator_epilogue[(None, None, 0, 0)],
+            )
+            thread_copy = tiled_copy_t2r.get_slice(epilogue_tidx)
+            tTR_tAcc = thread_copy.partition_S(accumulator_epilogue)
+            output_epilogue = cute.flat_divide(
+                tCgC[((None, None), 0, 0, None, None, None)],
+                self.epi_tile,
+            )
+            tTR_gC = thread_copy.partition_D(output_epilogue)
+            register_shape = tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape
+            tTR_rAcc = cute.make_rmem_tensor(register_shape, self.acc_dtype)
+            tTR_rC = cute.make_rmem_tensor(register_shape, self.c_dtype)
+            simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.c_dtype)
             tTR_gC = tTR_gC[(None, None, None, None, None, 0, 0, 0)]
             tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
             tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
@@ -1140,7 +1112,8 @@ class _TriAttentionScoreKernel:
                     tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))
                     # Only the straddling first tile takes the per-token branch.
                     if cutlass.dynamic_expr(
-                        tile_start_token >= score_start and tile_start_token + CTA_M <= self.seq_len
+                        tile_start_token >= score_start
+                        and tile_start_token + CTA_M <= self.score_token_capacity
                     ):
                         cute.copy(
                             simt_atom,
@@ -1150,7 +1123,7 @@ class _TriAttentionScoreKernel:
                     else:
                         output_token = tile_start_token + epilogue_tidx
                         if cutlass.dynamic_expr(
-                            output_token >= score_start and output_token < self.seq_len
+                            output_token >= score_start and output_token < self.score_token_capacity
                         ):
                             cute.copy(
                                 simt_atom,
@@ -1182,14 +1155,14 @@ class _TriAttentionScoreKernel:
                 raw_tma_consumer_state.advance()
             if cutlass.const_expr(self.write_partial_stats):
                 if tiles_processed == 0:
-                    for stats_head in cutlass.range_constexpr(N):
+                    for stats_head in cutlass.range_constexpr(PADDED_HEAD_COLUMNS):
                         stats_origins_m128[stats_head] = sStats[stats_head]
                 stats_token = tile_start_token + tidx
                 if tidx < EPILOGUE_THREADS:
                     if cutlass.dynamic_expr(
-                        stats_token >= score_start and stats_token < valid_seq_len
+                        stats_token >= score_start and stats_token < source_length
                     ):
-                        for stats_head in cutlass.range_constexpr(N):
+                        for stats_head in cutlass.range_constexpr(PADDED_HEAD_COLUMNS):
                             stats_delta = (
                                 stats_page_scores_m128[stats_head] - stats_origins_m128[stats_head]
                             )
@@ -1204,7 +1177,7 @@ class _TriAttentionScoreKernel:
             raw_tma_pipeline.producer_tail(raw_tma_producer_state)
             acc_pipeline.producer_tail(acc_producer_state)
         if cutlass.const_expr(self.write_partial_stats):
-            for stats_head in cutlass.range_constexpr(N):
+            for stats_head in cutlass.range_constexpr(PADDED_HEAD_COLUMNS):
                 stats_sum = stats_sums_m128[stats_head]
                 stats_square_sum = stats_square_sums_m128[stats_head]
                 for stats_offset in (16, 8, 4, 2, 1):
@@ -1213,7 +1186,9 @@ class _TriAttentionScoreKernel:
                         stats_square_sum, stats_offset
                     )
                 if lane_idx == 0 and warp_idx < EPILOGUE_THREADS // 32:
-                    stats_scratch_base = STATS_ORIGIN_SLOTS + (warp_idx * N + stats_head) * 2
+                    stats_scratch_base = (
+                        STATS_ORIGIN_SLOTS + (warp_idx * PADDED_HEAD_COLUMNS + stats_head) * 2
+                    )
                     sStats[stats_scratch_base] = stats_sum
                     sStats[stats_scratch_base + 1] = stats_square_sum
             cute.arch.barrier()
@@ -1223,7 +1198,9 @@ class _TriAttentionScoreKernel:
                     stats_sum = cutlass.Float32(0.0)
                     stats_square_sum = cutlass.Float32(0.0)
                     for stats_warp in cutlass.range_constexpr(EPILOGUE_THREADS // 32):
-                        stats_scratch_base = STATS_ORIGIN_SLOTS + (stats_warp * N + lane_idx) * 2
+                        stats_scratch_base = (
+                            STATS_ORIGIN_SLOTS + (stats_warp * PADDED_HEAD_COLUMNS + lane_idx) * 2
+                        )
                         stats_sum = stats_sum + sStats[stats_scratch_base]
                         stats_square_sum = stats_square_sum + sStats[stats_scratch_base + 1]
                     stats_count_i32 = tiles_processed * CTA_M
@@ -1232,7 +1209,7 @@ class _TriAttentionScoreKernel:
                         if cutlass.dynamic_expr(stats_invalid_prefix > 0):
                             stats_count_i32 = stats_count_i32 - stats_invalid_prefix
                         stats_last_tile_start_token = tile_start_token - CTA_M * self.page_shards
-                        stats_invalid_tail = stats_last_tile_start_token + CTA_M - valid_seq_len
+                        stats_invalid_tail = stats_last_tile_start_token + CTA_M - source_length
                         if cutlass.dynamic_expr(stats_invalid_tail > 0):
                             stats_count_i32 = stats_count_i32 - stats_invalid_tail
                     stats_count = cutlass.Float32(stats_count_i32)

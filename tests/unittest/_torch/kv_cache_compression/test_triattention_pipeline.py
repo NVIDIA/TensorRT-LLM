@@ -145,7 +145,6 @@ class TestTriAttentionClass:
         manager.num_extra_kv_tokens = 4
         manager._kv_reserve_draft_tokens = 4
         triattention = TriAttention(_make_tri_config(budget=8), manager)
-        triattention.calibration = {}
 
         triattention.on_request_init(_make_request(11))
         triattention.on_request_init(_make_request(12))
@@ -283,7 +282,6 @@ class TestCompressedTokenPublication:
             capacity=6, history_length=0, is_active=True, resize=mock.Mock(return_value=True)
         )
         manager.kv_cache_manager.kv_cache_map = {7: cache}
-        manager.calibration = {}
         state = _set_request_state(manager, 7, generation_steps=127)
 
         with _mocked_eviction_internals(manager) as internals:
@@ -325,7 +323,6 @@ class TestEvictionLifecycle:
         fake_v2.num_extra_kv_tokens = num_extra_kv_tokens
         fake_v2._kv_reserve_draft_tokens = kv_reserve_draft_tokens
         mgr = TriAttention(_make_tri_config(budget=8), fake_v2)
-        mgr.calibration = {}
         cache = SimpleNamespace(
             capacity=seq_len,
             history_length=1024,
@@ -362,7 +359,7 @@ class TestEvictionLifecycle:
 
         # Only the active request launched; the suspended one deferred whole.
         eviction_inputs = internals.execute.call_args.args[0]
-        assert [item["request"].py_request_id for item in eviction_inputs] == [7]
+        assert [item.request.py_request_id for item in eviction_inputs] == [7]
         assert first_state["generation_steps"] == 128
         assert second_state["generation_steps"] == 127
 
@@ -397,19 +394,15 @@ class TestEvictionLifecycle:
             mgr._evict_due_requests(batch)
 
         # Tail excluded from the source length; keep target = prompt + budget.
-        internals.execute.assert_called_once_with(
-            [
-                {
-                    "request": request,
-                    "target_cache": cache,
-                    "draft_cache": draft_cache,
-                    "source_length": confirmed,
-                    "logical_source_length": confirmed,
-                    "prompt_length": 1024,
-                    "target_tail_length": tail,
-                }
-            ]
-        )
+        internals.execute.assert_called_once()
+        (launched,) = internals.execute.call_args.args[0]
+        assert launched.request is request
+        assert launched.target_cache is cache
+        assert launched.draft_cache is draft_cache
+        assert launched.source_length == confirmed
+        assert launched.logical_source_length == confirmed
+        assert launched.prompt_length == 1024
+        assert launched.target_tail_length == tail
         assert request.py_num_compressed_tokens == confirmed - retained
         cache.resize.assert_called_once_with(retained + tail, None)
         draft_cache.resize.assert_called_once_with(retained + 1, None)
@@ -419,7 +412,6 @@ class TestEvictionLifecycle:
         # ledger (capacity minus the protected tail), never the logical length.
         physical_confirmed = 6100
         manager = _make_triattention(beta=128)
-        manager.calibration = {}
         _set_request_state(manager, 7, generation_steps=127, evicted_tokens=100)
         cache = SimpleNamespace(
             capacity=physical_confirmed,
@@ -429,7 +421,6 @@ class TestEvictionLifecycle:
         )
         manager.kv_cache_manager.kv_cache_map = {7: cache}
         manager.kv_cache_manager.pp_layers = [0, 1]
-        manager.kv_cache_manager.num_extra_kv_tokens = 0
         request = _make_request(
             7,
             py_prompt_len=1024,
@@ -441,9 +432,9 @@ class TestEvictionLifecycle:
             manager._evict_due_requests(SimpleNamespace(generation_requests=[request]))
 
         eviction_inputs = internals.execute.call_args.args[0]
-        assert eviction_inputs[0]["source_length"] == physical_confirmed
+        assert eviction_inputs[0].source_length == physical_confirmed
         # The logical position restores everything already evicted.
-        assert eviction_inputs[0]["logical_source_length"] == physical_confirmed + 100
+        assert eviction_inputs[0].logical_source_length == physical_confirmed + 100
         cache.resize.assert_called_once_with(1024 + manager.budget, None)
 
     def test_one_model_draft_co_compression_contract_is_accepted(self):
@@ -505,7 +496,7 @@ class TestFixedScoreMetadata:
         triattention = _make_triattention(budget=4, eviction_mode="union", normalize_scores=False)
         assert triattention.normalize_scores is True
 
-    def test_execute_rejects_int32_overflowing_round_starts(self):
+    def test_execute_rejects_int32_overflowing_logical_source_lengths(self):
         # Round starts past the int32 metadata range fail loudly (in the host
         # metadata build) before any GPU work is enqueued.
         device = torch.device("cuda", torch.cuda.current_device())
@@ -689,7 +680,7 @@ class TestFixedScoreMetadata:
         omega = torch.rand(num_freqs, device=device) * 0.05
         offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
         round_device = torch.arange(max_requests, dtype=torch.int32, device=device) + 9
-        round_starts = round_device[:request_count].tolist()
+        logical_source_lengths = round_device[:request_count].tolist()
         seq_lens = [seq_len - request % 2 for request in range(request_count)]
         layer_order = list(range(num_layers))
         tri = _make_cute_buffers(
@@ -710,7 +701,7 @@ class TestFixedScoreMetadata:
             layer_pool_ids=list(layer_order),
             normalize_scores=False,
         )
-        valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        source_lengths = torch.tensor(seq_lens, dtype=torch.int32, device=device)
 
         # Rounds stage through the production executor: the gather double
         # writes each layer's K page ids and the bulk copy encodes K/V rows.
@@ -733,7 +724,7 @@ class TestFixedScoreMetadata:
             return [
                 _make_eviction_input(
                     request_id=request,
-                    source_length=int(valid_seq_lens[request]),
+                    source_length=int(source_lengths[request]),
                     logical_source_length=int(round_device[request]),
                     prompt_length=prompt_len,
                 )
@@ -786,7 +777,7 @@ class TestFixedScoreMetadata:
             pools,
             {layer: page_ids_3d[layer, :request_count] for layer in layer_order},
             seq_lens,
-            round_starts,
+            logical_source_lengths,
             q_real,
             q_imag,
             mlr,
@@ -797,23 +788,23 @@ class TestFixedScoreMetadata:
         )
         for request in range(request_count):
             for layer_slot, layer in enumerate(layer_order):
-                valid_width = seq_lens[request] - prompt_len
-                segment = fixed[request, layer_slot, :, :valid_width]
+                decode_length = seq_lens[request] - prompt_len
+                segment = fixed[request, layer_slot, :, :decode_length]
                 expected = oracle[request * num_layers + layer][
-                    :, prompt_len : prompt_len + valid_width
+                    :, prompt_len : prompt_len + decode_length
                 ]
                 torch.testing.assert_close(segment, expected, rtol=5e-3, atol=5e-3)
 
         round_device.add_(17)
         page_ids_3d = page_ids_3d.roll(1, dims=2)
-        valid_seq_lens.copy_(
+        source_lengths.copy_(
             torch.tensor(
                 [seq_len - (request + 1) % 2 for request in range(request_count)],
                 dtype=torch.int32,
                 device=device,
             )
         )
-        expected_second_widths = valid_seq_lens - prompt_len
+        expected_second_widths = source_lengths - prompt_len
         tri._score_scratch.fill_(score_sentinel)
         tri._decode_lengths_device.fill_(-1)
         with mock.patch.object(module, "compact"):

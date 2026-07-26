@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Triton kernels, launch helpers, and mean-phase table builders for TriAttention
+"""Triton kernels and launch helpers for TriAttention
 (fp32 math; int64 past-2^31 flat offsets; masked ragged tails; scoring in the CuTe pack)."""
 
 from __future__ import annotations
@@ -17,38 +17,35 @@ STD_EPSILON = 1e-6
 
 @triton.jit
 def _gather_mean_phase_kernel(
-    round_starts,
+    logical_source_lengths,
     phase_cos,
     phase_sin,
-    phase_rows,
-    valid_seq_lens,
-    token_starts,
+    source_lengths,
+    prompt_lengths,
     mean_cos,
     mean_sin,
-    valid_widths,
+    decode_lengths,
     swa_destination_bases,
     swa_rebase_delta,
     NUM_FREQS: tl.constexpr,
     F_BLOCK: tl.constexpr,
     HAS_SWA: tl.constexpr,
 ):
-    """Copy each request's phase-table row; derive valid widths and SWA landing bases."""
+    """Copy each request's phase-table row; derive decode lengths and SWA landing bases."""
     request = tl.program_id(0)
     frequency = tl.arange(0, F_BLOCK)
     frequency_mask = frequency < NUM_FREQS
-    table_row = tl.load(round_starts + request).to(tl.int64)
-    # Clamp stale or padded round starts instead of faulting.
-    table_row = tl.minimum(tl.maximum(table_row, 0), phase_rows - 1)
+    table_row = tl.load(logical_source_lengths + request).to(tl.int64)
     source_offset = table_row * NUM_FREQS + frequency
     output_offset = request * NUM_FREQS + frequency
     row_cos = tl.load(phase_cos + source_offset, mask=frequency_mask, other=0.0)
     row_sin = tl.load(phase_sin + source_offset, mask=frequency_mask, other=0.0)
     tl.store(mean_cos + output_offset, row_cos, mask=frequency_mask)
     tl.store(mean_sin + output_offset, row_sin, mask=frequency_mask)
-    token_start = tl.load(token_starts + request)
-    tl.store(valid_widths + request, tl.load(valid_seq_lens + request) - token_start)
+    prompt_length = tl.load(prompt_lengths + request)
+    tl.store(decode_lengths + request, tl.load(source_lengths + request) - prompt_length)
     if HAS_SWA:
-        tl.store(swa_destination_bases + request, token_start + swa_rebase_delta)
+        tl.store(swa_destination_bases + request, prompt_length + swa_rebase_delta)
 
 
 # ---- Selection: combine scores per mode, then finalize the top-k set ----
@@ -84,7 +81,7 @@ def _score_row_stats_kernel(
     query_head = row_in_request % NUM_Q_HEADS
     kv_head = query_head // QUERY_GROUP_SIZE
     plane = kv_head * PADDED_COLUMNS + query_head % QUERY_GROUP_SIZE
-    valid_width = tl.load(decode_lengths + request)
+    decode_length = tl.load(decode_lengths + request)
     prompt_start = tl.load(prompt_lengths + request)
     score_row = (
         score_scratch
@@ -95,18 +92,18 @@ def _score_row_stats_kernel(
     score_sum = 0.0
     for start in tl.static_range(0, WIDTH, BLOCK):
         token = start + lane
-        valid = token < valid_width
+        valid = token < decode_length
         value = tl.load(score_row + token, mask=valid, other=0.0).to(tl.float32)
         score_sum += tl.sum(value, axis=0)
-    mean = score_sum / valid_width
+    mean = score_sum / decode_length
     square_sum = 0.0
     for start in tl.static_range(0, WIDTH, BLOCK):
         token = start + lane
-        valid = token < valid_width
+        valid = token < decode_length
         value = tl.load(score_row + token, mask=valid, other=0.0).to(tl.float32)
         centered = tl.where(valid, value - mean, 0.0)
         square_sum += tl.sum(centered * centered, axis=0)
-    std = tl.sqrt(square_sum / valid_width)
+    std = tl.sqrt(square_sum / decode_length)
     tl.store(row_mean + flat_row, mean)
     tl.store(row_inv_std + flat_row, 1.0 / tl.maximum(std, EPSILON))
 
@@ -119,7 +116,7 @@ def _score_per_head_reduce_kernel(
     row_mean,
     row_inv_std,
     selection_scores,
-    selection_seq_lens,
+    selection_row_lengths,
     segment_tokens,
     NUM_LAYERS: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
@@ -139,14 +136,14 @@ def _score_per_head_reduce_kernel(
     selection_row = tl.program_id(1)
     token_block = tl.program_id(2)
     token = token_block * BLOCK + tl.arange(0, BLOCK)
-    valid_width = tl.load(decode_lengths + request)
+    decode_length = tl.load(decode_lengths + request)
     prompt_start = tl.load(prompt_lengths + request)
-    valid_token = token < valid_width
+    valid_token = token < decode_length
 
     if token_block == 0:
         tl.store(
-            selection_seq_lens + request * SELECTION_ROWS + selection_row,
-            valid_width,
+            selection_row_lengths + request * SELECTION_ROWS + selection_row,
+            decode_length,
         )
 
     kv_head = selection_row % NUM_KV_HEADS
@@ -210,16 +207,16 @@ def prepare_per_head_scores(
     request_count: int,
     num_layers: int,
     num_q_heads: int,
+    num_kv_heads: int,
     padded_head_columns: int,
     score_token_capacity: int,
+    selection_width: int,
     per_layer: bool,
     normalize_scores: bool,
 ) -> None:
     """Normalize and reduce the scratch's decode windows for either per-head
     eviction mode."""
-    width = int(selection_scores_rows.shape[1])
-    selection_rows = int(selection_scores_rows.shape[0]) // int(decode_lengths.shape[0])
-    num_kv_heads = selection_rows // num_layers if per_layer else selection_rows
+    selection_rows = num_layers * num_kv_heads if per_layer else num_kv_heads
     rows = num_layers * num_q_heads
     segment_tokens = request_count * num_layers * score_token_capacity
     if normalize_scores:
@@ -236,10 +233,12 @@ def prepare_per_head_scores(
             NUM_KV_HEADS=num_kv_heads,
             PADDED_COLUMNS=padded_head_columns,
             BUCKET=score_token_capacity,
-            WIDTH=width,
+            WIDTH=selection_width,
         )
     # 256-token tiles match the reduce kernel's BLOCK default.
-    _score_per_head_reduce_kernel[(request_count, selection_rows, triton.cdiv(width, 256))](
+    _score_per_head_reduce_kernel[
+        (request_count, selection_rows, triton.cdiv(selection_width, 256))
+    ](
         score_scratch,
         decode_lengths,
         prompt_lengths,
@@ -253,7 +252,7 @@ def prepare_per_head_scores(
         NUM_KV_HEADS=num_kv_heads,
         PADDED_COLUMNS=padded_head_columns,
         BUCKET=score_token_capacity,
-        WIDTH=width,
+        WIDTH=selection_width,
         PER_LAYER=per_layer,
         NORMALIZE=normalize_scores,
     )
@@ -262,7 +261,7 @@ def prepare_per_head_scores(
 @triton.jit
 def _fold_union_ranks_kernel(
     gathered_rows,
-    selection_rows,
+    selection_scores_rows,
     request_count,
     TP_SIZE: tl.constexpr,
     WIDTH: tl.constexpr,
@@ -282,14 +281,14 @@ def _fold_union_ranks_kernel(
             other=-float("inf"),
         )
         folded = tl.maximum(folded, value)
-    tl.store(selection_rows + request * WIDTH + token, folded, mask=mask)
+    tl.store(selection_scores_rows + request * WIDTH + token, folded, mask=mask)
 
 
 @triton.jit
 def _settle_ties_kernel(
     selection_scores_rows,
     selection_row_lengths,
-    token_starts,
+    prompt_lengths,
     provisional_rows,
     kept_ordinal_rows,
     WIDTH: tl.constexpr,
@@ -307,7 +306,7 @@ def _settle_ties_kernel(
     row_selected = provisional_rows + row * KEEP_COUNT
     # Rebases the decode-relative ordinals to absolute positions (per request:
     # every selection row of a request shares its pinned prompt length).
-    prompt_len = tl.load(token_starts + request)
+    prompt_length = tl.load(prompt_lengths + request)
 
     threshold = float("inf")
     for start in tl.static_range(0, KEEP_COUNT, BLOCK):
@@ -327,11 +326,11 @@ def _settle_ties_kernel(
         ).to(tl.float32)
         threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
 
-    seq_len = tl.load(selection_row_lengths + row)
+    row_length = tl.load(selection_row_lengths + row)
     greater_count = 0
     for start in tl.static_range(0, WIDTH, BLOCK):
         token_index = start + tl.arange(0, BLOCK)
-        valid = (token_index < WIDTH) & (token_index < seq_len)
+        valid = (token_index < WIDTH) & (token_index < row_length)
         score = tl.load(
             row_scores + token_index,
             mask=valid,
@@ -344,7 +343,7 @@ def _settle_ties_kernel(
     ties_seen = 0
     for start in tl.static_range(0, WIDTH, BLOCK):
         token_index = start + tl.arange(0, BLOCK)
-        valid = (token_index < WIDTH) & (token_index < seq_len)
+        valid = (token_index < WIDTH) & (token_index < row_length)
         score = tl.load(
             row_scores + token_index,
             mask=valid,
@@ -359,7 +358,7 @@ def _settle_ties_kernel(
         write_offset = output_count + tl.cumsum(selected_i32, axis=0) - selected_i32
         tl.store(
             row_output + write_offset,
-            token_index + prompt_len,
+            token_index + prompt_length,
             mask=selected,
         )
         output_count += tl.sum(selected_i32)

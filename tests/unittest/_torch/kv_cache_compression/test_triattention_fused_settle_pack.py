@@ -61,7 +61,7 @@ def _settle_oracle(scores, row_lengths, row_prompt_offsets, provisional, output,
 
 def _pack_oracle(
     settled,
-    valid_seq_lens,
+    source_lengths,
     dense_offsets,
     dense_out,
     swa_offsets,
@@ -78,12 +78,12 @@ def _pack_oracle(
     """Pack in place: dense rows forward settled content verbatim (stale
     included) then append the tail ``seq_len + move - keep_count``; SWA
     rows write latest-window ordinals once per KV head."""
-    request_count = int(valid_seq_lens.shape[0])
+    request_count = int(source_lengths.shape[0])
     packed_rows = int(dense_out.shape[0])
     dense_total = int(dense_out.shape[1])
     swa_total = int(swa_out.shape[1])
     for request in range(request_count):
-        seq_len = int(valid_seq_lens[request])
+        seq_len = int(source_lengths[request])
         dense_begin = int(dense_offsets[request])
         dense_count = int(dense_offsets[request + 1]) - dense_begin
         for domain in range(packed_rows):
@@ -208,7 +208,7 @@ def test_pack_matches_torch_oracle_on_pre_settled_rows(eviction_mode, has_swa, w
         move_capacity = max(move_capacity, swa_window + tail_capacity)
     dense_total = request_count * (keep_count + tail_capacity)
     swa_total = request_count * (swa_window + tail_capacity)
-    valid_seq_lens = torch.tensor([10, 8, 0], dtype=torch.int32, device=device)
+    source_lengths = torch.tensor([10, 8, 0], dtype=torch.int32, device=device)
     dense_offsets = _staged_offsets(dense_counts, device)
     swa_offsets = _staged_offsets(swa_counts, device)
 
@@ -237,7 +237,7 @@ def test_pack_matches_torch_oracle_on_pre_settled_rows(eviction_mode, has_swa, w
         swa_reference = swa_stale.clone()
         _pack_oracle(
             settled,
-            valid_seq_lens,
+            source_lengths,
             dense_offsets,
             dense_reference,
             swa_offsets if has_swa else dense_offsets,
@@ -255,7 +255,7 @@ def test_pack_matches_torch_oracle_on_pre_settled_rows(eviction_mode, has_swa, w
         swa_actual = swa_stale.clone()
         _pack_move_sources_kernel[(request_count, selection_rows)](
             settled,
-            valid_seq_lens,
+            source_lengths,
             dense_offsets,
             dense_actual,
             swa_offsets if has_swa else None,
