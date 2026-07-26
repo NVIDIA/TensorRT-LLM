@@ -15,29 +15,16 @@
 
 import socket
 import time
+from types import SimpleNamespace
 
 import msgspec
 import zmq
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_events import KVEventAdapter
-from tensorrt_llm.llmapi.llm_args import KVEventsConfig
-from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import (
-    KVCacheEvent,
-    KVCacheEventManager,
-    KVCacheRemovedData,
-    KVCacheStoredBlockData,
-    KVCacheStoredData,
-    UniqueToken,
+from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
+    KVEventAdapter,
+    NativeKVCacheEventManager,
 )
-
-
-def _stored_block(block_hash: int, tokens: list[int]) -> KVCacheStoredBlockData:
-    return KVCacheStoredBlockData(
-        block_hash=block_hash,
-        tokens=[UniqueToken(token) for token in tokens],
-        cache_level=0,
-        priority=0,
-    )
+from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 
 
 def _unused_tcp_port() -> int:
@@ -46,36 +33,8 @@ def _unused_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def test_native_callback_drains_iteration_without_gathered_buffer():
-    """The callback must leave the legacy pull buffer empty without a gather."""
-    adapter = KVEventAdapter(
-        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
-        data_parallel_rank=0,
-        block_size=4,
-        max_window_size=128,
-    )
-    manager = KVCacheEventManager(
-        50_000,
-        window_size=128,
-        attention_dp_rank=0,
-        attention_dp_gather=adapter.publish_local_events,
-    )
-    manager.add_stored_event(
-        None,
-        [_stored_block(11, [1, 2, 3, 4])],
-    )
-
-    manager.flush_iteration_events()
-
-    assert adapter.enqueued_batches == 1
-    assert adapter.enqueued_events == 1
-    assert manager.get_latest_events(timeout_ms=0) == []
-    adapter.shutdown()
-    adapter.shutdown()
-
-
-def test_native_zmq_wire_filters_partial_blocks_and_reuses_port():
-    """Decode the vLLM wire format while filtering partial block lifecycle."""
+def test_native_fast_path_publishes_only_full_max_window_blocks():
+    """Protect radix hash reuse, filtering, wire format, and shutdown."""
     port = _unused_tcp_port()
     bind_endpoint = f"tcp://*:{port}"
     connect_endpoint = f"tcp://127.0.0.1:{port}"
@@ -97,32 +56,60 @@ def test_native_zmq_wire_filters_partial_blocks_and_reuses_port():
         block_size=4,
         max_window_size=128,
     )
+    manager = NativeKVCacheEventManager(
+        adapter,
+        block_size=4,
+        max_window_size=128,
+    )
+    manager.set_layer_group_window_sizes({0: 128, 1: 64})
     time.sleep(0.2)
 
-    full_hash = 2**63 + 5
-    partial_hash = 29
-    adapter.publish_local_events([
-        KVCacheEvent(
-            event_id=0,
-            data=KVCacheStoredData(
-                parent_hash=7,
-                blocks=[
-                    _stored_block(full_hash, [1, 2, 3, 4]),
-                    _stored_block(partial_hash, [5, 6]),
-                ],
-            ),
-            window_size=128,
-            attention_dp_rank=0,
+    root = SimpleNamespace(ordinal=-1)
+
+    def block(
+        key: bytes,
+        tokens: list[int],
+        prev: object,
+    ) -> SimpleNamespace:
+        max_window_page = object()
+        smaller_window_page = object()
+        return SimpleNamespace(
+            key=key,
+            tokens=tokens,
+            prev=prev,
+            ordinal=getattr(prev, "ordinal", -1) + 1,
+            storage=[
+                lambda: max_window_page,
+                lambda: smaller_window_page,
+            ],
         )
-    ])
-    adapter.publish_local_events([
-        KVCacheEvent(
-            event_id=1,
-            data=KVCacheRemovedData([full_hash, partial_hash]),
-            window_size=128,
-            attention_dp_rank=0,
-        )
-    ])
+
+    first_hash = b"\x11" * 24 + b"\x80\x00\x00\x00\x00\x00\x00\x01"
+    partial_hash = b"\x22" * 32
+    second_hash = b"\x33" * 24 + b"\x00\x00\x00\x00\x00\x00\x00\x02"
+    first_wire_hash = int.from_bytes(first_hash[-8:], "big")
+    second_wire_hash = int.from_bytes(second_hash[-8:], "big")
+    first_wire_hash = (
+        first_wire_hash - 2**64
+        if first_wire_hash >= 2**63
+        else first_wire_hash
+    )
+    second_wire_hash = (
+        second_wire_hash - 2**64
+        if second_wire_hash >= 2**63
+        else second_wire_hash
+    )
+    first = block(first_hash, [1, 2, 3, 4], root)
+    partial = block(partial_hash, [5, 6], first)
+    second = block(second_hash, [5, 6, 7, 8], first)
+
+    manager.add_stored_block_event_from_block(first)
+    manager.add_stored_block_event_from_block(partial)
+    manager.add_stored_life_cycle_event_from_block(second, 1)
+    manager.add_stored_life_cycle_event_from_block(second, 0)
+    manager.flush_iteration_events()
+    manager.add_removed_event([first_hash, partial_hash, second_hash])
+    manager.flush_iteration_events()
 
     frames = []
     for _ in range(2):
@@ -134,22 +121,33 @@ def test_native_zmq_wire_filters_partial_blocks_and_reuses_port():
     stored_batch = msgspec.msgpack.decode(frames[0][2])
     removed_batch = msgspec.msgpack.decode(frames[1][2])
     assert stored_batch[2] == 0
-    assert stored_batch[1] == [{
-        "type": "BlockStored",
-        "block_hashes": [-(2**63) + 5],
-        "parent_block_hash": 7,
-        "token_ids": [1, 2, 3, 4],
-        "block_size": 4,
-        "lora_id": None,
-        "medium": "GPU",
-        "lora_name": None,
-    }]
-    assert removed_batch[1] == [{
-        "type": "BlockRemoved",
-        "block_hashes": [-(2**63) + 5],
-        "medium": "GPU",
-    }]
+    assert stored_batch[1] == [
+        {
+            "type": "BlockStored",
+            "block_hashes": [first_wire_hash, second_wire_hash],
+            "parent_block_hash": None,
+            "token_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+            "block_size": 4,
+            "lora_id": None,
+            "medium": "GPU",
+            "lora_name": None,
+        }
+    ]
+    assert removed_batch[1] == [
+        {
+            "type": "BlockRemoved",
+            "block_hashes": [first_wire_hash, second_wire_hash],
+            "medium": "GPU",
+        }
+    ]
+    assert manager.stored_blocks == 2
+    assert manager.removed_blocks == 2
+    assert manager.partial_blocks_suppressed == 1
+    assert manager.non_target_life_cycles_ignored == 1
+    assert manager.dropped_events == 0
 
+    manager.shutdown()
+    manager.shutdown()
     adapter.shutdown()
     adapter.shutdown()
     subscriber.close(linger=0)

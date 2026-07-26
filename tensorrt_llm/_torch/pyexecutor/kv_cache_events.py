@@ -35,6 +35,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import (
     KVCacheCreatedData,
     KVCacheEvent,
+    KVCacheEventDiff,
+    KVCacheEventManager,
     KVCacheRemovedData,
     KVCacheStoredData,
     KVCacheUpdatedData,
@@ -338,6 +340,16 @@ def _to_wire_hash(block_hash: int | str | None) -> ExternalBlockHash | None:
             f"Invalid hexadecimal KV block hash: {block_hash!r}") from error
 
 
+def _vllm_wire_hash_from_radix_key(block_key: bytes) -> int:
+    """Convert an existing SHA-256 radix key like vLLM's integer event hashes."""
+    if len(block_key) < 8:
+        raise ValueError("V2 radix block keys must contain at least 8 bytes")
+    unsigned_hash = int.from_bytes(block_key[-8:], "big", signed=False)
+    wire_hash = _to_wire_hash(unsigned_hash)
+    assert isinstance(wire_hash, int)
+    return wire_hash
+
+
 class KVEventAdapter:
     """Converts local V2 events and publishes one wire batch per iteration."""
 
@@ -390,6 +402,32 @@ class KVEventAdapter:
                 f"Dropping native KV event iteration batch on rank={self._rank}"
             )
         return []
+
+    def publish_wire_events(
+        self,
+        wire_events: list[BlockStored | BlockRemoved | AllBlocksCleared],
+    ) -> None:
+        """Enqueue an already-converted local iteration batch."""
+        if self._closed or not wire_events:
+            return
+        self.local_batches += 1
+        self.local_events += len(wire_events)
+        try:
+            batch = KVEventBatch(
+                ts=time.time(),
+                events=wire_events,
+                data_parallel_rank=self._rank,
+            )
+            if self._publisher.publish(batch):
+                self.enqueued_batches += 1
+                self.enqueued_events += len(wire_events)
+            else:
+                self.dropped_batches += 1
+        except Exception:
+            self.dropped_batches += 1
+            logger.exception(
+                f"Dropping native KV event iteration batch on rank={self._rank}"
+            )
 
     def _convert_event(
         self, event: KVCacheEvent
@@ -458,3 +496,233 @@ class KVEventAdapter:
             f"enqueued_batches={self.enqueued_batches} "
             f"enqueued_events={self.enqueued_events} "
             f"dropped_batches={self.dropped_batches} kv_event_allgathers=0")
+
+
+class _NativeStoredBlockState:
+    __slots__ = ("block_hash", )
+
+    def __init__(self, block_hash: int) -> None:
+        self.block_hash = block_hash
+
+
+class NativeKVCacheEventManager(KVCacheEventManager):
+    """Scheduler-local fast path that produces vLLM wire events directly."""
+
+    def __init__(
+        self,
+        adapter: KVEventAdapter,
+        *,
+        block_size: int,
+        max_window_size: int,
+        max_entries: int = 50_000,
+    ) -> None:
+        self._adapter = adapter
+        self._block_size = block_size
+        self._max_window_size = max_window_size
+        self._max_entries = max_entries
+        self._target_life_cycle_id: int | None = None
+        self._stored_blocks: dict[bytes, _NativeStoredBlockState] = {}
+        self._pending_events: list[
+            BlockStored | BlockRemoved | AllBlocksCleared] = []
+        self._pending_entries = 0
+        self._closed = False
+        self.stored_blocks = 0
+        self.removed_blocks = 0
+        self.partial_blocks_suppressed = 0
+        self.non_target_life_cycles_ignored = 0
+        self.dropped_events = 0
+
+    def set_layer_group_window_sizes(self,
+                                     window_sizes: dict[int, int]) -> None:
+        target_ids = [
+            int(life_cycle_id)
+            for life_cycle_id, window_size in window_sizes.items()
+            if int(window_size) == self._max_window_size
+        ]
+        if not target_ids and window_sizes:
+            largest_window = max(window_sizes.values())
+            target_ids = [
+                int(life_cycle_id)
+                for life_cycle_id, window_size in window_sizes.items()
+                if window_size == largest_window
+            ]
+        if not target_ids:
+            raise ValueError(
+                "Native KV events require an attention KV cache life cycle")
+        self._target_life_cycle_id = min(target_ids)
+        logger.info(
+            "Native KV event fast path selected "
+            f"lifecycle_id={self._target_life_cycle_id} "
+            f"window_size={self._max_window_size}")
+
+    def add_created_event(
+        self,
+        num_blocks_per_cache_level: Any,
+        layer_group_ids: Any = None,
+    ) -> None:
+        return
+
+    def add_stored_block_event_from_block(self, block: Any) -> None:
+        if self._closed or self._target_life_cycle_id is None:
+            return
+        life_cycle_id = self._target_life_cycle_id
+        if life_cycle_id >= len(block.storage):
+            return
+        page_ref = block.storage[life_cycle_id]
+        if page_ref is None or page_ref() is None:
+            return
+        self._add_full_block(block)
+
+    def add_stored_life_cycle_event_from_block(self, block: Any,
+                                                life_cycle_id: int) -> None:
+        if int(life_cycle_id) != self._target_life_cycle_id:
+            self.non_target_life_cycles_ignored += 1
+            return
+        self.add_stored_block_event_from_block(block)
+
+    def _add_full_block(self, block: Any) -> None:
+        key = bytes(block.key)
+        if key in self._stored_blocks:
+            return
+        if len(block.tokens) != self._block_size:
+            self.partial_blocks_suppressed += 1
+            return
+        if not self._reserve_entries(1):
+            return
+        try:
+            token_ids = self._token_ids(block.tokens)
+            block_hash, parent_hash, state = self._block_hashes(block)
+        except ValueError:
+            self.dropped_events += 1
+            self._pending_entries -= 1
+            logger.exception(
+                "Dropping native KV store event with unsupported token data")
+            return
+        self._stored_blocks[key] = state
+        if self._pending_events and isinstance(self._pending_events[-1],
+                                               BlockStored):
+            previous = self._pending_events[-1]
+            if previous.block_hashes and previous.block_hashes[
+                    -1] == parent_hash:
+                previous.block_hashes.append(block_hash)
+                previous.token_ids.extend(token_ids)
+                self.stored_blocks += 1
+                return
+        self._pending_events.append(
+            BlockStored(
+                block_hashes=[block_hash],
+                parent_block_hash=parent_hash,
+                token_ids=token_ids,
+                block_size=self._block_size,
+                lora_id=None,
+                medium="GPU",
+                lora_name=None,
+            ))
+        self.stored_blocks += 1
+
+    @staticmethod
+    def _token_ids(tokens: Any) -> list[int]:
+        token_ids: list[int] = []
+        for token in tokens:
+            if type(token) is not int:
+                raise ValueError(
+                    "vLLM-compatible KV events require integer token IDs")
+            token_ids.append(token)
+        return token_ids
+
+    def _block_hashes(
+        self,
+        block: Any,
+    ) -> tuple[int, int | None, _NativeStoredBlockState]:
+        parent = block.prev
+        is_root_child = getattr(parent, "ordinal", -1) == -1
+        block_hash = _vllm_wire_hash_from_radix_key(bytes(block.key))
+        parent_hash = None if is_root_child else _vllm_wire_hash_from_radix_key(
+            bytes(parent.key))
+        return block_hash, parent_hash, _NativeStoredBlockState(block_hash)
+
+    def add_removed_event(self, block_hashes: Any) -> None:
+        if isinstance(block_hashes, (bytes, str, int)):
+            block_hashes = (block_hashes, )
+        removed_hashes: list[ExternalBlockHash] = []
+        for block_key in block_hashes:
+            if not isinstance(block_key, bytes):
+                continue
+            state = self._stored_blocks.pop(block_key, None)
+            if state is not None:
+                removed_hashes.append(state.block_hash)
+        self._add_removed_hashes(removed_hashes)
+
+    def add_removed_life_cycle_event(self, block_hash: bytes,
+                                     life_cycle_id: int) -> None:
+        if int(life_cycle_id) != self._target_life_cycle_id:
+            self.non_target_life_cycles_ignored += 1
+            return
+        state = self._stored_blocks.pop(block_hash, None)
+        if state is not None:
+            self._add_removed_hashes([state.block_hash])
+
+    def _add_removed_hashes(
+            self, block_hashes: list[ExternalBlockHash]) -> None:
+        if not block_hashes:
+            return
+        if not self._reserve_entries(len(block_hashes)):
+            return
+        if self._pending_events and isinstance(self._pending_events[-1],
+                                               BlockRemoved):
+            self._pending_events[-1].block_hashes.extend(block_hashes)
+        else:
+            self._pending_events.append(
+                BlockRemoved(block_hashes=block_hashes, medium="GPU"))
+        self.removed_blocks += len(block_hashes)
+
+    def add_updated_event(
+        self,
+        block_hash: Any,
+        *,
+        cache_level: KVCacheEventDiff | None = None,
+        priority: KVCacheEventDiff | None = None,
+        layer_group_id: int | None = None,
+    ) -> None:
+        return
+
+    def _reserve_entries(self, num_entries: int) -> bool:
+        if self._pending_entries + num_entries <= self._max_entries:
+            self._pending_entries += num_entries
+            return True
+        self.dropped_events += num_entries
+        if self.dropped_events == num_entries or (
+                self.dropped_events & (self.dropped_events - 1) == 0):
+            logger.warning(
+                "Dropping native KV events because the per-iteration safety "
+                f"cap was exceeded; dropped_events={self.dropped_events}")
+        return False
+
+    def flush_iteration_events(self) -> None:
+        if self._closed or not self._pending_events:
+            return
+        events = self._pending_events
+        self._pending_events = []
+        self._pending_entries = 0
+        self._adapter.publish_wire_events(events)
+
+    def get_latest_events(
+            self, timeout_ms: float | None = None) -> list[KVCacheEvent]:
+        raise RuntimeError(
+            "KV cache event polling is unavailable while native publishing "
+            "is enabled")
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self.flush_iteration_events()
+        self._closed = True
+        logger.info(
+            "Native KV event fast path "
+            f"stored_blocks={self.stored_blocks} "
+            f"removed_blocks={self.removed_blocks} "
+            f"partial_blocks_suppressed={self.partial_blocks_suppressed} "
+            f"non_target_life_cycles_ignored="
+            f"{self.non_target_life_cycles_ignored} "
+            f"dropped_events={self.dropped_events} "
+            f"kv_event_allgathers=0")
