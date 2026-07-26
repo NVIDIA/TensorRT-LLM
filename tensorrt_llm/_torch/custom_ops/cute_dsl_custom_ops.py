@@ -7271,6 +7271,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ------------------------------------------------------------------ #
     from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode import \
         GvrTopKKernel as _GvrTopKKernel
+    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_bsx_dispatch import \
+        bsx_topk as _bsx_topk
+    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_bsx_dispatch import \
+        is_bsx_supported as _is_bsx_supported
 
     class CuteDSLGvrTopKDecodeRunner:
         """Runner for the GVR Top-K cuTe DSL kernel (Blackwell SM100).
@@ -7569,6 +7573,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             ``counters`` without ``order_row`` is rejected.
             """
+            # BSX tier fast path (op43 port): fp32 / next_n=1 / cr=4 /
+            # npad <= 262144 decode rows route to the direct/reg/tp CuTe DSL
+            # tiers; everything else (half-prec, LB, sort-indirect, V3.2,
+            # oversize npad, hw cluster cap) falls through to the in-tree
+            # kernel below. Host-only guard — no device sync. The op
+            # signature and output contract are unchanged (unordered int32
+            # indices, -1 pad only for degenerate rows).
+            if _is_bsx_supported(logits, pre_idx, seq_lens, output_indices,
+                                 top_k, next_n, compress_ratio, order_row,
+                                 counters):
+                _bsx_topk(logits, pre_idx, seq_lens, output_indices, top_k)
+                return
+
             cute_dtype = _TORCH_TO_CUTLASS_DTYPE[logits.dtype]
             num_rows = logits.shape[0]
             # seq_lens is request-level, logits is row-level (next_n
