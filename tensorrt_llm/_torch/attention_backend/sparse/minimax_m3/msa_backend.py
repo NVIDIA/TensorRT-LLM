@@ -256,12 +256,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # Eager (prefill/mixed) per-token valid-block count. It is layer-invariant
     # (a function of qo/kv lengths and page size), so it is computed on the host
     # and staged to the device once per step via a non-blocking copy_, then
-    # reused by every sparse layer's indexer. _msa_eager_all_blocks_empty caches
-    # the host-side empty-selection result so the indexer can short-circuit without
-    # a device read. _msa_eager_n_valid_buf is the persistent backing store for the view.
+    # reused by every sparse layer's indexer. _msa_eager_n_valid_buf is the
+    # persistent backing store for the view.
     _msa_eager_n_valid_buf: Optional[torch.Tensor] = None
     _msa_eager_n_valid_blocks: Optional[torch.Tensor] = None
-    _msa_eager_all_blocks_empty: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -360,11 +358,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         """Device int32 valid-block count for the eager path, or None if no eager
         step was prepared (a decode step or a structural test)."""
         return self._msa_eager_n_valid_blocks
-
-    @property
-    def msa_eager_all_blocks_empty(self) -> bool:
-        """Whether the eager step has no valid KV blocks for any query token."""
-        return self._msa_eager_all_blocks_empty
 
     def _msa_main_kv_is_fp8(self) -> bool:
         """Whether the main paged K/V cache is stored as FP8 E4M3.
@@ -678,7 +671,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_eager_gqa_plan = None
         self._msa_eager_dense_plan = None
         self._msa_eager_n_valid_blocks = None
-        self._msa_eager_all_blocks_empty = False
         if not self._msa_fields_ready:
             return
         # Geometry is captured in __post_init__; skip when it is unavailable.
@@ -754,16 +746,18 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._msa_eager_gqa_plan = gqa_plan
             self._msa_eager_dense_plan = dense_plan
             # Stage the valid-block count to the device once for the whole step
-            # (see _msa_eager_n_valid_blocks). The empty-selection check runs
-            # here on the host, so run_indexer can short-circuit cheaply.
+            # (see _msa_eager_n_valid_blocks). clamp_min(1) matches the decode
+            # path and on_update_kv_lens: a zero-valid row would -inf-mask every
+            # block and NaN the GQA row that consumes the selection.
             n_valid_host = per_token_valid_blocks(
                 qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, causal=True, block_size=page_size
             )
             total_q = int(n_valid_host.shape[0])
-            self._msa_eager_all_blocks_empty = total_q == 0 or int(n_valid_host.max().item()) <= 0
             if total_q > 0:
                 dev_buf = self._ensure_eager_n_valid_buffer(total_q, device)
-                dev_buf[:total_q].copy_(n_valid_host.to(torch.int32), non_blocking=True)
+                dev_buf[:total_q].copy_(
+                    n_valid_host.clamp_min(1).to(torch.int32), non_blocking=True
+                )
                 self._msa_eager_n_valid_blocks = dev_buf[:total_q]
             return
 
@@ -1123,20 +1117,9 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         else:
             proxy_plan = metadata.msa_eager_proxy_plan
             max_score = None
-            # The empty case was resolved on the host, so short-circuit here.
-            if metadata.msa_eager_all_blocks_empty:
-                output_shape = (
-                    (config.num_kv_heads, num_tokens, MSA_REQUIRED_TOPK)
-                    if head_major_output
-                    else (num_tokens, config.num_kv_heads, MSA_REQUIRED_TOPK)
-                )
-                output = torch.full(
-                    output_shape,
-                    -1,
-                    dtype=torch.int32,
-                    device=idx_q.device,
-                )
-                return output.permute(1, 0, 2) if head_major_output else output
+            # No host-side empty check: the staged counts are clamped to at
+            # least one block, and the kernel masks each query to its own
+            # valid-block extent.
             n_valid_blocks = metadata.msa_eager_n_valid_blocks
             if n_valid_blocks is not None:
                 n_valid_blocks = n_valid_blocks[:num_tokens]

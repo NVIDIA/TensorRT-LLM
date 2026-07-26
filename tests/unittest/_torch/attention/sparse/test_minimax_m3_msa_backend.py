@@ -216,7 +216,6 @@ def test_msa_fp8_cache_converts_live_index_query_before_scoring():
     class FakeMetadata:
         msa_decode_proxy_plan = None
         msa_eager_proxy_plan = (False, 0, 2, {}, None)
-        msa_eager_all_blocks_empty = False
         msa_eager_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
         msa_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
         msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
