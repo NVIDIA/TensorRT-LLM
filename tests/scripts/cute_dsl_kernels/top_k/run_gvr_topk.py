@@ -871,7 +871,14 @@ def gvr_topk_decode(
     N_cols = logits.shape[1]
     N_dec = max_seq_len if max_seq_len is not None else N_cols
     if num_threads_per_block is None:
-        if self_scan:
+        if use_ext_cand and top_k <= 512:
+            # list-hit rows do O(list) work (~2-4K entries at K<=512),
+            # not O(N): the N-keyed 1024-thread pick pays barrier-heavy
+            # phases for no parallel gain (flash-512k v5: 8.4 -> 7.1us
+            # at 512 threads; K=1024 lists are big enough to keep the
+            # N-keyed pick).
+            num_threads_per_block = 512
+        elif self_scan:
             # self_scan owns the whole row scan in one CTA: the phase-0
             # cp.async pipeline scales with warp count at every N (the
             # 512-thread short-row heuristic below is tuned for the
