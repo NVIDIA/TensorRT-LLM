@@ -6026,6 +6026,126 @@ class GvrTopKKernel:
                 if cutlass.const_expr(_P4_TAIL_DBG):
                     ck1 = cute.arch.clock64()
 
+            # ---- parked count-free take (ext counts, no list): the
+            # emission already measured the admitted line's exact count,
+            # so the count pass exists ONLY to build P3's placement
+            # prefix. Claim-collect instead (v5 edge-cut walk shape:
+            # 4-way strided reads, ballot-merged claims): ONE cold pass
+            # replaces count(cold) + collect(L2-hot). P4 is candidate-
+            # order agnostic (the v5 list path feeds it emission-claim
+            # order already). The claim total re-measures the count; a
+            # mismatch with the parked band (stale host state) leaves
+            # take_cand=0 and the stock single-count path below recovers.
+            if cutlass.const_expr(
+                self.use_ext_counts
+                and not self.use_ext_cand
+                and not self.self_scan
+                and not self.enable_block_skip
+                and cluster_size == 1
+                and self.dtype == cutlass.Float32
+            ):
+                if ext_row == cutlass.Int32(1) and N < cutlass.Int32(16384):
+                    # short rows only: the fused walk wins ~1us below
+                    # ~16k (pass fixed costs dominate there); at 16k+
+                    # the claim-dense cells (pro 9.4% band) lose to
+                    # count-then-place and the rest sit at parity, so
+                    # the two-pass path keeps them (measured both ways,
+                    # loncheng cells; captures all sit above the gate)
+                    cut_p = s_thr[0]  # parked line (staged at P1-init)
+                    rbase = input_row.iterator.toint()
+                    vw_p = cutlass.const_expr(self.vec_bits // self.dtype.width)
+                    va_p = cutlass.const_expr(self.vec_align_bytes)
+                    eb_p = cutlass.const_expr(self.dtype.width // 8)
+                    cp_atom = self._make_load_copy_atom()
+                    frag0 = cute.make_fragment((vw_p,), self.dtype)
+                    frag1 = cute.make_fragment((vw_p,), self.dtype)
+                    frag2 = cute.make_fragment((vw_p,), self.dtype)
+                    frag3 = cute.make_fragment((vw_p,), self.dtype)
+                    step4_p = cutlass.const_expr(4 * num_threads * vw_p)
+                    nfull_p = (N // cutlass.Int32(step4_p)) * cutlass.Int32(step4_p)
+                    it_p = tidx * cutlass.Int32(vw_p)
+                    # 4 chunks in flight per iter (the count primitive's
+                    # ILP shape); per-element DIRECT smem atomics for
+                    # passers - no warp sync, claims hide under the reads
+                    while it_p < nfull_p:
+                        for _jf in cutlass.range_constexpr(4):
+                            gp_p = cute.make_ptr(
+                                self.dtype,
+                                rbase
+                                + cutlass.Int64(it_p + cutlass.Int32(_jf * num_threads * vw_p))
+                                * cutlass.Int64(eb_p),
+                                cute.AddressSpace.gmem,
+                                assumed_align=va_p,
+                            )
+                            cute.copy(
+                                cp_atom,
+                                cute.make_tensor(gp_p, cute.make_layout((vw_p,))),
+                                frag0
+                                if _jf == 0
+                                else frag1
+                                if _jf == 1
+                                else frag2
+                                if _jf == 2
+                                else frag3,
+                            )
+                        for _jf in cutlass.range_constexpr(4):
+                            for _jv in cutlass.range_constexpr(vw_p):
+                                v_p = cutlass.Float32(
+                                    (
+                                        frag0
+                                        if _jf == 0
+                                        else frag1
+                                        if _jf == 1
+                                        else frag2
+                                        if _jf == 2
+                                        else frag3
+                                    )[_jv]
+                                )
+                                if v_p >= cut_p:
+                                    sl_p = atomicAdd(
+                                        s_iscalars.iterator + cutlass.Int32(0),
+                                        cutlass.Int32(1),
+                                    )
+                                    if sl_p < cutlass.Int32(self.kC):
+                                        smem_keys[sl_p] = v_p
+                                        smem_vals[sl_p] = (
+                                            it_p
+                                            + cutlass.Int32(_jf * num_threads * vw_p)
+                                            + cutlass.Int32(_jv)
+                                        )
+                        it_p = it_p + cutlass.Int32(step4_p)
+                    i_p = nfull_p + tidx
+                    while i_p < N:
+                        vp_p = cute.make_ptr(
+                            cutlass.Float32,
+                            rbase + cutlass.Int64(i_p) * cutlass.Int64(4),
+                            cute.AddressSpace.gmem,
+                            assumed_align=4,
+                        )
+                        pval = cute.make_tensor(vp_p, cute.make_layout((1,)))[0]
+                        if pval >= cut_p:
+                            sl_p = atomicAdd(
+                                s_iscalars.iterator + cutlass.Int32(0),
+                                cutlass.Int32(1),
+                            )
+                            if sl_p < cutlass.Int32(self.kC):
+                                smem_keys[sl_p] = pval
+                                smem_vals[sl_p] = i_p
+                        i_p = i_p + cutlass.Int32(num_threads)
+                    cute.arch.barrier()
+                    cnt_p = s_iscalars[0]
+                    if cnt_p >= cutlass.Int32(self.top_k) and cnt_p <= cutlass.Int32(self.kC):
+                        take_cand = cutlass.Int32(1)
+                        if tidx == cutlass.Int32(0):
+                            s_iscalars[1] = cutlass.Int32(1)  # done
+                        cute.arch.barrier()
+                    if take_cand == cutlass.Int32(0):
+                        # stale host counts: reset the claim counter so
+                        # the stock single-count path re-measures cleanly
+                        if tidx == cutlass.Int32(0):
+                            s_iscalars[0] = cutlass.Int32(0)
+                        cute.arch.barrier()
+
             # ---- self_scan take: cut straight from the phase-0 cursors ----
             # Same admission state machine as the v5 list (tightest line
             # whose count fits [K, B*] wins; anchor = loosest in-band
