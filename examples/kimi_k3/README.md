@@ -105,26 +105,35 @@ This selects `eval_extra_llm_options_sa.yaml` and the SA-required
 change). Scores should match the non-SA run within noise — SA speculative
 decoding is lossless.
 
-For a serving throughput benchmark (synthetic 8K-input/1K-output requests at
-concurrency 64 and 256), submit:
+For serving performance, use the standard sweep under
+`examples/kimi_k3/perf_sweep/` (this supersedes the older
+`run_serving_benchmark_kimi_k3.sbatch` single-recipe benchmark). It submits
+the 17-point 8K/1K sweep across the three tuned serving recipes — `tep16`
+(latency, c 1–16), `tep8` (interactive, 8 GPUs, c 1–16), and `dep16`
+(throughput, c 16–1024):
 
 ```bash
-sbatch examples/kimi_k3/run_serving_benchmark_kimi_k3.sbatch \
+examples/kimi_k3/perf_sweep/submit_perf_sweep.sh \
     --model /path/to/kimi-k3-checkpoint \
     --image /path/to/tensorrt-llm-container.sqsh
 ```
 
-Optional arguments `--isl`, `--osl`, and `--concurrencies` override the
-workload shape. Note: at the benchmark's max_seq_len of 9344 (8K + 1K), this
-currently requires the unmerged KDA prefill varlen tile-overrun guard
-(branch `tali/k3-kda-prefill-oob-fix`, commit `0f0fface8c`); on unpatched
-`c77636a022` the server wedges during TRTLLM-Gen FMHA warmup.
+All jobs of a comparison batch are submitted together on purpose: a weight
+load overlapping another job's measurement window depresses DEP16 c>=128
+points by ~30%. Use `--jobs "tep16 tep8 dep16-lo dep16-hi"` to select a
+subset and `--dry-run` to inspect the sbatch commands.
 
-Results (one JSON per concurrency) are written to
-`kimi-k3-serving-benchmark-<job-id>/` in the submission directory. Reference
-numbers, measured 2026-07-23 at commit `c77636a022` plus that guard on 2+2
-cross-rack GB300 nodes: concurrency 64 — 587 output tok/s, mean TPOT
-101.4 ms; concurrency 256 — 1735 output tok/s, mean TPOT 136.8 ms.
+Guard the same three recipes with the GSM8K accuracy sweep whenever the
+serving configs or kernels change (expect ~96.5 +/- 0.5 per recipe):
+
+```bash
+examples/kimi_k3/perf_sweep/submit_acc_sweep.sh \
+    --model /path/to/kimi-k3-checkpoint \
+    --image /path/to/tensorrt-llm-container.sqsh
+```
+
+Results land in per-job `kimi-k3-sweep-<name>-<job-id>.log` files and result
+JSONs in the submission directory (run from a fresh results folder).
 
 Scheduler options must precede the script path; model and image arguments
 follow it. The scripts default to the `batch` partition and the
