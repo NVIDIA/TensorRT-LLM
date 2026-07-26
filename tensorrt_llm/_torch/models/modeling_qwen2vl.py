@@ -866,18 +866,17 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         # Text-only fast path: skip the multi-modal HF processor (tokenizer
         # output matches it bit-exactly when `images` / `videos` are `None`)
-        # while still populating mrope_config since the LM is M-RoPE.
+        # and emit no multimodal data at all.  M-RoPE positions for a prompt
+        # with no multimodal spans are just the sequential positions broadcast
+        # across the three axes, which PyTorchModelEngine._prepare_tp_inputs
+        # already writes as its text-only default before overwriting multimodal
+        # spans, so an mrope_config here would only recompute that value -- and
+        # by making MultimodalParams.has_content() true it would additionally
+        # open the EPD mRoPE IPC re-registration for context-only requests.
         if not mm_data:
             input_ids = self.tokenizer(text_prompt,
                                        return_tensors="pt").input_ids
-            attention_mask = torch.ones_like(input_ids)
-            mrope_config = self.get_mrope_config(input_ids, None, None,
-                                                 attention_mask, None)
-            return input_ids[0].to(torch.int32).tolist(), {
-                "multimodal_data": {
-                    "mrope_config": mrope_config
-                },
-            }
+            return input_ids[0].to(torch.int32).tolist(), None
 
         processed_inputs = self._preprocess(text_prompt, mm_data,
                                             mm_processor_kwargs)
