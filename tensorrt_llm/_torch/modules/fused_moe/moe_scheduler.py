@@ -42,10 +42,19 @@ exchange runs:
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
+
+# Route on the host (fused noaux_tc + post-topk pipeline) instead of inside
+# the trtllm-gen cubin. The in-cubin top-k tier for large expert counts
+# (896 experts / top-16) register-spills and costs ~33 us/layer at decode
+# batch 5..64 vs ~10 us for the post-topk pipeline; the separated path is
+# the same math the attention-DP deployments already run.
+FORCE_SEPARATED_ROUTING = os.environ.get(
+    "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
 
 from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
@@ -376,6 +385,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 2: Apply routing ==========
         requires_separated_routing = (
             moe.backend._supports_load_balancer() or moe.routing_method.requires_separated_routing
+            or FORCE_SEPARATED_ROUTING
         )
         if requires_separated_routing:
             # Separated routing: ConfigurableMoE calls routing_method
@@ -826,7 +836,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # When the scheduler precomputes top-k for DP/load-balancer paths,
             # the backend must not route again.  Single-rank TRTLLMGen paths do
             # not get precomputed top-k, so they still need router_logits.
-            router_logits_arg = None if moe.backend._supports_load_balancer() else router_logits
+            router_logits_arg = (None if
+                                 (moe.backend._supports_load_balancer()
+                                  or moe.routing_method.requires_separated_routing
+                                  or FORCE_SEPARATED_ROUTING) else router_logits)
             kwargs["router_logits"] = router_logits_arg
             kwargs["do_finalize"] = do_finalize
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(

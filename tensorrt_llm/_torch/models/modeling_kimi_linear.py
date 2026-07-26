@@ -89,7 +89,7 @@ from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata, TrtllmAttentionMetadata
-from ..distributed import AllReduce
+from ..distributed import AllReduce, AllReduceStrategy
 from ..metadata import KVCacheParams
 from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
@@ -174,6 +174,11 @@ _KIMI_K3_FP8_WEIGHT_READ_MLA_ENV = "KIMI_K3_FP8_WEIGHT_READ_MLA"
 # +14.6/+16.1/+10.4% and DEP16 +8.2/+6.2% tps/user vs control at the five
 # standard anchors, GSM8K strict-match bit-identical to control.
 _KIMI_K3_KDA_GLUE_FP8_ENV = "KIMI_K3_KDA_GLUE_FP8"
+
+# FP8 read for the fused shared-expert gate_up_proj. Default follows the
+# parallel layout (on under attention DP, off under TP — see the conversion
+# helper's comment); set 0/1 to force either.
+_KIMI_K3_FP8_WEIGHT_READ_GATE_UP_ENV = "KIMI_K3_FP8_WEIGHT_READ_GATE_UP"
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +371,8 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         return out.reshape(out_shape)
 
 
-def _convert_moe_mlps_to_fp8_weight_read(model: nn.Module) -> int:
+def _convert_moe_mlps_to_fp8_weight_read(
+        model: nn.Module, include_fused_gate_up: bool = True) -> int:
     """Swap the replicated MoE-layer MLP projections to an FP8 weight read.
 
     Targets the shared-expert MLP (gate/up/down) and the latent up/down
@@ -398,7 +404,15 @@ def _convert_moe_mlps_to_fp8_weight_read(model: nn.Module) -> int:
             continue
         shared = getattr(moe, "shared_experts", None)
         if shared is not None:
-            for attr in ("gate_proj", "up_proj", "down_proj"):
+            # KimiK3MLP fuses gate and up into gate_up_proj; keep the split
+            # names too so either MLP layout converts. The fused gate_up read
+            # only pays off when attention DP re-reads it per rank per step;
+            # under TP the bf16 GEMM overlaps on the aux stream and the FP8
+            # quantize+GEMM would serialize onto the critical path.
+            shared_attrs = (("gate_proj", "up_proj", "gate_up_proj",
+                             "down_proj") if include_fused_gate_up else
+                            ("gate_proj", "up_proj", "down_proj"))
+            for attr in shared_attrs:
                 _swap(shared, attr)
         for attr in ("routed_expert_down_proj", "routed_expert_up_proj"):
             _swap(moe, attr)
@@ -830,7 +844,8 @@ class KimiKDARuntime(nn.Module):
     ``model.layers.N.self_attn.q_proj.weight`` maps identically).
     """
 
-    def __init__(self, cfg, layer_idx: int, mapping=None):
+    def __init__(self, cfg, layer_idx: int, mapping=None,
+                 allreduce_strategy=AllReduceStrategy.AUTO):
         super().__init__()
         # Lazy import: pulls in fla/einops.
         from ..modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
@@ -851,6 +866,7 @@ class KimiKDARuntime(nn.Module):
         self._kda_tp_rank = (mapping.tp_rank
                              if self._kda_tp_size > 1 else 0)
         self._o_allreduce = (AllReduce(mapping=mapping,
+                                       strategy=allreduce_strategy,
                                        dtype=torch.bfloat16)
                              if self._kda_tp_size > 1 else None)
         num_heads = lin["num_heads"]
@@ -1636,7 +1652,8 @@ def _build_mla_step_runtime(
 class KimiMLARuntime(nn.Module):
     """Wraps ``KimiK3MLAAttention`` with the mixed-batch executor dispatch."""
 
-    def __init__(self, cfg, layer_idx: int, mapping=None):
+    def __init__(self, cfg, layer_idx: int, mapping=None, quant_config=None,
+                 allreduce_strategy=AllReduceStrategy.AUTO):
         super().__init__()
         import os
 
@@ -1679,6 +1696,7 @@ class KimiMLARuntime(nn.Module):
             f"padded MLA heads {padded_heads} not divisible by "
             f"tp_size {self._mla_tp_size}")
         self._o_allreduce = (AllReduce(mapping=mapping,
+                                       strategy=allreduce_strategy,
                                        dtype=torch.bfloat16)
                              if self._mla_tp_size > 1 else None)
         self.mixer = KimiK3MLAAttention(
@@ -1694,6 +1712,7 @@ class KimiMLARuntime(nn.Module):
             layer_idx=layer_idx,
             use_output_gate=cfg.mla_use_output_gate,
             max_position_embeddings=max_positions,
+            quant_config=quant_config,
         )
 
     def forward(self, hidden_states: torch.Tensor,
@@ -1745,13 +1764,29 @@ class KimiLinearDecoderLayer(nn.Module):
                 f"Kimi K3 layer {layer_idx} must be exactly one of KDA/MLA")
 
         if self.is_kda:
-            self.self_attn = KimiKDARuntime(cfg,
-                                            layer_idx,
-                                            mapping=model_config.mapping)
+            self.self_attn = KimiKDARuntime(
+                cfg,
+                layer_idx,
+                mapping=model_config.mapping,
+                allreduce_strategy=model_config.allreduce_strategy)
         else:
-            self.self_attn = KimiMLARuntime(cfg,
-                                            layer_idx,
-                                            mapping=model_config.mapping)
+            # Forward only the KV-cache quantization to the MLA attention
+            # backends (enables FP8 KV cache). The attention projection
+            # weights themselves stay BF16 — the model-level weight-quant
+            # algo must not leak into the attention backend's weight paths.
+            mla_quant_config = None
+            kv_quant_algo = (model_config.quant_config.kv_cache_quant_algo
+                             if model_config.quant_config is not None else
+                             None)
+            if kv_quant_algo is not None:
+                mla_quant_config = QuantConfig(
+                    kv_cache_quant_algo=kv_quant_algo)
+            self.self_attn = KimiMLARuntime(
+                cfg,
+                layer_idx,
+                mapping=model_config.mapping,
+                quant_config=mla_quant_config,
+                allreduce_strategy=model_config.allreduce_strategy)
 
         self.is_moe = (cfg.num_experts is not None
                        and layer_idx >= cfg.first_k_dense_replace
@@ -2492,7 +2527,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
         # DeepGEMM fp8_swap_ab_gemm kernel is Blackwell-only; keep BF16 on any
         # other SM or when explicitly disabled.
         if fp8_weight_read:
-            n_fp8 = _convert_moe_mlps_to_fp8_weight_read(self.model)
+            gate_up_default = ("1" if self.model_config.mapping.
+                               enable_attention_dp else "0")
+            n_fp8 = _convert_moe_mlps_to_fp8_weight_read(
+                self.model,
+                include_fused_gate_up=os.environ.get(
+                    _KIMI_K3_FP8_WEIGHT_READ_GATE_UP_ENV,
+                    gate_up_default) != "0")
             logger.info(
                 f"Kimi K3: reading {n_fp8} MoE-layer MLP projections "
                 f"(shared-expert + latent) at FP8 block-scale")
