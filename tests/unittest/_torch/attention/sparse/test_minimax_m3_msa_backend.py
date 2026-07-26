@@ -461,6 +461,63 @@ def test_build_kv_page_indices_matches_first_slot_of_each_page():
     torch.testing.assert_close(page_indices, reference, rtol=0, atol=0)
 
 
+def test_build_paged_kv_slot_mapping_out_cache_loc_matches_slot_grid():
+    """out_cache_loc must name the same slots as indexing req_to_token per new
+    token, for a mixed batch of one context request plus decode rows."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import (
+        build_paged_kv_slot_mapping,
+    )
+
+    tokens_per_block = 4
+    block_ids = torch.tensor([[6, 2, 9], [4, 0, 0], [7, 1, 0]], dtype=torch.int32)
+
+    class FakeCacheManager:
+        tokens_per_block = 4
+
+        def get_block_ids_per_seq(self, request_ids):
+            assert request_ids == [0, 1, 2]
+            return block_ids
+
+    # Request 0 prefills 6 tokens over a 3-token prefix; 1 and 2 decode.
+    qo_lens_cpu = torch.tensor([6, 1, 1], dtype=torch.int32)
+    kv_lens_cpu = torch.tensor([9, 3, 5], dtype=torch.int32)
+    qo_offset_cpu = kv_lens_cpu - qo_lens_cpu
+
+    mapping = build_paged_kv_slot_mapping(
+        kv_cache_manager=FakeCacheManager(),
+        request_ids=[0, 1, 2],
+        qo_lens_cpu=qo_lens_cpu,
+        qo_offset_cpu=qo_offset_cpu,
+        device=torch.device("cpu"),
+    )
+
+    req_to_token = _expand_slot_rows(block_ids, tokens_per_block)
+    reference = [
+        int(req_to_token[b, int(qo_offset_cpu[b]) + offset])
+        for b in range(3)
+        for offset in range(int(qo_lens_cpu[b]))
+    ]
+
+    torch.testing.assert_close(mapping.req_to_token, req_to_token, rtol=0, atol=0)
+    assert mapping.slot_ids.tolist() == [0, 1, 2]
+    assert mapping.out_cache_loc.dtype == torch.int32
+    assert mapping.out_cache_loc.tolist() == reference
+    assert mapping.block_ids_cpu.tolist() == block_ids.tolist()
+
+    # A zero-length CUDA-graph padding row offsets to -1. Its slot is a
+    # placeholder that on_update_kv_lens re-derives, so it only has to stay
+    # inside the row rather than index off the table.
+    padded = build_paged_kv_slot_mapping(
+        kv_cache_manager=FakeCacheManager(),
+        request_ids=[0, 1, 2],
+        qo_lens_cpu=torch.tensor([1, 1, 1], dtype=torch.int32),
+        qo_offset_cpu=torch.tensor([0, -1, -1], dtype=torch.int32),
+        device=torch.device("cpu"),
+    )
+    for b, slot in enumerate(padded.out_cache_loc.tolist()):
+        assert slot in req_to_token[b].tolist()
+
+
 def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k):
     num_tokens = int(slots.shape[0])
     num_heads, head_dim = int(k_cache.shape[1]), int(k_cache.shape[3])

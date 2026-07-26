@@ -11,9 +11,11 @@ slot mapping builder. MSA-only helpers live in :mod:`.msa_utils`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Tuple
 
 import torch
+
+from tensorrt_llm._utils import async_tensor_h2d, maybe_pin_memory
 
 from ..params import SparseMetadataParams, SparseParams
 
@@ -223,19 +225,21 @@ def build_paged_kv_slot_mapping(
     own page-indexed views without a second manager query or a device round
     trip.
 
-    The req_to_token reads that build out_cache_loc sync the host, so call this
-    only from prepare(), never from the forward path.
+    Both out_cache_loc and req_to_token are computed from the host block ids and
+    staged with non-blocking copies, so this neither syncs the host nor reads
+    device memory back. It still allocates per step, so call it from prepare(),
+    never from the forward path.
     """
     tokens_per_block = int(kv_cache_manager.tokens_per_block)
     # block_ids_per_seq is a [batch, max_blocks_per_seq] tensor; row b holds the
     # block ids assigned to request_ids[b] in order.
-    block_ids = kv_cache_manager.get_block_ids_per_seq(list(request_ids))
+    block_ids = maybe_pin_memory(kv_cache_manager.get_block_ids_per_seq(list(request_ids)))
     batch = int(qo_lens_cpu.shape[0])
     max_blocks = int(block_ids.shape[1])
     max_kv_len = max_blocks * tokens_per_block
 
     # Expand block ids -> per-token slot ids.
-    block_ids_dev = block_ids.to(device).to(torch.int64)
+    block_ids_dev = block_ids.to(device, non_blocking=True).to(torch.int64)
     within_block = torch.arange(tokens_per_block, device=device, dtype=torch.int64)
     # Outer product per batch entry: [batch, max_blocks, tokens_per_block]
     slot_grid = block_ids_dev.unsqueeze(-1) * tokens_per_block + within_block
@@ -243,15 +247,30 @@ def build_paged_kv_slot_mapping(
     slot_ids = torch.arange(batch, device=device, dtype=torch.int32)
 
     # out_cache_loc: per-new-token slot ids, in flattened query-token order.
-    req_to_token_cpu = req_to_token.to("cpu")
-    qo_lens_list = qo_lens_cpu.to(torch.long).tolist()
-    qo_offset_list = qo_offset_cpu.to(torch.long).tolist()
-    out_cache_loc_list: List[int] = []
-    for b in range(batch):
-        start = int(qo_offset_list[b])
-        for offset in range(int(qo_lens_list[b])):
-            out_cache_loc_list.append(int(req_to_token_cpu[b, start + offset].item()))
-    out_cache_loc = torch.tensor(out_cache_loc_list, dtype=torch.int32, device=device)
+    # Expanding the per-request lengths on the host reproduces the same slot
+    # ids as indexing req_to_token, without copying that [batch, max_kv_len]
+    # grid back from the device.
+    qo = qo_lens_cpu.to(torch.long)
+    total_q = int(qo.sum())
+    if total_q == 0:
+        out_cache_loc_cpu = torch.empty(0, dtype=torch.int32)
+    else:
+        row = torch.repeat_interleave(torch.arange(batch, dtype=torch.long), qo)
+        starts = torch.cumsum(qo, 0) - qo
+        pos = qo_offset_cpu.to(torch.long)[row] + (
+            torch.arange(total_q, dtype=torch.long) - starts[row]
+        )
+        # Optimistic (full-acceptance) offsets can overhang the last allocated
+        # slot and a zero-length padding row lands at -1. Those slots are
+        # placeholders that on_update_kv_lens re-derives before any forward
+        # reads them, so keep them in bounds instead of indexing off the table.
+        pos.clamp_(min=0, max=max(max_kv_len - 1, 0))
+        block_col = torch.div(pos, tokens_per_block, rounding_mode="floor")
+        out_cache_loc_cpu = (
+            block_ids[row, block_col].to(torch.long) * tokens_per_block
+            + (pos - block_col * tokens_per_block)
+        ).to(torch.int32)
+    out_cache_loc = async_tensor_h2d(out_cache_loc_cpu, torch.int32, device)
     return PagedKvSlotMapping(req_to_token, slot_ids, out_cache_loc, block_ids)
 
 
