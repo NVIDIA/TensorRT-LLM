@@ -76,6 +76,8 @@ from typing import List, Optional, Tuple
 import torch
 from torch import nn
 
+from tensorrt_llm.logger import logger
+
 from ....functional import PositionEmbeddingType
 from ....models.modeling_utils import QuantConfig
 from ...attention_backend import TrtllmAttention, TrtllmAttentionMetadata
@@ -403,6 +405,36 @@ class KimiK3MLAAttention(nn.Module):
             max_position_embeddings=max_position_embeddings,
         )
 
+        gen_mla_backend = os.environ.get("TLLM_K3_MLA_GEN_BACKEND", "cute-dsl")
+        # FP8 KV cache is accuracy-broken on K3: GSM8K 74.45 vs 96.44 with
+        # bf16 KV on the same self-built tree (jobs 2689405/2689404, MR !96),
+        # with partial scores decaying through the run — consistent with fp8
+        # latent-cache error compounding over generation length. The decode
+        # backend is NOT the cause: bf16 + trtllm-gen decode scores 96.59
+        # (job 2689406), so the deficit is the fp8 cache numerics themselves.
+        # Fail fast until that is fixed.
+        self.has_fp8_kv_cache = bool(
+            quant_config is not None
+            and quant_config.layer_quant_mode.has_fp8_kv_cache())
+        if self.has_fp8_kv_cache:
+            if os.environ.get("KIMI_K3_ALLOW_INACCURATE_MLA_GEN",
+                              "0") != "1":
+                raise ValueError(
+                    "Kimi K3: FP8 KV cache (kv_cache_config.dtype='fp8') "
+                    "currently degrades accuracy severely (GSM8K 74.5 vs "
+                    "96.4 with bf16 KV). Use a non-FP8 KV cache "
+                    "(kv_cache_config.dtype 'auto'/'bfloat16'), or set "
+                    "KIMI_K3_ALLOW_INACCURATE_MLA_GEN=1 for perf-only "
+                    "experiments.")
+            if gen_mla_backend != "trtllm-gen":
+                # cute-dsl rejects fp8 KV device scales; trtllm-gen decode
+                # is accuracy-equivalent to cute-dsl on K3 (96.59 vs 96.44).
+                logger.info(
+                    "Kimi K3 MLA: FP8 KV cache requires the trtllm-gen MLA "
+                    "generation backend; overriding "
+                    f"'{gen_mla_backend}' -> 'trtllm-gen'.")
+                gen_mla_backend = "trtllm-gen"
+
         # Context backend: absorbed MQA path, head_dim = kv_lora +
         # qk_rope, num_kv_heads=1. Called by ``forward_prefill`` with
         # ``attention_input_type=generation_only`` and a T-query MTP
@@ -434,8 +466,7 @@ class KimiK3MLAAttention(nn.Module):
             quant_config=quant_config,
             mla_params=mla_params,
             pos_embd_params=gen_pos_embd_params,
-            flashinfer_mla_backend=os.environ.get(
-                "TLLM_K3_MLA_GEN_BACKEND", "cute-dsl"),
+            flashinfer_mla_backend=gen_mla_backend,
         )
 
         # K3 NoPE contract — overwrite the actual cos/sin values with
