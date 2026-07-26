@@ -128,14 +128,16 @@ def _create_mla_outputs_fake(hidden_states, layer_idx):
 
 @torch.library.custom_op(
     "trtllm::mla_custom_op_inplace",
-    mutates_args=("attn_output",),
+    mutates_args=("output", "sparse_output", "sparse_output_sf"),
 )
 def mla_custom_op_inplace(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
-    attn_output: list[torch.Tensor],
+    output: torch.Tensor,
     latent_cache_gen: Optional[torch.Tensor],
+    sparse_output: Optional[torch.Tensor],
+    sparse_output_sf: Optional[torch.Tensor],
     hidden_states_fp4: Optional[torch.Tensor] = None,
     hidden_states_sf: Optional[torch.Tensor] = None,
 ) -> None:
@@ -149,6 +151,13 @@ def mla_custom_op_inplace(
             scaling_factor=hidden_states_sf,
             unquantized_hidden_states=hidden_states,
         )
+    attn_output = [output]
+    if sparse_output is not None:
+        attn_output.append(sparse_output)
+    if sparse_output_sf is not None:
+        if sparse_output is None:
+            raise RuntimeError("sparse_output_sf requires sparse_output")
+        attn_output.append(sparse_output_sf)
     mla_layer.forward_impl(
         position_ids,
         hidden_states,
@@ -1701,13 +1710,25 @@ class MLA(nn.Module):
             )
             return
 
+        output = attn_output[0]
+        sparse_output = None
+        sparse_output_sf = None
+        if len(attn_output) > 3:
+            raise RuntimeError("MLA output hooks may return at most two sparse output buffers.")
+        if len(attn_output) > 1:
+            sparse_output = attn_output[1]
+        if len(attn_output) > 2:
+            sparse_output_sf = attn_output[2]
+
         if isinstance(hidden_states, Fp4QuantizedTensor):
             torch.ops.trtllm.mla_custom_op_inplace(
                 hidden_states.unquantized_hidden_states,
                 position_ids,
                 self.layer_idx_str,
-                attn_output,
+                output,
                 latent_cache_gen,
+                sparse_output,
+                sparse_output_sf,
                 hidden_states.fp4_tensor,
                 hidden_states.scaling_factor,
             )
@@ -1716,8 +1737,10 @@ class MLA(nn.Module):
                 hidden_states,
                 position_ids,
                 self.layer_idx_str,
-                attn_output,
+                output,
                 latent_cache_gen,
+                sparse_output,
+                sparse_output_sf,
             )
 
     def _project_output(
@@ -1814,7 +1837,9 @@ class MLA(nn.Module):
     def transform_weights(self) -> None:
         if self._weights_transformed:
             return
-        if transform_sparse_attn_weights := self.sparse_attn_hooks.transform_sparse_attn_weights:
+        if transform_sparse_attn_weights := getattr(
+            getattr(self, "sparse_attn_hooks", None), "transform_sparse_attn_weights", None
+        ):
             transform_sparse_attn_weights(self)
             self._weights_transformed = True
             return
