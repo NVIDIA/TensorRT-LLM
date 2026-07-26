@@ -7164,7 +7164,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     mamba_ssm_cache_dtype="float16",
                     mamba_state_config=MambaStateConfig(
                         periodic_snapshot_interval=periodic_snapshot_interval),
-                    free_gpu_memory_fraction=0.8,
+                    free_gpu_memory_fraction=0.7,
                 ),
                 max_batch_size=32,
                 tensor_parallel_size=tp_size,
