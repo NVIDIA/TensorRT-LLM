@@ -5468,19 +5468,53 @@ class GvrTopKKernel:
         # valid), so the preIdx gather is skipped wholesale. A miss whose
         # target lies outside [t_0, t_2] recovers via the refine loop's
         # 8x bracket expansion (same fail-soft as the stock path).
+        rungs_ok = cutlass.Int32(0)
         if cutlass.const_expr(self.ext_rungs):
-            # variant B: the rungs carry the bracket, so P1's gather buys
-            # nothing - same seed-line init as the ext-counts hit path.
-            if tidx == cutlass.Int32(0):
-                s_thr[0] = seed_thr_row[1]
-                s_thr[1] = seed_thr_row[0]
-                s_thr[2] = seed_thr_row[2]
-                s_iscalars[0] = cutlass.Int32(0)  # cand_count
-                s_iscalars[1] = cutlass.Int32(0)  # done
-                s_iscalars[2] = cutlass.Int32(-1)  # cnt_lo (fb seeding owns)
-                s_iscalars[3] = cutlass.Int32(-1)  # cnt_hi
-                s_iscalars[4] = cutlass.Int32(0)  # out_count
-            cute.arch.barrier()
+            # runtime validity: finite AND strictly ascending; anything
+            # else (cold start, dropped row, NaN from the host loop)
+            # falls back to the stock seed path below - exactness never
+            # rides on the host's line quality
+            if (
+                seed_thr_row[0] < cutlass.Float32(1e37)
+                and seed_thr_row[0] > cutlass.Float32(-1e37)
+                and seed_thr_row[1] > seed_thr_row[0]
+                and seed_thr_row[2] > seed_thr_row[1]
+            ):
+                rungs_ok = cutlass.Int32(1)
+        if cutlass.const_expr(self.ext_rungs):
+            if rungs_ok == cutlass.Int32(1):
+                # variant B: the rungs carry the bracket, so P1's gather
+                # buys nothing - same seed-line init as the ext-counts
+                # hit path.
+                if tidx == cutlass.Int32(0):
+                    s_thr[0] = seed_thr_row[1]
+                    s_thr[1] = seed_thr_row[0]
+                    s_thr[2] = seed_thr_row[2]
+                    s_iscalars[0] = cutlass.Int32(0)  # cand_count
+                    s_iscalars[1] = cutlass.Int32(0)  # done
+                    s_iscalars[2] = cutlass.Int32(-1)  # cnt_lo (fb owns)
+                    s_iscalars[3] = cutlass.Int32(-1)  # cnt_hi
+                    s_iscalars[4] = cutlass.Int32(0)  # out_count
+                cute.arch.barrier()
+            if rungs_ok == cutlass.Int32(0):
+                self.phase1_preidx_stats(
+                    input_row,
+                    N,
+                    pre_idx_row,
+                    pre_idx_count,
+                    pre_idx_offset,
+                    smem_wmin,
+                    smem_wmax,
+                    smem_wsum,
+                    smem_wcnt_p1,
+                    s_thr,
+                    s_iscalars,
+                    tidx,
+                    warp_id,
+                    lane,
+                    smem_gath=smem_gath,
+                    s_mt_thr=s_mt_thr,
+                )
         if cutlass.const_expr(self.use_ext_counts):
             if ext_row == cutlass.Int32(1):
                 if tidx == cutlass.Int32(0):
@@ -6110,11 +6144,28 @@ class GvrTopKKernel:
                         # variant B: rung thresholds = the closed-loop seed
                         # lines verbatim; the stock multi-count measures
                         # them and the argmin admission below picks the
-                        # tightest one in [K, kC].
-                        if tidx == cutlass.Int32(0):
-                            for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
-                                s_mt_thr[m] = seed_thr_row[m]
-                        cute.arch.barrier()
+                        # tightest one in [K, kC]. Invalid lines fall back
+                        # to the stock P1b quantile rungs (P1 stats ran on
+                        # this row in that case).
+                        if rungs_ok == cutlass.Int32(1):
+                            if tidx == cutlass.Int32(0):
+                                for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
+                                    s_mt_thr[m] = seed_thr_row[m]
+                            cute.arch.barrier()
+                        if rungs_ok == cutlass.Int32(0):
+                            self.phase1b_hspace_rungs(
+                                input_row,
+                                N,
+                                pre_idx_row,
+                                pre_idx_count,
+                                pre_idx_offset,
+                                smem_hist,
+                                s_thr,
+                                s_mt_thr,
+                                tidx,
+                                warp_id,
+                                lane,
+                            )
                     if cutlass.const_expr(not (self.use_ext_counts or self.ext_rungs)):
                         if cutlass.const_expr(self.p1b_cache):
                             # rungs from the SMEM gather-cache P1 stashed (no 2nd
@@ -6665,6 +6716,15 @@ class GvrTopKKernel:
                             xstate_row[1] = s_thr[0]
                             xstate_row[2] = s_thr[0]
                             xstate_row[3] = cutlass.Float32(cand_count_p4)
+                            if cutlass.const_expr(
+                                self.ext_rungs and not _P4_SUB_DBG and not _P4_TAIL_DBG
+                            ):
+                                # cluster-merged rung counts (identical on
+                                # every CTA after the multi-count DSMEM
+                                # aggregation)
+                                xstate_row[4] = cutlass.Float32(s_mt_cnt[0])
+                                xstate_row[5] = cutlass.Float32(s_mt_cnt[1])
+                                xstate_row[6] = cutlass.Float32(s_mt_cnt[2])
 
         # Final cluster barrier: keep peer CTAs (and their SMEM) alive
         # until the leader's gather + Phase 4 finish. Skipped at
