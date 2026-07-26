@@ -194,7 +194,10 @@ class KimiK3MoEGate(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         logits = self.compute_logits(hidden_states)
 
-        if self._use_fused_routing:
+        # ``trtllm::noaux_tc_op`` is a CUDA-only custom op; CPU inputs
+        # (reference / parity tests) fall through to the eager path below,
+        # which stays the routing-contract reference on every device.
+        if self._use_fused_routing and logits.is_cuda:
             # One fused kernel replaces the sigmoid -> (+bias) -> top-k ->
             # gather -> renormalize -> scale chain below. ``noaux_tc`` returns
             # (weights, indices); return the eager dtype contract -- int64
