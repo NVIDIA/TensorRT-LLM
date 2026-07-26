@@ -192,9 +192,10 @@ decoding requires the default cache manager, which cannot reuse blocks.
 ## Current limitations
 
 - Pipeline parallelism is not supported.
-- FP8 KV cache has a known accuracy issue and is rejected at engine setup;
-  a fix is in progress. Setting `KIMI_K3_ALLOW_INACCURATE_MLA_GEN=1`
-  bypasses the check for performance experiments only.
+- FP8 KV cache (`kv_cache_config.dtype: fp8`) is supported and forces the
+  trtllm-gen MLA generation backend (the default cute-dsl backend does not
+  accept fp8 KV device scales); accuracy matches the bf16 KV baseline on
+  GSM8K.
 - Speculative decoding:
   - Suffix-automaton (SA) speculative decoding is supported as an opt-in
     for evaluation (see `eval_extra_llm_options_sa.yaml`). SA requires CUDA
