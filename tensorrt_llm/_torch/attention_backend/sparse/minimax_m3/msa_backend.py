@@ -230,6 +230,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     msa_kv_indices: Optional[torch.Tensor] = None
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
+    # Per-request kv_lens as staged by prepare(), before the overlap scheduler
+    # corrects them. on_update_kv_lens clamps against this; see there.
+    msa_kv_lens_staged: Optional[torch.Tensor] = None
     # Layer whose K/V/index-K caches were already written this step by the
     # fused scatter (msa_write_layer_caches); run_msa_paged_gqa consumes and
     # clears it so the legacy per-cache writes are skipped exactly once.
@@ -445,6 +448,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        self.msa_kv_lens_staged = self.get_empty(
+            buffers,
+            (max_num_sequences,),
+            cache_name="msa_kv_lens_staged",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
         # The proxy scratch needs the fmha_sm100 plan geometry. This metadata
         # exists only for the MSA backend, whose selection already required the
         # kernels, so a failed import here is a hard error rather than a reason
@@ -582,8 +592,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         staged optimistic (full-acceptance) lens. Decode steps are patched
         with pure device ops (capture-safe); the correction only shrinks
         lengths, so the host-baked plan worklists and the page-table layout
-        stay valid. Eager mixed batches install corrected host lens and
-        rebuild (small D2H sync). Idempotent.
+        stay valid. The clamp against msa_kv_lens_staged enforces that bound
+        rather than trusting it: a longer length would drive the kernels past
+        the extent prepare() planned for. Eager mixed batches install corrected
+        host lens and rebuild (small D2H sync). Idempotent.
         """
         super().on_update_kv_lens()
         if not self._msa_fields_ready:
@@ -603,7 +615,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._build_step_plans()
             return
 
-        kv_true = self.kv_lens_cuda[:batch]
+        kv_true = torch.minimum(self.kv_lens_cuda[:batch], self.msa_kv_lens_staged[:batch])
         qbr = self.msa_q_batch_row[:total_q].to(torch.long)
         qo_dev = self.msa_qo_lens_dev[:batch]
         kv_true_tok = kv_true[qbr]
@@ -891,6 +903,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         )
         self.msa_q_intra[:total_new_tokens].copy_(maybe_pin_memory(intra_cpu), non_blocking=True)
         self.msa_qo_lens_dev[:batch_size].copy_(maybe_pin_memory(qo_lens_cpu), non_blocking=True)
+        # Snapshot the staged lens as the upper bound on_update_kv_lens clamps
+        # to. Device-to-device, so it stays sync-free.
+        kv_lens_cuda = getattr(self, "kv_lens_cuda", None)
+        if kv_lens_cuda is not None:
+            self.msa_kv_lens_staged[:batch_size].copy_(kv_lens_cuda[:batch_size], non_blocking=True)
         self._msa_live_batch = batch_size
         self._msa_live_total_q = total_new_tokens
         self._msa_page_size = page_size
