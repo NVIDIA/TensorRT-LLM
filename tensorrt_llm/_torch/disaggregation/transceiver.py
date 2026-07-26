@@ -619,12 +619,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
+        need_progress = wait_num > 0
+        if need_progress:
+            self._poll_sessions_for_interval(
+                self._send_sessions,
+                self._send_reqs,
+                wait_num,
+                self._sender_future_timeout_ms,
+            )
 
         local_completed, local_failed = self._collect_done(self._send_sessions, self._send_reqs)
         to_process = self._build_to_process(
             self._send_sessions,
             self._ctx_consensus(local_completed + local_failed),
-            wait_num,
+            0 if need_progress else wait_num,
             block_all,
         )
 
@@ -757,16 +765,30 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return completed, failed, cancelled_reqs
 
     def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
-        poll_interval_s = (self.kv_transfer_poll_interval_ms or 0) / 1000.0
+        self._poll_sessions_for_interval(
+            self._recv_sessions,
+            self._recv_reqs,
+            wait_num,
+            self.kv_transfer_poll_interval_ms,
+        )
+
+    def _poll_sessions_for_interval(
+        self,
+        sessions: dict,
+        reqs: dict,
+        wait_num: int,
+        poll_interval_ms: Optional[int],
+    ) -> None:
+        poll_interval_s = (poll_interval_ms or 0) / 1000.0
         deadline = time.monotonic() + poll_interval_s
         while True:
-            completed, failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+            completed, failed = self._collect_done(sessions, reqs)
             if len(completed) + len(failed) >= wait_num:
                 return
             remaining_s = deadline - time.monotonic()
             if remaining_s <= 0:
                 return
-            for session in self._recv_sessions.values():
+            for session in sessions.values():
                 session.wait_complete(blocking=False)
             time.sleep(min(0.001, remaining_s))
 

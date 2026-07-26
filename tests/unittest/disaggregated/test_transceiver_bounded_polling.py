@@ -137,9 +137,20 @@ def _make_tx_session(
     return session
 
 
-def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued() -> None:
+def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued(
+    monkeypatch,
+) -> None:
     session = _FakeSession(rid=11, wait_result=None)
     transceiver = _make_transceiver({11: session})
+    monotonic = Mock(side_effect=[0.0, 0.0, 0.123])
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver.time.monotonic",
+        monotonic,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver.time.sleep",
+        Mock(),
+    )
 
     completed, failed = transceiver.check_context_transfer_status(at_least_request_num=1)
 
@@ -150,6 +161,38 @@ def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued() -
     assert 11 in transceiver._send_sessions
     assert 11 in transceiver._send_reqs
     assert transceiver._transfer_worker.sweep_count == 1
+
+
+def test_context_transfer_status_bounded_poll_reaps_completion(monkeypatch) -> None:
+    session = _FakeSession(rid=14, wait_result=WaitResult.COMPLETED)
+    req = _FakeRequest()
+    transceiver = _make_transceiver({14: session}, {14: req})
+
+    def complete_on_poll(blocking: bool = True) -> WaitResult:
+        session.blocking_calls.append(blocking)
+        session._is_completed = True
+        return WaitResult.COMPLETED
+
+    session.wait_complete = complete_on_poll
+    sleep = Mock()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver.time.monotonic",
+        Mock(return_value=0.0),
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver.time.sleep",
+        sleep,
+    )
+
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=1)
+
+    assert completed == [14]
+    assert failed == []
+    assert session.blocking_calls == [False, False]
+    sleep.assert_called_once_with(0.001)
+    assert session.closed
+    assert 14 not in transceiver._send_sessions
+    assert 14 not in transceiver._send_reqs
 
 
 def test_context_transfer_status_block_all_uses_blocking_wait() -> None:
