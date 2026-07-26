@@ -246,6 +246,7 @@ class _KVCache:
         "_ssm_blocks",
         "_never_resumed",
         "_enable_swa_scratch_reuse",
+        "_text_only",
         "_scratch_slots",
         "_pending_stats",
         "__rawref__",
@@ -305,6 +306,7 @@ class _KVCache:
         id: int | None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
         expected_prompt_length: int | None = None,
+        text_only: bool | None = None,
     ):
         self.id = id
         self._manager = manager
@@ -335,6 +337,11 @@ class _KVCache:
         )
         self._never_resumed = True
         self._enable_swa_scratch_reuse = manager.enable_swa_scratch_reuse
+        if text_only is False and manager.text_only:
+            raise ValueError(
+                "text_only=False is not allowed when the manager is configured text_only=True"
+            )
+        self._text_only = manager.text_only if text_only is None else text_only
         self._scratch_slots = make_typed(
             lambda _: list[ScratchSlotLock](), manager._storage.num_life_cycles
         )
@@ -696,6 +703,25 @@ class _KVCache:
             raise ValueError("Cannot disable SWA scratch reuse while scratch blocks are needed")
         assert not self.has_scratch_slots
         self._enable_swa_scratch_reuse = False
+
+    @property
+    def text_only(self) -> bool:
+        return self._text_only
+
+    @text_only.setter
+    def text_only(self, text_only: bool) -> None:
+        # A text-only deployment is a hard guarantee: a request may not opt out.
+        if not text_only and self.manager.text_only:
+            raise ValueError(
+                "Cannot set text_only=False for a request when the KV cache manager is "
+                "configured text_only=True"
+            )
+        # Claiming text-only is a fast-path claim; verify committed tokens are digest-free.
+        if text_only and any(isinstance(t, bytes) for t in self._committed_tokens):
+            raise ValueError(
+                "Cannot set text_only=True: this sequence has already committed digest tokens"
+            )
+        self._text_only = text_only
 
     def supports_index_mode(self, mode: PageIndexMode) -> bool:
         match mode:

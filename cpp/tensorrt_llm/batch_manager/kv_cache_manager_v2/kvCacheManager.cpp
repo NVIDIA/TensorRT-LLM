@@ -172,7 +172,7 @@ void KvCacheManager::clearReusableBlocks()
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope,
     std::vector<TokenIdExt> const& inputTokens, std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb,
-    std::optional<int> expectedPromptLength)
+    std::optional<int> expectedPromptLength, std::optional<bool> textOnly)
 {
     if (!priorityCb)
     {
@@ -190,22 +190,23 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope,
     std::optional<BlockRadixTree::ReuseMatch> reuseMatch;
     if (!inputTokens.empty())
     {
-        reuseMatch = matchReuse(reuseScope, inputTokens);
+        reuseMatch = matchReuse(reuseScope, inputTokens, textOnly.value_or(this->textOnly()));
     }
 
     return std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::move(id),
-        std::move(priorityCb), expectedPromptLength);
+        std::move(priorityCb), expectedPromptLength, textOnly);
 }
 
 BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
-    ReuseScope const& reuseScope, std::vector<TokenIdExt> const& inputTokens) const
+    ReuseScope const& reuseScope, std::vector<TokenIdExt> const& inputTokens, bool knownNoDigest) const
 {
-    return mRadixTree->match(reuseScope, inputTokens, enablePartialMatch());
+    return mRadixTree->match(reuseScope, inputTokens, knownNoDigest, enablePartialMatch());
 }
 
-int KvCacheManager::probeReuse(ReuseScope reuseScope, std::vector<TokenIdExt> const& inputTokens) const
+int KvCacheManager::probeReuse(
+    ReuseScope reuseScope, std::vector<TokenIdExt> const& inputTokens, bool knownNoDigest) const
 {
-    return matchReuse(reuseScope, inputTokens).numTokens;
+    return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
 }
 
 // ---- Memory pool queries --------------------------------------------------

@@ -219,7 +219,7 @@ TEST(KvCacheManagerV2StatsTest, PeakBlockStatsResetStartsNextIntervalFromCurrent
         {
             tokens.emplace_back(TokenId{token++});
         }
-        auto block = addOrGetExistingBlock(previous, LifeCycleId{1}, std::move(tokens));
+        auto block = addOrGetExistingBlock(previous, std::move(tokens), /*knownNoDigest=*/true);
         auto page = makeShared<CommittedPage>(
             &storage, block, lifeCycle, kGpuLevel, static_cast<int>(block->tokens.size()), kPriorityDefault);
         page->setSlot(slot);
@@ -311,7 +311,7 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
             {
                 tokens.emplace_back(TokenId{tokenBase++});
             }
-            auto block = addOrGetExistingBlock(previous, LifeCycleId{1}, std::move(tokens));
+            auto block = addOrGetExistingBlock(previous, std::move(tokens), /*knownNoDigest=*/true);
             auto page = makeShared<CommittedPage>(
                 &storage, block, lifeCycle, kGpuLevel, static_cast<int>(block->tokens.size()), kPriorityDefault);
             page->setSlot(slot);

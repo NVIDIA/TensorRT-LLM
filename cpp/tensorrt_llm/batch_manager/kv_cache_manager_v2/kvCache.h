@@ -211,7 +211,8 @@ public:
     using PriorityCb = std::function<Priority(BlockOrdinal, LifeCycleId)>;
 
     KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
-        std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt);
+        std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt,
+        std::optional<bool> textOnly = std::nullopt);
 
     ~KvCache();
 
@@ -431,6 +432,16 @@ public:
     // Enable or disable SWA scratch reuse. Throws if the transition is invalid.
     void setEnableSwaScratchReuse(bool enable);
 
+    // Resolved text-only status: the per-sequence override, else the manager config
+    // default. When true, this sequence's tokens are known to be digest-free, letting
+    // block-key hashing skip the digest scan.
+    bool textOnly() const noexcept;
+
+    // Set the per-sequence text-only override. Throws if the transition is invalid:
+    // a text-only deployment (config.textOnly) forbids setting false, and setting true
+    // requires the already-committed tokens to be digest-free (verified by a scan).
+    void setTextOnly(bool textOnly);
+
     // Whether the given page index mode is supported (SHARED requires no scratch slots).
     bool supportsIndexMode(PageIndexMode mode) const;
 
@@ -609,6 +620,8 @@ private:
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 
     std::vector<TokenIdExt> mCommittedTokens;
+    // Per-sequence text-only override; nullopt means inherit the manager config default.
+    bool mTextOnly = false;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;
     int mTokensPerBlock;

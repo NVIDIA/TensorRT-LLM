@@ -133,15 +133,24 @@ public:
     // ---- KvCache creation -------------------------------------------------
 
     // Create a new KvCache. Returned cache is SUSPENDED; call activate() with a stream.
-    // input_tokens: optional sequence to match against existing cached blocks.
-    // priorityCb:   optional priority override per block.
+    // input_tokens:         optional sequence to match against existing cached blocks.
+    // priorityCb:           optional priority override per block.
+    // expectedPromptLength: token count marking the prefill->generation boundary; once
+    //                       historyLength reaches it, later capacity growth is recorded as
+    //                       generation-phase allocation stats (defaults to inputTokens.size()).
+    //                       Stats-only: no effect on allocation, reuse, or correctness.
+    // textOnly:             per-sequence override of the text-only (digest-free) guarantee;
+    //                       nullopt inherits the manager config default.
     std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, std::vector<TokenIdExt> const& inputTokens = {},
         std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
-        std::optional<int> expectedPromptLength = std::nullopt);
+        std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt);
 
+    // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
+    // Defaults false (safe: the scanning path is taken).
     BlockRadixTree::ReuseMatch matchReuse(
-        ReuseScope const& reuseScope, std::vector<TokenIdExt> const& inputTokens) const;
-    int probeReuse(ReuseScope reuseScope = {}, std::vector<TokenIdExt> const& inputTokens = {}) const;
+        ReuseScope const& reuseScope, std::vector<TokenIdExt> const& inputTokens, bool knownNoDigest = false) const;
+    int probeReuse(
+        ReuseScope reuseScope = {}, std::vector<TokenIdExt> const& inputTokens = {}, bool knownNoDigest = false) const;
 
     // ---- Memory pool queries -----------------------------------------------
 
@@ -173,6 +182,12 @@ public:
     bool commitMinSnapshot() const noexcept
     {
         return mConfig.commitMinSnapshot;
+    }
+
+    // Deployment-level text-only guarantee (see KVCacheManagerConfig::textOnly).
+    bool textOnly() const noexcept
+    {
+        return mConfig.textOnly;
     }
 
     bool isSwaScratchReuseEnabled() const noexcept
