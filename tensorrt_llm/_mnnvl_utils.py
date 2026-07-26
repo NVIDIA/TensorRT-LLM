@@ -202,7 +202,13 @@ class MnnvlMemory:
         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
-        if cls.current_mem_offset + aligned_size > cls.current_rank_stride:
+        previous_address_state = (
+            cls.current_start_address,
+            cls.current_rank_stride,
+            cls.current_mem_offset,
+        )
+        reserved_new_address = cls.current_mem_offset + aligned_size > cls.current_rank_stride
+        if reserved_new_address:
             cls.new_mnnvl_memory_address(mapping, aligned_size)
 
         assert cls.current_mem_offset + aligned_size <= cls.current_rank_stride
@@ -292,26 +298,55 @@ class MnnvlMemory:
         madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
 
         mem_handles = [None] * comm_size
+        mem_handles[comm_rank] = allocated_mem_handle
+        mapped_rank_ptrs = []
 
-        for i, remote_handle_data in enumerate(all_handles_data):
-            rank_ptr = (
-                cls.current_start_address + cls.current_rank_stride * i + cls.current_mem_offset
-            )
-            if i == comm_rank:
-                # Local memory mapping
-                mem_handles[i] = allocated_mem_handle
-                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, allocated_mem_handle, 0))
-            else:
-                # Fabric memory mapping
-                imported_mem_handle = _check_cu_result(
-                    cuda.cuMemImportFromShareableHandle(
-                        remote_handle_data, allocation_prop.requestedHandleTypes
-                    )
+        try:
+            for i, remote_handle_data in enumerate(all_handles_data):
+                rank_ptr = (
+                    cls.current_start_address + cls.current_rank_stride * i + cls.current_mem_offset
                 )
-                mem_handles[i] = imported_mem_handle
-                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, imported_mem_handle, 0))
+                if i != comm_rank:
+                    # Fabric memory mapping
+                    mem_handles[i] = _check_cu_result(
+                        cuda.cuMemImportFromShareableHandle(
+                            remote_handle_data, allocation_prop.requestedHandleTypes
+                        )
+                    )
 
-            _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
+                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, mem_handles[i], 0))
+                mapped_rank_ptrs.append(rank_ptr)
+                _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
+        except Exception:
+            # Clean up partially imported and mapped memory before propagating
+            # the failure to the caller.
+            for rank_ptr in reversed(mapped_rank_ptrs):
+                try:
+                    _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
+                except Exception as e:
+                    logger.warning("cuMemUnmap failed during error cleanup: %s", e)
+            for mem_handle in mem_handles:
+                if mem_handle is None:
+                    continue
+                try:
+                    _check_cu_result(cuda.cuMemRelease(mem_handle))
+                except Exception as e:
+                    logger.warning("cuMemRelease failed during error cleanup: %s", e)
+            if reserved_new_address:
+                try:
+                    device_ptr = cuda.CUdeviceptr(cls.current_start_address)
+                    _check_cu_result(
+                        cuda.cuMemAddressFree(device_ptr, comm_size * cls.current_rank_stride)
+                    )
+                except Exception as e:
+                    logger.warning("cuMemAddressFree failed during error cleanup: %s", e)
+                else:
+                    (
+                        cls.current_start_address,
+                        cls.current_rank_stride,
+                        cls.current_mem_offset,
+                    ) = previous_address_state
+            raise
 
         ptr = cls.current_start_address + cls.current_mem_offset
         stride = cls.current_rank_stride
