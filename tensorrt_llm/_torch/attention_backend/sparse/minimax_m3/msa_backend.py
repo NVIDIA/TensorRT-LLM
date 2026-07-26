@@ -32,6 +32,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._utils import maybe_pin_memory
 
 from .common import (
     MiniMaxM3SparseConfig,
@@ -300,12 +301,19 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     @property
     def msa_qo_lens_cpu(self) -> Optional[torch.Tensor]:
-        """Per-request query length (host int32), from the base seq_lens."""
+        """Per-request query length (host int32), from the base seq_lens.
+
+        Pinned where pinning helps, as with the other two length properties:
+        the planners stage them to the device with non-blocking copies, which
+        degrade to a synchronous staging copy from pageable memory.
+        """
         seq_lens = self.seq_lens
         if seq_lens is None:
             return None
         out = seq_lens[: self.num_seqs]
-        return out if out.dtype == torch.int32 else out.to(torch.int32)
+        if out.dtype != torch.int32:
+            out = out.to(torch.int32)
+        return maybe_pin_memory(out)
 
     @property
     def msa_kv_lens_cpu(self) -> Optional[torch.Tensor]:
@@ -326,7 +334,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         extra = params.num_extra_kv_tokens if params is not None else 0
         if extra:
             out = out - extra
-        return out if out.dtype == torch.int32 else out.to(torch.int32)
+        if out.dtype != torch.int32:
+            out = out.to(torch.int32)
+        return maybe_pin_memory(out)
 
     @property
     def msa_qo_offset_cpu(self) -> Optional[torch.Tensor]:
@@ -335,7 +345,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         kv = self.msa_kv_lens_cpu
         if qo is None or kv is None:
             return None
-        return kv - qo
+        return maybe_pin_memory(kv - qo)
 
     @property
     def msa_decode_proxy_plan(self) -> Optional[tuple]:
@@ -907,9 +917,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             torch.arange(total_new_tokens, dtype=torch.int64)
             - torch.repeat_interleave(starts, qo_long)
         ).to(torch.int32)
-        self.msa_q_batch_row[:total_new_tokens].copy_(batch_row_cpu)
-        self.msa_q_intra[:total_new_tokens].copy_(intra_cpu)
-        self.msa_qo_lens_dev[:batch_size].copy_(qo_lens_cpu)
+        # Pinned and non-blocking: a plain copy_ from pageable host memory ends
+        # in cudaStreamSynchronize, which drains the whole queue.
+        self.msa_q_batch_row[:total_new_tokens].copy_(
+            maybe_pin_memory(batch_row_cpu), non_blocking=True
+        )
+        self.msa_q_intra[:total_new_tokens].copy_(maybe_pin_memory(intra_cpu), non_blocking=True)
+        self.msa_qo_lens_dev[:batch_size].copy_(maybe_pin_memory(qo_lens_cpu), non_blocking=True)
         self._msa_live_batch = batch_size
         self._msa_live_total_q = total_new_tokens
         self._msa_page_size = page_size
