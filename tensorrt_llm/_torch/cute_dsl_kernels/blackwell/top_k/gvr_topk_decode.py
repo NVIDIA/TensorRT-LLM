@@ -285,6 +285,7 @@ class GvrTopKKernel:
         p2_warp_redundant: bool = True,
         enable_block_skip: bool = False,
         use_ext_counts: bool = False,
+        ext_rungs: bool = False,
         use_ext_cand: bool = False,
         cand_cap: int = 5120,
         cand_rung: int = 0,
@@ -638,12 +639,25 @@ class GvrTopKKernel:
             self.cap_c = 0
         if use_ext_cand and not use_ext_counts:
             raise ValueError("use_ext_cand requires use_ext_counts")
+        # ext_rungs (two-pass variant B): closed-loop rung THRESHOLDS come
+        # from the host (previous-step xstep lines); the kernel counts them
+        # itself via the stock R0 multi-count and admits the tightest rung
+        # in [K, kC]. Exclusive with use_ext_counts (which also imports
+        # the counts and skips nothing else).
+        self.ext_rungs = bool(ext_rungs) and bool(enable_r0)
+        if self.ext_rungs and bool(use_ext_counts):
+            raise ValueError("ext_rungs is exclusive with use_ext_counts")
         self.use_ext_counts = bool(use_ext_counts) and bool(enable_r0)
         if self.use_ext_counts:
             if not self.fb_fix:
                 raise ValueError("use_ext_counts requires fb_fix")
             if self.M_thr != 3:
                 raise ValueError("use_ext_counts expects exactly 3 seed rungs")
+        if self.ext_rungs:
+            if not self.fb_fix:
+                raise ValueError("ext_rungs requires fb_fix")
+            if self.M_thr != 3:
+                raise ValueError("ext_rungs expects exactly 3 seed rungs")
             # cluster_size > 1 supported: the ext rungs/counts are
             # per-row (identical across the cluster), the stock multi
             # count pass cluster-merges as usual, and the L2 direct
@@ -4846,6 +4860,9 @@ class GvrTopKKernel:
         ):
             seed_thr_row = seed_thr[row_idx, None]
             seed_counts_row = seed_counts[row_idx, None]
+        elif cutlass.const_expr(self.ext_rungs and seed_thr is not None):
+            seed_thr_row = seed_thr[row_idx, None]
+            seed_counts_row = None
         else:
             seed_thr_row = None
             seed_counts_row = None
@@ -5449,6 +5466,19 @@ class GvrTopKKernel:
         # valid), so the preIdx gather is skipped wholesale. A miss whose
         # target lies outside [t_0, t_2] recovers via the refine loop's
         # 8x bracket expansion (same fail-soft as the stock path).
+        if cutlass.const_expr(self.ext_rungs):
+            # variant B: the rungs carry the bracket, so P1's gather buys
+            # nothing - same seed-line init as the ext-counts hit path.
+            if tidx == cutlass.Int32(0):
+                s_thr[0] = seed_thr_row[1]
+                s_thr[1] = seed_thr_row[0]
+                s_thr[2] = seed_thr_row[2]
+                s_iscalars[0] = cutlass.Int32(0)  # cand_count
+                s_iscalars[1] = cutlass.Int32(0)  # done
+                s_iscalars[2] = cutlass.Int32(-1)  # cnt_lo (fb seeding owns)
+                s_iscalars[3] = cutlass.Int32(-1)  # cnt_hi
+                s_iscalars[4] = cutlass.Int32(0)  # out_count
+            cute.arch.barrier()
         if cutlass.const_expr(self.use_ext_counts):
             if ext_row == cutlass.Int32(1):
                 if tidx == cutlass.Int32(0):
@@ -5480,7 +5510,7 @@ class GvrTopKKernel:
                     smem_gath=smem_gath,  # p1b_cache: stash gathered values (None-op OFF)
                     s_mt_thr=s_mt_thr,  # r0_vseed: park pmean in the last rung column
                 )
-        if cutlass.const_expr(not self.use_ext_counts):
+        if cutlass.const_expr(not (self.use_ext_counts or self.ext_rungs)):
             self.phase1_preidx_stats(
                 input_row,
                 N,
@@ -6074,7 +6104,16 @@ class GvrTopKKernel:
                                     warp_id,
                                     lane,
                                 )
-                    if cutlass.const_expr(not self.use_ext_counts):
+                    if cutlass.const_expr(self.ext_rungs):
+                        # variant B: rung thresholds = the closed-loop seed
+                        # lines verbatim; the stock multi-count measures
+                        # them and the argmin admission below picks the
+                        # tightest one in [K, kC].
+                        if tidx == cutlass.Int32(0):
+                            for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
+                                s_mt_thr[m] = seed_thr_row[m]
+                        cute.arch.barrier()
+                    if cutlass.const_expr(not (self.use_ext_counts or self.ext_rungs)):
                         if cutlass.const_expr(self.p1b_cache):
                             # rungs from the SMEM gather-cache P1 stashed (no 2nd
                             # GMEM gather); 16-bit only.

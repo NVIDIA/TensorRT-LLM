@@ -69,6 +69,7 @@ def _compile(
     use_ext_counts: bool = False,
     emit_xstate: bool = False,
     use_ext_cand: bool = False,
+    ext_rungs: bool = False,
     cand_cap: int = 5120,
     accept_cap: "int | None" = None,
     kc_override: "int | None" = None,
@@ -146,7 +147,7 @@ def _compile(
         cute.runtime.make_fake_compact_tensor(
             cutlass.Float32, (n_rows, 3), stride_order=(1, 0), assumed_align=4
         )
-        if use_ext_counts
+        if (use_ext_counts or ext_rungs)
         else None
     )
     seed_counts_fake = (
@@ -206,6 +207,7 @@ def _compile(
         use_ext_counts=use_ext_counts,
         emit_xstate=emit_xstate,
         use_ext_cand=use_ext_cand,
+        ext_rungs=ext_rungs,
         cand_cap=cand_cap,
         accept_cap=accept_cap,
         kc_override=kc_override,
@@ -214,7 +216,7 @@ def _compile(
         # ext counts need 3 rung slots (M_thr == 3): 2 qfracs + vseed. The
         # qfrac VALUES are irrelevant on this path (P1b is skipped) — only
         # the slot count matters.
-        r0_qfracs=(0.85, 0.35) if use_ext_counts else None,
+        r0_qfracs=(0.85, 0.35) if (use_ext_counts or ext_rungs) else None,
     )
     return cute.compile(
         kernel,
@@ -764,6 +766,9 @@ def gvr_topk_decode(
             and cand_idx.shape == (num_rows, _segtot)
         ), f"self_scan position column must be int32 [num_rows, {_segtot}]"
     use_ext_counts = seed_thr is not None and seed_counts is not None
+    # variant B (two-pass): thresholds without counts -> the kernel counts
+    # the rungs itself (stock R0 multi-count) and admits in-kernel
+    ext_rungs = seed_thr is not None and seed_counts is None
     if use_ext_counts:
         assert (
             seed_thr.dtype == torch.float32
@@ -898,6 +903,7 @@ def gvr_topk_decode(
         use_ext_counts,
         emit_xstate,
         use_ext_cand,
+        ext_rungs,
         cand_cap,
         int(os.environ["GVR_BSTAR"]) if "GVR_BSTAR" in os.environ else None,
         int(os.environ["GVR_KC"]) if "GVR_KC" in os.environ else None,
@@ -918,7 +924,7 @@ def gvr_topk_decode(
         out_indices,
         order_row if seqlen_sorted else None,
         block_max if enable_block_skip else None,
-        seed_thr if use_ext_counts else None,
+        seed_thr if (use_ext_counts or ext_rungs) else None,
         seed_counts if use_ext_counts else None,
         xstate if emit_xstate else None,
         cand_vals if use_ext_cand else None,
