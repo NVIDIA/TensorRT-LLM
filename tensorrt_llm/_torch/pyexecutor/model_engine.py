@@ -1286,6 +1286,19 @@ class PyTorchModelEngine(ModelEngine):
         else:
             logger.debug("Skipped TRTLLM-Gen FMHA JIT warmup for Ctx kernels")
 
+        model_type = getattr(self.model.model_config.pretrained_config,
+                             "model_type", None)
+        if model_type in ("kimi_k3", "kimi_linear"):
+            # Kimi's one-token context takes the NT < 4 FLA fallback and does
+            # not compile the optimized single-sequence K123 variant. A
+            # non-aligned five-chunk context enters the pure K123 path.
+            _KIMI_KDA_PREFILL_WARMUP_TOKENS = 257
+            logger.info(
+                "Adding Kimi KDA pure-prefill warmup with "
+                f"{_KIMI_KDA_PREFILL_WARMUP_TOKENS} context tokens")
+            warmup_requests_configs.append(
+                (_KIMI_KDA_PREFILL_WARMUP_TOKENS, 0))
+
         for num_tokens, num_gen_requests in warmup_requests_configs:
             warmup_request = self._create_warmup_request(
                 resource_manager,
