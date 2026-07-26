@@ -216,7 +216,10 @@ def test_msa_fp8_cache_converts_live_index_query_before_scoring():
     class FakeMetadata:
         msa_decode_proxy_plan = None
         msa_eager_proxy_plan = (False, 0, 2, {}, None)
-        msa_eager_all_blocks_empty = False
+        # Two decode requests. run_indexer reads both counts to route the
+        # selection output head-major or token-major.
+        num_contexts = 0
+        num_generations = 2
         msa_eager_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
         msa_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
         msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
@@ -273,7 +276,6 @@ def test_run_indexer_routes_head_major_output_by_batch_mode(
     class FakeMetadata:
         msa_decode_proxy_plan = None
         msa_eager_proxy_plan = ("eager",)
-        msa_eager_all_blocks_empty = False
         msa_eager_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
         msa_qo_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
@@ -283,11 +285,14 @@ def test_run_indexer_routes_head_major_output_by_batch_mode(
         def __init__(self):
             self.num_contexts = num_contexts
             self.num_generations = num_generations
-            self.idx_k_cache = None
+            # run_indexer reads the index-K cache before it writes this layer's
+            # index-K, so the fake has to hold a tensor from the start, as the
+            # persistent cache does in production.
+            self.idx_k_cache = torch.zeros(num_tokens, 1, sparse_index_dim)
 
         def msa_write_idx_k(self, layer_idx, idx_k):
             del layer_idx
-            self.idx_k_cache = idx_k
+            self.idx_k_cache.copy_(idx_k)
 
         def msa_idx_k_cache(self, layer_idx):
             del layer_idx
@@ -421,6 +426,101 @@ def test_per_token_valid_blocks_multi_token_decode():
     n_valid = per_token_valid_blocks(qo, kv, off, causal=True, block_size=4)
     # Row 0: 9 positions -> 3 blocks. Row 1 tokens attend 4, 5, 6 -> 1, 2, 2.
     assert n_valid.tolist() == [3, 1, 2, 2]
+
+
+def _expand_slot_rows(block_ids: torch.Tensor, tokens_per_block: int) -> torch.Tensor:
+    """req_to_token reference: block_id * tokens_per_block + offset_in_block."""
+    within = torch.arange(tokens_per_block, dtype=torch.int64)
+    grid = block_ids.to(torch.int64).unsqueeze(-1) * tokens_per_block + within
+    return grid.reshape(block_ids.shape[0], -1).to(torch.int32)
+
+
+def test_build_kv_page_indices_matches_first_slot_of_each_page():
+    """The host page table must equal the page ids each request's req_to_token
+    row holds at its page boundaries, since both use the manager's
+    tokens_per_block as the page size. Rows are ragged (0-padded block ids,
+    global and non-contiguous) and one request has no KV at all."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        build_kv_page_indices,
+    )
+
+    page_size = 8
+    block_ids = torch.tensor(
+        [[11, 4, 7, 0], [5, 9, 0, 0], [3, 0, 0, 0], [21, 13, 6, 2]],
+        dtype=torch.int32,
+    )
+    # 3 pages (partial last), 2 pages (exact), no pages, 4 pages.
+    kv_lens = torch.tensor([17, 16, 0, 32], dtype=torch.int32)
+    req_to_token = _expand_slot_rows(block_ids, page_size)
+
+    reference = torch.cat(
+        [
+            req_to_token[b, : int(kv_lens[b]) : page_size] // page_size
+            for b in range(block_ids.shape[0])
+        ]
+    )
+    page_indices = build_kv_page_indices(block_ids, kv_lens, page_size)
+
+    assert page_indices.dtype == torch.int32
+    assert page_indices.tolist() == [11, 4, 7, 5, 9, 21, 13, 6, 2]
+    torch.testing.assert_close(page_indices, reference, rtol=0, atol=0)
+
+
+def test_build_paged_kv_slot_mapping_out_cache_loc_matches_slot_grid():
+    """out_cache_loc must name the same slots as indexing req_to_token per new
+    token, for a mixed batch of one context request plus decode rows."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import (
+        build_paged_kv_slot_mapping,
+    )
+
+    tokens_per_block = 4
+    block_ids = torch.tensor([[6, 2, 9], [4, 0, 0], [7, 1, 0]], dtype=torch.int32)
+
+    class FakeCacheManager:
+        tokens_per_block = 4
+
+        def get_block_ids_per_seq(self, request_ids):
+            assert request_ids == [0, 1, 2]
+            return block_ids
+
+    # Request 0 prefills 6 tokens over a 3-token prefix; 1 and 2 decode.
+    qo_lens_cpu = torch.tensor([6, 1, 1], dtype=torch.int32)
+    kv_lens_cpu = torch.tensor([9, 3, 5], dtype=torch.int32)
+    qo_offset_cpu = kv_lens_cpu - qo_lens_cpu
+
+    mapping = build_paged_kv_slot_mapping(
+        kv_cache_manager=FakeCacheManager(),
+        request_ids=[0, 1, 2],
+        qo_lens_cpu=qo_lens_cpu,
+        qo_offset_cpu=qo_offset_cpu,
+        device=torch.device("cpu"),
+    )
+
+    req_to_token = _expand_slot_rows(block_ids, tokens_per_block)
+    reference = [
+        int(req_to_token[b, int(qo_offset_cpu[b]) + offset])
+        for b in range(3)
+        for offset in range(int(qo_lens_cpu[b]))
+    ]
+
+    torch.testing.assert_close(mapping.req_to_token, req_to_token, rtol=0, atol=0)
+    assert mapping.slot_ids.tolist() == [0, 1, 2]
+    assert mapping.out_cache_loc.dtype == torch.int32
+    assert mapping.out_cache_loc.tolist() == reference
+    assert mapping.block_ids_cpu.tolist() == block_ids.tolist()
+
+    # A zero-length CUDA-graph padding row offsets to -1. Its slot is a
+    # placeholder that on_update_kv_lens re-derives, so it only has to stay
+    # inside the row rather than index off the table.
+    padded = build_paged_kv_slot_mapping(
+        kv_cache_manager=FakeCacheManager(),
+        request_ids=[0, 1, 2],
+        qo_lens_cpu=torch.tensor([1, 1, 1], dtype=torch.int32),
+        qo_offset_cpu=torch.tensor([0, -1, -1], dtype=torch.int32),
+        device=torch.device("cpu"),
+    )
+    for b, slot in enumerate(padded.out_cache_loc.tolist()):
+        assert slot in req_to_token[b].tolist()
 
 
 def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k):
