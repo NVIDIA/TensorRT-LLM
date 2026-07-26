@@ -216,6 +216,10 @@ def test_msa_fp8_cache_converts_live_index_query_before_scoring():
     class FakeMetadata:
         msa_decode_proxy_plan = None
         msa_eager_proxy_plan = (False, 0, 2, {}, None)
+        # Two decode requests. run_indexer reads both counts to route the
+        # selection output head-major or token-major.
+        num_contexts = 0
+        num_generations = 2
         msa_eager_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
         msa_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
         msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
@@ -272,7 +276,6 @@ def test_run_indexer_routes_head_major_output_by_batch_mode(
     class FakeMetadata:
         msa_decode_proxy_plan = None
         msa_eager_proxy_plan = ("eager",)
-        msa_eager_all_blocks_empty = False
         msa_eager_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
         msa_qo_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
@@ -282,11 +285,14 @@ def test_run_indexer_routes_head_major_output_by_batch_mode(
         def __init__(self):
             self.num_contexts = num_contexts
             self.num_generations = num_generations
-            self.idx_k_cache = None
+            # run_indexer reads the index-K cache before it writes this layer's
+            # index-K, so the fake has to hold a tensor from the start, as the
+            # persistent cache does in production.
+            self.idx_k_cache = torch.zeros(num_tokens, 1, sparse_index_dim)
 
         def msa_write_idx_k(self, layer_idx, idx_k):
             del layer_idx
-            self.idx_k_cache = idx_k
+            self.idx_k_cache.copy_(idx_k)
 
         def msa_idx_k_cache(self, layer_idx):
             del layer_idx
