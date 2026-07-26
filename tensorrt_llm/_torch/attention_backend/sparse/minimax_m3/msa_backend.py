@@ -101,6 +101,9 @@ _MSA_PLAN_STABLE_KEYS = (
     "qo_segment_lens",
     "kv_segment_lens",
     "qo_offset",
+    # Sparse plans mask with seqused_k rather than kv_segment_lens, so it is a
+    # length mirror on_update_kv_lens patches and must be equally graph-stable.
+    "seqused_k",
 )
 _MSA_PLAN_INT64_KEYS = ("packed_work_range", "packed_work_info")
 # fmha_sm100 sizes packed_work_info at 131072 * max(num_kv_splits, 1); forcing
@@ -114,6 +117,22 @@ _MSA_SPLIT_KV_KEYS = (
     "workspace_o",
     "workspace_lse",
 )
+# The per-row lengths on_update_kv_lens patches, by plan flavour. Dense plans
+# mask with kv_segment_lens/qo_offset; sparse plans mask with seqused_k and keep
+# kv_segment_lens on the host for the page-table builder, which consumed it at
+# plan time. cu_seqlens_k is excluded: it describes the page-table layout staged
+# by prepare(), which stays valid because corrections only shrink lengths.
+_MSA_DENSE_LENGTH_KEYS = ("kv_segment_lens", "qo_offset")
+_MSA_SPARSE_LENGTH_KEYS = ("seqused_k",)
+
+
+def _msa_plan_length_keys(sub_plan: dict) -> tuple:
+    """The length mirrors to patch in one fmha_sm100 sub-plan.
+
+    fmha_sm100 tags sparse plans with "MM-SA-Nv"; the two flavours expose the
+    attended length under different keys.
+    """
+    return _MSA_SPARSE_LENGTH_KEYS if sub_plan.get("MM-SA-Nv") else _MSA_DENSE_LENGTH_KEYS
 
 
 class _MsaGraphSafePlan:
@@ -659,10 +678,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         per_request = {
             "kv_segment_lens": kv_true,
             "qo_offset": (kv_true - qo_dev).clamp_min(0),
+            "seqused_k": kv_true,
         }
         per_token = {
             "kv_segment_lens": kv_true_tok,
             "qo_offset": pos.clamp_min(0),
+            "seqused_k": (pos + 1).clamp_min(0),
         }
         starts = self._msa_q_token_starts
         for has_mixed, split, _, decode_sub, prefill_sub in self._msa_live_plans():
@@ -675,10 +696,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 if sub is None:
                     continue
                 tok_first, tok_last = starts[first], starts[last]
-                for key in ("kv_segment_lens", "qo_offset"):
+                for key in _msa_plan_length_keys(sub):
                     dst = sub.get(key)
                     if dst is None:
-                        continue
+                        raise RuntimeError(
+                            f"MSA plan has no length mirror {key!r}, so the corrected "
+                            "kv_lens cannot reach the kernel."
+                        )
                     rows = int(dst.shape[0])
                     if rows == last - first:
                         src = per_request[key][first:last]
