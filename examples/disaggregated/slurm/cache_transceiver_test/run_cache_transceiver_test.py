@@ -286,6 +286,35 @@ class _TransferError(Exception):
     pass
 
 
+def _wait_ctx_complete(xcvr, rid, runtime):
+    """Block until this ctx request's send finishes (or errors).
+
+    * C++ transceiver: check_context_transfer_status(None) is a true block-all;
+      a single call suffices (see the comment at the call site).
+    * PYTHON (V2) transceiver: even under block_all, each TxSession wait is
+      bounded by kv_transfer_sender_future_timeout_ms (default 1000 ms). A
+      slower peer handshake makes the call log "TxSession ... timed out" and
+      return with the request still DISAGG_CONTEXT_TRANS_IN_PROGRESS -- in the
+      real executor that is benign (the session stays open and is re-polled
+      every iteration), but returning here would free and refill the KV blocks
+      mid-flight, so the receiver reads the NEXT request's pattern (verify FAIL
+      on every request except the last). So poll until
+      this rid lands in the completed/failed lists. Collectively safe: every
+      ctx rank loops on the same rid and the per-call consensus makes all
+      ranks observe completion on the same iteration. The per-cell
+      signal.alarm and the hang detector bound the loop.
+    """
+    if runtime != "PYTHON":
+        xcvr.check_context_transfer_status(None)
+        return
+    while True:
+        completed, failed = xcvr.check_context_transfer_status(None)
+        if rid in failed:
+            raise _TransferError(f"ctx transfer failed for rid={rid}")
+        if rid in completed:
+            return
+
+
 def _wait_gen_complete(xcvr, req, runtime):
     """Block until this gen request's receive finishes (or errors).
 
@@ -371,7 +400,9 @@ def run_one_request(
         # transfer is still in progress. NIXL/UCX cold-start connection setup can
         # exceed that, so the harness would free the request mid-transfer, leaving
         # the gen side hung and the ctx sender thread asserting on a freed session.
-        xcvr.check_context_transfer_status(None)
+        # The PYTHON runtime additionally needs a poll loop on top of block_all;
+        # see _wait_ctx_complete.
+        _wait_ctx_complete(xcvr, rid, runtime)
         state = req.state
         tensorrt_llm.logger.info(f"[ctx r{rank}] rid={rid}: transfer DONE (send), state={state}")
         free_sequence(kvm, req, kv_handle, use_v2)
@@ -643,6 +674,13 @@ def main():
             backend=backend,
             transceiver_runtime=(None if runtime == "CPP" else "PYTHON"),
             max_tokens_in_buffer=cfg["kv_cache"]["max_tokens_in_buffer"],
+            # PYTHON (V2) only; 0 keeps bounce off. With bounce on, the KV data
+            # rides a fabric-VMM staging buffer (CU_MEM_HANDLE_TYPE_FABRIC), which
+            # is what lets UCX pick cuda_ipc across NVL72 nodes -- direct
+            # pool-to-pool transfers from non-fabric allocations fall back to
+            # much slower host-staged tcp, so enable bounce for cross-node
+            # transfers inside an NVLink domain.
+            kv_cache_bounce_size_mb=int(cfg["kv_cache"].get("bounce_size_mb", 0)),
         )
 
         # Build the cache manager + transceiver ONCE per case (the manager is

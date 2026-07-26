@@ -39,7 +39,10 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
 )
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
+from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+    AuxBuffer,
+    compute_aux_transfer_descs,
+)
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
@@ -912,9 +915,14 @@ class Sender(SenderBase):
             peer_slot = req_info.aux_slot
             assert peer_slot is not None, f"aux_slot is None for request {req_info.unique_rid}"
             assert task._slot is not None
-            src_ptrs = src_aux_meta.ptrs + src_aux_meta.item_sizes * task._slot
-            dst_ptrs = peer_aux_meta.ptrs + peer_aux_meta.item_sizes * peer_slot
-            sizes = src_aux_meta.item_sizes.astype(np.int64, copy=False)
+            # Per-buffer descriptors with each side's own slot stride, sizes
+            # clamped to min(src, dst) and zero-size entries dropped: the two
+            # sides may run different speculative configs (ctx/gen spec
+            # split), so per-slot item sizes can differ per buffer (e.g. the
+            # max_draft_len-sized draft-token buffer).
+            src_ptrs, dst_ptrs, sizes = compute_aux_transfer_descs(
+                src_aux_meta, peer_aux_meta, task._slot, peer_slot
+            )
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -1576,7 +1584,24 @@ class Receiver(ReceiverBase):
         allow_bounce = task.expected_transfers == 1 or (
             sender_dp_rank is not None and self._fanin_bounce_safe(topo_overlap, peer_infos)
         )
-        bounced = allow_bounce and self._bounce.reserve(receiver_req, task.expected_transfers)
+        # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks (the sender
+        # appends its MambaPolicy fragments in _build_kv_write_meta), so the bounce region must be
+        # sized for those bytes too or the write would overrun into the neighboring slot.
+        extra_bytes = 0
+        if receiver_req.mamba_state_index is not None:
+            if peer_infos.page_table is None:
+                allow_bounce = False  # cannot size the sender's recurrent-state payload
+            else:
+                extra_bytes = MambaPolicy.payload_bytes(
+                    sender_page_table=peer_infos.page_table,
+                    receiver_page_table=self._registrar.self_extractor.page_table,
+                    dst_slot=receiver_req.mamba_state_index,
+                    sender_ri=peer_infos,
+                    receiver_ri=self._registrar.self_rank_info,
+                )
+        bounced = allow_bounce and self._bounce.reserve(
+            receiver_req, task.expected_transfers, extra_bytes=extra_bytes
+        )
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -1630,6 +1655,19 @@ class Receiver(ReceiverBase):
                 sender_info = RankInfo.from_bytes(message[0])
             finally:
                 messenger.stop()
+
+            # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
+            # The sender-side check (PeerRegistrar.register) runs in the
+            # sender's listener thread, where exceptions are only logged, so
+            # reject here — before REGISTER_RANK_INFO is even sent — to fail
+            # the first gen request loudly instead of hanging on a transfer
+            # the sender will never serve.
+            MambaPolicy.validate_peer_compatible(
+                self._registrar.self_rank_info,
+                sender_info,
+                self._registrar.self_extractor.page_table,
+                sender_info.page_table,
+            )
 
             for endpoint in sender_info.sender_endpoints:
                 dealer = self._get_or_connect_dealer(endpoint)
