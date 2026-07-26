@@ -440,15 +440,15 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             static_assert(HC_MULT == 4, "float4 row loads assume HC_MULT == 4");
             const uint32_t gm_u = m_offset + upper_row;
             const uint32_t gm_l = m_offset + lower_row;
-            auto load_row4 = [](float const* base, uint32_t row, uint32_t row_floats, uint32_t vec_idx,
-                                 bool valid) -> float4
+            auto load_row4
+                = [](float const* base, uint32_t row, uint32_t row_floats, uint32_t vec_idx, bool valid) -> float4
             {
                 if (!valid)
                     return float4{0.f, 0.f, 0.f, 0.f};
                 return __ldg(reinterpret_cast<float4 const*>(base + row * row_floats) + vec_idx);
             };
-            const bool valid_u = gm_u < shape_m;
-            const bool valid_l = gm_l < shape_m;
+            bool const valid_u = gm_u < shape_m;
+            bool const valid_l = gm_l < shape_m;
             *reinterpret_cast<float4*>(pm_u) = load_row4(post_mix, gm_u, HC_MULT, 0, valid_u);
             *reinterpret_cast<float4*>(pm_l) = load_row4(post_mix, gm_l, HC_MULT, 0, valid_l);
 #pragma unroll
