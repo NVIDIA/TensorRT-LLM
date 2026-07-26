@@ -205,6 +205,15 @@ srun --overlap --kill-on-bad-exit=1 --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
     bash -c "
         set -x
         export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
+        export PYTHONPATH=\"$REPO\${PYTHONPATH:+:\$PYTHONPATH}\"
+        # Same cache redirects as the server step: importing tensorrt_llm on
+        # the client pulls in flashinfer, whose workspace defaults under
+        # \$HOME/.cache — a dangling path on some cluster images.
+        export FLASHINFER_WORKSPACE_BASE=$CACHE_DIR/fi_workspace
+        export FLASHINFER_CUBIN_DIR=$CACHE_DIR/fi_cubins
+        export HF_HOME=\${HF_HOME:-$CACHE_DIR/hf_home}
+        export TRITON_CACHE_DIR=/tmp/triton-cache-client
+        mkdir -p \"\$TRITON_CACHE_DIR\"
         run_client() {
             python3 -m tensorrt_llm.serve.scripts.benchmark_serving \
                 --model \"$MODEL\" --host 127.0.0.1 --port $PORT \
