@@ -81,6 +81,11 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     constexpr int kHiddenDim7168 = 7168; // DeepSeek-V3 / DeepSeek-V3.2 / Kimi K3
     constexpr int kHiddenDim6144 = 6144; // GLM-5
     constexpr int kHiddenDim4096 = 4096; // DeepSeek-V4
+    // The specialized min-latency kernel launches one block per expert and every block re-reads all
+    // num_tokens activation rows, so its L2 traffic scales with num_experts * num_tokens. At 896
+    // experts it beats the cublas fallback only for very small num_tokens; larger batches fall
+    // through to cublas below (bf16 tensor cores, writing the same fp32 `out`).
+    constexpr int kMaxNumTokens896 = 4;
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
     th::Tensor out = th::empty(output_size, mat_a.options().dtype(out_dtype_));
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
@@ -97,7 +102,8 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
             reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
             reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
     }
-    else if (shape_ok && num_experts == kNumExperts896 && hidden_dim == kHiddenDim7168)
+    else if (shape_ok && num_experts == kNumExperts896 && hidden_dim == kHiddenDim7168
+        && num_tokens <= kMaxNumTokens896)
     {
         LoopUnroller<1, 16, kNumExperts896, kHiddenDim7168>::unroll(num_tokens,
             reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),

@@ -1894,12 +1894,27 @@ class fp8SwapABGemmRunner(TunableRunner):
             dtype=self.output_dtype,
         )
 
-        deep_gemm.fp8_gemm_nt(
-            (a, a_sf),
-            (weight, weight_scale),
-            output,
-            disable_ue8m0_cast=self.disable_ue8m0_cast,
-        )
+        # At decode-sized M the SM100 heuristic picks a swap-AB multicast
+        # layout whose grid is only ceil(N/128) CTAs (~19% SM utilization on
+        # narrow-N shapes, ~2.6x slower than the same bytes in non-swap
+        # tiles). Requiring block_m % 256 == 0 makes every swap-AB candidate
+        # fail the tensor-memory check, so the heuristic falls back to the
+        # well-utilized non-swap tiles; large-M (prefill) calls keep the
+        # default candidates. Selection is host-side, so the better kernel
+        # is what CUDA-graph capture records.
+        small_m = input.size(0) <= 64
+        if small_m:
+            deep_gemm.set_block_size_multiple_of((256, 1))
+        try:
+            deep_gemm.fp8_gemm_nt(
+                (a, a_sf),
+                (weight, weight_scale),
+                output,
+                disable_ue8m0_cast=self.disable_ue8m0_cast,
+            )
+        finally:
+            if small_m:
+                deep_gemm.set_block_size_multiple_of((1, 1))
         return output
 
 
