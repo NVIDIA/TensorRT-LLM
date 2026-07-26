@@ -32,7 +32,7 @@ from tensorrt_llm._torch.modules.linear import Linear  # noqa: E402  (avoid cycl
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import is_sm_100f, prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
@@ -1079,6 +1079,11 @@ class DeepseekV4Indexer(Indexer):
             layer_idx,
             aux_stream,
         )
+        # Preserve the checkpoint's 128x128 FP8 quantization while deriving a
+        # native-MXF8 (sf_vec=32) scale view for the TRT-LLM CuTe DSL fused
+        # indexer-Q projection.  FP8BlockScalesLinearMethod materializes the
+        # derived, swizzled scale once after weight loading.
+        self.wq_b.use_indexer_q_cutedsl_fusion = True
         # Override base Indexer.weights_proj to bf16 (matches V4 checkpoint).
         self.weights_proj = Linear(
             self.hidden_size,
@@ -1138,6 +1143,10 @@ class DeepseekV4Indexer(Indexer):
         """
         q = self.wq_b(qr)
         q = q.view(-1, self.n_heads, self.head_dim)
+        return self._apply_q_rope(q, position_ids)
+
+    def _apply_q_rope(self, q: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        """Apply RoPE in-place to a projected indexer Q tensor."""
         # Fused in-place RoPE on the rope portion of each head
         nope_dim = self.head_dim - self.rope_dim
         torch.ops.trtllm.mla_rope_inplace(
@@ -1151,6 +1160,49 @@ class DeepseekV4Indexer(Indexer):
             self.rotary_emb.is_neox,
         )
         return q
+
+    def _project_and_quantize_q(
+        self, qr: torch.Tensor, position_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project Q and produce the cache precision consumed by the indexer.
+
+        The DSv4 MXFP4 configuration can fuse projection, interleaved RoPE,
+        and FP4 quantization. If the optional Hadamard transform is active,
+        retain the legacy path because that transform changes all 128 values
+        in a head and is not part of the CuTe DSL kernel.
+        """
+        use_fused_project_mxfp4 = (
+            self.indexer_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE
+            and not HAS_FAST_HADAMARD
+            and not self.rotary_emb.is_neox
+            and self.head_dim == 128
+            and self.rope_dim == 64
+            and self.wq_b.has_fp8_block_scales
+            and hasattr(self.wq_b, "indexer_q_weight_scale_cutedsl")
+            and hasattr(
+                torch.ops.trtllm,
+                "cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell",
+            )
+            and qr.dtype == torch.bfloat16
+            and is_sm_100f()
+        )
+        if use_fused_project_mxfp4:
+            q_fp4, q_scale = torch.ops.trtllm.cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell(
+                qr,
+                self.wq_b.weight,
+                self.wq_b.indexer_q_weight_scale_cutedsl,
+                position_ids.view(-1),
+                self.rotary_emb.rotary_cos_sin.view(-1, self.rope_dim),
+                self.wq_b.indexer_q_alpha_cutedsl,
+                use_tvm_ffi=True,
+            )
+            return q_fp4.view(-1, self.n_heads, self.head_dim // 2), q_scale.view(
+                -1, self.n_heads, 1
+            )
+
+        q = self.wq_b(qr).view(-1, self.n_heads, self.head_dim)
+        q = self._apply_q_rope(q, position_ids)
+        return self._quantize_q(q)
 
     def _quantize_q(self, q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # Rotate + quantize (layout matches compressor K: [nope|pe]). After
@@ -1281,7 +1333,7 @@ class DeepseekV4Indexer(Indexer):
         if pre_aux is None:
             self.indexer_start_event.record()
 
-            q = self._qk_projection_and_rope(qr, position_ids)
+            q_fp8, q_scale = self._project_and_quantize_q(qr, position_ids)
 
             with torch.cuda.stream(self.aux_stream):
                 self.indexer_start_event.wait()
@@ -1302,9 +1354,7 @@ class DeepseekV4Indexer(Indexer):
                 k_fp8.record_stream(cur_stream)
             if k_scale is not None:
                 k_scale.record_stream(cur_stream)
-            q = self._qk_projection_and_rope(qr, position_ids)
-
-        q_fp8, q_scale = self._quantize_q(q)
+            q_fp8, q_scale = self._project_and_quantize_q(qr, position_ids)
 
         self.weights_proj_event.wait()
         weights = self._apply_weight_scale(weights, q_scale)
@@ -1321,9 +1371,7 @@ class DeepseekV4Indexer(Indexer):
     ) -> Tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor
     ]:
-        q = self._qk_projection_and_rope(qr, position_ids)
-
-        q_fp8, q_scale = self._quantize_q(q)
+        q_fp8, q_scale = self._project_and_quantize_q(qr, position_ids)
 
         weights = self.weights_proj(hidden_states)
 
