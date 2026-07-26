@@ -71,6 +71,11 @@ class _FakeTransferWorker:
     def has_all_peer_req_infos_for_send(self, rid: int) -> bool:
         return rid in self.ready_request_ids
 
+    def _classify_peer_req_infos_for_send(self, request_ids):
+        request_ids = set(request_ids)
+        complete = len(request_ids & self.ready_request_ids)
+        return len(request_ids) - complete, 0, complete
+
     def pin_peer_req_infos_for_send(self, rid: int) -> None:
         self.pinned_request_ids.add(rid)
 
@@ -1536,6 +1541,98 @@ def test_prepare_context_requests_skips_consensus_when_nothing_waiting() -> None
 
     transceiver.prepare_context_requests([])
     transceiver._ctx_consensus.assert_not_called()
+
+
+def test_context_readiness_snapshot_is_opt_in_and_skips_empty(monkeypatch) -> None:
+    request_id = 91_000_000_000_001
+    info = Mock()
+    monotonic = Mock(side_effect=AssertionError("instrumentation must stay disabled"))
+    monkeypatch.setattr(transceiver_module.logger, "info", info)
+    monkeypatch.setattr(transceiver_module.time, "monotonic", monotonic)
+
+    transceiver = _make_transceiver({})
+    transceiver._wait_reqs = {request_id: _FakeRequest(request_id=request_id)}
+    transceiver._transfer_worker.ready_request_ids.add(request_id)
+    transceiver._ctx_consensus = Mock(return_value=[])
+    transceiver.prepare_context_requests([])
+    assert request_id in transceiver._wait_reqs
+    info.assert_not_called()
+
+    empty = _make_transceiver({})
+    empty._context_activation_digest = Mock()
+    empty.prepare_context_requests([])
+    info.assert_not_called()
+    monotonic.assert_not_called()
+
+
+def test_context_readiness_snapshot_reports_changed_post_promotion_counts(
+    monkeypatch,
+) -> None:
+    promoted_id = 92_000_000_000_001
+    waiting_id = 92_000_000_000_002
+    now = [100.0]
+    info = Mock()
+    monkeypatch.setattr(transceiver_module.logger, "info", info)
+    monkeypatch.setattr(transceiver_module.time, "monotonic", lambda: now[0])
+    transceiver = _make_transceiver({})
+    transceiver._dist = SimpleNamespace(rank=2)
+    transceiver._context_activation_digest = Mock()
+    transceiver._context_activation_count = 0
+    promoted_request = _FakeRequest(request_id=promoted_id)
+    transceiver._wait_reqs = {
+        promoted_id: promoted_request,
+        waiting_id: _FakeRequest(request_id=waiting_id),
+    }
+    transceiver._transfer_worker.ready_request_ids.update((promoted_id, waiting_id))
+    classify = Mock(wraps=transceiver._transfer_worker._classify_peer_req_infos_for_send)
+    transceiver._transfer_worker._classify_peer_req_infos_for_send = classify
+    transceiver._ctx_consensus = Mock(side_effect=[[promoted_id], [], [], [], []])
+
+    transceiver.prepare_context_requests([])
+    transceiver.prepare_context_requests([])
+    transceiver.prepare_context_requests([])
+    assert classify.call_count == 2
+    now[0] += transceiver_module._CONTEXT_READINESS_PROBE_INTERVAL_S
+    transceiver.prepare_context_requests([])
+
+    messages = [call.args[0] for call in info.call_args_list]
+    assert len(messages) == 2
+    assert "cohort=2 absent=0 partial=0 complete=2 pp_intersection=1" in messages[0]
+    assert "cohort=1 absent=0 partial=0 complete=1 pp_intersection=0" in messages[1]
+    assert classify.call_count == 3
+    assert all(
+        str(request_id) not in message
+        for message in messages
+        for request_id in (promoted_id, waiting_id)
+    )
+    assert promoted_request.state == LlmRequestState.CONTEXT_INIT
+
+    info.side_effect = RuntimeError("diagnostic failure")
+    transceiver._context_readiness_last_snapshot = None
+    transceiver._context_readiness_last_probe_key = None
+    transceiver.prepare_context_requests([])
+
+
+def test_context_readiness_snapshot_reports_async_activation(monkeypatch) -> None:
+    request_id = 93_000_000_000_001
+    info = Mock()
+    monkeypatch.setattr(transceiver_module.logger, "info", info)
+    transceiver = _make_transceiver({})
+    coordinator = _enable_fake_async_consensus(transceiver, peer_ready=True)
+    transceiver._context_activation_digest = Mock()
+    transceiver._context_activation_count = 0
+    request = _FakeRequest(request_id=request_id)
+    transceiver._transfer_worker.ready_request_ids.add(request_id)
+    transceiver._async_ready_published[request_id] = 0
+    transceiver._async_ready_prepared[(request_id, 0)] = request
+    transceiver._async_ready_released.add((request_id, 0))
+
+    transceiver.activate_context_requests_for_schedule([request])
+
+    assert coordinator.ready_activation_acks == [(request_id, 0)]
+    message = info.call_args.args[0]
+    assert "cohort=1 absent=0 partial=0 complete=1 async_activation=1" in message
+    assert str(request_id) not in message
 
 
 def test_context_activation_digest_is_common_to_legacy_and_authoritative_paths(
