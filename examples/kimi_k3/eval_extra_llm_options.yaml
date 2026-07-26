@@ -1,0 +1,10 @@
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+cuda_graph_config:
+  max_batch_size: 32
+enable_chunked_prefill: true
+kv_cache_config:
+  enable_block_reuse: false
+  # Leave runtime headroom for the AUTO-selected NVLinkOneSided workspace
+  # and the largest 8192-token prefill allocation.
+  free_gpu_memory_fraction: 0.5

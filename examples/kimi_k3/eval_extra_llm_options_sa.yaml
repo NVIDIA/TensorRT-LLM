@@ -1,0 +1,10 @@
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+disable_overlap_scheduler: true
+cuda_graph_config: null
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.6
+speculative_config:
+  decoding_type: SA
+  max_draft_len: 2

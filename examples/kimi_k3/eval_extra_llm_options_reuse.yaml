@@ -1,0 +1,12 @@
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+cuda_graph_config:
+  max_batch_size: 32
+enable_chunked_prefill: true
+kv_cache_config:
+  # Leave runtime headroom for the AUTO-selected NVLinkOneSided workspace
+  # and the largest 8192-token prefill allocation, matching
+  # eval_extra_llm_options.yaml. At 0.6 the hybrid cache manager's extra
+  # allocations OOM during executor creation on GB300 (executor_extra with
+  # only ~32 GiB free after the KV pool).
+  free_gpu_memory_fraction: 0.5
