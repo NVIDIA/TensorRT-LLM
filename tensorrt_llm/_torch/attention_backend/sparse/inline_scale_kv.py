@@ -1,31 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inline-scale KV pages for the SM120 FlashInfer sparse MLA path (DSA family).
+"""SM120 inline-scale KV packing for DSA sparse MLA.
 
-"Inline-scale" is flashinfer's name for the V32-family cache (its DSv3.2/GLM
-SM120 kernels read it; DeepSeek-V4 uses the footer-scale variant):
-quantization scales live inline with each token row, FlashMLA ABI. Per-token
-row layout:
-
-  bytes [0, 512):    FP8 E4M3 nope (4 tiles x 128)
-  bytes [512, 528):  4 x FP32 tile scales
-  bytes [528, 656):  BF16 rope (64 elements x 2 B)
-
-which makes ``TOKEN_BYTES = 512 + 16 + 128 = 656`` bytes per token.
-
-Quantization: each 128-element tile of the 512-element nope half is scaled by
-``max|x| / FP8_MAX`` — an arbitrary FP32 scale, not a power of two — and
-stored as FP8 E4M3 with the FP32 scale inline (flashinfer's
-``kv_scale_format="arbitrary_fp32"`` / GLM mode; DSv3.2 pow2 scales are a
-special case this writer does not produce). The 64-element rope half stays
-bf16. Nonzero tiles match SGLang's ``quantize_k_cache`` packer byte for byte;
-zero tiles use scale 1.0 to avoid division by zero.
-
-Sparse indices address tokens as global pool slot ids (``page = slot //
-page_size``, ``offset = slot % page_size``) — the currency
-``convert_req_index_to_global`` emits; negative slots are skipped so masked
-writes need no host-side filtering.
+Each token occupies 656 bytes: 512 FP8 values, four FP32 scales, and
+64 BF16 RoPE values.
 """
 
 import torch
@@ -65,39 +44,33 @@ def _quant_scatter_kernel(
     NUM_TILES: tl.constexpr,
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    EPS: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     tile_id = tl.program_id(1)
 
     loc = tl.load(loc_ptr + token_id)
     if loc >= 0:
-        # Byte offsets below multiply the page ordinal by the page byte size;
-        # keep that arithmetic 64-bit — an int32 slot id is fine in the token
-        # domain, but its byte products overflow past a 2 GiB pool.
+        # Pool byte offsets can exceed int32 even when slot ids do not.
         loc64 = loc.to(tl.int64)
         loc_page = loc64 // PAGE_SIZE_C
         loc_off = loc64 % PAGE_SIZE_C
         row_base = loc_page * PAGE_BYTES_C + loc_off * TOKEN_BYTES_C
 
         if tile_id == NUM_TILES:
-            # bf16 rope half: bytes [ROPE_OFFSET, TOKEN_BYTES) of the token
-            # row. Branch-local names: Triton unifies same-named variables
-            # across if/else arms, and the rope range (64) and quant tile
-            # (128) have different shapes.
+            # Keep branch-local names because the two ranges have different shapes.
             rope_range = tl.arange(0, DIM_ROPE_C)
             rope_in_offsets = token_id * rows_stride0 + DIM_NOPE_C + rope_range
             rope = tl.load(rows_ptr + rope_in_offsets)
             rope_out_offsets = (row_base + ROPE_OFFSET_C) // 2 + rope_range
             tl.store(pool_bf16_ptr + rope_out_offsets, rope)
         else:
-            # one 128-element nope tile: arbitrary fp32 scale + fp8 values.
-            # Keep zero tiles finite without changing nonzero quantization.
             tile_range = tl.arange(0, TILE)
             tile_in_offsets = token_id * rows_stride0 + tile_id * TILE + tile_range
             x = tl.load(rows_ptr + tile_in_offsets).to(tl.float32)
 
-            max_abs = tl.max(tl.abs(x))
-            y_s = tl.where(max_abs > 0.0, max_abs / FP8_MAX, 1.0)
+            max_abs = tl.maximum(tl.max(tl.abs(x)), EPS)
+            y_s = max_abs / FP8_MAX
             y_s_inv = 1.0 / y_s
             x_fp8 = tl.clamp(x * y_s_inv, FP8_MIN, FP8_MAX).to(pool_fp8_ptr.dtype.element_ty)
 
@@ -114,16 +87,7 @@ def quant_scatter(
     rows_bf16: torch.Tensor,
     page_size: int = PAGE_SIZE,
 ) -> None:
-    """Quantize bf16 latent rows and scatter them into an inline-scale pool.
-
-    Args:
-        pool_u8: uint8 pool buffer, shape [num_pages, page_size * TOKEN_BYTES],
-            contiguous, anchored where the pool's slot ids are zero.
-        loc: [num_tokens] int32/int64 global slot ids; entries < 0 are skipped.
-        rows_bf16: [num_tokens, 576] bf16 rows ([512 nope | 64 rope], rope
-            already rotated).
-        page_size: tokens per page — 64 for the SM120 DSv3.2/GLM kernels.
-    """
+    """Pack and scatter BF16 latent rows into inline-scale pages."""
     page_bytes = page_size * TOKEN_BYTES
     assert pool_u8.dtype == torch.uint8 and pool_u8.is_contiguous()
     assert pool_u8.shape[-1] == page_bytes, (
@@ -159,6 +123,7 @@ def quant_scatter(
         NUM_TILES=NUM_NOPE_TILES,
         FP8_MIN=_FP8_MIN,
         FP8_MAX=_FP8_MAX,
+        EPS=1e-8,
     )
 
 

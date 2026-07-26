@@ -85,12 +85,8 @@ def _parse_fmha_libs_env() -> tuple[str, ...]:
     return tuple(names)
 
 
-def get_enabled_fmha_lib_names() -> tuple[str, ...]:
-    return _parse_fmha_libs_env()
-
-
 def get_enabled_fmha_lib_classes() -> list[FmhaCls]:
-    return [FMHA_LIBS[name] for name in get_enabled_fmha_lib_names()]
+    return [FMHA_LIBS[name] for name in _parse_fmha_libs_env()]
 
 
 __all__ = [

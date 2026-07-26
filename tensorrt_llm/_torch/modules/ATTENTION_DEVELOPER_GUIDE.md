@@ -253,7 +253,7 @@ trtllm-gen kernels from FlashInfer, and `FallbackFmha` calls the regular
 `thop.attention` runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`; use
+`msa_sparse_gqa,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`; use
 `TLLM_FMHA_LIBS=fallback` or
 `TLLM_FMHA_LIBS=-flashinfer_trtllm_gen` to force the fallback path. Each FMHA
 library exposes `is_available()` for module/static environment checks and

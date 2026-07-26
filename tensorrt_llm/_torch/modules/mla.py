@@ -508,6 +508,7 @@ class MLA(nn.Module):
             self.register_to_config = True
 
         config = config or ModelConfig()
+        self.kv_cache_dtype = config.extra_attrs.get("kv_cache_dtype", "auto")
         sparse_attn_cfg = config.sparse_attention_config
         sparse_params = (
             sparse_attn_cfg.to_sparse_params(
@@ -794,6 +795,7 @@ class MLA(nn.Module):
             dtype=dtype,
             aux_stream=mqa_aux_stream,
             rope_append=not self.is_deepseek_v4,
+            kv_cache_dtype=self.kv_cache_dtype,
         )
         self.compressor = getattr(self.mqa, "compressor", None)
         self.indexer = getattr(self.mqa, "indexer", None)
@@ -1041,9 +1043,7 @@ class MLA(nn.Module):
             return False
         if num_generations > 0:
             return False
-        # The fused-FP8-Q path is part of the C++ attention op contract; the
-        # non-fused backends (FlashInfer SM120 sparse MLA) take bf16 Q only.
-        if not self.rope_fusion:
+        if self.kv_cache_dtype == "fp8_ds_mla":
             return False
         return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
 
@@ -1693,10 +1693,6 @@ class MLA(nn.Module):
             if self.apply_rotary_emb:
                 assert ctx_position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, ctx_position_ids)
-                # External RoPE: keep the latent cache's rope half in sync, as
-                # forward_impl does for the dense path — the backend appends
-                # these rows verbatim.
-                latent_cache_ctx[..., self.kv_lora_rank :] = k_pe_ctx
 
             self.forward_context_sparse_mla(
                 q_ctx,
@@ -1714,10 +1710,13 @@ class MLA(nn.Module):
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
-            # No external RoPE here: forward_absorption_generation's
-            # _mla_gen_rope rotates q_pe/k_pe itself (slicing position_ids by
-            # num_ctx_tokens), so rotating in this phase split too would
-            # rotate them twice. Pass the full position_ids for that slicing.
+            gen_position_ids = (
+                position_ids[..., num_ctx_tokens:num_tokens] if position_ids is not None else None
+            )
+            if self.apply_rotary_emb:
+                assert gen_position_ids is not None
+                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
+
             self.forward_generation_sparse_mla(
                 q_gen,
                 compressed_kv_gen,
@@ -1726,7 +1725,7 @@ class MLA(nn.Module):
                 output[num_ctx_tokens:num_tokens, :],
                 latent_cache=latent_cache_gen,
                 topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
-                position_ids=position_ids,
+                position_ids=gen_position_ids,
             )
 
     def forward_impl_with_deepseek_v4(
@@ -1954,9 +1953,6 @@ class MLA(nn.Module):
             if self.apply_rotary_emb:
                 assert ctx_position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, ctx_position_ids)
-                # Non-fused backends append latent_cache as-is, so its rope
-                # half must carry the rotated k_pe.
-                latent_cache_ctx[..., self.kv_lora_rank :] = k_pe_ctx
 
             self.forward_context_sparse_mla(
                 q_ctx,
@@ -1985,9 +1981,6 @@ class MLA(nn.Module):
             if self.apply_rotary_emb:
                 assert gen_position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
-                # Non-fused backends append latent_cache as-is, so its rope
-                # half must carry the rotated k_pe.
-                latent_cache_gen[..., self.kv_lora_rank :] = k_pe_gen
 
             self.forward_generation_sparse_mla(
                 q_gen,
@@ -2068,6 +2061,7 @@ class MLA(nn.Module):
             return False
         if not (
             self.short_seq_mha_threshold > 0
+            and self.kv_cache_dtype != "fp8_ds_mla"
             and not self.apply_rotary_emb
             and self.mapping.cp_size == 1
             and position_ids is not None
@@ -2557,11 +2551,7 @@ class MLA(nn.Module):
 
         if self.is_deepseek_v4:
             fused_q = q
-            # Non-fused backends (apply_rotary_emb): RoPE and the latent-cache
-            # resync already ran in forward_impl_with_deepseek_v4, the backend
-            # appends the latent rows itself, and the trtllm-gen scheduler
-            # buffers this op would fill have no consumer.
-            if not self.apply_rotary_emb:
+            if self.kv_cache_dtype != "fp8_ds_mla":
                 self.mqa.mla_rope_generation(
                     fused_q,
                     q_pe,
@@ -2582,7 +2572,9 @@ class MLA(nn.Module):
             )
 
             def _mla_gen_rope():
-                if self.apply_rotary_emb:
+                if self.kv_cache_dtype == "fp8_ds_mla":
+                    fused_q[..., self.kv_lora_rank :] = q_pe
+                elif self.apply_rotary_emb:
                     # Non-fused backends (Vanilla / FlashInfer) do not fuse RoPE
                     # in the attention kernel. Reuse apply_rope, which rotates
                     # q's q_pe slice in place, then copy rotated k_pe into the
@@ -2805,7 +2797,7 @@ class MLA(nn.Module):
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}."
                 )
 
-            if self.apply_rotary_emb:
+            if self.kv_cache_dtype == "fp8_ds_mla" or self.apply_rotary_emb:
                 fused_q[..., self.kv_lora_rank :] = q_pe
             fused_q = fused_q.view(
                 [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]

@@ -154,7 +154,7 @@ def test_deepseek_v4_fused_hc_default_enabled(monkeypatch):
 
 def test_deepseek_v4_model_defaults():
     class LlmArgs:
-        pass
+        kv_cache_config = KvCacheConfig()
 
     defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
 
@@ -165,6 +165,10 @@ def test_deepseek_v4_model_defaults():
             "enable_swa_scratch_reuse": True,
         }
     }
+
+    LlmArgs.kv_cache_config = KvCacheConfig(dtype="fp8_ds_mla")
+    defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
+    assert defaults["kv_cache_config"]["tokens_per_block"] == 256
 
 
 def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():

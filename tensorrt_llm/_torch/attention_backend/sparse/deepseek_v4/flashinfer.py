@@ -1,33 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FlashInfer sparse-MLA FMHA helpers for DeepSeek-V4 on SM120/SM121.
-
-On SM120 the C++ attention op compiles out the trtllm-gen sparse-MLA kernels
-for both phases (``attentionOp.h`` excludes SM120 from ``mUseTllmGen``), so
-the TRTLLM backend routes DeepSeek-V4 attention through flashinfer's packed
-sparse MLA FMHA library. The existing backend keeps ownership of metadata,
-indexing, compression, and local-to-global conversion; this module implements
-the packed-cache append and kernel launch.
-
-* both pools hold footer-scale pages (``footer_scale_kv``);
-* RoPE runs in Python (``support_fused_rope() -> False``), and the roped
-  latent rows are quantized and scattered into the SWA pool here rather than
-  inside the C++ op;
-* one flashinfer call serves context and generation alike — the kernel
-  auto-dispatches its decode fast path (<= 64 query tokens) vs the prefill
-  orchestrator, and per-token top-k lengths plus ``-1`` index padding carry
-  the phase semantics.
-"""
+"""FlashInfer sparse-MLA helpers for DeepSeek-V4 on SM120/SM121."""
 
 import math
 
 import torch
 
+from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 
 from ...interface import AttentionForwardArgs, AttentionInputType
+from ..flashinfer_workspace import get_sparse_mla_workspace
 from ..kernel import deepseek_v4_local_to_global_indices
 from . import footer_scale_kv
 from .deepseek_v4 import DeepseekV4AttentionType, DeepseekV4TrtllmAttentionMetadata, get_token_bytes
@@ -46,16 +31,7 @@ def _footer_scale_pool_2d(
     attn_type: DeepseekV4AttentionType,
     compress_ratio: int,
 ) -> torch.Tensor:
-    """Whole-pool uint8 view [num_pages, page_size*584] anchored at slot 0.
-
-    The sparse indices are pool-base-relative (layer offsets are folded into
-    the block tables / buffer-pointer arithmetic), so the kernel view must
-    span every layer's pages from the pool base. Cached on the metadata
-    object, keyed by the cache manager's identity: pool addresses are
-    constant for a manager's lifetime, but a metadata object that outlives a
-    manager swap (KV-cache estimation builds a throwaway manager) must not
-    serve views into the old manager's freed pools.
-    """
+    """Return a pool-base-relative uint8 view, cached per cache manager."""
     manager = metadata.kv_cache_manager
     cache = getattr(metadata, "_footer_scale_pools", None)
     if cache is None:
@@ -115,7 +91,7 @@ def _swa_append(attn, metadata, latent_rows, start_idx: int, end_idx: int) -> No
         attn.compress_ratio,
         DeepseekV4AttentionType.SWA,
         False,
-        kv_layout="footer_scale",
+        use_fp8_ds_mla=True,
     )
     loc = deepseek_v4_local_to_global_indices(
         req_id=req_id,
@@ -135,6 +111,7 @@ def run_flashinfer_sparse_mla(
     q: torch.Tensor,
     metadata: DeepseekV4TrtllmAttentionMetadata,
     forward_args: AttentionForwardArgs,
+    rotary_emb: RotaryEmbedding,
 ) -> None:
     """Run DeepSeek-V4 attention for ``FlashInferSparseMlaFmha``."""
     if forward_args.enable_dsv4_epilogue_fusion:
@@ -175,13 +152,41 @@ def run_flashinfer_sparse_mla(
             "FlashInfer SM120 sparse MLA takes bf16 queries; the fused "
             "FP8-Q path must stay disabled for this FMHA."
         )
-
+    positions = metadata.token_positions_cuda[start_idx:end_idx]
     latent_cache = forward_args.latent_cache
-    if latent_cache is not None and forward_args.update_kv_cache:
+    latent_rows = (
+        latent_cache.view(num_tokens, attn.head_dim)
+        if latent_cache is not None and forward_args.update_kv_cache
+        else None
+    )
+    if not forward_args.skip_mla_rope_generation:
+        torch.ops.trtllm.mla_rope_inplace(
+            q_view,
+            positions,
+            rotary_emb.rotary_cos_sin,
+            attn.num_heads,
+            attn.mla_params.kv_lora_rank,
+            attn.mla_params.qk_rope_head_dim,
+            False,
+            rotary_emb.is_neox,
+        )
+        if latent_rows is not None:
+            torch.ops.trtllm.mla_rope_inplace(
+                latent_rows.view(num_tokens, 1, attn.head_dim),
+                positions,
+                rotary_emb.rotary_cos_sin,
+                1,
+                attn.mla_params.kv_lora_rank,
+                attn.mla_params.qk_rope_head_dim,
+                False,
+                rotary_emb.is_neox,
+            )
+
+    if latent_rows is not None:
         _swa_append(
             attn,
             metadata,
-            latent_cache.view(num_tokens, attn.head_dim),
+            latent_rows,
             start_idx,
             end_idx,
         )
@@ -193,7 +198,6 @@ def run_flashinfer_sparse_mla(
         raise RuntimeError("FlashInfer DSv4 FMHA requires sparse attention indices.")
 
     window = attn.sparse_attention_config.window_size
-    positions = metadata.token_positions_cuda[start_idx:end_idx]
     swa_lens = (positions + 1).clamp(max=window).to(torch.int32)
 
     if attn.compress_ratio > 1:
@@ -215,23 +219,18 @@ def run_flashinfer_sparse_mla(
         num_splits = (window + _KV_SPLIT_TILE - 1) // _KV_SPLIT_TILE
 
     out_view = output.view(num_tokens, attn.num_heads, attn.head_dim)
-    out_lse = torch.zeros(num_tokens, attn.num_heads, dtype=torch.float32, device=q.device)
     if num_tokens <= 64:
-        mid_out = torch.zeros(
+        out_lse, mid_out, mid_lse = get_sparse_mla_workspace(
+            metadata,
+            q.device,
             num_tokens,
             attn.num_heads,
             num_splits,
             attn.head_dim,
-            dtype=torch.bfloat16,
-            device=q.device,
-        )
-        mid_lse = torch.full(
-            (num_tokens, attn.num_heads, num_splits),
-            float("-inf"),
-            dtype=torch.float32,
-            device=q.device,
+            attn.layer_idx,
         )
     else:
+        out_lse = torch.empty(num_tokens, attn.num_heads, dtype=torch.float32, device=q.device)
         mid_out = None
         mid_lse = None
 

@@ -104,9 +104,7 @@ class Compressor(nn.Module):
         self.kv_cache_dtype: KVCacheDtype = resolve_kv_cache_dtype(kv_cache_dtype)
         self.is_indexer = is_indexer
         self.rotate_activation = rotate_activation
-        # FlashInfer footer-scale mode: the COMPRESS pool holds footer-scale
-        # pages the fused C++ scatter cannot write, so postprocess + scatter
-        # run in Python instead (see _footer_scale_postprocess_scatter).
+        # The C++ scatter does not write FlashInfer's footer-scale layout.
         self.footer_scale_cache = False
 
         # Modules
@@ -344,14 +342,7 @@ class Compressor(nn.Module):
         compressed_mask: torch.Tensor,
         batch_size: int,
     ) -> None:
-        """Postprocess + footer-scale scatter, in Python.
-
-        Mirrors ``postProcessScatterKernel`` with ``ROTATE_ACTIVATION=false``:
-        full-row RMSNorm x weight, interleaved RoPE on the rope tail (fp32
-        throughout), then the cu-search + block-table walk to per-token slots.
-        Invalid tokens (masked, padded, or without a mapped block) become slot
-        ``-1``, which the scatter kernel skips.
-        """
+        """Apply RMSNorm/RoPE and scatter into the footer-scale cache."""
         from . import footer_scale_kv
 
         total_tokens = kv_comp.shape[0]

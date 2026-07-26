@@ -2254,18 +2254,11 @@ def deepseek_v4_local_to_global_indices(
         compress_ratio: Compression ratio (1: no compression, >1: with compression)
         num_compressed_indices: Max number of compressed indices for CUDA graph compatibility
             Output width = num_swa_indices + num_compressed_indices.
-        split_extra: Emit the two regions as separate contiguous tensors
-            instead of one combined table. The combined layout serves the
-            C++ FMHA kernel (tile index selects the TMA descriptor); the
-            split layout serves consumers that take per-pool index segments
-            (the FlashInfer sparse-MLA backend) without slicing copies.
+        split_extra: Return separate SWA and compressed index tensors.
 
     Returns:
-        split_extra=False:
-            global_indices: int32 [num_tokens, num_swa_indices + num_compressed_indices]
-        split_extra=True:
-            (swa_indices [num_tokens, num_swa_indices],
-             compressed_indices [num_tokens, num_compressed_indices] or None)
+        A combined index tensor, or separate SWA and compressed tensors when
+        split_extra is true.
     """
     assert req_id.dtype == torch.int32, f"req_id must be int32, got {req_id.dtype}"
     assert block_table_swa.dtype == torch.int32, f"block_table_swa must be int32, got {block_table_swa.dtype}"
@@ -2337,8 +2330,7 @@ def deepseek_v4_local_to_global_indices(
                           dtype=torch.int32,
                           device=req_id.device)
         out_extra = None
-    # The kernel needs a tensor argument even when the extra output is unused
-    # (SPLIT_EXTRA is a constexpr, so the branch touching it compiles out).
+    # SPLIT_EXTRA compiles out accesses to this dummy argument.
     out_extra_arg = out_extra if out_extra is not None else out
     out_extra_stride0, out_extra_stride1 = out_extra_arg.stride()
 

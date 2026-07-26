@@ -1,34 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FlashInfer sparse-MLA FMHA helpers for DSA models on SM120/SM121.
-
-On SM120 the C++ attention op compiles out the trtllm-gen sparse-MLA kernels
-for both phases (``attentionOp.h`` excludes SM120 from ``mUseTllmGen``), so
-this backend routes DSA (DeepSeek-V3.2 / GLM ``glm_moe_dsa``) attention
-through flashinfer's SM120 sparse MLA FMHA library. The TRTLLM DSA backend
-keeps ownership of metadata, indexing, and local-to-global conversion; this
-module implements the packed-cache append and kernel launch.
-
-* the main latent pool holds inline-scale pages (``inline_scale_kv``, the
-  FlashMLA ABI flashinfer's V32-family kernels read; GLM-style arbitrary
-  FP32 scales);
-* RoPE runs in Python (``support_fused_rope() -> False``), and the roped
-  latent rows are quantized and scattered into the pool here rather than
-  inside the C++ ``mla_rope_append_paged_kv_assign_q`` op;
-* one flashinfer call serves context and generation alike — the kernel
-  auto-dispatches its decode fast path (<= 64 query tokens) vs the prefill
-  orchestrator, and ``-1`` index padding carries the per-token top-k
-  semantics the indexer already emits.
-"""
+"""FlashInfer sparse-MLA helpers for DSA models on SM120/SM121."""
 
 import math
 
 import torch
 
+from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
+
 from ..interface import AttentionForwardArgs, AttentionInputType
 from . import inline_scale_kv
 from .dsa import DSAtrtllmAttentionMetadata
+from .flashinfer_workspace import get_sparse_mla_workspace
 
 _KV_SPLIT_TILE = 64  # BLOCK_SIZE_N of the SM120 kernels; sizes split-K scratch
 
@@ -40,14 +24,7 @@ def _sparse_mla_op():
 
 
 def _inline_scale_pool_paged(metadata: DSAtrtllmAttentionMetadata) -> torch.Tensor:
-    """Whole-pool uint8 view [num_pages, page_size, 656] anchored at slot 0.
-
-    Global slot ids from ``convert_req_index_to_global`` address pages of the
-    layer-interleaved primary pool (page ordinal = block * num_layers +
-    layer), so one flat view serves every layer. Keyed by the manager's
-    identity: a metadata object can outlive a manager swap (KV-cache
-    estimation builds a throwaway manager) and must not serve stale views.
-    """
+    """Return the layer-interleaved primary pool as inline-scale pages."""
     manager = metadata.kv_cache_manager
     cached = getattr(metadata, "_inline_scale_pool", None)
     if cached is not None and cached[0] == id(manager):
@@ -102,6 +79,7 @@ def run_flashinfer_sparse_mla(
     q: torch.Tensor,
     metadata: DSAtrtllmAttentionMetadata,
     forward_args: AttentionForwardArgs,
+    rotary_emb: RotaryEmbedding,
 ) -> None:
     """Run DSA attention for ``FlashInferSparseMlaFmha``."""
     if metadata.max_draft_tokens > 0:
@@ -127,12 +105,6 @@ def run_flashinfer_sparse_mla(
     output = forward_args.output
     if output is None:
         raise RuntimeError("FlashInfer DSA FMHA requires a preallocated output.")
-    if output.numel() != num_tokens * attn.num_heads * kv_lora_rank:
-        raise RuntimeError(
-            "FlashInfer DSA FMHA got a preallocated output of "
-            f"{output.numel()} elements; expected "
-            f"{num_tokens} x {attn.num_heads} x {kv_lora_rank}."
-        )
     if num_tokens == 0:
         return
 
@@ -143,12 +115,41 @@ def run_flashinfer_sparse_mla(
             "paths must stay disabled for this FMHA."
         )
 
+    positions = metadata.token_positions_cuda[start_idx:end_idx]
     latent_cache = forward_args.latent_cache
-    if latent_cache is not None and forward_args.update_kv_cache:
+    latent_rows = (
+        latent_cache.view(num_tokens, attn.head_dim)
+        if latent_cache is not None and forward_args.update_kv_cache
+        else None
+    )
+    if not forward_args.skip_mla_rope_generation:
+        torch.ops.trtllm.mla_rope_inplace(
+            q_view,
+            positions,
+            rotary_emb.rotary_cos_sin,
+            attn.num_heads,
+            attn.mla_params.kv_lora_rank,
+            attn.mla_params.qk_rope_head_dim,
+            False,
+            rotary_emb.is_neox,
+        )
+        if latent_rows is not None:
+            torch.ops.trtllm.mla_rope_inplace(
+                latent_rows.view(num_tokens, 1, attn.head_dim),
+                positions,
+                rotary_emb.rotary_cos_sin,
+                1,
+                attn.mla_params.kv_lora_rank,
+                attn.mla_params.qk_rope_head_dim,
+                False,
+                rotary_emb.is_neox,
+            )
+
+    if latent_rows is not None:
         _latent_append(
             attn,
             metadata,
-            latent_cache.view(num_tokens, attn.head_dim),
+            latent_rows,
             start_idx,
             end_idx,
             is_generation,
@@ -162,24 +163,19 @@ def run_flashinfer_sparse_mla(
     topk = topk_indices_global.shape[-1]
 
     out_view = output.view(num_tokens, attn.num_heads, kv_lora_rank)
-    out_lse = torch.zeros(num_tokens, attn.num_heads, dtype=torch.float32, device=q.device)
     if num_tokens <= 64:
         num_splits = (topk + _KV_SPLIT_TILE - 1) // _KV_SPLIT_TILE
-        mid_out = torch.zeros(
+        out_lse, mid_out, mid_lse = get_sparse_mla_workspace(
+            metadata,
+            q.device,
             num_tokens,
             attn.num_heads,
             num_splits,
             kv_lora_rank,
-            dtype=torch.bfloat16,
-            device=q.device,
-        )
-        mid_lse = torch.full(
-            (num_tokens, attn.num_heads, num_splits),
-            float("-inf"),
-            dtype=torch.float32,
-            device=q.device,
+            attn.layer_idx,
         )
     else:
+        out_lse = torch.empty(num_tokens, attn.num_heads, dtype=torch.float32, device=q.device)
         mid_out = None
         mid_lse = None
 

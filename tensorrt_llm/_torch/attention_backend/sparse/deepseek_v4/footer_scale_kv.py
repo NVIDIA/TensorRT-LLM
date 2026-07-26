@@ -1,27 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Footer-scale KV pages for the SM120 FlashInfer sparse MLA path.
+"""SM120 footer-scale KV packing for DeepSeek-V4 sparse MLA.
 
-"Footer-scale" is flashinfer's name for this cache family (its DSv4 kernels
-read it; DSv3.2 uses the inline-scale variant): quantization scales live in a
-per-page footer instead of inline with each token row. Page layout, for a
-page of ``PAGE_SIZE`` tokens:
-
-  bytes [0, PAGE_SIZE * DATA_ROW_BYTES):
-      per-token data rows, token-major: [448 B FP8-E4M3 nope | 128 B bf16 rope]
-  bytes [PAGE_SIZE * DATA_ROW_BYTES, PAGE_SIZE * TOKEN_BYTES):
-      per-token footer rows: [7 UE8M0 nope tile scales | 1 pad byte]
-
-which makes ``TOKEN_BYTES = 448 + 128 + 8 = 584`` bytes per token.
-
-Quantization: each 64-element tile of the 448-element nope half is scaled by
-the power-of-two ceiling of ``max|x| / FP8_MAX`` and stored as FP8 E4M3; the
-scale byte is the biased exponent (``exp + 127``). The 64-element rope half
-stays bf16. Sparse indices address tokens as global pool slot ids
-(``page = slot // page_size``, ``offset = slot % page_size``) — the same
-currency ``deepseek_v4_local_to_global_indices`` emits; negative slots are
-skipped so masked writes need no host-side filtering.
+Each token occupies 584 bytes: 448 FP8 values, 64 BF16 RoPE values, and
+seven UE8M0 scales plus one padding byte in the page footer.
 """
 
 import torch
@@ -69,15 +52,12 @@ def _quant_scatter_kernel(
 
     loc = tl.load(loc_ptr + token_id)
     if loc >= 0:
-        # Byte offsets below multiply the page ordinal by the page byte size;
-        # keep that arithmetic 64-bit — an int32 slot id is fine in the token
-        # domain, but its byte products overflow past a 2 GiB pool.
+        # Pool byte offsets can exceed int32 even when slot ids do not.
         loc64 = loc.to(tl.int64)
         loc_page = loc64 // PAGE_SIZE_C
         loc_off = loc64 % PAGE_SIZE_C
 
         if tile_id == NUM_TILES:
-            # bf16 rope half: bytes [DIM_NOPE, DATA_ROW_BYTES) of the token row.
             rope_range = tl.arange(0, DIM_ROPE_C)
             in_offsets = token_id * rows_stride0 + DIM_NOPE_C + rope_range
             rope = tl.load(rows_ptr + in_offsets)
@@ -88,7 +68,6 @@ def _quant_scatter_kernel(
             )
             tl.store(pool_bf16_ptr + out_offsets, rope)
         else:
-            # one 64-element nope tile: pow2 UE8M0 scale + fp8 values + scale byte.
             tile_range = tl.arange(0, TILE)
             in_offsets = token_id * rows_stride0 + tile_id * TILE + tile_range
             x = tl.load(rows_ptr + in_offsets).to(tl.float32)
@@ -116,17 +95,7 @@ def quant_scatter(
     rows_bf16: torch.Tensor,
     page_size: int = PAGE_SIZE,
 ) -> None:
-    """Quantize bf16 latent rows and scatter them into a footer-scale pool.
-
-    Args:
-        pool_u8: uint8 pool buffer, shape [num_pages, page_size * TOKEN_BYTES],
-            contiguous, anchored where the pool's slot ids are zero.
-        loc: [num_tokens] int32/int64 global slot ids; entries < 0 are skipped.
-        rows_bf16: [num_tokens, 512] bf16 rows ([448 nope | 64 rope], rope
-            already rotated).
-        page_size: tokens per page — 64 for the SWA and ratio-4 compressed
-            pools, 2 for the ratio-128 compressed pool.
-    """
+    """Pack and scatter BF16 latent rows into footer-scale pages."""
     page_bytes = page_size * TOKEN_BYTES
     assert pool_u8.dtype == torch.uint8 and pool_u8.is_contiguous()
     assert pool_u8.shape[-1] == page_bytes, (
