@@ -3314,14 +3314,17 @@ class Linear(nn.Module):
                 raise ValueError(
                     f"Uneven TP is not supported with QuantAlgo {_quant_algo}")
             self.tp_sharding = override_tp_sharding
+            self._tp_sharding_is_auto = False
         elif self.tp_size > 1 and self.tp_mode is not None \
                 and self.weights_loading_config.weight_mode == WeightMode.VANILLA \
                 and _quant_algo not in _uneven_tp_unsupported \
                 and not skip_create_weights_in_init:
             features = in_features if self.tp_mode == TensorParallelMode.ROW else out_features
             self.tp_sharding = self._auto_tp_sharding(features, quant_config)
+            self._tp_sharding_is_auto = True
         else:
             self.tp_sharding = None
+            self._tp_sharding_is_auto = False
             if self.tp_size > 1 and self.tp_mode is not None:
                 features = in_features if self.tp_mode == TensorParallelMode.ROW else out_features
                 assert features % self.tp_size == 0, (
@@ -3333,6 +3336,28 @@ class Linear(nn.Module):
 
         self.in_features = self.calculate_local_in_features(in_features)
         self.out_features = self.calculate_local_out_features(out_features)
+
+        # allgather with sizes=None requires every rank to hold the same shape, so an
+        # unevenly sharded COLUMN output has to declare the per-rank widths explicitly.
+        self.gather_output_sizes = None
+        if self.gather_output and self.tp_size > 1 \
+                and self.tp_mode == TensorParallelMode.COLUMN:
+            if self._tp_sharding_is_auto:
+                sizes = [
+                    end - start for start, end in (
+                        self._auto_tp_sharding(out_features, quant_config, rank)
+                        for rank in range(self.tp_size))
+                ]
+                if len(set(sizes)) > 1:
+                    self.gather_output_sizes = sizes
+            elif isinstance(self.tp_sharding, tuple) and \
+                    (self.tp_sharding[1] - self.tp_sharding[0]) * self.tp_size != out_features:
+                # Only this rank's range is known, so the other ranks' widths that
+                # allgather needs cannot be derived.
+                raise ValueError(
+                    f"gather_output=True with an uneven override_tp_sharding "
+                    f"{self.tp_sharding} is not supported (out_features="
+                    f"{out_features}, tp_size={self.tp_size}).")
 
         if self.tp_mode == TensorParallelMode.COLUMN:
             reduce_output = False if self.mapping.enable_attention_dp else reduce_output
@@ -3387,34 +3412,36 @@ class Linear(nn.Module):
     def _calc_shard(total, tp_size, rank):
         return (total // tp_size) * rank + min(total % tp_size, rank)
 
-    def _auto_tp_sharding(self, features, quant_config):
+    def _auto_tp_sharding(self, features, quant_config, rank=None):
         """Auto-generate tp_sharding tuple based on quant alignment requirements.
 
         VANILLA mode only. Fused modes (FUSED_QKV, FUSED_GATE_UP) require explicit
         override_tp_sharding because individual sub-weight sizes (Q vs K vs V; gate
         vs up) are not knowable here — they aren't always equal (e.g. GQA), and
         cross-rank consistency must be decided by the caller.
+
+        `rank` defaults to this module's own TP rank; pass an explicit rank to query
+        another rank's range (e.g. to build the per-rank sizes an allgather needs).
         """
         assert self.weights_loading_config.weight_mode == WeightMode.VANILLA, (
             f"_auto_tp_sharding only supports VANILLA mode, got "
             f"{self.weights_loading_config.weight_mode}. Fused modes require "
             f"explicit override_tp_sharding.")
+        rank = self.tp_rank if rank is None else rank
         alignment = get_quant_method(quant_config).get_tp_alignment(
             self.tp_mode, quant_config)
         if alignment <= 1:
             # No alignment constraint — use standard element-level distribution
-            start = self._calc_shard(features, self.tp_size, self.tp_rank)
-            end = self._calc_shard(features, self.tp_size, self.tp_rank + 1)
+            start = self._calc_shard(features, self.tp_size, rank)
+            end = self._calc_shard(features, self.tp_size, rank + 1)
         else:
             # Distribute whole alignment-sized blocks across ranks
             assert features % alignment == 0, (
                 f"Feature dim ({features}) must be divisible by quant alignment "
                 f"({alignment}) for TP sharding")
             num_blocks = features // alignment
-            block_start = self._calc_shard(num_blocks, self.tp_size,
-                                           self.tp_rank)
-            block_end = self._calc_shard(num_blocks, self.tp_size,
-                                         self.tp_rank + 1)
+            block_start = self._calc_shard(num_blocks, self.tp_size, rank)
+            block_end = self._calc_shard(num_blocks, self.tp_size, rank + 1)
             start = block_start * alignment
             end = block_end * alignment
         return (start, end)
@@ -3703,7 +3730,9 @@ class Linear(nn.Module):
             output = self.apply_linear(input, self.bias, lora_params, layer_idx)
             if self.gather_output:
                 from ..distributed import allgather
-                output = allgather(output, self.mapping)
+                output = allgather(output,
+                                   self.mapping,
+                                   sizes=self.gather_output_sizes)
         else:
             output = self.apply_linear(input, self.bias, lora_params, layer_idx)
 
