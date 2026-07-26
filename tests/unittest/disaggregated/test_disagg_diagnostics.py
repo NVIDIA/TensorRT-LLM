@@ -314,10 +314,16 @@ def test_rank_filter_is_applied_when_emitter_is_created(monkeypatch):
     monkeypatch.setenv(diagnostics.DISAGG_DIAGNOSTICS_ENV, "1")
     monkeypatch.setenv(diagnostics.DISAGG_DIAGNOSTICS_RANKS_ENV, "0,2")
 
-    assert DisaggLifecycleEmitter.from_environment(rank=0, runtime="CPP", backend="NIXL").enabled
-    assert not DisaggLifecycleEmitter.from_environment(
+    enabled_emitter = DisaggLifecycleEmitter.from_environment(rank=0, runtime="CPP", backend="NIXL")
+    disabled_emitter = DisaggLifecycleEmitter.from_environment(
         rank=1, runtime="CPP", backend="NIXL"
-    ).enabled
+    )
+    try:
+        assert enabled_emitter.enabled
+        assert not disabled_emitter.enabled
+    finally:
+        assert enabled_emitter.close()
+        assert disabled_emitter.close()
 
 
 def test_request_state_is_named_and_domain_qualified(monkeypatch):
