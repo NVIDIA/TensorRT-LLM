@@ -5540,6 +5540,34 @@ class GvrTopKKernel:
                     s_iscalars[2] = cutlass.Int32(-1)  # cnt_lo (fb seeding owns)
                     s_iscalars[3] = cutlass.Int32(-1)  # cnt_hi
                     s_iscalars[4] = cutlass.Int32(0)  # out_count
+                    # rung parking folded into the SAME thread0 block
+                    # (was a second thread0 block + barrier in the R0
+                    # region): tightest in-band count picks the admitted
+                    # line; single-column builds stage it in s_thr[0] and
+                    # pre-mark the rung column (M_qf = accepted, -2 =
+                    # defensive M-ary rerun).
+                    bx_m = cutlass.Int32(-1)
+                    bx_c = cutlass.Int32(2147483647)
+                    for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
+                        cx = cutlass.Int32(seed_thr_row[3 + m])
+                        if (
+                            cx >= cutlass.Int32(self.top_k)
+                            and cx <= cutlass.Int32(self.kC)
+                            and cx < bx_c
+                        ):
+                            bx_m = cutlass.Int32(m)
+                            bx_c = cx
+                    for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
+                        if bx_m >= cutlass.Int32(0):
+                            s_mt_thr[m] = seed_thr_row[bx_m]
+                        else:
+                            s_mt_thr[m] = seed_thr_row[m]
+                    if cutlass.const_expr(not self.enable_block_skip):
+                        if bx_m >= cutlass.Int32(0):
+                            s_thr[0] = seed_thr_row[bx_m]
+                            s_r0col[0] = cutlass.Int32(self.M_qf)
+                        else:
+                            s_r0col[0] = cutlass.Int32(-2)
                 cute.arch.barrier()
             if ext_row == cutlass.Int32(0):
                 self.phase1_preidx_stats(
@@ -6108,24 +6136,51 @@ class GvrTopKKernel:
                             # count (+ list build at that threshold) and classify
                             # admits it; a full miss keeps the 3 distinct rungs as
                             # measured brackets for the seeded refine.
-                            if tidx == cutlass.Int32(0):
-                                bx_m = cutlass.Int32(-1)
-                                bx_c = cutlass.Int32(2147483647)
-                                for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
-                                    cx = cutlass.Int32(seed_thr_row[3 + m])
-                                    if (
-                                        cx >= cutlass.Int32(self.top_k)
-                                        and cx <= cutlass.Int32(self.kC)
-                                        and cx < bx_c
-                                    ):
-                                        bx_m = cutlass.Int32(m)
-                                        bx_c = cx
-                                for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
-                                    if bx_m >= cutlass.Int32(0):
-                                        s_mt_thr[m] = seed_thr_row[bx_m]
-                                    else:
-                                        s_mt_thr[m] = seed_thr_row[m]
-                            cute.arch.barrier()
+                            # rung parking + single-path staging happen in
+                            # the P1-init thread0 block (one barrier for
+                            # the whole admission prologue).
+                            if cutlass.const_expr(not self.enable_block_skip):
+                                # v3: the parked M-ary pass counted the SAME
+                                # threshold in all three columns (3x compare
+                                # + 3 ptcnt columns for identical values).
+                                # Count it ONCE with the refine primitive -
+                                # same per-thread ptcnt cache and cluster
+                                # merge P3 consumes - and accept in place.
+                                if s_r0col[0] == cutlass.Int32(self.M_qf):
+                                    self.block_count_ge(
+                                        input_row,
+                                        slice_start,
+                                        slice_end,
+                                        s_thr[0],
+                                        smem_ptcnt,
+                                        smem_wcnt,
+                                        s_iscalars,
+                                        s_cluster_partial,
+                                        tidx,
+                                        warp_id,
+                                        lane,
+                                        do_cluster_sync=do_cluster_sync,
+                                        smem_input=smem_input,
+                                    )
+                                    cute.arch.barrier()
+                                    if tidx == cutlass.Int32(0):
+                                        cpar = s_iscalars[0]
+                                        if cpar >= cutlass.Int32(
+                                            self.top_k
+                                        ) and cpar <= cutlass.Int32(self.kC):
+                                            s_iscalars[1] = cutlass.Int32(1)
+                                        else:
+                                            # emission counts disagree with
+                                            # the measured count (stale
+                                            # host state): rerun the full
+                                            # M-ary machinery on the three
+                                            # distinct seed lines.
+                                            s_r0col[0] = cutlass.Int32(-2)
+                                            for m in cutlass.range_constexpr(
+                                                cutlass.const_expr(self.M_thr)
+                                            ):
+                                                s_mt_thr[m] = seed_thr_row[m]
+                                    cute.arch.barrier()
                         if ext_row == cutlass.Int32(0):
                             if cutlass.const_expr(self.p1b_cache):
                                 # rungs from the SMEM gather-cache P1 stashed (no 2nd
@@ -6208,26 +6263,37 @@ class GvrTopKKernel:
                                 warp_id,
                                 lane,
                             )
-                    self.block_count_ge_multi(
-                        input_row,
-                        slice_start,
-                        slice_end,
-                        s_mt_thr,
-                        smem_ptcnt_multi,
-                        smem_wcnt_multi,
-                        s_mt_cnt,
-                        s_cluster_partial_m,
-                        do_cluster_sync,
-                        tidx,
-                        warp_id,
-                        lane,
-                        smem_ptcnt=smem_ptcnt,
-                        block_max_row=block_max_row,
-                        smem_active=smem_active,
-                        s_active_cnt=s_active_cnt,
-                    )
+                    r0_par = cutlass.Int32(0)
+                    if cutlass.const_expr(self.use_ext_counts and not self.enable_block_skip):
+                        # single-column fast path accepted: the parked count
+                        # is done and admitted; the M-ary pass, argmin,
+                        # handoff and miss machinery all stand down
+                        # (s_r0col == M_qf skips the copy and the refine).
+                        if s_r0col[0] == cutlass.Int32(self.M_qf) and s_iscalars[
+                            1
+                        ] == cutlass.Int32(1):
+                            r0_par = cutlass.Int32(1)
+                    if r0_par == cutlass.Int32(0):
+                        self.block_count_ge_multi(
+                            input_row,
+                            slice_start,
+                            slice_end,
+                            s_mt_thr,
+                            smem_ptcnt_multi,
+                            smem_wcnt_multi,
+                            s_mt_cnt,
+                            s_cluster_partial_m,
+                            do_cluster_sync,
+                            tidx,
+                            warp_id,
+                            lane,
+                            smem_ptcnt=smem_ptcnt,
+                            block_max_row=block_max_row,
+                            smem_active=smem_active,
+                            s_active_cnt=s_active_cnt,
+                        )
                     cute.arch.barrier()
-                    if tidx == 0:
+                    if tidx == 0 and r0_par == cutlass.Int32(0):
                         # tightest admissible rung = SMALLEST count in [K, kC].
                         # (Explicit argmin: with r0_vseed the pmean column is not
                         # sorted into the rung order; for sorted rungs this is
