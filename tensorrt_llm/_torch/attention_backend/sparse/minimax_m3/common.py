@@ -11,7 +11,7 @@ slot mapping builder. MSA-only helpers live in :mod:`.msa_utils`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -189,6 +189,15 @@ def write_kv_slots(
             cache.index_copy_(0, out_cache_loc.to(torch.long), values.to(cache.dtype))
 
 
+class PagedKvSlotMapping(NamedTuple):
+    """One step's paged-cache slot mapping (see build_paged_kv_slot_mapping)."""
+
+    req_to_token: torch.Tensor
+    slot_ids: torch.Tensor
+    out_cache_loc: torch.Tensor
+    block_ids_cpu: torch.Tensor
+
+
 def build_paged_kv_slot_mapping(
     *,
     kv_cache_manager,
@@ -196,12 +205,11 @@ def build_paged_kv_slot_mapping(
     qo_lens_cpu: torch.Tensor,
     qo_offset_cpu: torch.Tensor,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> PagedKvSlotMapping:
     """Build the backend-neutral paged-cache slot mapping.
 
-    Returns (req_to_token, slot_ids, out_cache_loc), derived only from the paged
-    KV cache manager and the per-request query geometry, with no dependency on
-    any backend-specific metadata.
+    Derived only from the paged KV cache manager and the per-request query
+    geometry, with no dependency on any backend-specific metadata.
 
     req_to_token is the [batch, max_kv_len] int32 map from (request, position)
     to a global slot id, expanded from get_block_ids_per_seq with
@@ -210,7 +218,10 @@ def build_paged_kv_slot_mapping(
     lists the per-new-token slot ids in flattened query order: request b
     contributes positions qo_offset[b] through qo_offset[b] + qo_lens[b] - 1.
     That one formula covers prefill (qo_offset is the prefix length) and decode
-    (qo_offset is kv_len - 1 with qo_len 1).
+    (qo_offset is kv_len - 1 with qo_len 1). block_ids_cpu is the host block-id
+    table every field above derives from, returned so backends can build their
+    own page-indexed views without a second manager query or a device round
+    trip.
 
     The req_to_token reads that build out_cache_loc sync the host, so call this
     only from prepare(), never from the forward path.
@@ -241,13 +252,14 @@ def build_paged_kv_slot_mapping(
         for offset in range(int(qo_lens_list[b])):
             out_cache_loc_list.append(int(req_to_token_cpu[b, start + offset].item()))
     out_cache_loc = torch.tensor(out_cache_loc_list, dtype=torch.int32, device=device)
-    return req_to_token, slot_ids, out_cache_loc
+    return PagedKvSlotMapping(req_to_token, slot_ids, out_cache_loc, block_ids)
 
 
 __all__ = [
     "MiniMaxM3SparseConfig",
     "MiniMaxM3SparseMetadataParams",
     "MiniMaxM3SparseParams",
+    "PagedKvSlotMapping",
     "build_paged_kv_slot_mapping",
     "write_kv_slots",
 ]

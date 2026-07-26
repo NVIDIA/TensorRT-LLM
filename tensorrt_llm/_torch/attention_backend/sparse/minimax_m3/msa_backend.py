@@ -866,14 +866,18 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # fine: forwards read only the persistent buffers filled below.
         # qo_offset is the prefix length, so one build covers prefill
         # (num_cached) and decode (kv_len - 1 with qo_len 1).
-        req_to_token, slot_ids, out_cache_loc = build_paged_kv_slot_mapping(
+        mapping = build_paged_kv_slot_mapping(
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             qo_lens_cpu=qo_lens_cpu,
             qo_offset_cpu=qo_offset_cpu,
             device=cache_device,
         )
-        kv_indices = build_kv_page_indices(req_to_token, slot_ids, kv_lens_cpu, page_size)
+        req_to_token = mapping.req_to_token
+        out_cache_loc = mapping.out_cache_loc
+        # The page table comes from the same host block ids the mapping was
+        # built from, so it costs no device work.
+        kv_indices = build_kv_page_indices(mapping.block_ids_cpu, kv_lens_cpu, page_size)
 
         total_new_tokens = int(out_cache_loc.shape[0])
         total_pages = int(kv_indices.shape[0])

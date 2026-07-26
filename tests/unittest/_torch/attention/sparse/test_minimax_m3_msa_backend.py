@@ -423,6 +423,44 @@ def test_per_token_valid_blocks_multi_token_decode():
     assert n_valid.tolist() == [3, 1, 2, 2]
 
 
+def _expand_slot_rows(block_ids: torch.Tensor, tokens_per_block: int) -> torch.Tensor:
+    """req_to_token reference: block_id * tokens_per_block + offset_in_block."""
+    within = torch.arange(tokens_per_block, dtype=torch.int64)
+    grid = block_ids.to(torch.int64).unsqueeze(-1) * tokens_per_block + within
+    return grid.reshape(block_ids.shape[0], -1).to(torch.int32)
+
+
+def test_build_kv_page_indices_matches_first_slot_of_each_page():
+    """The host page table must equal the page ids each request's req_to_token
+    row holds at its page boundaries, since both use the manager's
+    tokens_per_block as the page size. Rows are ragged (0-padded block ids,
+    global and non-contiguous) and one request has no KV at all."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        build_kv_page_indices,
+    )
+
+    page_size = 8
+    block_ids = torch.tensor(
+        [[11, 4, 7, 0], [5, 9, 0, 0], [3, 0, 0, 0], [21, 13, 6, 2]],
+        dtype=torch.int32,
+    )
+    # 3 pages (partial last), 2 pages (exact), no pages, 4 pages.
+    kv_lens = torch.tensor([17, 16, 0, 32], dtype=torch.int32)
+    req_to_token = _expand_slot_rows(block_ids, page_size)
+
+    reference = torch.cat(
+        [
+            req_to_token[b, : int(kv_lens[b]) : page_size] // page_size
+            for b in range(block_ids.shape[0])
+        ]
+    )
+    page_indices = build_kv_page_indices(block_ids, kv_lens, page_size)
+
+    assert page_indices.dtype == torch.int32
+    assert page_indices.tolist() == [11, 4, 7, 5, 9, 21, 13, 6, 2]
+    torch.testing.assert_close(page_indices, reference, rtol=0, atol=0)
+
+
 def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k):
     num_tokens = int(slots.shape[0])
     num_heads, head_dim = int(k_cache.shape[1]), int(k_cache.shape[3])
