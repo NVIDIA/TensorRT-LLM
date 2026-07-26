@@ -49,6 +49,7 @@ _P4_TAIL_DBG = bool(int(os.environ.get("GVR_P4_TAIL_DBG", "0")))
 # P4 sub-phase clock64 breakdown -> xstate[1,2,4,5,6,7] (debug: clobbers
 # the closed-loop thr/anch publish; single-shot cells only, not chains)
 _P4_SUB_DBG = bool(int(os.environ.get("GVR_P4_SUB_DBG", "0")))
+_SKIP_DBG = bool(int(os.environ.get("GVR_SKIP_DBG", "0")))
 
 
 # ---------------------------------------------------------------------------
@@ -6564,6 +6565,21 @@ class GvrTopKKernel:
                         # cand_count_p4 = pre-P4 snapshot (P4 repurposes
                         # the s_iscalars slots).
                         xstate_row[3] = cutlass.Float32(cand_count_p4)
+                        if cutlass.const_expr(
+                            self.ext_rungs and not _P4_SUB_DBG and not _P4_TAIL_DBG
+                        ):
+                            # closed-loop food: the three rung counts this
+                            # step measured (exact, straight from the R0
+                            # multi-count) - the host derives next-step
+                            # lines from these instead of re-counting.
+                            xstate_row[4] = cutlass.Float32(s_mt_cnt[0])
+                            xstate_row[5] = cutlass.Float32(s_mt_cnt[1])
+                            xstate_row[6] = cutlass.Float32(s_mt_cnt[2])
+                        if cutlass.const_expr(_SKIP_DBG and self.enable_block_skip):
+                            xstate_row[4] = cutlass.Float32(s_active_cnt[0])
+                            xstate_row[5] = cutlass.Float32(s_active_cnt[1])
+                            xstate_row[6] = cutlass.Float32(s_r0col[0])
+                            xstate_row[7] = cutlass.Float32(s_active_cnt[2])
             else:
                 # cs>1: only the leader (CTA 0 in cluster) runs Phase 4.
                 if is_leader:
