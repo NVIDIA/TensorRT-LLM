@@ -33,9 +33,10 @@ from ...custom_ops.trtllm_gen_custom_ops import \
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
+from ...utils import (ActivationType, ActType_TrtllmGen, AuxStreamType,
+                      Fp4QuantizedTensor)
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
-from .moe_op_backend import MoEOpBackend, get_op_backend
+from .moe_op_backend import MoEOpBackend, TRTLLMOpBackend, get_op_backend
 from .wide_ep_ft import get_wide_ep_ft_options
 
 # isort: off
@@ -212,6 +213,9 @@ class TRTLLMGenFusedMoE(MoE):
         init_load_balancer: bool = True,
         without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
+        trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
+        trtllm_gen_activation_alpha: Optional[float] = None,
+        trtllm_gen_activation_beta: Optional[float] = None,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -232,6 +236,13 @@ class TRTLLMGenFusedMoE(MoE):
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
         )
+
+        self.trtllm_gen_activation_type = (
+            ActType_TrtllmGen(trtllm_gen_activation_type)
+            if trtllm_gen_activation_type is not None else None)
+        self.trtllm_gen_activation_alpha = trtllm_gen_activation_alpha
+        self.trtllm_gen_activation_beta = trtllm_gen_activation_beta
+        self._validate_backend_local_activation()
 
         # Cached for autotune profile sizing (forward path passes
         # tune_max_num_tokens to the MoE op).
@@ -330,6 +341,8 @@ class TRTLLMGenFusedMoE(MoE):
 
     def _to_trtllm_gen_activation_type(self,
                                        activation_type: ActivationType) -> int:
+        if self.trtllm_gen_activation_type is not None:
+            return int(self.trtllm_gen_activation_type)
         if activation_type == ActivationType.Swiglu:
             return 0
         elif activation_type == ActivationType.SwigluBias:
@@ -342,6 +355,76 @@ class TRTLLMGenFusedMoE(MoE):
             return 2
         else:
             raise ValueError(f"Unsupported activation type: {activation_type}")
+
+    @property
+    def is_situ_activation(self) -> bool:
+        return self.trtllm_gen_activation_type == ActType_TrtllmGen.SiTu
+
+    def _validate_backend_local_activation(self) -> None:
+        if self.trtllm_gen_activation_type is None:
+            if (self.trtllm_gen_activation_alpha is not None
+                    or self.trtllm_gen_activation_beta is not None):
+                raise ValueError(
+                    "TRTLLM-Gen backend-local activation alpha/beta require "
+                    "trtllm_gen_activation_type.")
+            return
+
+        if not self.is_situ_activation:
+            raise ValueError(
+                "Only the SiTu TRTLLM-Gen backend-local activation is "
+                f"supported, got {self.trtllm_gen_activation_type.name}.")
+        if self.dtype != torch.bfloat16:
+            raise ValueError(
+                "TRTLLM-Gen SiTu requires bfloat16 activations, got "
+                f"{self.dtype}.")
+        if get_sm_version() not in {100, 103}:
+            raise ValueError("TRTLLM-Gen SiTu requires SM100 or SM103, got "
+                             f"SM{get_sm_version()}.")
+        if (self.quant_config is None
+                or self.quant_config.quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8):
+            quant_algo = (None if self.quant_config is None else
+                          self.quant_config.quant_algo)
+            raise ValueError(
+                "TRTLLM-Gen SiTu requires W4A8_MXFP4_MXFP8 quantization, "
+                f"got {quant_algo}.")
+        if self.tp_size > 1:
+            # Intra-expert MoE TP: w1/w3 column-shard and w2 row-shard along
+            # the intermediate dim (the stock MXFP4 quant-method loaders slice
+            # the group-32 packed bytes and scales per rank). Require the
+            # per-rank shard to stay a whole multiple of the quant method's
+            # weight alignment so per-shard scale groups and the padded
+            # weight buffers line up without fractional groups.
+            alignment = W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.weight_alignment
+            if (self.intermediate_size % self.tp_size != 0
+                    or self.intermediate_size_per_partition % alignment != 0):
+                raise ValueError(
+                    "TRTLLM-Gen SiTu MoE TP requires intermediate_size "
+                    f"({self.intermediate_size}) divisible by moe_tp_size "
+                    f"({self.tp_size}) with the per-rank shard a multiple of "
+                    f"{alignment}, got "
+                    f"{self.intermediate_size_per_partition}.")
+        if self.activation_type != ActivationType.Swiglu:
+            raise ValueError(
+                "TRTLLM-Gen SiTu must use generic SwiGLU geometry so FC1 "
+                "contains gate and up projections.")
+        if self.bias or any(
+                value is not None
+                for value in (self.swiglu_alpha, self.swiglu_beta,
+                              self.swiglu_limit, self.swiglu_limit_scalar)):
+            raise ValueError(
+                "TRTLLM-Gen SiTu does not support bias or SwiGLU-specific "
+                "alpha/beta/limit parameters.")
+        if (self.trtllm_gen_activation_alpha is None
+                or self.trtllm_gen_activation_beta is None):
+            raise ValueError(
+                "TRTLLM-Gen SiTu requires both backend-local activation "
+                "alpha and beta.")
+        if (self.trtllm_gen_activation_alpha <= 0.0
+                or self.trtllm_gen_activation_beta <= 0.0):
+            raise ValueError(
+                "TRTLLM-Gen SiTu activation alpha/beta must be positive, got "
+                f"{self.trtllm_gen_activation_alpha} and "
+                f"{self.trtllm_gen_activation_beta}.")
 
     @staticmethod
     def _is_flashinfer_fused_moe_available() -> bool:
@@ -364,6 +447,11 @@ class TRTLLMGenFusedMoE(MoE):
         return not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
 
     def _check_flashinfer_backend_support(self) -> bool:
+        # SiTu is provided by the native TRTLLM-Gen cubin and is not part of
+        # FlashInfer's activation enum.
+        if self.is_situ_activation:
+            return False
+
         # For BF16 (unquantized) path, we will use FlashInfer regardless whether
         # env TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER=1 is set or not as it's the only way.
         if self._is_unquantized_path():
@@ -495,6 +583,26 @@ class TRTLLMGenFusedMoE(MoE):
                     "TRTLLMGenFusedMoE FP8 block-scale path only supports the uniform " \
                     "swiglu_limit_scalar, not a per-expert swiglu_limit tensor."
 
+        if self.is_situ_activation:
+            if not isinstance(self.op_backend, TRTLLMOpBackend):
+                raise ValueError(
+                    "TRTLLM-Gen SiTu requires the native TRTLLM op backend.")
+            if not self.has_w4a8_mxfp4_mxfp8:
+                raise ValueError(
+                    "TRTLLM-Gen SiTu requires the W4A8_MXFP4_MXFP8 path.")
+            if self.scaling_vector_size != 32:
+                raise ValueError(
+                    "TRTLLM-Gen SiTu requires MXFP4 scaling vector size 32, "
+                    f"got {self.scaling_vector_size}.")
+            for name in ("situ_alpha", "situ_beta"):
+                value = getattr(self, name)
+                if (value.dtype != torch.float32
+                        or value.shape != (self.expert_size_per_partition, )
+                        or not value.is_contiguous()):
+                    raise ValueError(
+                        f"{name} must be a contiguous float32 tensor with "
+                        "one value per local expert/slot.")
+
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
@@ -527,6 +635,20 @@ class TRTLLMGenFusedMoE(MoE):
         self.quant_method = self._get_quant_method()
         self.quant_method.create_weights(self)
 
+        if self.is_situ_activation:
+            situ_alpha = nn.Parameter(torch.full(
+                (self.expert_size_per_partition, ),
+                float(self.trtllm_gen_activation_alpha),
+                dtype=torch.float32),
+                                      requires_grad=False)
+            situ_beta = nn.Parameter(torch.full(
+                (self.expert_size_per_partition, ),
+                float(self.trtllm_gen_activation_beta),
+                dtype=torch.float32),
+                                     requires_grad=False)
+            self.register_parameter("situ_alpha", situ_alpha)
+            self.register_parameter("situ_beta", situ_beta)
+
         self._weights_created = True
         self._check_configs()
 
@@ -543,6 +665,14 @@ class TRTLLMGenFusedMoE(MoE):
                 dtype=torch.float32),
                                         requires_grad=False)
             self.register_parameter("w2_bias", self.w2_bias)
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        if self.is_situ_activation:
+            # Reinitialize constants after meta-device materialization. These
+            # are backend configuration, not checkpoint weights.
+            self.situ_alpha.data.fill_(float(self.trtllm_gen_activation_alpha))
+            self.situ_beta.data.fill_(float(self.trtllm_gen_activation_beta))
 
     def load_weights(self,
                      weights: List[Dict],
@@ -792,12 +922,16 @@ class TRTLLMGenFusedMoE(MoE):
             # When output is provided, use it directly as the result
             final_hidden_states = moe_output if moe_output is not None else result
         elif self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_mxfp8:
-            factor = 1 if self.activation_type in [
-                ActivationType.Relu2, ActivationType.Silu
+            act_type = self._to_trtllm_gen_activation_type(self.activation_type)
+            factor = 1 if act_type in [
+                ActType_TrtllmGen.Relu2, ActType_TrtllmGen.Silu
             ] else 2
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // factor
-            act_type = self._to_trtllm_gen_activation_type(self.activation_type)
+            gemm1_alpha = (self.situ_alpha
+                           if self.is_situ_activation else self.swiglu_alpha)
+            gemm1_beta = (self.situ_beta
+                          if self.is_situ_activation else self.swiglu_beta)
 
             output1_scale_scalar = self._get_data_or_none("fc31_scale_c")
             output1_scale_gate_scalar = self._get_data_or_none("fc31_alpha")
@@ -811,8 +945,8 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w3_w1_weight,
                 self.w3_w1_weight_scale,
                 self.w3_w1_bias if self.bias else None,
-                self.swiglu_alpha,
-                self.swiglu_beta,
+                gemm1_alpha,
+                gemm1_beta,
                 self.swiglu_limit,
                 self.w2_weight,
                 self.w2_weight_scale,
@@ -963,7 +1097,10 @@ class TRTLLMGenFusedMoE(MoE):
         run_post_quant_allgather = (self.use_dp and self.parallel_size > 1
                                     and not self.enable_alltoall)
         post_quant_comm = run_post_quant_allgather or self.enable_alltoall
-        requires_separated_routing = self.routing_method.requires_separated_routing
+        requires_separated_routing = (
+            self.routing_method.requires_separated_routing
+            or os.environ.get("TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING",
+                              "0") == "1")
 
         x_sf = None
         token_selected_experts = None
