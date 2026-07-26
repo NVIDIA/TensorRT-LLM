@@ -33,10 +33,16 @@ adapted for the production ``trtllm::cute_dsl_gvr_topk_decode`` contract:
 
 Faithful phase-by-phase port otherwise:
   P1  : hint gather + minmax + two-stage 64-bin histogram -> CCDF rung ladder
-  P2a : uniform every-32nd-float4 sampled multi-rung count -> 3-stage pivot
-  P2b : ONE fused streaming pass: exact counts at {pivot, hmin} + optimistic
-        collect of packed (key<<32|idx) u64 candidates >= pivot into CTA0
-        smem (capped kC)
+  P2a : uniform every-32nd-float4 sampled multi-rung count (+ per-rung
+        float4 occupancy for a clustering-aware sigma) -> 4-stage pivot:
+        stage 0 is the hint-ladder ADMISSION (in-tree R0 op#26 parity) —
+        tightest rung whose sampled CI sits inside [K, kC] — followed by
+        the legacy 3-stage pick when no rung qualifies
+  P2b : ONE fused streaming pass: exact counts at {pivot, rescue rung}
+        + optimistic collect of packed (key<<32|idx) u64 candidates
+        >= pivot into CTA0 smem (capped kC). Pivot count in [K, kC] =>
+        the candidates are reused as-is (1-pass admission); pivot under K
+        but rescue in-window => ONE collect re-stream
   P2c : multi-rung secant refine / max-below plateau descent when the pivot
         count misses [K, kC]
   P3  : candidate reuse (thr == tpush, no overflow) or one re-stream collect
@@ -384,6 +390,17 @@ class GvrTpKernel:
 
     # ------------------------------------------------------------------
     # sample_count<TB, R, SS>: uniform every-SS-th float4 over the slice.
+    # Each per-thread accumulator PACKS the per-rung hit count (low 16
+    # bits) with the per-rung float4 OCCUPANCY (high 16 bits) — the number
+    # of sampled float4s with at least one hit. On spatially-clustered
+    # real rows the 4 values of one float4 are strongly correlated, so the
+    # effective independent sample count is the occupancy, not the hit
+    # count: the admission stage sizes its confidence interval with the
+    # compound-Poisson sigma cnt/sqrt(occ) (equal to the classic
+    # sqrt(cnt) Poisson sigma on IID data where occ == cnt). Packing
+    # keeps registers, SMEM and the exchange at their pre-admission
+    # sizes; no field overflow: the bsx envelope pins npad <= 262144, so
+    # cluster-total cnt <= npad/32 = 8192 < 2^16 and occ <= npad/128.
     # ------------------------------------------------------------------
     @cute.jit
     def sample_count(self, R: cutlass.Constexpr, row_addr, v0, v1, n_eff, tidx, s_rungs, s_ptcnt):
@@ -399,10 +416,18 @@ class GvrTpKernel:
         while v0 + j * cutlass.Int32(SS) < v1:
             self._ld_float4(copy_atom, row_addr, v0 + j * cutlass.Int32(SS), frag)
             gi = (v0 + j * cutlass.Int32(SS)) << cutlass.Int32(2)
-            for q in cutlass.range_constexpr(4):
-                v = _mask_tail(frag[q], gi + cutlass.Int32(q), n_eff)
-                for r in cutlass.range_constexpr(R):
-                    cnt[r] = cnt[r] + cutlass.Int32(v >= tr[r])
+            v0m = _mask_tail(frag[0], gi, n_eff)
+            v1m = _mask_tail(frag[1], gi + cutlass.Int32(1), n_eff)
+            v2m = _mask_tail(frag[2], gi + cutlass.Int32(2), n_eff)
+            v3m = _mask_tail(frag[3], gi + cutlass.Int32(3), n_eff)
+            for r in cutlass.range_constexpr(R):
+                c4 = (
+                    cutlass.Int32(v0m >= tr[r])
+                    + cutlass.Int32(v1m >= tr[r])
+                    + cutlass.Int32(v2m >= tr[r])
+                    + cutlass.Int32(v3m >= tr[r])
+                )
+                cnt[r] = cnt[r] + c4 + (cutlass.Int32(c4 > cutlass.Int32(0)) << cutlass.Int32(16))
             j = j + cutlass.Int32(TB)
         for r in cutlass.range_constexpr(R):
             s_ptcnt[r * TB + tidx] = cnt[r]
@@ -410,6 +435,8 @@ class GvrTpKernel:
     # ------------------------------------------------------------------
     # exchange_counts<TB, CS, R>: warp-fused CTA reduce -> cluster sum + prefix.
     # rcnt[r] = cluster-wide count, rpre[r] = exclusive prefix over lower ranks.
+    # P2a rows carry packed (occ << 16 | cnt) accumulators; the integer sum
+    # distributes over the packed fields (no overflow: see sample_count).
     # ------------------------------------------------------------------
     @cute.jit
     def exchange_counts(
@@ -662,7 +689,12 @@ class GvrTpKernel:
 
     # ------------------------------------------------------------------
     # fused_count_collect<TB, 2, UF>: exact counts at {rungs[0]=pivot,
-    # rungs[1]=hmin} + push (key,idx) >= tpush into CTA0 cand, capped kcap.
+    # rungs[1]=rescue} + push (key,idx) >= tpush into CTA0 cand, capped
+    # kcap. The rescue rung (next fatter ladder rung) replaces HEAD's hmin
+    # column at identical register cost: on a pivot undershoot the driver
+    # accepts the rescue with ONE collect re-stream instead of the
+    # multi-pass secant loop (hmin was a bracket-only data point; the
+    # secant fallback re-derives its bracket from the rescue instead).
     # Keys are RAW fp32 bits (f2u happens in P4 round 0), matching CUDA.
     # Candidates are a single packed (key<<32 | idx) u64 array — CUDA's
     # `unsigned long long cand[kC]` — one 8B push per candidate.
@@ -962,7 +994,9 @@ class GvrTpKernel:
                 )
                 hmin_floor = s_rungs[AR - 1]
                 span0 = cute.arch.fmax(s_hminmax[1] - s_hminmax[0], cutlass.Float32(1e-3))
-                # P2a: sampled ladder count -> pivot pick
+                # P2a: sampled ladder count -> pivot pick. The exchanged rows
+                # carry packed (occ << 16 | cnt) values (admission sigma
+                # input); every consumer below unpacks with & 0xFFFF / >> 16.
                 self.sample_count(AR, row_addr, v0, v1, n_eff, tidx, s_rungs, s_ptcnt)
                 self.exchange_counts(
                     AR, xch & cutlass.Int32(1), tidx, rank, s_ptcnt, s_rcnt, s_rpre, s_ipartial
@@ -970,16 +1004,60 @@ class GvrTpKernel:
                 xch = xch + cutlass.Int32(1)
                 cute.arch.barrier()
                 if tidx == cutlass.Int32(0):
-                    # 3-stage pivot pick (iter7 band -> iter8b 2-sigma ->
-                    # iter12-F1b gamble)
+                    # 4-stage pivot pick (R0-admission tightest-in-window ->
+                    # iter7 band -> iter8b 2-sigma -> iter12-F1b gamble)
                     lo = cutlass.const_expr((3 * K) // 2)
                     hi = cutlass.const_expr((6 * kC) // 10)
                     tgt_py = min(max(3 * K, (3 * K) // 2), (6 * kC) // 10)
                     tgt = cutlass.Int32(tgt_py)
                     best = cutlass.Int32(AR - 1)
                     bestd = cutlass.Int32(0x7FFFFFFF)
+                    # Stage 0 — hint-ladder ADMISSION (in-tree R0 parity,
+                    # op#26 lineage): accept the TIGHTEST ladder rung
+                    # (highest threshold = smallest admitted-candidate set)
+                    # whose sampled-count confidence interval lies inside
+                    # the [K, kC] acceptance window, mirroring the R0 rule
+                    # "smallest exact count in [K, kC]". The old stage-1
+                    # band ([1.5K, 0.6kC], target ~3K) systematically picks
+                    # a FAT rung on real high-hit-rate rows (2-4x more P3
+                    # pushes + P4 candidates than needed — the v32/pro
+                    # BS>=16 losses vs the in-tree R0 kernel) or, when
+                    # spatially-clustered real data inflates a sampled
+                    # estimate into the band while the true count is < K,
+                    # an undershooting one (whole-row secant + re-stream:
+                    # the flash_512k 1.6-1.8x losses).
+                    # Sigma is clustering-aware: est = SS*cnt, sigma =
+                    # SS*cnt/sqrt(occ) (compound Poisson over occupied
+                    # float4 clumps; equals the classic sqrt(SS*est) when
+                    # occ == cnt, i.e. IID rows). Lower margin is 2 sigma;
+                    # K2048 uses 1.5 (its [K, 4K] window is too narrow for
+                    # 2-sigma to ever fire tight, and the rescue rung
+                    # bounds a miss at one extra collect pass). Rungs are
+                    # descending in j, so the first passing j is the
+                    # tightest; later stages never override (their dd >= 0
+                    # cannot beat bestd == 0).
+                    mlo = cutlass.const_expr(1.5 if K >= 2048 else 2.0)
                     for j in cutlass.range_constexpr(AR):
-                        est = s_rcnt[j] * cutlass.Int32(SS)
+                        cnt_j = s_rcnt[j] & cutlass.Int32(0xFFFF)
+                        if cnt_j > cutlass.Int32(0):
+                            if bestd == cutlass.Int32(0x7FFFFFFF):
+                                occ_j = s_rcnt[j] >> cutlass.Int32(16)
+                                if occ_j < cutlass.Int32(1):
+                                    occ_j = cutlass.Int32(1)
+                                sig = (
+                                    cutlass.Float32(float(SS))
+                                    * cutlass.Float32(cnt_j)
+                                    / cmath.sqrt(cutlass.Float32(occ_j))
+                                )
+                                fest = cutlass.Float32(cnt_j * cutlass.Int32(SS))
+                                if fest - cutlass.Float32(mlo) * sig >= cutlass.Float32(float(K)):
+                                    if fest + cutlass.Float32(2.0) * sig <= cutlass.Float32(
+                                        float(kC)
+                                    ):
+                                        bestd = cutlass.Int32(0)
+                                        best = cutlass.Int32(j)
+                    for j in cutlass.range_constexpr(AR):
+                        est = (s_rcnt[j] & cutlass.Int32(0xFFFF)) * cutlass.Int32(SS)
                         if est >= cutlass.Int32(lo):
                             if est <= cutlass.Int32(hi):
                                 dd = est - tgt
@@ -990,7 +1068,7 @@ class GvrTpKernel:
                                     best = cutlass.Int32(j)
                     if bestd == cutlass.Int32(0x7FFFFFFF):
                         for j in cutlass.range_constexpr(AR):
-                            est = s_rcnt[j] * cutlass.Int32(SS)
+                            est = (s_rcnt[j] & cutlass.Int32(0xFFFF)) * cutlass.Int32(SS)
                             if est > cutlass.Int32(0):
                                 g = cutlass.Float32(2.0) * cmath.sqrt(
                                     cutlass.Float32(cutlass.Int32(SS) * est)
@@ -1005,9 +1083,11 @@ class GvrTpKernel:
                                             bestd = dd
                                             best = cutlass.Int32(j)
                     if bestd == cutlass.Int32(0x7FFFFFFF):
-                        if s_rcnt[AR - 1] * cutlass.Int32(SS) > cutlass.Int32(kC):
+                        if (s_rcnt[AR - 1] & cutlass.Int32(0xFFFF)) * cutlass.Int32(
+                            SS
+                        ) > cutlass.Int32(kC):
                             for j in cutlass.range_constexpr(AR):
-                                est = s_rcnt[j] * cutlass.Int32(SS)
+                                est = (s_rcnt[j] & cutlass.Int32(0xFFFF)) * cutlass.Int32(SS)
                                 if est > cutlass.Int32(0):
                                     dd = est - tgt
                                     if dd < cutlass.Int32(0):
@@ -1016,8 +1096,17 @@ class GvrTpKernel:
                                         bestd = dd
                                         best = cutlass.Int32(j)
                     tp_ = s_rungs[best]
+                    # Rescue rung: the next FATTER ladder rung below the
+                    # pivot. If the pivot's exact count lands under K
+                    # (sampling error on a clustered row), the driver can
+                    # accept the rescue with ONE collect re-stream instead
+                    # of the multi-pass secant loop. Read before the ladder
+                    # slots are overwritten.
+                    resc_ = hmin_floor
+                    if best < cutlass.Int32(AR - 1):
+                        resc_ = s_rungs[best + cutlass.Int32(1)]
                     s_rungs[0] = tp_
-                    s_rungs[1] = hmin_floor
+                    s_rungs[1] = resc_
                 cute.arch.barrier()
                 tpush = s_rungs[0]
                 self.fused_count_collect(

@@ -131,6 +131,7 @@ def _make_bsx_inputs(
     kind: str = "randn",
     varlen: bool = True,
     preidx: str = "mixed",
+    hit_rate: float = 0.5,
 ):
     """Build (logits fp32, pre_idx int32, seq_lens int32) for the bsx path.
 
@@ -141,9 +142,9 @@ def _make_bsx_inputs(
     top-K if the lane masking were broken (production tails are stale
     values, not -FLT_MAX pad).
 
-    ``preidx``: 'mixed' = argmax slot 0 + ~50% real topk hints;
-    'zeros' = all-zero cold start; 'oor' = out-of-range garbage
-    (negative / >= npad) that the kernels must clamp harmlessly.
+    ``preidx``: 'mixed' = argmax slot 0 + ``hit_rate`` real topk hints
+    (default ~50%); 'zeros' = all-zero cold start; 'oor' = out-of-range
+    garbage (negative / >= npad) that the kernels must clamp harmlessly.
     """
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -170,7 +171,7 @@ def _make_bsx_inputs(
         pre_idx = torch.randint(-npad, 4 * npad, (bs, top_k), dtype=torch.int32, device="cuda")
     else:
         ref_topk = valid_logits.topk(top_k, dim=-1).indices.int()
-        keep = torch.rand(ref_topk.shape, device="cuda") < 0.5
+        keep = torch.rand(ref_topk.shape, device="cuda") < hit_rate
         junk = torch.arange(top_k, dtype=torch.int32, device="cuda").expand(bs, -1)
         # junk arange is in-range for every row: N_eff > top_k here.
         pre_idx = torch.where(keep, ref_topk, junk).contiguous()
@@ -424,6 +425,106 @@ def test_bsx_preidx_hardening(npad, bs, top_k, preidx):
     logits, pre_idx, seq_lens = _make_bsx_inputs(
         bs, npad, top_k, seed=13, kind="randn", varlen=True, preidx=preidx
     )
+    out = _run_op(logits, pre_idx, seq_lens, top_k)
+    _tie_aware_check(out, logits, seq_lens, top_k)
+
+
+# ---------------------------------------------------------------------------
+# tp-tier hint-ladder ADMISSION fast path (R0 parity): the P2a stage-0 pick
+# pushes candidates at the tightest ladder rung whose sampled CI lies in
+# [K, kC], so high-hit-rate rows finish in one fused streaming pass. These
+# cases pin the admission decision surface: hit-rate extremes, tie plateaus
+# AT the admission threshold, forced count > kC overflow fallback, and a
+# batch mixing admitted and fallback rows (per-row escape independence).
+# ---------------------------------------------------------------------------
+@skip_not_sm100
+@pytest.mark.parametrize("hit_rate", [0.85, 0.15])
+@pytest.mark.parametrize(
+    "npad,bs,top_k",
+    [
+        (65536, 16, 1024),  # cs=8 cluster tp (pro-like)
+        (32832, 16, 2048),  # cs=4 cluster tp (v32 32k production shape)
+        (131136, 128, 512),  # cs=1 streaming tp (flash 512k production shape)
+    ],
+)
+def test_bsx_tp_admission_hitrate(npad, bs, top_k, hit_rate):
+    """High-hr rows must admit (1-pass) and low-hr rows must stay exact via
+    the pivot/secant fallback; both paths must produce exact top-K."""
+    _skip_if_cluster_capped(bs, npad, top_k)
+    logits, pre_idx, seq_lens = _make_bsx_inputs(
+        bs, npad, top_k, seed=npad + bs + int(hit_rate * 100), varlen=True, hit_rate=hit_rate
+    )
+    _assert_bsx_routes(logits, pre_idx, seq_lens, top_k, "tp")
+    out = _run_op(logits, pre_idx, seq_lens, top_k)
+    _tie_aware_check(out, logits, seq_lens, top_k)
+
+
+@skip_not_sm100
+def test_bsx_tp_admission_tie_plateau():
+    """Tie plateau AT the admission threshold: K/2 distinct high values +
+    a 3K-wide exact-tie plateau straddling the K-th rank. The hint set is
+    the true top-K, so the ladder rungs land ON the plateau value and the
+    admitted candidate set is tie-degenerate; the P4 tie-ticket emit must
+    still return an exact value multiset."""
+    bs, npad, top_k = 16, 65536, 1024  # cs=8 tp
+    _skip_if_cluster_capped(bs, npad, top_k)
+    torch.manual_seed(31)
+    torch.cuda.manual_seed(31)
+    logits = -torch.rand(bs, npad, dtype=torch.float32, device="cuda") - 1.0
+    for r in range(bs):
+        perm = torch.randperm(npad, device="cuda")
+        hi = perm[: top_k // 2]
+        plateau = perm[top_k // 2 : top_k // 2 + 3 * top_k]
+        logits[r, hi] = 5.0 + torch.arange(top_k // 2, device="cuda").float() * 0.01
+        logits[r, plateau] = 1.0  # exact ties straddling rank K
+    seq_lens = torch.full((bs,), npad * CR, dtype=torch.int32, device="cuda")
+    pre_idx = logits.topk(top_k, dim=-1).indices.int().contiguous()
+    _assert_bsx_routes(logits, pre_idx, seq_lens, top_k, "tp")
+    out = _run_op(logits, pre_idx, seq_lens, top_k)
+    _tie_aware_check(out, logits, seq_lens, top_k)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("top_k,n_plateau", [(1024, 8000), (2048, 12000)])
+def test_bsx_tp_admission_overflow_fallback(top_k, n_plateau):
+    """count(>= any admissible threshold) > kC: K-1 distinct high values,
+    then an n_plateau-wide exact-tie plateau (n_plateau > kC = 6144/8192).
+    Every threshold at or below the plateau overflows the candidate buffer
+    (the uncapped push counter detects it) and every threshold above it
+    undershoots (K-1 < K), so admission can never accept and the kernel
+    must fall through to the max-below plateau-descent path and its direct
+    emit. Exact answer: the K-1 highs plus exactly one plateau member."""
+    bs, npad = 16, 65536  # cs=8 tp
+    _skip_if_cluster_capped(bs, npad, top_k)
+    torch.manual_seed(37)
+    torch.cuda.manual_seed(37)
+    logits = -torch.rand(bs, npad, dtype=torch.float32, device="cuda") - 1.0
+    for r in range(bs):
+        perm = torch.randperm(npad, device="cuda")
+        hi = perm[: top_k - 1]
+        plateau = perm[top_k - 1 : top_k - 1 + n_plateau]
+        logits[r, hi] = 5.0 + torch.arange(top_k - 1, device="cuda").float() * 0.01
+        logits[r, plateau] = 1.0
+    seq_lens = torch.full((bs,), npad * CR, dtype=torch.int32, device="cuda")
+    pre_idx = logits.topk(top_k, dim=-1).indices.int().contiguous()
+    _assert_bsx_routes(logits, pre_idx, seq_lens, top_k, "tp")
+    out = _run_op(logits, pre_idx, seq_lens, top_k)
+    _tie_aware_check(out, logits, seq_lens, top_k)
+
+
+@skip_not_sm100
+def test_bsx_tp_admission_mixed_batch():
+    """Ragged batch mixing rows that admit (true-top-K hints) with rows
+    that must fall back (all-zero cold-start hints): per-row admission
+    escape is independent, so every row must stay exact regardless of
+    which path its cluster takes."""
+    bs, npad, top_k = 16, 65536, 1024  # cs=8 tp
+    _skip_if_cluster_capped(bs, npad, top_k)
+    logits, pre_idx, seq_lens = _make_bsx_inputs(
+        bs, npad, top_k, seed=41, varlen=True, hit_rate=0.9
+    )
+    pre_idx[1::2] = 0  # odd rows: cold-start (degenerate ladder -> fallback)
+    _assert_bsx_routes(logits, pre_idx, seq_lens, top_k, "tp")
     out = _run_op(logits, pre_idx, seq_lens, top_k)
     _tie_aware_check(out, logits, seq_lens, top_k)
 
