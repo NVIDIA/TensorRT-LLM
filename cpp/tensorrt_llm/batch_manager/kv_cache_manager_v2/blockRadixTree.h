@@ -20,10 +20,13 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/eventSink.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
+#include "kv_cache_manager_v2/tokenIdExt.h"
+#include "kv_cache_manager_v2/utils/math.h" // HalfOpenRange
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
 #include "sha256.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <iterator>
@@ -88,11 +91,14 @@ public:
     explicit Hasher(ReuseScope const& seed);
 
     Hasher& update(TokenId token);
-    Hasher& update(BlockKey const& key);
+    Hasher& update(Digest const& digest); // 32 raw bytes (BlockKey is a Digest alias)
     Hasher& update(ReuseScope const& scope);
     Hasher& update(std::vector<uint8_t> const& bytes);
     Hasher& update(TokenIdExt const& tokenExt);
-    Hasher& update(TokenIdExt const* tokens, size_t count);
+    // knownNoDigest: caller guarantees the range holds no digest, enabling the bulk
+    // fast path. Only pass true from external knowledge (request/model text_only) — never
+    // from scanning the tokens, since false already makes update() scan internally.
+    Hasher& update(TokenIdExt const* tokens, size_t count, bool knownNoDigest = false);
 
     BlockKey digest() const;
 
@@ -100,16 +106,61 @@ private:
     CSHA256 mState;
 };
 
-// ---------------------------------------------------------------------------
-// Utility: convert a token sequence → list of BlockKeys.
-// First key is the root (reuseScope digest), then one per token block.
-// Mirrors Python's sequence_to_blockchain_keys().
-// ---------------------------------------------------------------------------
-std::vector<BlockKey> sequenceToBlockchainKeys(
-    int tokensPerBlock, ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens);
+// One step of the blockchain-key generator: a block's key plus the half-open token
+// index range [beg, end) it covers ([0, 0) for the root). Carrying the range lets
+// callers slice the tokens without re-deriving block boundaries, mirroring Python's
+// (token_block, key) pairs.
+struct BlockchainKeyStep
+{
+    BlockKey key;
+    HalfOpenRange<size_t> tokens;
+};
 
-// Generate multi-modal token IDs (mirrors gen_multi_modal_tokens in Python).
-std::vector<TokenIdExt> genMultiModalTokens(
+// ---------------------------------------------------------------------------
+// sequenceToBlockchainKeys — lazy per-block key generator.
+// Returns a callable yielding one BlockchainKeyStep per call (nullopt when done):
+// the first call yields the root (reuseScope digest, empty [0,0) range), then one
+// step per tokensPerBlock chunk chained on the previous digest. Mirrors Python's
+// sequence_to_blockchain_keys(). Lazy so a caller that stops early (e.g. on the
+// first mismatch) skips the remaining hashing. Inline so both the tree
+// (matchTokenPath) and the nanobind layer drive the same generator.
+// knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
+// ---------------------------------------------------------------------------
+inline auto sequenceToBlockchainKeys(
+    int tokensPerBlock, ReuseScope reuseScope, TokenIdExt const* tokens, size_t numTokens, bool knownNoDigest = false)
+{
+    // digest carries the running hash from the previous block.
+    BlockKey digest = Hasher(reuseScope).digest();
+    // ordinal = -1: next call yields root (reuseScope digest).
+    // ordinal >= 0: next call yields key for tokens[ordinal*tpb .. (ordinal+1)*tpb).
+    int ordinal = -1;
+
+    return [=]() mutable -> std::optional<BlockchainKeyStep>
+    {
+        if (ordinal == -1)
+        {
+            ordinal++;
+            return BlockchainKeyStep{digest, {}}; // root key, empty [0,0) token range
+        }
+
+        size_t beg = static_cast<size_t>(ordinal) * static_cast<size_t>(tokensPerBlock);
+        if (beg >= numTokens)
+            return std::nullopt;
+
+        size_t end = std::min(beg + static_cast<size_t>(tokensPerBlock), numTokens);
+
+        Hasher h;
+        h.update(digest);
+        h.update(tokens + beg, end - beg, knownNoDigest);
+        digest = h.digest();
+
+        ordinal++;
+        return BlockchainKeyStep{digest, {beg, end}};
+    };
+}
+
+// Generate multi-modal token IDs (mirrors gen_multimodal_cache_key_tokens in Python).
+std::vector<TokenIdExt> genMultimodalCacheKeyTokens(
     int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset = 0);
 
 // ---------------------------------------------------------------------------
@@ -138,6 +189,10 @@ struct NodeBase
 
     /// RootBlock: delegates to tree. Block: len(prev->tokens) or prev->tokensPerBlock().
     virtual int tokensPerBlock() const noexcept = 0;
+
+    /// Tree-wide life-cycle count. RootBlock: delegates to tree. Block: storage.size().
+    /// Mirrors Python's num_life_cycles property.
+    virtual LifeCycleId numLifeCycles() const noexcept = 0;
 
 protected:
     NodeBase(BlockKey k, EventSink* sink)
@@ -172,6 +227,7 @@ struct RootBlock : NodeBase
     }
 
     int tokensPerBlock() const noexcept override;
+    LifeCycleId numLifeCycles() const noexcept override; // delegates to tree
 };
 
 // ---------------------------------------------------------------------------
@@ -181,6 +237,8 @@ struct RootBlock : NodeBase
 // ---------------------------------------------------------------------------
 struct Block : NodeBase, EnableSharedFromThis<Block>
 {
+    // A block's tokens are written once and never re-hashed because its key is
+    // computed before construction, so store them in a plain vector.
     std::vector<TokenIdExt> tokens;
 
     // Previous node in the chain (RootBlock or Block). Null after detaching from the tree.
@@ -189,10 +247,14 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
 
     TypedVec<LifeCycleId, CommittedPage*> storage;
 
-    Block(BlockKey key, std::vector<TokenIdExt> tokens, NodeBase* prev, LifeCycleId numLifeCycles);
+    // key is precomputed by the caller (for the pre-construction dedup lookup);
+    // numLifeCycles is derived from prev. tokens is moved in as a plain vector.
+    Block(BlockKey key, std::vector<TokenIdExt> tokens, NodeBase* prev);
     ~Block() override;
 
-    static BlockKey makeKey(BlockKey const& prevKey, TokenIdExt const* tokens, size_t count);
+    // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
+    static BlockKey makeKey(
+        BlockKey const& prevKey, TokenIdExt const* tokens, size_t count, bool knownNoDigest = false);
 
     Type type() const noexcept override
     {
@@ -206,7 +268,7 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
 
     int tokensPerBlock() const noexcept override;
 
-    LifeCycleId numLifeCycles() const noexcept
+    LifeCycleId numLifeCycles() const noexcept override
     {
         return storage.size();
     }
@@ -309,8 +371,9 @@ public:
         int numLookupTokens;
     };
 
-    ReuseMatch match(
-        ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch = false) const;
+    // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
+    ReuseMatch match(ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool knownNoDigest = false,
+        bool enablePartialMatch = false) const;
 
     // Clear all cached pages. ~Block() handles excludeFromEviction for DROPPABLE pages.
     void clear();
@@ -346,8 +409,9 @@ public:
     }
 
 private:
-    std::vector<MatchResult> matchTokenPath(
-        ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const;
+    // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
+    std::vector<MatchResult> matchTokenPath(ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens,
+        bool knownNoDigest, bool enablePartialMatch) const;
     std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched) const;
 
     // Erase any pending empty root blocks from mRoots.
@@ -371,8 +435,9 @@ private:
 // prefix of an existing sibling — mirrors Python's UselessBlockError.
 // If isNew is non-null, *isNew is set to true if a new block was created, false
 // if an existing block was returned.
+// knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
 SharedPtr<Block> addOrGetExistingBlock(
-    NodeBase* prev, LifeCycleId numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew = nullptr);
+    NodeBase* prev, std::vector<TokenIdExt> tokens, bool knownNoDigest, bool* isNew = nullptr);
 
 // Post-order traversal: remove a subtree rooted at `root` from its parent's
 // next map. ~Block() handles page cleanup. Mirrors Python's remove_subtree().

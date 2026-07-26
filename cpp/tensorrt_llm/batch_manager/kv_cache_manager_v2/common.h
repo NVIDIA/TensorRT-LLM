@@ -17,16 +17,17 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/tokenIdExt.h" // TokenId, Digest, TokenIdExt
 #include "kv_cache_manager_v2/utils/typedIndex.h"
 #include "tensorrt_llm/batch_manager/common.h"
 
 #include <array>
 #include <cstdint>
 #include <cstring>
-#include <memory>
 #include <optional>
 #include <string>
 #include <sys/types.h>
+#include <type_traits>
 #include <variant>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -76,95 +77,11 @@ enum class PageIndexMode : int
 using CacheLevel = StrongIndex<int, struct CacheLevelTag, 0>;
 inline constexpr CacheLevel kGpuLevel{0};
 
-// Vocabulary token identifier (normal tokens only).
-using TokenId = int64_t;
-
 // Opaque request identifier shared with the rest of the batch manager.
 using RequestIdType = tensorrt_llm::batch_manager::RequestIdType;
 
 // Opaque LoRA task identifier shared with the rest of the batch manager.
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
-
-// 32-byte aligned to enable SIMD.
-inline constexpr int kDIGEST_LEN = 32;
-
-struct alignas(kDIGEST_LEN) Digest : std::array<std::byte, kDIGEST_LEN>
-{
-    // Custom operator== needed to emit SIMD code
-    bool operator==(Digest const& o) const noexcept
-    {
-        return std::memcmp(this, &o, kDIGEST_LEN) == 0;
-    }
-
-    bool operator!=(Digest const& o) const noexcept
-    {
-        return !(*this == o);
-    }
-};
-
-// Heap-allocated digest token for multi-modal tokens.
-// Copyable (deep-copies the digest) with value-based equality.
-// Digest tokens are rare, so unique_ptr keeps sizeof(TokenIdExt) small.
-class DigestToken
-{
-public:
-    explicit DigestToken(Digest const& d)
-        : mData(std::make_unique<Digest>(d))
-    {
-    }
-
-    explicit DigestToken(std::unique_ptr<Digest> d)
-        : mData(std::move(d))
-    {
-    }
-
-    DigestToken(DigestToken const& o)
-        : mData(std::make_unique<Digest>(*o.mData))
-    {
-    }
-
-    DigestToken(DigestToken&&) noexcept = default;
-
-    DigestToken& operator=(DigestToken const& o)
-    {
-        if (this != &o)
-            mData = std::make_unique<Digest>(*o.mData);
-        return *this;
-    }
-
-    DigestToken& operator=(DigestToken&&) noexcept = default;
-
-    bool operator==(DigestToken const& o) const
-    {
-        return *mData == *o.mData;
-    }
-
-    bool operator!=(DigestToken const& o) const
-    {
-        return !(*this == o);
-    }
-
-    std::byte const* data() const noexcept
-    {
-        return mData->data();
-    }
-
-    size_t size() const noexcept
-    {
-        return mData->size();
-    }
-
-    Digest const& digest() const noexcept
-    {
-        return *mData;
-    }
-
-private:
-    std::unique_ptr<Digest> mData;
-};
-
-// Extended token id: normal TokenId or a heap-allocated digest for multi-modal tokens.
-using TokenIdExt = std::variant<TokenId, DigestToken>;
 
 // Ordinal index of a KV cache block (sequence of tokens).
 using BlockOrdinal = StrongIndex<int, struct BlockOrdinalTag, -1>;
@@ -228,16 +145,3 @@ using Address = std::variant<MemAddress, DiskAddress>;
 using DataRole = std::string;
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
-
-// std::hash specialization for Digest/BlockKey so unordered_map works without a custom hasher.
-template <>
-struct std::hash<tensorrt_llm::batch_manager::kv_cache_manager_v2::Digest>
-{
-    size_t operator()(tensorrt_llm::batch_manager::kv_cache_manager_v2::Digest const& k) const noexcept
-    {
-        // First 8 bytes of a SHA-256 digest are already well-distributed.
-        uint64_t v;
-        std::memcpy(&v, k.data(), sizeof(v));
-        return static_cast<size_t>(v);
-    }
-};

@@ -4195,14 +4195,16 @@ class TestBlockKeyHashing(unittest.TestCase):
         h = hashlib.sha256()
         h.update(seed)
         for item in block:
-            h.update(item.to_bytes(8, "little") if type(item) is int else item)
+            # Normal token ids are packed as 4 little-endian bytes (31-bit range),
+            # matching the C++ backend's 4-byte TokenIdExt layout.
+            h.update(item.to_bytes(4, "little") if type(item) is int else item)
         return h.digest()
 
     def test_update_int_block_matches_reference(self) -> None:
         rng = random.Random(123)
         seed = b"\xaa\xbb\xcc"
         for n in (0, 1, 7, 32, 33, 257):
-            block = [rng.randint(0, (1 << 60)) for _ in range(n)]
+            block = [rng.randint(0, (1 << 31) - 1) for _ in range(n)]
             self.assertEqual(
                 Hasher(seed).update(block).digest,
                 self._ref_update(seed, block),
