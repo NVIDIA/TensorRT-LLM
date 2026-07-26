@@ -798,3 +798,180 @@ def test_gemma4_reasoning_parser_finish_unterminated_reasoning():
     result = parser.finish()
     assert result.content == ""
     assert result.reasoning_content == "<chan"
+
+
+# ---------------------------------------------------------------------------
+# Kimi K3 reasoning parser tests
+#
+# Fixture strings are transcribed from the checkpoint's `encoding_k3.py`
+# rendering (the authoritative XTML chat template): tags render as
+# `<|open|>tag key="value"<|sep|>` / `<|close|>tag<|sep|>` with no
+# whitespace between segments, and the generation prompt ends inside
+# `<|open|>think<|sep|>` (or `<|open|>response<|sep|>` when thinking=False),
+# so completions start mid-channel and end with
+# `<|close|>message<|sep|><|end_of_msg|>`.
+# ---------------------------------------------------------------------------
+
+K3_OPEN, K3_CLOSE, K3_SEP, K3_EOM = ("<|open|>", "<|close|>", "<|sep|>",
+                                     "<|end_of_msg|>")
+
+# One get_weather call, exactly as encoding_k3._render_assistant_segments
+# renders it (attributes space-prefixed, index 1-based, string args raw).
+K3_TOOLS_SECTION = (
+    f'{K3_OPEN}tools{K3_SEP}'
+    f'{K3_OPEN}call tool="get_weather" index="1"{K3_SEP}'
+    f'{K3_OPEN}argument key="location" type="string"{K3_SEP}'
+    f'NYC'
+    f'{K3_CLOSE}argument{K3_SEP}'
+    f'{K3_CLOSE}call{K3_SEP}'
+    f'{K3_CLOSE}tools{K3_SEP}')
+
+K3_MSG_END = f"{K3_CLOSE}message{K3_SEP}{K3_EOM}"
+
+
+def _k3_completion(reasoning: str,
+                   content: str,
+                   tools_section: str = "",
+                   terminated: bool = True) -> str:
+    """A thinking-mode completion (prompt already opened the think channel)."""
+    text = (f"{reasoning}{K3_CLOSE}think{K3_SEP}"
+            f"{K3_OPEN}response{K3_SEP}{content}")
+    if terminated:
+        text += f"{K3_CLOSE}response{K3_SEP}{tools_section}{K3_MSG_END}"
+    return text
+
+
+@pytest.mark.parametrize(("text", "content", "reasoning_content"), [
+    # Fully terminated think + response message.
+    (_k3_completion("step by step", "The answer is 4."), "The answer is 4.",
+     "step by step"),
+    # Tool-calling message: the tools section passes through into content
+    # verbatim so the kimi_k3 tool parser can consume it downstream.
+    (_k3_completion("pick a tool", "Checking.", K3_TOOLS_SECTION),
+     "Checking." + K3_TOOLS_SECTION, "pick a tool"),
+    # Length-capped mid-think: everything is reasoning.
+    ("unterminated reasoning", "", "unterminated reasoning"),
+    # Length-capped mid-response: finish() flushes the response tail.
+    (_k3_completion("r", "partial resp", terminated=False), "partial resp",
+     "r"),
+    # Empty think body.
+    (_k3_completion("", "only content"), "only content", ""),
+])
+def test_kimi_k3_reasoning_parser(text: str, content: str,
+                                  reasoning_content: str):
+    parser = ReasoningParserFactory.create_reasoning_parser("kimi_k3")
+    result = parser.parse(text)
+    assert result.content == content
+    assert result.reasoning_content == reasoning_content
+
+
+@pytest.mark.parametrize(("text", "content", "reasoning_content"), [
+    # thinking=False: prompt opened the response channel directly.
+    (f"plain answer{K3_CLOSE}response{K3_SEP}{K3_MSG_END}", "plain answer",
+     ""),
+    (f"answer{K3_CLOSE}response{K3_SEP}{K3_TOOLS_SECTION}{K3_MSG_END}",
+     "answer" + K3_TOOLS_SECTION, ""),
+])
+def test_kimi_k3_reasoning_parser_non_thinking(text: str, content: str,
+                                               reasoning_content: str):
+    parser = ReasoningParserFactory.create_reasoning_parser(
+        "kimi_k3", {"thinking": False})
+    result = parser.parse(text)
+    assert result.content == content
+    assert result.reasoning_content == reasoning_content
+
+
+@pytest.mark.parametrize(
+    ("delta_texts", "content", "reasoning_content"),
+    [
+        # Plain reasoning streams straight through.
+        (["a", "b"], ["", ""], ["a", "b"]),
+        # Channel switch split across deltas mid-marker.
+        ([
+            "rea", f"son{K3_CLOSE}thi", f"nk{K3_SEP}{K3_OPEN}response{K3_SEP}c",
+            "d"
+        ], ["", "", "c", "d"], ["rea", "son", "", ""]),
+        # A partial marker at the end of a delta is held back, then released
+        # as reasoning once it turns out not to be a marker.
+        (["a<|clo", "x"], ["", ""], ["a", "<|clox"]),
+        # Structural close/open pair arriving as one delta.
+        ([f"r{K3_CLOSE}think{K3_SEP}{K3_OPEN}response{K3_SEP}c"], ["c"], ["r"]),
+        # tools_pass: `<|close|>tools<|sep|>` has an internal `<`, so the
+        # suffix hold must consider mid-marker splits like `...<|close|>to`.
+        ([
+            f"r{K3_CLOSE}think{K3_SEP}{K3_OPEN}response{K3_SEP}",
+            f"{K3_OPEN}tools{K3_SEP}CALL{K3_CLOSE}to",
+            f"ols{K3_SEP}{K3_MSG_END}",
+        ], [
+            "",
+            f"{K3_OPEN}tools{K3_SEP}CALL",
+            f"{K3_CLOSE}tools{K3_SEP}",
+        ], ["r", "", ""]),
+        # Message terminator split across deltas produces no output.
+        ([f"r{K3_CLOSE}think{K3_SEP}{K3_OPEN}response{K3_SEP}c", "<|close|>mes",
+          f"sage{K3_SEP}{K3_EOM}"], ["c", "", ""], ["r", "", ""]),
+    ])
+def test_kimi_k3_reasoning_parser_stream(delta_texts: list, content: list,
+                                         reasoning_content: list):
+    parser = ReasoningParserFactory.create_reasoning_parser("kimi_k3")
+    for i, delta_text in enumerate(delta_texts):
+        result = parser.parse_delta(delta_text)
+        assert result.content == content[i], \
+            f"Step {i}: delta={delta_text!r}, expected content={content[i]!r}, got {result.content!r}"
+        assert result.reasoning_content == reasoning_content[i], \
+            f"Step {i}: delta={delta_text!r}, expected reasoning={reasoning_content[i]!r}, got {result.reasoning_content!r}"
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7])
+@pytest.mark.parametrize("thinking", [True, False])
+def test_kimi_k3_reasoning_parser_stream_matches_parse(chunk_size: int,
+                                                       thinking: bool):
+    """Streaming in arbitrary chunkings must reproduce the one-shot parse.
+
+    This sweeps every marker-split position, which is the riskiest logic in
+    the parser (`_partial_suffix_len` suffix holds).
+    """
+    if thinking:
+        text = _k3_completion("Let me think.", "Answer: 4.", K3_TOOLS_SECTION)
+    else:
+        text = (f"Answer: 4.{K3_CLOSE}response{K3_SEP}{K3_TOOLS_SECTION}"
+                f"{K3_MSG_END}")
+    kwargs = None if thinking else {"thinking": False}
+
+    oneshot = ReasoningParserFactory.create_reasoning_parser(
+        "kimi_k3", kwargs).parse(text)
+
+    streamer = ReasoningParserFactory.create_reasoning_parser(
+        "kimi_k3", kwargs)
+    content, reasoning = [], []
+    for start in range(0, len(text), chunk_size):
+        result = streamer.parse_delta(text[start:start + chunk_size])
+        content.append(result.content)
+        reasoning.append(result.reasoning_content)
+    tail = streamer.finish()
+    content.append(tail.content)
+    reasoning.append(tail.reasoning_content)
+
+    assert "".join(content) == oneshot.content
+    assert "".join(reasoning) == oneshot.reasoning_content
+
+
+def test_kimi_k3_needs_raw_special_tokens():
+    """The K3 delimiters are special tokens: the serving layer keys off this
+    flag to disable skip_special_tokens for the request."""
+    assert ReasoningParserFactory.needs_raw_special_tokens("kimi_k3") is True
+    assert ReasoningParserFactory.needs_raw_special_tokens("KIMI_K3") is True
+    assert ReasoningParserFactory.needs_raw_special_tokens(
+        "deepseek-r1") is False
+    assert ReasoningParserFactory.needs_raw_special_tokens(
+        "no_such_parser") is False
+
+
+def test_auto_detect_kimi_k3(tmp_path):
+    """Kimi K3 model → 'kimi_k3' parser."""
+    model_dir = str(tmp_path / "Kimi-K3")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "kimi_k3")
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "kimi_k3"
