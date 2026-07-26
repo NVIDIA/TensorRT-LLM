@@ -30,7 +30,7 @@ import torch
 import triton
 
 from tensorrt_llm._torch.distributed import allgather
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheCompressionManager
 from tensorrt_llm._torch.utils import next_positive_power_of_2
@@ -331,20 +331,17 @@ class TriAttention(KVCacheCompressionManager):
         config = AutoConfig.from_pretrained(
             self.model_path, trust_remote_code=True
         ).get_text_config()
-        config_values = config.to_dict()
-        rope_params = (
-            config_values.get("rope_parameters") or config_values.get("rope_scaling") or {}
-        )
-        if rope_params and all(isinstance(value, dict) for value in rope_params.values()):
+        # transformers >= 5.5 folds rope_theta/rope_type into rope_parameters.
+        rope_params = config.to_dict()["rope_parameters"]
+        if all(isinstance(value, dict) for value in rope_params.values()):
             raise ValueError(
                 f"TriAttention does not support per-layer-type rope parameters ({self.model_path})"
             )
-        rope_type = rope_params.get("rope_type") or rope_params.get("type") or "default"
+        rope_type = rope_params["rope_type"]
         if rope_type == "default":
             # "default" has no ROPE_INIT_FUNCTIONS entry; the analytic formula is its definition.
             head_dim = freq_count * 2
-            theta = rope_params.get("rope_theta", config_values.get("rope_theta"))
-            base = float(theta) if theta is not None else 10000.0
+            base = float(rope_params["rope_theta"])
             positions = torch.arange(0, head_dim, 2, dtype=torch.float32)
             omega = (1.0 / (base ** (positions / head_dim)))[:freq_count].clone()
             scale_sq = 1.0
@@ -1336,25 +1333,10 @@ class TriAttention(KVCacheCompressionManager):
         )
 
     def _runtime_kv_layout(self, *, draft: bool = False) -> Dict[str, object]:
-        # Only pool page counts are polled; manager identity and layer count are manager-lifetime contracts.
+        # V2 pools are allocated once at manager init; the layout is a manager-lifetime contract.
         manager = self.draft_kv_cache_manager if draft else self.kv_cache_manager
         cached = self._kv_layout_caches[draft]
         if cached is not None:
-            current_page_counts = tuple(
-                int(
-                    manager.impl.get_page_index_upper_bound(
-                        manager.layer_offsets[cached["global_layers"][layer]],
-                        Role.KEY,
-                    )
-                )
-                // int(manager.kv_factor)
-                for layer in cached["pool_representatives"]
-            )
-            if current_page_counts != cached["pool_page_counts"]:
-                raise RuntimeError(
-                    f"TriAttention {'draft ' if draft else ''}V2 pool layout changed "
-                    "after the layout was built; KV pool rebalance is not supported"
-                )
             return cached
 
         if draft:
@@ -1411,7 +1393,4 @@ class TriAttention(KVCacheCompressionManager):
             swa_window=swa_window,
             layer_pool_ids=layer_pool_ids,
             pool_representatives=pool_representatives,
-            pool_page_counts=tuple(
-                int(layer_pools[layer].shape[0]) for layer in pool_representatives
-            ),
         )

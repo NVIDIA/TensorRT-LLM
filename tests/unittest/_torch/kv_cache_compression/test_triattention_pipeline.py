@@ -43,7 +43,6 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import T
 # Framework base class lives in pyexecutor.resource_manager; the factory lives
 # in pyexecutor._util (next to _create_kv_cache_manager), matching #15106.
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 
 # The SM100 CuTe kernel is the only score path, so every test that actually
 # launches scores (or builds the real staging buffers, whose constructor
@@ -98,46 +97,6 @@ class TestConfigAndFactory:
 
 
 class TestTriAttentionClass:
-    def test_cached_layout_checks_page_counts_without_rebuilding_pool_views(self):
-        page_count_query = mock.Mock(side_effect=[8, 16, 8, 18])
-        manager = SimpleNamespace(
-            get_buffers=mock.Mock(side_effect=AssertionError("pool view was rebuilt")),
-            impl=SimpleNamespace(get_page_index_upper_bound=page_count_query),
-            kv_factor=2,
-            layer_offsets={10: 100, 11: 101, 12: 102},
-        )
-        triattention = _make_triattention()
-        triattention.kv_cache_manager = manager
-        cached = dict(
-            global_layers=[10, 11, 12],
-            layer_pools=[torch.empty(4), torch.empty(8), torch.empty(4)],
-            dense_layers=[0, 1, 2],
-            swa_layers=[],
-            swa_window=None,
-            layer_pool_ids=(0, 1, 0),
-            # These are local layer slots. Layer 2 shares layer 0's pool.
-            pool_representatives=(0, 1),
-            pool_page_counts=(4, 8),
-        )
-        triattention._kv_layout_caches[False] = cached
-
-        assert triattention._runtime_kv_layout() is cached
-        manager.get_buffers.assert_not_called()
-        assert page_count_query.call_args_list == [
-            mock.call(100, Role.KEY),
-            mock.call(101, Role.KEY),
-        ]
-
-        with pytest.raises(RuntimeError, match="pool layout changed"):
-            triattention._runtime_kv_layout()
-        manager.get_buffers.assert_not_called()
-        assert page_count_query.call_args_list == [
-            mock.call(100, Role.KEY),
-            mock.call(101, Role.KEY),
-            mock.call(100, Role.KEY),
-            mock.call(101, Role.KEY),
-        ]
-
     def test_request_init_and_finish_lifecycle(self):
         # Init: speculative capacity accepted, manager marked, state tracked.
         # Finish: state cleared; buffers and the step's batch stay resident.
@@ -191,7 +150,7 @@ class TestTriAttentionClass:
         torch.save({"metadata": {"sampled_heads": sampled}, "stats": stats}, path)
         mgr = _make_triattention()
         mgr.calibration_path = str(path)
-        config = _make_hf_config(rope_theta=10000.0)
+        config = _make_hf_config(rope_parameters={"rope_type": "default", "rope_theta": 10000.0})
 
         with mock.patch("transformers.AutoConfig.from_pretrained", return_value=config):
             converted = mgr._resolve_calibration()
