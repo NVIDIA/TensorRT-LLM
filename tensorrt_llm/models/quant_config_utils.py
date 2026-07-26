@@ -38,8 +38,30 @@ def update_quant_config_from_compressed_tensors(
             )
         group_config = next(iter(config_groups.values()))
     weights_quant_config = group_config["weights"]
-    inputs_quant_config = group_config["input_activations"]
     weights_quant_strategy = weights_quant_config["strategy"]
+
+    # MXFP4 pack-quantized (weight-only): FP4 E2M1 weights packed two per
+    # uint8 with per-32-group uint8 E8M0 scales and no activation
+    # quantization (e.g. Kimi K3 routed experts). Handled before reading the
+    # input-activation strategy, which is null for weight-only recipes.
+    if (hf_quant_config.get("format") == "mxfp4-pack-quantized"
+            or (weights_quant_config["num_bits"] == 4
+                and weights_quant_config.get("type") == "float"
+                and weights_quant_strategy == "group"
+                and group_config.get("input_activations") is None)):
+        group_size = weights_quant_config["group_size"]
+        if group_size != 32:
+            raise ValueError(
+                f"Unsupported group_size: {group_size}. Supported: 32 for MXFP4."
+            )
+        quant_config.quant_algo = QuantAlgo.W4A16_MXFP4
+        quant_config.group_size = group_size
+        hf_exclude_modules = hf_quant_config.get("modules_to_not_convert", None)
+        quant_config.exclude_modules = list(
+            set((hf_exclude_modules or []) + hf_quant_config.get("ignore", [])))
+        return
+
+    inputs_quant_config = group_config["input_activations"]
     inputs_quant_strategy = inputs_quant_config["strategy"]
 
     if weights_quant_config["num_bits"] == 8:

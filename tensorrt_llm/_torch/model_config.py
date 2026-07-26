@@ -29,8 +29,8 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm._torch.pyexecutor.config_utils import (
-    get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
-    load_pretrained_config)
+    get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
+    is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -71,9 +71,29 @@ def _is_lock_infra_error(exc: BaseException) -> bool:
     if isinstance(exc, PermissionError):
         return True
     if isinstance(exc, OSError):
+        # EEXIST: filelock's ensure_directory_exists() can lose the
+        # mkdir(exist_ok=True) race on NFS when many ranks start at once
+        # (the post-EEXIST is_dir() recheck sees a stale attribute cache).
+        # An un-creatable lock dir is broken infra, not contention.
         return exc.errno in (errno.EACCES, errno.EPERM, errno.ENOLCK,
-                             errno.ESTALE)
+                             errno.ESTALE, errno.EEXIST)
     return False
+
+
+def _release_lock_ignoring_infra_errors(lock: "filelock.BaseFileLock") -> None:
+    """Release ``lock``, downgrading broken-lock-infra errors to a warning.
+
+    NFS can return ENOLCK/ESTALE from the unlock ``flock`` call itself (e.g.
+    lock-daemon exhaustion when many ranks start simultaneously). The config
+    load the lock protected has already completed at release time, so
+    crashing the process here would fail an otherwise healthy executor.
+    """
+    try:
+        lock.release()
+    except (PermissionError, OSError) as e:
+        if not _is_lock_infra_error(e):
+            raise
+        logger.warning(f"config lock release failed ({e}), continuing")
 
 
 @contextlib.contextmanager
@@ -119,12 +139,12 @@ def config_file_lock(timeout: int = 10):
             try:
                 yield
             finally:
-                tmp_lock.release()
+                _release_lock_ignoring_infra_errors(tmp_lock)
     else:
         try:
             yield
         finally:
-            lock.release()
+            _release_lock_ignoring_infra_errors(lock)
 
 
 @dataclass(kw_only=True)
@@ -1361,6 +1381,8 @@ class ModelConfig(Generic[TConfig]):
             return cfg.hybrid_override_pattern.count("*")
         if is_qwen3_hybrid(cfg):
             return get_qwen3_hybrid_num_attention_layers(cfg)
+        if is_kimi_linear(cfg):
+            return get_kimi_linear_num_attention_layers(cfg)
         return cfg.num_hidden_layers
 
     def get_num_mamba_layers(self) -> int:
@@ -1370,6 +1392,9 @@ class ModelConfig(Generic[TConfig]):
             return cfg.hybrid_override_pattern.count("M")
         if is_qwen3_hybrid(cfg):
             return cfg.num_hidden_layers - get_qwen3_hybrid_num_attention_layers(
+                cfg)
+        if is_kimi_linear(cfg):
+            return cfg.num_hidden_layers - get_kimi_linear_num_attention_layers(
                 cfg)
         return 0
 

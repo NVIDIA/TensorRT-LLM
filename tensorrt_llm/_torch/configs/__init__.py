@@ -7,6 +7,7 @@ from tensorrt_llm._torch.configs.gemma4_unified import (
     Gemma4UnifiedTextConfig,
     Gemma4UnifiedVisionConfig,
 )
+from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 
 
@@ -36,6 +37,12 @@ def _register_custom_configs_with_transformers() -> None:
         "deepseek_v32": DeepseekV3Config,
         "kimi_k2": DeepseekV3Config,
         "deepseek_v4": DeepseekV4Config,
+        # Kimi K3 text config ("kimi_linear"). The composite "kimi_k3"
+        # model_type is flattened to the text config by
+        # pyexecutor.config_utils.load_pretrained_config; registering the
+        # text config here lets AutoConfig / AutoTokenizer resolve
+        # "kimi_linear" without trust_remote_code.
+        "kimi_linear": KimiLinearConfig,
         "laguna": LagunaConfig,
         "gemma4_unified": Gemma4UnifiedConfig,
         "gemma4_unified_text": Gemma4UnifiedTextConfig,
@@ -63,5 +70,6 @@ __all__ = [
     "Gemma4UnifiedConfig",
     "Gemma4UnifiedTextConfig",
     "Gemma4UnifiedVisionConfig",
+    "KimiLinearConfig",
     "LagunaConfig",
 ]
