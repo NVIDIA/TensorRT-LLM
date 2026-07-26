@@ -9,20 +9,11 @@ import torch
 from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
 from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker
 from tensorrt_llm._torch.speculative.interface import (
-    DraftModelCapabilities,
     needs_external_draft_weights,
     should_use_separate_draft_kv_cache,
 )
-from tensorrt_llm._torch.speculative.utils import (
-    get_num_draft_kv_layers,
-    get_num_extra_kv_tokens,
-    get_num_spec_layers,
-)
+from tensorrt_llm._torch.speculative.utils import get_num_extra_kv_tokens, get_num_spec_layers
 from tensorrt_llm.llmapi import MTPDecodingConfig
-
-
-def _shared_kv_capabilities() -> DraftModelCapabilities:
-    return DraftModelCapabilities.external_shared_target_kv()
 
 
 def _shared_kv_spec_config(**kwargs) -> MTPDecodingConfig:
@@ -32,25 +23,18 @@ def _shared_kv_spec_config(**kwargs) -> MTPDecodingConfig:
         mtp_eagle_one_model=True,
         **kwargs,
     )
-    spec_config._draft_model_capabilities = _shared_kv_capabilities()
+    spec_config._is_gemma4_mtp_assistant = True
+    spec_config._allow_separate_draft_kv_cache = False
     return spec_config
 
 
-def test_external_shared_kv_capability_separates_module_and_kv_counts():
+def test_external_shared_kv_uses_no_draft_kv_cache():
     spec_config = _shared_kv_spec_config()
 
     assert needs_external_draft_weights(spec_config)
-    assert get_num_spec_layers(spec_config) == 1
-    assert get_num_draft_kv_layers(spec_config) == 0
+    assert get_num_spec_layers(spec_config) == 0
     assert get_num_extra_kv_tokens(spec_config) == 0
     assert not should_use_separate_draft_kv_cache(spec_config)
-
-
-def test_embedded_one_model_mtp_does_not_load_external_weights():
-    spec_config = _shared_kv_spec_config()
-    spec_config._draft_model_capabilities = None
-
-    assert not needs_external_draft_weights(spec_config)
 
 
 def test_external_shared_kv_worker_rejects_unverified_modes():
@@ -157,34 +141,3 @@ def test_gemma4_target_forward_dispatches_one_model_worker():
     assert torch.equal(worker_calls[0]["hidden_states"], hidden_states)
     assert torch.equal(worker_calls[0]["logits"], hidden_states[[2]])
     assert worker_calls[0]["draft_model"] is model.draft_model
-
-
-def test_gemma4_target_forward_still_captures_hidden_states_without_worker():
-    model = SimpleNamespace(
-        layer_idx=-1,
-        config=SimpleNamespace(final_logit_softcapping=None),
-        model=lambda **kwargs: torch.tensor([[1.0, 2.0]]),
-        logits_processor=SimpleNamespace(forward=lambda hidden_states, *args: hidden_states),
-        lm_head=object(),
-        spec_worker=None,
-    )
-    captured = []
-    spec_metadata = SimpleNamespace(
-        is_layer_capture=lambda layer_idx: layer_idx == -1,
-        maybe_capture_hidden_states=lambda layer_idx, hidden_states: captured.append(
-            (layer_idx, hidden_states.clone())
-        ),
-    )
-    attn_metadata = SimpleNamespace(padded_num_tokens=None)
-
-    output = Gemma4ForCausalLM.forward(
-        model,
-        attn_metadata=attn_metadata,
-        input_ids=torch.tensor([1]),
-        spec_metadata=spec_metadata,
-    )
-
-    assert torch.equal(output, torch.tensor([[1.0, 2.0]]))
-    assert len(captured) == 1
-    assert captured[0][0] == -1
-    assert torch.equal(captured[0][1], torch.tensor([[1.0, 2.0]]))

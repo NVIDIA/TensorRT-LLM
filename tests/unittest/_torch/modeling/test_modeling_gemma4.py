@@ -575,12 +575,6 @@ class TestGemma4Assistant(unittest.TestCase):
         self.assertEqual(config.vocab_size, 1024)
         self.assertEqual(config.num_hidden_layers, 4)
 
-    def test_assistant_config_default_constructor_is_serializable(self):
-        config = Gemma4AssistantConfig()
-
-        self.assertEqual(config.text_config.num_kv_shared_layers, 4)
-        self.assertIn("text_config", config.to_dict())
-
     def test_assistant_config_auto_config_round_trip(self):
         config = Gemma4AssistantConfig(**deepcopy(GEMMA4_ASSISTANT_CONFIG))
 
@@ -891,7 +885,6 @@ def _build_gemma4_kv_cache_manager(
     num_blocks=4,
     tokens_per_block=32,
     batch_size=1,
-    force_vswa=False,
 ):
     """Create KVCacheManagerV2 supporting Gemma4 per-layer head_dim / kv_heads.
 
@@ -947,7 +940,7 @@ def _build_gemma4_kv_cache_manager(
     # exceeds sliding_window.
     sliding_window = getattr(config, "sliding_window", None)
     max_attn_window = None
-    needs_vswa = force_vswa or (isinstance(head_dim, list) and len(set(head_dim)) > 1)
+    needs_vswa = isinstance(head_dim, list) and len(set(head_dim)) > 1
     if not needs_vswa:
         needs_vswa = isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1
     if needs_vswa and sliding_window:
@@ -2458,11 +2451,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         self,
         initial_page_counts: list[int],
         *,
-        config_dict: dict | None = None,
         reserved_page_counts: list[int] | None = None,
         max_pages: int = 64,
         manager_batch_size: int | None = None,
-        force_vswa: bool = False,
     ) -> tuple[
         "KVCacheManagerV2",
         list["FlashInferAttention"],
@@ -2478,13 +2469,12 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         if manager_batch_size is None:
             manager_batch_size = batch_size
 
-        config = Gemma4TextConfig(**deepcopy(config_dict or GEMMA4_E2B_REAL_DIMS_CONFIG))
+        config = Gemma4TextConfig(**deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG))
         kv_cache_manager = self._get_kv_cache_manager(
             config,
             num_blocks=max_pages,
             tokens_per_block=_TRTLLM_GEN_TOKENS_PER_BLOCK,
             batch_size=manager_batch_size,
-            force_vswa=force_vswa,
         )
         self.addCleanup(kv_cache_manager.shutdown)
         self.assertTrue(kv_cache_manager.is_vswa, "Expected VSWA manager")
@@ -2603,13 +2593,14 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     def _expected_decode_block_table(
         self,
         metadata: "FlashInferAttentionMetadata",
-        pool_id: int,
+        head_dim: int,
         page_counts: list[int],
         *,
         rows: int,
         width: int,
     ) -> torch.Tensor:
         """Build the expected compact table from one VSWA pool's host indices."""
+        pool_id = metadata._vswa_head_dim_to_pool[head_dim]
         pool_indices = metadata._host_pool_indices[pool_id].numpy()
         expected = torch.zeros((rows, width), dtype=torch.int32)
         source_offset = metadata.num_context_blocks
@@ -2694,7 +2685,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                 block_tables = wrappers.decode_wrapper._block_tables
                 expected = self._expected_decode_block_table(
                     metadata,
-                    plan_params.kv_pool_id,
+                    plan_params.head_dim,
                     new_page_counts,
                     rows=len(initial_page_counts),
                     width=max(initial_page_counts),
@@ -2723,12 +2714,11 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
         initial_state = {}
         for plan_params, wrappers in metadata._plan_params_to_wrappers.items():
-            self.assertIsNotNone(plan_params.kv_pool_id)
             block_tables = wrappers.decode_wrapper._block_tables
             self.assertGreaterEqual(block_tables.size(1), 65)
             self.assertEqual(block_tables.size(1), metadata.kv_cache_manager.max_blocks_per_seq)
             self.assertEqual(wrappers.host_decode_block_tables.size(1), 64)
-            initial_state[plan_params.kv_pool_id] = (
+            initial_state[plan_params.head_dim] = (
                 block_tables.data_ptr(),
                 wrappers.host_decode_block_tables.data_ptr(),
             )
@@ -2740,61 +2730,19 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         for plan_params, wrappers in metadata._plan_params_to_wrappers.items():
             with self.subTest(head_dim=plan_params.head_dim):
                 block_tables = wrappers.decode_wrapper._block_tables
-                old_device_ptr, old_host_ptr = initial_state[plan_params.kv_pool_id]
+                old_device_ptr, old_host_ptr = initial_state[plan_params.head_dim]
                 self.assertEqual(block_tables.data_ptr(), old_device_ptr)
                 self.assertNotEqual(wrappers.host_decode_block_tables.data_ptr(), old_host_ptr)
                 self.assertGreaterEqual(wrappers.host_decode_block_tables.size(1), 65)
                 expected = self._expected_decode_block_table(
                     metadata,
-                    plan_params.kv_pool_id,
+                    plan_params.head_dim,
                     new_page_counts,
                     rows=len(new_page_counts),
                     width=max(new_page_counts),
                 )
                 torch.testing.assert_close(
                     block_tables[: len(new_page_counts), : max(new_page_counts)].cpu(),
-                    expected,
-                    atol=0,
-                    rtol=0,
-                )
-
-    @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
-    def test_cuda_graph_trtllm_gen_distinguishes_same_head_dim_pools(self) -> None:
-        """Plan keys retain the KV pool when sliding and full head dims match."""
-        config_dict = deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG)
-        config_dict["global_head_dim"] = config_dict["head_dim"]
-        initial_page_counts = [5, 3]
-        _, _, metadata, _, _, _ = self._make_trtllm_gen_decode_case(
-            initial_page_counts,
-            config_dict=config_dict,
-            force_vswa=True,
-        )
-
-        plan_params = list(metadata._plan_params_to_wrappers)
-        self.assertEqual(len(plan_params), 2)
-        self.assertEqual({params.head_dim for params in plan_params}, {256})
-        self.assertEqual(len({params.kv_pool_id for params in plan_params}), 2)
-
-        new_page_counts = [2, 1]
-        self._prepare_decode_page_counts(metadata, [0, 1], new_page_counts)
-        torch.cuda.synchronize()
-
-        for params, wrappers in metadata._plan_params_to_wrappers.items():
-            with self.subTest(pool_id=params.kv_pool_id):
-                expected = self._expected_decode_block_table(
-                    metadata,
-                    params.kv_pool_id,
-                    new_page_counts,
-                    rows=len(new_page_counts),
-                    width=max(new_page_counts),
-                )
-                torch.testing.assert_close(
-                    wrappers.decode_wrapper._block_tables[
-                        : len(new_page_counts), : max(new_page_counts)
-                    ].cpu(),
                     expected,
                     atol=0,
                     rtol=0,

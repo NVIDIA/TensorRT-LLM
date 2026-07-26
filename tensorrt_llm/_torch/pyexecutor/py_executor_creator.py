@@ -40,8 +40,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import (is_hybrid_linear, is_minimax_m3,
-                           load_pretrained_config)
+from .config_utils import is_hybrid_linear, is_minimax_m3
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -455,14 +454,9 @@ def create_py_executor(
         # External MTP assistants with shared target KV use a dedicated
         # FlashInfer decode metadata view. Other one-engine modes still rely
         # on the one-query-per-sequence decode contract.
-        supports_shared_kv_flashinfer = False
-        if (spec_config.spec_dec_mode.is_mtp_eagle_one_model()
-                and spec_config.speculative_model is not None
-                and checkpoint_dir is not None):
-            target_config = load_pretrained_config(
-                checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
-            supports_shared_kv_flashinfer = target_config.model_type in (
-                "gemma4", "gemma4_text")
+        supports_shared_kv_flashinfer = getattr(spec_config,
+                                                "_is_gemma4_mtp_assistant",
+                                                False)
         if (llm_args.attn_backend == "FLASHINFER"
                 and not supports_shared_kv_flashinfer):
             raise ValueError(

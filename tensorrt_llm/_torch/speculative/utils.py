@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
-from ..speculative.interface import SpecMetadata
+from ..speculative.interface import SpecMetadata, is_gemma4_mtp_assistant
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSampler,
                            DraftTargetOneModelSpecMetadata,
@@ -131,15 +131,13 @@ def get_spec_metadata(spec_config,
             draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
-        hidden_size = getattr(model_config, "speculative_hidden_size",
-                              model_config.hidden_size)
         return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             num_layers=model_config.num_hidden_layers,
-            hidden_size=hidden_size,
+            hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
             is_draft_model=is_draft_model,
@@ -445,10 +443,8 @@ def get_spec_drafter(model_engine,
 
 
 def get_num_spec_layers(spec_config):
-    """Return the logical number of draft modules executed by the worker."""
-    capabilities = getattr(spec_config, "_draft_model_capabilities", None)
-    if capabilities is not None and capabilities.num_draft_modules:
-        return capabilities.num_draft_modules
+    if is_gemma4_mtp_assistant(spec_config):
+        return 0
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         return 1
     if spec_config.spec_dec_mode.is_mtp_vanilla():
@@ -457,14 +453,6 @@ def get_num_spec_layers(spec_config):
         num_draft_hidden_layers = spec_config._num_draft_hidden_layers
         return num_draft_hidden_layers if num_draft_hidden_layers is not None else 1
     return 0
-
-
-def get_num_draft_kv_layers(spec_config):
-    """Return the number of draft-owned layers requiring KV cache storage."""
-    capabilities = getattr(spec_config, "_draft_model_capabilities", None)
-    if capabilities is not None:
-        return capabilities.num_draft_kv_layers
-    return get_num_spec_layers(spec_config)
 
 
 def update_spec_config_from_draft_model_config(spec_config,
@@ -533,8 +521,7 @@ def get_num_extra_kv_tokens(spec_config):
     """
     if spec_config is None:
         return 0
-    capabilities = getattr(spec_config, "_draft_model_capabilities", None)
-    if capabilities is not None and capabilities.shares_target_kv_cache:
+    if is_gemma4_mtp_assistant(spec_config):
         return 0
     if spec_config.spec_dec_mode.use_one_engine():
         return spec_config.max_draft_len - 1
@@ -594,6 +581,14 @@ def update_spec_config_from_model_config(spec_config, model_config):
 
     if not spec_config.use_dynamic_tree:
         spec_config.max_total_draft_tokens = spec_config.max_draft_len
+
+    model_type = getattr(model_config, "model_type", None)
+    spec_config._is_gemma4_mtp_assistant = bool(
+        model_type in ("gemma4", "gemma4_text")
+        and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+        and spec_config.speculative_model is not None)
+    if spec_config._is_gemma4_mtp_assistant:
+        spec_config._allow_separate_draft_kv_cache = False
 
 
 def update_spec_config_from_loaded_model(spec_config, model) -> None:

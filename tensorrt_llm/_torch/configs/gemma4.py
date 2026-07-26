@@ -27,15 +27,6 @@ class Gemma4AssistantConfig(PreTrainedConfig):
     model_type = "gemma4_assistant"
     sub_configs = {"text_config": Gemma4TextConfig}
 
-    # Runtime ownership contract for the one-model speculative pipeline.
-    loads_external_weights = True
-    num_draft_modules = 1
-    owns_independent_kv_cache = False
-    num_draft_kv_layers = 0
-    shares_target_kv_cache = True
-    freezes_draft_attention_state = True
-    requires_external_draft_metadata_view = True
-
     def __init__(
         self,
         text_config=None,
@@ -102,8 +93,3 @@ class Gemma4AssistantConfig(PreTrainedConfig):
     @property
     def num_hidden_layers(self):
         return self.text_config.num_hidden_layers
-
-    @property
-    def speculative_hidden_size(self):
-        """Hidden-state width captured from the target model."""
-        return self.backbone_hidden_size

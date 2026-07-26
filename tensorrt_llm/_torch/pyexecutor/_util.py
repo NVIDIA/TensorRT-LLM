@@ -44,7 +44,7 @@ from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
-from ..speculative import (get_num_draft_kv_layers, get_num_extra_kv_tokens,
+from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
@@ -1207,7 +1207,7 @@ class KvCacheCreator:
         """
         if self._speculative_config.spec_dec_mode.is_external_drafter():
             return self._draft_config.pretrained_config.num_hidden_layers
-        return get_num_draft_kv_layers(self._speculative_config)
+        return get_num_spec_layers(self._speculative_config)
 
     def _create_one_model_draft_kv_cache_manager(
         self,
@@ -1797,7 +1797,7 @@ def _build_per_layer_num_kv_heads(
     if spec_config is None or draft_config is None:
         return num_key_value_heads
 
-    from ..speculative.utils import get_num_draft_kv_layers
+    from ..speculative.utils import get_num_spec_layers
     draft_pretrained = draft_config.pretrained_config
     draft_num_kv_heads = getattr(
         draft_pretrained, 'num_key_value_heads',
@@ -1806,7 +1806,7 @@ def _build_per_layer_num_kv_heads(
     if draft_num_kv_heads is None or draft_num_kv_heads == num_key_value_heads:
         return num_key_value_heads
 
-    num_spec_layers = get_num_draft_kv_layers(spec_config)
+    num_spec_layers = get_num_spec_layers(spec_config)
     logger.info(f"Per-layer KV heads for speculative decoding: "
                 f"target={num_key_value_heads} x {num_hidden_layers} layers, "
                 f"draft={draft_num_kv_heads} x {num_spec_layers} layers, "

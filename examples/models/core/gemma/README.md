@@ -50,10 +50,9 @@ The `/v1/chat/completions` endpoint applies the Gemma 4 chat template automatica
 ### MTP speculative decoding
 
 Gemma 4 supports Multi-Token Prediction (MTP) speculative decoding through the
-one-model PyTorch execution path. The target and its matching assistant
-checkpoint are loaded into one engine, and the Q-only assistant reads the
-target model's KV cache. Create a server configuration for the
-target/assistant pair:
+PyTorch execution path. The target loads its matching assistant checkpoint,
+and the Q-only assistant reads the target model's KV cache. Create a server
+configuration for the target/assistant pair:
 
 ```bash
 cat > gemma4_mtp.yaml <<'EOF'

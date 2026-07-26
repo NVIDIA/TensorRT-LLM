@@ -1227,6 +1227,17 @@ class Gemma4TextModel(DecoderModel):
 # ---------------------------------------------------------------------------
 # Gemma4 For Causal LM
 # ---------------------------------------------------------------------------
+def _configure_gemma4_mtp_assistant(model_config: ModelConfig) -> None:
+    spec_config = model_config.spec_config
+    if (
+        spec_config is not None
+        and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+        and spec_config.speculative_model is not None
+    ):
+        spec_config._is_gemma4_mtp_assistant = True
+        spec_config._allow_separate_draft_kv_cache = False
+
+
 @register_auto_model("Gemma4ForCausalLM")
 class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
     def __init__(
@@ -1248,6 +1259,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
                 "moe_ep_size>1 requires a Gemma4 MoE variant (only 26B-A4B-it today)."
             )
 
+        _configure_gemma4_mtp_assistant(model_config)
         super().__init__(Gemma4TextModel(model_config), model_config)
 
     @classmethod
@@ -1584,10 +1596,6 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
         )
         self._target_embed_tokens_ref = None
 
-    @classmethod
-    def get_model_defaults(cls, llm_args) -> dict:
-        return {"attn_backend": "FLASHINFER"}
-
     def load_weights_from_target_model(self, target_model: nn.Module) -> None:
         target_llm = target_model.llm if hasattr(target_model, "llm") else target_model
         self._target_embed_tokens_ref = weakref.ref(target_llm.model.embed_tokens)
@@ -1627,21 +1635,6 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
             output_size=positions.shape[0],
         ).unsqueeze(0)
 
-    @staticmethod
-    def _last_token_states(
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
-        last_tokens = (
-            torch.cumsum(
-                attn_metadata.seq_lens_cuda,
-                dim=0,
-                dtype=torch.long,
-            )
-            - 1
-        )
-        return hidden_states[last_tokens]
-
     def forward_draft_step(
         self,
         input_ids: torch.IntTensor,
@@ -1667,35 +1660,6 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
         else:
             logits = self.lm_head(assistant_hidden_states).float()
         return logits, projected_hidden_states
-
-    def forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: torch.IntTensor = None,
-        position_ids: Optional[torch.IntTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        return_context_logits: bool = False,
-        spec_metadata=None,
-        **kwargs,
-    ) -> torch.Tensor:
-        if input_ids is None or spec_metadata is None:
-            raise ValueError("Gemma4 assistant requires input_ids and speculative metadata")
-        logits, projected_hidden_states = self.forward_draft_step(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            recurrent_hidden_states=spec_metadata.get_hidden_states(),
-            attn_metadata=attn_metadata,
-            spec_metadata=spec_metadata,
-        )
-        spec_metadata.maybe_capture_hidden_states(
-            self.config.num_hidden_layers - 1,
-            projected_hidden_states,
-        )
-
-        if return_context_logits:
-            return logits
-        last_token_indices = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-        return logits[last_token_indices]
 
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
         weights = weight_mapper.preprocess_weights(weights)

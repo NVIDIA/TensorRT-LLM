@@ -308,9 +308,6 @@ def setup_llm(args, **kwargs):
     if spec_decode_algo == 'MTP':
         if not args.use_one_model:
             print("Running MTP eagle with two model style.")
-            if args.draft_model_dir is None:
-                raise ValueError(
-                    "--draft_model_dir is required for two-model MTP")
         speculative_model = (args.draft_model_dir if args.draft_model_dir
                              is not None else args.model_dir)
         spec_config = MTPDecodingConfig(

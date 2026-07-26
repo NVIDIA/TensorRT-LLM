@@ -417,13 +417,6 @@ class ModelLoader:
 
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
-        if llm_args.speculative_config is not None:
-            from tensorrt_llm._torch.speculative import \
-                update_spec_config_from_model_config
-
-            update_spec_config_from_model_config(llm_args.speculative_config,
-                                                 config.pretrained_config)
-
         model_cls = AutoModelForCausalLM._resolve_class(config)
         use_kv_cache_manager_v2 = (
             llm_args.kv_cache_config.use_kv_cache_manager_v2)
@@ -439,6 +432,15 @@ class ModelLoader:
                     logger.info(
                         f"Applied model defaults for {model_cls.__name__}: {applied_defaults}"
                     )
+
+        if llm_args.speculative_config is not None:
+            from tensorrt_llm._torch.speculative import \
+                update_spec_config_from_model_config
+
+            # Model defaults reconstruct nested Pydantic configs. Populate
+            # runtime-only speculative state after that reconstruction.
+            update_spec_config_from_model_config(llm_args.speculative_config,
+                                                 config.pretrained_config)
 
         # The transceiver preference follows the checkpoint's original
         # architecture: _resolve_class may rewrite it to an execution class

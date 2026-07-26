@@ -20,7 +20,7 @@ from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, SpecWorkerBase
+from .interface import SpecMetadata, SpecWorkerBase, is_gemma4_mtp_assistant
 from .mtp import MTPSampler, _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
@@ -657,41 +657,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self._saved_position_offsets = None
         self._saved_position_offsets_cpp = None
         self._saved_generation_lengths = None
-        self._uses_external_shared_target_kv = False
-
-    def set_draft_model(self, draft_model) -> None:
-        super().set_draft_model(draft_model)
-        capabilities = getattr(self.spec_config, "_draft_model_capabilities",
-                               None)
-        self._uses_external_shared_target_kv = bool(
-            capabilities is not None and capabilities.loads_external_weights
-            and capabilities.shares_target_kv_cache
-            and not capabilities.owns_independent_kv_cache)
-        if not self._uses_external_shared_target_kv:
-            return
-        if self.use_dynamic_tree:
-            raise ValueError(
-                "Gemma4 shared-target-KV one-model MTP supports only the "
-                "linear draft path.")
-        if self.spec_config.draft_len_schedule is not None:
-            raise ValueError(
-                "Gemma4 shared-target-KV one-model MTP does not support a "
-                "draft length schedule.")
-        if self.sa_enhancer is not None:
-            raise ValueError(
-                "Gemma4 shared-target-KV one-model MTP does not support the "
-                "suffix automaton enhancer.")
-        if self.spec_config.use_rejection_sampling:
-            raise ValueError(
-                "Gemma4 shared-target-KV one-model MTP does not support "
-                "rejection sampling.")
-
-    def set_guided_decoder(self, guided_decoder) -> bool:
-        if self._uses_external_shared_target_kv:
-            raise ValueError(
-                "Gemma4 shared-target-KV one-model MTP does not support "
-                "guided decoding.")
-        return super().set_guided_decoder(guided_decoder)
 
     @property
     def max_draft_len(self) -> int:
@@ -759,11 +724,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                       resource_manager=None):
 
         runtime_draft_len = spec_metadata.runtime_draft_len
-        if self._uses_external_shared_target_kv:
-            return self._forward_external_shared_target_kv(
-                input_ids, position_ids, hidden_states, logits, attn_metadata,
-                spec_metadata, draft_model)
-
         # skip the draft forward if the runtime draft length is 0
         if runtime_draft_len == 0:
             return self.skip_drafting(input_ids, position_ids, hidden_states,
@@ -857,134 +817,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             'next_draft_tokens': next_draft_tokens,
             'next_new_tokens': next_new_tokens,
         }
-
-    def _forward_external_shared_target_kv(
-        self,
-        input_ids,
-        position_ids,
-        hidden_states,
-        logits,
-        attn_metadata,
-        spec_metadata,
-        draft_model,
-    ):
-        """Draft with an external Q-only assistant over accepted target KV."""
-        if not isinstance(attn_metadata, FlashInferAttentionMetadata):
-            raise TypeError(
-                "Gemma4 shared-target-KV one-model MTP currently requires "
-                "FlashInfer attention metadata.")
-        if self.guided_decoder is not None:
-            raise ValueError(
-                "Gemma4 shared-target-KV one-model MTP does not support "
-                "guided decoding.")
-
-        batch_size = attn_metadata.num_seqs
-        num_contexts = batch_size - spec_metadata.num_generations
-        runtime_draft_len = spec_metadata.runtime_draft_len
-        if runtime_draft_len == 0:
-            target_tokens = self._sample_tokens_for_batch(
-                logits, spec_metadata, num_contexts, batch_size)
-            accepted_tokens = target_tokens.unsqueeze(1)
-            num_accepted_tokens = torch.ones(batch_size,
-                                             dtype=torch.int,
-                                             device=logits.device)
-            next_draft_tokens = torch.empty((batch_size, 0),
-                                            dtype=torch.int32,
-                                            device=logits.device)
-            return {
-                "logits": logits,
-                "new_tokens": accepted_tokens,
-                "new_tokens_lens": num_accepted_tokens,
-                "next_draft_tokens": next_draft_tokens,
-                "next_new_tokens": accepted_tokens,
-            }
-
-        raw_logits = logits
-        accepted_tokens, num_accepted_tokens = (
-            self.sample_and_accept_draft_tokens(input_ids, logits,
-                                                attn_metadata, spec_metadata))
-
-        (
-            draft_input_ids,
-            recurrent_hidden_states,
-            draft_position_ids,
-        ) = self._prepare_external_shared_target_kv_draft_inputs(
-            accepted_tokens=accepted_tokens,
-            num_accepted_tokens=num_accepted_tokens,
-            hidden_states=hidden_states,
-            position_ids=position_ids,
-            sequence_lengths=attn_metadata.seq_lens_cuda[:batch_size],
-            num_contexts=num_contexts,
-            batch_indices=spec_metadata.batch_indices_cuda[:batch_size],
-        )
-
-        draft_metadata = attn_metadata.get_shared_kv_draft_metadata()
-        draft_metadata.update_shared_kv_draft_lengths(attn_metadata,
-                                                      num_accepted_tokens,
-                                                      num_contexts)
-        draft_metadata.use_spec_decoding = False
-        draft_metadata.padded_num_tokens = None
-        draft_metadata.all_rank_num_tokens = (
-            spec_metadata.subseq_all_rank_num_tokens)
-
-        next_draft_tokens = []
-        for draft_step in range(runtime_draft_len):
-            draft_logits, recurrent_hidden_states = (
-                draft_model.forward_draft_step(
-                    input_ids=draft_input_ids,
-                    position_ids=draft_position_ids,
-                    recurrent_hidden_states=recurrent_hidden_states,
-                    attn_metadata=draft_metadata,
-                    spec_metadata=spec_metadata,
-                ))
-            draft_input_ids = self.sample_draft_tokens(
-                draft_logits,
-                spec_metadata,
-                batch_size,
-                draft_step=draft_step,
-            )
-            next_draft_tokens.append(draft_input_ids)
-
-        next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
-        batch_indices = spec_metadata.batch_indices_cuda[:batch_size]
-        next_new_tokens = self._prepare_next_new_tokens(accepted_tokens,
-                                                        next_draft_tokens,
-                                                        batch_indices,
-                                                        batch_size,
-                                                        num_accepted_tokens)
-        attn_metadata.use_spec_decoding = True
-        return {
-            "logits": raw_logits,
-            "new_tokens": accepted_tokens,
-            "new_tokens_lens": num_accepted_tokens,
-            "next_draft_tokens": next_draft_tokens,
-            "next_new_tokens": next_new_tokens,
-        }
-
-    @staticmethod
-    def _prepare_external_shared_target_kv_draft_inputs(
-        *,
-        accepted_tokens: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
-        sequence_lengths: torch.Tensor,
-        num_contexts: int,
-        batch_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Select the accepted token, hidden row, and fixed draft position."""
-        sequence_starts = torch.cumsum(
-            sequence_lengths, dim=0, dtype=torch.long) - sequence_lengths
-        recurrent_indices = sequence_starts + sequence_lengths - 1
-        recurrent_indices[num_contexts:].copy_(
-            sequence_starts[num_contexts:] +
-            num_accepted_tokens[num_contexts:] - 1)
-        draft_input_ids = accepted_tokens[batch_indices,
-                                          num_accepted_tokens - 1]
-        recurrent_hidden_states = hidden_states[recurrent_indices]
-        draft_position_ids = (
-            _select_mtp_position_ids(position_ids, recurrent_indices) + 1)
-        return draft_input_ids, recurrent_hidden_states, draft_position_ids
 
     def _forward_draft_loop(self, inputs, attn_metadata, spec_metadata,
                             draft_model, draft_kv_cache_manager, num_contexts,
@@ -1307,6 +1139,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         logits: torch.Tensor,
         attn_metadata: AttentionMetadata,
         spec_metadata: Eagle3OneModelSpecMetadata,
+        num_contexts: Optional[int] = None,
     ):
         """Sample the golden token and verify previously proposed draft tokens.
 
@@ -1314,9 +1147,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         acceptance is enabled (both Eagle3 and MTP Eagle); ignored otherwise.
         """
         batch_size = attn_metadata.num_seqs
-        num_contexts = (batch_size - spec_metadata.num_generations
-                        if self._uses_external_shared_target_kv else
-                        attn_metadata.num_contexts)
+        if num_contexts is None:
+            num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
         runtime_draft_len = spec_metadata.runtime_draft_len
@@ -1444,13 +1276,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
 
 class MTPEagleWorker(Eagle3OneModelWorker):
-    """Backward-compatible alias for ``Eagle3OneModelWorker`` in MTP Eagle mode.
-
-    The constructor matches the historical positional signature
-    ``(spec_config, model_config, use_separate_draft_kv_cache)`` so callers
-    that import ``MTPEagleWorker`` from ``mtp.py`` or instantiate it directly
-    keep working. All logic is inherited from :class:`Eagle3OneModelWorker`.
-    """
+    """MTP worker built on the shared Eagle3 one-model drafting loop."""
 
     def __init__(self,
                  spec_config,
@@ -1465,3 +1291,180 @@ class MTPEagleWorker(Eagle3OneModelWorker):
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
         # Preserved for callers/tests that still expect this attribute.
         self.is_thop = False
+        self._uses_external_shared_target_kv = is_gemma4_mtp_assistant(
+            spec_config)
+
+    def set_draft_model(self, draft_model) -> None:
+        super().set_draft_model(draft_model)
+        if not self._uses_external_shared_target_kv:
+            return
+        if self.use_dynamic_tree:
+            raise ValueError(
+                "Gemma4 shared-target-KV MTP supports only the linear draft "
+                "path.")
+        if self.spec_config.draft_len_schedule is not None:
+            raise ValueError(
+                "Gemma4 shared-target-KV MTP does not support a draft length "
+                "schedule.")
+        if self.sa_enhancer is not None:
+            raise ValueError(
+                "Gemma4 shared-target-KV MTP does not support the suffix "
+                "automaton enhancer.")
+        if self.spec_config.use_rejection_sampling:
+            raise ValueError(
+                "Gemma4 shared-target-KV MTP does not support rejection "
+                "sampling.")
+
+    def set_guided_decoder(self, guided_decoder) -> bool:
+        if self._uses_external_shared_target_kv:
+            raise ValueError(
+                "Gemma4 shared-target-KV MTP does not support guided "
+                "decoding.")
+        return super().set_guided_decoder(guided_decoder)
+
+    def _forward_impl(self,
+                      input_ids,
+                      position_ids,
+                      hidden_states,
+                      logits,
+                      attn_metadata,
+                      spec_metadata,
+                      draft_model,
+                      resource_manager=None):
+        if not self._uses_external_shared_target_kv:
+            return super()._forward_impl(input_ids, position_ids, hidden_states,
+                                         logits, attn_metadata, spec_metadata,
+                                         draft_model, resource_manager)
+        return self._forward_external_shared_target_kv(input_ids, position_ids,
+                                                       hidden_states, logits,
+                                                       attn_metadata,
+                                                       spec_metadata,
+                                                       draft_model)
+
+    def _forward_external_shared_target_kv(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        """Draft with a Gemma4 Q-only assistant over accepted target KV."""
+        if not isinstance(attn_metadata, FlashInferAttentionMetadata):
+            raise TypeError(
+                "Gemma4 shared-target-KV MTP requires FlashInfer attention "
+                "metadata.")
+
+        batch_size = attn_metadata.num_seqs
+        num_contexts = batch_size - spec_metadata.num_generations
+        runtime_draft_len = spec_metadata.runtime_draft_len
+        if runtime_draft_len == 0:
+            target_tokens = self._sample_tokens_for_batch(
+                logits, spec_metadata, num_contexts, batch_size)
+            accepted_tokens = target_tokens.unsqueeze(1)
+            num_accepted_tokens = torch.ones(batch_size,
+                                             dtype=torch.int,
+                                             device=logits.device)
+            next_draft_tokens = torch.empty((batch_size, 0),
+                                            dtype=torch.int32,
+                                            device=logits.device)
+            return {
+                "logits": logits,
+                "new_tokens": accepted_tokens,
+                "new_tokens_lens": num_accepted_tokens,
+                "next_draft_tokens": next_draft_tokens,
+                "next_new_tokens": accepted_tokens,
+            }
+
+        accepted_tokens, num_accepted_tokens = (
+            self.sample_and_accept_draft_tokens(
+                input_ids,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                num_contexts=num_contexts,
+            ))
+        (
+            draft_input_ids,
+            recurrent_hidden_states,
+            draft_position_ids,
+        ) = self._prepare_external_shared_target_kv_draft_inputs(
+            accepted_tokens=accepted_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            sequence_lengths=attn_metadata.seq_lens_cuda[:batch_size],
+            num_contexts=num_contexts,
+            batch_indices=spec_metadata.batch_indices_cuda[:batch_size],
+        )
+
+        draft_metadata = attn_metadata.get_shared_kv_draft_metadata()
+        draft_metadata.update_shared_kv_draft_lengths(attn_metadata,
+                                                      num_accepted_tokens,
+                                                      num_contexts)
+        draft_metadata.use_spec_decoding = False
+        draft_metadata.padded_num_tokens = None
+        draft_metadata.all_rank_num_tokens = (
+            spec_metadata.subseq_all_rank_num_tokens)
+
+        next_draft_tokens = []
+        for draft_step in range(runtime_draft_len):
+            draft_logits, recurrent_hidden_states = (
+                draft_model.forward_draft_step(
+                    input_ids=draft_input_ids,
+                    position_ids=draft_position_ids,
+                    recurrent_hidden_states=recurrent_hidden_states,
+                    attn_metadata=draft_metadata,
+                    spec_metadata=spec_metadata,
+                ))
+            draft_input_ids = self.sample_draft_tokens(
+                draft_logits,
+                spec_metadata,
+                batch_size,
+                draft_step=draft_step,
+            )
+            next_draft_tokens.append(draft_input_ids)
+
+        next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens,
+            next_draft_tokens,
+            spec_metadata.batch_indices_cuda[:batch_size],
+            batch_size,
+            num_accepted_tokens,
+        )
+        attn_metadata.use_spec_decoding = True
+        return {
+            "logits": logits,
+            "new_tokens": accepted_tokens,
+            "new_tokens_lens": num_accepted_tokens,
+            "next_draft_tokens": next_draft_tokens,
+            "next_new_tokens": next_new_tokens,
+        }
+
+    @staticmethod
+    def _prepare_external_shared_target_kv_draft_inputs(
+        *,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        num_contexts: int,
+        batch_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select the accepted token, hidden row, and fixed draft position."""
+        sequence_starts = torch.cumsum(
+            sequence_lengths, dim=0, dtype=torch.long) - sequence_lengths
+        recurrent_indices = sequence_starts + sequence_lengths - 1
+        recurrent_indices[num_contexts:].copy_(
+            sequence_starts[num_contexts:] +
+            num_accepted_tokens[num_contexts:] - 1)
+        draft_input_ids = accepted_tokens[batch_indices,
+                                          num_accepted_tokens - 1]
+        recurrent_hidden_states = hidden_states[recurrent_indices]
+        draft_position_ids = (
+            _select_mtp_position_ids(position_ids, recurrent_indices) + 1)
+        return draft_input_ids, recurrent_hidden_states, draft_position_ids
