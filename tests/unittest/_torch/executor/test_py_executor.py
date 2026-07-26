@@ -19,6 +19,7 @@ import types
 from unittest.mock import MagicMock, Mock
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
@@ -26,13 +27,28 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    DisaggTransferAdmissionController,
+    EncoderStepResult,
+    PyExecutor,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+
+
+class _InflightRequestIds:
+    def __init__(self):
+        self.ids = set()
+
+    def insert(self, request_id):
+        self.ids.add(request_id)
+
+    def erase(self, request_id):
+        self.ids.discard(request_id)
 
 
 class MockPyExecutor:
@@ -115,6 +131,205 @@ def mock_dist():
     mock_dist.rank = 0
     mock_dist.tp_size = 1
     return mock_dist
+
+
+def _make_async_encoder_executor(future):
+    executor = object.__new__(PyExecutor)
+    executor.encoder_launch_executor = Mock()
+    executor.encoder_launch_executor.submit.return_value = future
+    executor.pending_encoder_steps = []
+    executor.inflight_req_ids = _InflightRequestIds()
+    executor._run_encoder_step_unchecked = Mock()
+    executor._publish_encoder_step = Mock()
+    executor._handle_errors = Mock()
+    return executor
+
+
+def _make_encoder_batch_wait_executor():
+    executor = object.__new__(PyExecutor)
+    executor.max_batch_size = 32
+    executor.batch_wait_timeout_iters = 48
+    executor.encoder_batch_wait_iters_count = 0
+    return executor
+
+
+def test_encoder_microbatch_graph_waits_for_target(monkeypatch):
+    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_CUDA_GRAPH_MAX_BATCH_SIZE", "8")
+    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_LOW_WATERMARK", "24")
+    executor = _make_encoder_batch_wait_executor()
+    encoder_requests = [object()] * 7
+    generation_requests = [object()] * 24
+
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        generation_requests,
+    )
+
+    assert scheduled == []
+    assert executor.encoder_batch_wait_iters_count == 1
+
+
+def test_encoder_microbatch_graph_releases_target(monkeypatch):
+    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_CUDA_GRAPH_MAX_BATCH_SIZE", "8")
+    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_LOW_WATERMARK", "24")
+    executor = _make_encoder_batch_wait_executor()
+    encoder_requests = [object()] * 8
+
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [object()] * 24,
+    )
+
+    assert scheduled == encoder_requests
+    assert executor.encoder_batch_wait_iters_count == 0
+
+
+def test_encoder_microbatch_graph_does_not_release_partial_at_low_watermark(monkeypatch):
+    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_CUDA_GRAPH_MAX_BATCH_SIZE", "8")
+    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_LOW_WATERMARK", "24")
+    executor = _make_encoder_batch_wait_executor()
+    encoder_requests = [object()]
+
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [object()] * 24,
+    )
+
+    assert scheduled == []
+    assert executor.encoder_batch_wait_iters_count == 1
+
+
+def test_encoder_microbatch_graph_caps_scheduler_overfill(monkeypatch):
+    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_CUDA_GRAPH_MAX_BATCH_SIZE", "8")
+    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_LOW_WATERMARK", "24")
+    executor = _make_encoder_batch_wait_executor()
+    encoder_requests = [object() for _ in range(12)]
+
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [object()] * 20,
+    )
+
+    assert scheduled == encoder_requests[:8]
+    assert executor.encoder_batch_wait_iters_count == 0
+
+
+def test_encoder_microbatch_graph_releases_supported_tail_at_deadline(monkeypatch):
+    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_CUDA_GRAPH_MAX_BATCH_SIZE", "8")
+    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_LOW_WATERMARK", "24")
+    executor = _make_encoder_batch_wait_executor()
+    executor.encoder_batch_wait_iters_count = executor.batch_wait_timeout_iters
+    encoder_requests = [object() for _ in range(7)]
+
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [],
+    )
+
+    assert scheduled == encoder_requests[:4]
+    assert executor.encoder_batch_wait_iters_count == 0
+
+
+def test_pending_encoder_future_is_polled_without_blocking():
+    future = Mock()
+    future.done.return_value = False
+    executor = _make_async_encoder_executor(future)
+    request = types.SimpleNamespace(request_id=11, state=LlmRequestState.ENCODER_INIT)
+
+    executor._submit_encoder_step([request])
+    executor._poll_encoder_steps()
+
+    future.result.assert_not_called()
+    executor._publish_encoder_step.assert_not_called()
+    assert executor.inflight_req_ids.ids == {11}
+    assert len(executor.pending_encoder_steps) == 1
+    executor.encoder_launch_executor.submit.assert_called_once_with(
+        executor._run_encoder_step_unchecked,
+        [request],
+    )
+
+
+def test_completed_encoder_future_waits_for_cuda_event_without_blocking():
+    ready_event = Mock()
+    ready_event.query.side_effect = [False, True]
+    result = EncoderStepResult(
+        hidden_states=torch.empty((1, 2)),
+        sequence_lengths=[1],
+        ready_event=ready_event,
+    )
+    future = Mock()
+    future.done.return_value = True
+    future.result.return_value = result
+    executor = _make_async_encoder_executor(future)
+    request = types.SimpleNamespace(request_id=12, state=LlmRequestState.ENCODER_INIT)
+
+    executor._submit_encoder_step([request])
+    executor._poll_encoder_steps()
+
+    future.result.assert_called_once_with()
+    ready_event.query.assert_called_once_with()
+    executor._publish_encoder_step.assert_not_called()
+    assert executor.inflight_req_ids.ids == {12}
+    assert len(executor.pending_encoder_steps) == 1
+
+    executor._poll_encoder_steps()
+
+    future.result.assert_called_once_with()
+    assert ready_event.query.call_count == 2
+    executor._publish_encoder_step.assert_called_once_with([request], result)
+    assert executor.inflight_req_ids.ids == set()
+    assert executor.pending_encoder_steps == []
+
+
+def test_publish_encoder_output_does_not_resurrect_completed_request():
+    executor = object.__new__(PyExecutor)
+    active_request = types.SimpleNamespace(state=LlmRequestState.ENCODER_INIT)
+    completed_request = types.SimpleNamespace(state=LlmRequestState.GENERATION_COMPLETE)
+    hidden_states = torch.arange(12).reshape(6, 2)
+    ready_event = Mock()
+
+    executor._scatter_encoder_output(
+        [active_request, completed_request],
+        hidden_states,
+        [2, 4],
+        ready_event,
+    )
+
+    assert active_request.state == LlmRequestState.CONTEXT_INIT
+    assert active_request.py_encoder_output_ready_event is ready_event
+    assert torch.equal(active_request.py_encoder_output, hidden_states[:2])
+    assert completed_request.state == LlmRequestState.GENERATION_COMPLETE
+    assert not hasattr(completed_request, "py_encoder_output")
+
+
+def test_attach_encoder_output_records_stream_after_encoder_is_ready():
+    executor = object.__new__(PyExecutor)
+    executor.execution_stream = Mock()
+    ready_event = Mock()
+    first_output = Mock()
+    second_output = Mock()
+    first_request = types.SimpleNamespace(
+        py_encoder_output=first_output,
+        py_encoder_output_ready_event=ready_event,
+    )
+    second_request = types.SimpleNamespace(
+        py_encoder_output=second_output,
+        py_encoder_output_ready_event=ready_event,
+    )
+    scheduled_requests = types.SimpleNamespace(context_requests=[first_request, second_request])
+
+    executor._attach_encoder_output_to_execution_stream(scheduled_requests)
+
+    executor.execution_stream.wait_event.assert_not_called()
+    first_output.record_stream.assert_called_once_with(executor.execution_stream)
+    second_output.record_stream.assert_called_once_with(executor.execution_stream)
+    assert first_request.py_encoder_output_ready_event is None
+    assert second_request.py_encoder_output_ready_event is None
 
 
 @pytest.fixture
