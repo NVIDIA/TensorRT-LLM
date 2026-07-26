@@ -61,6 +61,13 @@ PARTIAL_SCORES_ENV_VAR = "TLLM_EVAL_PARTIAL_SCORES_EVERY"
 # See generate_until for the throughput/early-signal tradeoff.
 MAX_IN_FLIGHT_ENV_VAR = "TLLM_EVAL_MAX_IN_FLIGHT"
 
+# When "1", request per-request perf metrics and log an aggregate
+# speculative-decoding summary (acceptance length AL as mean decoded
+# tokens/step, acceptance rate AR as accepted/drafted draft tokens) at the
+# end of generate_until. No-op output on non-speculative runs; unset/0
+# leaves sampling params untouched (no perf-metrics overhead).
+SPEC_STATS_ENV_VAR = "TLLM_EVAL_SPEC_STATS"
+
 
 class _RunningScoreTracker:
     """Best-effort running metric estimates over completed eval responses.
@@ -186,6 +193,9 @@ class LmEvalWrapper(TemplateLM):
                 self.max_in_flight = 0
         else:
             self.max_in_flight = 0
+        # Env-gated speculative-decoding stats (AL/AR) aggregation over the
+        # eval corpus; forces return_perf_metrics on generated requests.
+        self.spec_stats = os.environ.get(SPEC_STATS_ENV_VAR) == "1"
 
     @property
     def eot_token_id(self) -> int:
@@ -265,7 +275,42 @@ class LmEvalWrapper(TemplateLM):
                     if current is not None and current > value:
                         continue
                 setattr(sampling_params, trtllm_key, value)
+        if self.spec_stats:
+            sampling_params.return_perf_metrics = True
         return sampling_params
+
+    def _log_spec_stats(self, outputs: List[RequestOutput]) -> None:
+        """Log corpus-aggregate speculative-decoding stats (TLLM_EVAL_SPEC_STATS=1).
+
+        AL (acceptance length) is reported as the mean of per-request
+        ``avg_decoded_tokens_per_iter`` (target token + accepted draft tokens
+        per decode step); AR (acceptance rate) as total accepted / total
+        drafted draft tokens from the per-request perf metrics. Skips silently
+        when the run produced no speculative metrics (non-spec-dec config).
+        """
+        tokens_per_iter = [
+            output.avg_decoded_tokens_per_iter for output in outputs
+            if getattr(output, "avg_decoded_tokens_per_iter", None) is not None
+        ]
+        accepted = drafted = 0
+        for output in outputs:
+            perf_metrics = getattr(output.outputs[0], "request_perf_metrics",
+                                   None)
+            spec_dec = getattr(perf_metrics, "speculative_decoding",
+                               None) if perf_metrics else None
+            if spec_dec is not None:
+                accepted += spec_dec.total_accepted_draft_tokens
+                drafted += spec_dec.total_draft_tokens
+        if tokens_per_iter:
+            mean_tpi = sum(tokens_per_iter) / len(tokens_per_iter)
+            logger.info(
+                f"Spec-dec stats: AL (mean decoded tokens/step) {mean_tpi:.3f} "
+                f"(min {min(tokens_per_iter):.3f}, "
+                f"max {max(tokens_per_iter):.3f}, n={len(tokens_per_iter)})")
+        if drafted > 0:
+            logger.info(
+                f"Spec-dec stats: AR (accepted/drafted draft tokens) "
+                f"{accepted}/{drafted} = {accepted / drafted:.2%}")
 
     def _generate_until_windowed(self, requests, scorer,
                                  disable_tqdm: bool) -> List[RequestOutput]:
@@ -382,6 +427,9 @@ class LmEvalWrapper(TemplateLM):
         if self.output_dir:
             dump_inference_results(self.output_dir, outputs,
                                    getattr(self.llm, 'tokenizer', None))
+
+        if self.spec_stats:
+            self._log_spec_stats(outputs)
 
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
@@ -651,6 +699,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         if self.output_dir:
             dump_inference_results(self.output_dir, outputs,
                                    getattr(self.llm, 'tokenizer', None))
+
+        if self.spec_stats:
+            self._log_spec_stats(outputs)
 
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
