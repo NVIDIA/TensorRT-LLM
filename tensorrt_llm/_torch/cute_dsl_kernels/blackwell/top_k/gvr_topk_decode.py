@@ -5406,7 +5406,18 @@ class GvrTopKKernel:
         ck1 = cutlass.Int64(0)
         ext_row = cutlass.Int32(0)
         if cutlass.const_expr(self.use_ext_counts):
-            if seed_thr_row[0] < cutlass.Float32(1e37):
+            # line validity mirrors ext_rungs: ALL THREE lines finite and
+            # strictly ascending. The old t0-only guard let a NaN in
+            # t1/t2 get parked into the refine brackets (the same failure
+            # mode that broke ext_rungs exactness on-chain); invalid rows
+            # fall to the stock path, exactness never rides on the host
+            # loop's line quality.
+            if (
+                seed_thr_row[0] < cutlass.Float32(1e37)
+                and seed_thr_row[0] > cutlass.Float32(-1e37)
+                and seed_thr_row[1] > seed_thr_row[0]
+                and seed_thr_row[2] > seed_thr_row[1]
+            ):
                 for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
                     cm_e = cutlass.Int32(seed_thr_row[3 + m])
                     if cm_e >= cutlass.Int32(self.top_k) and cm_e <= cutlass.Int32(self.kC):
@@ -5428,6 +5439,9 @@ class GvrTopKKernel:
                     and claimed_p >= cutlass.Int32(self.top_k + 64)
                     and claimed_p <= cutlass.Int32(self.list_cap)
                     and seed_thr_row[0] < cutlass.Float32(1e37)
+                    and seed_thr_row[0] > cutlass.Float32(-1e37)
+                    and seed_thr_row[1] > seed_thr_row[0]
+                    and seed_thr_row[2] > seed_thr_row[1]
                 ):
                     ext_row = cutlass.Int32(1)
             # ---- self_scan phase 0: fused scan-bucket ----
