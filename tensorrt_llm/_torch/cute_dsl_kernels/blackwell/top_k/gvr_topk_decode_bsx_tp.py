@@ -36,8 +36,11 @@ Faithful phase-by-phase port otherwise:
   P2a : uniform every-32nd-float4 sampled multi-rung count (+ per-rung
         float4 occupancy for a clustering-aware sigma) -> 4-stage pivot:
         stage 0 is the hint-ladder ADMISSION (in-tree R0 op#26 parity) —
-        tightest rung whose sampled CI sits inside [K, kC] — followed by
-        the legacy 3-stage pick when no rung qualifies
+        tightest rung whose sampled CI sits inside [K, 0.6*kC] (the
+        legacy pivot-band hi) — stage 0b prefers the legacy band pick
+        when it is strictly leaner and safe by its clustering-aware
+        1.5-sigma lower CI, and the legacy 3-stage pick handles rows
+        where no rung qualifies
   P2b : ONE fused streaming pass: exact counts at {pivot, rescue rung}
         + optimistic collect of packed (key<<32|idx) u64 candidates
         >= pivot into CTA0 smem (capped kC). Pivot count in [K, kC] =>
@@ -1029,14 +1032,40 @@ class GvrTpKernel:
                     # Sigma is clustering-aware: est = SS*cnt, sigma =
                     # SS*cnt/sqrt(occ) (compound Poisson over occupied
                     # float4 clumps; equals the classic sqrt(SS*est) when
-                    # occ == cnt, i.e. IID rows). Lower margin is 2 sigma;
-                    # K2048 uses 1.5 (its [K, 4K] window is too narrow for
-                    # 2-sigma to ever fire tight, and the rescue rung
-                    # bounds a miss at one extra collect pass). Rungs are
-                    # descending in j, so the first passing j is the
-                    # tightest; later stages never override (their dd >= 0
-                    # cannot beat bestd == 0).
-                    mlo = cutlass.const_expr(1.5 if K >= 2048 else 2.0)
+                    # occ == cnt, i.e. IID rows).
+                    # Fix round (pr2 full-grid regressions), all changes on
+                    # the PICK only — the fused pass / rescue / exactness
+                    # machinery is byte-identical to the admission commit:
+                    #  * upper acceptance bound tightened from kC to the
+                    #    legacy pivot-band hi (0.6*kC): an in-window-but-
+                    #    fat admitted rung inflates P3 pushes + P4
+                    #    candidates 2-4x over the ~3K legacy target;
+                    #  * K2048 lower margin raised 1.5 -> 1.85 sigma: at
+                    #    1.5 the admitted rung's true count lands under K
+                    #    on clustered rows (v32_32k_L23 rung est 2720,
+                    #    sigma 374, true 1959 < K) and the rescue
+                    #    re-stream costs more than the fat legacy pick it
+                    #    displaced; 1.85 keeps the genuine tight admits
+                    #    (v32_32k_L50: margin +1.92 sigma, true 2917);
+                    #  * stage 0b below: when the legacy band pick is
+                    #    strictly LEANER than the admitted rung and safe
+                    #    by its own clustering-aware 1.5-sigma lower CI,
+                    #    prefer it (mlo=2.0 rows whose next-leaner rung
+                    #    sits at 1.8-2.0 sigma otherwise admit a 2.5x
+                    #    fatter set: pro_64k_L06 4134 vs legacy 1671).
+                    # Rungs are descending in j, so the first passing j is
+                    # the tightest.
+                    # All margin tests below are sqrt/div-free: with
+                    # sigma = est/sqrt(occ), "est - m*sigma >= K" is
+                    # "(est-K)^2 * occ >= m^2 * est^2" (est >= K), and
+                    # "est + 2*sigma <= U" is "4*est^2 <= (U-est)^2 * occ"
+                    # (est <= U). The pick is a THREAD-0 serial section
+                    # between two CTA barriers; the sqrt+fdiv chain of the
+                    # first admission cut measured ~2-5% whole-kernel on
+                    # L2-resident accept-path rows.
+                    mlo2 = cutlass.const_expr(1.85 * 1.85 if K >= 2048 else 4.0)
+                    ubnd = cutlass.const_expr(float((6 * kC) // 10))
+                    adm_est = cutlass.Int32(0x7FFFFFFF)
                     for j in cutlass.range_constexpr(AR):
                         cnt_j = s_rcnt[j] & cutlass.Int32(0xFFFF)
                         if cnt_j > cutlass.Int32(0):
@@ -1044,18 +1073,26 @@ class GvrTpKernel:
                                 occ_j = s_rcnt[j] >> cutlass.Int32(16)
                                 if occ_j < cutlass.Int32(1):
                                     occ_j = cutlass.Int32(1)
-                                sig = (
-                                    cutlass.Float32(float(SS))
-                                    * cutlass.Float32(cnt_j)
-                                    / cmath.sqrt(cutlass.Float32(occ_j))
-                                )
+                                focc = cutlass.Float32(occ_j)
                                 fest = cutlass.Float32(cnt_j * cutlass.Int32(SS))
-                                if fest - cutlass.Float32(mlo) * sig >= cutlass.Float32(float(K)):
-                                    if fest + cutlass.Float32(2.0) * sig <= cutlass.Float32(
-                                        float(kC)
-                                    ):
-                                        bestd = cutlass.Int32(0)
-                                        best = cutlass.Int32(j)
+                                fe2 = fest * fest
+                                a_lo = fest - cutlass.Float32(float(K))
+                                bhi = cutlass.Float32(ubnd) - fest
+                                if a_lo >= cutlass.Float32(0.0):
+                                    if a_lo * a_lo * focc >= cutlass.Float32(mlo2) * fe2:
+                                        if bhi >= cutlass.Float32(0.0):
+                                            if cutlass.Float32(4.0) * fe2 <= bhi * bhi * focc:
+                                                bestd = cutlass.Int32(0)
+                                                best = cutlass.Int32(j)
+                                                adm_est = cnt_j * cutlass.Int32(SS)
+                    # Stage 0b — legacy band pick (min |est - tgt| in
+                    # [1.5K, 0.6kC], EXACTLY the pr1 stage-1 rule), then
+                    # combine: with no admission it is taken as-is (pr1
+                    # parity); with an admitted rung it OVERRIDES only
+                    # when strictly leaner AND safe by its own
+                    # clustering-aware 1.5-sigma lower CI.
+                    jb = cutlass.Int32(AR - 1)
+                    jbd = cutlass.Int32(0x7FFFFFFF)
                     for j in cutlass.range_constexpr(AR):
                         est = (s_rcnt[j] & cutlass.Int32(0xFFFF)) * cutlass.Int32(SS)
                         if est >= cutlass.Int32(lo):
@@ -1063,9 +1100,29 @@ class GvrTpKernel:
                                 dd = est - tgt
                                 if dd < cutlass.Int32(0):
                                     dd = tgt - est
-                                if dd < bestd:
-                                    bestd = dd
-                                    best = cutlass.Int32(j)
+                                if dd < jbd:
+                                    jbd = dd
+                                    jb = cutlass.Int32(j)
+                    if jbd != cutlass.Int32(0x7FFFFFFF):
+                        if bestd == cutlass.Int32(0x7FFFFFFF):
+                            bestd = jbd
+                            best = jb
+                        else:
+                            cnt_b = s_rcnt[jb] & cutlass.Int32(0xFFFF)
+                            est_b = cnt_b * cutlass.Int32(SS)
+                            if est_b < adm_est:
+                                occ_b = s_rcnt[jb] >> cutlass.Int32(16)
+                                if occ_b < cutlass.Int32(1):
+                                    occ_b = cutlass.Int32(1)
+                                fb = cutlass.Float32(est_b)
+                                ab = fb - cutlass.Float32(float(K))
+                                if ab >= cutlass.Float32(0.0):
+                                    if (
+                                        ab * ab * cutlass.Float32(occ_b)
+                                        >= cutlass.Float32(2.25) * fb * fb
+                                    ):
+                                        bestd = jbd
+                                        best = jb
                     if bestd == cutlass.Int32(0x7FFFFFFF):
                         for j in cutlass.range_constexpr(AR):
                             est = (s_rcnt[j] & cutlass.Int32(0xFFFF)) * cutlass.Int32(SS)

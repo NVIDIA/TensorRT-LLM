@@ -432,7 +432,9 @@ def test_bsx_preidx_hardening(npad, bs, top_k, preidx):
 # ---------------------------------------------------------------------------
 # tp-tier hint-ladder ADMISSION fast path (R0 parity): the P2a stage-0 pick
 # pushes candidates at the tightest ladder rung whose sampled CI lies in
-# [K, kC], so high-hit-rate rows finish in one fused streaming pass. These
+# [K, 0.6*kC] (the legacy pivot-band hi; a leaner SAFE legacy band pick
+# overrides it — stage 0b), so high-hit-rate rows finish in one fused
+# streaming pass. These
 # cases pin the admission decision surface: hit-rate extremes, tie plateaus
 # AT the admission threshold, forced count > kC overflow fallback, and a
 # batch mixing admitted and fallback rows (per-row escape independence).
