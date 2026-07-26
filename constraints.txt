@@ -18,3 +18,7 @@ soupsieve>=2.8.4
 # starlette>=1.3.1
 # WAR against https://github.com/advisories/GHSA-mgf9-4vpg-hj56
 tornado>=6.5.6
+# WAR against https://github.com/advisories/GHSA-
+gitpython>=3.1.55
+# WAR against https://github.com/advisories/GHSA-gx64-gj6p-pc4c
+jupyterlab>=4.5.10

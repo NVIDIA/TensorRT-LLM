@@ -2,7 +2,7 @@
 
 set -ex
 
-ETCD_VER=v3.7.0
+ETCD_VER=v3.7.1
 
 # choose either URL
 DOWNLOAD_URL=https://storage.googleapis.com/etcd
