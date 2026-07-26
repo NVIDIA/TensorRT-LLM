@@ -136,7 +136,11 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
         mkdir -p \"\$TRITON_CACHE_DIR\"
         export FLASHINFER_WORKSPACE_BASE=$CACHE_DIR/fi_workspace
         export FLASHINFER_CUBIN_DIR=$CACHE_DIR/fi_cubins
-        mkdir -p \"\$FLASHINFER_WORKSPACE_BASE\" \"\$FLASHINFER_CUBIN_DIR\"
+        # HF dataset/hub cache: \$HOME/.cache is dangling on remote ranks in
+        # some cluster images, so keep HF under CACHE_DIR (matches
+        # perf_sweep.sbatch); the gsm8k dataset is served from this cache.
+        export HF_HOME=\${HF_HOME:-$CACHE_DIR/hf_home}
+        mkdir -p \"\$FLASHINFER_WORKSPACE_BASE\" \"\$FLASHINFER_CUBIN_DIR\" \"\$HF_HOME\"
         # Node-local HF remote-code modules cache: racing mkdir over shared
         # \$HOME escapes pathlib's exist_ok on NFS (see run_gsm8k_kimi_k3).
         export HF_MODULES_CACHE=/tmp/hf-modules-rank\${SLURM_PROCID:-0}
