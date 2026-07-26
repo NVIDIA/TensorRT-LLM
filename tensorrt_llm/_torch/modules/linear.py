@@ -3350,14 +3350,17 @@ class Linear(nn.Module):
                 ]
                 if len(set(sizes)) > 1:
                     self.gather_output_sizes = sizes
-            elif isinstance(self.tp_sharding, tuple) and \
-                    (self.tp_sharding[1] - self.tp_sharding[0]) * self.tp_size != out_features:
-                # Only this rank's range is known, so the other ranks' widths that
-                # allgather needs cannot be derived.
+            elif self.tp_sharding is not None:
+                # allgather concatenates in rank order, so gather_output assumes rank i
+                # holds the i-th ascending, contiguous slice. _auto_tp_sharding
+                # guarantees that; an arbitrary override guarantees neither the widths
+                # nor the ordering, and `sizes` carries widths only — it cannot express
+                # a permuted or non-contiguous layout even when the widths are equal.
                 raise ValueError(
-                    f"gather_output=True with an uneven override_tp_sharding "
-                    f"{self.tp_sharding} is not supported (out_features="
-                    f"{out_features}, tp_size={self.tp_size}).")
+                    f"gather_output=True is not supported together with "
+                    f"override_tp_sharding ({self.tp_sharding}); gather_output "
+                    f"requires the rank-ordered contiguous layout that only "
+                    f"automatic TP sharding provides.")
 
         if self.tp_mode == TensorParallelMode.COLUMN:
             reduce_output = False if self.mapping.enable_attention_dp else reduce_output
