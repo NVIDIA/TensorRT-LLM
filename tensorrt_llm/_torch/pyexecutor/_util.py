@@ -1827,6 +1827,19 @@ def _create_kv_cache_manager(
     Returns:
         A KVCacheManager instance for the given model engine or model config
     """
+    if (estimating_kv_cache
+            and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
+            and kv_cache_config.pool_ratio is None
+            and kv_cache_config.avg_seq_len is not None
+            and kv_cache_config.avg_seq_len > max_seq_len):
+        # Estimation can build multiple managers from the same temporary
+        # config. The first manager may reduce max_seq_len to fit max_tokens,
+        # so later draft/cross managers need a per-manager workload length.
+        # Keep the shared config untouched because it is restored after
+        # estimation.
+        kv_cache_config = kv_cache_config.model_copy(
+            update={"avg_seq_len": max_seq_len})
+
     # Extract config from model_engine or use provided model_config
     if model_config is not None:
         config = model_config.pretrained_config
