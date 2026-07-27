@@ -933,12 +933,15 @@ bash "${scriptPrepareBodyPathNode}"
                 def containerImageForAgent = LLM_DOCKER_IMAGE
                 if (cluster.fatBuilderArgs != null) {
                     def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    // Include fat_build_inline.sh content hash in the cache key so that changes
+                    // to the build script (e.g. adding --no-user) invalidate the cached sqsh.
+                    def fatBuildScriptHash = sh(returnStdout: true, script: "sha256sum ${scriptFatBuildLocalPath} | cut -d' ' -f1 | head -c 8").trim()
                     def fatCheckResult = Utils.exec(
                         pipeline,
                         returnStdout: true,
                         script: Utils.sshUserCmd(
                             remote,
-                            "\"fatHash=\$(printf '%s' '${llmTarfile}|${LLM_DOCKER_IMAGE}' | sha256sum | cut -d' ' -f1 | head -c 16); fatSqshPath=${fatSqshDir}/fat-\${fatHash}.sqsh; test -f \"\$fatSqshPath\" && echo \"\$fatSqshPath\" || echo MISSING\""
+                            "\"fatHash=\$(printf '%s' '${llmTarfile}|${LLM_DOCKER_IMAGE}|${fatBuildScriptHash}' | sha256sum | cut -d' ' -f1 | head -c 16); fatSqshPath=${fatSqshDir}/fat-\${fatHash}.sqsh; test -f \"\$fatSqshPath\" && echo \"\$fatSqshPath\" || echo MISSING\""
                         )
                     ).trim()
                     if (fatCheckResult != "MISSING" && fatCheckResult) {
@@ -1696,13 +1699,18 @@ bash "${scriptFatBuildBodyPathNode}"
                     containerImageArg = "\${enrootImagePath}"
                     def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
                     def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    // Embed fat_build_inline.sh content hash so cache is invalidated when
+                    // the build script changes (e.g. adding --no-user to pip install).
+                    def fatBuildScriptHash = sh(returnStdout: true, script: "sha256sum ${scriptFatBuildLocalPath} | cut -d' ' -f1 | head -c 8").trim()
 
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
 
                     # Fat sqsh: pre-built on CPU node; if present, skip all pip installs.
+                    # Cache key includes fat_build_inline.sh content hash (${fatBuildScriptHash})
+                    # so that build script changes automatically invalidate the cached sqsh.
                     fatSqshDir="$fatSqshDir"
-                    fatHash=\$(printf '%s' "$llmTarfile|$LLM_DOCKER_IMAGE" | sha256sum | cut -d' ' -f1 | head -c 16)
+                    fatHash=\$(printf '%s' "$llmTarfile|$LLM_DOCKER_IMAGE|${fatBuildScriptHash}" | sha256sum | cut -d' ' -f1 | head -c 16)
                     fatSqshPath="\$fatSqshDir/fat-\${fatHash}.sqsh"
 
                     if [ -f "\$fatSqshPath" ]; then

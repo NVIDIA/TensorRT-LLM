@@ -62,7 +62,10 @@ importContainerWithRetries "${FAT_CONTAINER}" "$baseSqshPath"
 
 # Build fat sqsh from cached base sqsh.
 mkdir -p "${FAT_SQSH_DIR}"
-fatHash=$(printf '%s' "${FAT_LLM_TARFILE}|${FAT_LLM_DOCKER_IMAGE}" | sha256sum | cut -d' ' -f1 | head -c 16)
+# Include hash of the build script itself so changing fat_build_inline.sh
+# (e.g. adding --no-user) invalidates the cached sqsh automatically.
+fatBuildScriptHash=$(sha256sum "${FAT_BUILD_SCRIPT_PATH}" | cut -d' ' -f1 | head -c 8)
+fatHash=$(printf '%s' "${FAT_LLM_TARFILE}|${FAT_LLM_DOCKER_IMAGE}|${fatBuildScriptHash}" | sha256sum | cut -d' ' -f1 | head -c 16)
 fatSqshPath="${FAT_SQSH_DIR}/fat-${fatHash}.sqsh"
 if [ -f "$fatSqshPath" ]; then
     echo "[fat_build_sbatch] Fat sqsh already exists: $fatSqshPath"
