@@ -33,3 +33,47 @@
  #else
                      recv_int4[token_idx * hidden_int4 + i] = out_int4;
  #endif
+
+--- a/csrc/kernels/extension_kernels.cu
++++ b/csrc/kernels/extension_kernels.cu
+@@ -658,8 +658,30 @@ low_precision_combine(void* combined_x,
+             float global_scale_val = 0.f;
+             if constexpr (LowPrecisionTypeTraits<kPrecision>::kUseGlobalScale) {
+                 auto rdma_send_x_global_scale_vec = reinterpret_cast<float*>(rdma_send_x_current_expert + token_idx * kNumBytesPerSlot + kHiddenCommBytes + kScalesBytes);
+-                global_scale_val = __ldg(global_scale_per_token + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank + token_idx);
+-                rdma_send_x_global_scale_vec[0] = global_scale_val;
++                if (global_scale_per_token != nullptr) {
++                    global_scale_val = __ldg(global_scale_per_token + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank + token_idx);
++                } else {
++                    // Match calculate_nvfp4_global_scale exactly, but compute the
++                    // per-token reduction in the combine warp to avoid a separate
++                    // kernel launch and intermediate scale tensor.
++                    float per_token_max_abs_val = 0.f;
++                    const auto x_int4 = local_x + token_idx * kHiddenBf16VecAccessNum;
++                    for (int i = lane_id; i < kHiddenBf16VecAccessNum; i += 32) {
++                        const auto int4_value = __ldg(x_int4 + i);
++                        const auto bf16_values = reinterpret_cast<const nv_bfloat16*>(&int4_value);
++#pragma unroll
++                        for (int j = 0; j < kBF16ElemsNumPerVecAccess; ++j) {
++                            per_token_max_abs_val = fmaxf(
++                                per_token_max_abs_val, fabsf(static_cast<float>(bf16_values[j])));
++                        }
++                    }
++                    per_token_max_abs_val = fmaxf(
++                        per_token_max_abs_val,
++                        __shfl_xor_sync(0xffffffff, per_token_max_abs_val, 16));
++                    per_token_max_abs_val = half_warp_reduce_max(per_token_max_abs_val);
++                    global_scale_val = 448.f * 6.f / per_token_max_abs_val;
++                }
++                rdma_send_x_global_scale_vec[0] = global_scale_val;
+             }
+             const auto x_int4 = local_x + token_idx * kHiddenBf16VecAccessNum;
+             for(int i = lane_id; i < kHiddenBf16VecAccessNum; i += 32) {
+@@ -785,7 +807,6 @@ void low_precision_combine(int precision,void* combined_x,
+ auto combine_func = low_precision_combine<LowPrecisionType::FP8, hidden, kNumMaxTopk>; \
+ if(precision != 0) { \
+     combine_func = low_precision_combine<LowPrecisionType::NVFP4, hidden, kNumMaxTopk>; \
+-    EP_HOST_ASSERT(global_scale_per_token != nullptr); \
+ } else { \
+     EP_HOST_ASSERT(global_scale_per_token == nullptr); \
+ } \
