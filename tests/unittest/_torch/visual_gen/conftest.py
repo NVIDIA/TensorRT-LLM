@@ -2,18 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared pytest configuration for the VisualGen unit tests."""
 
-import os
 from collections.abc import Iterator
 
 import pytest
-
-# Must be set before any test module imports tensorrt_llm (the MPI-vs-Ray
-# orchestration choice is made at import time): these CPU/GPU unit tests never
-# use MPI, and initializing a process-global MPI session risks
-# fork-after-MPI_Init flakes under forked pytest workers. conftest is imported
-# before the test modules, which makes this the single session-wide owner of
-# the variable; ``setdefault`` keeps an explicit caller override intact.
-os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 
 
 @pytest.fixture(scope="module")
