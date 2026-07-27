@@ -60,6 +60,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluBiasActivation,
     materialize_activation_params,
 )
+from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
@@ -149,6 +150,51 @@ def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
 
     with pytest.raises(RuntimeError, match="no valid fallback tactic"):
         _select_explicit_fallback_tactic([])
+
+
+def test_deep_ep_nvfp4_fused_output_scale_skips_standalone_scale_op(monkeypatch):
+    calculate_global_scale = MagicMock(
+        side_effect=AssertionError("standalone NVFP4 output-scale op must not run")
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "calculate_nvfp4_global_scale",
+        calculate_global_scale,
+    )
+
+    combined_output = torch.empty(2, 4, dtype=torch.bfloat16)
+    combine_low_precision = MagicMock(return_value=combined_output)
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    comm.mapping = SimpleNamespace(moe_ep_size=2)
+    comm.expert_size_per_partition = 2
+    comm.hidden_size = 4
+    comm.use_low_precision_combine = True
+    comm._fuse_nvfp4_output_scale = True
+    comm.quant_config = SimpleNamespace(layer_quant_mode=SimpleNamespace(has_nvfp4=lambda: True))
+    comm.deep_ep_buffer = SimpleNamespace(low_latency_combine_low_precision=combine_low_precision)
+    recv_expert_count = torch.tensor([2, 0], dtype=torch.int32)
+    topk_idx = torch.zeros(2, 1, dtype=torch.int32)
+    topk_weights = torch.ones(2, 1, dtype=torch.float32)
+    deep_ep_handle = object()
+    comm._dispatch_state = {
+        "deep_ep_handle": deep_ep_handle,
+        "deep_ep_topk_idx": topk_idx,
+        "deep_ep_topk_weights": topk_weights,
+        "recv_expert_count": recv_expert_count,
+    }
+
+    final_hidden_states = torch.randn(8, 4, dtype=torch.bfloat16)
+    output = comm.combine(final_hidden_states, all_rank_max_num_tokens=2)
+
+    assert output is combined_output
+    calculate_global_scale.assert_not_called()
+    call_args = combine_low_precision.call_args.args
+    assert call_args[0] == "nvfp4"
+    assert call_args[1].shape == (2, 4, 4)
+    assert call_args[2] is None
+    assert call_args[3] is topk_idx
+    assert call_args[4] is topk_weights
+    assert call_args[5] is deep_ep_handle
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:

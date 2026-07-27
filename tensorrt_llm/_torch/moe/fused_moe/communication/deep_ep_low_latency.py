@@ -33,6 +33,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .base import Communication
 
+_NVFP4_FUSED_OUTPUT_SCALE_ENV = "TRTLLM_DEEP_EP_NVFP4_FUSED_OUTPUT_SCALE"
+
 
 class DeepEPLowLatency(Communication):
     """
@@ -89,6 +91,18 @@ class DeepEPLowLatency(Communication):
         self.use_low_precision_combine = (
             use_low_precision_combine and self.supports_low_precision_combine()
         )
+        fused_output_scale_value = os.environ.get(_NVFP4_FUSED_OUTPUT_SCALE_ENV)
+        if fused_output_scale_value not in (None, "0", "1"):
+            raise ValueError(
+                f"{_NVFP4_FUSED_OUTPUT_SCALE_ENV} must be 0 or 1, got {fused_output_scale_value!r}"
+            )
+        self._fuse_nvfp4_output_scale = fused_output_scale_value == "1"
+        if self._fuse_nvfp4_output_scale and (
+            not self.use_low_precision_combine or not self._has_nvfp4()
+        ):
+            raise ValueError(
+                f"{_NVFP4_FUSED_OUTPUT_SCALE_ENV} requires low-precision NVFP4 combine"
+            )
         # Read from environment variable, same as wideEP
         self.enable_postquant_alltoall = (
             os.environ.get("TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1") == "1"
@@ -352,9 +366,14 @@ class DeepEPLowLatency(Communication):
         if self.use_low_precision_combine:
             if self._has_nvfp4():
                 precision = "nvfp4"
-                global_scales = torch.ops.trtllm.calculate_nvfp4_global_scale(
-                    final_hidden_states, recv_expert_count
-                )
+                if self._fuse_nvfp4_output_scale:
+                    # A missing scale tensor selects DeepEP's exact in-kernel
+                    # dynamic per-token reduction in low-precision combine.
+                    global_scales = None
+                else:
+                    global_scales = torch.ops.trtllm.calculate_nvfp4_global_scale(
+                        final_hidden_states, recv_expert_count
+                    )
             else:
                 precision = "fp8"
                 global_scales = None
