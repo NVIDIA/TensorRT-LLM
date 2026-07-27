@@ -567,7 +567,7 @@ class PyTorchModelEngine(ModelEngine):
         # are enumerated here once:
         #   (A) encoder-forward workspace — `encoder_max_num_tokens` (below),
         #       in encoder attention tokens, clamped up to the largest atomic
-        #       item; profiled by runtime-valid multimodal warmup requests.
+        #       item; profiled by a direct full-budget encoder warmup.
         #   (B) resident output bytes — `mm_encoder_output_budget_bytes`
         #       (`_resolve_mm_encoder_output_budget_bytes`), the maximum
         #       post-encoder embeddings produced by one legal encoder iteration,

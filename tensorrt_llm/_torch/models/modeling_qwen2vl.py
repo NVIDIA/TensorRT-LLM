@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
-from PIL import Image
 from torch.nn import functional as F
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
@@ -722,8 +721,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         *,
         max_num_encoder_tokens: int,
         max_num_items: int,
+        dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
-        """Build raw images for a runtime-valid profiling request."""
+        """Build a processed full-budget encoder profiling batch."""
         if max_num_encoder_tokens <= 0:
             raise ValueError("max_num_encoder_tokens must be positive")
         if max_num_items <= 0:
@@ -740,8 +740,52 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             return {}
         num_images = min(max_num_items,
                          max_num_encoder_tokens // tokens_per_image)
-        image = Image.new("RGB", (size["width"], size["height"]))
-        return {"image": [image.copy() for _ in range(num_images)]}
+        return self._dummy_mm_data_for_size(
+            width=size["width"],
+            height=size["height"],
+            num_frames=size.get("num_frames", 1),
+            num_images=num_images,
+            dtype=dtype,
+        )
+
+    def _dummy_mm_data_for_size(
+        self,
+        *,
+        width: int,
+        height: int,
+        num_frames: int = 1,
+        num_images: int = 1,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Dict[str, Any]:
+        """Build processed Qwen vision tensors of the requested geometry."""
+        cfg = self.config.vision_config
+        grid_t, grid_h, grid_w = self._grid_thw_for_size(
+            width=width,
+            height=height,
+            num_frames=num_frames,
+        )
+        num_images = max(num_images, 1)
+        patches_per_image = grid_t * grid_h * grid_w
+        in_channels = getattr(cfg, "in_channels", None) or getattr(
+            cfg, "in_chans", 3)
+        temporal_patch_size = getattr(cfg, "temporal_patch_size", 1)
+        in_dim = (in_channels * temporal_patch_size * cfg.patch_size *
+                  cfg.patch_size)
+
+        pixel_values = torch.zeros(
+            (num_images * patches_per_image, in_dim),
+            dtype=dtype or self.dtype,
+        )
+        image_grid_thw = torch.tensor(
+            [[grid_t, grid_h, grid_w]] * num_images,
+            dtype=torch.long,
+        )
+        return {
+            "image": {
+                "pixel_values": pixel_values,
+                "image_grid_thw": image_grid_thw,
+            }
+        }
 
     @classmethod
     def _build_temporal_block(

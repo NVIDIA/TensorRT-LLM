@@ -687,14 +687,11 @@ class BaseMultimodalInputProcessor(ABC):
 
 
 class BaseMultimodalDummyInputsBuilder(ABC):
-    """Build deterministic multimodal request data for KV-cache profiling.
+    """Build deterministic multimodal data for KV-cache profiling.
 
     A model declares the per-item token demand of each modality it encodes via
-    :meth:`get_mm_max_tokens_per_item`, and materializes raw request-side media
-    via :meth:`get_dummy_mm_data`. The profiler passes this data through the
-    normal input processor and executor request path, so prompt expansion,
-    multimodal metadata, encoder output ownership, and prefill fusion match
-    runtime behavior.
+    :meth:`get_mm_max_tokens_per_item`, and materializes the corresponding
+    processed encoder inputs via :meth:`get_dummy_mm_data`.
 
     Token unit is **encoder attention** (pre-merger), matching
     ``encoder_max_num_tokens`` and ``AttentionMetadata.max_num_tokens``.
@@ -729,7 +726,7 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         only ``"image"``: image and video share one ViT, so the image worst case
         already covers the vision encoder.)
 
-        Default ``{}`` → no multimodal request profiling (text-only fallback);
+        Default ``{}`` → no multimodal encoder profiling (text-only fallback);
         a model opts in by overriding this together with
         :meth:`get_dummy_mm_data`.
         """
@@ -779,16 +776,17 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         *,
         max_num_encoder_tokens: int,
         max_num_items: int,
+        dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
-        """Build raw request-side ``multi_modal_data`` for memory profiling.
+        """Build processed ``multimodal_data`` for MM encoder profiling.
 
         Args:
             max_num_encoder_tokens: Aggregate encoder-attention token budget.
             max_num_items: Maximum number of atomic multimodal items.
+            dtype: Data type for floating-point encoder inputs.
 
         Returns:
-            Raw image, video, or audio items accepted by the normal input
-            processor.
+            The model-specific tensors consumed directly by the encoder.
 
         The default raises ``NotImplementedError``. The profiler then falls
         back to text-only memory estimation.

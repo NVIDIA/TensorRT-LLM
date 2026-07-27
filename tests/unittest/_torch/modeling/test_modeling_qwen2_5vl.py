@@ -617,6 +617,7 @@ def _make_dummy_processor(
             "shortest_edge": min_pixels,
             "longest_edge": max_pixels
         }))
+    instance._dtype = torch.float16
     return instance
 
 
@@ -797,12 +798,16 @@ def test_qwen3_attention_capacity_keeps_long_video_safe():
 @pytest.mark.parametrize("budget", [1024, 4096, 16384])
 def test_get_dummy_mm_data_saturates_budget(processor_cls, budget):
     proc = _make_dummy_processor(processor_cls)
-    images = proc.get_dummy_mm_data(max_num_encoder_tokens=budget,
-                                    max_num_items=1)["image"]
-    assert len(images) == 1
-    width, height = images[0].size
-    per_image = proc._num_vision_tokens(width=width, height=height)
-    total_patches = len(images) * per_image
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=budget,
+        max_num_items=1,
+        dtype=torch.float32,
+    )["image"]
+    grid = image["image_grid_thw"]
+    total_patches = int(grid.prod(dim=1).sum().item())
+    per_image = int(grid[0].prod().item())
+    assert image["pixel_values"].shape[0] == total_patches
+    assert image["pixel_values"].dtype == torch.float32
     assert total_patches <= budget
     assert total_patches + per_image > budget
 
@@ -810,12 +815,46 @@ def test_get_dummy_mm_data_saturates_budget(processor_cls, budget):
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
 def test_get_dummy_mm_data_covers_many_item_boundary(processor_cls):
     proc = _make_dummy_processor(processor_cls)
-    images = proc.get_dummy_mm_data(max_num_encoder_tokens=8192,
-                                    max_num_items=8)["image"]
-    token_lengths = [
-        proc._num_vision_tokens(width=image.width, height=image.height)
-        for image in images
-    ]
-    assert len(images) == 8
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        max_num_items=8,
+        dtype=torch.float16,
+    )["image"]
+    token_lengths = image["image_grid_thw"].prod(dim=1).tolist()
     assert token_lengths == [1024] * 8
-    assert sum(token_lengths) == 8192
+    assert image["pixel_values"].shape[0] == sum(token_lengths) == 8192
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_dummy_mm_data_satisfies_the_encoder_input_contract(processor_cls):
+    """KV-cache profiling feeds `get_dummy_mm_data()` straight to the encoder.
+
+    Nothing rebuilds these tensors through the input processor any more, so the
+    processor now restates the encoder's input layout on its own. A drift
+    between the two would surface only as a crash during startup memory
+    estimation. Drive the encoder's real parsing step instead of restating its
+    key names here, so a rename on either side fails this test.
+    """
+    proc = _make_dummy_processor(processor_cls)
+    mm_data = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        max_num_items=8,
+        dtype=torch.float16,
+    )
+
+    # `_parse_and_batch_multimodal_data` reads only its argument, so an unbound
+    # call exercises the contract without constructing vision weights.
+    content, extra = Qwen2VisionModelBase._parse_and_batch_multimodal_data(
+        None, [MultimodalParams(multimodal_data=mm_data)])
+
+    pixel_values = content["pixel_values"]
+    grid = extra["image_grid_thw"]
+    # The encoder derives its attention sequence lengths from the grid, so the
+    # patch rows it was handed have to match.
+    assert pixel_values.shape[0] == int(grid.prod(dim=1).sum())
+    # The trailing dim is what the patch embedding projects. The dummy builder
+    # recomputes it, so pin it against the config the encoder is built from.
+    cfg = proc.config.vision_config
+    assert pixel_values.shape[1] == (cfg.in_channels * cfg.temporal_patch_size *
+                                     cfg.patch_size * cfg.patch_size)
+    assert pixel_values.dtype == torch.float16

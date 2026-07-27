@@ -20,8 +20,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
-from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -38,20 +37,6 @@ def _make_mock_request(num_input_tokens, beam_width=1):
     req.input_token_ids = list(range(num_input_tokens))
     req.sampling_config.beam_width = beam_width
     return req
-
-
-def _make_mock_multimodal_request(output_embedding_lengths):
-    num_items = len(output_embedding_lengths)
-    metadata = MultimodalEncoderItemMetadata(
-        item_refs=[("image", item_idx) for item_idx in range(num_items)],
-        encoder_token_lengths=[1] * num_items,
-        output_embedding_lengths=output_embedding_lengths,
-    )
-    return SimpleNamespace(
-        py_multimodal_data={
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
-        }
-    )
 
 
 class _TextModel:
@@ -72,40 +57,47 @@ class _EncoderCacheMultimodalModel(_MultimodalModel):
     supports_encoder_cache = True
 
 
-def test_dummy_context_requests_include_multimodal_request():
+def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
+    monkeypatch,
+):
     class _InputProcessor:
-        config = SimpleNamespace(model_type="qwen2_5_vl")
-
         def __init__(self):
             self.calls = []
 
         def get_mm_max_tokens_per_item(self):
             return {"image": 4096}
 
-        def get_dummy_mm_data(self, *, max_num_encoder_tokens, max_num_items):
-            self.calls.append((max_num_encoder_tokens, max_num_items))
-            item = SimpleNamespace(token_budget=max_num_encoder_tokens // max_num_items)
-            return {"image": [item] * max_num_items}
+        def get_dummy_mm_data(
+            self,
+            *,
+            max_num_encoder_tokens,
+            max_num_items,
+            dtype,
+        ):
+            self.calls.append((max_num_encoder_tokens, max_num_items, dtype))
+            return {"image": {"item_count": max_num_items}}
 
     class _Model(MultimodalModelMixin):
+        dtype = torch.float16
         mm_encoder = object()
 
+        def __init__(self):
+            self.forwarded_item_counts = []
+            self.last_output = None
+
+        def encode_multimodal_inputs(self, multimodal_params):
+            count = multimodal_params[0].multimodal_data["image"]["item_count"]
+            self.forwarded_item_counts.append(count)
+            self.last_output = torch.arange(count * 4).reshape(count, 4)
+            return self.last_output
+
     input_processor = _InputProcessor()
-
-    def input_processor_with_hash(inputs, sampling_params):
-        del sampling_params
-        items = inputs["multi_modal_data"]["image"]
-        # Model a fixed framing token above the encoder-to-LLM conversion.
-        prompt_length = sum((item.token_budget + 511) // 512 for item in items) + 1
-        return list(range(prompt_length)), {"multimodal_data": {"item_count": len(items)}}
-
     model = _Model()
     model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(vocab_size=128))
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = SimpleNamespace(
         model=model,
         input_processor=input_processor,
-        input_processor_with_hash=input_processor_with_hash,
         encoder_max_num_items=8,
         encoder_max_num_tokens=8192,
         use_mrope=False,
@@ -115,12 +107,21 @@ def test_dummy_context_requests_include_multimodal_request():
     creator._max_num_tokens = 18
     creator._max_beam_width = 1
 
+    # The LLM dummy remains text-only and is not allowed to shrink the
+    # independent encoder profiling budget.
     requests = creator._create_dummy_context_requests(input_seq_len=18)
-
     assert sum(len(request.input_token_ids) for request in requests) == 18
-    assert input_processor.calls[0] == (8192, 2)
-    assert requests[0].py_multimodal_data["item_count"] == 2
-    assert getattr(requests[1], "py_multimodal_data", None) is None
+    assert input_processor.calls == []
+    assert all(getattr(request, "py_multimodal_data", None) is None for request in requests)
+
+    creator._dummy_encoder_inputs = creator._create_dummy_encoder_inputs()
+    assert input_processor.calls == [(8192, 2, torch.float16)]
+
+    monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
+    retained_output = creator._encode_dummy_inputs()
+    assert model.forwarded_item_counts == [2]
+    assert retained_output.data_ptr() != model.last_output.data_ptr()
+    assert creator._dummy_encoder_inputs == []
 
 
 def _make_creator(
@@ -286,7 +287,6 @@ def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
 ):
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = SimpleNamespace(model=model_cls(encoder_cache_max_bytes))
-    creator._dummy_reqs = []
 
     assert creator._get_multimodal_encoder_memory_reserve() == expected_reserve
 
@@ -295,22 +295,9 @@ def test_reserve_adds_only_unprofiled_output_capacity():
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = SimpleNamespace(
         mm_encoder_output_budget_bytes=512,
-        bytes_per_mm_encoder_embedding=100,
         model=_MultimodalModel(0),
     )
-    creator._dummy_reqs = [_make_mock_multimodal_request([4])]
-    assert creator._get_multimodal_encoder_memory_reserve() == 112
-
-
-def test_no_output_reserve_when_dummy_profiles_full_capacity():
-    creator = object.__new__(KvCacheCreator)
-    creator._model_engine = SimpleNamespace(
-        mm_encoder_output_budget_bytes=512,
-        bytes_per_mm_encoder_embedding=128,
-        model=_MultimodalModel(0),
-    )
-    creator._dummy_reqs = [_make_mock_multimodal_request([4])]
-    assert creator._get_multimodal_encoder_memory_reserve() == 0
+    assert creator._get_multimodal_encoder_memory_reserve(profiled_output_bytes=400) == 112
 
 
 # ---------------------------------------------------------------------------
