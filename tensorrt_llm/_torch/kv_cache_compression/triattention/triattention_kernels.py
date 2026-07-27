@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Triton kernels and launch helpers for TriAttention
-(fp32 math; int64 past-2^31 flat offsets; masked ragged tails; scoring in the CuTe pack)."""
+"""Triton reduction, TP-fold, and selection kernels for TriAttention."""
 
 from __future__ import annotations
 
@@ -71,8 +70,7 @@ def _score_row_stats_kernel(
     # at def time (STD_EPSILON itself must stay a plain float for the CuTe import).
     EPSILON: tl.constexpr = STD_EPSILON,
 ):
-    """Compute one valid-window mean and inverse standard deviation per score row,
-    reading each row's decode window straight out of the score scratch."""
+    """Compute decode-window mean and inverse standard deviation for each score row."""
     QUERY_GROUP_SIZE: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
     flat_row = tl.program_id(0)
     request = flat_row // ROWS
@@ -128,8 +126,7 @@ def _score_per_head_reduce_kernel(
     NORMALIZE: tl.constexpr,
     BLOCK: tl.constexpr = 256,
 ):
-    """Reduce each KV-head domain's decode window straight out of the score
-    scratch into one selector row."""
+    """Reduce each KV-head decode window from score scratch into a selector row."""
     QUERY_GROUP_SIZE: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
     SELECTION_ROWS: tl.constexpr = NUM_LAYERS * NUM_KV_HEADS if PER_LAYER else NUM_KV_HEADS
     request = tl.program_id(0)
@@ -195,7 +192,7 @@ def _score_per_head_reduce_kernel(
     tl.store(selection_scores + output, reduced, mask=token < WIDTH)
 
 
-def prepare_per_head_scores(
+def reduce_per_head_scores(
     score_scratch: torch.Tensor,
     decode_lengths: torch.Tensor,
     prompt_lengths: torch.Tensor,
@@ -205,18 +202,18 @@ def prepare_per_head_scores(
     selection_row_lengths: torch.Tensor,
     *,
     request_count: int,
-    num_layers: int,
-    num_q_heads: int,
-    num_kv_heads: int,
     padded_head_columns: int,
     score_token_capacity: int,
-    selection_width: int,
     per_layer: bool,
     normalize_scores: bool,
 ) -> None:
-    """Normalize and reduce the scratch's decode windows for either per-head
-    eviction mode."""
-    selection_rows = num_layers * num_kv_heads if per_layer else num_kv_heads
+    """Reduce score-scratch decode windows into per-head selection rows."""
+    request_capacity = int(decode_lengths.numel())
+    num_layers = int(row_mean.shape[1])
+    num_q_heads = int(row_mean.shape[2])
+    selection_rows = int(selection_scores_rows.shape[0]) // request_capacity
+    num_kv_heads = selection_rows // num_layers if per_layer else selection_rows
+    selection_width = int(selection_scores_rows.shape[1])
     rows = num_layers * num_q_heads
     segment_tokens = request_count * num_layers * score_token_capacity
     if normalize_scores:
@@ -267,8 +264,7 @@ def _fold_union_ranks_kernel(
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr = 1024,
 ):
-    """Fold the TP-gathered rank-local union rows into the global union row
-    (elementwise max over the rank blocks)."""
+    """Max-fold TP-gathered rank-local rows into each global union row."""
     request = tl.program_id(0)
     token_block = tl.program_id(1)
     token = token_block * BLOCK + tl.arange(0, BLOCK)
@@ -296,8 +292,7 @@ def _settle_ties_kernel(
     SELECTION_ROWS: tl.constexpr,
     BLOCK: tl.constexpr = 256,
 ):
-    """Settle one selection row's score ties into its final kept-token row
-    (deterministic lowest-index tie break, ascending output)."""
+    """Settle score ties by lowest index and sort the kept-token indices."""
     request = tl.program_id(0)
     selection_domain = tl.program_id(1)
     row = request * SELECTION_ROWS + selection_domain

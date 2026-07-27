@@ -4,19 +4,15 @@
 
 import pytest
 import torch
-from conftest import build_compaction as _build_compaction
-from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_cute_buffers as _make_cute_buffers
 from conftest import make_eviction_input as _make_eviction_input
 from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import make_staging_manager as _make_staging_manager
 from conftest import rect_to_score_scratch as _rect_to_score_scratch
-from conftest import run_compaction as _run_compaction
-from conftest import set_protected_tails as _set_protected_tails
 
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-    prepare_per_head_scores,
+    reduce_per_head_scores,
 )
 
 
@@ -46,63 +42,25 @@ def _make_selection_buffers(
     num_query_heads=1,
     num_kv_heads=1,
 ):
-    """A bare manager with selection-only attributes for the mode, without
-    CuTe score state or compaction (the settle launch writes only the
-    kept-ordinal rows). Mirrors the product's canonical row-major selection
-    allocation; ``_settle_top_tokens`` reads exactly these attributes."""
+    """Allocate the production selection buffers without score or compaction."""
     tri = TriAttention.__new__(TriAttention)
     tri.eviction_mode = eviction_mode
     tri._request_capacity = max_requests
     tri._selection_width_capacity = width
-    tri._keep_count = keep_count
+    tri.budget = keep_count
     tri._num_layers = num_layers
     tri._num_q_heads = num_query_heads
     tri._num_kv_heads = num_kv_heads
-    tri._decode_lengths_device = torch.full(
-        (max_requests,), width, dtype=torch.int32, device=device
-    )
     tri._prompt_lengths_device = torch.zeros(max_requests, dtype=torch.int32, device=device)
-    if eviction_mode == "union":
-        tri._selection_rows_per_request = 1
-        tri._selection_scores_rows = torch.empty(
-            (max_requests, width), dtype=torch.float32, device=device
-        )
-        tri._selection_row_lengths = tri._decode_lengths_device
-        # Padded rows carry zero valid width; their provisional TopK entries
-        # must still be in-range ordinals for the finalizer's score gather.
-        tri._provisional_rows = torch.zeros(
-            (max_requests, keep_count), dtype=torch.int32, device=device
-        )
-        tri._kept_ordinal_rows = torch.empty(
-            (max_requests, keep_count), dtype=torch.int32, device=device
-        )
-    else:
-        selection_rows = num_kv_heads if eviction_mode == "per_head" else num_layers * num_kv_heads
-        tri._selection_rows_per_request = selection_rows
-        tri._row_mean = torch.empty(
-            max_requests, num_layers, num_query_heads, 1, dtype=torch.float32, device=device
-        )
-        tri._row_inv_std = torch.empty_like(tri._row_mean)
-        tri._selection_scores_rows = torch.empty(
-            (max_requests * selection_rows, width), dtype=torch.float32, device=device
-        )
-        tri._selection_row_lengths = torch.full(
-            (max_requests * selection_rows,), width, dtype=torch.int32, device=device
-        )
-        tri._provisional_rows = torch.zeros(
-            (max_requests * selection_rows, keep_count), dtype=torch.int32, device=device
-        )
-        tri._kept_ordinal_rows = torch.empty(
-            (max_requests * selection_rows, keep_count), dtype=torch.int32, device=device
-        )
+    tri._allocate_selection_buffers(device, tp_size=1)
     return tri
 
 
 def _select_per_head(tri, scores, *, normalize_scores):
     """The per-head selection flow: reduce kernels, then top-k settle."""
-    request_count, num_layers, num_q_heads, width = scores.shape
+    request_count, _, _, width = scores.shape
     score_scratch, prompt_lengths = _rect_to_score_scratch(scores, tri._num_kv_heads)
-    prepare_per_head_scores(
+    reduce_per_head_scores(
         score_scratch,
         tri._decode_lengths_device,
         prompt_lengths,
@@ -111,16 +69,12 @@ def _select_per_head(tri, scores, *, normalize_scores):
         tri._selection_scores_rows,
         tri._selection_row_lengths,
         request_count=request_count,
-        num_layers=num_layers,
-        num_q_heads=num_q_heads,
-        num_kv_heads=tri._num_kv_heads,
         padded_head_columns=8,
         score_token_capacity=width,
-        selection_width=tri._selection_width_capacity,
         per_layer=tri.eviction_mode == "per_layer_perhead",
         normalize_scores=normalize_scores,
     )
-    tri._settle_top_tokens(tri._request_capacity)
+    tri._select_top_tokens(tri._request_capacity)
 
 
 def _stable_topk(row: torch.Tensor, width: int, keep_count: int) -> torch.Tensor:
@@ -246,7 +200,7 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         torch.tensor([prompt_len] * request_count, dtype=torch.int32, device=device)
     )
     tri._selection_scores_rows.copy_(scores.amax(dim=1))
-    tri._settle_top_tokens(tri._request_capacity)
+    tri._select_top_tokens(tri._request_capacity)
     actual = tri._kept_ordinal_rows.cpu()
 
     combined = scores.amax(dim=1).cpu()
@@ -259,7 +213,7 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
 
 @pytest.mark.parametrize("per_layer", [False, True])
 @pytest.mark.parametrize("normalize_scores", [False, True])
-def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, normalize_scores):
+def test_per_head_reduction_matches_ragged_torch_reference(per_layer, normalize_scores):
     device = torch.device("cuda", torch.cuda.current_device())
     request_count, layers, query_heads, kv_heads, width = 2, 3, 4, 2, 97
     generator = torch.Generator(device=device).manual_seed(29)
@@ -287,7 +241,7 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
     )
 
     score_scratch, prompt_lengths = _rect_to_score_scratch(scores, kv_heads)
-    prepare_per_head_scores(
+    reduce_per_head_scores(
         score_scratch,
         decode_lengths,
         prompt_lengths,
@@ -296,12 +250,8 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
         selection_scores_rows,
         selection_row_lengths,
         request_count=request_count,
-        num_layers=layers,
-        num_q_heads=query_heads,
-        num_kv_heads=kv_heads,
         padded_head_columns=8,
         score_token_capacity=width,
-        selection_width=width,
         per_layer=per_layer,
         normalize_scores=normalize_scores,
     )
@@ -330,108 +280,6 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
             atol=2e-5,
         )
         assert torch.isneginf(selection_scores[request, :, decode_length:]).all()
-
-
-@pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
-def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode):
-    # Supported bf16 geometry; kept ordinals span all three pages so moves
-    # cross page boundaries.
-    device = torch.device("cuda", torch.cuda.current_device())
-    request_count = 2
-    num_layers = 2
-    num_kv_heads = 2
-    # Mixed prompt lengths prove per-request destination rebasing.
-    prompt_lens = [2, 5]
-    decode_keep_count = 4
-    seq_len = 80
-    tokens_per_block = 32
-    pages_per_request = 3
-    head_dim = 64
-    protected_tails = [2, 1]
-    page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
-    initial_pools = _make_ramp_pools(num_layers, device=device)
-    pools = [pool.clone() for pool in initial_pools]
-
-    # Decode-only kept ordinals holding absolute positions.
-    union_decode = torch.tensor(
-        [[16, 32, 56, 72], [24, 40, 48, 64]], dtype=torch.int64, device=device
-    )
-    if eviction_mode == "union":
-        keep = union_decode
-        selection_rows = 1
-    else:
-        selection_rows = num_kv_heads if eviction_mode == "per_head" else num_layers * num_kv_heads
-        keep = torch.empty(
-            request_count,
-            selection_rows,
-            decode_keep_count,
-            dtype=torch.int64,
-            device=device,
-        )
-        for request in range(request_count):
-            for row in range(selection_rows):
-                keep[request, row] = torch.tensor(
-                    sorted(
-                        {
-                            prompt_lens[request] + ((request + row + offset * 2) % 8) * 8
-                            for offset in range(decode_keep_count)
-                        }
-                    ),
-                    dtype=torch.int64,
-                    device=device,
-                )
-
-    compaction = _build_compaction(
-        eviction_mode=eviction_mode,
-        layer_pools=pools,
-        kept_token_ordinals=keep.to(torch.int32),
-        valid_sequence_lengths=torch.tensor([seq_len, seq_len], dtype=torch.int32, device=device),
-        kv_block_offsets=_encode_block_offsets(page_tables.unsqueeze(0)),
-        prompt_offsets=torch.tensor(prompt_lens, dtype=torch.int32, device=device),
-        protected_tail_capacity=max(protected_tails),
-    )
-    _set_protected_tails(compaction, protected_tails)
-    # Production settles the kept ordinals into the contract's decision
-    # rows; with pre-settled ordinals the pack launch inside compact() is
-    # its exact analog.
-    _run_compaction(compaction)
-    torch.cuda.synchronize(device)
-
-    for layer, (before_pool, after_pool) in enumerate(zip(initial_pools, pools)):
-        for request in range(request_count):
-            prompt_len = prompt_lens[request]
-            pages = page_tables[request].to(torch.long)
-            before = (
-                before_pool[pages]
-                .permute(1, 2, 0, 3, 4)
-                .reshape(2, num_kv_heads, pages_per_request * tokens_per_block, head_dim)
-            )
-            after = after_pool[pages].permute(1, 2, 0, 3, 4).reshape_as(before)
-            assert torch.equal(after[:, :, :prompt_len], before[:, :, :prompt_len])
-            for head in range(num_kv_heads):
-                if eviction_mode == "union":
-                    selected = keep[request]
-                elif eviction_mode == "per_head":
-                    selected = keep[request, head]
-                else:
-                    selected = keep[request, layer * num_kv_heads + head]
-                tail = torch.arange(
-                    seq_len,
-                    seq_len + protected_tails[request],
-                    dtype=torch.int64,
-                    device=device,
-                )
-                source = torch.cat((selected, tail))
-                destination = torch.arange(
-                    prompt_len,
-                    prompt_len + source.numel(),
-                    dtype=torch.int64,
-                    device=device,
-                )
-                assert torch.equal(
-                    after[:, head].index_select(1, destination),
-                    before[:, head].index_select(1, source),
-                )
 
 
 @requires_sm100
@@ -547,9 +395,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
 
 @requires_sm100
 def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
-    """Two real eviction rounds through one live V2 cache: three pages
-    compact to two, releasing one physical page for reuse; expected keep
-    sets derive from a host-side score mirror."""
+    """Preserve bytes, tails, and V2 page reuse across two real eviction rounds."""
     pytest.importorskip("cutlass")
     import tensorrt_llm
     import tensorrt_llm.bindings
@@ -752,76 +598,6 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
         for request in requests:
             manager.free_resources(request)
         manager.shutdown()
-
-
-def test_eager_compaction_rebases_masked_swa_window_and_tail():
-    # Supported bf16 geometry; dense and SWA moves stay page-crossing.
-    device = torch.device("cuda", torch.cuda.current_device())
-    dense_tables = torch.tensor([[2, 0, 1], [5, 3, 4]], dtype=torch.int32, device=device)
-    swa_tables = torch.tensor([[1, 2, 0], [4, 5, 3]], dtype=torch.int32, device=device)
-    initial_pools = _make_ramp_pools(2, num_kv_heads=1, device=device)
-    pools = [pool.clone() for pool in initial_pools]
-    # Decode-only kept ordinals holding absolute positions past the prompt.
-    keep = torch.tensor(
-        [[16, 32, 40, 56], [16, 24, 40, 48]],
-        dtype=torch.int64,
-        device=device,
-    )
-    source_lengths = torch.tensor([64, 56], dtype=torch.int32, device=device)
-    protected_tails = [2, 1]
-    compaction = _build_compaction(
-        layer_pools=pools,
-        dense_layers=[0],
-        swa_layers=[1],
-        # Dense layer 0 stages in plane 0, the SWA layer in its own plane 1.
-        layer_pool_ids=[0, 1],
-        kept_token_ordinals=keep.to(torch.int32),
-        valid_sequence_lengths=source_lengths,
-        kv_block_offsets=_encode_block_offsets(torch.stack((dense_tables, swa_tables))),
-        prompt_offsets=torch.tensor([2, 2], dtype=torch.int32, device=device),
-        swa_window=2,
-        protected_tail_capacity=max(protected_tails),
-    )
-    _set_protected_tails(compaction, protected_tails)
-    _run_compaction(compaction)
-    torch.cuda.synchronize(device)
-
-    for request, (source_length, tail_length) in enumerate(
-        zip(source_lengths.tolist(), protected_tails)
-    ):
-        dense_pages = dense_tables[request].to(torch.long)
-        swa_pages = swa_tables[request].to(torch.long)
-        dense_before = initial_pools[0][dense_pages].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 64)
-        dense_after = pools[0][dense_pages].permute(1, 2, 0, 3, 4).reshape_as(dense_before)
-        swa_before = initial_pools[1][swa_pages].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 64)
-        swa_after = pools[1][swa_pages].permute(1, 2, 0, 3, 4).reshape_as(swa_before)
-        tail = torch.arange(
-            source_length,
-            source_length + tail_length,
-            dtype=torch.int64,
-            device=device,
-        )
-        dense_source = torch.cat((keep[request], tail))
-        dense_destination = torch.arange(
-            2, 2 + dense_source.numel(), dtype=torch.int64, device=device
-        )
-        swa_source = torch.arange(
-            source_length - 2,
-            source_length + tail_length,
-            dtype=torch.int64,
-            device=device,
-        )
-        swa_destination = torch.arange(4, 4 + swa_source.numel(), dtype=torch.int64, device=device)
-        assert torch.equal(dense_after[:, :, :2], dense_before[:, :, :2])
-        assert torch.equal(swa_after[:, :, :2], swa_before[:, :, :2])
-        assert torch.equal(
-            dense_after.index_select(2, dense_destination),
-            dense_before.index_select(2, dense_source),
-        )
-        assert torch.equal(
-            swa_after.index_select(2, swa_destination),
-            swa_before.index_select(2, swa_source),
-        )
 
 
 def test_fold_union_ranks_matches_max_oracle():

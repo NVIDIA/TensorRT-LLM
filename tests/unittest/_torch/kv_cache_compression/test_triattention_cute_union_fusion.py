@@ -4,7 +4,8 @@
 
 The reference leg gathers the production score rows and normalizes +
 union-reduces them with a pure-torch float32 oracle; tolerances are
-unchanged from the retired Triton reference copies."""
+unchanged from the retired Triton reference copies.
+"""
 
 import pytest
 import torch
@@ -29,35 +30,11 @@ def _run_fused_union(
     mean_sin,
     union_out,
 ):
-    """The fused score+stats+normalized-union pipeline (THE union path), fired
-    directly off the compiled entries exactly like the round. Test mean phases
-    load into the build-bound buffers; the fused rows land straight in the
-    build-bound ``tri._selection_scores_rows``."""
-    import cuda.bindings.driver as cuda_driver
-
+    """Run the fused score+stats+normalized-union pipeline."""
     _stage_score_metadata(tri, request_count, source_lengths, decode_lengths, prompt_lengths)
     tri._mean_cos[:request_count].copy_(mean_cos[:request_count])
     tri._mean_sin[:request_count].copy_(mean_sin[:request_count])
-    assert (
-        request_count in tri._compiled_score_by_request_count
-        and request_count in tri._compiled_normalize_union_by_request_count
-    )
-    stream = cuda_driver.CUstream(torch.cuda.current_stream(tri._score_scratch.device).cuda_stream)
-    tri._compiled_score_by_request_count[request_count](
-        *tri._cute_score_prefix,
-        tri._cute_mean_cos,
-        tri._cute_mean_sin,
-        *tri._cute_score_tail,
-        request_count,
-        stream,
-    )
-    tri._compiled_normalize_union_by_request_count[request_count](
-        tri._cute_partial_stats,
-        *tri._cute_selection_prefix,
-        tri._cute_selection_scores_rows,
-        request_count,
-        stream,
-    )
+    tri._launch_score(request_count)
     columns = min(union_out.shape[1], tri._selection_scores_rows.shape[1])
     union_out[:request_count, :columns].copy_(tri._selection_scores_rows[:request_count, :columns])
 
@@ -65,8 +42,7 @@ def _run_fused_union(
 def _reference_union_scores(
     scores_rows: torch.Tensor, decode_lengths: torch.Tensor
 ) -> torch.Tensor:
-    """Union oracle: per-row mean/biased-std z-norm over the valid prefix
-    (std clamped at 1e-6), union-max across rows, ``-inf`` past the width."""
+    """Compute the normalized max-fold union score oracle."""
     request_count, _, width = scores_rows.shape
     combined = torch.full(
         (request_count, width), float("-inf"), dtype=torch.float32, device=scores_rows.device
@@ -100,7 +76,7 @@ def _reference_union_scores(
         # only the real heads' rows, and the union finalizer maps head rows
         # onto the padded score planes.
         (128, 32, 4, 0, None),
-        # Mixed-prompt cohort (one start mid-tile, one page-aligned) — the
+        # Mixed-prompt request group (one start mid-tile, one page-aligned) — the
         # case the fused pipeline previously declined. Starts are per-request
         # runtime reads, so one representative row covers the family.
         (128, 64, 4, [37, 128], [250, 230]),
@@ -113,8 +89,7 @@ def test_union_fusion_matches_split_pipeline(
     score_starts: "int | list",
     valid_lens: "list | None",
 ) -> None:
-    """Fused rows must reproduce split score->normalize->union rows;
-    ``score_starts`` is uniform or per-request (read at runtime)."""
+    """Check fused union rows against the split score-normalize-union path."""
     pytest.importorskip("cutlass")
 
     torch.manual_seed(20260721)
@@ -213,8 +188,7 @@ def test_union_fusion_matches_split_pipeline(
 
 @_SM100_ONLY
 def test_union_fusion_frequency_count_guard_raises() -> None:
-    """16 frequencies (head size 32) sit outside the fused kernel contract
-    and are rejected at kernel construction."""
+    """Reject unsupported 16-frequency fused-kernel geometry."""
     pytest.importorskip("cutlass")
 
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_cute_score_fused import (  # noqa: E501

@@ -97,8 +97,7 @@ def make_ramp_pools(
     base=0,
     device=None,
 ):
-    """bf16 pools with a shifted ``arange % 251`` ramp: every wrong move
-    lands on a different byte pattern (supported geometry defaults)."""
+    """Build bf16 ramp pools whose moved regions have distinct byte patterns."""
     return [
         (
             (
@@ -119,11 +118,7 @@ def make_ramp_pools(
 
 
 def build_compaction(**overrides):
-    """``build_compaction_params`` with the suite's 2-layer defaults:
-    allocates the caller-owned move-offset rows (capacity cumsum) and SWA
-    destination bases, and hands the test's pre-settled
-    ``kept_token_ordinals`` in as the decision rows. Returns the opaque
-    ``params`` plus a test-side mirror of the caller-owned inputs."""
+    """Build opaque compaction parameters and caller-owned test inputs."""
     from tensorrt_llm._torch.kv_cache_compression.compaction import build_compaction_params
 
     args = dict(
@@ -214,9 +209,7 @@ def build_compaction(**overrides):
 
 
 def run_compaction(compaction):
-    """Replica of the round's move stage in production order: SWA
-    destination rebase, then ``compact`` loops the opaque params (each packs
-    its decision rows into move sources and fires its native moves)."""
+    """Run SWA rebasing and opaque compaction in production order."""
     from tensorrt_llm._torch.kv_cache_compression.compaction import compact
 
     if compaction["swa_destination_bases"] is not None:
@@ -229,18 +222,16 @@ def run_compaction(compaction):
 
 
 def make_bare_staging(device, *, max_requests, staged_blocks_per_seq):
-    """A bare manager carrying only the staging attributes, for the bulk
-    page-table copy tests (mirrors the product's ``_rebuild_eviction_runtime`` names)."""
+    """A bare manager carrying only the page-table staging attributes."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
     staging = TriAttention.__new__(TriAttention)
     staging.kv_cache_manager = None
     staging.draft_kv_cache_manager = None
     staging._request_capacity = max_requests
-    staging._keep_count = 4
+    staging.budget = 4
     staging._swa_window = None
-    staging._draft_protected_tail_capacity = None
-    staging._block_offsets_ready_event = torch.cuda.Event()
+    staging._draft_protected_tail_capacity = 0
     staging._compaction_done_event = torch.cuda.Event()
     staging._staging_reuse_event = torch.cuda.Event()
     staging._block_offsets_host = torch.empty(
@@ -265,34 +256,6 @@ def make_staging_manager(host_table, gather, manager_stream, *, num_slots=1):
         kv_offset=torch.ones(num_slots, dtype=torch.int32, pin_memory=True),
         _stream=manager_stream,
     )
-
-
-def make_buffer_stubs(manager, *, decode_width=260):
-    """Stub the calibration/layout surfaces around ``_ensure_eviction_runtime``.
-
-    Returns the layout dict plus the manager attributes a stubbed
-    ``_rebuild_eviction_runtime`` should set (production sets them in place)."""
-    manager._freq_scale_sq = torch.ones(2)
-    manager._phase = {"rows": 8}
-    manager._omega = torch.ones(2)
-    manager._local_score_calibration = mock.Mock(return_value=(torch.ones(2, 2, 2),) * 3)
-    pool = torch.empty(8, 2, 1, 4, 4)
-    layout = dict(
-        global_layers=[0, 1],
-        layer_pools=[pool, pool],
-        dense_layers=[0, 1],
-        swa_layers=[],
-        swa_window=None,
-        layer_pool_ids=(0, 0),
-    )
-    built_attributes = dict(
-        _selection_width_capacity=decode_width,
-        _score_token_capacity=1024,
-        _request_capacity=8,
-        _prompt_lengths_device=torch.zeros(8, dtype=torch.int32),
-        _decode_lengths_device=torch.empty(8, dtype=torch.int32),
-    )
-    return layout, built_attributes
 
 
 def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
@@ -329,8 +292,7 @@ _TEST_MODEL_DIR: Optional[str] = None
 
 
 def make_test_model_dir() -> str:
-    """A real on-disk dense model config: construction-time layer partition
-    resolves through the production AutoConfig path, no mocks."""
+    """Create a real dense-model config for production layer partitioning."""
     global _TEST_MODEL_DIR
     if _TEST_MODEL_DIR is None:
         _TEST_MODEL_DIR = tempfile.mkdtemp(prefix="triattention_test_model_")
@@ -364,8 +326,7 @@ def make_test_calibration_pt() -> str:
 
 
 def make_tri_config(**overrides):
-    """A real TriAttentionKvCacheCompressionConfig with test calibration inputs
-    (the config validator requires both ``model_path`` and ``calibration_path``)."""
+    """Build a real TriAttention config with test calibration inputs."""
     from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
 
     options = {
@@ -378,10 +339,11 @@ def make_tri_config(**overrides):
 
 
 def make_triattention(**overrides):
-    """Construct a fully initialized manager for method-level unit tests."""
+    """Construct a manager while isolating GPU-owned persistent state."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
-    return TriAttention(make_tri_config(**overrides), make_fake_v2())
+    with mock.patch.object(TriAttention, "_initialize_eviction_state"):
+        return TriAttention(make_tri_config(**overrides), make_fake_v2())
 
 
 def make_eviction_input(
@@ -396,8 +358,11 @@ def make_eviction_input(
     draft_cache=None,
     state=None,
 ):
-    """One due-cohort item shaped exactly like ``_evict_due_requests`` builds."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import _EvictionInput
+    """One due-request item shaped exactly like ``_evict_due_requests`` builds."""
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+        _EvictionInput,
+        _RequestState,
+    )
 
     if request is None:
         request = SimpleNamespace(py_request_id=request_id, py_num_compressed_tokens=0)
@@ -405,7 +370,7 @@ def make_eviction_input(
         request=request,
         target_cache=target_cache,
         draft_cache=draft_cache,
-        state={"generation_steps": 0, "evicted_tokens": 0} if state is None else state,
+        state=_RequestState() if state is None else state,
         source_length=int(source_length),
         logical_source_length=int(
             source_length if logical_source_length is None else logical_source_length
@@ -436,11 +401,7 @@ def make_request(request_id, **overrides):
 @contextmanager
 def mocked_eviction_internals(manager):
     """Run the real ``_evict_due_requests`` transaction around a mocked round executor."""
-    with (
-        mock.patch.object(manager, "_runtime_kv_layout", return_value={}),
-        mock.patch.object(manager, "_ensure_eviction_runtime"),
-        mock.patch.object(manager, "_execute_eviction_round") as execute,
-    ):
+    with mock.patch.object(manager, "_execute_eviction_round") as execute:
         yield SimpleNamespace(execute=execute)
 
 
@@ -457,8 +418,7 @@ def torch_tri_score_oracle(
     offsets,
     layer_indices,
 ):
-    """Independent Torch oracle of the paged mean score (GQA mapping via
-    ``head // group_size`` plus the position-independent MLR term)."""
+    """Compute paged mean scores independently with Torch."""
     scores = []
     num_q_heads = int(q_real.shape[1])
     for request, seq_len in enumerate(seq_lens):
@@ -500,21 +460,17 @@ def torch_tri_score_oracle(
 
 
 def make_phase_table(offsets, omega, initial_rows):
-    """Build the mean-phase table dict exactly like the product's inlined
-    form and grow it to cover positions ``[0, initial_rows)``."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        grow_mean_phase_table,
+    """Build the semantic phase-table surface consumed by an eviction round."""
+    omega = omega.to(dtype=torch.float32).contiguous()
+    positions = torch.arange(max(int(initial_rows), 1), dtype=torch.float32, device=omega.device)
+    angles = (positions[:, None, None] + offsets[None, :, None]) * omega[None, None, :]
+    num_freqs = int(omega.numel())
+    return SimpleNamespace(
+        cos=torch.cos(angles).mean(dim=1).contiguous(),
+        sin=torch.sin(angles).mean(dim=1).contiguous(),
+        num_freqs=num_freqs,
+        frequency_block=1 << (num_freqs - 1).bit_length(),
     )
-
-    phase = {
-        "omega": omega.to(dtype=torch.float32).contiguous(),
-        "offset_values": offsets.tolist(),
-        "cos": None,
-        "sin": None,
-        "rows": 0,
-    }
-    grow_mean_phase_table(phase, max(int(initial_rows), 1))
-    return phase
 
 
 def make_cute_buffers(
@@ -536,28 +492,20 @@ def make_cute_buffers(
     layer_pool_ids=None,
     normalize_scores=True,
 ):
-    """A bare manager with real eviction buffers built over the one-shared-slot
-    default layout; split reference legs use ``eviction_mode="per_head"`` over
-    the same pools. ``layer_pool_ids`` is the canonical per-layer V2 pool id
-    list and drives the page-table grouping."""
+    """Build a bare manager with a real score pipeline over test pools."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
     num_layers = len(layer_pools)
     assert int(q_real.shape[1]) == num_q_heads
-    # The build takes every capacity explicitly (no test-only None-derive
-    # path); the widest window defaults keep old call sites.
     if decode_width is None:
         decode_width = seq_len
     if layer_pool_ids is None:
         layer_pool_ids = [0] * num_layers
-    # A live-manager source table exactly wide enough for the requested
-    # capacity (the staged width clamps to it).
     requested_tokens = seq_len + protected_tail_capacity
     tokens_per_block = int(layer_pools[0].shape[3])
     source_blocks = -(-int(requested_tokens) // tokens_per_block)
     source_blocks = (source_blocks + 3) // 4 * 4
     layout = dict(
-        global_layers=list(range(num_layers)),
         layer_pools=layer_pools,
         dense_layers=list(range(num_layers)),
         swa_layers=[],
@@ -565,35 +513,45 @@ def make_cute_buffers(
         layer_pool_ids=layer_pool_ids,
     )
     manager = TriAttention.__new__(TriAttention)
-    # The cold builder reads staging geometry from the owning manager.
     manager.kv_cache_manager = SimpleNamespace(
         num_pools=max(layer_pool_ids) + 1,
         host_kv_cache_block_offsets=torch.empty(1, 1, 2, source_blocks, dtype=torch.int32),
         mapping=SimpleNamespace(tp_size=1, tp_rank=0, enable_attention_dp=False),
     )
     manager.draft_kv_cache_manager = None
-    manager._draft_protected_tail_capacity = None
+    manager._draft_protected_tail_capacity = 0
     manager.eviction_mode = eviction_mode
     manager.normalize_scores = normalize_scores
-    manager._staging_reuse_event = None
-    manager._block_offsets_ready_event = None
-    manager._compaction_done_event = None
+    manager._request_capacity = max_requests
+    manager._selection_width_capacity = decode_width
     manager._phase = make_phase_table(offsets, omega, seq_len)
-    # Real owner state consumed by the cold builder (production sets these at
-    # construction / calibration load).
     manager.budget = keep_count
     manager._protected_tail_capacity = protected_tail_capacity
     manager._freq_scale_sq = freq_scale_sq
-    manager._calibration_q_real = q_real
-    manager._calibration_q_imag = q_imag
-    manager._calibration_mlr_coef = mlr_coef
-    manager._rebuild_eviction_runtime(
-        layout,
-        None,
-        request_capacity=max_requests,
-        score_token_capacity=seq_len,
-        selection_width_capacity=decode_width,
+    manager._score_q_real = q_real
+    manager._score_q_imag = q_imag
+    manager._score_mlr_coef = mlr_coef
+    manager._target_layout = layout
+    manager._draft_layout = None
+    manager._num_layers = num_layers
+    manager._num_q_heads = num_q_heads
+    manager._num_kv_heads = int(layer_pools[0].shape[2])
+    manager._union_tp_mapping = None
+    manager._swa_window = None
+    manager._allocate_metadata_buffers(
+        layer_pools[0].device,
+        num_freqs=int(q_real.shape[2]),
     )
+    manager._allocate_selection_buffers(layer_pools[0].device, tp_size=1)
+    manager._score_scratch = None
+    manager._score_token_capacity = 0
+    manager._launch_score = None
+    manager._compaction_params = ()
+    manager._staging_reuse_event = torch.cuda.Event()
+    manager._staging_reuse_event.record(torch.cuda.current_stream(layer_pools[0].device))
+    manager._compaction_done_event = torch.cuda.Event()
+    manager._compaction_done_event.record(torch.cuda.current_stream(layer_pools[0].device))
+    manager._build_eviction_capacity(score_token_capacity=seq_len)
     return manager
 
 
@@ -604,8 +562,7 @@ def write_block_offsets(manager, encoded):
 
 
 def rect_to_score_scratch(scores, num_kv_heads, padded_head_columns=8):
-    """Scatter a [request, layer, q_head, token] rectangle into the fused
-    scorer's scratch layout (prompt starts at zero, bucket = rectangle width)."""
+    """Scatter rectangular scores into the fused scorer's scratch layout."""
     request_count, num_layers, num_q_heads, width = scores.shape
     group = num_q_heads // num_kv_heads
     scratch = torch.zeros(
@@ -622,8 +579,7 @@ def rect_to_score_scratch(scores, num_kv_heads, padded_head_columns=8):
 
 
 def stage_score_metadata(manager, request_count, source_lengths, decode_lengths, prompt_lengths):
-    """Stage the per-round score metadata exactly like production (the
-    compiled score launches read the staged rows via pointer capture)."""
+    """Stage per-round score metadata exactly as production does."""
     torch.sub(
         source_lengths[:request_count],
         prompt_lengths[:request_count],
@@ -636,48 +592,32 @@ def stage_score_metadata(manager, request_count, source_lengths, decode_lengths,
 def launch_split_scores(
     manager, request_count, source_lengths, decode_lengths, prompt_lengths, mean_cos, mean_sin
 ):
-    """The production score-only leg plus the decode-window gather (the round
-    executor's per-head sequence, parameterized by count). Test mean phases
-    load into the build-bound buffers, exactly like the production in-place
-    gather refresh; the compiled entry fires directly, like the round does."""
-    import cuda.bindings.driver as cuda_driver
-
+    """Run the score pipeline and gather its per-head decode-window rectangle."""
     stage_score_metadata(manager, request_count, source_lengths, decode_lengths, prompt_lengths)
     manager._mean_cos[:request_count].copy_(mean_cos[:request_count])
     manager._mean_sin[:request_count].copy_(mean_sin[:request_count])
-    assert request_count in manager._compiled_score_by_request_count
-    stream = cuda_driver.CUstream(
-        torch.cuda.current_stream(manager._score_scratch.device).cuda_stream
-    )
-    manager._compiled_score_by_request_count[request_count](
-        *manager._cute_score_prefix,
-        manager._cute_mean_cos,
-        manager._cute_mean_sin,
-        *manager._cute_score_tail,
-        request_count,
-        stream,
-    )
+    manager._launch_score(request_count)
+    score_scratch = manager._score_scratch
+    score_token_capacity = manager._score_token_capacity
     num_segments = request_count * manager._num_layers
     group_size = manager._num_q_heads // manager._num_kv_heads
     source = (
-        manager._score_scratch[
-            : manager._num_kv_heads * 8 * num_segments * manager._score_token_capacity
-        ]
+        score_scratch[: manager._num_kv_heads * 8 * num_segments * score_token_capacity]
         .view(
             manager._num_kv_heads,
             8,
             request_count,
             manager._num_layers,
-            manager._score_token_capacity,
+            score_token_capacity,
         )[:, :group_size]
         .permute(2, 3, 0, 1, 4)
     )
     columns = prompt_lengths[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + torch.arange(
         manager._selection_width_capacity,
         dtype=torch.int64,
-        device=manager._score_scratch.device,
+        device=score_scratch.device,
     ).view(1, 1, 1, 1, -1)
-    columns = columns.clamp_(max=manager._score_token_capacity - 1).expand(
+    columns = columns.clamp_(max=score_token_capacity - 1).expand(
         request_count,
         manager._num_layers,
         manager._num_kv_heads,
@@ -693,7 +633,7 @@ def launch_split_scores(
         ),
         float("nan"),
         dtype=torch.float32,
-        device=manager._score_scratch.device,
+        device=score_scratch.device,
     )
     torch.gather(
         source,

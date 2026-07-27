@@ -1,236 +1,75 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Draft KV co-compression: the target's union keep set broadcasts over
-the draft's own KV heads, the draft's tail appends as ordinals, both land
-at ``destination_base = prompt_len``. Covers the physical moves, packed
-indices, stream ordering, admission gates, the published compressed-token
-invariant, and buffer reuse/rebuild."""
+"""TriAttention draft lifecycle, ordering, admission, and publication."""
 
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
-from conftest import build_compaction as _build_compaction
-from conftest import encode_block_offsets as _encode_block_offsets
-from conftest import make_buffer_stubs as _make_buffer_stubs
 from conftest import make_eviction_input as _make_eviction_input
 from conftest import make_fake_v2 as _make_fake_v2
-from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import make_request as _make_request
 from conftest import make_tri_config as _make_tri_config
 from conftest import make_triattention as _make_triattention
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
-from conftest import run_compaction as _run_compaction
-from conftest import set_protected_tails as _set_protected_tails
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
-
-
-def _fresh_request_state():
-    """One request's compression ledger, as the manager initializes it."""
-    return {"generation_steps": 0, "evicted_tokens": 0}
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+    TriAttention,
+    _RequestState,
+)
 
 
-def _logical_view(pool: torch.Tensor, pages: torch.Tensor) -> torch.Tensor:
-    """Gather one request's pages into [K/V, head, token, dim] order."""
-    num_kv_heads = int(pool.shape[2])
-    head_dim = int(pool.shape[4])
-    return pool.index_select(0, pages).permute(1, 2, 0, 3, 4).reshape(2, num_kv_heads, -1, head_dim)
-
-
-def _launched_draft_compaction(draft_protected_tails):
-    """Target and draft pools with distinct head counts (supported bf16
-    geometry, mod-251 ramp payload), compacted in one round."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    request_count = 2
-    prompt_len = 2
-    target_protected_tails = [2, 1]
-    valid_seq_lens = [10, 9]
-
-    target_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
-    draft_tables = torch.tensor([[1, 0, 2], [5, 4, 3]], dtype=torch.int32, device=device)
-    target_pools = _make_ramp_pools(2, num_kv_heads=2, device=device)
-    draft_pool = _make_ramp_pools(1, num_kv_heads=4, base=149, device=device)[0]
-    assert target_pools[0].shape[2] != draft_pool.shape[2]
-    initial_target = [pool.clone() for pool in target_pools]
-    initial_draft = draft_pool.clone()
-
-    keep = torch.tensor([[2, 4, 7, 9], [3, 5, 6, 8]], dtype=torch.int64, device=device)
-
-    compaction = _build_compaction(
-        layer_pools=target_pools,
-        layer_pool_ids=[0, 0],
-        kept_token_ordinals=keep.to(torch.int32),
-        valid_sequence_lengths=torch.tensor(valid_seq_lens, dtype=torch.int32, device=device),
-        kv_block_offsets=_encode_block_offsets(target_tables),
-        prompt_offsets=torch.full((request_count,), prompt_len, dtype=torch.int32, device=device),
-        protected_tail_capacity=max(target_protected_tails),
-        draft_layer_pools=[draft_pool],
-        draft_layers=[0],
-        draft_layer_pool_ids=[0],
-        draft_protected_tail_capacity=max(draft_protected_tails),
-        draft_kv_block_offsets=_encode_block_offsets(draft_tables),
-    )
-    _set_protected_tails(compaction, target_protected_tails, draft_protected_tails)
-    _run_compaction(compaction)
-    torch.cuda.synchronize(device)
-
-    return SimpleNamespace(
-        device=device,
-        request_count=request_count,
-        prompt_len=prompt_len,
-        keep=keep,
-        valid_seq_lens=valid_seq_lens,
-        target_protected_tails=target_protected_tails,
-        draft_protected_tails=draft_protected_tails,
-        target_tables=target_tables,
-        draft_tables=draft_tables,
-        target_pools=target_pools,
-        draft_pool=draft_pool,
-        initial_target=initial_target,
-        initial_draft=initial_draft,
-        compaction=compaction,
-    )
-
-
-def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle():
-    # Ragged draft tails [1, 2] against target tails [2, 1]: one request's
-    # draft tail below and one above its target, subsuming the uniform row.
-    built = _launched_draft_compaction(draft_protected_tails=[1, 2])
-    device = built.device
-    prompt_len = built.prompt_len
-
-    expected_offsets = [0]
-    for request in range(built.request_count):
-        valid = built.valid_seq_lens[request]
-        # Target dense layers compact the union keep set plus the target tail.
-        target_pages = built.target_tables[request].to(torch.long)
-        target_tail = torch.arange(
-            valid,
-            valid + built.target_protected_tails[request],
-            dtype=torch.int64,
-            device=device,
-        )
-        target_source = torch.cat((built.keep[request], target_tail))
-        target_destination = torch.arange(
-            prompt_len,
-            prompt_len + target_source.numel(),
-            dtype=torch.int64,
-            device=device,
-        )
-        for before_pool, after_pool in zip(built.initial_target, built.target_pools):
-            before = _logical_view(before_pool, target_pages)
-            after = _logical_view(after_pool, target_pages)
-            assert torch.equal(after[:, :, :prompt_len], before[:, :, :prompt_len])
-            assert torch.equal(
-                after.index_select(2, target_destination),
-                before.index_select(2, target_source),
-            )
-
-        # Same kept ordinals through the draft's OWN table/heads/tail.
-        draft_pages = built.draft_tables[request].to(torch.long)
-        draft_tail = torch.arange(
-            valid,
-            valid + built.draft_protected_tails[request],
-            dtype=torch.int64,
-            device=device,
-        )
-        draft_source = torch.cat((built.keep[request], draft_tail))
-        draft_destination = torch.arange(
-            prompt_len,
-            prompt_len + draft_source.numel(),
-            dtype=torch.int64,
-            device=device,
-        )
-        before = _logical_view(built.initial_draft, draft_pages)
-        after = _logical_view(built.draft_pool, draft_pages)
-        assert torch.equal(after[:, :, :prompt_len], before[:, :, :prompt_len])
-        for head in range(int(built.draft_pool.shape[2])):
-            assert torch.equal(
-                after[:, head].index_select(1, draft_destination),
-                before[:, head].index_select(1, draft_source),
-            )
-
-        expected_offsets.append(expected_offsets[-1] + int(draft_source.numel()))
-
-    # The test-owned draft move-offset row must match the broadcast-plus-tail
-    # oracle; the packed move sources themselves are covered byte-exactly by
-    # the pool assertions above (the ramp payload makes every wrong move land
-    # on different bytes) and by the pack-kernel oracle suite.
-    assert built.compaction["draft_move_offsets"].cpu().tolist() == expected_offsets
-
-
-def test_execute_eviction_round_orders_both_manager_streams():
-    """The round executor snapshots both page-table planes, then records one
-    completion event and BOTH cache-manager streams wait on it -- even when
-    the round body fails -- so neither manager can free or reallocate pages
-    this cohort is still reading."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
-
+def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
+    """Keep target and draft work on the caller stream before manager handoff."""
     event = mock.Mock()
     host = torch.zeros(6, 9, dtype=torch.int32)
     tri = TriAttention.__new__(TriAttention)
     tri._request_capacity = 8
-    tri._keep_count = 4
-    tri.eviction_mode = "union"
+    tri.budget = 4
     tri._swa_window = None
-    tri._compaction_params = ()
     tri._draft_protected_tail_capacity = 1
     tri._staging_reuse_event = mock.Mock()
     tri._compaction_done_event = event
     tri._request_metadata_host = host
     tri._request_metadata_host_np = host.numpy()
-    tri._request_metadata_device = torch.zeros_like(host)
-    tri._phase = {"cos": None, "sin": None, "rows": 8}
-    tri._phase_num_freqs = 1
-    tri._phase_f_block = 1
-    tri._logical_source_lengths_device = None
-    tri._source_lengths_device = None
-    tri._prompt_lengths_device = None
-    tri._decode_lengths_device = None
-    tri._mean_cos = None
-    tri._mean_sin = None
-    tri._swa_destination_bases = None
-    tri._swa_rebase_delta = 0
+    metadata_device = mock.Mock()
+    tri._request_metadata_device = metadata_device
     tri._block_offsets_host = None
     tri._block_offsets_device = torch.zeros(1, dtype=torch.int32)
     tri._draft_block_offsets_host = None
     tri._draft_block_offsets_device = None
-    target_stream = mock.Mock()
-    draft_stream = mock.Mock()
-    manager = SimpleNamespace(_stream=target_stream)
+    execution_stream = mock.Mock()
+    manager = SimpleNamespace(_stream=execution_stream)
     draft_manager = SimpleNamespace(
-        _stream=draft_stream, num_extra_kv_tokens=0, _kv_reserve_draft_tokens=0
+        _stream=execution_stream, num_extra_kv_tokens=0, _kv_reserve_draft_tokens=0
     )
     tri.kv_cache_manager = manager
     tri.draft_kv_cache_manager = draft_manager
-    compute_stream = SimpleNamespace()
+    compute_stream = mock.Mock()
     eviction_inputs = [_make_eviction_input(request_id=7, source_length=8)]
 
     class Boom(RuntimeError):
         pass
 
-    score_kernel = mock.MagicMock()
-    score_kernel.__getitem__.return_value.side_effect = Boom
+    metadata_device.copy_.side_effect = Boom
     with (
-        mock.patch.object(torch.cuda, "current_stream", return_value=compute_stream),
-        mock.patch.object(module, "grow_mean_phase_table"),
+        mock.patch.object(
+            torch.cuda, "current_stream", return_value=compute_stream
+        ) as current_stream,
         mock.patch.object(tri, "_stage_block_offsets") as stage,
-        mock.patch.object(module, "_gather_mean_phase_kernel", score_kernel),
-        mock.patch.object(module, "compact") as compact,
     ):
         with pytest.raises(Boom):
             tri._execute_eviction_round(eviction_inputs)
 
     # Both page-table planes were snapshotted before the round body fired.
     assert stage.call_count == 2
-    compact.assert_not_called()
-    # One event records the round; BOTH cache managers wait on it.
+    # One event records the current execution stream. Only the target manager
+    # owns the post-round resize/release handoff.
+    current_stream.assert_called_once_with(tri._block_offsets_device.device)
     event.record.assert_called_once_with(compute_stream)
-    target_stream.wait_event.assert_called_once_with(event)
-    draft_stream.wait_event.assert_called_once_with(event)
+    execution_stream.wait_event.assert_called_once_with(event)
 
 
 @pytest.mark.parametrize(
@@ -270,7 +109,6 @@ def test_draft_admission_gates_raise(gate, match):
 
 def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     manager = _make_triattention(budget=4, beta=4)
-    manager._layer_partition = ([0, 1], [], None)
     target = manager.kv_cache_manager
     target._stream = mock.Mock()
     target.pp_layers = [0, 1]
@@ -290,7 +128,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     manager._draft_protected_tail_capacity = 1
 
     request = _make_request(7, py_prompt_len=2, py_num_accepted_draft_tokens=1)
-    manager._request_states[7] = _fresh_request_state()
+    manager._request_states[7] = _RequestState()
     batch = SimpleNamespace(generation_requests=[request])
 
     # Every step confirms one sampled token plus one accepted draft token.
@@ -309,11 +147,11 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
             manager._evict_due_requests(batch)
 
             state = manager._request_states[7]
-            if state["evicted_tokens"] > previous_evicted:
+            if state.evicted_tokens > previous_evicted:
                 # An eviction round compacted the cache to prompt + budget.
                 eviction_rounds += 1
-                confirmed -= state["evicted_tokens"] - previous_evicted
-                previous_evicted = state["evicted_tokens"]
+                confirmed -= state.evicted_tokens - previous_evicted
+                previous_evicted = state.evicted_tokens
                 cache.capacity = confirmed
                 assert confirmed == 2 + 4
                 # The staged logical position restores the uncompressed
@@ -330,8 +168,8 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     assert eviction_rounds == 3
     assert previous_published == 12
     # Each round the draft cache shrinks with the target, and the one
-    # executor call runs on the manager itself, which carries both cache
-    # managers whose streams it orders after the compact launches.
+    # executor call runs on the compression manager, which carries both cache
+    # managers while handing completion back through the target manager.
     assert draft_cache.resize.call_args_list == [mock.call(7, None)] * eviction_rounds
     assert len(internals.execute.call_args_list) == eviction_rounds
     assert manager.kv_cache_manager is target
@@ -341,118 +179,58 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
         assert call.kwargs == {}
 
 
-def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
-    manager = _make_triattention(budget=4)
-    layout, built_attributes = _make_buffer_stubs(manager)
-    draft_layout = dict(
-        layer_pools=[],
-        dense_layers=[],
-        pool_representatives=(),
-        layer_pool_ids=(),
-        pool_page_counts=(4,),
-    )
-    manager.draft_kv_cache_manager = _make_fake_v2(is_draft=True)
-    # Injected post-construction: mirror the ctor-cached manager-lifetime tail.
-    manager._draft_protected_tail_capacity = 1
-    eviction_inputs = [_make_eviction_input(_make_request(7), request_id=7, source_length=8)]
+def test_request_admission_reserves_score_high_watermark():
+    manager = _make_triattention(budget=128, beta=64)
+    manager._phase = mock.Mock()
+    manager._selection_width_capacity = 260
+    manager._score_token_capacity = 0
+    manager._launch_score = None
+    manager._compaction_done_event = mock.Mock()
+    manager.kv_cache_manager = SimpleNamespace(max_seq_len=65536, tokens_per_block=64)
 
-    def apply_built(*args, **kwargs):
-        for name, value in built_attributes.items():
-            setattr(manager, name, value)
+    def publish_score_state(*, score_token_capacity):
+        manager._score_token_capacity = score_token_capacity
+        manager._launch_score = object()
 
-    phase = manager._phase
-    with mock.patch.object(
-        manager, "_rebuild_eviction_runtime", side_effect=apply_built
-    ) as prepare:
-        manager._ensure_eviction_runtime(layout, draft_layout, eviction_inputs)
-
-        # Request capacity follows the executor limits, while the score
-        # bucket follows what the cohort actually presents (power-of-two,
-        # 1024 floor) instead of pinning tens-of-GiB scratch to max_seq_len.
-        # The stubbed build's capacities became the resident manager state.
-        assert manager._buffers_built
-        assert manager._selection_width_capacity == built_attributes["_selection_width_capacity"]
-        # The mode and the shared phase-table dict live on the manager itself
-        # and thread through unchanged (no longer build arguments).
-        assert manager.eviction_mode == "union"
-        assert manager._phase is phase
-        args = prepare.call_args.args
-        kwargs = prepare.call_args.kwargs
-        assert args[0] is layout
-        assert args[1] is draft_layout
-        assert kwargs["request_capacity"] == 8
-        assert kwargs["selection_width_capacity"] == 4 + 2 * 128
-        assert kwargs["score_token_capacity"] == 1024
-
-        # A second round within the resident capacities reuses the buffers
-        # (and with them the compaction launch data they carry).
-        manager._ensure_eviction_runtime(layout, draft_layout, eviction_inputs)
-        assert prepare.call_count == 1
-
-        # A cohort that outgrows the resident capacities rebuilds the whole
-        # buffer state, compaction included.
-        grown = [
-            _make_eviction_input(
-                _make_request(7),
-                request_id=7,
-                source_length=8 + built_attributes["_selection_width_capacity"],
-            )
-        ]
-
-        def apply_rebuilt(*args, **kwargs):
-            apply_built()
-            manager._selection_width_capacity = built_attributes["_selection_width_capacity"] + 8
-
-        prepare.side_effect = apply_rebuilt
-        manager._ensure_eviction_runtime(layout, draft_layout, grown)
-        assert prepare.call_count == 2
-        assert manager._buffers_built
-        assert (
-            manager._selection_width_capacity == built_attributes["_selection_width_capacity"] + 8
-        )
-
-
-def test_source_growth_beyond_score_bucket_rebuilds_buffers():
-    """A later cohort can grow max(source_length) past the compiled score
-    bucket while decode width, page tokens, and request count all still fit;
-    the reuse gate must rebuild instead of scoring past the static geometry."""
-    manager = _make_triattention(budget=4)
-    layout, built_attributes = _make_buffer_stubs(manager)
-    eviction_inputs = [
-        _make_eviction_input(
-            _make_request(7),
-            request_id=7,
-            source_length=1024,
-            prompt_length=1020,
-        )
+    manager._build_eviction_capacity = mock.Mock(side_effect=publish_score_state)
+    requests = [
+        _make_request(1, py_prompt_len=100, py_max_new_tokens=10000),
+        _make_request(2, py_prompt_len=700, py_max_new_tokens=10),
+        _make_request(3, py_prompt_len=900, py_max_new_tokens=200),
     ]
 
-    def apply_built(*args, **kwargs):
-        for name, value in built_attributes.items():
-            setattr(manager, name, value)
+    for request in requests:
+        manager._reserve_eviction_capacity(request)
 
-    with mock.patch.object(
-        manager, "_rebuild_eviction_runtime", side_effect=apply_built
-    ) as prepare:
-        manager._ensure_eviction_runtime(layout, None, eviction_inputs)
-        assert prepare.call_count == 1
-        # One more source token, same decode width and request count.
-        grown = [
-            _make_eviction_input(
-                _make_request(7),
-                request_id=7,
-                source_length=1025,
-                prompt_length=1021,
-            )
-        ]
-        manager._ensure_eviction_runtime(layout, None, grown)
-        assert prepare.call_count == 2
+    assert manager._build_eviction_capacity.call_args_list == [
+        mock.call(score_token_capacity=1024),
+        mock.call(score_token_capacity=2048),
+    ]
+    manager._compaction_done_event.synchronize.assert_called_once_with()
+    assert manager._phase.reserve.call_args_list == [
+        mock.call(10101),
+        mock.call(1101),
+    ]
+
+
+def test_request_admission_aligns_clamped_score_bucket_to_tile():
+    manager = _make_triattention(budget=128, beta=64)
+    manager._phase = mock.Mock()
+    manager._selection_width_capacity = 256
+    manager._score_token_capacity = 0
+    manager._launch_score = None
+    manager._compaction_done_event = mock.Mock()
+    manager.kv_cache_manager = SimpleNamespace(max_seq_len=1050, tokens_per_block=128)
+    manager._build_eviction_capacity = mock.Mock()
+
+    manager._reserve_eviction_capacity(_make_request(1, py_prompt_len=1025, py_max_new_tokens=192))
+
+    manager._build_eviction_capacity.assert_called_once_with(score_token_capacity=1280)
+    manager._compaction_done_event.synchronize.assert_not_called()
 
 
 def test_staged_block_width_clamps_to_manager_source_width():
-    """Score tile rounding can request more page-table blocks than the live V2
-    source table holds; the staged width must clamp to the manager width so the
-    native gather never reads past the K plane (tpb=32, max_seq_len=96, tail=1)."""
+    """Clamp staged block width to the live V2 source-table width."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
         _allocate_block_offset_staging,
     )

@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SM100 CuTe-DSL scorer for the TriAttention mean-score path (score-only and fused
-score+stats+union entries); geometry outside the exact contract raises at construction."""
+"""SM100 CuTe-DSL score pipeline for TriAttention."""
 
 from __future__ import annotations
 
 import threading
+from typing import Callable, Dict, Optional, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -1330,3 +1330,242 @@ def _tensor_spec(tensor: torch.Tensor) -> tuple:
 
 def _to_cute(tensor: torch.Tensor, *, assumed_align: int = 16) -> cute.Tensor:
     return from_dlpack(tensor, assumed_align=assumed_align)
+
+
+def _get_or_compile(cache_key: tuple, build: Callable[[], object]) -> object:
+    with _COMPILE_LOCK:
+        compiled = _COMPILED_KERNELS.get(cache_key)
+        if compiled is None:
+            compiled = build()
+            _COMPILED_KERNELS[cache_key] = compiled
+    return compiled
+
+
+def build_score_pipeline(
+    layout: Dict[str, object],
+    *,
+    block_offsets: torch.Tensor,
+    source_lengths: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+    mean_cos: torch.Tensor,
+    mean_sin: torch.Tensor,
+    q_real: torch.Tensor,
+    q_imag: torch.Tensor,
+    mlr_coef: torch.Tensor,
+    freq_scale_sq: torch.Tensor,
+    score_token_capacity: int,
+    union_scores: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Callable[[int], None]]:
+    """Compile a capacity-specific score pipeline and return its scratch and launcher."""
+    layer_pools = tuple(layout["layer_pools"])
+    scored_layers = tuple(int(layer) for layer in layout["dense_layers"])
+    layer_pool_ids = tuple(int(slot) for slot in layout["layer_pool_ids"])
+    anchor_pool = layer_pools[scored_layers[0]]
+    device = anchor_pool.device
+    request_capacity = int(source_lengths.numel())
+    num_layers = len(scored_layers)
+    score_token_capacity = int(score_token_capacity)
+
+    num_q_heads = int(q_real.shape[1])
+    num_freqs = int(q_real.shape[2])
+    _, _, num_kv_heads, tokens_per_block, _ = anchor_pool.shape
+    num_kv_heads = int(num_kv_heads)
+    tokens_per_block = int(tokens_per_block)
+    max_segments = request_capacity * num_layers
+    max_segment_offset = (max_segments - 1) * score_token_capacity
+    if max_segment_offset >= 2**31:
+        raise ValueError(f"score bucket overflows the int32 segment offsets: {max_segment_offset}")
+
+    segment_request_ids = torch.arange(
+        request_capacity, dtype=torch.int32, device=device
+    ).repeat_interleave(num_layers)
+    segment_layer_ids = torch.tensor(scored_layers, dtype=torch.int32, device=device).repeat(
+        request_capacity
+    )
+    segment_pool_slots = torch.tensor(
+        tuple(layer_pool_ids[layer] for layer in scored_layers),
+        dtype=torch.int64,
+        device=device,
+    ).repeat(request_capacity)
+    segment_page_offsets = segment_pool_slots * block_offsets.stride(0) + segment_request_ids.to(
+        torch.int64
+    ) * block_offsets.stride(1)
+    segment_output_offsets = (
+        torch.arange(max_segments, dtype=torch.int64, device=device) * score_token_capacity
+    ).to(torch.int32)
+
+    score_scratch = torch.empty(
+        num_kv_heads * PADDED_HEAD_COLUMNS * max_segments * score_token_capacity,
+        dtype=torch.float32,
+        device=device,
+    )
+    partial_stats = torch.empty(
+        (
+            request_capacity * num_layers * num_q_heads * SMALL_WORKLOAD_PAGE_SHARDS * STATS_FIELDS
+            if union_scores is not None
+            else 1
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+    tma_descriptors = _encode_tma_descriptors(
+        list(layer_pools),
+        list(scored_layers),
+        num_freqs,
+        tokens_per_block,
+    )
+
+    score_operands = (
+        (block_offsets.view(-1), 16),
+        (segment_page_offsets, 16),
+        (segment_request_ids, 16),
+        (segment_layer_ids, 16),
+        (source_lengths, 4),
+        (segment_output_offsets, 16),
+        (prompt_lengths, 4),
+        (q_real.view(-1), 16),
+        (q_imag.view(-1), 16),
+        (mlr_coef.view(-1), 16),
+        (mean_cos.view(-1), 16),
+        (mean_sin.view(-1), 16),
+        (freq_scale_sq, 16),
+        (score_scratch, 16),
+        (partial_stats, 16),
+        (anchor_pool, 16),
+        (tma_descriptors, 128),
+    )
+    score_args = tuple(
+        _to_cute(tensor, assumed_align=alignment) for tensor, alignment in score_operands
+    )
+    tensor_specs = tuple(_tensor_spec(tensor) for tensor, _ in score_operands)
+    static_geometry = (
+        request_capacity,
+        num_layers,
+        score_token_capacity,
+        num_q_heads,
+        num_kv_heads,
+        num_freqs,
+        tokens_per_block,
+        tuple(int(value) for value in anchor_pool.shape),
+        tuple(int(value) for value in anchor_pool.stride()),
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    variants = [(1, SMALL_WORKLOAD_PAGE_SHARDS)]
+    if request_capacity > 1:
+        variants.append((request_capacity, 2))
+
+    compiled_scores: Dict[int, object] = {}
+    page_shards_by_request_count: Dict[int, int] = {}
+    variant_key = (
+        "triattention_cute_score_stats" if union_scores is not None else "triattention_cute_score"
+    )
+    for request_count, page_shards in variants:
+        cache_key = (
+            variant_key,
+            static_geometry,
+            tensor_specs,
+            request_count,
+            page_shards,
+        )
+        compiled_scores[request_count] = _get_or_compile(
+            cache_key,
+            lambda page_shards=page_shards: cute.compile(
+                _TriAttentionScoreKernel(
+                    num_layers=num_layers,
+                    score_token_capacity=score_token_capacity,
+                    num_q_heads=num_q_heads,
+                    num_freqs=num_freqs,
+                    pool_shape=tuple(int(value) for value in anchor_pool.shape),
+                    pool_strides=tuple(int(value) for value in anchor_pool.stride()),
+                    page_shards=page_shards,
+                    write_partial_stats=union_scores is not None,
+                ),
+                *score_args,
+                cutlass.Int32(1),
+                stream,
+            ),
+        )
+        page_shards_by_request_count[request_count] = page_shards
+
+    if request_capacity > 1:
+        small = compiled_scores[1]
+        large = compiled_scores[request_capacity]
+        for request_count in range(1, request_capacity + 1):
+            use_extra_shard = request_count * num_layers * num_kv_heads * 2 < 2 * sm_count
+            compiled_scores[request_count] = small if use_extra_shard else large
+            page_shards_by_request_count[request_count] = (
+                SMALL_WORKLOAD_PAGE_SHARDS if use_extra_shard else 2
+            )
+
+    normalize_args: Tuple[object, ...] = ()
+    compiled_normalizers: Dict[int, object] = {}
+    if union_scores is not None:
+        # Local import avoids a module cycle: selection imports the score
+        # module's shared layout constants.
+        from .triattention_cute_selection import (
+            _select_normalize_union_config,
+            _TriAttentionNormalizeUnionKernel,
+        )
+
+        normalize_operands = (
+            (partial_stats, 16),
+            (score_scratch, 16),
+            (source_lengths, 4),
+            (segment_output_offsets, 16),
+            (prompt_lengths, 4),
+            (union_scores, 16),
+        )
+        normalize_args = tuple(
+            _to_cute(tensor, assumed_align=alignment) for tensor, alignment in normalize_operands
+        )
+        for request_count in range(1, request_capacity + 1):
+            page_shards = page_shards_by_request_count[request_count]
+            config = _select_normalize_union_config(request_count, score_token_capacity, sm_count)
+            config_key = (page_shards, *config)
+            cache_key = (
+                "triattention_cute_normalize_union",
+                static_geometry,
+                tensor_specs,
+                config_key,
+                _tensor_spec(union_scores),
+            )
+            tokens_per_lane, token_subtiles, row_cluster_ctas = config
+
+            def build_normalizer(
+                page_shards=page_shards,
+                tokens_per_lane=tokens_per_lane,
+                token_subtiles=token_subtiles,
+                row_cluster_ctas=row_cluster_ctas,
+            ):
+                return cute.compile(
+                    _TriAttentionNormalizeUnionKernel(
+                        num_layers=num_layers,
+                        score_token_capacity=score_token_capacity,
+                        num_q_heads=num_q_heads,
+                        num_kv_heads=num_kv_heads,
+                        page_shards=page_shards,
+                        tokens_per_lane=tokens_per_lane,
+                        token_subtiles=token_subtiles,
+                        row_cluster_ctas=row_cluster_ctas,
+                        output_row_stride=int(union_scores.stride(0)),
+                    ),
+                    *normalize_args,
+                    cutlass.Int32(1),
+                    stream,
+                )
+
+            compiled_normalizers[request_count] = _get_or_compile(cache_key, build_normalizer)
+
+    def launch_score(request_count: int) -> None:
+        current_stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+        compiled_scores[request_count](*score_args, request_count, current_stream)
+        if compiled_normalizers:
+            compiled_normalizers[request_count](
+                *normalize_args,
+                request_count,
+                current_stream,
+            )
+
+    # The closure retains every DLPack-backed argument for the launcher's lifetime.
+    return score_scratch, launch_score

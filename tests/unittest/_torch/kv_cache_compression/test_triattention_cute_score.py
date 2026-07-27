@@ -3,7 +3,8 @@
 """The SM100 TriAttention CuTe scorer (the only score path) vs oracles.
 
 The launch matrix drives the named production geometries against the
-pure-PyTorch oracle; the contract test pins the no-fallback loud raise."""
+pure-PyTorch oracle; the contract test pins the no-fallback loud raise.
+"""
 
 import pytest
 import torch
@@ -161,8 +162,7 @@ def test_cute_kernel_matches_torch_oracle(case):
         list(range(num_layers)),
     )
 
-    # Every count up to capacity is served, nothing beyond.
-    assert max_requests + 1 not in tri._compiled_score_by_request_count
+    # Every request count used by the runtime dispatches through the launcher.
     for request_count in dict.fromkeys((1, max_requests - 1, max_requests)):
         decode_lengths = torch.full((max_requests,), -1, dtype=torch.int32, device=device)
         scores = _launch_split_scores(
