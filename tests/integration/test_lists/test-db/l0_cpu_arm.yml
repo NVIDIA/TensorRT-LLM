@@ -14,3 +14,4 @@ l0_cpu_arm:
       orchestrator: mpi
   tests:
   - unittest/executor/test_rpc.py
+  - unittest/llmapi/test_bench_async.py
