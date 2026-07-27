@@ -413,6 +413,11 @@ void invokeUpdateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
 template <typename T, typename T_cache, typename KVCacheBuffer>
 void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
 
+// Debug function to test basic parameter access
+template <typename T, typename KVCacheBuffer>
+void invokeDebugSparseKvCacheParams(
+    QKVPreprocessingParams<T, KVCacheBuffer> params, int* debug_output, cudaStream_t stream);
+
 //! Compact a uniform group of KVCacheManagerV2 layer pools in one batched launch
 //! (per request and head, moves are ascending and never overtake their sources:
 //! the copy runs in place).

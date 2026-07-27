@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Shared harness for the KV-cache compaction tests."""
+
 import json
 import os
 import tempfile
@@ -128,6 +130,7 @@ def build_compaction(**overrides):
         eviction_mode="union",
         dense_layers=[0, 1],
         swa_layers=[],
+        layer_group_representative={0: 0, 1: 1},
         layer_pool_ids=[0, 0],
         request_count=2,
         decode_keep_count=4,
