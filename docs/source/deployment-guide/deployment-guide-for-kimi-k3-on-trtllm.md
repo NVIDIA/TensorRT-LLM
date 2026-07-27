@@ -56,6 +56,7 @@ Kimi K3 additionally depends on `fla` and `einops`, installed into the same in-p
 To use the optimized CuTeDSL MLA kernel, install the FlashInfer revision used by the Kimi K3 example into the same in-place environment:
 
 ```bash
+.venv-3.12/bin/python -m pip install -U 'packaging>=24.2'  # required by the FlashInfer source build
 .venv-3.12/bin/python -u -m pip install --force-reinstall --no-deps \
     --no-build-isolation \
     "flashinfer-python[cu13] @ git+https://github.com/PerkzZheng/flashinfer-k3.git@b6cc594918baf76c40c3a6236fd53f0f8fb9d2dc"
