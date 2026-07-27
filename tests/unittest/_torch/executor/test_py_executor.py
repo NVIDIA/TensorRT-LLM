@@ -20,7 +20,6 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
@@ -508,7 +507,7 @@ class TestDisaggTransferAdmissionController:
         assert result.admitted_requests == [request]
         assert result.admitted_transfer_blocks == 3
 
-    def test_apply_reverts_deferred_v2_allocations(self):
+    def test_apply_bypasses_transfer_admission_controller(self):
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
         executor._is_kv_manager_v2 = True
@@ -523,9 +522,9 @@ class TestDisaggTransferAdmissionController:
             executor, [candidate]
         )
 
-        assert admitted == []
-        assert wait_for_progress
-        executor._revert_ctx_alloc.assert_called_once_with([candidate])
+        assert admitted == [candidate]
+        assert not wait_for_progress
+        executor._revert_ctx_alloc.assert_not_called()
 
     def test_apply_missing_controller_preserves_candidates(self):
         executor = object.__new__(PyExecutor)
@@ -540,7 +539,7 @@ class TestDisaggTransferAdmissionController:
         assert admitted == [candidate]
         assert not wait_for_progress
 
-    def test_apply_missing_v2_flag_defaults_to_non_v2(self):
+    def test_apply_bypasses_controller_without_v2_flag(self):
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
         executor._revert_ctx_alloc = Mock()
@@ -554,11 +553,11 @@ class TestDisaggTransferAdmissionController:
             executor, [candidate]
         )
 
-        assert admitted == []
-        assert wait_for_progress
+        assert admitted == [candidate]
+        assert not wait_for_progress
         executor._revert_ctx_alloc.assert_not_called()
 
-    def test_sync_mode_retains_transfer_budget(self, monkeypatch):
+    def test_sync_mode_bypasses_transfer_budget(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
@@ -577,9 +576,9 @@ class TestDisaggTransferAdmissionController:
             executor, candidates
         )
 
-        assert admitted == [candidates[0]]
+        assert admitted == candidates
         assert not wait_for_progress
-        executor._revert_ctx_alloc.assert_called_once_with([candidates[1]])
+        executor._revert_ctx_alloc.assert_not_called()
 
     def test_gen_only_no_context_bypasses_transfer_budget(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
@@ -634,7 +633,7 @@ class TestDisaggTransferIdleProgress:
 
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
-    def test_polls_generation_transfer_when_admission_blocked(self):
+    def test_does_not_poll_generation_transfer_when_admission_blocked(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1)
         executor._check_disagg_gen_cache_transfer_status = Mock()
@@ -648,10 +647,10 @@ class TestDisaggTransferIdleProgress:
             all_gen_first=False,
         )
 
-        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
 
-    def test_peer_rank_enters_bounded_progress_poll(self):
+    def test_peer_rank_does_not_enter_bounded_progress_poll(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
         executor.dist.allreduce.return_value = 1
@@ -666,11 +665,11 @@ class TestDisaggTransferIdleProgress:
             all_gen_first=False,
         )
 
-        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
-        executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+        executor.dist.allreduce.assert_not_called()
 
-    def test_falls_back_to_context_transfer_when_not_generation_blocked(self):
+    def test_does_not_fall_back_to_context_transfer(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1)
         executor._check_disagg_gen_cache_transfer_status = Mock()
@@ -684,7 +683,7 @@ class TestDisaggTransferIdleProgress:
             all_gen_first=False,
         )
 
-        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
+        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
     def test_sync_benchmark_skips_idle_transfer_collectives(self, monkeypatch):
@@ -811,7 +810,7 @@ class TestDisaggTransferIdleProgress:
             charge_budget=False,
         )
 
-    def test_peer_cp_rank_enters_context_progress_poll(self):
+    def test_peer_cp_rank_does_not_enter_context_progress_poll(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
         executor.dist.allreduce.return_value = 0
@@ -827,9 +826,10 @@ class TestDisaggTransferIdleProgress:
             all_gen_first=False,
         )
 
-        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
+        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
-        executor.dist.tp_cp_allgather.assert_called_once_with(0)
+        executor.dist.allreduce.assert_not_called()
+        executor.dist.tp_cp_allgather.assert_not_called()
 
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
