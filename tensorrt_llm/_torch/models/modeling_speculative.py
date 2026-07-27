@@ -2045,6 +2045,15 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
 
+    def setup_aliases(self) -> None:
+        if (self.draft_model is not None
+                and getattr(self.draft_model, "shares_target_kv_cache", False)):
+            setup_target_aliases = getattr(self.draft_model,
+                                           "load_weights_from_target_model",
+                                           None)
+            if callable(setup_target_aliases):
+                setup_target_aliases(self)
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,

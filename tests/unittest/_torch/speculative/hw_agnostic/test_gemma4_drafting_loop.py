@@ -92,6 +92,22 @@ def test_external_shared_kv_builds_draft_from_external_config(monkeypatch):
     )
 
 
+def test_shared_kv_alias_setup_rebinds_target_model():
+    calls = []
+    draft_model = SimpleNamespace(
+        shares_target_kv_cache=True,
+        load_weights_from_target_model=lambda target: calls.append(target),
+    )
+    model = SimpleNamespace(draft_model=draft_model)
+
+    modeling_speculative.SpecDecOneEngineForCausalLM.setup_aliases(model)
+
+    assert calls == [model]
+
+    model.draft_model = SimpleNamespace(shares_target_kv_cache=True)
+    modeling_speculative.SpecDecOneEngineForCausalLM.setup_aliases(model)
+
+
 def test_external_shared_kv_worker_requires_draft_model_capability():
     worker = MTPEagleWorker(_shared_kv_spec_config())
 
