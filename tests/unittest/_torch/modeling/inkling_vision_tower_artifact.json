@@ -1,0 +1,209 @@
+{
+  "num_items": 12,
+  "aligned": 12,
+  "max_abs_over_items": 0.0,
+  "reference": "sglang HMLPPatchEncoder (real source, bf16, CUDA)",
+  "checkpoint": "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/kleinc/hf_data/Inkling-NVFP4-full",
+  "scales": [
+    [
+      1,
+      1,
+      1,
+      3
+    ],
+    [
+      1,
+      5,
+      5,
+      128
+    ],
+    [
+      1,
+      10,
+      10,
+      320
+    ],
+    [
+      1,
+      40,
+      40,
+      4800
+    ],
+    [
+      2,
+      40,
+      40,
+      9600
+    ]
+  ],
+  "records": [
+    {
+      "id": "validation_Math_1",
+      "num_patches": 1148,
+      "feature_rows_trt": 1148,
+      "feature_rows_sglang": 1148,
+      "out_width": 6144,
+      "placeholder_count": 1148,
+      "placeholder_invariant_ok": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_max": 0.0,
+      "cosine": 1.0,
+      "match": true
+    },
+    {
+      "id": "validation_Math_2",
+      "num_patches": 198,
+      "feature_rows_trt": 198,
+      "feature_rows_sglang": 198,
+      "out_width": 6144,
+      "placeholder_count": 198,
+      "placeholder_invariant_ok": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_max": 0.0,
+      "cosine": 1.0,
+      "match": true
+    },
+    {
+      "id": "validation_Physics_1",
+      "num_patches": 361,
+      "feature_rows_trt": 361,
+      "feature_rows_sglang": 361,
+      "out_width": 6144,
+      "placeholder_count": 361,
+      "placeholder_invariant_ok": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_max": 0.0,
+      "cosine": 1.0,
+      "match": true
+    },
+    {
+      "id": "validation_Chemistry_1",
+      "num_patches": 336,
+      "feature_rows_trt": 336,
+      "feature_rows_sglang": 336,
+      "out_width": 6144,
+      "placeholder_count": 336,
+      "placeholder_invariant_ok": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_max": 0.0,
+      "cosine": 1.0,
+      "match": true
+    },
+    {
+      "id": "validation_Accounting_1",
+      "num_patches": 444,
+      "feature_rows_trt": 444,
+      "feature_rows_sglang": 444,
+      "out_width": 6144,
+      "placeholder_count": 444,
+      "placeholder_invariant_ok": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_max": 0.0,
+      "cosine": 1.0,
+      "match": true
+    },
+    {
+      "id": "validation_Accounting_2",
+      "num_patches": 288,
+      "feature_rows_trt": 288,
+      "feature_rows_sglang": 288,
+      "out_width": 6144,
+      "placeholder_count": 288,
+      "placeholder_invariant_ok": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_max": 0.0,
+      "cosine": 1.0,
+      "match": true
+    },
+    {
+      "id": "validation_Accounting_3",
+      "num_patches": 153,
+      "feature_rows_trt": 153,
+      "feature_rows_sglang": 153,
+      "out_width": 6144,
+      "placeholder_count": 153,
+      "placeholder_invariant_ok": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_max": 0.0,
+      "cosine": 1.0,
+      "match": true
+    },
+    {
+      "id": "validation_Accounting_4",
+      "num_patches": 520,
+      "feature_rows_trt": 520,
+      "feature_rows_sglang": 520,
+      "out_width": 6144,
+      "placeholder_count": 520,
+      "placeholder_invariant_ok": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_max": 0.0,
+      "cosine": 1.0,
+      "match": true
+    },
+    {
+      "id": "validation_Accounting_5",
+      "num_patches": 520,
+      "feature_rows_trt": 520,
+      "feature_rows_sglang": 520,
+      "out_width": 6144,
+      "placeholder_count": 520,
+      "placeholder_invariant_ok": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_max": 0.0,
+      "cosine": 1.0,
+      "match": true
+    },
+    {
+      "id": "validation_Accounting_6",
+      "num_patches": 676,
+      "feature_rows_trt": 676,
+      "feature_rows_sglang": 676,
+      "out_width": 6144,
+      "placeholder_count": 676,
+      "placeholder_invariant_ok": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_max": 0.0,
+      "cosine": 1.0,
+      "match": true
+    },
+    {
+      "id": "validation_Accounting_7",
+      "num_patches": 132,
+      "feature_rows_trt": 132,
+      "feature_rows_sglang": 132,
+      "out_width": 6144,
+      "placeholder_count": 132,
+      "placeholder_invariant_ok": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_max": 0.0,
+      "cosine": 1.0,
+      "match": true
+    },
+    {
+      "id": "validation_Accounting_8",
+      "num_patches": 494,
+      "feature_rows_trt": 494,
+      "feature_rows_sglang": 494,
+      "out_width": 6144,
+      "placeholder_count": 494,
+      "placeholder_invariant_ok": true,
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_max": 0.0,
+      "cosine": 1.0,
+      "match": true
+    }
+  ]
+}

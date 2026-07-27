@@ -103,8 +103,7 @@ class InklingTextConfig(PretrainedConfig):
         # `max_position_embeddings` is read by several TRT-LLM code paths
         # (Attention, RopeParams probing); Inkling has no RoPE but keep the 1M
         # context window available so nothing clamps sequence length.
-        self.max_position_embeddings = kwargs.get("max_position_embeddings",
-                                                  model_max_length)
+        self.max_position_embeddings = kwargs.get("max_position_embeddings", model_max_length)
         self.logits_mup_width_multiplier = logits_mup_width_multiplier
         self.use_embed_norm = use_embed_norm
 
@@ -152,21 +151,25 @@ class InklingTextConfig(PretrainedConfig):
         return layer_idx in self._local_ids
 
     def layer_num_kv_heads(self, layer_idx: int) -> int:
-        return (self.swa_num_key_value_heads
-                if self.is_local_layer(layer_idx) else self.num_key_value_heads)
+        return (
+            self.swa_num_key_value_heads
+            if self.is_local_layer(layer_idx)
+            else self.num_key_value_heads
+        )
 
     def layer_num_heads(self, layer_idx: int) -> int:
-        return (self.swa_num_attention_heads
-                if self.is_local_layer(layer_idx) else self.num_attention_heads)
+        return (
+            self.swa_num_attention_heads
+            if self.is_local_layer(layer_idx)
+            else self.num_attention_heads
+        )
 
     def layer_head_dim(self, layer_idx: int) -> int:
-        return (self.swa_head_dim
-                if self.is_local_layer(layer_idx) else self.head_dim)
+        return self.swa_head_dim if self.is_local_layer(layer_idx) else self.head_dim
 
     def layer_window(self, layer_idx: int) -> int | None:
         """Sliding-window size for local layers; ``None`` for global layers."""
-        return self.sliding_window_size if self.is_local_layer(
-            layer_idx) else None
+        return self.sliding_window_size if self.is_local_layer(layer_idx) else None
 
     def num_kv_heads_per_layer(self) -> list[int]:
         """Per-layer KV-head counts for the hybrid attention geometry.
@@ -178,9 +181,7 @@ class InklingTextConfig(PretrainedConfig):
         count instead of a single uniform value. ``head_dim`` is uniform (128)
         across local and global layers, so only the KV-head count varies.
         """
-        return [
-            self.layer_num_kv_heads(i) for i in range(self.num_hidden_layers)
-        ]
+        return [self.layer_num_kv_heads(i) for i in range(self.num_hidden_layers)]
 
 
 class InklingConfig(PretrainedConfig):
@@ -202,11 +203,27 @@ class InklingConfig(PretrainedConfig):
         vision_config=None,
         mtp_config=None,
         eos_token_id: int = 200006,
+        # Multimodal placeholder ids. One appears per media item in the
+        # pre-rendered token stream; the input processor expands it to one token
+        # per patch (image) / audio frame and the vision/audio fusion overwrites
+        # those positions. The IMAGE placeholder is the IN-VOCAB chat-template
+        # token ``<|unused_200054|>`` (id 200054): TensorRT-LLM's executor
+        # validates request token ids and rejects an out-of-range id, so the
+        # SGLang-internal -101 sentinel (parser/inkling_tokenizer.py) raises
+        # ``RequestError: Token ID out of range`` at ``llm.generate``. -101 and
+        # 200054 are interchangeable for parity (both are replaced by the same
+        # vision embeddings); the SGLang reference is POSTed with -101, TRT runs
+        # 200054. The in-scope checkpoint's config.json omits these, so the
+        # defaults are authoritative unless a config spells them out.
+        image_token_id: int = 200054,
+        audio_token_id: int = -102,
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
         self.eos_token_id = eos_token_id
+        self.image_token_id = image_token_id
+        self.audio_token_id = audio_token_id
 
         if text_config is None:
             self.text_config = InklingTextConfig()

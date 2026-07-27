@@ -54,28 +54,55 @@ from torch import nn
 
 from tensorrt_llm._torch.attention_backend import AttentionMetadata
 from tensorrt_llm._torch.attention_backend.inkling_triton import (
-    build_page_table, inkling_decode_attention, inkling_prefill_attention,
-    write_kv_cache_hnd)
+    build_page_table,
+    inkling_decode_attention,
+    inkling_prefill_attention,
+    write_kv_cache_hnd,
+)
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm.logger import logger
-from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
-                                                       DecoderModelForCausalLM,
-                                                       filter_weights,
-                                                       register_auto_model)
+from tensorrt_llm._torch.models.modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    filter_weights,
+    register_auto_model,
+)
 from tensorrt_llm._torch.modules.embedding import Embedding
-from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
-                                                   RoutingMethodType,
-                                                   create_moe)
-from tensorrt_llm._torch.modules.linear import (Linear, TensorParallelMode,
-                                                WeightMode,
-                                                WeightsLoadingConfig)
-from tensorrt_llm._torch.modules.mamba.causal_conv1d import (
-    causal_conv1d_fn, causal_conv1d_update)
+from tensorrt_llm._torch.modules.fused_moe import (
+    BaseMoeRoutingMethod,
+    RoutingMethodType,
+    create_moe,
+)
+from tensorrt_llm._torch.modules.linear import (
+    Linear,
+    TensorParallelMode,
+    WeightMode,
+    WeightsLoadingConfig,
+)
+from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.logger import logger
 
+from ...inputs import (
+    ContentFormat,
+    MultimodalPlaceholderMetadata,
+    MultimodalPlaceholderPlacement,
+    register_input_processor,
+)
 from ..configs.inkling import InklingConfig, InklingTextConfig
+from .modeling_inkling_vision import (
+    DEFAULT_IMAGE_TOKEN_ID,
+    InklingInputProcessor,
+    InklingVisionModel,
+    emit_vision_scatter_probe,
+    vision_probe_enabled,
+)
+from .modeling_multimodal_utils import (
+    filter_mm_token_from_input_ids,
+    find_input_mm_embeds,
+    fuse_input_embeds,
+)
 
 # Per-layer, per-request short-conv state carried across decode steps: the four
 # causal short convolutions of one Inkling decoder layer. Each field is a
@@ -182,26 +209,27 @@ def _ink_rowdiff(t: Optional[torch.Tensor], ctx=None) -> float:
 # finiteness in FP_OPS_XRANK), and mlp-side ops 10/11/12 UNMEASURED (B2 is
 # attention-born; the ``_ink_fp`` residual covers the post-mlp stream).
 _INK_FP_OP_NAMES = (
-    "attn_norm",     # 0 decoder: pre-attention RMSNorm output
-    "attn_q",        # 1 attention: q after qkv-proj + qk-norm
-    "attn_k",        # 2 attention: k after kv-sconv + qk-norm
-    "attn_v",        # 3 attention: v after kv-sconv
-    "attn_rel",      # 4 attention: relative-position bias rel_logits
-    "attn_kernel",   # 5 attention: paged decode-kernel output (softmax/PV/KV-page read)
+    "attn_norm",  # 0 decoder: pre-attention RMSNorm output
+    "attn_q",  # 1 attention: q after qkv-proj + qk-norm
+    "attn_k",  # 2 attention: k after kv-sconv + qk-norm
+    "attn_v",  # 3 attention: v after kv-sconv
+    "attn_rel",  # 4 attention: relative-position bias rel_logits
+    "attn_kernel",  # 5 attention: paged decode-kernel output (softmax/PV/KV-page read)
     "o_proj_local",  # 6 UNMEASURED (extra GEMM dropped -- Heisenbug); use XRANK
-    "o_proj_out",    # 7 attention: o_proj output POST all-reduce (= h_core)
-    "attn_sconv",    # 8 decoder: attention short-conv output (h_asc)
-    "h_attn",        # 9 decoder: post-attention residual (residual + h_asc)
-    "mlp_norm",      # 10 UNMEASURED (mlp-side; residual buffer covers downstream)
-    "moe_out",       # 11 UNMEASURED (mlp-side; residual buffer covers downstream)
-    "mlp_sconv",     # 12 UNMEASURED (mlp-side; residual buffer covers downstream)
+    "o_proj_out",  # 7 attention: o_proj output POST all-reduce (= h_core)
+    "attn_sconv",  # 8 decoder: attention short-conv output (h_asc)
+    "h_attn",  # 9 decoder: post-attention residual (residual + h_asc)
+    "mlp_norm",  # 10 UNMEASURED (mlp-side; residual buffer covers downstream)
+    "moe_out",  # 11 UNMEASURED (mlp-side; residual buffer covers downstream)
+    "mlp_sconv",  # 12 UNMEASURED (mlp-side; residual buffer covers downstream)
 )
 N_INK_FP_OPS = len(_INK_FP_OP_NAMES)
 _INK_FP_STAT_W = 4  # [nonfinite_count, max_abs, l2, numel]
 
 
-def _ink_fp_stat(slot: torch.Tensor, t: torch.Tensor,
-                 scratch: Optional[torch.Tensor] = None) -> None:
+def _ink_fp_stat(
+    slot: torch.Tensor, t: torch.Tensor, scratch: Optional[torch.Tensor] = None
+) -> None:
     """Capture-safe finiteness fingerprint of ``t`` written into ``slot`` (a
     length-4 fp32 view): ``[nonfinite_flag, max_abs, 0, numel]``.
 
@@ -226,10 +254,10 @@ def _ink_fp_stat(slot: torch.Tensor, t: torch.Tensor,
     tv = t.detach()
     n = tv.numel()
     if scratch is not None and n <= scratch.numel():
-        sv = scratch[:n].view(tv.shape)   # view of pre-alloc scratch (no alloc)
-        sv.copy_(tv)                       # cast->fp32 + gather (no numel alloc)
-        sv.abs_()                          # in-place abs (no alloc)
-        m = sv.amax()                      # scalar reduction (no host sync)
+        sv = scratch[:n].view(tv.shape)  # view of pre-alloc scratch (no alloc)
+        sv.copy_(tv)  # cast->fp32 + gather (no numel alloc)
+        sv.abs_()  # in-place abs (no alloc)
+        m = sv.amax()  # scalar reduction (no host sync)
         slot[0].copy_((~torch.isfinite(m)).to(torch.float32))
         slot[1].copy_(torch.nan_to_num(m, nan=0.0, posinf=0.0, neginf=0.0))
         slot[3].fill_(float(n))
@@ -238,12 +266,15 @@ def _ink_fp_stat(slot: torch.Tensor, t: torch.Tensor,
     # happen for the probed Inkling ops): the original small-alloc path.
     tf = tv.reshape(-1).to(torch.float32)
     slot.copy_(
-        torch.stack([
-            (~torch.isfinite(tf)).sum().to(torch.float32),
-            tf.abs().amax(),
-            tf.new_zeros(()),
-            tf.new_full((), float(tf.numel())),
-        ]))
+        torch.stack(
+            [
+                (~torch.isfinite(tf)).sum().to(torch.float32),
+                tf.abs().amax(),
+                tf.new_zeros(()),
+                tf.new_full((), float(tf.numel())),
+            ]
+        )
+    )
 
 
 # ===========================================================================
@@ -322,8 +353,7 @@ def _ink_fp_stat(slot: torch.Tensor, t: torch.Tensor,
 #                                      (sl==1 there too), which made its NO_LEAD
 #                                      invalid (iter-90 confound analysis).
 # Toggles are env-gated and BYTE-UNCHANGED when ``INKLING_B2_FIX`` is unset.
-_B2_FIX_NAMES = ("zero_kvpool", "persist_out", "full_meta", "sync_meta",
-                 "pad_scatter")
+_B2_FIX_NAMES = ("zero_kvpool", "persist_out", "full_meta", "sync_meta", "pad_scatter")
 
 
 def _b2_fix_active(name: str) -> bool:
@@ -336,9 +366,9 @@ def _b2_fix_active(name: str) -> bool:
     return name in v.split(",")
 
 
-def _ink_report_divergence(num_layers: int, dsink: dict,
-                           inputs_embeds: torch.Tensor,
-                           out: torch.Tensor) -> None:
+def _ink_report_divergence(
+    num_layers: int, dsink: dict, inputs_embeds: torch.Tensor, out: torch.Tensor
+) -> None:
     """Print the first (step, layer, sub-op) where identical decode rows fork.
 
     ``dsink[i]`` holds per-sub-op row divergences for layer ``i`` (see
@@ -371,38 +401,56 @@ def _ink_report_divergence(num_layers: int, dsink: dict,
         if rec is not None and any(v > 0.0 for v in rec["pre_state"]):
             state_first = i
             break
-    op_str = ("L%d/%s=%.2e" % (first[0], first[1], first[2][first[1]])
-              if first else "none")
+    op_str = "L%d/%s=%.2e" % (first[0], first[1], first[2][first[1]]) if first else "none"
     if step <= 80 or final_d > 0.0:
-        print("INKLING_DIVERGE_TRACE step=%d nrows=%d d_embed=%.3e final_d=%.3e "
-              "state_first=%s op_first=%s"
-              % (step, out.shape[0], d_embed, final_d,
-                 ("L%d" % state_first) if state_first is not None else "none",
-                 op_str),
-              flush=True)
+        print(
+            "INKLING_DIVERGE_TRACE step=%d nrows=%d d_embed=%.3e final_d=%.3e "
+            "state_first=%s op_first=%s"
+            % (
+                step,
+                out.shape[0],
+                d_embed,
+                final_d,
+                ("L%d" % state_first) if state_first is not None else "none",
+                op_str,
+            ),
+            flush=True,
+        )
     if final_d > 0.0 and not _INK_DIVERGE["reported"]:
         _INK_DIVERGE["reported"] = True
         if first is not None:
             rec = first[2]
-            print("INKLING_DIVERGE_ONSET step=%d d_embed=%.3e final_d=%.3e "
-                  "first_layer=%d first_subop=%s d_in=%.3e attn_core=%.3e "
-                  "attn_sconv=%.3e mlp_core=%.3e mlp_sconv=%.3e pre_state=%s"
-                  % (step, d_embed, final_d, first[0], first[1], rec["d_in"],
-                     rec["attn_core"], rec["attn_sconv"], rec["mlp_core"],
-                     rec["mlp_sconv"],
-                     ",".join("%.2e" % v for v in rec["pre_state"])),
-                  flush=True)
+            print(
+                "INKLING_DIVERGE_ONSET step=%d d_embed=%.3e final_d=%.3e "
+                "first_layer=%d first_subop=%s d_in=%.3e attn_core=%.3e "
+                "attn_sconv=%.3e mlp_core=%.3e mlp_sconv=%.3e pre_state=%s"
+                % (
+                    step,
+                    d_embed,
+                    final_d,
+                    first[0],
+                    first[1],
+                    rec["d_in"],
+                    rec["attn_core"],
+                    rec["attn_sconv"],
+                    rec["mlp_core"],
+                    rec["mlp_sconv"],
+                    ",".join("%.2e" % v for v in rec["pre_state"]),
+                ),
+                flush=True,
+            )
         else:
-            print("INKLING_DIVERGE_ONSET step=%d d_embed=%.3e final_d=%.3e "
-                  "first_layer=-1 (final diverged but no per-layer sub-op did; "
-                  "final-norm / logits / gather path)"
-                  % (step, d_embed, final_d),
-                  flush=True)
+            print(
+                "INKLING_DIVERGE_ONSET step=%d d_embed=%.3e final_d=%.3e "
+                "first_layer=-1 (final diverged but no per-layer sub-op did; "
+                "final-norm / logits / gather path)" % (step, d_embed, final_d),
+                flush=True,
+            )
 
 
-def _ink_report_prefill(num_layers: int, dsink: dict,
-                        inputs_embeds: torch.Tensor, out: torch.Tensor,
-                        ctx) -> None:
+def _ink_report_prefill(
+    num_layers: int, dsink: dict, inputs_embeds: torch.Tensor, out: torch.Tensor, ctx
+) -> None:
     """Print the first (layer, sub-op) where identical PROMPTS diverge in prefill.
 
     The decode localizer (:func:`_ink_report_divergence`) only fires on pure
@@ -429,18 +477,28 @@ def _ink_report_prefill(num_layers: int, dsink: dict,
                 break
         if first is not None:
             break
-    op_str = ("L%d/%s=%.2e" % (first[0], first[1], first[2][first[1]])
-              if first else "none")
-    print("INKLING_PREFILL_DIVERGE num_req=%d seqlen=%d d_embed=%.3e final_d=%.3e "
-          "op_first=%s" % (num_req, seqlen, d_embed, final_d, op_str),
-          flush=True)
+    op_str = "L%d/%s=%.2e" % (first[0], first[1], first[2][first[1]]) if first else "none"
+    print(
+        "INKLING_PREFILL_DIVERGE num_req=%d seqlen=%d d_embed=%.3e final_d=%.3e "
+        "op_first=%s" % (num_req, seqlen, d_embed, final_d, op_str),
+        flush=True,
+    )
     if first is not None:
         rec = first[2]
-        print("INKLING_PREFILL_ONSET first_layer=%d first_subop=%s d_in=%.3e "
-              "attn_core=%.3e attn_sconv=%.3e mlp_core=%.3e mlp_sconv=%.3e"
-              % (first[0], first[1], rec["d_in"], rec["attn_core"],
-                 rec["attn_sconv"], rec["mlp_core"], rec["mlp_sconv"]),
-              flush=True)
+        print(
+            "INKLING_PREFILL_ONSET first_layer=%d first_subop=%s d_in=%.3e "
+            "attn_core=%.3e attn_sconv=%.3e mlp_core=%.3e mlp_sconv=%.3e"
+            % (
+                first[0],
+                first[1],
+                rec["d_in"],
+                rec["attn_core"],
+                rec["attn_sconv"],
+                rec["mlp_core"],
+                rec["mlp_sconv"],
+            ),
+            flush=True,
+        )
 
 
 class InklingConvStateCache:
@@ -472,11 +530,13 @@ class InklingConvStateCache:
     construction + TP=4 launch).
     """
 
-    def __init__(self,
-                 model_config: "ModelConfig[InklingTextConfig]",
-                 max_batch_size: int,
-                 device: torch.device,
-                 dtype: torch.dtype = torch.bfloat16):
+    def __init__(
+        self,
+        model_config: "ModelConfig[InklingTextConfig]",
+        max_batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
         # Accept either the text ``ModelConfig`` (runtime: InklingModel's own
         # config) or the top-level multimodal one (tests build from the full
         # checkpoint config); resolve to the text sub-config either way.
@@ -488,37 +548,28 @@ class InklingConvStateCache:
         self.kwin = kwin
 
         def buf(channels):
-            return torch.zeros(max_batch_size,
-                               channels,
-                               kwin,
-                               device=device,
-                               dtype=dtype)
+            return torch.zeros(max_batch_size, channels, kwin, device=device, dtype=dtype)
 
         self._layers: List[InklingConvState] = []
         for i in range(config.num_hidden_layers):
-            kv_dim = (config.layer_num_kv_heads(i) *
-                      config.layer_head_dim(i)) // tp_size
+            kv_dim = (config.layer_num_kv_heads(i) * config.layer_head_dim(i)) // tp_size
             hidden = config.hidden_size
             self._layers.append(
-                InklingConvState(k=buf(kv_dim),
-                                 v=buf(kv_dim),
-                                 attn=buf(hidden),
-                                 mlp=buf(hidden)))
+                InklingConvState(k=buf(kv_dim), v=buf(kv_dim), attn=buf(hidden), mlp=buf(hidden))
+            )
         # Stable per-request slot-index buffer (int32, CUDA). Refreshed in place
         # per forward -- EAGERLY, from input preparation, before CUDA-graph
         # capture/replay (see :meth:`write_state_indices`) -- so a captured
         # decode graph aliases it and every replay reads the current batch's
         # rows (Mamba2Metadata stable-pointer pattern).
-        self.state_indices = torch.arange(max_batch_size,
-                                          dtype=torch.int32,
-                                          device=device)
+        self.state_indices = torch.arange(max_batch_size, dtype=torch.int32, device=device)
         # Pinned host staging for that per-forward write: the eager input-prep
         # phase fills this and issues ONE async H2D copy into ``state_indices``.
         # Pinned so the copy is cheap and legal even under graph capture; kept in
         # lock-step size with ``state_indices`` across :meth:`_grow`.
-        self.state_indices_cpu = torch.zeros(max_batch_size,
-                                             dtype=torch.int32,
-                                             pin_memory=prefer_pinned())
+        self.state_indices_cpu = torch.zeros(
+            max_batch_size, dtype=torch.int32, pin_memory=prefer_pinned()
+        )
         self._slot_of = {}
         self._free = list(range(max_batch_size - 1, -1, -1))
 
@@ -581,28 +632,19 @@ class InklingConvStateCache:
         for i, st in enumerate(self._layers):
             grown = []
             for t in st:
-                buf = torch.zeros(new,
-                                  t.shape[1],
-                                  t.shape[2],
-                                  device=t.device,
-                                  dtype=t.dtype)
+                buf = torch.zeros(new, t.shape[1], t.shape[2], device=t.device, dtype=t.dtype)
                 buf[:old].copy_(t)
                 grown.append(buf)
             self._layers[i] = InklingConvState(*grown)
-        self.state_indices = torch.arange(new,
-                                          dtype=torch.int32,
-                                          device=self.state_indices.device)
+        self.state_indices = torch.arange(new, dtype=torch.int32, device=self.state_indices.device)
         # Keep the pinned host-staging buffer sized in lock-step, else the eager
         # H2D write in write_state_indices would index past its end.
-        self.state_indices_cpu = torch.zeros(new,
-                                             dtype=torch.int32,
-                                             pin_memory=prefer_pinned())
+        self.state_indices_cpu = torch.zeros(new, dtype=torch.int32, pin_memory=prefer_pinned())
         # New rows old..new-1 join the free list, popped ascending like __init__.
         self._free = list(range(new - 1, old - 1, -1)) + self._free
         self.max_batch_size = new
 
-    def write_state_indices(self, request_ids: List[int],
-                            is_graph: bool) -> List[int]:
+    def write_state_indices(self, request_ids: List[int], is_graph: bool) -> List[int]:
         """Resolve ``request_ids`` to pool rows and publish them into the stable
         ``state_indices`` CUDA buffer -- the EAGER, pre-capture slot write.
 
@@ -630,12 +672,11 @@ class InklingConvStateCache:
             raise RuntimeError(
                 "Inkling short-conv pool grew during CUDA graph capture/replay; "
                 "the pool must be sized to the max graph batch up front (a grown "
-                "pool strands the captured state_indices pointer).")
+                "pool strands the captured state_indices pointer)."
+            )
         n = len(slots)
-        self.state_indices_cpu[:n].copy_(torch.tensor(slots,
-                                                      dtype=torch.int32))
-        self.state_indices[:n].copy_(self.state_indices_cpu[:n],
-                                     non_blocking=True)
+        self.state_indices_cpu[:n].copy_(torch.tensor(slots, dtype=torch.int32))
+        self.state_indices[:n].copy_(self.state_indices_cpu[:n], non_blocking=True)
         return slots
 
     def free(self, request_ids: List[int]):
@@ -668,16 +709,17 @@ class InklingConvStateManager:
     through ``pyexecutor``).
     """
 
-    def __init__(self,
-                 model_config: "ModelConfig[InklingConfig]",
-                 max_batch_size: int,
-                 device: torch.device,
-                 dtype: torch.dtype = torch.bfloat16):
+    def __init__(
+        self,
+        model_config: "ModelConfig[InklingConfig]",
+        max_batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
         # +1 row for a CUDA-graph padding / dummy-request slot (mamba pattern):
         # padded decode batches admit up to max_batch_size real requests plus a
         # shared dummy row.
-        self.cache = InklingConvStateCache(model_config, max_batch_size + 1,
-                                           device, dtype)
+        self.cache = InklingConvStateCache(model_config, max_batch_size + 1, device, dtype)
         self.max_batch_size = max_batch_size
 
     # ---- BaseResourceManager duck-typed interface (container uses hasattr) ----
@@ -747,8 +789,7 @@ class InklingConvRuntime:
     has_initial_state: Optional[torch.Tensor]  # bool [n_ctx]
 
     @classmethod
-    def build(cls, attn_metadata,
-              cache: InklingConvStateCache) -> "InklingConvRuntime":
+    def build(cls, attn_metadata, cache: InklingConvStateCache) -> "InklingConvRuntime":
         """Eager entry point: publish this batch's slots, then build the split.
 
         Resolves the batch's request ids to pool rows and writes them into the
@@ -760,13 +801,13 @@ class InklingConvRuntime:
         the captured ``model.forward``.
         """
         is_graph = bool(getattr(attn_metadata, "is_cuda_graph", False))
-        slots = cache.write_state_indices(list(attn_metadata.request_ids),
-                                          is_graph)
+        slots = cache.write_state_indices(list(attn_metadata.request_ids), is_graph)
         return cls.from_metadata(attn_metadata, cache, slots)
 
     @classmethod
-    def from_metadata(cls, attn_metadata, cache: InklingConvStateCache,
-                      slots: List[int]) -> "InklingConvRuntime":
+    def from_metadata(
+        cls, attn_metadata, cache: InklingConvStateCache, slots: List[int]
+    ) -> "InklingConvRuntime":
         """Build the context/generation split from ALREADY-published pool rows.
 
         ``slots`` are the request-id -> pool-row assignments already written into
@@ -787,25 +828,26 @@ class InklingConvRuntime:
         device = state_indices.device
         num_ctx_tokens = sum(seq_lens[:num_contexts])
         ctx_indices = state_indices[:num_contexts] if num_contexts else None
-        gen_indices = (state_indices[num_contexts:len(slots)]
-                       if num_contexts < len(slots) else None)
+        gen_indices = (
+            state_indices[num_contexts : len(slots)] if num_contexts < len(slots) else None
+        )
         query_start_loc = has_initial_state = None
         if num_contexts:
             cu = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
-            cu[1:] = torch.tensor(seq_lens[:num_contexts],
-                                  dtype=torch.int32,
-                                  device=device).cumsum(0)
+            cu[1:] = torch.tensor(seq_lens[:num_contexts], dtype=torch.int32, device=device).cumsum(
+                0
+            )
             query_start_loc = cu
             # Fresh prefill carries no prior conv window (chunked-prefill reuse
             # would set this per request from cached-token counts).
-            has_initial_state = torch.zeros(num_contexts,
-                                            dtype=torch.bool,
-                                            device=device)
-        return cls(num_ctx_tokens=num_ctx_tokens,
-                   ctx_indices=ctx_indices,
-                   gen_indices=gen_indices,
-                   query_start_loc=query_start_loc,
-                   has_initial_state=has_initial_state)
+            has_initial_state = torch.zeros(num_contexts, dtype=torch.bool, device=device)
+        return cls(
+            num_ctx_tokens=num_ctx_tokens,
+            ctx_indices=ctx_indices,
+            gen_indices=gen_indices,
+            query_start_loc=query_start_loc,
+            has_initial_state=has_initial_state,
+        )
 
 
 def _resolve_conv_runtime(resource_manager, attn_metadata):
@@ -822,18 +864,20 @@ def _resolve_conv_runtime(resource_manager, attn_metadata):
     copy); this fallback only fires for eager, never-captured warmup paths that
     reach ``model.forward`` without the engine having pre-built the split.
     """
-    from tensorrt_llm._torch.pyexecutor.resource_manager import \
-        ResourceManagerType
-    mgr = resource_manager.get_resource_manager(
-        ResourceManagerType.CONV_STATE_MANAGER)
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+    mgr = resource_manager.get_resource_manager(ResourceManagerType.CONV_STATE_MANAGER)
     if mgr is None:
         return None, None
     return mgr.prepare_conv_runtime(attn_metadata)
 
 
-def _apply_sconv(sconv: "InklingShortConv", x: torch.Tensor,
-                 pool_buf: Optional[torch.Tensor],
-                 rt: Optional[InklingConvRuntime]) -> torch.Tensor:
+def _apply_sconv(
+    sconv: "InklingShortConv",
+    x: torch.Tensor,
+    pool_buf: Optional[torch.Tensor],
+    rt: Optional[InklingConvRuntime],
+) -> torch.Tensor:
     """Run one short-conv over a (possibly mixed) batch through the state pool.
 
     ``rt is None`` -> stateless full-sequence causal conv (focused replays).
@@ -849,18 +893,21 @@ def _apply_sconv(sconv: "InklingShortConv", x: torch.Tensor,
     nctx = rt.num_ctx_tokens
     if nctx > 0:
         parts.append(
-            sconv.forward(x[:nctx],
-                          conv_state=pool_buf,
-                          cache_indices=rt.ctx_indices,
-                          query_start_loc=rt.query_start_loc,
-                          has_initial_state=rt.has_initial_state,
-                          is_decode=False))
+            sconv.forward(
+                x[:nctx],
+                conv_state=pool_buf,
+                cache_indices=rt.ctx_indices,
+                query_start_loc=rt.query_start_loc,
+                has_initial_state=rt.has_initial_state,
+                is_decode=False,
+            )
+        )
     if x.shape[0] > nctx:
         parts.append(
-            sconv.forward(x[nctx:],
-                          conv_state=pool_buf,
-                          cache_indices=rt.gen_indices,
-                          is_decode=True))
+            sconv.forward(
+                x[nctx:], conv_state=pool_buf, cache_indices=rt.gen_indices, is_decode=True
+            )
+        )
     return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
 
 
@@ -877,8 +924,11 @@ def _module_excluded_from_quant(model_config: ModelConfig, name: str) -> bool:
     layer-2 routed experts (``.mlp.experts`` excluded) as bf16.
     """
     qc = model_config.quant_config
-    return (qc is not None and qc.exclude_modules is not None
-            and qc.is_module_excluded_from_quantization(name))
+    return (
+        qc is not None
+        and qc.exclude_modules is not None
+        and qc.is_module_excluded_from_quantization(name)
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -933,8 +983,15 @@ class InklingMoeRoutingMethod(BaseMoeRoutingMethod):
     shared-expert branch (see :func:`inkling_joint_renorm`).
     """
 
-    def __init__(self, top_k: int, num_experts: int, n_shared_experts: int,
-                 callable_gate_bias, callable_global_scale, route_scale: float):
+    def __init__(
+        self,
+        top_k: int,
+        num_experts: int,
+        n_shared_experts: int,
+        callable_gate_bias,
+        callable_global_scale,
+        route_scale: float,
+    ):
         super().__init__()
         self.top_k = top_k
         self.num_experts = num_experts
@@ -950,9 +1007,9 @@ class InklingMoeRoutingMethod(BaseMoeRoutingMethod):
         # behavior is unchanged.
         self._trtllm_backend = _inkling_trtllm_moe_backend()
 
-    def apply(self,
-              router_logits: torch.Tensor,
-              input_ids=None) -> tuple[torch.Tensor, torch.Tensor]:
+    def apply(
+        self, router_logits: torch.Tensor, input_ids=None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # router_logits: [num_tokens, num_experts + n_shared] in fp32.
         routed_w, topk_idx, _ = inkling_joint_renorm(
             router_logits.float(),
@@ -987,9 +1044,15 @@ class InklingMoeRoutingMethod(BaseMoeRoutingMethod):
         return self._trtllm_backend
 
 
-def inkling_joint_renorm(router_logits: torch.Tensor, gate_bias: torch.Tensor,
-                         global_scale: torch.Tensor, route_scale: float,
-                         top_k: int, num_routed: int, n_shared: int):
+def inkling_joint_renorm(
+    router_logits: torch.Tensor,
+    gate_bias: torch.Tensor,
+    global_scale: torch.Tensor,
+    route_scale: float,
+    top_k: int,
+    num_routed: int,
+    n_shared: int,
+):
     """Exact Inkling router math (fp32). Mirrors HF ``InklingTopkRouter``.
 
     Returns ``(routed_weights [T, top_k], topk_idx [T, top_k], shared_gammas
@@ -998,21 +1061,19 @@ def inkling_joint_renorm(router_logits: torch.Tensor, gate_bias: torch.Tensor,
     scaled by ``route_scale * global_scale``.
     """
     routed_logits = router_logits[..., :num_routed]
-    shared_logits = router_logits[..., num_routed:num_routed + n_shared]
+    shared_logits = router_logits[..., num_routed : num_routed + n_shared]
 
     scores = routed_logits.sigmoid()
     scores_for_choice = scores + gate_bias
     topk_idx = torch.topk(scores_for_choice, top_k, dim=-1, sorted=False)[1]
 
-    topk_logits = torch.cat([routed_logits.gather(-1, topk_idx), shared_logits],
-                            dim=-1)
+    topk_logits = torch.cat([routed_logits.gather(-1, topk_idx), shared_logits], dim=-1)
     topk_log_probs = torch.nn.functional.logsigmoid(topk_logits)
-    weights = torch.exp(topk_log_probs -
-                        torch.logsumexp(topk_log_probs, dim=-1, keepdim=True))
+    weights = torch.exp(topk_log_probs - torch.logsumexp(topk_log_probs, dim=-1, keepdim=True))
     weights = weights * route_scale * global_scale
 
     routed_weights = weights[..., :top_k].contiguous()
-    shared_gammas = weights[..., top_k:top_k + n_shared].contiguous()
+    shared_gammas = weights[..., top_k : top_k + n_shared].contiguous()
     return routed_weights, topk_idx, shared_gammas
 
 
@@ -1043,17 +1104,11 @@ class InklingShortConv(nn.Module):
     and are replicated (``tp_shard=False``).
     """
 
-    def __init__(self,
-                 channels: int,
-                 kernel_size: int,
-                 mapping=None,
-                 tp_shard: bool = False):
+    def __init__(self, channels: int, kernel_size: int, mapping=None, tp_shard: bool = False):
         super().__init__()
         self.kernel_size = kernel_size
-        self.tp_size = mapping.tp_size if (mapping is not None
-                                           and tp_shard) else 1
-        self.tp_rank = mapping.tp_rank if (mapping is not None
-                                           and tp_shard) else 0
+        self.tp_size = mapping.tp_size if (mapping is not None and tp_shard) else 1
+        self.tp_rank = mapping.tp_rank if (mapping is not None and tp_shard) else 0
         assert channels % self.tp_size == 0, (channels, self.tp_size)
         self.channels_full = channels
         # Local (this rank's) channel count -- what the forward actually sees.
@@ -1076,13 +1131,15 @@ class InklingShortConv(nn.Module):
             w = w.chunk(self.tp_size, dim=0)[self.tp_rank]
         self.weight.data.copy_(w[:])
 
-    def forward(self,
-                x: torch.Tensor,
-                conv_state: Optional[torch.Tensor] = None,
-                cache_indices: Optional[torch.Tensor] = None,
-                query_start_loc: Optional[torch.Tensor] = None,
-                has_initial_state: Optional[torch.Tensor] = None,
-                is_decode: bool = False) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        conv_state: Optional[torch.Tensor] = None,
+        cache_indices: Optional[torch.Tensor] = None,
+        query_start_loc: Optional[torch.Tensor] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
+        is_decode: bool = False,
+    ) -> torch.Tensor:
         """x: [num_tokens, channels]; internal residual ``y = conv(x) + x``.
 
         The stateless (no-cache) branch runs the conv in fp32 (per the source);
@@ -1106,37 +1163,42 @@ class InklingShortConv(nn.Module):
             # ``conv(x) + x``. (The prefill branch is safe: ``transpose().
             # contiguous()`` already copies. This decode-only aliasing was the
             # multi-step-decode K/V divergence.)
-            y = causal_conv1d_update(x.clone(),
-                                     conv_state,
-                                     w,
-                                     self.bias,
-                                     activation=None,
-                                     conv_state_indices=cache_indices)
+            y = causal_conv1d_update(
+                x.clone(),
+                conv_state,
+                w,
+                self.bias,
+                activation=None,
+                conv_state_indices=cache_indices,
+            )
         elif conv_state is not None:
             # Prefill with cache: varlen [channels, total_tokens].
             xt = x.transpose(0, 1).contiguous()
-            y = causal_conv1d_fn(xt,
-                                 w,
-                                 self.bias,
-                                 query_start_loc=query_start_loc,
-                                 cache_indices=cache_indices,
-                                 has_initial_state=has_initial_state,
-                                 conv_states=conv_state,
-                                 activation=None)
+            y = causal_conv1d_fn(
+                xt,
+                w,
+                self.bias,
+                query_start_loc=query_start_loc,
+                cache_indices=cache_indices,
+                has_initial_state=has_initial_state,
+                conv_states=conv_state,
+                activation=None,
+            )
             y = y.transpose(0, 1).contiguous()
         else:
             # No cache: self-contained causal depthwise conv over the sequence.
             xt = x.float().transpose(0, 1).unsqueeze(0)  # [1, channels, T]
-            y = torch.nn.functional.conv1d(xt,
-                                           self.weight.float(),
-                                           bias=None,
-                                           padding=self.kernel_size - 1,
-                                           groups=self.channels)
-            y = y[..., :x.shape[0]].squeeze(0).transpose(0, 1)
+            y = torch.nn.functional.conv1d(
+                xt,
+                self.weight.float(),
+                bias=None,
+                padding=self.kernel_size - 1,
+                groups=self.channels,
+            )
+            y = y[..., : x.shape[0]].squeeze(0).transpose(0, 1)
         return (y.to(in_dtype) + residual).to(in_dtype)
 
-    def forward_decode(self, x_new: torch.Tensor,
-                       conv_state: torch.Tensor) -> tuple:
+    def forward_decode(self, x_new: torch.Tensor, conv_state: torch.Tensor) -> tuple:
         """Single-step decode short conv with an explicit conv-state window.
 
         ``x_new`` is ``[num_req, channels]`` (one new token per request);
@@ -1154,9 +1216,7 @@ class InklingShortConv(nn.Module):
         """
         in_dtype = x_new.dtype
         w = self.weight.squeeze(1).float()  # [channels, K]
-        window = torch.cat([conv_state.float(),
-                            x_new.float().unsqueeze(-1)],
-                           dim=-1)  # [R,C,K]
+        window = torch.cat([conv_state.float(), x_new.float().unsqueeze(-1)], dim=-1)  # [R,C,K]
         y = (window * w.unsqueeze(0)).sum(dim=-1)  # [R, C]
         new_state = window[..., 1:].to(in_dtype)  # [R, C, K-1]
         return (y.to(in_dtype) + x_new).to(in_dtype), new_state
@@ -1230,12 +1290,11 @@ class InklingDecodeMeta:
                 f"InklingDecodeMeta(layer={self.layer_idx}) would grow its stable "
                 f"decode buffers during CUDA graph capture/replay (num_gen="
                 f"{num_gen} > cap={self.cap}); the buffers are sized to the "
-                f"scheduler batch, so this signals a capture-shape mismatch")
+                f"scheduler batch, so this signals a capture-shape mismatch"
+            )
         self.cap = max(num_gen, self.cap)
         self.seq_lens = torch.ones(self.cap, dtype=torch.int32, device=device)
-        self.page_table = torch.zeros((self.cap, self.max_pages),
-                                      dtype=torch.int32,
-                                      device=device)
+        self.page_table = torch.zeros((self.cap, self.max_pages), dtype=torch.int32, device=device)
 
     def _b2_fix_eager(self, device) -> None:
         """Apply the feedback #18 no-probe B2 candidates that must run EAGERLY (the
@@ -1254,14 +1313,19 @@ class InklingDecodeMeta:
         if _b2_fix_active("full_meta"):
             self.seq_lens.fill_(1)
             self.page_table.zero_()
-        if _b2_fix_active("persist_out") and self._owner is not None and (
-                self.out_buf is None or self.out_buf.shape[0] < self.cap):
+        if (
+            _b2_fix_active("persist_out")
+            and self._owner is not None
+            and (self.out_buf is None or self.out_buf.shape[0] < self.cap)
+        ):
             o = self._owner
-            self.out_buf = torch.zeros(self.cap,
-                                       o.local_num_heads,
-                                       o.head_dim,
-                                       dtype=o.qkv_proj.weight.dtype,
-                                       device=device)
+            self.out_buf = torch.zeros(
+                self.cap,
+                o.local_num_heads,
+                o.head_dim,
+                dtype=o.qkv_proj.weight.dtype,
+                device=device,
+            )
 
     def refresh(self, attn_metadata, device) -> bool:
         """Publish this batch's generation decode metadata into the stable
@@ -1276,8 +1340,7 @@ class InklingDecodeMeta:
         if num_gen <= 0:
             return False
         gen_ids = request_ids[num_contexts:]
-        num_cached = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[
-            num_contexts:]
+        num_cached = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[num_contexts:]
         # Host-side block table for THIS layer (per-pool). This is the SAME call
         # the previous host path made inside forward; relocating it here (eager,
         # outside any captured region) is what makes the copy legal.
@@ -1321,8 +1384,7 @@ class InklingDecodeMeta:
                 real_pages = set()
                 for j in range(num_gen):
                     if int(num_cached[j]) > 0:
-                        real_pages.update(int(b) for b in block_ids[j]
-                                          if int(b) >= 0)
+                        real_pages.update(int(b) for b in block_ids[j] if int(b) >= 0)
                 for p in range(self.num_pages - 1, -1, -1):
                     if p not in real_pages:
                         scratch_page = p
@@ -1332,9 +1394,7 @@ class InklingDecodeMeta:
         sl_host = torch.empty(num_gen, dtype=torch.int32, pin_memory=pin)
         for i in range(num_gen):
             sl_host[i] = int(num_cached[i]) + 1
-        pt_host = torch.zeros((num_gen, self.max_pages),
-                              dtype=torch.int32,
-                              pin_memory=pin)
+        pt_host = torch.zeros((num_gen, self.max_pages), dtype=torch.int32, pin_memory=pin)
         for i, blocks in enumerate(block_ids):
             # ``pad_scatter``: ``scratch_page`` is non-None only in a padded
             # CUDA-graph batch (is_graph and num_gen>1), so ``sl_host[i]==1`` here
@@ -1373,12 +1433,12 @@ class InklingDecodeMeta:
                 parts = []
                 for i in range(num_gen):
                     pgs = [int(b) for b in block_ids[i] if int(b) >= 0]
-                    parts.append(
-                        f"row{i}:id={gen_ids[i]!s} sl={int(sl_host[i])} pages={pgs}")
+                    parts.append(f"row{i}:id={gen_ids[i]!s} sl={int(sl_host[i])} pages={pgs}")
                 print(
                     f"INKLING_B2_DIAG layer=5 num_gen={num_gen} is_graph={is_graph} "
                     f"num_pages={self.num_pages} | " + " | ".join(parts),
-                    flush=True)
+                    flush=True,
+                )
         self.seq_lens[:num_gen].copy_(sl_host, non_blocking=nb)
         self.page_table[:num_gen].copy_(pt_host, non_blocking=nb)
         self.ready = True
@@ -1425,8 +1485,7 @@ class InklingAttention(QKNormRoPEAttention):
     (the KV-cache layer offset) is read here.
     """
 
-    def __init__(self, model_config: ModelConfig[InklingTextConfig],
-                 layer_idx: int):
+    def __init__(self, model_config: ModelConfig[InklingTextConfig], layer_idx: int):
         config = model_config.pretrained_config
         self.is_local = config.is_local_layer(layer_idx)
         head_dim = config.layer_head_dim(layer_idx)
@@ -1434,10 +1493,8 @@ class InklingAttention(QKNormRoPEAttention):
         num_kv_heads = config.layer_num_kv_heads(layer_idx)
         self.attention_window_size = config.layer_window(layer_idx)
         self.d_rel = config.d_rel
-        self.rel_extent = (config.sliding_window_size
-                           if self.is_local else config.rel_extent)
-        self.log_scaling_n_floor = (None if self.is_local else
-                                    config.log_scaling_n_floor)
+        self.rel_extent = config.sliding_window_size if self.is_local else config.rel_extent
+        self.log_scaling_n_floor = None if self.is_local else config.log_scaling_n_floor
         self.log_scaling_alpha = config.log_scaling_alpha
 
         # Attention (q/k/v/o projections + KV cache) is bf16, not NVFP4: the
@@ -1450,9 +1507,9 @@ class InklingAttention(QKNormRoPEAttention):
         # (ModelConfig.__setattr__ whitelists ``quant_config`` for exactly this
         # per-module-quant override, so the shallow copy needs no unfreeze.)
         attn_model_config = model_config
-        if _module_excluded_from_quant(model_config,
-                                       f"model.llm.layers.{layer_idx}.attn"):
+        if _module_excluded_from_quant(model_config, f"model.llm.layers.{layer_idx}.attn"):
             from tensorrt_llm.models.modeling_utils import QuantConfig
+
             attn_model_config = copy.copy(model_config)
             attn_model_config.quant_config = QuantConfig()
 
@@ -1476,7 +1533,7 @@ class InklingAttention(QKNormRoPEAttention):
             # rather than 1/sqrt(head_dim). The backend uses
             # 1/(sqrt(head_dim) * q_scaling); q_scaling = sqrt(head_dim) yields
             # the required 1/head_dim.
-            q_scaling=float(head_dim)**0.5,
+            q_scaling=float(head_dim) ** 0.5,
             skip_rope=True,
             fuse_qk_norm_rope=False,
             is_qk_norm=True,
@@ -1491,8 +1548,7 @@ class InklingAttention(QKNormRoPEAttention):
         # sliding window is applied natively inside the kernel for local layers
         # (inclusive radius = window - 1: query p attends to keys [p-(w-1), p]).
         self.sm_scale = 1.0 / float(head_dim)
-        self.window_left = (self.attention_window_size -
-                            1) if self.is_local else -1
+        self.window_left = (self.attention_window_size - 1) if self.is_local else -1
 
         tp_size = model_config.mapping.tp_size
         # r projection: per-head relative states (num_heads * d_rel), sharded by
@@ -1511,20 +1567,17 @@ class InklingAttention(QKNormRoPEAttention):
         # sliding-window extent (512), global layers the full rel_extent (1024)
         # -- so the parameter must use ``self.rel_extent``, not the global
         # ``config.rel_extent`` (mismatch here is the 1024-vs-512 load crash).
-        self.rel_logits_proj = nn.Parameter(
-            torch.empty(self.d_rel, self.rel_extent))
+        self.rel_logits_proj = nn.Parameter(torch.empty(self.d_rel, self.rel_extent))
         # k/v short convs act on the k/v stream from the fused qkv projection,
         # so they are sharded by kv-head like that projection. Pass the FULL
         # channel count and let InklingShortConv slice this rank's block at load.
         full_kv_dim = num_kv_heads * head_dim
-        self.k_sconv = InklingShortConv(full_kv_dim,
-                                        config.sconv_kernel_size,
-                                        mapping=model_config.mapping,
-                                        tp_shard=True)
-        self.v_sconv = InklingShortConv(full_kv_dim,
-                                        config.sconv_kernel_size,
-                                        mapping=model_config.mapping,
-                                        tp_shard=True)
+        self.k_sconv = InklingShortConv(
+            full_kv_dim, config.sconv_kernel_size, mapping=model_config.mapping, tp_shard=True
+        )
+        self.v_sconv = InklingShortConv(
+            full_kv_dim, config.sconv_kernel_size, mapping=model_config.mapping, tp_shard=True
+        )
         self.local_num_heads = num_heads // tp_size
         # Stable GPU buffers for the CUDA-graph-safe runtime decode metadata,
         # refreshed eagerly (before capture/replay) by the model engine via
@@ -1538,11 +1591,7 @@ class InklingAttention(QKNormRoPEAttention):
         self._decode_meta._owner = self
         self._b2_kvpool_zeroed = False
 
-    def _project(self,
-                 hidden_states,
-                 conv_states,
-                 conv_pool_kv=None,
-                 conv_rt=None):
+    def _project(self, hidden_states, conv_states, conv_pool_kv=None, conv_rt=None):
         """Fused qkv projection -> split -> k/v short-conv -> per-head qk RMSNorm.
 
         Returns ``(q, k, v, new_kv_state)`` with q/k/v shaped
@@ -1582,12 +1631,16 @@ class InklingAttention(QKNormRoPEAttention):
         q, k = self.apply_qk_norm(q, k)
         nh = self.q_size // D
         nkv = self.kv_size // D
-        return (q.view(num_tokens, nh,
-                       D), k.view(num_tokens, nkv,
-                                  D), v.view(num_tokens, nkv, D), new_kv_state)
+        return (
+            q.view(num_tokens, nh, D),
+            k.view(num_tokens, nkv, D),
+            v.view(num_tokens, nkv, D),
+            new_kv_state,
+        )
 
-    def _build_rel_logits(self, hidden_states: torch.Tensor,
-                          position_ids: Optional[torch.Tensor]) -> torch.Tensor:
+    def _build_rel_logits(
+        self, hidden_states: torch.Tensor, position_ids: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         """Contiguous relative-bias aux tensor ``[T, local_heads, rel_extent]``.
 
         ``rel_logits[t, h, e] = sum_d r[t, h, d] * proj[d, e]`` (fp32), mirroring
@@ -1597,10 +1650,10 @@ class InklingAttention(QKNormRoPEAttention):
         Triton kernels index this by ``clamp(q_pos-k_pos, 0, rel_extent-1)`` and
         zero it outside ``[0, rel_extent)`` -- the exact source score_mod.
         """
-        r = self.r_proj(hidden_states).view(-1, self.local_num_heads,
-                                            self.d_rel)
-        rel = torch.einsum("thd,de->the", r.float(),
-                           self.rel_logits_proj.float())  # [T, H, rel_extent]
+        r = self.r_proj(hidden_states).view(-1, self.local_num_heads, self.d_rel)
+        rel = torch.einsum(
+            "thd,de->the", r.float(), self.rel_logits_proj.float()
+        )  # [T, H, rel_extent]
         # DIAGNOSTIC ablation (env-gated, default OFF -> production byte-unchanged):
         # INKLING_ABLATE_RELBIAS=1 zeros the learned relative-position bias so the
         # attention runs on the core QK/PV path alone. Used by the iter90 MMLU
@@ -1611,21 +1664,24 @@ class InklingAttention(QKNormRoPEAttention):
         if self.log_scaling_n_floor is not None and position_ids is not None:
             pos = position_ids.reshape(-1).float()
             tau = 1.0 + self.log_scaling_alpha * torch.log(
-                ((pos + 1.0) / self.log_scaling_n_floor).clamp(min=1.0))
+                ((pos + 1.0) / self.log_scaling_n_floor).clamp(min=1.0)
+            )
             rel = rel * tau[:, None, None]
         return rel.contiguous()
 
-    def _attention(self,
-                   q,
-                   k,
-                   v,
-                   rel_logits,
-                   attn_metadata,
-                   *,
-                   decode_seq_lens,
-                   decode_page_table,
-                   skip_kv_write,
-                   allow_mixed=False):
+    def _attention(
+        self,
+        q,
+        k,
+        v,
+        rel_logits,
+        attn_metadata,
+        *,
+        decode_seq_lens,
+        decode_page_table,
+        skip_kv_write,
+        allow_mixed=False,
+    ):
         """Dispatch prefill / decode over the paged cache, supporting mixed
         context+generation batches.
 
@@ -1645,8 +1701,7 @@ class InklingAttention(QKNormRoPEAttention):
         # the base attention forward, which Inkling bypasses, so it stays ``None``
         # at real runtime (the focused replays set it by hand, masking this).
         cache_layer = self.layer_idx
-        kv = attn_metadata.kv_cache_manager.get_buffers(cache_layer,
-                                                        kv_layout="HND")
+        kv = attn_metadata.kv_cache_manager.get_buffers(cache_layer, kv_layout="HND")
         # kv: [num_pages, 2, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = kv[:, 0], kv[:, 1]
         page_size = kv.shape[3]
@@ -1666,8 +1721,7 @@ class InklingAttention(QKNormRoPEAttention):
         # first prefill / KV-estimation forward, never under decode-graph capture),
         # so it cannot wipe a live request's cache. Diagnostic-only (the single-
         # request B2 repro); default-off, production byte-unchanged.
-        if (num_contexts > 0 and not self._b2_kvpool_zeroed
-                and _b2_fix_active("zero_kvpool")):
+        if num_contexts > 0 and not self._b2_kvpool_zeroed and _b2_fix_active("zero_kvpool"):
             kv.zero_()
             self._b2_kvpool_zeroed = True
 
@@ -1684,52 +1738,105 @@ class InklingAttention(QKNormRoPEAttention):
             raise NotImplementedError(
                 "InklingAttention: mixed context+generation batch needs the "
                 "short-conv state pool (pass conv_cache/conv_rt); the stateless "
-                "and explicit-window short-conv paths cannot mix a batch")
+                "and explicit-window short-conv paths cannot mix a batch"
+            )
 
         outs = []
         if num_contexts > 0:
             outs.append(
-                self._run_context(q[:ctx_tokens], k[:ctx_tokens],
-                                  v[:ctx_tokens], rel_logits[:ctx_tokens],
-                                  seq_lens[:num_contexts],
-                                  num_cached[:num_contexts],
-                                  request_ids[:num_contexts], mgr, cache_layer,
-                                  k_cache, v_cache, page_size, skip_kv_write))
+                self._run_context(
+                    q[:ctx_tokens],
+                    k[:ctx_tokens],
+                    v[:ctx_tokens],
+                    rel_logits[:ctx_tokens],
+                    seq_lens[:num_contexts],
+                    num_cached[:num_contexts],
+                    request_ids[:num_contexts],
+                    mgr,
+                    cache_layer,
+                    k_cache,
+                    v_cache,
+                    page_size,
+                    skip_kv_write,
+                )
+            )
         if num_contexts < num_seqs:
             outs.append(
-                self._run_generation(q[ctx_tokens:], k[ctx_tokens:],
-                                     v[ctx_tokens:], rel_logits[ctx_tokens:],
-                                     num_cached[num_contexts:],
-                                     request_ids[num_contexts:], mgr,
-                                     cache_layer, k_cache, v_cache, page_size,
-                                     decode_seq_lens, decode_page_table,
-                                     skip_kv_write))
+                self._run_generation(
+                    q[ctx_tokens:],
+                    k[ctx_tokens:],
+                    v[ctx_tokens:],
+                    rel_logits[ctx_tokens:],
+                    num_cached[num_contexts:],
+                    request_ids[num_contexts:],
+                    mgr,
+                    cache_layer,
+                    k_cache,
+                    v_cache,
+                    page_size,
+                    decode_seq_lens,
+                    decode_page_table,
+                    skip_kv_write,
+                )
+            )
         return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
 
-    def _run_context(self, q, k, v, rel_logits, seq_lens, num_cached,
-                     request_ids, mgr, cache_layer, k_cache, v_cache, page_size,
-                     skip_kv_write):
+    def _run_context(
+        self,
+        q,
+        k,
+        v,
+        rel_logits,
+        seq_lens,
+        num_cached,
+        request_ids,
+        mgr,
+        cache_layer,
+        k_cache,
+        v_cache,
+        page_size,
+        skip_kv_write,
+    ):
         device = q.device
         # Persist new K/V to the paged cache for later generation reuse.
         if not skip_kv_write:
             block_ids = mgr.get_batch_cache_indices(request_ids, cache_layer)
             off = 0
             for i, sl in enumerate(seq_lens):
-                write_kv_cache_hnd(k_cache, v_cache, k[off:off + sl],
-                                   v[off:off + sl], block_ids[i],
-                                   int(num_cached[i]), page_size)
+                write_kv_cache_hnd(
+                    k_cache,
+                    v_cache,
+                    k[off : off + sl],
+                    v[off : off + sl],
+                    block_ids[i],
+                    int(num_cached[i]),
+                    page_size,
+                )
                 off += sl
         cu = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
-        cu[1:] = torch.tensor(seq_lens, dtype=torch.int32,
-                              device=device).cumsum(0)
+        cu[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=device).cumsum(0)
         max_seqlen = max(seq_lens)
-        return inkling_prefill_attention(q, k, v, cu, max_seqlen, self.sm_scale,
-                                         rel_logits, self.rel_extent,
-                                         self.window_left)
+        return inkling_prefill_attention(
+            q, k, v, cu, max_seqlen, self.sm_scale, rel_logits, self.rel_extent, self.window_left
+        )
 
-    def _run_generation(self, q, k, v, rel_logits, num_cached, request_ids, mgr,
-                        cache_layer, k_cache, v_cache, page_size,
-                        decode_seq_lens, decode_page_table, skip_kv_write):
+    def _run_generation(
+        self,
+        q,
+        k,
+        v,
+        rel_logits,
+        num_cached,
+        request_ids,
+        mgr,
+        cache_layer,
+        k_cache,
+        v_cache,
+        page_size,
+        decode_seq_lens,
+        decode_page_table,
+        skip_kv_write,
+    ):
         device = q.device
         # --- Runtime CUDA-graph-safe path. ---------------------------------
         # When the model engine has eagerly published this batch's decode
@@ -1764,55 +1871,78 @@ class InklingAttention(QKNormRoPEAttention):
             # ``torch.empty_like`` output whose address moves with the CUDA-graph
             # pool layout -- the exact Heisenbug knob. ``None`` -> production path
             # (fresh output), byte-unchanged when the toggle is off.
-            ob = (meta.out_buf[:num_req]
-                  if (meta.out_buf is not None
-                      and _b2_fix_active("persist_out")) else None)
-            return inkling_decode_attention(q, k_cache, v_cache, sl, pt,
-                                            page_size, self.sm_scale, rel_logits,
-                                            self.rel_extent, self.window_left,
-                                            out=ob)
+            ob = (
+                meta.out_buf[:num_req]
+                if (meta.out_buf is not None and _b2_fix_active("persist_out"))
+                else None
+            )
+            return inkling_decode_attention(
+                q,
+                k_cache,
+                v_cache,
+                sl,
+                pt,
+                page_size,
+                self.sm_scale,
+                rel_logits,
+                self.rel_extent,
+                self.window_left,
+                out=ob,
+            )
         # The write and the ragged->dense block-id work are host-side; under
         # CUDA-graph replay ``skip_kv_write`` is set and static ``decode_*``
         # tensors are supplied, so this whole block is skipped and only GPU ops
         # (projection, einsum, decode kernel, o_proj) enter the captured graph.
-        if (not skip_kv_write) or decode_seq_lens is None \
-                or decode_page_table is None:
+        if (not skip_kv_write) or decode_seq_lens is None or decode_page_table is None:
             num_req = len(request_ids)
             block_ids = mgr.get_batch_cache_indices(request_ids, cache_layer)
             if not skip_kv_write:
                 for i in range(num_req):
-                    write_kv_cache_hnd(k_cache, v_cache, k[i:i + 1],
-                                       v[i:i + 1], block_ids[i],
-                                       int(num_cached[i]), page_size)
+                    write_kv_cache_hnd(
+                        k_cache,
+                        v_cache,
+                        k[i : i + 1],
+                        v[i : i + 1],
+                        block_ids[i],
+                        int(num_cached[i]),
+                        page_size,
+                    )
             if decode_seq_lens is None:
                 total = [int(num_cached[i]) + 1 for i in range(num_req)]
-                decode_seq_lens = torch.tensor(total,
-                                               dtype=torch.int32,
-                                               device=device)
+                decode_seq_lens = torch.tensor(total, dtype=torch.int32, device=device)
             if decode_page_table is None:
                 max_pages = max(len(b) for b in block_ids)
-                decode_page_table = build_page_table(block_ids, max_pages,
-                                                     device)
-        return inkling_decode_attention(q, k_cache, v_cache, decode_seq_lens,
-                                        decode_page_table, page_size,
-                                        self.sm_scale, rel_logits,
-                                        self.rel_extent, self.window_left)
+                decode_page_table = build_page_table(block_ids, max_pages, device)
+        return inkling_decode_attention(
+            q,
+            k_cache,
+            v_cache,
+            decode_seq_lens,
+            decode_page_table,
+            page_size,
+            self.sm_scale,
+            rel_logits,
+            self.rel_extent,
+            self.window_left,
+        )
 
-    def forward(self,
-                position_ids: Optional[torch.IntTensor],
-                hidden_states: torch.Tensor,
-                attn_metadata: AttentionMetadata,
-                *,
-                conv_states=None,
-                conv_pool_kv=None,
-                conv_rt=None,
-                decode_seq_lens=None,
-                decode_page_table=None,
-                skip_kv_write: bool = False,
-                return_conv_state: bool = False,
-                ops_fp: Optional[torch.Tensor] = None,
-                ops_scratch: Optional[torch.Tensor] = None,
-                **kwargs):
+    def forward(
+        self,
+        position_ids: Optional[torch.IntTensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        *,
+        conv_states=None,
+        conv_pool_kv=None,
+        conv_rt=None,
+        decode_seq_lens=None,
+        decode_page_table=None,
+        skip_kv_write: bool = False,
+        return_conv_state: bool = False,
+        ops_fp: Optional[torch.Tensor] = None,
+        ops_scratch: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
         """Inkling attention through the Triton score_mod path.
 
         Short-conv path (priority): ``conv_pool_kv=(pool_k, pool_v)`` + ``conv_rt``
@@ -1834,8 +1964,7 @@ class InklingAttention(QKNormRoPEAttention):
         # norm's output dtype -- the isolated crit4 replay fed a pre-cast bf16
         # tensor, which hid this until the stacked forward / runtime.
         hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
-        q, k, v, new_kv_state = self._project(hidden_states, conv_states,
-                                              conv_pool_kv, conv_rt)
+        q, k, v, new_kv_state = self._project(hidden_states, conv_states, conv_pool_kv, conv_rt)
         # feedback #17 op-level B2 bisection -- walk INTO the global-attention
         # kernel. q/k/v (post qkv-proj + kv-sconv + qk-norm) and rel_logits are
         # the paged-decode kernel's INPUTS; if they are finite but attn_kernel is
@@ -1849,15 +1978,17 @@ class InklingAttention(QKNormRoPEAttention):
         rel_logits = self._build_rel_logits(hidden_states, position_ids)
         if ops_fp is not None:
             _ink_fp_stat(ops_fp[4], rel_logits[-1], ops_scratch)  # attn_rel
-        attn_out = self._attention(q,
-                                   k,
-                                   v,
-                                   rel_logits,
-                                   attn_metadata,
-                                   decode_seq_lens=decode_seq_lens,
-                                   decode_page_table=decode_page_table,
-                                   skip_kv_write=skip_kv_write,
-                                   allow_mixed=conv_rt is not None)
+        attn_out = self._attention(
+            q,
+            k,
+            v,
+            rel_logits,
+            attn_metadata,
+            decode_seq_lens=decode_seq_lens,
+            decode_page_table=decode_page_table,
+            skip_kv_write=skip_kv_write,
+            allow_mixed=conv_rt is not None,
+        )
         attn_out = attn_out.reshape(num_tokens, self.q_size)
         if ops_fp is not None:
             # attn_kernel = softmax/PV/KV-page-read output (pre out-proj).
@@ -1900,7 +2031,8 @@ class InklingDenseMLP(nn.Module):
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             weights_loading_config=WeightsLoadingConfig(
-                weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
+                weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
+            ),
         )
         self.down_proj = Linear(
             inter,
@@ -1935,10 +2067,8 @@ class InklingGate(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.route_scale = config.route_scale
         n_total = self.num_routed + self.n_shared
-        self.weight = nn.Parameter(
-            torch.empty(n_total, config.hidden_size, dtype=torch.float32))
-        self.bias = nn.Parameter(
-            torch.empty(self.num_routed, dtype=torch.float32))
+        self.weight = nn.Parameter(torch.empty(n_total, config.hidden_size, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.empty(self.num_routed, dtype=torch.float32))
         self.global_scale = nn.Parameter(torch.ones(1, dtype=torch.float32))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1973,16 +2103,14 @@ class InklingSharedExperts(nn.Module):
         # dtype-mismatches the bmm ("expected BFloat16 but found Float"). The
         # checkpoint stores these bf16 (shared_experts is in exclude_modules).
         self.shared_w13 = nn.Parameter(
-            torch.empty(self.n_shared,
-                        2 * inter,
-                        hidden,
-                        dtype=config.torch_dtype))
+            torch.empty(self.n_shared, 2 * inter, hidden, dtype=config.torch_dtype)
+        )
         self.shared_w2 = nn.Parameter(
-            torch.empty(self.n_shared, hidden, inter, dtype=config.torch_dtype))
+            torch.empty(self.n_shared, hidden, inter, dtype=config.torch_dtype)
+        )
         self.act_fn = torch.nn.functional.silu
 
-    def forward(self, hidden_states: torch.Tensor,
-                gammas: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, gammas: torch.Tensor) -> torch.Tensor:
         # hidden_states: [T, hidden] (bf16); gammas: [T, n_shared] fp32 (from the
         # joint renorm). Keep both bmms in the activation dtype and apply the
         # per-token gamma in fp32 AFTER the (linear) down projection, where it
@@ -1999,8 +2127,7 @@ class InklingSharedExperts(nn.Module):
         # contiguous chunk(2) here would pair the wrong channels (silu(mix)*mix).
         gate, up = gate_up[..., 0::2], gate_up[..., 1::2]
         activated = self.act_fn(gate) * up
-        out = torch.bmm(activated,
-                        self.shared_w2.transpose(1, 2))  # [S, T, hidden]
+        out = torch.bmm(activated, self.shared_w2.transpose(1, 2))  # [S, T, hidden]
         out = out.float() * gammas.transpose(0, 1).unsqueeze(-1).float()
         return out.sum(dim=0).to(hidden_states.dtype)
 
@@ -2014,8 +2141,7 @@ class InklingMoE(nn.Module):
     gamma-weighted shared output is added on top (source ``h + shared``).
     """
 
-    def __init__(self, model_config: ModelConfig[InklingTextConfig],
-                 layer_idx: int):
+    def __init__(self, model_config: ModelConfig[InklingTextConfig], layer_idx: int):
         super().__init__()
         config = model_config.pretrained_config
         self.gate = InklingGate(config)
@@ -2024,8 +2150,7 @@ class InklingMoE(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.route_scale = config.route_scale
 
-        experts_quant_config = self._experts_quant_config(
-            model_config, layer_idx)
+        experts_quant_config = self._experts_quant_config(model_config, layer_idx)
         # reduce_results=True: all-reduce the routed-expert output across the TP
         # group. Under TP each rank holds a shard of the 256 experts and produces
         # only a PARTIAL routed sum, so the full routed output is the sum across
@@ -2084,7 +2209,8 @@ class InklingMoE(nn.Module):
             f"experts_cls={type(self.experts).__name__} "
             f"backend_cls={backend_cls} "
             f"routing_type={self.gate.routing_method.routing_method_type.name} "
-            f"separated={self.gate.routing_method.requires_separated_routing}")
+            f"separated={self.gate.routing_method.requires_separated_routing}"
+        )
         self.shared_experts = InklingSharedExperts(config)
 
     @staticmethod
@@ -2102,9 +2228,9 @@ class InklingMoE(nn.Module):
         so ``create_moe`` builds an unquantized bf16 MoE; otherwise the NVFP4
         base config.
         """
-        if _module_excluded_from_quant(
-                model_config, f"model.llm.layers.{layer_idx}.mlp.experts"):
+        if _module_excluded_from_quant(model_config, f"model.llm.layers.{layer_idx}.mlp.experts"):
             from tensorrt_llm.models.modeling_utils import QuantConfig
+
             return QuantConfig()
         return model_config.quant_config
 
@@ -2134,39 +2260,38 @@ class InklingDecoderLayer(nn.Module):
     residual, then the residual add (HF ``InklingDecoderLayer`` order).
     """
 
-    def __init__(self, model_config: ModelConfig[InklingTextConfig],
-                 layer_idx: int):
+    def __init__(self, model_config: ModelConfig[InklingTextConfig], layer_idx: int):
         super().__init__()
         config = model_config.pretrained_config
         self.layer_idx = layer_idx
-        self.attn_norm = RMSNorm(hidden_size=config.hidden_size,
-                                 eps=config.rms_norm_eps,
-                                 dtype=config.torch_dtype)
+        self.attn_norm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
         self.attn = InklingAttention(model_config, layer_idx)
-        self.attn_sconv = InklingShortConv(config.hidden_size,
-                                           config.sconv_kernel_size)
-        self.mlp_norm = RMSNorm(hidden_size=config.hidden_size,
-                                eps=config.rms_norm_eps,
-                                dtype=config.torch_dtype)
+        self.attn_sconv = InklingShortConv(config.hidden_size, config.sconv_kernel_size)
+        self.mlp_norm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
         if config.is_dense_layer(layer_idx):
             self.mlp = InklingDenseMLP(model_config)
         else:
             self.mlp = InklingMoE(model_config, layer_idx)
-        self.mlp_sconv = InklingShortConv(config.hidden_size,
-                                          config.sconv_kernel_size)
+        self.mlp_sconv = InklingShortConv(config.hidden_size, config.sconv_kernel_size)
 
-    def forward(self,
-                position_ids: torch.IntTensor,
-                hidden_states: torch.Tensor,
-                attn_metadata: AttentionMetadata,
-                *,
-                conv_state: Optional[InklingConvState] = None,
-                conv_rt: Optional[InklingConvRuntime] = None,
-                dump_sink: Optional[dict] = None,
-                diverge_sink: Optional[dict] = None,
-                ops_fp: Optional[torch.Tensor] = None,
-                ops_scratch: Optional[torch.Tensor] = None,
-                **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        *,
+        conv_state: Optional[InklingConvState] = None,
+        conv_rt: Optional[InklingConvRuntime] = None,
+        dump_sink: Optional[dict] = None,
+        diverge_sink: Optional[dict] = None,
+        ops_fp: Optional[torch.Tensor] = None,
+        ops_scratch: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
         """Pre-norm attention + MLP, each followed by a short-conv (internal
         residual), then the residual add.
 
@@ -2200,10 +2325,12 @@ class InklingDecoderLayer(nn.Module):
             # divergence THIS step (non-determinism / divergent KV read).
             if diverge_sink is not None and conv_rt.gen_indices is not None:
                 gi = conv_rt.gen_indices
-                pre_state = (_ink_rowdiff(conv_state.k[gi]),
-                             _ink_rowdiff(conv_state.v[gi]),
-                             _ink_rowdiff(conv_state.attn[gi]),
-                             _ink_rowdiff(conv_state.mlp[gi]))
+                pre_state = (
+                    _ink_rowdiff(conv_state.k[gi]),
+                    _ink_rowdiff(conv_state.v[gi]),
+                    _ink_rowdiff(conv_state.attn[gi]),
+                    _ink_rowdiff(conv_state.mlp[gi]),
+                )
             else:
                 pre_state = (0.0, 0.0, 0.0, 0.0)
 
@@ -2221,17 +2348,18 @@ class InklingDecoderLayer(nn.Module):
             # inkling_fp_ops_analyze.py.
             if ops_fp is not None:
                 _ink_fp_stat(ops_fp[0], h[-1], ops_scratch)  # attn_norm
-            h_core = self.attn(position_ids,
-                               h,
-                               attn_metadata,
-                               conv_pool_kv=(conv_state.k, conv_state.v),
-                               conv_rt=conv_rt,
-                               ops_fp=ops_fp,
-                               ops_scratch=ops_scratch,
-                               **kwargs)
+            h_core = self.attn(
+                position_ids,
+                h,
+                attn_metadata,
+                conv_pool_kv=(conv_state.k, conv_state.v),
+                conv_rt=conv_rt,
+                ops_fp=ops_fp,
+                ops_scratch=ops_scratch,
+                **kwargs,
+            )
             # (h_core == o_proj_out, written as ops_fp[7] inside self.attn.)
-            h_asc = _apply_sconv(self.attn_sconv, h_core, conv_state.attn,
-                                 conv_rt)
+            h_asc = _apply_sconv(self.attn_sconv, h_core, conv_state.attn, conv_rt)
             if ops_fp is not None:
                 _ink_fp_stat(ops_fp[8], h_asc[-1], ops_scratch)  # attn_sconv
             h = residual + h_asc
@@ -2291,8 +2419,8 @@ class InklingDecoderLayer(nn.Module):
                         )
                         dump_sink["router_logits"] = _pick(_rl)
                         dump_sink["topk_idx"] = (
-                            _ti[-1] if _ap else _ti).detach().to(
-                                torch.int32).cpu()
+                            (_ti[-1] if _ap else _ti).detach().to(torch.int32).cpu()
+                        )
                         dump_sink["routed_w"] = _pick(_rw)
             hm = _apply_sconv(self.mlp_sconv, hmlp, conv_state.mlp, conv_rt)
             # op 12 (mlp_sconv) intentionally not fingerprinted (see the mlp-side
@@ -2300,8 +2428,8 @@ class InklingDecoderLayer(nn.Module):
             if dump_sink is not None and dump_sink.get("_finegrain"):
                 # point 6: mlp short-conv output (computed after the dump block).
                 dump_sink["mlp_sconv"] = (
-                    hm[-1] if dump_sink.get("_answer_pos_only") else hm
-                ).detach().float().cpu()
+                    (hm[-1] if dump_sink.get("_answer_pos_only") else hm).detach().float().cpu()
+                )
             out = residual + hm
             if diverge_sink is not None:
                 # Per-sub-op row divergence (identical requests -> must be 0.0).
@@ -2328,23 +2456,25 @@ class InklingDecoderLayer(nn.Module):
             # pins the context-phase MoE (layers >=2) as the non-deterministic op,
             # while the dense MLP (layers 0/1) must stay 0.0. Zero cost when unset.
             import os as _os_rr
-            if (_os_rr.environ.get("INKLING_PREFILL_RERUN")
-                    and getattr(conv_rt, "num_ctx_tokens", 0) > 0
-                    and conv_rt.gen_indices is None
-                    and self.layer_idx in (0, 1, 2, 3, 4, 5)):
+
+            if (
+                _os_rr.environ.get("INKLING_PREFILL_RERUN")
+                and getattr(conv_rt, "num_ctx_tokens", 0) > 0
+                and conv_rt.gen_indices is None
+                and self.layer_idx in (0, 1, 2, 3, 4, 5)
+            ):
                 _hmlp2 = self.mlp(hn)
-                _d = (hmlp.detach().float()
-                      - _hmlp2.detach().float()).abs().max().item()
-                print("INKLING_MOE_RERUN layer=%d ntok=%d d=%.3e" %
-                      (self.layer_idx, hn.shape[0], _d),
-                      flush=True)
+                _d = (hmlp.detach().float() - _hmlp2.detach().float()).abs().max().item()
+                print(
+                    "INKLING_MOE_RERUN layer=%d ntok=%d d=%.3e" % (self.layer_idx, hn.shape[0], _d),
+                    flush=True,
+                )
             return out
 
         if conv_state is None:
             residual = hidden_states
             hidden_states = self.attn_norm(hidden_states)
-            hidden_states = self.attn(position_ids, hidden_states,
-                                      attn_metadata)
+            hidden_states = self.attn(position_ids, hidden_states, attn_metadata)
             hidden_states = self.attn_sconv(hidden_states)  # internal residual
             hidden_states = residual + hidden_states
 
@@ -2358,12 +2488,14 @@ class InklingDecoderLayer(nn.Module):
         # --- Generation phase: carry all four short-conv states. ---
         residual = hidden_states
         h = self.attn_norm(hidden_states)
-        h, new_kv = self.attn(position_ids,
-                              h,
-                              attn_metadata,
-                              conv_states=(conv_state.k, conv_state.v),
-                              return_conv_state=True,
-                              **kwargs)
+        h, new_kv = self.attn(
+            position_ids,
+            h,
+            attn_metadata,
+            conv_states=(conv_state.k, conv_state.v),
+            return_conv_state=True,
+            **kwargs,
+        )
         # Roll the k/v short-conv windows forward in place for the next step.
         conv_state.k.copy_(new_kv[0])
         conv_state.v.copy_(new_kv[1])
@@ -2394,16 +2526,15 @@ class InklingModel(DecoderModel):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
         )
-        self.embed_norm = RMSNorm(hidden_size=config.hidden_size,
-                                  eps=config.rms_norm_eps,
-                                  dtype=config.torch_dtype)
-        self.layers = nn.ModuleList([
-            InklingDecoderLayer(model_config, i)
-            for i in range(config.num_hidden_layers)
-        ])
-        self.norm = RMSNorm(hidden_size=config.hidden_size,
-                            eps=config.rms_norm_eps,
-                            dtype=config.torch_dtype)
+        self.embed_norm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+        self.layers = nn.ModuleList(
+            [InklingDecoderLayer(model_config, i) for i in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
         # --- B2 CUDA-graph decode localizer (env INKLING_FP, zero cost off) ---
         # Capture-SAFE per-layer decode fingerprint: a persistent, stable-pointer
         # GPU buffer [num_layers+1, hidden_size] holding the last generation row's
@@ -2439,9 +2570,9 @@ class InklingModel(DecoderModel):
         if self._ink_fp is not None:
             return
         import os
+
         h = self.norm.weight.shape[0]
-        self._ink_fp = torch.zeros(len(self.layers) + 1, h,
-                                   dtype=torch.float32, device=device)
+        self._ink_fp = torch.zeros(len(self.layers) + 1, h, dtype=torch.float32, device=device)
         # feedback #17 op-level B2 bisection: per-layer intra-layer op boundaries
         # (N_INK_FP_OPS=13, walking attn_norm -> QK(q,k,v,rel) ->
         # softmax/PV/KV-page(attn_kernel) -> out-proj(o_proj_local) ->
@@ -2452,43 +2583,57 @@ class InklingModel(DecoderModel):
         # Allocated EAGERLY (pre-capture) like _ink_fp. Zero cost unless
         # INKLING_FP_OPS is set.
         if os.environ.get("INKLING_FP_OPS"):
-            self._ink_fp_ops = torch.zeros(len(self.layers), N_INK_FP_OPS,
-                                           _INK_FP_STAT_W, dtype=torch.float32,
-                                           device=device)
-            self._ink_fp_ops_maxlayer = int(
-                os.environ.get("INKLING_FP_OPS_MAXLAYER", "10000"))
+            self._ink_fp_ops = torch.zeros(
+                len(self.layers), N_INK_FP_OPS, _INK_FP_STAT_W, dtype=torch.float32, device=device
+            )
+            self._ink_fp_ops_maxlayer = int(os.environ.get("INKLING_FP_OPS_MAXLAYER", "10000"))
             # iter-79 ALLOCATION-FREE op fingerprint: a fp32 scratch sized well
             # above the largest probed op numel (global rel_logits[-1] =
             # local_heads*rel_extent <= 64*1024 at TP=1; hidden=6144; q<=8192).
             # 1<<17 (512 KiB) gives >=8x margin at TP=4 and is allocated EAGERLY
             # (pre-capture) like the buffers above, so ``_ink_fp_stat`` reuses it
             # with copy_/abs_/amax and allocates nothing numel-sized in-graph.
-            self._ink_fp_ops_scratch = torch.zeros(1 << 17, dtype=torch.float32,
-                                                   device=device)
+            self._ink_fp_ops_scratch = torch.zeros(1 << 17, dtype=torch.float32, device=device)
 
-    def forward(self,
-                attn_metadata: AttentionMetadata,
-                input_ids: Optional[torch.IntTensor] = None,
-                position_ids: Optional[torch.IntTensor] = None,
-                inputs_embeds: Optional[torch.Tensor] = None,
-                conv_cache: Optional[InklingConvStateCache] = None,
-                conv_rt: Optional[InklingConvRuntime] = None,
-                **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        conv_cache: Optional[InklingConvStateCache] = None,
+        conv_rt: Optional[InklingConvRuntime] = None,
+        inputs_embeds_prenormed: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
         """Decoder stack. ``conv_cache`` (+ ``conv_rt``) is the runtime short-conv
         state pool: each layer reads its own four ``[max_batch, C, K-1]`` buffers
         and the shared per-forward ``conv_rt`` split, so the four short-convs of
         every layer carry per-request state across decode steps exactly like the
         paged KV cache. ``conv_cache=None`` keeps the stateless focused-replay
-        behavior."""
+        behavior.
+
+        ``inputs_embeds_prenormed`` mirrors SGLang ``inkling.py`` forward: on the
+        multimodal path the wrapper has ALREADY applied ``embed_norm`` to the text
+        embeddings (via a normed embedder, matching SGLang's
+        ``get_input_embeddings``) and scattered the RAW vision-tower rows in AFTER
+        the norm, so the fused stream must NOT be re-normed here -- the vision rows
+        carry the tower's own final norm and SGLang never pushes them through
+        ``embed_norm``. Re-norming the fused stream (the pre-fix behavior) sent the
+        image rows through an extra RMSNorm SGLang omits, corrupting them so the
+        decoder could not read the image (the "image not visible" hallucination
+        behind the MMMU Accounting gap). Text-only and focused-replay callers pass
+        raw ``inputs_embeds`` and keep the norm (default ``False``)."""
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        hidden_states = self.embed_norm(inputs_embeds)
+        hidden_states = inputs_embeds if inputs_embeds_prenormed else self.embed_norm(inputs_embeds)
         # Debug-only: env-gated per-layer PREFILL activation dump, to localize the
         # full-model TP=4 vs TP=1 divergence (the focused replays are all TP=1).
         # Zero cost when INKLING_DUMP_PREFILL is unset. Dumps once, on the first
         # context forward, one file per rank (all-reduced hidden is identical
         # across ranks, so the comparison reads rank 0).
         import os as _os
+
         _dump_path = _os.environ.get("INKLING_DUMP_PREFILL")
         # Only the real short prompt, not the ~max_num_tokens KV-cache estimation
         # prefill: gate on a context-token count window and overwrite (the last
@@ -2517,8 +2662,11 @@ class InklingModel(DecoderModel):
         # jump into router-chaos vs expert-GEMM. Zero cost unless _finegrain is set.
         _dump_finegrain = _os.environ.get("INKLING_DUMP_FINEGRAIN") == "1"
         _dump_maxlayer = int(_os.environ.get("INKLING_DUMP_MAXLAYER", "999"))
-        _ctx_tok = (int(attn_metadata.seq_lens[:attn_metadata.num_contexts].sum())
-                    if attn_metadata.num_contexts > 0 else 0)
+        _ctx_tok = (
+            int(attn_metadata.seq_lens[: attn_metadata.num_contexts].sum())
+            if attn_metadata.num_contexts > 0
+            else 0
+        )
         _do_dump = bool(_dump_path) and _dump_min <= _ctx_tok <= _dump_max
         _rec = None
         if _do_dump:
@@ -2528,11 +2676,8 @@ class InklingModel(DecoderModel):
                 _rank = 0
             _rec = {
                 "rank": _rank,
-                "input_ids":
-                (input_ids.detach().cpu() if input_ids is not None else None),
-                "position_ids":
-                (position_ids.detach().cpu()
-                 if position_ids is not None else None),
+                "input_ids": (input_ids.detach().cpu() if input_ids is not None else None),
+                "position_ids": (position_ids.detach().cpu() if position_ids is not None else None),
                 "num_contexts": int(attn_metadata.num_contexts),
                 "seq_lens": attn_metadata.seq_lens.detach().cpu(),
                 "inputs_embeds": inputs_embeds.detach().float().cpu(),
@@ -2547,8 +2692,12 @@ class InklingModel(DecoderModel):
         if _dv_on and attn_metadata.num_contexts > 0:
             _INK_DIVERGE["step"] = 0
             _INK_DIVERGE["reported"] = False
-        _dv = (_dv_on and attn_metadata.num_contexts == 0
-               and hidden_states.shape[0] > 1 and conv_rt is not None)
+        _dv = (
+            _dv_on
+            and attn_metadata.num_contexts == 0
+            and hidden_states.shape[0] > 1
+            and conv_rt is not None
+        )
         # Prefill residual localizer: a PURE context forward of >=2 identical
         # prompts of equal length. The decode localizer cannot see a divergence
         # seeded here (it only fires on pure-gen forwards); this compares each
@@ -2560,10 +2709,13 @@ class InklingModel(DecoderModel):
             _clens = _slens[:_nc]
             _L = _clens[0]
             _ctok = sum(_clens)
-            if (_L > 0 and all(x == _L for x in _clens)
-                    and hidden_states.shape[0] == _ctok
-                    and input_ids is not None
-                    and input_ids.shape[0] >= _ctok):
+            if (
+                _L > 0
+                and all(x == _L for x in _clens)
+                and hidden_states.shape[0] == _ctok
+                and input_ids is not None
+                and input_ids.shape[0] >= _ctok
+            ):
                 _ii = input_ids[:_ctok].reshape(_nc, _L)
                 if bool((_ii == _ii[0:1]).all()):
                     _pf = (_nc, _L)
@@ -2577,11 +2729,13 @@ class InklingModel(DecoderModel):
         # on every replay (num_contexts is 0 both at capture and replay for the
         # decode graph), so the buffer holds the LAST replay's per-layer decode
         # output -- read out eagerly in prepare_inkling_attn_decode.
-        _fp_on = (self._ink_fp is not None and attn_metadata.num_contexts == 0
-                  and hidden_states.shape[0] >= 1)
+        _fp_on = (
+            self._ink_fp is not None
+            and attn_metadata.num_contexts == 0
+            and hidden_states.shape[0] >= 1
+        )
         for i, layer in enumerate(self.layers):
-            layer_state = (conv_cache.layer_state(i)
-                           if conv_cache is not None else None)
+            layer_state = conv_cache.layer_state(i) if conv_cache is not None else None
             # Sublayer detail (h_attn/moe_out): full-position for the original
             # short-prompt mode (i<8), OR answer-position-only for EVERY layer in the
             # feedback #4 all-layers module-split mode. Plain all-layers mode keeps
@@ -2590,28 +2744,37 @@ class InklingModel(DecoderModel):
                 if _dump_finegrain:
                     # feedback #7: intra-layer boundaries + gate for L0..maxlayer
                     # only; layers beyond maxlayer keep just the residual stream.
-                    _sink = ({"_answer_pos_only": True, "_finegrain": True}
-                             if i <= _dump_maxlayer else None)
+                    _sink = (
+                        {"_answer_pos_only": True, "_finegrain": True}
+                        if i <= _dump_maxlayer
+                        else None
+                    )
                 else:
                     _sink = {"_answer_pos_only": True}
             elif _do_dump and not _dump_all and i < 8:
                 _sink = {}
             else:
                 _sink = None
-            hidden_states = layer(position_ids,
-                                  hidden_states,
-                                  attn_metadata,
-                                  conv_state=layer_state,
-                                  conv_rt=conv_rt,
-                                  dump_sink=_sink,
-                                  diverge_sink=_active_sink,
-                                  ops_fp=(self._ink_fp_ops[i]
-                                          if (_fp_on
-                                              and self._ink_fp_ops is not None
-                                              and not layer.attn.is_local
-                                              and i <= self._ink_fp_ops_maxlayer)
-                                          else None),
-                                  ops_scratch=self._ink_fp_ops_scratch)
+            hidden_states = layer(
+                position_ids,
+                hidden_states,
+                attn_metadata,
+                conv_state=layer_state,
+                conv_rt=conv_rt,
+                dump_sink=_sink,
+                diverge_sink=_active_sink,
+                ops_fp=(
+                    self._ink_fp_ops[i]
+                    if (
+                        _fp_on
+                        and self._ink_fp_ops is not None
+                        and not layer.attn.is_local
+                        and i <= self._ink_fp_ops_maxlayer
+                    )
+                    else None
+                ),
+                ops_scratch=self._ink_fp_ops_scratch,
+            )
             if _fp_on:
                 # Last generation row's residual after layer i (device->device,
                 # captured -> replays). fp32 cast is a transient graph-pool alloc.
@@ -2620,17 +2783,24 @@ class InklingModel(DecoderModel):
                 # residual stream after layer i (non-fused: hidden_states IS the
                 # stream). All-layers mode stores the answer-position (last) token
                 # only, matching the SGLang forward-hook's rs[-1] capture.
-                _rec["layers"][i] = (hidden_states[-1] if _dump_all
-                                     else hidden_states).detach().float().cpu()
+                _rec["layers"][i] = (
+                    (hidden_states[-1] if _dump_all else hidden_states).detach().float().cpu()
+                )
                 if _sink:
                     _rec.setdefault("h_attn", {})[i] = _sink.get("h_attn")
                     _rec.setdefault("moe_out", {})[i] = _sink.get("moe_out")
                     if _sink.get("_finegrain"):
                         # feedback #7 fine-grain points (present only for L0..
                         # maxlayer; router_* only on MoE layers >= dense_mlp_idx).
-                        for _k in ("attn_core", "attn_sconv", "mlp_norm",
-                                   "mlp_sconv", "router_logits", "topk_idx",
-                                   "routed_w"):
+                        for _k in (
+                            "attn_core",
+                            "attn_sconv",
+                            "mlp_norm",
+                            "mlp_sconv",
+                            "router_logits",
+                            "topk_idx",
+                            "routed_w",
+                        ):
                             _v = _sink.get(_k)
                             if _v is not None:
                                 _rec.setdefault(_k, {})[i] = _v
@@ -2644,30 +2814,24 @@ class InklingModel(DecoderModel):
                 _dv_rank = 0
             if _dv_rank == 0:
                 if _dv:
-                    _ink_report_divergence(len(self.layers), _dsink,
-                                           inputs_embeds, out)
+                    _ink_report_divergence(len(self.layers), _dsink, inputs_embeds, out)
                 if _pf:
-                    _ink_report_prefill(len(self.layers), _pfsink,
-                                        inputs_embeds, out, _pf)
+                    _ink_report_prefill(len(self.layers), _pfsink, inputs_embeds, out, _pf)
         if _do_dump:
-            _rec["final_norm"] = (out[-1] if _dump_all
-                                  else out).detach().float().cpu()
+            _rec["final_norm"] = (out[-1] if _dump_all else out).detach().float().cpu()
             import torch as _torch
+
             # All-layers mode keys the file by context-token count so several
             # teacher-forced prompts (distinct lengths) written under one fixed
             # INKLING_DUMP_PREFILL base (set in the launcher env, seen by every TP
             # worker) land in distinct files instead of overwriting each other.
-            _suffix = (f".n{_ctx_tok}.rank{_rec['rank']}" if _dump_all
-                       else f".rank{_rec['rank']}")
+            _suffix = f".n{_ctx_tok}.rank{_rec['rank']}" if _dump_all else f".rank{_rec['rank']}"
             _torch.save(_rec, f"{_dump_path}{_suffix}")
-            print(f"[inkling-dump] wrote prefill activations to "
-                  f"{_dump_path}{_suffix}",
-                  flush=True)
+            print(f"[inkling-dump] wrote prefill activations to {_dump_path}{_suffix}", flush=True)
         return out
 
 
-class InklingForCausalLM(DecoderModelForCausalLM[InklingModel,
-                                                 InklingTextConfig]):
+class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig]):
     """Text CausalLM: muP logit scaling + unpadded-vocab slice.
 
     ``embed`` and ``unembed`` are separate checkpoint tensors (never tied). The
@@ -2714,6 +2878,7 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel,
         # cg=off run since prefill logits are identical) to pin the first layer
         # where CUDA graph corrupts, plus cross-rank residual consistency.
         import os
+
         fp_path = os.environ.get("INKLING_FP")
         if fp_path:
             self.model._ensure_fp_buffer(device)
@@ -2734,8 +2899,8 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel,
                         rank = 0
                     step = self.model._ink_fp_step
                     torch.save(
-                        self.model._ink_fp.detach().to("cpu"),
-                        f"{fp_path}.rank{rank}.step{step}")
+                        self.model._ink_fp.detach().to("cpu"), f"{fp_path}.rank{rank}.step{step}"
+                    )
                     # feedback #17 op-level stats dump. The [L,13,4] stats tensor
                     # is tiny (~14 KB), so dump EVERY step (no MAXSTEP truncation):
                     # the analyzer needs the full onset trace -- including steps
@@ -2745,7 +2910,8 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel,
                     if self.model._ink_fp_ops is not None:
                         torch.save(
                             self.model._ink_fp_ops.detach().to("cpu"),
-                            f"{fp_path}.ops.rank{rank}.step{step}")
+                            f"{fp_path}.ops.rank{rank}.step{step}",
+                        )
                         # One-time page_size sidecar (rank 0, first dumped step):
                         # the KV-cache page/token size, so the analyzer can place
                         # each step's KV position relative to a page boundary for
@@ -2754,27 +2920,28 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel,
                         if rank == 0 and step == 0:
                             try:
                                 import json as _json
-                                _kv = attn_metadata.kv_cache_manager.get_buffers(
-                                    0, kv_layout="HND")
-                                with open(f"{fp_path}.page_size.json",
-                                          "w") as _pf:
-                                    _json.dump({"page_size": int(_kv.shape[3])},
-                                               _pf)
+
+                                _kv = attn_metadata.kv_cache_manager.get_buffers(0, kv_layout="HND")
+                                with open(f"{fp_path}.page_size.json", "w") as _pf:
+                                    _json.dump({"page_size": int(_kv.shape[3])}, _pf)
                             except Exception:  # noqa: BLE001
                                 pass
                     self.model._ink_fp_step += 1
-                self.model._ink_fp_prev_decode = (num_gen > 0)
+                self.model._ink_fp_prev_decode = num_gen > 0
 
-    def forward(self,
-                attn_metadata: AttentionMetadata,
-                input_ids: Optional[torch.IntTensor] = None,
-                position_ids: Optional[torch.IntTensor] = None,
-                inputs_embeds: Optional[torch.Tensor] = None,
-                return_context_logits: bool = False,
-                conv_cache: Optional[InklingConvStateCache] = None,
-                conv_rt: Optional[InklingConvRuntime] = None,
-                resource_manager=None,
-                **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        return_context_logits: bool = False,
+        conv_cache: Optional[InklingConvStateCache] = None,
+        conv_rt: Optional[InklingConvRuntime] = None,
+        resource_manager=None,
+        inputs_embeds_prenormed: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
         # Real-runtime path: the short-conv state pool is owned by the registered
         # InklingConvStateManager (request lifetime shared with the KV cache).
         # The model engine's eager input-prep pre-builds ``conv_cache``/``conv_rt``
@@ -2783,8 +2950,7 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel,
         # explicitly. This fallback only fires for eager, never-captured warmup
         # paths that reach forward without a pre-built split.
         if conv_cache is None and resource_manager is not None:
-            conv_cache, conv_rt = _resolve_conv_runtime(resource_manager,
-                                                        attn_metadata)
+            conv_cache, conv_rt = _resolve_conv_runtime(resource_manager, attn_metadata)
         hidden_states = self.model(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
@@ -2792,26 +2958,69 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel,
             inputs_embeds=inputs_embeds,
             conv_cache=conv_cache,
             conv_rt=conv_rt,
+            inputs_embeds_prenormed=inputs_embeds_prenormed,
         )
         hidden_states = hidden_states / self.mup_multiplier
-        return self.logits_processor.forward(hidden_states, self.lm_head,
-                                             attn_metadata,
-                                             return_context_logits)
+        return self.logits_processor.forward(
+            hidden_states, self.lm_head, attn_metadata, return_context_logits
+        )
+
+
+def _encode_inkling_image_embeds(
+    visual: InklingVisionModel, multimodal_params: list
+) -> List[torch.Tensor]:
+    """Run the hMLP vision tower over the context requests' patch features.
+
+    Reads ``multimodal_data['image']['vision_patches_bthwc']`` (the tensor the
+    :class:`InklingInputProcessor` attaches) from each context
+    ``MultimodalParams``, concatenates them, and runs the tower on the tower's
+    device/dtype. Returns a single-element list ``[feats]`` with ``feats`` of
+    shape ``(sum_patches, decoder_dmodel)`` -- the same shape
+    ``get_multimodal_embeddings`` returns and ``find_input_mm_embeds`` slices --
+    or ``[]`` when no context request carries image features."""
+    patches = []
+    for param in multimodal_params:
+        data = getattr(param, "multimodal_data", None) or {}
+        image = data.get("image") or {}
+        vp = image.get("vision_patches_bthwc")
+        if vp is not None:
+            patches.append(vp)
+    if not patches:
+        return []
+    p = next(visual.parameters())
+    x = torch.cat([vp.to(device=p.device, dtype=p.dtype) for vp in patches], dim=0)
+    return [visual(x)]
 
 
 @register_auto_model("InklingForConditionalGeneration")
+@register_input_processor(
+    InklingInputProcessor,
+    model_type="inkling_mm_model",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={"image": "<image>"},
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.OPENAI,
+    ),
+)
 class InklingForConditionalGeneration(InklingForCausalLM):
     """Registered entry point for the multimodal ``inkling_mm_model`` checkpoint.
 
-    For the text-only GSM8K/MMLU bring-up this routes straight to the text
-    :class:`InklingForCausalLM` over the ``text_config`` sub-config and consumes
-    only ``model.llm.*`` weights; audio / vision / MTP keys are intentionally
-    unused (Phase 3). See ``checkpoints/hf/inkling_weight_mapper.py`` for the
-    HF→TRT name mapping and consumed/deferred accounting.
+    Text-only GSM8K/MMLU requests route straight to the text
+    :class:`InklingForCausalLM` over the ``text_config`` sub-config and consume
+    only ``model.llm.*`` weights. Image requests are preprocessed by the
+    registered :class:`InklingInputProcessor` (Stage-1 / Goal 1.2): it expands
+    the ``<image>`` placeholder to one token per vision patch and attaches the
+    ``vision_patches_bthwc`` features. The hMLP vision tower
+    (:class:`InklingVisionModel`, Goal 1.3) is built as a replicated bf16
+    submodule ``self.visual``, and its per-patch outputs are fused into
+    ``inputs_embeds`` at the placeholder positions before the text decoder
+    (Goal 1.4, OOV-safe ``fuse_input_embeds``). Audio / MTP remain deferred.
+    See ``checkpoints/hf/inkling_weight_mapper.py`` for the HF→TRT name mapping
+    and consumed/deferred accounting.
     """
 
     @classmethod
-    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         # Inkling's hybrid per-layer KV-head split (local sliding-window layers
         # carry 16 KV heads, global layers 8) structurally requires
         # KVCacheManagerV2's per-layer ``num_kv_heads`` geometry -- V1's unified
@@ -2856,26 +3065,149 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         # correct -- exactly the human "confirm CUTLASS-vs-flashinfer kernel"
         # guidance; pursue a Python/config-level deterministic combine first.
         return {
-            "kv_cache_config": {
-                "use_kv_cache_manager_v2": True
-            },
+            "kv_cache_config": {"use_kv_cache_manager_v2": True},
         }
 
     def __init__(self, model_config: ModelConfig[InklingConfig]):
         text_model_config = _text_sub_model_config(model_config)
         super().__init__(text_model_config)
         self._top_model_config = model_config
+        # --- Goal 1.4: image-embedding fusion ---------------------------------
+        # Build the hMLP vision tower (Goal 1.3) as a replicated bf16 submodule.
+        # It is EXCLUDED from NVFP4 (hf_quant_config exclude_modules) and is NOT
+        # tensor-parallel sharded: it emits one full-width ``decoder_dmodel`` row
+        # per patch that fuses into the (replicated, all-reduced) residual
+        # stream, so every TP rank runs the identical tower over identical
+        # patches. ``None`` for a text-only checkpoint (no vision_config).
+        vision_config = getattr(model_config.pretrained_config, "vision_config", None)
+        if vision_config is not None and getattr(vision_config, "decoder_dmodel", None):
+            self.visual = InklingVisionModel(vision_config).to(torch.bfloat16)
+        else:
+            self.visual = None
+        # The in-vocab image placeholder id (``<|unused_200054|>`` = 200054, the
+        # token the Inkling chat template emits for an image content part; see
+        # ``DEFAULT_IMAGE_TOKEN_ID``). It MUST be in-vocab: the TRT-LLM executor
+        # validates request token ids and rejects an out-of-range id, so the
+        # SGLang-internal -101 sentinel raises ``RequestError: Token ID out of
+        # range`` at ``llm.generate``. Surfaced to the model engine's
+        # ``_prepare_multimodal_indices`` (which uses ``torch.isin`` against this)
+        # so it locates the image rows. ``fuse_input_embeds`` is still called with
+        # ``mm_token_ids=None`` (explicit text/mm indices) so the placeholder id
+        # is never embedded -- the vision tower overwrites those positions.
+        image_token_id = int(
+            getattr(model_config.pretrained_config, "image_token_id", DEFAULT_IMAGE_TOKEN_ID)
+        )
+        self._mm_token_ids = torch.tensor([image_token_id], dtype=torch.int32)
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
+
+    def _resolve_mm_indices(self, input_ids, kwargs):
+        """Executor-precomputed text/mm indices if shipped, else compute them
+        from the -101 sentinel via ``isin`` (a host sync; eager/warmup only)."""
+        ti = kwargs.get("text_token_indices")
+        mi = kwargs.get("mm_token_indices")
+        if ti is not None and mi is not None:
+            return ti, mi
+        return filter_mm_token_from_input_ids(
+            input_ids,
+            vocab_size=self.model.embed_tokens.num_embeddings,
+            mm_token_ids=self._mm_token_ids.to(input_ids.device),
+        )
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        return_context_logits: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Fuse image embeddings into the text embedding stream, then run the
+        accepted text decoder. Only context (prefill) requests carry vision
+        features; decode steps have ``num_contexts == 0`` and pass straight
+        through. A text-only request is byte-identical to the accepted text path
+        (the vision tower is never touched)."""
+        inputs_embeds_prenormed = False
+        if inputs_embeds is None and self.visual is not None:
+            multimodal_params = kwargs.get("multimodal_params", []) or []
+            num_ctx = attn_metadata.num_contexts
+            ctx_params = multimodal_params[:num_ctx]
+            if ctx_params:
+                # Keep the replicated tower on the decoder's device (one-time
+                # move; the full-model loader may leave it on CPU).
+                dev = self.model.embed_tokens.weight.device
+                if next(self.visual.parameters()).device != dev:
+                    self.visual = self.visual.to(dev)
+                mm_embeds = _encode_inkling_image_embeds(self.visual, ctx_params)
+                mm_embeds = find_input_mm_embeds(mm_embeds, ctx_params)
+                if mm_embeds:
+                    ti, mi = self._resolve_mm_indices(input_ids, kwargs)
+                    # Embed TEXT positions through ``embed_norm`` (SGLang folds it
+                    # into ``get_input_embeddings``) so the fused stream carries
+                    # normed text + RAW vision rows; the vision rows keep the
+                    # tower's own final norm and must skip the decoder's
+                    # ``embed_norm`` (``inputs_embeds_prenormed=True``). Pre-fix
+                    # this scattered raw text and let the decoder re-norm the whole
+                    # fused stream, which pushed the image rows through an extra
+                    # RMSNorm SGLang omits and corrupted them ("image not visible").
+                    input_ids, inputs_embeds = fuse_input_embeds(
+                        self._embed_tokens_with_norm,
+                        input_ids,
+                        mm_embeds,
+                        mm_token_ids=None,  # explicit indices: placeholder never embedded
+                        text_token_indices=ti,
+                        mm_token_indices=mi,
+                    )
+                    inputs_embeds_prenormed = True
+                    # Priority-0 image-use probe (S3-C6 / feedback #3 P0-B/V4):
+                    # env-gated, default-off scatter accounting proving every image
+                    # placeholder position (``mi``) was filled by a tower row
+                    # (``mm_embeds``). Emitted from inside the fusion, not inferred
+                    # from the request dict.
+                    if vision_probe_enabled():
+                        n_rows = int(sum(int(e.shape[0]) for e in mm_embeds))
+                        n_idx = int(mi.numel()) if mi is not None else 0
+                        emit_vision_scatter_probe(n_idx, n_rows)
+        return super().forward(
+            attn_metadata,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            return_context_logits=return_context_logits,
+            inputs_embeds_prenormed=inputs_embeds_prenormed,
+            **kwargs,
+        )
+
+    def _embed_tokens_with_norm(self, ids: torch.IntTensor) -> torch.Tensor:
+        """Text embedder that folds ``embed_norm`` onto the token embedding, a
+        faithful port of SGLang ``InklingModel.get_input_embeddings`` (which norms
+        the text tokens while the scattered vision rows keep their own norm). Used
+        only by the multimodal fusion path; ``fuse_input_embeds`` calls it on the
+        text-position ids and scatters the RAW vision rows in afterward."""
+        return self.model.embed_norm(self.model.embed_tokens(ids))
 
     def load_weights(self, weights: dict, weight_mapper=None):
-        from tensorrt_llm._torch.models.checkpoints.hf.inkling_weight_mapper import \
-            InklingHfWeightMapper
+        # Load the bf16 vision tower first (Goal 1.4 fusion): the
+        # ``model.visual.*`` keys the text loader intentionally drops. Done
+        # before the text load so any post-load completeness check sees it
+        # populated.
+        if self.visual is not None:
+            visual_weights = {k: v for k, v in weights.items() if k.startswith("model.visual.")}
+            self.visual.load_weights(visual_weights)
+        from tensorrt_llm._torch.models.checkpoints.hf.inkling_weight_mapper import (
+            InklingHfWeightMapper,
+        )
+
         if weight_mapper is None:
             weight_mapper = InklingHfWeightMapper()
             weight_mapper.init_model_and_config(self, self.model_config)
-        # Keep only the text tower; drop audio/vision/mtp (intentionally unused),
-        # then remap the checkpoint's SGLang-style keys to the TRT module tree
-        # (fuse q/k/v, split dense w13, unfuse NVFP4 experts). This preprocess
-        # step must run here (like modeling_nemotron_h) -- the base
+        # Keep only the text tower; drop audio/mtp (intentionally unused), then
+        # remap the checkpoint's SGLang-style keys to the TRT module tree (fuse
+        # q/k/v, split dense w13, unfuse NVFP4 experts). This preprocess step
+        # must run here (like modeling_nemotron_h) -- the base
         # _load_weights_impl_v2 assumes already-mapped names.
         text_weights = filter_weights("model.llm", weights)
         text_weights = weight_mapper.preprocess_weights(text_weights)
@@ -2883,11 +3215,12 @@ class InklingForConditionalGeneration(InklingForCausalLM):
 
 
 def _text_sub_model_config(
-        model_config: ModelConfig[InklingConfig]
+    model_config: ModelConfig[InklingConfig],
 ) -> ModelConfig[InklingTextConfig]:
     """Build a text-only ``ModelConfig`` from the multimodal one, preserving the
     mapping / quant config so NVFP4 expert loading and TP sharding are intact."""
     import copy
+
     text_config = model_config.pretrained_config.text_config
     text_model_config = copy.copy(model_config)
     text_model_config.pretrained_config = text_config
