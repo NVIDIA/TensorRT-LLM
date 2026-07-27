@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import runpy
 from pathlib import Path
+
+import pytest
 
 
 def _requirement(path: Path, name: str) -> str:
@@ -29,3 +32,14 @@ def test_openengine_binding_generation_dependencies_are_declared() -> None:
     assert _requirement(requirements, "grpcio") == "grpcio>=1.67"
     assert _requirement(requirements, "grpcio-tools") == "grpcio-tools>=1.67"
     assert _requirement(requirements, "protobuf") == "protobuf>=5.27"
+
+
+def test_openengine_bsr_module_requires_immutable_commit() -> None:
+    root = Path(__file__).resolve().parents[3]
+    installer = runpy.run_path(str(root / "scripts" / "install_openengine.py"))
+    bsr_commit = installer["_bsr_commit"]
+    commit = "a" * 32
+
+    assert bsr_commit(f"buf.build/openengine/openengine:{commit}") == commit
+    with pytest.raises(RuntimeError, match="exact 32-character"):
+        bsr_commit("buf.build/openengine/openengine:main")

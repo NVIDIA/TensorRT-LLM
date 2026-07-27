@@ -22,8 +22,16 @@ headless OpenCV decoder needed by video-capable input processors. The
 verifies the pinned source and generates bindings into the local build tree.
 
 The installer rejects a different or dirty sibling proto checkout. Once the
-schema is published through Buf, export the immutable module into a checkout
-and pass it with `--sibling` and the pinned `--source-identity`. Update
-`OPENENGINE_COMMIT` to the immutable BSR module commit at publication. The
-installer prints the required `OPENENGINE_SCHEMA_RELEASE` export; sibling
-startup fails closed unless that value exactly matches `OPENENGINE_COMMIT`.
+schema is published through Buf, pass its exact immutable module commit:
+
+```bash
+python scripts/install_openengine.py \
+  --buf-module buf.build/openengine/openengine:<32-character-commit>
+```
+
+For an already exported BSR source tree, pass `--sibling` with the same
+32-character `--source-identity`. `OPENENGINE_COMMIT` remains the local Git
+source pin; generated bindings carry either that source commit or the BSR
+commit as their schema identity. The installer prints the required
+`OPENENGINE_SCHEMA_RELEASE` export, and sibling startup fails closed unless
+that value exactly matches the generated identity.

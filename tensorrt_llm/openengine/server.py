@@ -7,6 +7,7 @@ import importlib
 import ipaddress
 
 import grpc
+from openengine._schema_identity import SCHEMA_RELEASE
 from openengine.v1 import openengine_pb2_grpc, server_pb2
 
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
@@ -15,7 +16,6 @@ from tensorrt_llm.serve.kv_event_fanout import KvEventFanout
 from tensorrt_llm.serve.request_tracker import RequestTracker
 from tensorrt_llm.serve.stats_fanout import StatsFanout
 
-from ._schema_pin import OPENENGINE_COMMIT
 from .servicer import OpenEngineServicer, schema_release
 
 _MAX_MESSAGE_LENGTH = 256 * 1024 * 1024
@@ -24,11 +24,11 @@ _IPV4_UNSPECIFIED = str(ipaddress.IPv4Address(0))
 
 def validate_schema_release(schema_release: str) -> str:
     """Require an immutable OpenEngine source identity before binding."""
-    if schema_release == OPENENGINE_COMMIT:
+    if schema_release == SCHEMA_RELEASE:
         return schema_release
     raise RuntimeError(
-        "OPENENGINE_SCHEMA_RELEASE must exactly match the pinned OPENENGINE_COMMIT "
-        f"({OPENENGINE_COMMIT})"
+        "OPENENGINE_SCHEMA_RELEASE must exactly match the generated schema identity "
+        f"({SCHEMA_RELEASE})"
     )
 
 

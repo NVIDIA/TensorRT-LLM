@@ -4,6 +4,7 @@
 from pathlib import Path
 
 import pytest
+from openengine._schema_identity import SCHEMA_RELEASE
 
 from tensorrt_llm.openengine._schema_pin import OPENENGINE_COMMIT
 from tensorrt_llm.openengine.server import (
@@ -14,8 +15,8 @@ from tensorrt_llm.openengine.server import (
 from tensorrt_llm.openengine.servicer import schema_release
 
 
-def test_schema_release_accepts_exact_pinned_identity() -> None:
-    assert validate_schema_release(OPENENGINE_COMMIT) == OPENENGINE_COMMIT
+def test_schema_release_accepts_exact_generated_identity() -> None:
+    assert validate_schema_release(SCHEMA_RELEASE) == SCHEMA_RELEASE
 
 
 def test_packaged_schema_pin_matches_repository_pin() -> None:
@@ -37,6 +38,7 @@ def test_packaged_schema_pin_matches_repository_pin() -> None:
         "latest",
         "v0.2.0",
         "signed-tag:1.2.3",
+        "a" * 32,
         "a" * 40,
         "a" * 64,
     ],

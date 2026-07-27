@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import grpc
+from openengine._schema_identity import SCHEMA_RELEASE
 from openengine.v1 import (
     error_pb2,
     generation_pb2,
@@ -41,7 +42,7 @@ from tensorrt_llm.serve.kv_event_fanout import KvEventFanout, KvEventSubscriberO
 from tensorrt_llm.serve.request_tracker import RequestTracker
 from tensorrt_llm.serve.stats_fanout import StatsFanout
 
-from ._schema_pin import MINIMUM_CLIENT_REVISION, OPENENGINE_COMMIT, SCHEMA_REVISION
+from ._schema_pin import MINIMUM_CLIENT_REVISION, SCHEMA_REVISION
 from .converters import (
     decode_handoff,
     encode_handoff,
@@ -57,7 +58,7 @@ from .lora_registry import LoraRegistry
 
 def schema_release() -> str:
     """Return the immutable OpenEngine source identity configured at startup."""
-    return os.getenv("OPENENGINE_SCHEMA_RELEASE", OPENENGINE_COMMIT)
+    return os.getenv("OPENENGINE_SCHEMA_RELEASE", SCHEMA_RELEASE)
 
 
 def _arg(llm: object, name: str, default: Any = None) -> Any:
