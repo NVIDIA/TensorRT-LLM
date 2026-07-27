@@ -793,14 +793,14 @@ class LTX2Pipeline(BasePipeline):
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
             model_config=model_config,
-            stage2_groups=self._build_stage2_dit_groups(),
+            **self._extra_transformer_kwargs(),
         )
         self.transformer._transformer_config = vars(cfg)
 
-    def _build_stage2_dit_groups(self):
-        """Two-stage pipeline override supplies the dual-topology groups;
-        single-stage builds none."""
-        return None
+    def _extra_transformer_kwargs(self) -> dict:
+        """Extra LTXModel constructor kwargs; empty for the base one-stage
+        pipeline. Subclasses override to add topology-specific kwargs."""
+        return {}
 
     # ------------------------------------------------------------------
     # CUDA graph setup (Modality-aware override)

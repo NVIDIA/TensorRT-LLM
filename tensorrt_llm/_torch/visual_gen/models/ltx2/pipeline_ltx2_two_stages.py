@@ -1009,6 +1009,12 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     def _current_lora_cuda_graph_state(self) -> str:
         return getattr(self, "_lora_cuda_graph_state", "original")
 
+    def _extra_transformer_kwargs(self) -> dict:
+        """Hand the dual-topology groups to LTXModel; built collectively here at
+        pipeline init (load). Only the two-stage pipeline supplies them, so the
+        base one-stage pipeline stays free of any stage-2 surface."""
+        return {"stage2_groups": self._build_stage2_dit_groups()}
+
     def _build_stage2_dit_groups(self) -> Optional[Stage2Groups]:
         """Build the stage-2 dual-topology groups (once, collectively, at load).
 
