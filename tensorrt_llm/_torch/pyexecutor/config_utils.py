@@ -2,13 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
+
+
+def uses_vswa_kv_cache_layout(
+        max_attention_windows: Optional[Sequence[int]]) -> bool:
+    """Return whether windows require a variable-window KV cache layout.
+
+    Recurrent-state cache sentinels are negative and do not represent
+    attention windows, so hybrid linear-attention layouts are not VSWA.
+    """
+    return (max_attention_windows is not None
+            and len(set(max_attention_windows)) > 1
+            and all(window > 0 for window in max_attention_windows))
 
 
 def is_gemma4_hybrid(config):

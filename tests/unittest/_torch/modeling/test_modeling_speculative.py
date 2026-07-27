@@ -15,6 +15,7 @@
 
 """Unit tests for speculative modeling classes."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -22,8 +23,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.attention_backend.interface import RopeParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_speculative import (
+    DFlashForCausalLM,
     Eagle3ForCausalLM,
     SpecDecOneEngineForCausalLM,
 )
@@ -221,3 +224,88 @@ def test_specdec_one_engine_explicit_overrides_pretrained_config() -> None:
     )
     assert kwargs["hidden_size"] == hidden_size
     assert kwargs["vocab_size"] == vocab_size
+
+
+def _fake_dflash_attention(rope_params, source):
+    if source == "rotary_emb":
+        return SimpleNamespace(
+            rotary_emb=SimpleNamespace(
+                rope_params=rope_params,
+                head_dim=128,
+                is_neox=True,
+            ),
+            pos_embd_params=None,
+        )
+    return SimpleNamespace(
+        rotary_emb=None,
+        pos_embd_params=SimpleNamespace(rope=rope_params, is_neox=True),
+        head_dim=128,
+    )
+
+
+def _fake_dflash_wrapper(rope_params, source):
+    layers = [
+        SimpleNamespace(self_attn=_fake_dflash_attention(params, source)) for params in rope_params
+    ]
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper.model = SimpleNamespace(layers=layers)
+    wrapper.config = SimpleNamespace(layer_types=["sliding_attention", "full_attention"])
+    return wrapper
+
+
+@pytest.mark.parametrize("source", ["rotary_emb", "pos_embd_params"])
+def test_dflash_allows_mixed_layer_types_with_uniform_rope(source):
+    rope_params = RopeParams(dim=128, theta=1_000_000.0, max_positions=4096)
+    wrapper = _fake_dflash_wrapper([rope_params, rope_params], source)
+
+    DFlashForCausalLM._validate_uniform_rope(wrapper)
+
+
+@pytest.mark.parametrize("source", ["rotary_emb", "pos_embd_params"])
+def test_dflash_rejects_different_effective_rope(source):
+    wrapper = _fake_dflash_wrapper(
+        [
+            RopeParams(dim=128, theta=1_000_000.0, max_positions=4096),
+            RopeParams(dim=128, theta=10_000_000.0, max_positions=4096),
+        ],
+        source,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"layers \[1\] have a different effective RoPE configuration",
+    ):
+        DFlashForCausalLM._validate_uniform_rope(wrapper)
+
+
+def _fake_dflash_mask_wrapper(config, sliding_layers_causal=False):
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper.config = config
+    wrapper._sliding_layers_causal = sliding_layers_causal
+    return wrapper
+
+
+def test_dflash_attention_mask_args():
+    wrapper = _fake_dflash_mask_wrapper(
+        SimpleNamespace(
+            num_hidden_layers=2,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=4096,
+            use_sliding_window=True,
+        )
+    )
+
+    assert wrapper._get_attention_mask_args(0) == (True, (4095, 0))
+    assert wrapper._get_attention_mask_args(1) == (False, (-1, -1))
+
+    laguna_wrapper = _fake_dflash_mask_wrapper(
+        SimpleNamespace(
+            num_hidden_layers=1,
+            layer_types=["sliding_attention"],
+        ),
+        sliding_layers_causal=True,
+    )
+
+    assert laguna_wrapper._get_attention_mask_args(0) == (True, (-1, -1))

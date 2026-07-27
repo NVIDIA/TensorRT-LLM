@@ -6428,6 +6428,48 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    def test_nvfp4_dflash(self, mocker):
+        if get_sm_version() not in (100, 103):
+            pytest.skip(
+                "Qwen3.6-35B-A3B NVFP4 DFlash test runs on SM100/SM103 only")
+
+        dflash_model_path = f"{llm_models_root()}/Qwen3.6-35B-A3B-DFlash"
+        if not os.path.exists(
+                self.MODEL_PATH) or not os.path.exists(dflash_model_path):
+            pytest.skip("Qwen3.6-35B-A3B NVFP4 target or DFlash draft model "
+                        "directory does not exist")
+
+        mocker.patch.dict(os.environ, {"TRTLLM_USE_GDN_REPLAY": "1"})
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.8,
+            enable_block_reuse=False,
+            dtype="fp8",
+            mamba_ssm_cache_dtype="bfloat16",
+        )
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=8)
+        spec_config = DFlashDecodingConfig(max_draft_len=7,
+                                           speculative_model=dflash_model_path)
+
+        with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
+                 tensor_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 max_seq_len=8192,
+                 max_batch_size=8,
+                 enable_chunked_prefill=True,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config,
+                 moe_config=MoeConfig(backend="TRTLLM"),
+                 speculative_config=spec_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            assert llm.args.speculative_config.decoding_type == 'DFlash'
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(183000)

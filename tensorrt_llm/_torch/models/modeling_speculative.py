@@ -1084,20 +1084,51 @@ class DFlashForCausalLM(nn.Module):
         self._context_input_layernorm = False
         self._sliding_layers_causal = False
 
+    @staticmethod
+    def _rope_signature(attn):
+        """Return the effective RoPE configuration used by an attention layer."""
+        if attn.rotary_emb is not None:
+            return (
+                attn.rotary_emb.rope_params,
+                attn.rotary_emb.head_dim,
+                attn.rotary_emb.is_neox,
+            )
+        if attn.pos_embd_params is not None:
+            return (
+                attn.pos_embd_params.rope,
+                attn.head_dim,
+                attn.pos_embd_params.is_neox,
+            )
+        return None
+
+    def _validate_uniform_rope(self):
+        """Check that all draft layers can safely share one RoPE cache."""
+        signatures = [
+            self._rope_signature(layer.self_attn) for layer in self.model.layers
+        ]
+        if not signatures:
+            raise ValueError("DFlash requires at least one draft model layer.")
+
+        mismatched_layers = [
+            layer_idx
+            for layer_idx, signature in enumerate(signatures[1:], start=1)
+            if signature != signatures[0]
+        ]
+        if mismatched_layers:
+            layer_types = getattr(self.config, 'layer_types', None)
+            raise ValueError(
+                "DFlash shares one RoPE cache across draft layers, but layers "
+                f"{mismatched_layers} have a different effective RoPE "
+                f"configuration from layer 0. layer_types={layer_types}.")
+
     def _init_rope(self):
         """Initialize RoPE from the draft model's attention configuration.
 
         Reuses the existing RotaryEmbedding infrastructure which correctly
         handles all RoPE variants (standard, YaRN, scaled, etc.).
         """
-        # RoPE is read from layer 0; guard that the drafter is single-layer-type
-        # (the target uses per-layer-type RoPE, the drafter does not).
-        layer_types = getattr(self.config, 'layer_types', None)
-        if layer_types is not None and len(set(layer_types)) > 1:
-            raise ValueError(
-                "DFlash _init_rope() reads RoPE from layer 0 only, but the drafter "
-                f"has heterogeneous layer_types {sorted(set(layer_types))}; per-layer "
-                "RoPE resolution is required for this checkpoint.")
+        # The flattened context-KV path shares layer 0's RoPE cache.
+        self._validate_uniform_rope()
         attn0 = self.model.layers[0].self_attn
 
         if attn0.rotary_emb is not None:
@@ -1541,6 +1572,41 @@ class DFlashForCausalLM(nn.Module):
             rope_sin = rope_sin.to(dtype)
         return rope_cos, rope_sin
 
+    def _get_attention_mask_args(self, layer_idx):
+        """Return FlashAttention causal and local-window arguments for a layer."""
+        layer_types = getattr(self.config, 'layer_types', None)
+        if layer_types is None:
+            return False, (-1, -1)
+        if len(layer_types) != self.config.num_hidden_layers:
+            raise ValueError(
+                f"DFlash layer_types length {len(layer_types)} does not match "
+                f"num_hidden_layers {self.config.num_hidden_layers}.")
+
+        layer_type = layer_types[layer_idx]
+        if layer_type == 'full_attention':
+            return False, (-1, -1)
+        if layer_type != 'sliding_attention':
+            raise ValueError(
+                f"Unsupported DFlash layer_type {layer_type!r} at layer "
+                f"{layer_idx}.")
+
+        use_sliding_window = bool(
+            getattr(self.config, 'use_sliding_window', False))
+        causal = self._sliding_layers_causal or use_sliding_window
+        if not use_sliding_window:
+            # Laguna uses causal draft blocks but deliberately retains all
+            # context K/V. Generic legacy drafters also preserve their prior
+            # non-windowed behavior.
+            return causal, (-1, -1)
+
+        sliding_window = getattr(self.config, 'sliding_window', None)
+        if not isinstance(sliding_window, int) or sliding_window <= 0:
+            raise ValueError(
+                "DFlash use_sliding_window requires a positive integer "
+                "sliding_window.")
+        # FlashAttention's bounds are inclusive: W tokens are current + W-1 left.
+        return causal, (sliding_window - 1, 0)
+
     def dflash_forward(
         self,
         noise_embedding: torch.Tensor,
@@ -1705,19 +1771,15 @@ class DFlashForCausalLM(nn.Module):
 
             # flash_attn appends k_noise/v_noise in-place at
             # cache_seqlens[i]..+block_size for each batch i.
-            # DFlash sliding-attention draft layers use causal block attention;
-            # full-attention layers stay non-causal. Matches the vLLM reference,
-            # which overrides sliding_attention layers to causal metadata (the
-            # window itself is disabled; context K/V sit at absolute slots).
-            layer_types = getattr(self.config, 'layer_types', None)
-            causal = (self._sliding_layers_causal and bool(layer_types)
-                      and layer_types[layer_idx] == 'sliding_attention')
-            # DSpark SWA: non-causal sliding window on 'sliding_attention'
-            # layers ((-1, -1) == flash-attn default == no window otherwise).
-            # KV index == token position in the pool, so this restricts draft
-            # queries to the last swa_window context tokens + the block.
-            window_size = (self._dspark_layer_windows[layer_idx] if layer_idx
-                           < len(self._dspark_layer_windows) else (-1, -1))
+            # Qwen-style sliding layers use their configured causal local
+            # window. Laguna keeps its existing causal, non-windowed behavior;
+            # DSpark retains its non-causal symmetric local window.
+            causal, window_size = self._get_attention_mask_args(layer_idx)
+            dspark_window = (
+                self._dspark_layer_windows[layer_idx]
+                if layer_idx < len(self._dspark_layer_windows) else (-1, -1))
+            if dspark_window != (-1, -1):
+                window_size = dspark_window
             out = flash_attn_with_kvcache(
                 q=Q_bshd,
                 k_cache=layer_k_cache,

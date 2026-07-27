@@ -49,7 +49,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
                            is_gemma4_hybrid, is_hybrid_linear, is_kimi_linear,
-                           is_mla, is_nemotron_hybrid, is_qwen3_hybrid)
+                           is_mla, is_nemotron_hybrid, is_qwen3_hybrid,
+                           uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -454,12 +455,6 @@ def _derive_draft_max_attention_window(
     max_seq_len: int,
     num_draft_layers: int,
 ) -> Optional[List[int]]:
-    if not is_vswa_enabled(kv_cache_config):
-        max_attention_window = kv_cache_config.max_attention_window
-        if max_attention_window is None:
-            return None
-        return _normalize_attention_windows(max_attention_window, max_seq_len)
-
     sliding_window = getattr(draft_pretrained_config, "sliding_window", None)
     layer_types = getattr(draft_pretrained_config, "layer_types", None)
     # HF configs today expose a single scalar `sliding_window`; `layer_types`
@@ -487,6 +482,12 @@ def _derive_draft_max_attention_window(
                                  None)
     if sliding_window is not None and use_sliding_window is True:
         return _normalize_attention_windows([int(sliding_window)], max_seq_len)
+
+    if not uses_vswa_kv_cache_layout(kv_cache_config.max_attention_window):
+        max_attention_window = kv_cache_config.max_attention_window
+        if max_attention_window is None:
+            return None
+        return _normalize_attention_windows(max_attention_window, max_seq_len)
 
     return None
 
@@ -1226,7 +1227,8 @@ class KvCacheCreator:
             # handle user provided max_tokens
             if self._max_kv_tokens_in is not None:
                 # raise error if it is VSWA case
-                is_vswa = is_vswa_enabled(self._kv_cache_config)
+                is_vswa = uses_vswa_kv_cache_layout(
+                    self._kv_cache_config.max_attention_window)
 
                 # raise error if it is VSWA case
                 if is_vswa:
@@ -1379,8 +1381,25 @@ class KvCacheCreator:
             return self._draft_config.pretrained_config.num_hidden_layers
         return get_num_spec_layers(self._speculative_config)
 
+    def _get_draft_max_attention_window(
+        self,
+        max_seq_len: int,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+    ) -> Optional[List[int]]:
+        """Derive the draft manager's per-layer attention windows."""
+        effective_draft_config = self._get_effective_draft_config()
+        kv_cache_config = (kv_cache_config if kv_cache_config is not None else
+                           self._kv_cache_config)
+        return _derive_draft_max_attention_window(
+            kv_cache_config,
+            effective_draft_config.pretrained_config,
+            max_seq_len,
+            self._get_num_draft_layers(),
+        )
+
     def _create_one_model_draft_kv_cache_manager(
         self,
+        max_seq_len: int,
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
     ) -> Optional[KVCacheManager]:
@@ -1397,48 +1416,32 @@ class KvCacheCreator:
 
         draft_kv_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config).model_copy()
-        draft_kv_config.max_attention_window = _derive_draft_max_attention_window(
-            self._kv_cache_config,
-            effective_draft_config.pretrained_config,
-            self._max_seq_len,
-            num_draft_layers,
-        )
-        # A draft whose *own* config is VSWA (mixed sliding/full attention
-        # layers, so the derived window has >1 distinct size) is envisioned but
-        # not yet supported here. ``draft_kv_config`` inherits the target's
-        # combined ``max_gpu_total_bytes`` via the ``model_copy()`` above; a
-        # VSWA draft would route through ``calculate_max_num_blocks_for_vswa``,
-        # which sizes pools from that full byte budget rather than the draft's
-        # ``max_tokens`` share — so the separate draft manager would re-allocate
-        # the whole KV budget and OOM. Only the non-SWA draft path (single/None
-        # window, which falls back to the ``max_tokens``-partitioned allocation)
-        # is exercised today; no draft model currently ships with mixed
-        # ``layer_types``. When one does, partition the budget here before the
-        # per-window split, e.g.:
-        #     _, draft_cost = self._get_target_and_draft_cache_costs()
-        #     draft_kv_config.max_gpu_total_bytes = draft_cost.bytes_for_tokens(
-        #         self._kv_cache_config.max_tokens)
-        if is_vswa_enabled(draft_kv_config):
-            raise NotImplementedError(
-                "A VSWA draft model (mixed sliding-window and full-attention "
-                "layers) is not yet supported for one-model speculative "
-                "decoding with a separate draft KV cache manager: its KV budget "
-                "would not be partitioned from the target's and would overrun "
-                "GPU memory. Derived draft max_attention_window="
-                f"{draft_kv_config.max_attention_window}.")
-        if (draft_kv_config.pool_ratio is not None
+        # Estimation uses a small max_tokens-sized temporary draft cache before
+        # the measured GPU budget is available to split. Applying VSWA here
+        # would instead size every window pool from the unsplit free-memory
+        # budget. Install the real draft layout only for the final managers,
+        # after build_managers has partitioned max_gpu_total_bytes.
+        if estimating_kv_cache:
+            draft_kv_config.max_attention_window = None
+        else:
+            draft_kv_config.max_attention_window = (
+                self._get_draft_max_attention_window(max_seq_len,
+                                                     draft_kv_config))
+        if (not uses_vswa_kv_cache_layout(
+                draft_kv_config.max_attention_window)
+                and draft_kv_config.pool_ratio is not None
                 and len(draft_kv_config.pool_ratio) != 1):
             # pool_ratio describes one manager's pool-group layout. The
             # target hybrid manager may have separate recurrent-state and
-            # attention groups, while today's supported one-model draft
-            # manager has one non-VSWA attention group. Reusing the target's
-            # two ratios for that separate manager fails its arity check.
+            # attention groups, while a non-VSWA draft manager has one
+            # attention group. Reusing the target's ratios fails its arity
+            # check.
             logger.info(
                 "Normalizing the separate one-model draft KV cache pool_ratio "
                 f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
                 "pool group.")
             draft_kv_config.pool_ratio = [1.0]
-        if is_vswa_enabled(self._kv_cache_config):
+        if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "
                 f"draft manager: {draft_kv_config.max_attention_window}")
@@ -1460,7 +1463,7 @@ class KvCacheCreator:
             mapping=self._mapping,
             kv_cache_config=draft_kv_config,
             tokens_per_block=self._tokens_per_block,
-            max_seq_len=self._max_seq_len,
+            max_seq_len=max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
             sparse_attention_config=sparse_attn_config,
@@ -1851,6 +1854,7 @@ class KvCacheCreator:
 
     def _needs_gpu_kv_cache_budget_split(
         self,
+        max_seq_len: int,
         kv_cache_config: Optional[KvCacheConfig] = None,
     ) -> bool:
         """Whether max_gpu_total_bytes must be split per manager."""
@@ -1858,7 +1862,13 @@ class KvCacheCreator:
             return self._should_create_separate_draft_kv_cache()
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
-        return is_vswa_enabled(kv_cache_config)
+        if uses_vswa_kv_cache_layout(kv_cache_config.max_attention_window):
+            return True
+        if not self._should_create_separate_draft_kv_cache():
+            return False
+        draft_windows = self._get_draft_max_attention_window(
+            max_seq_len, kv_cache_config)
+        return uses_vswa_kv_cache_layout(draft_windows)
 
     def build_managers(self,
                        resources: Dict,
@@ -1888,7 +1898,8 @@ class KvCacheCreator:
         if not estimating_kv_cache and has_draft:
             # Used when each manager sizes pools from max_gpu_total_bytes (V2
             # and V1 VSWA). V1 non-VSWA GPU uses shared max_tokens instead.
-            if self._needs_gpu_kv_cache_budget_split(self_kv_cache_config):
+            if self._needs_gpu_kv_cache_budget_split(original_max_seq_len,
+                                                     self_kv_cache_config):
                 self_kv_cache_config, draft_kv_cache_config = (
                     self._split_kv_cache_budget_for_draft(
                         "max_gpu_total_bytes", self_kv_cache_config,
@@ -1938,6 +1949,7 @@ class KvCacheCreator:
         # One-model speculative decoding with different KV layouts
         elif self._should_create_separate_draft_kv_cache():
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
+                original_max_seq_len,
                 estimating_kv_cache,
                 kv_cache_config_override=draft_build_kv_cache_config)
 
@@ -2535,7 +2547,8 @@ def _create_kv_cache_manager(
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
         # Only needed for V1; V2 handles per-layer windows natively via life cycles.
-        is_vswa = is_vswa_enabled(kv_cache_config)
+        is_vswa = uses_vswa_kv_cache_layout(
+            kv_cache_config.max_attention_window)
         binding_model_config = None
         if is_vswa and kv_cache_manager_cls.__name__ == "KVCacheManager":
             binding_model_config = _model_config.get_bindings_model_config(
