@@ -361,6 +361,48 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_ro("reusable_blocks_all", &tbk::PrefixReuseSummary::reusableBlocksAll)
         .def_ro("first_new_block", &tbk::PrefixReuseSummary::firstNewBlock);
 
+    nb::class_<tbk::AllocationIdentity>(m, "AllocationIdentity")
+        .def(nb::init<>())
+        .def(nb::init<std::uint64_t, tb::LlmRequest::RequestIdType, std::uint64_t>(), nb::arg("allocator_domain_id"),
+            nb::arg("request_id"), nb::arg("allocation_generation"))
+        .def_ro("allocator_domain_id", &tbk::AllocationIdentity::allocatorDomainId)
+        .def_ro("request_id", &tbk::AllocationIdentity::requestId)
+        .def_ro("allocation_generation", &tbk::AllocationIdentity::allocationGeneration)
+        .def("__eq__", &tbk::AllocationIdentity::operator==);
+
+    nb::class_<tbk::AllocationLeaseSliceSpec>(m, "AllocationLeaseSliceSpec")
+        .def(nb::init<>())
+        .def_rw("window_size", &tbk::AllocationLeaseSliceSpec::windowSize)
+        .def_rw("first_block_index", &tbk::AllocationLeaseSliceSpec::firstBlockIndex)
+        .def_rw("block_count", &tbk::AllocationLeaseSliceSpec::blockCount);
+
+    nb::class_<tbk::AllocationLeaseBlockDescriptor>(m, "AllocationLeaseBlockDescriptor")
+        .def_prop_ro("window_size", &tbk::AllocationLeaseBlockDescriptor::getWindowSize)
+        .def_prop_ro("block_index", &tbk::AllocationLeaseBlockDescriptor::getBlockIndex)
+        .def_prop_ro("beam_index", &tbk::AllocationLeaseBlockDescriptor::getBeamIndex)
+        .def_prop_ro("block_id", &tbk::AllocationLeaseBlockDescriptor::getBlockId)
+        .def_prop_ro("primary_pool_index", &tbk::AllocationLeaseBlockDescriptor::getPrimaryPoolIndex)
+        .def_prop_ro("shared", &tbk::AllocationLeaseBlockDescriptor::isShared);
+
+    nb::class_<tbk::AllocationLeaseSnapshot>(m, "AllocationLeaseSnapshot")
+        .def_prop_ro("lease_id", &tbk::AllocationLeaseSnapshot::getLeaseId)
+        .def_prop_ro("identity", &tbk::AllocationLeaseSnapshot::getIdentity)
+        .def_prop_ro("blocks", &tbk::AllocationLeaseSnapshot::getBlocks);
+
+    nb::enum_<tbk::AllocationLeaseSettlement>(m, "AllocationLeaseSettlement")
+        .value("RELEASED", tbk::AllocationLeaseSettlement::kRELEASED)
+        .value("ALREADY_RELEASED", tbk::AllocationLeaseSettlement::kALREADY_RELEASED)
+        .value("NOT_QUIESCED", tbk::AllocationLeaseSettlement::kNOT_QUIESCED)
+        .value("STALE_GENERATION", tbk::AllocationLeaseSettlement::kSTALE_GENERATION)
+        .value("NOT_FOUND", tbk::AllocationLeaseSettlement::kNOT_FOUND);
+
+    nb::class_<tbk::AllocationLeaseAccounting>(m, "AllocationLeaseAccounting")
+        .def_ro("outstanding_lease_count", &tbk::AllocationLeaseAccounting::outstandingLeaseCount)
+        .def_ro("outstanding_block_pin_count", &tbk::AllocationLeaseAccounting::outstandingBlockPinCount)
+        .def_ro("lease_state_known", &tbk::AllocationLeaseAccounting::leaseStateKnown)
+        .def_ro("shutdown_started", &tbk::AllocationLeaseAccounting::shutdownStarted)
+        .def_prop_ro("safe_to_release_pools", &tbk::AllocationLeaseAccounting::safeToReleasePools);
+
     nb::class_<tbk::KvCacheStats>(m, "KvCacheStats")
         .def(nb::init<>())
         .def_rw("max_num_blocks", &tbk::KvCacheStats::maxNumBlocks)
@@ -479,6 +521,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("request_infos"), nb::arg("llm_requests"))
         .def("remove_sequence", &BaseKVCacheManager::removeSequence, nb::call_guard<nb::gil_scoped_release>())
         .def("pin_blocks", &BaseKVCacheManager::pinBlocks, nb::call_guard<nb::gil_scoped_release>())
+        .def("get_allocation_identity", &BaseKVCacheManager::getAllocationIdentity, nb::arg("request_id"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("snapshot_and_lease", &BaseKVCacheManager::snapshotAndLease, nb::arg("identity"),
+            nb::arg("slice_spec") = tbk::AllocationLeaseSliceSpec{}, nb::call_guard<nb::gil_scoped_release>())
+        .def("settle_allocation_lease", &BaseKVCacheManager::settleAllocationLease, nb::arg("lease_id"),
+            nb::arg("identity"), nb::arg("physical_disposition"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_allocation_lease_accounting", &BaseKVCacheManager::getAllocationLeaseAccounting,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("truncate_blocks", &BaseKVCacheManager::truncateBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence,
             nb::call_guard<nb::gil_scoped_release>())

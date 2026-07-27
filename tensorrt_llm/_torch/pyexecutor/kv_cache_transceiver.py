@@ -7,6 +7,9 @@ from typing import Any, Dict, List, Optional
 
 import tensorrt_llm
 from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation.lifecycle import (
+    CancelResult, LifecycleCapability, LogicalDisposition, PhysicalDisposition,
+    ShutdownResult, TransceiverCapabilities)
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.bindings import WorldConfig
 from tensorrt_llm.llmapi.llm_args import (_CACHE_TRANSCEIVER_BACKEND_ENV_VARS,
@@ -202,6 +205,11 @@ def create_kv_cache_transceiver(
 
 class KvCacheTransceiver(ABC):
 
+    @property
+    def requires_physical_drain_before_request_release(self) -> bool:
+        """Whether request resources must remain owned until cancel drains."""
+        return False
+
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest):
         raise NotImplementedError
@@ -229,6 +237,49 @@ class KvCacheTransceiver(ABC):
     @abstractmethod
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError
+
+    def capabilities(self) -> TransceiverCapabilities:
+        """Return fail-closed lifecycle capabilities for this runtime."""
+        return TransceiverCapabilities()
+
+    def cancel_session(self, req: LlmRequest, reason: str) -> CancelResult:
+        """Compatibility adapter for transceivers without structured results.
+
+        The legacy boolean does not prove physical quiescence and may destroy
+        ownership. This fallback therefore does not invoke it.
+        """
+        del req
+        return CancelResult(
+            logical=LogicalDisposition.REJECTED,
+            physical=PhysicalDisposition.IN_DOUBT,
+            retryable=False,
+            reason=("structured cancellation is unsupported; the destructive"
+                    f" legacy path was not invoked: {reason}"),
+        )
+
+    def poll_session(self, req: LlmRequest) -> PhysicalDisposition:
+        """Return physical state for one request, failing closed by default."""
+        del req
+        return PhysicalDisposition.IN_DOUBT
+
+    def fence_submission(self, req: LlmRequest) -> LogicalDisposition:
+        """Prevent later submissions for one request."""
+        del req
+        return LogicalDisposition.REJECTED
+
+    def quiesce_session(self, req: LlmRequest) -> PhysicalDisposition:
+        """Drain submitted operations for one request."""
+        del req
+        return PhysicalDisposition.IN_DOUBT
+
+    def shutdown_lifecycle(self, deadline_s: Optional[float]) -> ShutdownResult:
+        """Attempt bounded shutdown without asserting unsupported quiescence."""
+        del deadline_s
+        return ShutdownResult(
+            physical=PhysicalDisposition.IN_DOUBT,
+            in_doubt_context_count=None,
+            reason="structured lifecycle shutdown is unsupported",
+        )
 
     def supports_inflight_request_cancellation(self) -> bool:
         return False
@@ -258,15 +309,22 @@ class KvCacheTransceiver(ABC):
         """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
 
     def get_data_transceiver_state(self) -> bytes:
-        """Get the serialized DataTransceiverState (CacheState + CommState)."""
+        """Get serialized arbitrary-KV state when the backend provides it."""
         return b""
 
     def get_status_dump(self) -> str:
         """Return a human-readable dump of transceiver state for debugging hangs."""
         return ""
 
-    def shutdown(self):
-        """Shut down the transceiver and release registered resources."""
+    def shutdown(self) -> Optional[bool]:
+        """Shut down the transceiver and release registered resources.
+
+        Returns:
+            Lifecycle-capable implementations return ``True`` only after a
+            complete drain and ``False`` while resources remain owned. Legacy
+            implementations may return ``None``; callers must not interpret it
+            as transport-quiescence evidence.
+        """
 
 
 class BindKvCacheTransceiver(KvCacheTransceiver):
@@ -350,6 +408,146 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
+
+    def capabilities(self) -> TransceiverCapabilities:
+        get_capabilities = getattr(self.impl, "capabilities", None)
+        if get_capabilities is None:
+            supported = (frozenset(
+                {LifecycleCapability.IN_FLIGHT_CANCELLATION}) if getattr(
+                    self, "_supports_inflight_request_cancellation", False) else
+                         frozenset())
+            return TransceiverCapabilities(
+                protocol_version=0,
+                supported=supported,
+                qualified_legacy_mode=True,
+            )
+
+        cpp_capabilities = get_capabilities()
+        protocol_version = int(cpp_capabilities.protocol_version)
+        qualified_legacy_mode = bool(cpp_capabilities.qualified_legacy_mode)
+        if protocol_version != 0 or not qualified_legacy_mode:
+            raise RuntimeError(
+                "C++ KV cache transceiver is qualified only for lifecycle protocol v0"
+            )
+        field_mapping = {
+            "attempt_identity":
+            LifecycleCapability.ATTEMPT_IDENTITY,
+            "endpoint_incarnation":
+            LifecycleCapability.ENDPOINT_INCARNATION,
+            "allocation_generation_leases":
+            (LifecycleCapability.ALLOCATION_GENERATION_LEASES),
+            "cancel_before_create_tombstones":
+            (LifecycleCapability.CANCEL_BEFORE_CREATE_TOMBSTONES),
+            "publication_gate":
+            LifecycleCapability.PUBLICATION_GATE,
+            "in_flight_cancellation":
+            LifecycleCapability.IN_FLIGHT_CANCELLATION,
+            "exact_writer_tracking":
+            LifecycleCapability.EXACT_WRITER_TRACKING,
+            "submission_fence":
+            LifecycleCapability.SUBMISSION_FENCE,
+            "per_operation_quiescence":
+            (LifecycleCapability.PER_OPERATION_QUIESCENCE),
+            "endpoint_wide_quiescence":
+            (LifecycleCapability.ENDPOINT_WIDE_QUIESCENCE),
+            "direct_transfer":
+            LifecycleCapability.DIRECT_TRANSFER,
+            "bounce_transfer":
+            LifecycleCapability.BOUNCE_TRANSFER,
+            "multi_writer":
+            LifecycleCapability.MULTI_WRITER,
+            "generation_first":
+            LifecycleCapability.GENERATION_FIRST,
+            "pipeline_parallel":
+            LifecycleCapability.PIPELINE_PARALLEL,
+            "tensor_parallel":
+            LifecycleCapability.TENSOR_PARALLEL,
+            "attention_data_parallel":
+            (LifecycleCapability.ATTENTION_DATA_PARALLEL),
+            "terminal_result_replay":
+            (LifecycleCapability.TERMINAL_RESULT_REPLAY),
+        }
+        supported = {
+            capability
+            for field_name, capability in field_mapping.items()
+            if bool(getattr(cpp_capabilities, field_name))
+        }
+        if self._supports_inflight_request_cancellation:
+            supported.add(LifecycleCapability.IN_FLIGHT_CANCELLATION)
+        return TransceiverCapabilities(
+            protocol_version=protocol_version,
+            supported=frozenset(supported),
+            qualified_legacy_mode=qualified_legacy_mode,
+        )
+
+    @staticmethod
+    def _convert_cpp_disposition(value, enum_type):
+        name = getattr(value, "name", None)
+        if name is None:
+            name = str(value).rsplit(".", maxsplit=1)[-1]
+        return enum_type[name]
+
+    def cancel_session(self, req: LlmRequest, reason: str) -> CancelResult:
+        cancel_session = getattr(self.impl, "cancel_session", None)
+        if cancel_session is None:
+            return super().cancel_session(req, reason)
+        cpp_result = cancel_session(req, reason)
+        return CancelResult(
+            logical=self._convert_cpp_disposition(cpp_result.logical,
+                                                  LogicalDisposition),
+            physical=self._convert_cpp_disposition(cpp_result.physical,
+                                                   PhysicalDisposition),
+            retryable=bool(cpp_result.retryable),
+            reason=str(cpp_result.reason),
+        )
+
+    @staticmethod
+    def _get_cpp_request_id(req: LlmRequest) -> Optional[int]:
+        from tensorrt_llm._torch.disaggregation.base.transfer import \
+            get_unique_rid
+
+        return get_unique_rid(req)
+
+    def poll_session(self, req: LlmRequest) -> PhysicalDisposition:
+        poll_session = getattr(self.impl, "poll_session", None)
+        request_id = self._get_cpp_request_id(req)
+        if poll_session is None or request_id is None:
+            return PhysicalDisposition.IN_DOUBT
+        return self._convert_cpp_disposition(poll_session(request_id),
+                                             PhysicalDisposition)
+
+    def fence_submission(self, req: LlmRequest) -> LogicalDisposition:
+        fence_submission = getattr(self.impl, "fence_submission", None)
+        request_id = self._get_cpp_request_id(req)
+        if fence_submission is None or request_id is None:
+            return LogicalDisposition.REJECTED
+        return self._convert_cpp_disposition(fence_submission(request_id),
+                                             LogicalDisposition)
+
+    def quiesce_session(self, req: LlmRequest) -> PhysicalDisposition:
+        quiesce_session = getattr(self.impl, "quiesce_session", None)
+        request_id = self._get_cpp_request_id(req)
+        if quiesce_session is None or request_id is None:
+            return PhysicalDisposition.IN_DOUBT
+        return self._convert_cpp_disposition(quiesce_session(request_id),
+                                             PhysicalDisposition)
+
+    def shutdown_lifecycle(self, deadline_s: Optional[float]) -> ShutdownResult:
+        shutdown_lifecycle = getattr(self.impl, "shutdown_lifecycle", None)
+        if shutdown_lifecycle is None:
+            return super().shutdown_lifecycle(deadline_s)
+        deadline_ms = -1 if deadline_s is None else max(0, int(deadline_s *
+                                                               1000))
+        cpp_result = shutdown_lifecycle(deadline_ms)
+        return ShutdownResult(
+            physical=self._convert_cpp_disposition(cpp_result.physical,
+                                                   PhysicalDisposition),
+            in_doubt_context_count=(None if cpp_result.in_doubt_context_count
+                                    is None else int(
+                                        cpp_result.in_doubt_context_count)),
+            fatal=bool(cpp_result.fatal),
+            reason=str(cpp_result.reason),
+        )
 
     def supports_inflight_request_cancellation(self) -> bool:
         return self._supports_inflight_request_cancellation

@@ -81,6 +81,9 @@ class _FakeExecutor:
     def _check_disagg_ctx_cache_transfer_status(self, _):
         return None
 
+    def _requires_physical_transfer_drain(self):
+        return PyExecutor._requires_physical_transfer_drain(self)
+
 
 class TestSendKvAsyncReleasesIndexSlot:
     """Test that `_send_kv_async` releases the IndexMapper slot before the

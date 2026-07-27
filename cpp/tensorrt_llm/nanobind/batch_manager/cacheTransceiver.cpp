@@ -24,6 +24,8 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include <ATen/ATen.h>
+#include <chrono>
+#include <cstdint>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -88,6 +90,56 @@ public:
 
 void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
 {
+    nb::enum_<tb::LogicalDisposition>(m, "LogicalDisposition")
+        .value("ACCEPTED", tb::LogicalDisposition::kACCEPTED)
+        .value("ALREADY_TERMINAL", tb::LogicalDisposition::kALREADY_TERMINAL)
+        .value("NOT_FOUND", tb::LogicalDisposition::kNOT_FOUND)
+        .value("REJECTED", tb::LogicalDisposition::kREJECTED);
+
+    nb::enum_<tb::PhysicalDisposition>(m, "PhysicalDisposition")
+        .value("NOT_EXPOSED", tb::PhysicalDisposition::kNOT_EXPOSED)
+        .value("ACTIVE", tb::PhysicalDisposition::kACTIVE)
+        .value("QUIESCING", tb::PhysicalDisposition::kQUIESCING)
+        .value("QUIESCED_SUCCESS", tb::PhysicalDisposition::kQUIESCED_SUCCESS)
+        .value("QUIESCED_FAILURE", tb::PhysicalDisposition::kQUIESCED_FAILURE)
+        .value("IN_DOUBT", tb::PhysicalDisposition::kIN_DOUBT);
+
+    nb::class_<tb::TransceiverCapabilities>(m, "TransceiverCapabilities")
+        .def_ro("protocol_version", &tb::TransceiverCapabilities::protocolVersion)
+        .def_ro("qualified_legacy_mode", &tb::TransceiverCapabilities::qualifiedLegacyMode)
+        .def_ro("attempt_identity", &tb::TransceiverCapabilities::attemptIdentity)
+        .def_ro("endpoint_incarnation", &tb::TransceiverCapabilities::endpointIncarnation)
+        .def_ro("allocation_generation_leases", &tb::TransceiverCapabilities::allocationGenerationLeases)
+        .def_ro("cancel_before_create_tombstones", &tb::TransceiverCapabilities::cancelBeforeCreateTombstones)
+        .def_ro("publication_gate", &tb::TransceiverCapabilities::publicationGate)
+        .def_ro("in_flight_cancellation", &tb::TransceiverCapabilities::inFlightCancellation)
+        .def_ro("exact_writer_tracking", &tb::TransceiverCapabilities::exactWriterTracking)
+        .def_ro("submission_fence", &tb::TransceiverCapabilities::submissionFence)
+        .def_ro("per_operation_quiescence", &tb::TransceiverCapabilities::perOperationQuiescence)
+        .def_ro("endpoint_wide_quiescence", &tb::TransceiverCapabilities::endpointWideQuiescence)
+        .def_ro("direct_transfer", &tb::TransceiverCapabilities::directTransfer)
+        .def_ro("bounce_transfer", &tb::TransceiverCapabilities::bounceTransfer)
+        .def_ro("multi_writer", &tb::TransceiverCapabilities::multiWriter)
+        .def_ro("generation_first", &tb::TransceiverCapabilities::generationFirst)
+        .def_ro("pipeline_parallel", &tb::TransceiverCapabilities::pipelineParallel)
+        .def_ro("tensor_parallel", &tb::TransceiverCapabilities::tensorParallel)
+        .def_ro("attention_data_parallel", &tb::TransceiverCapabilities::attentionDataParallel)
+        .def_ro("terminal_result_replay", &tb::TransceiverCapabilities::terminalResultReplay);
+
+    nb::class_<tb::CancelResult>(m, "CancelResult")
+        .def_ro("logical", &tb::CancelResult::logical)
+        .def_ro("physical", &tb::CancelResult::physical)
+        .def_ro("retryable", &tb::CancelResult::retryable)
+        .def_ro("reason", &tb::CancelResult::reason)
+        .def_prop_ro("safe_to_reuse", &tb::CancelResult::safeToReuse);
+
+    nb::class_<tb::ShutdownResult>(m, "ShutdownResult")
+        .def_ro("physical", &tb::ShutdownResult::physical)
+        .def_ro("in_doubt_context_count", &tb::ShutdownResult::inDoubtContextCount)
+        .def_ro("fatal", &tb::ShutdownResult::fatal)
+        .def_ro("reason", &tb::ShutdownResult::reason)
+        .def_prop_ro("safe_to_release_managers", &tb::ShutdownResult::safeToReleaseManagers);
+
     nb::class_<tb::BaseCacheTransceiver, PyCacheTransceiver>(m, "BaseCacheTransceiver")
         .def("respond_and_send_async", &BaseCacheTransceiver::respondAndSendAsync)
         .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync,
@@ -120,6 +172,16 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
         .def("cancel_request", &BaseCacheTransceiver::cancelRequest)
+        .def("capabilities", &BaseCacheTransceiver::getLifecycleCapabilities)
+        .def("cancel_session", &BaseCacheTransceiver::cancelSession, nb::arg("request"), nb::arg("reason") = "")
+        .def("poll_session", &BaseCacheTransceiver::pollSession, nb::arg("request_id"))
+        .def("fence_submission", &BaseCacheTransceiver::fenceSubmission, nb::arg("request_id"))
+        .def("quiesce_session", &BaseCacheTransceiver::quiesceSession, nb::arg("request_id"))
+        .def(
+            "shutdown_lifecycle",
+            [](tb::BaseCacheTransceiver& self, std::int64_t deadline_ms)
+            { return self.shutdownLifecycle(std::chrono::milliseconds(deadline_ms)); },
+            nb::arg("deadline_ms"))
         .def("has_poisoned_transfer_buffer", &BaseCacheTransceiver::hasPoisonedTransferBuffer);
 
     nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")

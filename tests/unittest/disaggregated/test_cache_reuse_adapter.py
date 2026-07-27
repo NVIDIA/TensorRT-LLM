@@ -290,7 +290,12 @@ def _build_transceiver_for_kv_slice(num_extra_kv_tokens: int, prompt_len: int):
       - cache manager: num_extra_kv_tokens (read in this code path)
     """
     tokens_per_block = 8
-    layer_group = AttentionLayerGroup(pool_group_idx=0, kv_head_num_per_rank=1)
+    window_size = 4096
+    layer_group = AttentionLayerGroup(
+        pool_group_idx=0,
+        kv_head_num_per_rank=1,
+        sliding_window_size=window_size,
+    )
     total_blocks = (prompt_len + num_extra_kv_tokens + tokens_per_block - 1) // tokens_per_block
     block_ids = np.arange(total_blocks, dtype=np.int64)
 
@@ -300,7 +305,27 @@ def _build_transceiver_for_kv_slice(num_extra_kv_tokens: int, prompt_len: int):
         get_block_ids=lambda req, idx, lg: block_ids,
     )
     page_table = SimpleNamespace(layer_groups=[layer_group])
-    cache_manager = SimpleNamespace(num_extra_kv_tokens=num_extra_kv_tokens)
+    lease_snapshot = SimpleNamespace(
+        lease_id=1,
+        identity=SimpleNamespace(allocation_generation=1),
+        blocks=tuple(
+            SimpleNamespace(
+                window_size=window_size,
+                block_index=block_index,
+                beam_index=0,
+                primary_pool_index=int(block_id),
+            )
+            for block_index, block_id in enumerate(block_ids)
+        ),
+    )
+    lease_handle = SimpleNamespace(
+        snapshot=lease_snapshot,
+        settle=lambda proof: SimpleNamespace(name="RELEASED"),
+    )
+    cache_manager = SimpleNamespace(
+        num_extra_kv_tokens=num_extra_kv_tokens,
+        snapshot_and_lease=lambda request_id: lease_handle,
+    )
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._reuse_adapter = reuse_adapter

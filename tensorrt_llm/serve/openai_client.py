@@ -18,7 +18,7 @@ import json
 import os
 import traceback
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Awaitable, Callable, List, Optional, Tuple, Type
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Tuple, Type
 
 import aiohttp
 
@@ -27,6 +27,18 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.disagg_auth import (
     build_internal_disagg_auth_headers,
     request_requires_internal_disagg_auth,
+)
+from tensorrt_llm.serve.disagg_lifecycle_control import (
+    CONTEXT_ARTIFACT_ABORT_PATH,
+    GENERATION_GRANT_ABORT_PATH,
+    GENERATION_GRANT_PATH,
+    GENERATION_GRANT_RENEW_PATH,
+    ContextArtifactAbortRequest,
+    GenerationGrantAbortRequest,
+    GenerationGrantDecisionResponse,
+    GenerationGrantRenewRequest,
+    GenerationGrantRequest,
+    ObligationResponse,
 )
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -73,7 +85,106 @@ def _metrics_phase(role: ServerRole) -> str:
     return "ctx" if role is ServerRole.CONTEXT else "gen"
 
 
+class _OwnedAsyncGenerator(AsyncGenerator[Any, None]):
+    """Finalize an async stream exactly once, including before first iteration."""
+
+    def __init__(
+        self,
+        generator: AsyncGenerator[Any, None],
+        on_finish: Callable[[bool], Awaitable[None]],
+    ) -> None:
+        self._generator = generator
+        self._on_finish = on_finish
+        self._finish_task: Optional[asyncio.Task] = None
+        self._closed = False
+
+    async def _finish(self, success: bool) -> None:
+        if self._finish_task is None:
+            self._finish_task = asyncio.create_task(self._on_finish(success))
+        await asyncio.shield(self._finish_task)
+
+    async def __anext__(self) -> Any:
+        return await self.asend(None)
+
+    async def asend(self, value: Any) -> Any:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            return await self._generator.asend(value)
+        except StopAsyncIteration:
+            self._closed = True
+            await self._finish(success=True)
+            raise
+        except BaseException:
+            self._closed = True
+            await self._finish(success=False)
+            raise
+
+    async def athrow(self, typ, val=None, tb=None) -> Any:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            if tb is not None:
+                return await self._generator.athrow(typ, val, tb)
+            if val is not None:
+                return await self._generator.athrow(typ, val)
+            return await self._generator.athrow(typ)
+        except BaseException:
+            self._closed = True
+            await self._finish(success=False)
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            if self._finish_task is not None:
+                await asyncio.shield(self._finish_task)
+            return
+        self._closed = True
+        try:
+            await self._generator.aclose()
+        finally:
+            await self._finish(success=False)
+
+
 class OpenAIClient(ABC):
+    async def abort_context_artifact(
+        self,
+        request: ContextArtifactAbortRequest,
+        *,
+        server: str,
+    ) -> ObligationResponse:
+        raise NotImplementedError("this OpenAI client does not implement context-artifact abort")
+
+    async def issue_generation_grant(
+        self,
+        request: GenerationGrantRequest,
+        *,
+        server: str,
+    ) -> GenerationGrantDecisionResponse:
+        raise NotImplementedError(
+            "this OpenAI client does not implement disaggregated GEN admission"
+        )
+
+    async def renew_generation_grant(
+        self,
+        request: GenerationGrantRenewRequest,
+        *,
+        server: str,
+    ) -> ObligationResponse:
+        raise NotImplementedError(
+            "this OpenAI client does not implement disaggregated GEN grant renewal"
+        )
+
+    async def abort_generation_grant(
+        self,
+        request: GenerationGrantAbortRequest,
+        *,
+        server: str,
+    ) -> ObligationResponse:
+        raise NotImplementedError(
+            "this OpenAI client does not implement disaggregated GEN grant abort"
+        )
+
     async def send_request(
         self,
         request: UCompletionRequest,
@@ -136,6 +247,19 @@ class OpenAIClient(ABC):
 
 
 class OpenAIHttpClient(OpenAIClient):
+    async def abort_context_artifact(
+        self,
+        request: ContextArtifactAbortRequest,
+        *,
+        server: str,
+    ) -> ObligationResponse:
+        response = await self._post_lifecycle_control(
+            server,
+            CONTEXT_ARTIFACT_ABORT_PATH,
+            request.model_dump(mode="json"),
+        )
+        return ObligationResponse.model_validate(response)
+
     def __init__(
         self,
         router: Router,
@@ -194,12 +318,21 @@ class OpenAIHttpClient(OpenAIClient):
         _dp = request.disaggregated_params
         _ctx_rid = _dp.ctx_request_id if _dp is not None else None
         logger.debug(f"Sending {self._role} request {_ctx_rid} to {url}")
+        router_finalization_started = False
         try:
             self._metrics_collector.total_requests.inc()
             resp_generator = self._post_with_retry(server, url, request, hooks, req_id)
             if request.stream:
-                # return the response generator, the request is not done yet
-                return resp_generator
+                # The wrapper owns router finalization even when the caller
+                # closes the lazy stream before its first ``__anext__()``.
+                async def _finish_stream(success: bool) -> None:
+                    await self._finish_request(
+                        request,
+                        success=success,
+                        req_id=req_id,
+                    )
+
+                return _OwnedAsyncGenerator(resp_generator, _finish_stream)
             else:
                 # consume the generator to get the response and return it directly when it's not streaming
                 response = None
@@ -211,12 +344,87 @@ class OpenAIHttpClient(OpenAIClient):
                         else:
                             hooks.on_first_token(server, request)
                             hooks.on_resp_done(server, request, response)
+                router_finalization_started = True
+                await self._finish_request(request, req_id=req_id)
                 return response
+        except asyncio.CancelledError:
+            self._metrics_collector.error_requests.inc()
+            # Once dispatch starts, the client exclusively owns router
+            # finalization.  In particular, coordinator cancellation must not
+            # leave a reservation live or let a second layer finish it again.
+            if not router_finalization_started:
+                router_finalization_started = True
+                await self._finish_request(request, success=False, req_id=req_id)
+            raise
         except Exception:
             self._metrics_collector.error_requests.inc()
             # finish the request upon error
-            await self._finish_request(request, success=False, req_id=req_id)
+            if not router_finalization_started:
+                router_finalization_started = True
+                await self._finish_request(request, success=False, req_id=req_id)
             raise
+
+    async def issue_generation_grant(
+        self,
+        request: GenerationGrantRequest,
+        *,
+        server: str,
+    ) -> GenerationGrantDecisionResponse:
+        response = await self._post_lifecycle_control(
+            server,
+            GENERATION_GRANT_PATH,
+            request.model_dump(mode="json"),
+        )
+        return GenerationGrantDecisionResponse.model_validate(response)
+
+    async def renew_generation_grant(
+        self,
+        request: GenerationGrantRenewRequest,
+        *,
+        server: str,
+    ) -> ObligationResponse:
+        response = await self._post_lifecycle_control(
+            server,
+            GENERATION_GRANT_RENEW_PATH,
+            request.model_dump(mode="json"),
+        )
+        return ObligationResponse.model_validate(response)
+
+    async def abort_generation_grant(
+        self,
+        request: GenerationGrantAbortRequest,
+        *,
+        server: str,
+    ) -> ObligationResponse:
+        response = await self._post_lifecycle_control(
+            server,
+            GENERATION_GRANT_ABORT_PATH,
+            request.model_dump(mode="json"),
+        )
+        return ObligationResponse.model_validate(response)
+
+    async def _post_lifecycle_control(
+        self,
+        server: str,
+        endpoint: str,
+        body: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        url = (
+            f"{server.rstrip('/')}{endpoint}"
+            if server.startswith(("http://", "https://"))
+            else f"http://{server.rstrip('/')}{endpoint}"
+        )
+        async with self._session.post(url, json=body) as response:
+            payload = await response.text()
+            if response.status >= 400:
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=response.status,
+                    message=f"{response.reason}: {payload[:2048]}",
+                    headers=response.headers,
+                )
+            return json.loads(payload)
 
     async def _post_with_retry(
         self,
@@ -235,9 +443,18 @@ class OpenAIHttpClient(OpenAIClient):
         loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
         for attempt in range(loop_max):
             # Regenerate disagg_request_id on retry to avoid ID collision on workers
-            if attempt > 0 and self._disagg_id_generator is not None:
+            if attempt > 0:
                 dp = getattr(request, "disaggregated_params", None)
-                if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
+                if dp is not None and getattr(dp, "logical_request_id", None) is not None:
+                    raise RuntimeError(
+                        "generation-safe disaggregated retries require a new "
+                        "coordinator-issued handoff attempt"
+                    )
+                if (
+                    self._disagg_id_generator is not None
+                    and dp is not None
+                    and getattr(dp, "disagg_request_id", None) is not None
+                ):
                     dp.disagg_request_id = await self._disagg_id_generator()
                     if hooks:
                         hooks.on_disagg_request_id(dp.disagg_request_id)
@@ -293,11 +510,19 @@ class OpenAIHttpClient(OpenAIClient):
                     if is_stream:
                         # do NOT return generator directly here or the response will go
                         # out of scope and get destroyed
-                        async for line in self._response_generator(
-                            request, http_response, start_time, server, hooks, req_id
-                        ):
-                            lines_yielded += 1
-                            yield line
+                        response_generator = self._response_generator(
+                            request, http_response, start_time, server, hooks
+                        )
+                        try:
+                            async for line in response_generator:
+                                lines_yielded += 1
+                                yield line
+                        finally:
+                            # Closing an outer async generator does not
+                            # implicitly close a nested iterator.  Close it
+                            # synchronously so its router-finalization owner
+                            # records an early consumer close as failure.
+                            await response_generator.aclose()
                         # don't finish the request here since the response generator is not done yet
                     else:
                         if http_response.status >= 400:
@@ -312,8 +537,6 @@ class OpenAIHttpClient(OpenAIClient):
                         response_dict = await http_response.json()
                         # yield here since python forbids return statements in async generators
                         yield response_dict
-                        # finish the request after the successful response
-                        await self._finish_request(request, req_id=req_id)
                         self._metrics_collector.complete_latency_seconds.observe(
                             get_steady_clock_now_in_seconds() - start_time
                         )
@@ -363,13 +586,11 @@ class OpenAIHttpClient(OpenAIClient):
         start_time: float,
         server: str,
         hooks: Optional[ResponseHooks] = None,
-        req_id: Optional[int] = None,
     ) -> AsyncGenerator[Any, None]:
         assert request.stream, "Request is not streaming"
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
             "Response is not streaming"
         )
-        success = True
         try:
             last_token_time = start_time
             chunk_count = 0
@@ -440,15 +661,19 @@ class OpenAIHttpClient(OpenAIClient):
             # a client error is expected when the response stream is done if the connector has close=True
             logger.error(f"{self._role} client {server} error: {e}")
             self._metrics_collector.error_requests.inc()
-            success = False
+            raise
+        except asyncio.CancelledError:
+            self._metrics_collector.error_requests.inc()
+            raise
+        except GeneratorExit:
+            # ``aclose()`` injects GeneratorExit rather than Exception.  Treat
+            # an early consumer close as failure so cache-aware routing never
+            # promotes blocks from an incomplete request.
+            self._metrics_collector.error_requests.inc()
             raise
         except Exception:
             self._metrics_collector.error_requests.inc()
-            success = False
             raise
-        finally:
-            # finish the request after streaming response is done or error is raised
-            await self._finish_request(request, success=success, req_id=req_id)
 
     async def _finish_request(
         self,

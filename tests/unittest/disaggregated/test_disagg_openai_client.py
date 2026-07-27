@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
@@ -317,6 +318,56 @@ class TestOpenAIHttpClient:
         )
         mock_router.finish_request.assert_called_once_with(
             streaming_completion_request, mock_session, success=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_early_stream_close_finishes_router_once_as_failure(
+        self,
+        openai_client,
+        streaming_completion_request,
+        mock_session,
+        mock_router,
+    ):
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 200
+        mock_http_response.headers = {"Content-Type": "text/event-stream"}
+
+        async def mock_iter_any():
+            yield b'data: "first"\n\n'
+            await asyncio.Future()
+
+        mock_http_response.content = AsyncMock()
+        mock_http_response.content.iter_any = mock_iter_any
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = mock_http_response
+
+        response_generator = await openai_client.send_request(streaming_completion_request)
+        assert await response_generator.__anext__() == b'data: "first"\n\n'
+        await response_generator.aclose()
+
+        mock_router.finish_request.assert_awaited_once_with(
+            streaming_completion_request,
+            mock_session,
+            success=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_immediate_stream_close_finishes_router_without_dispatch(
+        self,
+        openai_client,
+        streaming_completion_request,
+        mock_session,
+        mock_router,
+    ):
+        response_generator = await openai_client.send_request(streaming_completion_request)
+        await response_generator.aclose()
+
+        mock_session.post.assert_not_called()
+        mock_router.finish_request.assert_awaited_once_with(
+            streaming_completion_request,
+            mock_session,
+            success=False,
         )
 
     @pytest.mark.asyncio

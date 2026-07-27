@@ -16,6 +16,7 @@ import copy
 import enum
 import math
 import os
+import threading
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
@@ -55,6 +56,8 @@ from .scheduler import ScheduledRequests
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
 PoolConfigurationCpp = tensorrt_llm.bindings.internal.batch_manager.PoolConfiguration
+AllocationLeaseSliceSpecCpp = (
+    tensorrt_llm.bindings.internal.batch_manager.AllocationLeaseSliceSpec)
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 ModelConfigCpp = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
@@ -90,6 +93,31 @@ class PoolConfiguration:
     window_size: int
     head_dim: int
     dtype: "DataType"
+
+
+@dataclass(frozen=True)
+class KVCacheAllocationLease:
+    """Explicit handle for one allocator-owned V1 KV allocation lease.
+
+    Garbage collection intentionally does not settle this handle. The caller
+    must provide a reusable physical disposition after the protected accessor
+    is quiescent.
+    """
+
+    snapshot: object
+    _manager: object
+
+    @property
+    def identity(self):
+        return self.snapshot.identity
+
+    def settle(self, physical_disposition):
+        """Settle this exact lease without consulting a request-ID mapping."""
+        return self._manager.settle_allocation_lease(
+            self.snapshot.lease_id,
+            self.snapshot.identity,
+            physical_disposition,
+        )
 
 
 class ResourceManagerType(enum.Enum):
@@ -734,6 +762,29 @@ class KVCacheManager(BaseResourceManager):
     def shutdown(self):
         self.impl.release_pools()
 
+    def snapshot_and_lease(
+        self,
+        request_id: int,
+        slice_spec=None,
+    ) -> KVCacheAllocationLease:
+        """Lease the exact V1 allocation currently assigned to ``request_id``.
+
+        The allocator revalidates the generation between identity lookup and
+        pinning, so request-ID reuse can only make acquisition fail; it cannot
+        redirect the lease to a newer allocation.
+        """
+        identity = self.impl.get_allocation_identity(request_id)
+        if identity is None:
+            raise KeyError(f"KV cache for request {request_id} does not exist")
+        if slice_spec is None:
+            slice_spec = AllocationLeaseSliceSpecCpp()
+        snapshot = self.impl.snapshot_and_lease(identity, slice_spec)
+        if snapshot is None:
+            raise RuntimeError(
+                f"KV cache allocation for request {request_id} changed or is shutting down"
+            )
+        return KVCacheAllocationLease(snapshot, self.impl)
+
     def get_max_resource_count(self) -> int:
         return self.impl.max_num_blocks
 
@@ -1076,7 +1127,7 @@ class KVCacheManager(BaseResourceManager):
 
     def store_blocks_for_reuse(self,
                                request: LlmRequest,
-                               pin_blocks: bool = False):
+                               pin_blocks: bool = False) -> List[int]:
         return self.impl.store_blocks_for_reuse(request.py_request_id, request,
                                                 pin_blocks)
 
@@ -1353,8 +1404,8 @@ class KVCacheManager(BaseResourceManager):
             self.impl.commit_and_get_block_hashes_for_request(
                 request, window_size))
 
-    def unpin_blocks_by_id(self, kv_cache_block_id: int):
-        self.impl.unpin_blocks_by_id(kv_cache_block_id)
+    def unpin_blocks_by_id(self, block_ids: List[int]) -> None:
+        self.impl.unpin_blocks_by_id(block_ids)
 
     def get_last_block_id(self, request_id: int) -> int:
         return self.impl.get_last_block_id(request_id)
@@ -2574,11 +2625,43 @@ class KVCacheCompressionManager(BaseResourceManager):
         self.on_request_finish(request)
 
 
+@dataclass
+class _ResourceReleaseProgress:
+    request: LlmRequest
+    release_plan: Tuple[BaseResourceManager, ...]
+    next_manager: int = 0
+    in_doubt_manager: Optional[int] = None
+    manager_call_active: bool = False
+    failure: Optional[str] = None
+
+
+@dataclass
+class _TransferResourceReleaseProgress:
+    request: LlmRequest
+    completed_managers: Set[ResourceManagerType]
+    in_doubt_manager: Optional[ResourceManagerType] = None
+    manager_call_active: bool = False
+    failure: Optional[str] = None
+
+
 class ResourceManager:
 
     def __init__(self, resource_managers: dict[ResourceManagerType,
                                                BaseResourceManager]):
         self.resource_managers = OrderedDict(resource_managers)
+        # Keep the exact request and a stable teardown plan rooted while a
+        # multi-manager release is incomplete. A retry never invokes managers
+        # that already returned. A manager that raised remains in doubt and
+        # blocks teardown because its internal mutation boundary is unknown.
+        self._resource_release_progress: Dict[int,
+                                              _ResourceReleaseProgress] = {}
+        # Async transfer admission releases seq/spec resources early. Record
+        # each successful manager here so final request teardown never invokes
+        # it again, while an exception remains fail-closed and exact-request
+        # rooted.
+        self._transfer_resource_release_progress: Dict[
+            int, _TransferResourceReleaseProgress] = {}
+        self._resource_release_lock = threading.RLock()
 
     def __call__(self, type: ResourceManagerType):
         return self.resource_managers[type]
@@ -2614,10 +2697,192 @@ class ResourceManager:
                     resource_manager.update_resources(scheduled_batch)
 
     def free_resources(self, request: LlmRequest):
-        for resource_type, resource_manager in reversed(
-                self.resource_managers.items()):
-            if hasattr(resource_manager, "free_resources"):
-                resource_manager.free_resources(request)
+        request_key = id(request)
+        while True:
+            with self._resource_release_lock:
+                transfer_progress = self._transfer_resource_release_progress.get(
+                    request_key)
+                if (transfer_progress is not None
+                        and transfer_progress.request is not request):
+                    raise RuntimeError(
+                        "transfer resource release identity collision for request "
+                        f"{request.py_request_id}")
+                if (transfer_progress is not None
+                        and transfer_progress.in_doubt_manager is not None):
+                    if transfer_progress.manager_call_active:
+                        raise RuntimeError(
+                            "transfer resource release is already in progress for "
+                            f"request {request.py_request_id} at manager "
+                            f"{transfer_progress.in_doubt_manager.value}")
+                    raise RuntimeError(
+                        "transfer resource release outcome is in doubt for request "
+                        f"{request.py_request_id} at manager "
+                        f"{transfer_progress.in_doubt_manager.value}: "
+                        f"{transfer_progress.failure}")
+
+                progress = self._resource_release_progress.get(request_key)
+                if progress is not None and progress.request is not request:
+                    raise RuntimeError(
+                        "resource release identity collision for request "
+                        f"{request.py_request_id}")
+
+                if progress is None:
+                    release_plan = tuple(
+                        resource_manager
+                        for resource_mgr_type, resource_manager in reversed(
+                            self.resource_managers.items())
+                        if (transfer_progress is None or resource_mgr_type
+                            not in transfer_progress.completed_managers)
+                        if hasattr(resource_manager, "free_resources"))
+                    progress = _ResourceReleaseProgress(request, release_plan)
+                    self._resource_release_progress[request_key] = progress
+
+                if progress.in_doubt_manager is not None:
+                    if progress.manager_call_active:
+                        raise RuntimeError(
+                            "resource release is already in progress for request "
+                            f"{request.py_request_id} at manager index "
+                            f"{progress.in_doubt_manager}")
+                    raise RuntimeError(
+                        "resource release outcome is in doubt for request "
+                        f"{request.py_request_id} at manager index "
+                        f"{progress.in_doubt_manager}: {progress.failure}")
+
+                if progress.next_manager == len(progress.release_plan):
+                    if self._resource_release_progress.get(
+                            request_key) is progress:
+                        self._resource_release_progress.pop(request_key)
+                    if (transfer_progress is not None
+                            and self._transfer_resource_release_progress.get(
+                                request_key) is transfer_progress):
+                        self._transfer_resource_release_progress.pop(
+                            request_key)
+                    return
+
+                # Reserve one exact manager attempt under synchronization, then
+                # release the global metadata lock before arbitrary allocator or
+                # callback code runs. A concurrent call for this same request
+                # fails closed, while unrelated requests can continue.
+                manager_index = progress.next_manager
+                manager = progress.release_plan[manager_index]
+                progress.in_doubt_manager = manager_index
+                progress.manager_call_active = True
+
+            try:
+                manager.free_resources(request)
+            except Exception as error:
+                with self._resource_release_lock:
+                    if (self._resource_release_progress.get(request_key)
+                            is progress):
+                        progress.manager_call_active = False
+                        progress.failure = f"{type(error).__name__}: {error}"
+                raise
+
+            with self._resource_release_lock:
+                if self._resource_release_progress.get(
+                        request_key) is not progress:
+                    raise RuntimeError(
+                        "resource release progress disappeared for request "
+                        f"{request.py_request_id}")
+                if (progress.in_doubt_manager != manager_index
+                        or not progress.manager_call_active):
+                    raise RuntimeError(
+                        "resource release progress changed during callback for "
+                        f"request {request.py_request_id}")
+                progress.next_manager += 1
+                progress.in_doubt_manager = None
+                progress.manager_call_active = False
+                progress.failure = None
+
+    def release_resource_for_transfer(
+            self, request: LlmRequest,
+            resource_mgr_type: ResourceManagerType) -> None:
+        """Release one manager early and remember it through final teardown."""
+        request_key = id(request)
+        with self._resource_release_lock:
+            final_progress = self._resource_release_progress.get(request_key)
+            if final_progress is not None:
+                if final_progress.request is not request:
+                    raise RuntimeError(
+                        "resource release identity collision for request "
+                        f"{request.py_request_id}")
+                raise RuntimeError(
+                    "final resource release already started for request "
+                    f"{request.py_request_id}; refusing an early transfer "
+                    "release")
+
+            progress = self._transfer_resource_release_progress.get(request_key)
+            if progress is not None and progress.request is not request:
+                raise RuntimeError(
+                    "transfer resource release identity collision for request "
+                    f"{request.py_request_id}")
+            if progress is None:
+                progress = _TransferResourceReleaseProgress(request, set())
+                self._transfer_resource_release_progress[request_key] = progress
+
+            if progress.in_doubt_manager is not None:
+                if progress.manager_call_active:
+                    raise RuntimeError(
+                        "transfer resource release is already in progress for "
+                        f"request {request.py_request_id} at manager "
+                        f"{progress.in_doubt_manager.value}")
+                raise RuntimeError(
+                    "transfer resource release outcome is in doubt for request "
+                    f"{request.py_request_id} at manager "
+                    f"{progress.in_doubt_manager.value}: {progress.failure}")
+            if resource_mgr_type in progress.completed_managers:
+                return
+
+            manager = self.resource_managers.get(resource_mgr_type)
+            if manager is None or not hasattr(manager, "free_resources"):
+                progress.completed_managers.add(resource_mgr_type)
+                return
+
+            progress.in_doubt_manager = resource_mgr_type
+            progress.manager_call_active = True
+
+        try:
+            manager.free_resources(request)
+        except Exception as error:
+            with self._resource_release_lock:
+                if self._transfer_resource_release_progress.get(
+                        request_key) is progress:
+                    progress.manager_call_active = False
+                    progress.failure = f"{type(error).__name__}: {error}"
+            raise
+
+        with self._resource_release_lock:
+            if self._transfer_resource_release_progress.get(
+                    request_key) is not progress:
+                raise RuntimeError(
+                    "transfer resource release progress disappeared for request "
+                    f"{request.py_request_id}")
+            if (progress.in_doubt_manager != resource_mgr_type
+                    or not progress.manager_call_active):
+                raise RuntimeError(
+                    "transfer resource release progress changed during callback "
+                    f"for request {request.py_request_id}")
+            progress.completed_managers.add(resource_mgr_type)
+            progress.in_doubt_manager = None
+            progress.manager_call_active = False
+            progress.failure = None
+
+    def has_in_doubt_resource_releases(self) -> bool:
+        """Whether a resource manager raised after release was attempted."""
+        with self._resource_release_lock:
+            return (any(
+                progress.in_doubt_manager is not None
+                and not progress.manager_call_active
+                for progress in self._resource_release_progress.values())
+                    or any(progress.in_doubt_manager is not None
+                           and not progress.manager_call_active for progress in
+                           self._transfer_resource_release_progress.values()))
+
+    def has_pending_resource_releases(self) -> bool:
+        """Whether an exact request is rooted in either release ledger."""
+        with self._resource_release_lock:
+            return bool(self._resource_release_progress
+                        or self._transfer_resource_release_progress)
 
     def reorder_pipeline(self,
                          resource_manager_list: list[ResourceManagerType]):

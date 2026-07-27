@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import dataclasses
 import json
@@ -35,6 +50,7 @@ from .utils import (EngineDeadError, ErrorResponse, has_event_loop,
                     is_llm_response)
 
 if TYPE_CHECKING:
+    from .._torch.disaggregation.handoff import HandoffLifecycleEvent
     from .executor import GenerationExecutor
     from .postproc_worker import PostprocParams, PostprocWorker
     from .request import GenerationRequest
@@ -196,6 +212,8 @@ class GenerationResultBase:
         # is permanently failed: result()/aresult()/_exception() re-raise it on
         # every subsequent call instead of looking successful.
         self._terminal_error: Optional[BaseException] = None
+        self._disagg_handoff_event: Optional["HandoffLifecycleEvent"] = None
+        self._disagg_handoff_ready = asyncio.Event()
         self._aborted = False
         self.metrics_dict = {}
         self.candidate_metrics: list[dict] = []
@@ -451,9 +469,11 @@ class GenerationResultBase:
     @nvtx_range_debug("handle_response",
                       color="red",
                       category="GenerationResultBase")
-    def _handle_response(self,
-                         response: Union["PostprocWorker.Output", tllm.Response,
-                                         ResponseWrapper, ErrorResponse]):
+    def _handle_response(
+        self, response: Union["PostprocWorker.Output", tllm.Response,
+                              ResponseWrapper, ErrorResponse]
+    ) -> bool:
+        """Apply one response and report whether it contained only control data."""
         req_perf_metrics_dict = None
         if isinstance(response, ResponseWrapper):
             req_perf_metrics_dict = response.request_perf_metrics
@@ -461,6 +481,25 @@ class GenerationResultBase:
             response = response._response
         else:
             logprobs_result = None
+
+        if is_llm_response(response):
+            handoff_event = getattr(response, "disagg_handoff_event", None)
+            if handoff_event is not None:
+                from .._torch.disaggregation.handoff import \
+                    HandoffLifecycleEvent
+
+                if not isinstance(handoff_event, HandoffLifecycleEvent):
+                    raise TypeError(
+                        "disagg_handoff_event must be a HandoffLifecycleEvent")
+                if (self._disagg_handoff_event is not None
+                        and self._disagg_handoff_event != handoff_event):
+                    raise RuntimeError(
+                        "request received conflicting disaggregated handoff events"
+                    )
+                self._disagg_handoff_event = handoff_event
+                self._disagg_handoff_ready.set()
+                if response.result is None and not response.has_error():
+                    return True
 
         if isinstance(response, PostprocWorker.Output):
             self._done = response.is_final
@@ -624,6 +663,15 @@ class GenerationResultBase:
                 handler(response.error_msg)
         else:
             raise ValueError(f"Unknown response type: {response}")
+        return False
+
+    async def _wait_disagg_handoff_event(self) -> "HandoffLifecycleEvent":
+        """Wait without consuming generation output from the result queue."""
+        await self._disagg_handoff_ready.wait()
+        event = self._disagg_handoff_event
+        if event is None:
+            raise RuntimeError("handoff event signaled without event data")
+        return event
 
     def record_stats(self,
                      output: CompletionOutput,
@@ -869,11 +917,12 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         self._post_processor_hook = post_processor_hook
 
     def _handle_response(self, response: "GenerationExecutor.Response"):
-        GenerationResultBase._handle_response(self, response)
+        if GenerationResultBase._handle_response(self, response):
+            return True
 
         # The postprocess has been performed, return directly
         if isinstance(response, PostprocWorker.Output):
-            return
+            return False
 
         kwargs = {
             'skip_special_tokens':
@@ -927,6 +976,7 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                             break
 
             self._apply_post_processor_hook()
+        return False
 
     def _apply_post_processor_hook(self):
         """Run the user post-processing hook at the detok chokepoint.
@@ -1019,28 +1069,35 @@ class GenerationResult(GenerationResultBase):
         # worker dies silently without pushing a terminal response, instead of blocking potentially
         # indefinitely.
         # Raises `queue.Empty` on timeout; `result()` turns that into a `TimeoutError`.
-        response = self.queue.get(timeout=timeout)
-        # Fast-fail: when a worker dies, the proxy enqueues EngineDeadError onto
-        # every pending result so this get() unblocks instead of hanging forever
-        # on a queue whose producer is gone. Record it as the sticky terminal
-        # error and mark the result done before raising, so subsequent
-        # result()/aresult()/_exception() calls keep surfacing the failure
-        # instead of re-blocking on an empty queue or looking successful.
-        if isinstance(response, EngineDeadError):
-            self._terminal_error = response
-            self._done = True
-            raise response
-        self._handle_response(response)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            remaining_s = (None if deadline is None else max(
+                0.0, deadline - time.monotonic()))
+            response = self.queue.get(timeout=remaining_s)
+            # Fast-fail: when a worker dies, the proxy enqueues EngineDeadError onto
+            # every pending result so this get() unblocks instead of hanging forever
+            # on a queue whose producer is gone. Record it as the sticky terminal
+            # error and mark the result done before raising, so subsequent
+            # result()/aresult()/_exception() calls keep surfacing the failure
+            # instead of re-blocking on an empty queue or looking successful.
+            if isinstance(response, EngineDeadError):
+                self._terminal_error = response
+                self._done = True
+                raise response
+            if not self._handle_response(response):
+                return
 
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
-        response = await self.aqueue.get()
-        global_tracer().log_instant("result_step.get")
-        if isinstance(response, EngineDeadError):
-            self._terminal_error = response
-            self._done = True
-            raise response
-        self._handle_response(response)
+        while True:
+            response = await self.aqueue.get()
+            global_tracer().log_instant("result_step.get")
+            if isinstance(response, EngineDeadError):
+                self._terminal_error = response
+                self._done = True
+                raise response
+            if not self._handle_response(response):
+                return
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         """Wait for the completion of the request, and return the result.

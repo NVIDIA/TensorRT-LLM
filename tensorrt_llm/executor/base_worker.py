@@ -50,7 +50,7 @@ from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs, get_metrics_dict)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     bucket_responses_by_frontend, frontend_lane_index,
-                    is_llm_response)
+                    is_control_only_llm_response, is_llm_response)
 
 if TYPE_CHECKING:
     from .._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
@@ -1418,8 +1418,13 @@ def _send_rsp(
         else:
             worker.result_queue.put(response)
     else:
-        sampling_params, postproc_params, disaggregated_params = (
-            _get_params_for_first_rsp(worker, response.client_id))
+        if is_control_only_llm_response(response):
+            sampling_params = None
+            postproc_params = None
+            disaggregated_params = None
+        else:
+            sampling_params, postproc_params, disaggregated_params = (
+                _get_params_for_first_rsp(worker, response.client_id))
         inp = PostprocWorker.Input(
             response,
             # sampling_params is necessary for creating fake GenerationResult
@@ -1445,7 +1450,8 @@ def _send_rsp(
     # Eliminate the finished GenerationRequest instances timely, which may
     # take considerable memory.
     if is_llm_response(response):
-        if response.has_error() or response.result.is_final:
+        if response.has_error() or (not is_control_only_llm_response(response)
+                                    and response.result.is_final):
             worker._pop_result(response.client_id)
     elif isinstance(response, ErrorResponse):
         worker._pop_result(response.client_id)

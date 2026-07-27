@@ -16,11 +16,13 @@ import asyncio
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
 import torch
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams as LlmDisaggregatedParams
+from tensorrt_llm.disaggregated_params import TransceiverLifecycleAdvertisement
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
@@ -31,6 +33,10 @@ from tensorrt_llm.llmapi.disagg_utils import (
 )
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+from tensorrt_llm.serve.disagg_lifecycle_control import (
+    GenerationGrantDecisionResponse,
+    ObligationResponse,
+)
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -63,6 +69,64 @@ def _client_factory(*_args, **_kwargs):
     return AsyncMock()
 
 
+def _transceiver_lifecycle_advertisement() -> dict:
+    return {
+        "protocol_version": 1,
+        "capabilities": [
+            "ALLOCATION_GENERATION_LEASES",
+            "ATTEMPT_IDENTITY",
+            "CANCEL_BEFORE_CREATE_TOMBSTONES",
+            "DIRECT_TRANSFER",
+            "ENDPOINT_INCARNATION",
+            "EXACT_WRITER_TRACKING",
+            "GENERATION_FIRST",
+            "PER_OPERATION_QUIESCENCE",
+            "PUBLICATION_GATE",
+            "SUBMISSION_FENCE",
+            "TERMINAL_RESULT_REPLAY",
+        ],
+        "qualified_legacy_mode": False,
+        "backend": "python",
+        "instance_id": str(uuid4()),
+        "world_size": 1,
+        "tp_size": 1,
+        "pp_size": 1,
+        "cp_size": 1,
+        "attention_dp": False,
+    }
+
+
+def _lifecycle_request_params(
+    advertisement: TransceiverLifecycleAdvertisement,
+    *,
+    request_type: str,
+    context_control_endpoint: str | None = "ctx:9000",
+) -> LlmDisaggregatedParams:
+    identities = [str(uuid4()) for _ in range(4)]
+    return LlmDisaggregatedParams(
+        request_type=request_type,
+        logical_request_id=17,
+        prefill_artifact_id=identities[0],
+        artifact_version=0,
+        handoff_attempt_uuid=identities[1],
+        consumer_grant_id=identities[2],
+        transfer_session_id=identities[3],
+        context_control_endpoint=context_control_endpoint,
+        context_transceiver_lifecycle=advertisement,
+        schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
+    )
+
+
+def _transceiver_server_info() -> dict:
+    return {
+        "server_info": {
+            "disaggregated_params": {
+                "context_transceiver_lifecycle": _transceiver_lifecycle_advertisement(),
+            },
+        },
+    }
+
+
 def _make_service(schedule_style: str) -> OpenAIDisaggregatedService:
     config = DisaggServerConfig(server_configs=[], schedule_style=schedule_style)
     # The coordinator builds its own (empty) routers from config; override them
@@ -77,6 +141,18 @@ def _make_service(schedule_style: str) -> OpenAIDisaggregatedService:
     service._ctx_router = ctx_router
     service._gen_router = gen_router
     return service
+
+
+def test_lifecycle_admission_deadline_is_below_artifact_ttl(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_DISAGG_ARTIFACT_TTL_S", "20")
+    monkeypatch.delenv(
+        "TRTLLM_DISAGG_LIFECYCLE_ADMISSION_TIMEOUT_S",
+        raising=False,
+    )
+
+    service = _make_service("context_first")
+
+    assert service._lifecycle_admission_timeout_s == 10
 
 
 @pytest.mark.asyncio
@@ -206,6 +282,769 @@ async def _mock_streaming_response(chunks):
         yield chunk
 
 
+def _response_with_request_lifecycle(
+    request,
+    *,
+    finish_reason: str,
+    context_only: bool,
+) -> CompletionResponse:
+    values = request.disaggregated_params.model_dump()
+    values.update(
+        request_type="context_only" if context_only else "generation_only",
+        ctx_request_id=request.disaggregated_params.disagg_request_id,
+    )
+    params = DisaggregatedParams.model_validate(values)
+    return CompletionResponse(
+        model="test-model",
+        usage=UsageInfo(
+            prompt_tokens=3,
+            completion_tokens=0 if context_only else 1,
+            total_tokens=3 if context_only else 4,
+        ),
+        prompt_token_ids=[1, 2, 3],
+        choices=[
+            CompletionResponseChoice(
+                index=0,
+                text="" if context_only else "done",
+                finish_reason=finish_reason,
+                disaggregated_params=params,
+            )
+        ],
+    )
+
+
+def _accepted_generation_grant() -> GenerationGrantDecisionResponse:
+    return GenerationGrantDecisionResponse(
+        lifecycle_protocol_version=1,
+        accepted=True,
+        generation_endpoint_name="gen:9001",
+        generation_endpoint_rank=0,
+        generation_endpoint_incarnation=uuid4(),
+        generation_transceiver_lifecycle=_transceiver_lifecycle_advertisement(),
+        ttl_s=600.0,
+    )
+
+
+def _make_generation_safe_service(
+    monkeypatch,
+    schedule_style: str,
+) -> OpenAIDisaggregatedService:
+    monkeypatch.setenv("TRTLLM_DISAGG_LIFECYCLE_PROTOCOL_VERSION", "1")
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service(schedule_style)
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._ctx_router.get_next_server = AsyncMock(
+        return_value=("ctx:9000", _transceiver_server_info())
+    )
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_client.issue_generation_grant = AsyncMock(
+        return_value=_accepted_generation_grant()
+    )
+    service._gen_client.abort_generation_grant = AsyncMock(
+        return_value=ObligationResponse(
+            lifecycle_protocol_version=1,
+            accepted=True,
+            state="REVOKED",
+        )
+    )
+    service._ctx_client.abort_context_artifact = AsyncMock(
+        return_value=ObligationResponse(
+            lifecycle_protocol_version=1,
+            accepted=True,
+            state="ABORTED",
+        )
+    )
+    return service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_generation_safe_cancellation_releases_admitted_request(
+    monkeypatch,
+    schedule_style,
+):
+    service = _make_generation_safe_service(monkeypatch, schedule_style)
+    gen_started = asyncio.Event()
+    gen_cancelled = asyncio.Event()
+    ctx_started = asyncio.Event()
+    ctx_cancelled = asyncio.Event()
+    renewal_started = asyncio.Event()
+    renewal_cancelled = asyncio.Event()
+
+    async def _renew(*_args, **_kwargs):
+        renewal_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            renewal_cancelled.set()
+
+    async def _gen(*_args, **_kwargs):
+        gen_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            gen_cancelled.set()
+
+    async def _ctx(request, *_args, **_kwargs):
+        if schedule_style == "context_first":
+            return _response_with_request_lifecycle(
+                request,
+                finish_reason="length",
+                context_only=True,
+            )
+        ctx_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            ctx_cancelled.set()
+
+    service._renew_generation_grant = _renew
+    service._gen_client.send_request = AsyncMock(side_effect=_gen)
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx)
+
+    task = asyncio.create_task(
+        service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello"))
+    )
+    await asyncio.wait_for(gen_started.wait(), timeout=1)
+    await asyncio.wait_for(renewal_started.wait(), timeout=1)
+    if schedule_style == "generation_first":
+        await asyncio.wait_for(ctx_started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert gen_cancelled.is_set()
+    assert renewal_cancelled.is_set()
+    service._gen_client.abort_generation_grant.assert_awaited_once()
+    # The HTTP clients own router finalization once dispatch starts.
+    service._gen_router.finish_request.assert_not_awaited()
+    service._ctx_client.abort_context_artifact.assert_awaited_once()
+    service._ctx_router.finish_request.assert_not_awaited()
+    if schedule_style == "generation_first":
+        assert ctx_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_context_first_cancellation_aborts_active_prefill(
+    monkeypatch,
+):
+    service = _make_generation_safe_service(monkeypatch, "context_first")
+    ctx_started = asyncio.Event()
+    ctx_cancelled = asyncio.Event()
+
+    async def _ctx(*_args, **_kwargs):
+        ctx_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            ctx_cancelled.set()
+
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx)
+    task = asyncio.create_task(
+        service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello"))
+    )
+    await asyncio.wait_for(ctx_started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert ctx_cancelled.is_set()
+    service._ctx_client.abort_context_artifact.assert_awaited_once()
+    service._gen_client.issue_generation_grant.assert_not_awaited()
+    service._ctx_router.finish_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_generation_safe_early_stream_close_releases_admitted_request(
+    monkeypatch,
+    schedule_style,
+):
+    service = _make_generation_safe_service(monkeypatch, schedule_style)
+    stream_closed = asyncio.Event()
+    renewal_started = asyncio.Event()
+    renewal_cancelled = asyncio.Event()
+
+    async def _renew(*_args, **_kwargs):
+        renewal_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            renewal_cancelled.set()
+
+    async def _stream():
+        try:
+            yield "first"
+            await asyncio.Future()
+        finally:
+            stream_closed.set()
+
+    async def _gen(*_args, **_kwargs):
+        return _stream()
+
+    async def _ctx(request, *_args, **_kwargs):
+        return _response_with_request_lifecycle(
+            request,
+            finish_reason="length",
+            context_only=True,
+        )
+
+    service._renew_generation_grant = _renew
+    service._gen_client.send_request = AsyncMock(side_effect=_gen)
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx)
+
+    response = await service._send_disagg_request(
+        CompletionRequest(
+            model="test-model",
+            prompt="hello",
+            stream=True,
+        )
+    )
+    assert await asyncio.wait_for(response.__anext__(), timeout=1) == "first"
+    await asyncio.wait_for(renewal_started.wait(), timeout=1)
+    await asyncio.wait_for(response.aclose(), timeout=1)
+
+    assert stream_closed.is_set()
+    assert renewal_cancelled.is_set()
+    service._gen_client.abort_generation_grant.assert_awaited_once()
+    service._gen_router.finish_request.assert_not_awaited()
+    service._ctx_client.abort_context_artifact.assert_awaited_once()
+    service._ctx_router.finish_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_generation_safe_immediate_stream_close_releases_admitted_request(
+    monkeypatch,
+    schedule_style,
+):
+    service = _make_generation_safe_service(monkeypatch, schedule_style)
+    stream_closed = asyncio.Event()
+    renewal_started = asyncio.Event()
+    renewal_cancelled = asyncio.Event()
+
+    async def _renew(*_args, **_kwargs):
+        renewal_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            renewal_cancelled.set()
+
+    class _ClosableStream:
+        def __init__(self):
+            self._yielded = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._yielded:
+                self._yielded = True
+                return "first"
+            await asyncio.Future()
+
+        async def aclose(self):
+            stream_closed.set()
+
+    async def _gen(*_args, **_kwargs):
+        return _ClosableStream()
+
+    async def _ctx(request, *_args, **_kwargs):
+        return _response_with_request_lifecycle(
+            request,
+            finish_reason="length",
+            context_only=True,
+        )
+
+    service._renew_generation_grant = _renew
+    service._gen_client.send_request = AsyncMock(side_effect=_gen)
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx)
+
+    response = await service._send_disagg_request(
+        CompletionRequest(
+            model="test-model",
+            prompt="hello",
+            stream=True,
+        )
+    )
+    await asyncio.wait_for(renewal_started.wait(), timeout=1)
+    await asyncio.wait_for(response.aclose(), timeout=1)
+
+    assert stream_closed.is_set()
+    assert renewal_cancelled.is_set()
+    service._gen_client.abort_generation_grant.assert_awaited_once()
+    service._gen_router.finish_request.assert_not_awaited()
+    service._ctx_client.abort_context_artifact.assert_awaited_once()
+    service._ctx_router.finish_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_generation_safe_exhausted_stream_keeps_normal_completion_semantics(
+    monkeypatch,
+    schedule_style,
+):
+    service = _make_generation_safe_service(monkeypatch, schedule_style)
+    context_completed = asyncio.Event()
+    renewal_cancelled = asyncio.Event()
+
+    async def _renew(*_args, **_kwargs):
+        try:
+            await asyncio.Future()
+        finally:
+            renewal_cancelled.set()
+
+    async def _stream():
+        yield "first"
+        await context_completed.wait()
+        yield "last"
+
+    async def _gen(*_args, **_kwargs):
+        return _stream()
+
+    async def _ctx(request, *_args, **_kwargs):
+        context_completed.set()
+        return _response_with_request_lifecycle(
+            request,
+            finish_reason="length",
+            context_only=True,
+        )
+
+    service._renew_generation_grant = _renew
+    service._gen_client.send_request = AsyncMock(side_effect=_gen)
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx)
+
+    response = await service._send_disagg_request(
+        CompletionRequest(
+            model="test-model",
+            prompt="hello",
+            stream=True,
+        )
+    )
+
+    async def _collect_stream():
+        return [chunk async for chunk in response]
+
+    assert await asyncio.wait_for(_collect_stream(), timeout=1) == [
+        "first",
+        "last",
+    ]
+    assert renewal_cancelled.is_set()
+    service._gen_client.abort_generation_grant.assert_not_awaited()
+    service._gen_router.finish_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_generation_safe_failed_renewal_cleans_up_after_stream_exhaustion(
+    monkeypatch,
+    schedule_style,
+):
+    service = _make_generation_safe_service(monkeypatch, schedule_style)
+    context_completed = asyncio.Event()
+    fail_renewal = asyncio.Event()
+    renewal_failed = asyncio.Event()
+
+    async def _renew(*_args, **_kwargs):
+        await fail_renewal.wait()
+        try:
+            raise RuntimeError("generation grant renewal failed")
+        finally:
+            renewal_failed.set()
+
+    async def _stream():
+        yield "first"
+        await context_completed.wait()
+        yield "last"
+
+    async def _gen(*_args, **_kwargs):
+        return _stream()
+
+    async def _ctx(request, *_args, **_kwargs):
+        context_completed.set()
+        return _response_with_request_lifecycle(
+            request,
+            finish_reason="length",
+            context_only=True,
+        )
+
+    service._renew_generation_grant = _renew
+    service._gen_client.send_request = AsyncMock(side_effect=_gen)
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx)
+
+    response = await service._send_disagg_request(
+        CompletionRequest(
+            model="test-model",
+            prompt="hello",
+            stream=True,
+        )
+    )
+    fail_renewal.set()
+    await asyncio.wait_for(renewal_failed.wait(), timeout=1)
+
+    assert await asyncio.wait_for(response.__anext__(), timeout=1) == "first"
+    assert await asyncio.wait_for(response.__anext__(), timeout=1) == "last"
+    with pytest.raises(RuntimeError, match="generation grant renewal failed"):
+        await asyncio.wait_for(response.__anext__(), timeout=1)
+
+    service._gen_client.abort_generation_grant.assert_awaited_once()
+    service._ctx_client.abort_context_artifact.assert_awaited_once()
+    service._gen_router.finish_request.assert_not_awaited()
+    service._ctx_router.finish_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_generation_safe_admission_order_and_endpoint_binding(
+    monkeypatch,
+    schedule_style,
+):
+    monkeypatch.setenv("TRTLLM_DISAGG_LIFECYCLE_PROTOCOL_VERSION", "1")
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service(schedule_style)
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._ctx_router.get_next_server = AsyncMock(
+        return_value=("ctx:9000", _transceiver_server_info())
+    )
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    events = []
+
+    async def _issue(*_args, **_kwargs):
+        events.append("grant")
+        return _accepted_generation_grant()
+
+    async def _ctx(request, *_args, **_kwargs):
+        events.append("ctx")
+        return _response_with_request_lifecycle(
+            request,
+            finish_reason="length",
+            context_only=True,
+        )
+
+    async def _gen(request, *_args, **_kwargs):
+        events.append("gen")
+        return _response_with_request_lifecycle(
+            request,
+            finish_reason="stop",
+            context_only=False,
+        )
+
+    service._gen_client.issue_generation_grant = AsyncMock(side_effect=_issue)
+    service._gen_client.send_request = AsyncMock(side_effect=_gen)
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx)
+
+    response = await service._send_disagg_request(
+        CompletionRequest(model="test-model", prompt="hello")
+    )
+
+    if schedule_style == "generation_first":
+        assert events.index("grant") < events.index("ctx")
+    else:
+        assert events.index("ctx") < events.index("grant")
+    ctx_params = service._ctx_client.send_request.call_args.args[0].disaggregated_params
+    gen_params = service._gen_client.send_request.call_args.args[0].disaggregated_params
+    grant_request = service._gen_client.issue_generation_grant.call_args.args[0]
+    assert grant_request.context_control_endpoint == "ctx:9000"
+    assert grant_request.context_transceiver_lifecycle == (gen_params.context_transceiver_lifecycle)
+    assert grant_request.schedule_style == service._schedule_style
+    assert gen_params.generation_endpoint_name == "gen:9001"
+    if schedule_style == "generation_first":
+        assert ctx_params.generation_endpoint_incarnation == (
+            gen_params.generation_endpoint_incarnation
+        )
+    else:
+        assert ctx_params.generation_endpoint_incarnation is None
+    assert ctx_params.consumer_grant_id == gen_params.consumer_grant_id
+    assert response.choices[0].text == "done"
+
+
+@pytest.mark.asyncio
+async def test_generation_safe_ctx_failure_explicitly_aborts_grant(
+    monkeypatch,
+):
+    monkeypatch.setenv("TRTLLM_DISAGG_LIFECYCLE_PROTOCOL_VERSION", "1")
+    service = _make_service("generation_first")
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._ctx_router.get_next_server = AsyncMock(
+        return_value=("ctx:9000", _transceiver_server_info())
+    )
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_client.issue_generation_grant = AsyncMock(
+        return_value=_accepted_generation_grant()
+    )
+    service._ctx_client.send_request = AsyncMock(side_effect=RuntimeError("CTX failed"))
+    service._gen_client.abort_generation_grant = AsyncMock(
+        side_effect=RuntimeError("GEN control endpoint unreachable")
+    )
+
+    with pytest.raises(RuntimeError, match="CTX failed"):
+        await service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello"))
+
+    service._gen_client.abort_generation_grant.assert_awaited_once()
+    service._ctx_client.abort_context_artifact.assert_awaited_once()
+    service._gen_router.finish_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generation_safe_ctx_artifact_is_aborted_when_gen_admission_fails(
+    monkeypatch,
+):
+    monkeypatch.setenv("TRTLLM_DISAGG_LIFECYCLE_PROTOCOL_VERSION", "1")
+    service = _make_service("context_first")
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._ctx_router.get_next_server = AsyncMock(
+        return_value=("ctx:9000", _transceiver_server_info())
+    )
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_client.send_request = AsyncMock(
+        side_effect=lambda request, **_kwargs: _response_with_request_lifecycle(
+            request,
+            finish_reason="length",
+            context_only=True,
+        )
+    )
+    service._gen_client.issue_generation_grant = AsyncMock(
+        side_effect=RuntimeError("GEN admission unavailable")
+    )
+    service._ctx_client.abort_context_artifact = AsyncMock(
+        return_value=ObligationResponse(
+            lifecycle_protocol_version=1,
+            accepted=True,
+            state="ABORTED",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="GEN admission unavailable"):
+        await service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello"))
+
+    service._ctx_client.abort_context_artifact.assert_awaited_once()
+    abort_request = service._ctx_client.abort_context_artifact.call_args.args[0]
+    assert abort_request.lifecycle_protocol_version == 1
+    assert abort_request.logical_request_id == 101
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_generation_safe_grant_rendezvous_timeout_releases_obligations(
+    monkeypatch,
+    schedule_style,
+):
+    monkeypatch.setenv("TRTLLM_DISAGG_LIFECYCLE_PROTOCOL_VERSION", "1")
+    service = _make_service(schedule_style)
+    service._lifecycle_admission_timeout_s = 0.01
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._ctx_router.get_next_server = AsyncMock(
+        return_value=("ctx:9000", _transceiver_server_info())
+    )
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_client.send_request = AsyncMock(
+        side_effect=lambda request, **_kwargs: _response_with_request_lifecycle(
+            request,
+            finish_reason="length",
+            context_only=True,
+        )
+    )
+    service._ctx_client.abort_context_artifact = AsyncMock(
+        return_value=ObligationResponse(
+            lifecycle_protocol_version=1,
+            accepted=True,
+            state="ABORTED",
+        )
+    )
+    grant_cancelled = asyncio.Event()
+
+    async def _never_returning_grant(*_args, **_kwargs):
+        try:
+            await asyncio.Future()
+        finally:
+            grant_cancelled.set()
+
+    service._gen_client.issue_generation_grant = AsyncMock(side_effect=_never_returning_grant)
+
+    with pytest.raises(
+        TimeoutError,
+        match="generation lifecycle admission timed out",
+    ):
+        await service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello"))
+
+    assert grant_cancelled.is_set()
+    # The second call is an idempotent resolution replay of the exact request.
+    assert service._gen_client.issue_generation_grant.await_count == 2
+    service._gen_client.send_request.assert_not_awaited()
+    service._gen_router.finish_request.assert_awaited_once()
+    if schedule_style == "context_first":
+        service._ctx_client.send_request.assert_awaited_once()
+        service._ctx_client.abort_context_artifact.assert_awaited_once()
+        service._ctx_router.finish_request.assert_not_awaited()
+    else:
+        service._ctx_client.send_request.assert_not_awaited()
+        service._ctx_client.abort_context_artifact.assert_not_awaited()
+        service._ctx_router.finish_request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_generation_admission_is_replayed_then_aborted(
+    monkeypatch,
+):
+    service = _make_generation_safe_service(monkeypatch, "context_first")
+    service._lifecycle_admission_timeout_s = 0.01
+    service._ctx_client.send_request = AsyncMock(
+        side_effect=lambda request, **_kwargs: _response_with_request_lifecycle(
+            request,
+            finish_reason="length",
+            context_only=True,
+        )
+    )
+    decision = _accepted_generation_grant()
+    requests = []
+
+    async def _accept_then_drop_response(request, **_kwargs):
+        requests.append(request.model_copy(deep=True))
+        if len(requests) == 1:
+            await asyncio.Future()
+        return decision
+
+    service._gen_client.issue_generation_grant = AsyncMock(side_effect=_accept_then_drop_response)
+
+    with pytest.raises(TimeoutError, match="generation lifecycle admission timed out"):
+        await service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello"))
+
+    assert len(requests) == 2
+    assert requests[0] == requests[1]
+    service._gen_client.abort_generation_grant.assert_awaited_once()
+    abort_request = service._gen_client.abort_generation_grant.await_args.args[0]
+    assert abort_request.consumer_grant_id == requests[0].consumer_grant_id
+    assert abort_request.generation_endpoint_incarnation == decision.generation_endpoint_incarnation
+    service._ctx_client.abort_context_artifact.assert_awaited_once()
+    service._gen_client.send_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generation_safe_endpoint_selection_has_bounded_rendezvous(
+    monkeypatch,
+):
+    monkeypatch.setenv("TRTLLM_DISAGG_LIFECYCLE_PROTOCOL_VERSION", "1")
+    service = _make_service("context_first")
+    service._lifecycle_admission_timeout_s = 0.01
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._ctx_router.get_next_server = AsyncMock(
+        return_value=("ctx:9000", _transceiver_server_info())
+    )
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_client.send_request = AsyncMock(
+        side_effect=lambda request, **_kwargs: _response_with_request_lifecycle(
+            request,
+            finish_reason="length",
+            context_only=True,
+        )
+    )
+    service._ctx_client.abort_context_artifact = AsyncMock(
+        return_value=ObligationResponse(
+            lifecycle_protocol_version=1,
+            accepted=True,
+            state="ABORTED",
+        )
+    )
+    selection_cancelled = asyncio.Event()
+
+    async def _never_returning_selection(*_args, **_kwargs):
+        try:
+            await asyncio.Future()
+        finally:
+            selection_cancelled.set()
+
+    service._gen_router.get_next_server = AsyncMock(side_effect=_never_returning_selection)
+
+    with pytest.raises(
+        TimeoutError,
+        match="generation lifecycle admission timed out",
+    ):
+        await service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello"))
+
+    assert selection_cancelled.is_set()
+    service._gen_client.issue_generation_grant.assert_not_awaited()
+    service._ctx_client.abort_context_artifact.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_generation_safe_mode_keeps_gen_only_requests_outside_handoff_protocol(
+    monkeypatch,
+    schedule_style,
+):
+    monkeypatch.setenv("TRTLLM_DISAGG_LIFECYCLE_PROTOCOL_VERSION", "1")
+    monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
+    service = _make_service(schedule_style)
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_client.send_request = AsyncMock(
+        return_value=_make_completion_response(
+            "done",
+            finish_reason="stop",
+            disagg_request_id=101,
+            context_only=False,
+        )
+    )
+
+    response = await service._send_disagg_request(
+        CompletionRequest(model="test-model", prompt="hello")
+    )
+
+    service._ctx_client.send_request.assert_not_awaited()
+    service._gen_client.issue_generation_grant.assert_not_awaited()
+    gen_request = service._gen_client.send_request.call_args.args[0]
+    assert gen_request.disaggregated_params.request_type == "generation_only"
+    assert gen_request.disaggregated_params.logical_request_id is None
+    assert response.choices[0].text == "done"
+
+
+@pytest.mark.asyncio
+async def test_generation_safe_conditional_bypass_uses_reserved_gen_without_handoff(
+    monkeypatch,
+):
+    monkeypatch.setenv("TRTLLM_DISAGG_LIFECYCLE_PROTOCOL_VERSION", "1")
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service("context_first")
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._check_conditional_disagg = AsyncMock(return_value=("gen:9001", False))
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_client.send_request = AsyncMock(
+        return_value=_make_completion_response(
+            "done",
+            finish_reason="stop",
+            disagg_request_id=None,
+            context_only=False,
+        )
+    )
+
+    response = await service._send_disagg_request(
+        CompletionRequest(model="test-model", prompt="hello")
+    )
+
+    service._ctx_client.send_request.assert_not_awaited()
+    service._gen_router.get_next_server.assert_not_awaited()
+    service._gen_client.issue_generation_grant.assert_not_awaited()
+    gen_request = service._gen_client.send_request.call_args.args[0]
+    assert gen_request.disaggregated_params is None
+    assert response.choices[0].text == "done"
+
+
 def test_get_gen_request_uses_ctx_response_prompt_token_ids_for_chat():
     service = _make_service("context_first")
     ctx_prompt_token_ids = [101, 102, 103]
@@ -269,6 +1108,187 @@ async def test_create_chat_response_sets_prompt_token_ids_for_context_only():
     )
 
     assert response.prompt_token_ids == prompt_token_ids
+
+
+def test_protocol_v1_rejects_identityless_cross_side_request() -> None:
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    advertisement = TransceiverLifecycleAdvertisement.from_value(
+        _transceiver_lifecycle_advertisement()
+    )
+    server = OpenAIServer.__new__(OpenAIServer)
+    server.server_role = ServerRole.GENERATION
+    server.generator = SimpleNamespace(
+        disaggregated_params={
+            "context_transceiver_lifecycle": advertisement,
+        }
+    )
+    server.disagg_lifecycle_control = mock.MagicMock()
+    params = LlmDisaggregatedParams(request_type="generation_only")
+
+    with pytest.raises(RuntimeError, match="missing its negotiated attempt identity"):
+        server._validate_disagg_before_submit(params)
+
+    server.disagg_lifecycle_control.validate_generation_grant_active.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("server_role", "request_type", "expected_role"),
+    [
+        (ServerRole.CONTEXT, "generation_only", "GENERATION"),
+        (ServerRole.GENERATION, "context_only", "CONTEXT"),
+    ],
+)
+def test_protocol_v1_rejects_cross_side_request_on_wrong_server_role(
+    server_role: ServerRole,
+    request_type: str,
+    expected_role: str,
+) -> None:
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    advertisement = TransceiverLifecycleAdvertisement.from_value(
+        _transceiver_lifecycle_advertisement()
+    )
+    server = OpenAIServer.__new__(OpenAIServer)
+    server.server_role = server_role
+    server.generator = SimpleNamespace(
+        disaggregated_params={
+            "context_transceiver_lifecycle": advertisement,
+        }
+    )
+    server.disagg_lifecycle_control = mock.MagicMock()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            rf"protocol-v1 {request_type} request reached "
+            rf"{server_role.name} server; expected {expected_role}"
+        ),
+    ):
+        server._validate_disagg_before_submit(
+            _lifecycle_request_params(
+                advertisement,
+                request_type=request_type,
+            )
+        )
+
+    server.disagg_lifecycle_control.validate_generation_grant_active.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("server_role", "request_type", "transceiver_params"),
+    [
+        (
+            ServerRole.CONTEXT,
+            "context_only",
+            {
+                "ctx_dp_rank": 0,
+                "ctx_info_endpoint": ["tcp://context:9000"],
+            },
+        ),
+        (ServerRole.CONTEXT, "context_only", {}),
+        (
+            ServerRole.GENERATION,
+            "generation_only",
+            {
+                "ctx_dp_rank": 0,
+                "ctx_info_endpoint": ["tcp://context:9000"],
+            },
+        ),
+        (ServerRole.GENERATION, "generation_only", {}),
+    ],
+)
+def test_identityless_protocol_v0_preserves_legacy_cross_side_submission(
+    server_role: ServerRole,
+    request_type: str,
+    transceiver_params: dict,
+) -> None:
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    server = OpenAIServer.__new__(OpenAIServer)
+    server.server_role = server_role
+    server.generator = SimpleNamespace(disaggregated_params=transceiver_params)
+    server.disagg_lifecycle_control = mock.MagicMock()
+
+    server._validate_disagg_before_submit(LlmDisaggregatedParams(request_type=request_type))
+
+    server.disagg_lifecycle_control.assert_not_called()
+
+
+def test_protocol_v1_rejects_missing_context_control_endpoint() -> None:
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    advertisement = TransceiverLifecycleAdvertisement.from_value(
+        _transceiver_lifecycle_advertisement()
+    )
+    server = OpenAIServer.__new__(OpenAIServer)
+    server.server_role = ServerRole.GENERATION
+    server.generator = SimpleNamespace(
+        disaggregated_params={
+            "context_transceiver_lifecycle": advertisement,
+        }
+    )
+    server.disagg_lifecycle_control = mock.MagicMock()
+
+    with pytest.raises(RuntimeError, match="lifecycle-control endpoint"):
+        server._validate_disagg_before_submit(
+            _lifecycle_request_params(
+                advertisement,
+                request_type="generation_only",
+                context_control_endpoint=None,
+            )
+        )
+
+    server.disagg_lifecycle_control.validate_generation_grant_active.assert_not_called()
+
+
+def test_context_rejects_stale_selected_transceiver_incarnation() -> None:
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    selected = TransceiverLifecycleAdvertisement.from_value(_transceiver_lifecycle_advertisement())
+    current = TransceiverLifecycleAdvertisement.from_value(
+        {
+            **selected.to_dict(),
+            "instance_id": str(uuid4()),
+        }
+    )
+    server = OpenAIServer.__new__(OpenAIServer)
+    server.server_role = ServerRole.CONTEXT
+    server.generator = SimpleNamespace(
+        disaggregated_params={
+            "context_transceiver_lifecycle": current,
+        }
+    )
+    server.disagg_lifecycle_control = mock.MagicMock()
+
+    with pytest.raises(RuntimeError, match="current context endpoint incarnation"):
+        server._validate_disagg_before_submit(
+            _lifecycle_request_params(
+                selected,
+                request_type="context_only",
+            )
+        )
+
+
+def test_context_accepts_exact_current_transceiver_incarnation() -> None:
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    current = TransceiverLifecycleAdvertisement.from_value(_transceiver_lifecycle_advertisement())
+    server = OpenAIServer.__new__(OpenAIServer)
+    server.server_role = ServerRole.CONTEXT
+    server.generator = SimpleNamespace(
+        disaggregated_params={
+            "context_transceiver_lifecycle": current,
+        }
+    )
+    server.disagg_lifecycle_control = mock.MagicMock()
+
+    server._validate_disagg_before_submit(
+        _lifecycle_request_params(
+            current,
+            request_type="context_only",
+        )
+    )
 
 
 @pytest.mark.asyncio

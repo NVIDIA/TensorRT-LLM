@@ -20,6 +20,15 @@ from pathlib import Path
 from types import ModuleType
 from typing import NamedTuple, Optional, Union
 
+from ._allocation_lease import (  # noqa: F401
+    AllocationIdentity,
+    AllocationLeaseHandle,
+    AllocationLeaseSnapshot,
+    AllocationRange,
+    AllocationReuseProof,
+    LeaseSettlement,
+)
+
 _BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
 
 if _BACKEND == "python":
@@ -290,6 +299,11 @@ else:
 
 __all__ = [
     "AggregatedPageDesc",
+    "AllocationIdentity",
+    "AllocationLeaseHandle",
+    "AllocationLeaseSnapshot",
+    "AllocationRange",
+    "AllocationReuseProof",
     "AttentionLayerConfig",
     "BAD_PAGE_INDEX",
     "CACHE_LEVEL1",
@@ -323,6 +337,7 @@ __all__ = [
     "KVCacheUpdatedData",
     "KvCacheStatus",
     "LayerGroupId",
+    "LeaseSettlement",
     "LayerId",
     "LifeCycleId",
     "MemAddress",

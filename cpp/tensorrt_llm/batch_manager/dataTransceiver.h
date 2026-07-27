@@ -315,6 +315,9 @@ public:
     /// @return Whether the request is cancelled.
     virtual bool cancelRequest(LlmRequest const& llmRequest);
 
+    /// @brief Cancel without conflating acceptance with physical quiescence.
+    virtual CancelResult cancelSession(LlmRequest const& llmRequest, std::string const& reason);
+
     /// @brief Send ready signal.
     /// @param requestId The ID used in the context phase of the current request.
     /// @param isReady Whether the request is ready to be received.
@@ -366,6 +369,9 @@ public:
     /// @param llmRequest Request object.
     /// @return Whether the request is cancelled.
     virtual bool cancelRequest(LlmRequest const& llmRequest);
+
+    /// @brief Cancel without conflating acceptance with physical quiescence.
+    virtual CancelResult cancelSession(LlmRequest const& llmRequest, std::string const& reason);
 
     /// @brief Receive ready signal.
     /// @param session The session object.

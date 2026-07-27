@@ -22,12 +22,14 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
+#include "tensorrt_llm/batch_manager/transceiverLifecycle.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <fstream>
 #include <future>
@@ -42,6 +44,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -252,6 +255,46 @@ public:
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
+    /// Return lifecycle capabilities before publishing any transport address.
+    [[nodiscard]] virtual TransceiverCapabilities getLifecycleCapabilities() const
+    {
+        return {};
+    }
+
+    /// Request cancellation without conflating logical acceptance and physical quiescence.
+    virtual CancelResult cancelSession(std::shared_ptr<LlmRequest> llmRequest, std::string const& reason)
+    {
+        static_cast<void>(llmRequest);
+        return {LogicalDisposition::kREJECTED, PhysicalDisposition::kIN_DOUBT, false,
+            "Structured cancellation is unsupported; the destructive legacy cancellation path was not invoked: "
+                + reason};
+    }
+
+    /// Poll one request's physical disposition. Legacy implementations fail closed.
+    [[nodiscard]] virtual PhysicalDisposition pollSession(LlmRequest::RequestIdType) const
+    {
+        return PhysicalDisposition::kIN_DOUBT;
+    }
+
+    /// Fence future submission for one request. Legacy implementations do not provide this proof.
+    virtual LogicalDisposition fenceSubmission(LlmRequest::RequestIdType)
+    {
+        return LogicalDisposition::kREJECTED;
+    }
+
+    /// Drain already-submitted operations for one request. Legacy implementations fail closed.
+    virtual PhysicalDisposition quiesceSession(LlmRequest::RequestIdType)
+    {
+        return PhysicalDisposition::kIN_DOUBT;
+    }
+
+    /// Attempt bounded endpoint shutdown. This does not replace the legacy destructor.
+    virtual ShutdownResult shutdownLifecycle(std::chrono::milliseconds)
+    {
+        return {PhysicalDisposition::kIN_DOUBT, std::nullopt, false,
+            "Explicit bounded lifecycle shutdown is not implemented by this transceiver"};
+    }
+
     /// Get the serialized DataTransceiverState (CacheState + CommState) for this transceiver.
     [[nodiscard]] virtual std::vector<char> getSerializedDataTransceiverState() const
     {
@@ -306,6 +349,12 @@ public:
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
+
+    [[nodiscard]] TransceiverCapabilities getLifecycleCapabilities() const override;
+
+    CancelResult cancelSession(std::shared_ptr<LlmRequest> llmRequest, std::string const& reason) override;
+
+    ShutdownResult shutdownLifecycle(std::chrono::milliseconds deadline) override;
 
     [[nodiscard]] std::vector<char> getSerializedDataTransceiverState() const override;
 

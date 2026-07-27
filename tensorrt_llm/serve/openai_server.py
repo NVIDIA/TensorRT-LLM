@@ -1,4 +1,19 @@
 #!/usr/bin/env python
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import array
 import asyncio
 import base64
@@ -21,7 +36,7 @@ from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
                     Optional, Union)
 
 import uvicorn
-from fastapi import Body, FastAPI, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
@@ -31,7 +46,11 @@ from starlette.routing import Mount
 from transformers import AutoProcessor
 
 from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm._torch.disaggregation.capability_negotiation import (
+    LifecycleNegotiationError, negotiate_generation_safe_lifecycle,
+    validate_generation_safe_advertisement)
 from tensorrt_llm._utils import EnergyMonitor
+from tensorrt_llm.disaggregated_params import TransceiverLifecycleAdvertisement
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -66,6 +85,13 @@ from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
     request_requires_internal_disagg_auth, validate_internal_disagg_request)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
+from tensorrt_llm.serve.disagg_lifecycle_control import (
+    ARTIFACT_OBLIGATION_PATH, CONTEXT_ARTIFACT_ABORT_PATH,
+    GENERATION_GRANT_ABORT_PATH, GENERATION_GRANT_PATH,
+    GENERATION_GRANT_RENEW_PATH, ArtifactObligationRequest,
+    ContextArtifactAbortRequest, DisaggLifecycleControl,
+    GenerationGrantAbortRequest, GenerationGrantDecisionResponse,
+    GenerationGrantRenewRequest, GenerationGrantRequest)
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
@@ -302,6 +328,40 @@ class OpenAIServer(_VideoRoutesMixin):
         self.binding_addr = None
         self.host = None
         self.port = None
+        self.disagg_lifecycle_control = None
+        if server_role in (ServerRole.CONTEXT, ServerRole.GENERATION):
+            transceiver_params = getattr(generator, "disaggregated_params",
+                                         None)
+            getter = getattr(transceiver_params, "get", None)
+            lifecycle_value = (getter("context_transceiver_lifecycle")
+                               if callable(getter) else getattr(
+                                   transceiver_params,
+                                   "context_transceiver_lifecycle", None))
+            if lifecycle_value is not None:
+                local_lifecycle = (TransceiverLifecycleAdvertisement.from_value(
+                    lifecycle_value))
+                if local_lifecycle.protocol_version == 1:
+                    max_live_grants = max(
+                        1,
+                        int(
+                            getattr(getattr(generator, "args", None),
+                                    "max_batch_size", 1)))
+                    self.disagg_lifecycle_control = DisaggLifecycleControl(
+                        role=server_role,
+                        endpoint_name=self._disagg_lifecycle_endpoint_name,
+                        max_live_generation_grants=max_live_grants,
+                        grant_ttl_s=float(
+                            os.getenv("TRTLLM_DISAGG_GEN_GRANT_TTL_S", "600")),
+                        artifact_ttl_s=float(
+                            os.getenv("TRTLLM_DISAGG_ARTIFACT_TTL_S", "60")),
+                        artifact_renew_interval_s=float(
+                            os.getenv("TRTLLM_DISAGG_ARTIFACT_RENEW_INTERVAL_S",
+                                      "20")),
+                        replay_filter_capacity=int(
+                            os.getenv("TRTLLM_DISAGG_REPLAY_FILTER_CAPACITY",
+                                      "262144")),
+                        endpoint_lifecycle=self._local_transceiver_lifecycle,
+                    )
 
         # Dedicated thread pools for the chat / completion path. Keeping
         # multimodal preprocessing and decode work off the asyncio default
@@ -436,9 +496,16 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self.embedding_batcher.start()
                 logger.info("Started encode dynamic batcher")
 
+            if self.disagg_lifecycle_control is not None:
+                await self.disagg_lifecycle_control.start()
+
             yield
 
+            if self.disagg_lifecycle_control is not None:
+                await self.disagg_lifecycle_control.shutdown()
+
             await self._perf_metrics_writer.close()
+
             if self.embedding_batcher is not None:
                 await self.embedding_batcher.shutdown()
                 logger.info("Stopped encode dynamic batcher")
@@ -838,6 +905,258 @@ class OpenAIServer(_VideoRoutesMixin):
             return self.generator._check_health()
         return True
 
+    def _disagg_lifecycle_endpoint_name(self) -> str:
+        if self.binding_addr is None:
+            raise RuntimeError(
+                "disaggregated lifecycle endpoint is not bound yet")
+        return self.binding_addr
+
+    def _local_transceiver_lifecycle(self,
+                                     *,
+                                     require_generation_safe: bool = True
+                                     ) -> TransceiverLifecycleAdvertisement:
+        params = getattr(self.generator, "disaggregated_params", None)
+        getter = getattr(params, "get", None)
+        value = (getter("context_transceiver_lifecycle") if callable(getter)
+                 else getattr(params, "context_transceiver_lifecycle", None))
+        if value is None:
+            raise LifecycleNegotiationError(
+                "disaggregated endpoint does not advertise a transceiver "
+                "lifecycle contract")
+        advertisement = TransceiverLifecycleAdvertisement.from_value(value)
+        if require_generation_safe:
+            role = ("context"
+                    if self.server_role == ServerRole.CONTEXT else "generation")
+            validate_generation_safe_advertisement(
+                advertisement,
+                role=role,
+            )
+        return advertisement
+
+    @staticmethod
+    def _has_disagg_lifecycle_identity(
+            disaggregated_params: Optional[LlmDisaggregatedParams]) -> bool:
+        if disaggregated_params is None:
+            return False
+        return any(
+            getattr(disaggregated_params, field, None) is not None
+            for field in (
+                "logical_request_id",
+                "prefill_artifact_id",
+                "artifact_version",
+                "handoff_attempt_uuid",
+                "consumer_grant_id",
+                "transfer_session_id",
+            ))
+
+    def _mark_disagg_scheduler_inserted(
+            self, disaggregated_params: Optional[LlmDisaggregatedParams],
+            promise: RequestOutput) -> None:
+        control = self.disagg_lifecycle_control
+        if (control is None or
+                not self._has_disagg_lifecycle_identity(disaggregated_params)):
+            return
+        if (self.server_role == ServerRole.GENERATION
+                and disaggregated_params.request_type == "generation_only"):
+            control.mark_generation_scheduler_inserted(disaggregated_params,
+                                                       promise)
+        elif (self.server_role == ServerRole.CONTEXT
+              and disaggregated_params.request_type == "context_only"):
+            control.mark_context_scheduler_inserted(disaggregated_params,
+                                                    promise)
+
+    def _validate_disagg_before_submit(
+            self,
+            disaggregated_params: Optional[LlmDisaggregatedParams]) -> None:
+        """Validate the negotiated cross-side mode before scheduler submission."""
+        if (disaggregated_params is None or disaggregated_params.request_type
+                not in ("context_only", "generation_only")):
+            # A missing envelope or context_and_generation is an explicit
+            # local-only request. It creates no cross-side handoff.
+            return
+        has_identity = self._has_disagg_lifecycle_identity(disaggregated_params)
+        try:
+            local_lifecycle = self._local_transceiver_lifecycle(
+                require_generation_safe=False)
+        except LifecycleNegotiationError:
+            # Qualified protocol-v0 endpoints intentionally preserve the
+            # legacy server-info shape and do not advertise lifecycle
+            # metadata. Identityless requests therefore remain on the legacy
+            # path, while any request carrying protocol-v1 identity must fail
+            # closed when the local endpoint cannot validate that identity.
+            if not has_identity:
+                return
+            raise
+        if local_lifecycle.protocol_version == 1:
+            expected_role = (ServerRole.CONTEXT
+                             if disaggregated_params.request_type
+                             == "context_only" else ServerRole.GENERATION)
+            if self.server_role != expected_role:
+                actual_role = getattr(self.server_role, "name",
+                                      str(self.server_role))
+                raise LifecycleNegotiationError(
+                    f"protocol-v1 {disaggregated_params.request_type} request "
+                    f"reached {actual_role} server; expected {expected_role.name}"
+                )
+            role = ("context"
+                    if self.server_role == ServerRole.CONTEXT else "generation")
+            validate_generation_safe_advertisement(
+                local_lifecycle,
+                role=role,
+            )
+            if not has_identity:
+                raise LifecycleNegotiationError(
+                    "protocol-v1 cross-side request is missing its negotiated "
+                    "attempt identity")
+            source_lifecycle = (
+                disaggregated_params.context_transceiver_lifecycle)
+            if source_lifecycle is None:
+                raise LifecycleNegotiationError(
+                    "protocol-v1 cross-side request is missing the selected "
+                    "context transceiver lifecycle")
+            if not disaggregated_params.context_control_endpoint:
+                raise LifecycleNegotiationError(
+                    "protocol-v1 cross-side request is missing the selected "
+                    "context lifecycle-control endpoint")
+            if self.server_role == ServerRole.CONTEXT:
+                source_lifecycle = (TransceiverLifecycleAdvertisement.
+                                    from_value(source_lifecycle))
+                if source_lifecycle != local_lifecycle:
+                    raise LifecycleNegotiationError(
+                        "selected context transceiver lifecycle does not match "
+                        "the current context endpoint incarnation")
+        else:
+            if (local_lifecycle.protocol_version != 0
+                    or not local_lifecycle.qualified_legacy_mode):
+                raise LifecycleNegotiationError(
+                    "cross-side request reached an unqualified transceiver "
+                    "lifecycle mode")
+            if has_identity:
+                raise LifecycleNegotiationError(
+                    "generation-safe request reached a qualified-legacy "
+                    "transceiver without protocol-v1 support")
+
+        control = self.disagg_lifecycle_control
+        if control is None or not has_identity:
+            return
+        if (self.server_role == ServerRole.GENERATION
+                and disaggregated_params.request_type == "generation_only"):
+            control.validate_generation_grant_active(disaggregated_params)
+
+    async def _finish_disagg_request(
+        self,
+        disaggregated_params: Optional[LlmDisaggregatedParams],
+        promise: RequestOutput,
+        *,
+        success: bool,
+        context_handoff_created: bool = True,
+        reason: str = "",
+    ) -> None:
+        control = self.disagg_lifecycle_control
+        if (control is None or
+                not self._has_disagg_lifecycle_identity(disaggregated_params)):
+            return
+        if (self.server_role == ServerRole.GENERATION
+                and disaggregated_params.request_type == "generation_only"):
+            await control.finish_generation(disaggregated_params,
+                                            success=success,
+                                            reason=reason)
+        elif (self.server_role == ServerRole.CONTEXT
+              and disaggregated_params.request_type == "context_only"):
+            if success and context_handoff_created:
+                control.register_context_artifact(disaggregated_params, promise)
+            else:
+                control.abandon_context_artifact(disaggregated_params)
+
+    @staticmethod
+    def _response_has_disagg_handoff(response: object) -> bool:
+        choices = getattr(response, "choices", None)
+        if not choices:
+            return False
+        params = getattr(choices[0], "disaggregated_params", None)
+        return (params is not None
+                and getattr(params, "ctx_request_id", None) is not None
+                and getattr(params, "disagg_request_id", None) is not None)
+
+    async def issue_generation_grant(self, request: GenerationGrantRequest):
+        control = self.disagg_lifecycle_control
+        if control is None:
+            raise HTTPException(
+                status_code=404,
+                detail="disaggregated lifecycle control is unavailable")
+        try:
+            local_lifecycle = self._local_transceiver_lifecycle()
+            negotiate_generation_safe_lifecycle(
+                request.context_transceiver_lifecycle,
+                local_lifecycle,
+                schedule_style=request.schedule_style,
+                ctx_dp_rank=request.ctx_dp_rank,
+            )
+        except (LifecycleNegotiationError, ValueError) as error:
+            return GenerationGrantDecisionResponse(
+                lifecycle_protocol_version=1,
+                accepted=False,
+                reason=str(error),
+            )
+        try:
+            response = control.issue_generation_grant(request)
+            if not response.accepted:
+                return response
+            return response.model_copy(
+                update={
+                    "generation_transceiver_lifecycle": local_lifecycle,
+                })
+        except (KeyError, RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    async def renew_generation_grant(self,
+                                     request: GenerationGrantRenewRequest):
+        control = self.disagg_lifecycle_control
+        if control is None:
+            raise HTTPException(
+                status_code=404,
+                detail="disaggregated lifecycle control is unavailable")
+        try:
+            return control.renew_generation_grant(request)
+        except (KeyError, RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    async def abort_generation_grant(self,
+                                     request: GenerationGrantAbortRequest):
+        control = self.disagg_lifecycle_control
+        if control is None:
+            raise HTTPException(
+                status_code=404,
+                detail="disaggregated lifecycle control is unavailable")
+        try:
+            return await control.abort_generation_grant(request)
+        except (KeyError, RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    async def handle_artifact_obligation(self,
+                                         request: ArtifactObligationRequest):
+        control = self.disagg_lifecycle_control
+        if control is None:
+            raise HTTPException(
+                status_code=404,
+                detail="disaggregated lifecycle control is unavailable")
+        try:
+            return control.handle_artifact_obligation(request)
+        except (KeyError, RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    async def abort_context_artifact(self,
+                                     request: ContextArtifactAbortRequest):
+        control = self.disagg_lifecycle_control
+        if control is None:
+            raise HTTPException(
+                status_code=404,
+                detail="disaggregated lifecycle control is unavailable")
+        try:
+            return control.abort_context_artifact(request)
+        except (KeyError, RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate",
@@ -912,6 +1231,23 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/_internal/tokenize",
                                self.tokenize,
                                methods=["POST"])
+        if self.server_role == ServerRole.GENERATION:
+            self.app.add_api_route(GENERATION_GRANT_PATH,
+                                   self.issue_generation_grant,
+                                   methods=["POST"])
+            self.app.add_api_route(GENERATION_GRANT_RENEW_PATH,
+                                   self.renew_generation_grant,
+                                   methods=["POST"])
+            self.app.add_api_route(GENERATION_GRANT_ABORT_PATH,
+                                   self.abort_generation_grant,
+                                   methods=["POST"])
+        elif self.server_role == ServerRole.CONTEXT:
+            self.app.add_api_route(ARTIFACT_OBLIGATION_PATH,
+                                   self.handle_artifact_obligation,
+                                   methods=["POST"])
+            self.app.add_api_route(CONTEXT_ARTIFACT_ABORT_PATH,
+                                   self.abort_context_artifact,
+                                   methods=["POST"])
 
         # RL-only endpoints
         self.app.add_api_route("/release_memory",
@@ -1423,6 +1759,9 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
+        promise: Optional[RequestOutput] = None
+        disaggregated_params: Optional[LlmDisaggregatedParams] = None
+        lifecycle_finished = False
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -1434,6 +1773,8 @@ class OpenAIServer(_VideoRoutesMixin):
         async def chat_stream_generator(
                 promise: RequestOutput,
                 postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
+            nonlocal lifecycle_finished
+            success = False
             try:
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
@@ -1453,12 +1794,21 @@ class OpenAIServer(_VideoRoutesMixin):
                             res, args)
                     for pp_res in pp_results:
                         yield pp_res
+                success = True
                 yield "data: [DONE]\n\n"
                 await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
-            except:
+            except Exception:
                 logger.error(traceback.format_exc())
                 raise
+            finally:
+                await self._finish_disagg_request(
+                    disaggregated_params,
+                    promise,
+                    success=success,
+                    reason="" if success else "generation stream terminated",
+                )
+                lifecycle_finished = True
 
         try:
             ensure_request_chat_template_allowed(
@@ -1594,6 +1944,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     functools.partial(preprocess_fn, prompt, sampling_params,
                                       disaggregated_params))
 
+            self._validate_disagg_before_submit(disaggregated_params)
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
                 sampling_params=sampling_params,
@@ -1609,6 +1960,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
+            self._mark_disagg_scheduler_inserted(disaggregated_params, promise)
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
@@ -1622,6 +1974,14 @@ class OpenAIServer(_VideoRoutesMixin):
             else:
                 response = await self._create_chat_response(
                     promise, postproc_params, raw_request, disaggregated_params)
+                await self._finish_disagg_request(
+                    disaggregated_params,
+                    promise,
+                    success=True,
+                    context_handoff_created=self._response_has_disagg_handoff(
+                        response),
+                )
+                lifecycle_finished = True
                 # Context-only: optionally return prompt_token_ids as a base64
                 # int32 buffer (one string) so the disagg orchestrator relays it
                 # without materializing the int list on its event loop. The encode
@@ -1636,12 +1996,33 @@ class OpenAIServer(_VideoRoutesMixin):
                     response.prompt_token_ids = None
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
+            if promise is not None and not lifecycle_finished:
+                await self._finish_disagg_request(
+                    disaggregated_params,
+                    promise,
+                    success=False,
+                    reason="executor failure",
+                )
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except ValueError as e:
+            if promise is not None and not lifecycle_finished:
+                await self._finish_disagg_request(
+                    disaggregated_params,
+                    promise,
+                    success=False,
+                    reason=str(e),
+                )
             return self.create_error_response(str(e))
         except Exception as e:
+            if promise is not None and not lifecycle_finished:
+                await self._finish_disagg_request(
+                    disaggregated_params,
+                    promise,
+                    success=False,
+                    reason=str(e),
+                )
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
 
@@ -1757,6 +2138,9 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
+        promises: List[RequestOutput] = []
+        disaggregated_params: Optional[LlmDisaggregatedParams] = None
+        lifecycle_finished_promises: set[int] = set()
 
         async def completion_response(
                 promise: RequestOutput,
@@ -1808,6 +2192,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         async def completion_generator(promise: RequestOutput,
                                        params: Optional[PostprocParams]):
+            success = False
             try:
                 async for output in promise:
                     if not self.postproc_worker_enabled:
@@ -1817,6 +2202,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         pp_result = output.outputs[0]._postprocess_result
                     for pp_res in pp_result:
                         yield pp_res
+                success = True
                 await self._extract_metrics(output, raw_request)
             except Exception as e:
                 logger.error(traceback.format_exc())
@@ -1834,6 +2220,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 })
                 yield f"data: {error_data}\n\n"
                 yield "data: [DONE]\n\n"
+            finally:
+                await self._finish_disagg_request(
+                    disaggregated_params,
+                    promise,
+                    success=success,
+                    reason="" if success else "generation stream terminated",
+                )
+                lifecycle_finished_promises.add(id(promise))
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
@@ -1870,13 +2264,19 @@ class OpenAIServer(_VideoRoutesMixin):
             else:
                 prompts = request.prompt
 
+            request_disaggregated_params = to_llm_disaggregated_params(
+                request.disaggregated_params)
+            if (self._has_disagg_lifecycle_identity(
+                    request_disaggregated_params) and len(prompts) != 1):
+                raise ValueError(
+                    "generation-safe disaggregated requests support one prompt")
+
             stream_response_id = None
             stream_created = None
             if request.stream and len(prompts) > 1:
                 stream_response_id = f"cmpl-{uuid.uuid4().hex}"
                 stream_created = int(time.time())
 
-            promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
             # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
@@ -1894,8 +2294,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
             self._validate_internal_disagg_request(request, raw_request)
-            disaggregated_params = to_llm_disaggregated_params(
-                request.disaggregated_params)
+            disaggregated_params = request_disaggregated_params
             resolve_request_conversation_id(
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
@@ -1931,6 +2330,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 else:
                     tokens_prompt = prompt
 
+                self._validate_disagg_before_submit(disaggregated_params)
                 promise = self.generator.generate_async(
                     inputs=tokens_prompt,
                     sampling_params=sampling_params,
@@ -1942,6 +2342,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     trace_headers=trace_headers,
                     priority=request.priority if request.priority is not None
                     else DEFAULT_REQUEST_PRIORITY)
+                self._mark_disagg_scheduler_inserted(disaggregated_params,
+                                                     promise)
                 asyncio.create_task(
                     self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
@@ -1967,14 +2369,41 @@ class OpenAIServer(_VideoRoutesMixin):
                     completion_response(promise, params) for promise, params in
                     zip(promises, postproc_params_collection)
                 ])
+                for promise, response in zip(promises, rsps):
+                    await self._finish_disagg_request(
+                        disaggregated_params,
+                        promise,
+                        success=True,
+                        context_handoff_created=self.
+                        _response_has_disagg_handoff(response),
+                    )
+                    lifecycle_finished_promises.add(id(promise))
                 response = merge_completion_responses(rsps) if len(
                     rsps) > 1 else rsps[0]
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
+            for promise in promises:
+                if id(promise) not in lifecycle_finished_promises:
+                    await self._finish_disagg_request(
+                        disaggregated_params,
+                        promise,
+                        success=False,
+                        reason="executor failure",
+                    )
+                    lifecycle_finished_promises.add(id(promise))
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
+            for promise in promises:
+                if id(promise) not in lifecycle_finished_promises:
+                    await self._finish_disagg_request(
+                        disaggregated_params,
+                        promise,
+                        success=False,
+                        reason=str(e),
+                    )
+                    lifecycle_finished_promises.add(id(promise))
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
 
@@ -1984,9 +2413,14 @@ class OpenAIServer(_VideoRoutesMixin):
 
         Supports both streaming and non-streaming modes.
         """
+        promise: Optional[RequestOutput] = None
+        disaggregated_params: Optional[LlmDisaggregatedParams] = None
+        lifecycle_finished = False
 
         async def create_streaming_generator(promise: RequestOutput,
                                              postproc_params: PostprocParams):
+            nonlocal lifecycle_finished
+            success = False
             try:
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
@@ -2005,6 +2439,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                   post_processor(res, args))
                     for pp_res in pp_results:
                         yield pp_res
+                success = True
                 yield "data: [DONE]\n\n"
                 await self._extract_metrics(res, raw_request)
             except asyncio.CancelledError:
@@ -2012,6 +2447,14 @@ class OpenAIServer(_VideoRoutesMixin):
             except Exception:
                 logger.error(traceback.format_exc())
                 raise
+            finally:
+                await self._finish_disagg_request(
+                    disaggregated_params,
+                    promise,
+                    success=success,
+                    reason="" if success else "generation stream terminated",
+                )
+                lifecycle_finished = True
 
         try:
             ensure_request_chat_template_allowed(
@@ -2073,6 +2516,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 agent_hierarchy=request.agent_hierarchy)
 
             # Generate
+            self._validate_disagg_before_submit(disaggregated_params)
             promise = self.generator.generate_async(
                 inputs=harmony_tokens,
                 sampling_params=sampling_params,
@@ -2087,6 +2531,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
+            self._mark_disagg_scheduler_inserted(disaggregated_params, promise)
             if not self.postproc_worker_enabled:
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
@@ -2101,11 +2546,33 @@ class OpenAIServer(_VideoRoutesMixin):
             else:
                 response = await self._create_chat_response(
                     promise, postproc_params, raw_request, disaggregated_params)
+                await self._finish_disagg_request(
+                    disaggregated_params,
+                    promise,
+                    success=True,
+                    context_handoff_created=self._response_has_disagg_handoff(
+                        response),
+                )
+                lifecycle_finished = True
                 return JSONResponse(response.model_dump())
 
         except ValueError as e:
+            if promise is not None and not lifecycle_finished:
+                await self._finish_disagg_request(
+                    disaggregated_params,
+                    promise,
+                    success=False,
+                    reason=str(e),
+                )
             return self.create_error_response(str(e))
         except Exception as e:
+            if promise is not None and not lifecycle_finished:
+                await self._finish_disagg_request(
+                    disaggregated_params,
+                    promise,
+                    success=False,
+                    reason=str(e),
+                )
             logger.error("Error in harmony chat completion: %s", e)
             logger.debug("Error details: %s", traceback.format_exc())
             return self.create_error_response(message=str(e),

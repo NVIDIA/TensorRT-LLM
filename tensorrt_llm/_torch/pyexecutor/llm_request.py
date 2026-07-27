@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
@@ -5,6 +20,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.disaggregation.handoff import HandoffLifecycleEvent
+from tensorrt_llm._torch.disaggregation.protocol import \
+    transfer_protocol_identity_from_params
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
@@ -625,6 +643,7 @@ class LlmResponse:
     error_msg: Optional[str] = None
     result: Optional[LlmResult] = None
     client_id: Optional[int] = None
+    disagg_handoff_event: Optional[HandoffLifecycleEvent] = None
 
     def has_error(self):
         return self.error_msg is not None
@@ -813,6 +832,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_logprobs_mode = LogprobMode(
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
+        self.py_disagg_transfer_protocol_identity = None
         self.py_conversation_params = None
 
         self.py_num_connector_matched_tokens = 0
@@ -1244,6 +1264,9 @@ def executor_request_to_llm_request(
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)
+    llm_request.py_disagg_transfer_protocol_identity = (
+        transfer_protocol_identity_from_params(
+            llm_request.py_disaggregated_params))
     llm_request.py_conversation_params = getattr(executor_request,
                                                  "py_conversation_params", None)
     if child_req_ids:

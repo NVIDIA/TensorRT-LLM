@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, cast, get_type_hint
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
         DEFAULT_BEAM_INDEX,
+        AllocationReuseProof,
         AttentionLayerConfig,
         BatchDesc,
         BufferConfig,
@@ -46,6 +47,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        LeaseSettlement,
         PlannedDropHandle,
         ReuseScope,
         SsmLayerConfig,
@@ -84,6 +86,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
         DEFAULT_BEAM_INDEX,
+        AllocationReuseProof,
         AttentionLayerConfig,
         BatchDesc,
         BufferConfig,
@@ -99,6 +102,7 @@ else:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        LeaseSettlement,
         PlannedDropHandle,
         ReuseScope,
         SsmLayerConfig,
@@ -386,6 +390,259 @@ class TestKVCacheManagerV2(unittest.TestCase):
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
+
+
+class TestAllocationLeases(TestKVCacheManagerV2):
+    def prepare_manager(self) -> None:
+        self.prepare(16 << 20, 0, 0, 2, None, 0)
+
+    def test_close_waits_for_every_reusable_settlement(self) -> None:
+        self.prepare_manager()
+        kv_cache = self.manager.create_kv_cache(id=7)
+        with TemporaryCudaStream([]) as stream:
+            self.assertTrue(kv_cache.resume(cast(CudaStream, stream.handle)))
+            self.assertTrue(kv_cache.resize(self.cfg.tokens_per_block))
+            first = self.manager.snapshot_and_lease(kv_cache)
+            second = self.manager.snapshot_and_lease(kv_cache)
+
+            with self.assertRaisesRegex(RuntimeError, "allocation leases are active"):
+                kv_cache.set_base_page_index_buf(DEFAULT_BEAM_INDEX, LayerGroupId(0), None)
+            with self.assertRaisesRegex(RuntimeError, "allocation leases are active"):
+                kv_cache.suspend()
+            kv_cache.close()
+
+            self.assertTrue(kv_cache.close_pending)
+            self.assertGreater(kv_cache.num_blocks, 0)
+            with self.assertRaisesRegex(RuntimeError, "logical close"):
+                kv_cache.set_base_page_index_buf(DEFAULT_BEAM_INDEX, LayerGroupId(0), None)
+            with self.assertRaisesRegex(RuntimeError, "logical close"):
+                kv_cache.suspend()
+
+            self.assertEqual(
+                first.settle(AllocationReuseProof.ACTIVE),
+                LeaseSettlement.NOT_QUIESCED,
+            )
+            self.assertEqual(
+                first.settle(AllocationReuseProof.QUIESCED_SUCCESS),
+                LeaseSettlement.RELEASED,
+            )
+            self.assertEqual(
+                first.settle(AllocationReuseProof.QUIESCED_SUCCESS),
+                LeaseSettlement.ALREADY_RELEASED,
+            )
+            self.assertTrue(kv_cache.close_pending)
+            self.assertGreater(kv_cache.num_blocks, 0)
+            self.assertEqual(
+                second.settle(AllocationReuseProof.IN_DOUBT),
+                LeaseSettlement.NOT_QUIESCED,
+            )
+            self.assertEqual(
+                second.settle(AllocationReuseProof.QUIESCED_FAILURE),
+                LeaseSettlement.RELEASED,
+            )
+            self.assertEqual(kv_cache.status, _KVCache.Status.CLOSED)
+            self.assertEqual(kv_cache.num_blocks, 0)
+            self.assertEqual(self.manager.outstanding_allocation_lease_count, 0)
+        stream.take_finish_event().synchronize()
+
+    def test_request_id_reuse_keeps_allocation_generations_independent(self) -> None:
+        self.prepare_manager()
+        with TemporaryCudaStream([]) as stream:
+            old_cache = self.manager.create_kv_cache(id=11)
+            self.assertTrue(old_cache.resume(cast(CudaStream, stream.handle)))
+            old_lease = self.manager.snapshot_and_lease(old_cache)
+            old_cache.close()
+
+            new_cache = self.manager.create_kv_cache(id=11)
+            self.assertTrue(new_cache.resume(cast(CudaStream, stream.handle)))
+            new_lease = self.manager.snapshot_and_lease(new_cache)
+
+            self.assertEqual(
+                old_cache.allocation_identity.allocator_domain_id,
+                new_cache.allocation_identity.allocator_domain_id,
+            )
+            self.assertGreater(
+                new_cache.allocation_generation,
+                old_cache.allocation_generation,
+            )
+            self.assertEqual(
+                self.manager.settle_allocation_lease(
+                    old_lease.snapshot.lease_id,
+                    new_cache.allocation_identity,
+                    AllocationReuseProof.NOT_EXPOSED,
+                ),
+                LeaseSettlement.STALE_GENERATION,
+            )
+            self.assertTrue(old_cache.close_pending)
+
+            self.assertEqual(
+                old_lease.settle(AllocationReuseProof.NOT_EXPOSED),
+                LeaseSettlement.RELEASED,
+            )
+            self.assertEqual(
+                self.manager.settle_allocation_lease(
+                    old_lease.snapshot.lease_id,
+                    new_cache.allocation_identity,
+                    AllocationReuseProof.NOT_EXPOSED,
+                ),
+                LeaseSettlement.STALE_GENERATION,
+            )
+            self.assertEqual(
+                self.manager.settle_allocation_lease(
+                    old_lease.snapshot.lease_id + 1000,
+                    old_cache.allocation_identity,
+                    AllocationReuseProof.NOT_EXPOSED,
+                ),
+                LeaseSettlement.NOT_FOUND,
+            )
+            self.assertEqual(old_cache.status, _KVCache.Status.CLOSED)
+            self.assertEqual(new_cache.status, _KVCache.Status.ACTIVE)
+
+            new_cache.close()
+            self.assertEqual(
+                new_lease.settle(AllocationReuseProof.QUIESCED_SUCCESS),
+                LeaseSettlement.RELEASED,
+            )
+            self.assertEqual(new_cache.status, _KVCache.Status.CLOSED)
+        stream.take_finish_event().synchronize()
+
+    def test_handle_garbage_collection_does_not_release_or_enable_shutdown(self) -> None:
+        self.prepare_manager()
+        with TemporaryCudaStream([]) as stream:
+            kv_cache = self.manager.create_kv_cache(id=13)
+            self.assertTrue(kv_cache.resume(cast(CudaStream, stream.handle)))
+            lease = self.manager.snapshot_and_lease(kv_cache)
+            lease_id = lease.snapshot.lease_id
+            identity = lease.snapshot.identity
+            del lease
+            gc.collect()
+
+            self.assertEqual(self.manager.outstanding_allocation_lease_count, 1)
+            with self.assertRaisesRegex(RuntimeError, "1 outstanding allocation lease"):
+                self.manager.shutdown()
+
+            self.assertEqual(
+                self.manager.settle_allocation_lease(
+                    lease_id,
+                    identity,
+                    AllocationReuseProof.QUIESCED_SUCCESS,
+                ),
+                LeaseSettlement.RELEASED,
+            )
+            kv_cache.close()
+        stream.take_finish_event().synchronize()
+
+    def test_close_bookkeeping_failure_precedes_every_destructive_release(self) -> None:
+        class FailingRemovalSet(set):
+            def remove(self, value) -> None:
+                raise RuntimeError("injected living-cache removal failure")
+
+        self.prepare_manager()
+        kv_cache = self.manager.create_kv_cache(id=15)
+        with TemporaryCudaStream([]) as stream:
+            self.assertTrue(kv_cache.resume(cast(CudaStream, stream.handle)))
+            self.assertTrue(kv_cache.resize(self.cfg.tokens_per_block))
+            lease = self.manager.snapshot_and_lease(kv_cache)
+            page_indices = tuple(
+                page_index
+                for allocation_range in lease.snapshot.ranges
+                for page_index in allocation_range.page_indices
+            )
+            original_living_kv_caches = self.manager._living_kv_caches
+            self.manager._living_kv_caches = FailingRemovalSet(original_living_kv_caches)
+            kv_cache.close()
+
+            self.assertEqual(
+                lease.settle(AllocationReuseProof.QUIESCED_SUCCESS),
+                LeaseSettlement.IN_DOUBT,
+            )
+            self.assertEqual(kv_cache.status, _KVCache.Status.ACTIVE)
+            self.assertEqual(kv_cache.num_blocks, 1)
+            self.assertEqual(
+                tuple(
+                    kv_cache.get_aggregated_page_indices(
+                        LayerGroupId(0),
+                        valid_only=True,
+                    )
+                ),
+                page_indices[:1],
+            )
+
+            # Test-only recovery: production deliberately retains the failed
+            # retirement until an endpoint reset.
+            lease_id = lease.snapshot.lease_id
+            record = self.manager._in_doubt_allocation_leases.pop(lease_id)
+            self.manager._allocation_leases[lease_id] = record
+            del self.manager._settled_allocation_leases[lease_id]
+            self.manager._living_kv_caches = original_living_kv_caches
+            self.assertEqual(
+                lease.settle(AllocationReuseProof.QUIESCED_SUCCESS),
+                LeaseSettlement.RELEASED,
+            )
+            self.assertEqual(kv_cache.status, _KVCache.Status.CLOSED)
+        stream.take_finish_event().synchronize()
+
+    def test_snapshot_descriptors_are_immutable_and_range_checked(self) -> None:
+        self.prepare_manager()
+        kv_cache = self.manager.create_kv_cache(id=17)
+        with self.assertRaisesRegex(RuntimeError, "suspended allocation"):
+            self.manager.snapshot_and_lease(kv_cache, block_range=(0, 0))
+
+        with TemporaryCudaStream([]) as stream:
+            self.assertTrue(kv_cache.resume(cast(CudaStream, stream.handle)))
+            self.assertTrue(kv_cache.resize(self.cfg.tokens_per_block))
+            lease = self.manager.snapshot_and_lease(kv_cache)
+
+            self.assertEqual(lease.snapshot.identity, kv_cache.allocation_identity)
+            self.assertTrue(lease.snapshot.ranges)
+            self.assertTrue(all(len(r.page_indices) == 1 for r in lease.snapshot.ranges))
+            with self.assertRaises((AttributeError, TypeError)):
+                lease.snapshot.ranges = ()
+            with self.assertRaisesRegex(ValueError, "outside the allocation"):
+                self.manager.snapshot_and_lease(kv_cache, block_range=(0, 2))
+
+            kv_cache.close()
+            self.assertEqual(
+                lease.settle(AllocationReuseProof.QUIESCED_SUCCESS),
+                LeaseSettlement.RELEASED,
+            )
+        stream.take_finish_event().synchronize()
+
+    def test_snapshot_segments_around_intentionally_absent_swa_pages(self) -> None:
+        self.prepare(
+            16 << 20,
+            0,
+            0,
+            2,
+            32,
+            0,
+            tokens_per_block=32,
+        )
+        kv_cache = self.manager.create_kv_cache(id=19)
+        with TemporaryCudaStream([]) as stream:
+            self.assertTrue(kv_cache.resume(cast(CudaStream, stream.handle)))
+            self.assertTrue(kv_cache.resize(256, history_length=224))
+
+            lease = self.manager.snapshot_and_lease(kv_cache, layer_group_ids=[0])
+
+            self.assertEqual(len(lease.snapshot.ranges), 1)
+            allocation_range = lease.snapshot.ranges[0]
+            self.assertEqual((allocation_range.block_begin, allocation_range.block_end), (6, 8))
+            self.assertEqual(
+                allocation_range.page_indices,
+                tuple(
+                    kv_cache.get_aggregated_page_indices(
+                        LayerGroupId(0),
+                        valid_only=True,
+                    )
+                ),
+            )
+            kv_cache.close()
+            self.assertEqual(
+                lease.settle(AllocationReuseProof.QUIESCED_SUCCESS),
+                LeaseSettlement.RELEASED,
+            )
+        stream.take_finish_event().synchronize()
 
 
 class TestNoBatching(TestKVCacheManagerV2):
@@ -2031,6 +2288,37 @@ class TestSSMSupport(unittest.TestCase):
         self.assertEqual(initial_slot, resumed_slot, "SSM slot unchanged after suspend/resume")
         kv_cache.close()
 
+    def test_allocation_lease_snapshots_exact_pinned_ssm_slot(self) -> None:
+        cfg = self._make_ssm_config()
+        self.manager = KVCacheManager(cfg)
+        kv_cache = self.manager.create_kv_cache(id=23)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        self.assertTrue(kv_cache.resume(stream))
+        kv_cache.capacity = cfg.tokens_per_block
+        ssm_lg = self.manager._life_cycles.ssm_life_cycle_id
+        assert ssm_lg is not None
+
+        lease = self.manager.snapshot_and_lease(
+            kv_cache,
+            layer_group_ids=[int(ssm_lg)],
+            block_range=(0, 1),
+        )
+
+        self.assertEqual(len(lease.snapshot.ranges), 1)
+        allocation_range = lease.snapshot.ranges[0]
+        self.assertEqual(allocation_range.page_indices, ())
+        self.assertEqual(
+            allocation_range.ssm_page_index,
+            kv_cache.get_ssm_block_base_index(LayerGroupId(ssm_lg)),
+        )
+        kv_cache.close()
+        self.assertEqual(
+            lease.settle(AllocationReuseProof.QUIESCED_SUCCESS),
+            LeaseSettlement.RELEASED,
+        )
+        stream_holder.synchronize()
+
     def test_no_reuse_with_ssm(self) -> None:
         """input_tokens are accepted but no prefix reuse happens without a prior snapshot."""
         cfg = self._make_ssm_config(tokens_per_block=32)
@@ -3367,6 +3655,26 @@ class TestScratchReuse(TestKVCacheManagerV2):
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
+
+    def test_allocation_lease_rejects_scratch_backed_slice(self) -> None:
+        self._prepare_scratch(
+            num_layers=8,
+            window_size=32,
+            tokens_per_block=32,
+            gpu_quota=16 << 20,
+        )
+        kv_cache = self.manager.create_kv_cache(id=29)
+        with TemporaryCudaStream([]) as stream:
+            self.assertTrue(kv_cache.resume(cast(CudaStream, stream.handle)))
+            self.assertTrue(kv_cache.resize(256))
+            self.assertTrue(kv_cache.has_scratch_slots)
+
+            with self.assertRaisesRegex(RuntimeError, "scratch-backed page"):
+                self.manager.snapshot_and_lease(kv_cache)
+
+            self.assertEqual(self.manager.outstanding_allocation_lease_count, 0)
+            kv_cache.close()
+        stream.take_finish_event().synchronize()
 
     def test_excess_scratch_slot_waits_for_ready_event_on_new_stream(self):
         num_layers = 512

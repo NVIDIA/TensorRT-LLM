@@ -194,6 +194,7 @@ class StorageManager:
         "_levels",
         "_min_slots",
         "_event_manager",
+        "_topology_change_guard",
         "__rawref__",
     )
     _life_cycles: LifeCycleRegistry
@@ -207,6 +208,7 @@ class StorageManager:
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _min_slots: TypedIndexList[PoolGroupIndex, int]
     _event_manager: "KVCacheEventManager | None"
+    _topology_change_guard: Callable[[], None] | None
     __rawref__: rawref.ref["StorageManager"]
 
     def __init__(
@@ -220,9 +222,11 @@ class StorageManager:
         initial_pool_ratio: list[float] | None = None,
         event_manager: "KVCacheEventManager | None" = None,
         max_util_for_resume: float = 1.0,
+        topology_change_guard: Callable[[], None] | None = None,
     ) -> None:
         self.__rawref__ = rawref.NULL
         self._event_manager = event_manager
+        self._topology_change_guard = topology_change_guard
         assert config.cache_tiers[GPU_LEVEL].tier == CacheTier.GPU_MEM, (
             "The first cache tier must be GPU memory"
         )
@@ -305,10 +309,15 @@ class StorageManager:
         self.destroy()
 
     def destroy(self) -> None:
+        self._assert_topology_change_allowed()
         if self.__rawref__.is_valid:
             self.__rawref__.invalidate()
             for lvl in self._levels:
                 lvl.storage.destroy()
+
+    def _assert_topology_change_allowed(self) -> None:
+        if self._topology_change_guard is not None:
+            self._topology_change_guard()
 
     def get_pool_group_index(self, life_cycle: LifeCycleId) -> PoolGroupIndex:
         return self._life_cycle_grouping[life_cycle]
@@ -761,6 +770,7 @@ class StorageManager:
         persistent_pages: list[Page],
     ) -> None:
         """Move pages to eliminate overflow slots then shrink the pool group"""
+        self._assert_topology_change_allowed()
         lc2pg = self._life_cycle_grouping
         assert len(persistent_pages) <= new_num_slots and all(
             p.cache_level == level and lc2pg[p.life_cycle] == pg_idx for p in persistent_pages
@@ -820,6 +830,7 @@ class StorageManager:
     def expand_pool_group(
         self, level: CacheLevel, pg_idx: PoolGroupIndex, new_num_slots: int
     ) -> None:
+        self._assert_topology_change_allowed()
         pool_group = self._levels[level].storage._pool_groups[pg_idx]
         assert new_num_slots > pool_group.num_slots
         pool_group.resize_pools(new_num_slots)
@@ -833,6 +844,7 @@ class StorageManager:
         persistent_pages: TypedIndexList[PoolGroupIndex, list[Page]] | None = None,
     ) -> None:
         """Adapt the cache level by adjusting the ratio list. Persistent pages are those held and not evictable."""
+        self._assert_topology_change_allowed()
         num_cache_levels = self.num_cache_levels
         lvl_storage = self._levels[level].storage
         old_num_slots = lvl_storage.slot_count_list

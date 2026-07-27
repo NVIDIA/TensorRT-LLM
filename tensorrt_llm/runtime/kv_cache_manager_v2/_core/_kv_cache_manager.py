@@ -14,18 +14,28 @@
 # limitations under the License.
 
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, cast
+from uuid import uuid4
 
 from .. import rawref
+from .._allocation_lease import (
+    AllocationIdentity,
+    AllocationLeaseHandle,
+    AllocationLeaseSnapshot,
+    AllocationRange,
+    AllocationReuseProof,
+    LeaseSettlement,
+)
 from .._block_radix_tree import BlockRadixTree, ReuseMatch, ReuseScope
 from .._common import (
     BAD_PAGE_INDEX,
     GPU_LEVEL,
     PRIORITY_DEFAULT,
+    BeamIndex,
     BlockOrdinal,
     CacheLevel,
     CacheTier,
@@ -61,6 +71,14 @@ from ._moving_average import MovingAverage
 
 if TYPE_CHECKING:
     from .._event_manager import KVCacheEventManager
+
+
+MAX_SETTLED_ALLOCATION_LEASE_TOMBSTONES = 4096
+
+# Managers enter this process-wide fail-closed quarantine as soon as they issue
+# an allocation lease. An abandoned handle therefore cannot make the backing
+# storage unreachable. The last safe settlement removes the strong root.
+_QUARANTINED_ALLOCATION_MANAGERS: dict[str, object] = {}
 
 
 @dataclass(slots=True, frozen=True)
@@ -192,6 +210,32 @@ class PoolGroupPeakBlockStats:
     evictable: int
 
 
+@dataclass(slots=True)
+class _AllocationLeaseRecord:
+    snapshot: AllocationLeaseSnapshot
+    allocation: _KVCache
+
+
+@dataclass(slots=True, frozen=True)
+class _AllocationLeaseTombstone:
+    identity: AllocationIdentity
+    settlement: LeaseSettlement
+
+
+@dataclass(slots=True, frozen=True)
+class _PoolTopologyLeaseGuard:
+    active: dict[int, _AllocationLeaseRecord]
+    in_doubt: dict[int, _AllocationLeaseRecord]
+
+    def __call__(self) -> None:
+        outstanding = len(self.active) + len(self.in_doubt)
+        if outstanding:
+            raise RuntimeError(
+                "cannot resize KV cache pools while "
+                f"{outstanding} allocation lease(s) are active or in doubt"
+            )
+
+
 class KVCacheManager:
     __slots__ = (
         "_init_config",
@@ -216,6 +260,13 @@ class KVCacheManager:
         "_iteration_peak_num_blocks_by_cache_level",
         "_dirty_stats_kv_cache_ids",
         "_stats_excluded_kv_cache_ids",
+        "_allocator_domain_id",
+        "_next_allocation_generation",
+        "_next_allocation_lease_id",
+        "_allocation_leases",
+        "_in_doubt_allocation_leases",
+        "_settled_allocation_leases",
+        "_settled_allocation_lease_order",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
@@ -248,6 +299,13 @@ class KVCacheManager:
     ]
     _dirty_stats_kv_cache_ids: set[int]
     _stats_excluded_kv_cache_ids: set[int]
+    _allocator_domain_id: str
+    _next_allocation_generation: int
+    _next_allocation_lease_id: int
+    _allocation_leases: dict[int, _AllocationLeaseRecord]
+    _in_doubt_allocation_leases: dict[int, _AllocationLeaseRecord]
+    _settled_allocation_leases: dict[int, _AllocationLeaseTombstone]
+    _settled_allocation_lease_order: deque[int]
 
     def __init__(
         self,
@@ -257,6 +315,13 @@ class KVCacheManager:
         init_cuda_once()
         config = deepcopy(config)
         self._init_config = config
+        self._allocator_domain_id = uuid4().hex
+        self._next_allocation_generation = 1
+        self._next_allocation_lease_id = 1
+        self._allocation_leases = {}
+        self._in_doubt_allocation_leases = {}
+        self._settled_allocation_leases = {}
+        self._settled_allocation_lease_order = deque()
         self._life_cycles = LifeCycleRegistry(config)
         self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         storage_config = create_storage_config(config)
@@ -270,6 +335,10 @@ class KVCacheManager:
             initial_pool_ratio=config.initial_pool_ratio,
             event_manager=event_manager,
             max_util_for_resume=config.max_util_for_resume,
+            topology_change_guard=_PoolTopologyLeaseGuard(
+                self._allocation_leases,
+                self._in_doubt_allocation_leases,
+            ),
         )
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
@@ -292,11 +361,32 @@ class KVCacheManager:
         self._stats_excluded_kv_cache_ids = set()
 
     def __del__(self) -> None:
-        self.shutdown()
+        if not hasattr(self, "_allocator_domain_id"):
+            return
+        if self.outstanding_allocation_lease_count:
+            self._quarantine_for_allocation_leases()
+            return
+        try:
+            self.shutdown()
+        except Exception:
+            # A destructor cannot report a usable error to its caller. Retain
+            # the backing storage instead of letting failed teardown free it.
+            self._quarantine_for_allocation_leases()
 
     def shutdown(self) -> None:
-        self.clear_reusable_blocks()
-        self._storage.destroy()
+        outstanding = self.outstanding_allocation_lease_count
+        if outstanding:
+            self._quarantine_for_allocation_leases()
+            raise RuntimeError(
+                f"KV cache manager has {outstanding} outstanding allocation lease(s)"
+            )
+        try:
+            self.clear_reusable_blocks()
+            self._storage.destroy()
+        except Exception:
+            self._quarantine_for_allocation_leases()
+            raise
+        self._release_allocation_lease_quarantine()
 
     def clear_reusable_blocks(self) -> None:
         self._radix_tree.clear()
@@ -410,14 +500,233 @@ class KVCacheManager:
         )
         if expected_prompt_length is None and input_tokens is not None:
             expected_prompt_length = len(input_tokens)
+        allocation_generation = self._next_allocation_generation
+        self._next_allocation_generation += 1
         return _KVCache(
             self,
             reuse_scope,
             reuse_match,
             id,
             custom_priority_callback,
+            allocation_generation,
             expected_prompt_length,
         )
+
+    @property
+    def allocator_domain_id(self) -> str:
+        """Stable identifier for allocations created by this manager."""
+        return self._allocator_domain_id
+
+    @property
+    def outstanding_allocation_lease_count(self) -> int:
+        """Number of leases that still prevent allocator reuse."""
+        return len(self._allocation_leases) + len(self._in_doubt_allocation_leases)
+
+    def _has_allocation_leases(self, allocation: _KVCache) -> bool:
+        return any(
+            record.allocation is allocation
+            for records in (
+                self._allocation_leases.values(),
+                self._in_doubt_allocation_leases.values(),
+            )
+            for record in records
+        )
+
+    def _quarantine_for_allocation_leases(self) -> None:
+        existing = _QUARANTINED_ALLOCATION_MANAGERS.get(self.allocator_domain_id)
+        if existing is not None and existing is not self:
+            raise RuntimeError("allocator domain collision in allocation-lease quarantine")
+        _QUARANTINED_ALLOCATION_MANAGERS[self.allocator_domain_id] = self
+
+    def _release_allocation_lease_quarantine(self) -> None:
+        existing = _QUARANTINED_ALLOCATION_MANAGERS.get(self.allocator_domain_id)
+        if existing is self:
+            del _QUARANTINED_ALLOCATION_MANAGERS[self.allocator_domain_id]
+
+    def _assert_pool_topology_mutable(self) -> None:
+        _PoolTopologyLeaseGuard(
+            self._allocation_leases,
+            self._in_doubt_allocation_leases,
+        )()
+
+    def _remember_allocation_lease_settlement(
+        self,
+        lease_id: int,
+        identity: AllocationIdentity,
+        settlement: LeaseSettlement,
+    ) -> None:
+        """Publish settlement before an active record can disappear."""
+        self._settled_allocation_leases[lease_id] = _AllocationLeaseTombstone(
+            identity,
+            settlement,
+        )
+        if settlement == LeaseSettlement.RELEASED:
+            self._settled_allocation_lease_order.append(lease_id)
+            if len(self._settled_allocation_lease_order) > MAX_SETTLED_ALLOCATION_LEASE_TOMBSTONES:
+                expired_lease_id = self._settled_allocation_lease_order.popleft()
+                del self._settled_allocation_leases[expired_lease_id]
+
+    def snapshot_and_lease(
+        self,
+        allocation: _KVCache,
+        layer_group_ids: Sequence[int] | None = None,
+        block_range: tuple[int, int] | None = None,
+    ) -> AllocationLeaseHandle:
+        """Snapshot immutable descriptors and lease one exact allocation.
+
+        The caller must pass the allocation object obtained from its current
+        request mapping. This method never performs a delayed request-id lookup.
+        Like the rest of the V2 allocator, acquisition and settlement must be
+        serialized on the manager's scheduler-owner thread.
+        """
+        if allocation.manager is not self:
+            raise ValueError("allocation is owned by a different KV cache manager")
+        if allocation.close_requested:
+            raise RuntimeError("cannot lease an allocation after logical close")
+        if not allocation.is_active:
+            raise RuntimeError("cannot lease a suspended allocation with evictable pages")
+
+        num_blocks = allocation.num_blocks
+        if block_range is None:
+            block_begin, block_end = 0, num_blocks
+        else:
+            block_begin, block_end = block_range
+            if block_begin < 0 or block_end < block_begin or block_end > num_blocks:
+                raise ValueError("block_range is outside the allocation")
+
+        if layer_group_ids is None:
+            selected_layer_groups = tuple(range(self._life_cycles.size))
+        else:
+            selected_layer_groups = tuple(layer_group_ids)
+            if len(set(selected_layer_groups)) != len(selected_layer_groups):
+                raise ValueError("layer_group_ids must not contain duplicates")
+            if any(
+                layer_group_id < 0 or layer_group_id >= self._life_cycles.size
+                for layer_group_id in selected_layer_groups
+            ):
+                raise ValueError("layer_group_id is outside the allocation")
+
+        ranges = list[AllocationRange]()
+        ssm_life_cycle_id = self._life_cycles.ssm_life_cycle_id
+        for layer_group_id in selected_layer_groups:
+            typed_layer_group_id = LayerGroupId(layer_group_id)
+            is_ssm = typed_layer_group_id == ssm_life_cycle_id
+            for beam_index in range(int(allocation.beam_width)):
+                typed_beam_index = BeamIndex(beam_index)
+                if is_ssm:
+                    ssm_page_index = allocation._snapshot_transferable_ssm_page_index(
+                        typed_layer_group_id,
+                        typed_beam_index,
+                    )
+                    ranges.append(
+                        AllocationRange(
+                            layer_group_id=layer_group_id,
+                            beam_index=beam_index,
+                            block_begin=0,
+                            block_end=0,
+                            page_indices=(),
+                            ssm_page_index=ssm_page_index,
+                        )
+                    )
+                    continue
+                segments = allocation._snapshot_transferable_page_ranges(
+                    typed_layer_group_id,
+                    typed_beam_index,
+                    block_begin,
+                    block_end,
+                )
+                for segment_begin, segment_end, page_indices in segments:
+                    ranges.append(
+                        AllocationRange(
+                            layer_group_id=layer_group_id,
+                            beam_index=beam_index,
+                            block_begin=segment_begin,
+                            block_end=segment_end,
+                            page_indices=page_indices,
+                        )
+                    )
+
+        lease_id = self._next_allocation_lease_id
+        self._next_allocation_lease_id += 1
+        snapshot = AllocationLeaseSnapshot(
+            lease_id=lease_id,
+            identity=allocation.allocation_identity,
+            ranges=tuple(ranges),
+        )
+        handle = AllocationLeaseHandle(snapshot, self)
+        self._allocation_leases[lease_id] = _AllocationLeaseRecord(snapshot, allocation)
+        self._quarantine_for_allocation_leases()
+        return handle
+
+    def settle_allocation_lease(
+        self,
+        lease_id: int,
+        identity: AllocationIdentity,
+        proof: AllocationReuseProof,
+    ) -> LeaseSettlement:
+        """Settle one lease without allowing stale generations to affect reuse."""
+        record = self._allocation_leases.get(lease_id)
+        if record is None:
+            in_doubt_record = self._in_doubt_allocation_leases.get(lease_id)
+            if in_doubt_record is not None:
+                if in_doubt_record.snapshot.identity != identity:
+                    return LeaseSettlement.STALE_GENERATION
+                return LeaseSettlement.IN_DOUBT
+            tombstone = self._settled_allocation_leases.get(lease_id)
+            if tombstone is None:
+                return LeaseSettlement.NOT_FOUND
+            if tombstone.identity != identity:
+                return LeaseSettlement.STALE_GENERATION
+            if tombstone.settlement == LeaseSettlement.IN_DOUBT:
+                return LeaseSettlement.IN_DOUBT
+            return LeaseSettlement.ALREADY_RELEASED
+
+        if record.snapshot.identity != identity:
+            return LeaseSettlement.STALE_GENERATION
+        if not proof.is_reusable:
+            return LeaseSettlement.NOT_QUIESCED
+
+        allocation = record.allocation
+        has_other_allocation_lease = any(
+            other_lease_id != lease_id and other_record.allocation is allocation
+            for other_lease_id, other_record in self._allocation_leases.items()
+        ) or any(
+            other_record.allocation is allocation
+            for other_record in self._in_doubt_allocation_leases.values()
+        )
+        needs_physical_retirement = allocation.close_pending and not has_other_allocation_lease
+
+        if needs_physical_retirement:
+            # IN_DOUBT is the fail-closed default published before the active
+            # record disappears. Successful retirement upgrades it to RELEASED.
+            self._remember_allocation_lease_settlement(
+                lease_id,
+                identity,
+                LeaseSettlement.IN_DOUBT,
+            )
+            del self._allocation_leases[lease_id]
+            try:
+                allocation._finalize_close()
+            except Exception:
+                self._in_doubt_allocation_leases[lease_id] = record
+                self._quarantine_for_allocation_leases()
+                return LeaseSettlement.IN_DOUBT
+            self._remember_allocation_lease_settlement(
+                lease_id,
+                identity,
+                LeaseSettlement.RELEASED,
+            )
+        else:
+            self._remember_allocation_lease_settlement(
+                lease_id,
+                identity,
+                LeaseSettlement.RELEASED,
+            )
+            del self._allocation_leases[lease_id]
+
+        if self.outstanding_allocation_lease_count == 0:
+            self._release_allocation_lease_quarantine()
+        return LeaseSettlement.RELEASED
 
     def _match_reuse(
         self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
@@ -804,6 +1113,10 @@ class KVCacheManager:
             return check_mismatch(self._target_ratio_list_other, self._current_other_ratios, 1.25)
 
     def _adjust_level(self, level: CacheLevel, new_quota: int | None = None) -> None:
+        # StorageManager.adjust_cache_level() is the only manager-owned path to
+        # shrink/expand/reallocate backing pools. Snapshot addresses remain
+        # stable by fencing that entry point for every live or in-doubt lease.
+        self._assert_pool_topology_mutable()
         new_ratio_list = self._get_target_ratio_list(level)
         storage = self._storage
         num_cache_levels = storage.num_cache_levels
@@ -849,6 +1162,7 @@ class KVCacheManager:
         This function should be called periodically to ensure the cache level and ratio list are
         adjusted to the optimal values. All KV caches must be suspended before calling this function.
         """
+        self._assert_pool_topology_mutable()
         assert all(
             unwrap_rawref(c).status == _KVCache.Status.SUSPENDED for c in self._living_kv_caches
         )

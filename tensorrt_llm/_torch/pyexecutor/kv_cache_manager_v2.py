@@ -45,6 +45,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     CACHE_LEVEL1,
     DEFAULT_BEAM_INDEX,
     GPU_LEVEL,
+    AllocationLeaseHandle,
+    AllocationReuseProof,
     AttentionLayerConfig,
     AttnLifeCycle,
     BatchDesc,
@@ -60,6 +62,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheEventManager,
     KVCacheIterationStatsDelta,
     LayerId,
+    LeaseSettlement,
     PageIndexMode,
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
@@ -3212,6 +3215,32 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
 
+    def snapshot_and_lease(
+        self,
+        request_id: int,
+        layer_group_ids: Sequence[int] | None = None,
+        block_range: tuple[int, int] | None = None,
+    ) -> AllocationLeaseHandle:
+        """Lease the exact allocation currently mapped to ``request_id``.
+
+        The request map is consulted once. The allocator registry then retains
+        that concrete allocation generation even if the same request ID is
+        subsequently assigned a new allocation. Callers must serialize this
+        operation with request-map mutation on the scheduler-owner thread.
+        """
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is None:
+            raise KeyError(f"KV cache for request {request_id} does not exist")
+        return self.impl.snapshot_and_lease(kv_cache, layer_group_ids, block_range)
+
+    @staticmethod
+    def settle_allocation_lease(
+        lease: AllocationLeaseHandle,
+        proof: AllocationReuseProof,
+    ) -> LeaseSettlement:
+        """Settle a lease on the scheduler-owner thread without a map lookup."""
+        return lease.settle(proof)
+
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
@@ -3456,6 +3485,11 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
+        outstanding = self.impl.outstanding_allocation_lease_count
+        if outstanding:
+            raise RuntimeError(
+                f"KV cache manager has {outstanding} outstanding allocation lease(s)"
+            )
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()

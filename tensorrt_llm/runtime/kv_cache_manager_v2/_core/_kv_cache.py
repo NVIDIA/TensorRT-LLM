@@ -16,6 +16,7 @@
 import array
 import enum
 import math
+import os
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from itertools import chain
 from typing import TYPE_CHECKING, Callable, ClassVar, Iterator, NamedTuple, Type, cast
 
 from .. import rawref
+from .._allocation_lease import AllocationIdentity
 from .._block_radix_tree import Block, ReuseMatch, ReuseScope, RootBlock, UselessBlockError
 from .._common import (
     BAD_BLOCK_ORDINAL,
@@ -229,6 +231,8 @@ class _KVCache:
         "_get_priority",
         "_cuda_stream",
         "_status",
+        "_allocation_identity",
+        "_close_requested",
         "_beam_width",
         "_expected_prompt_length",
         "_generation_alloc_ready",
@@ -260,6 +264,8 @@ class _KVCache:
     _get_priority: Callable[[BlockOrdinal, LifeCycle], Priority]
     _cuda_stream: CudaStream | None
     _status: _Status
+    _allocation_identity: AllocationIdentity
+    _close_requested: bool
     _beam_width: BeamIndex
     _expected_prompt_length: int | None
     _generation_alloc_ready: bool
@@ -304,14 +310,21 @@ class _KVCache:
         reuse_match: ReuseMatch | None,
         id: int | None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
+        allocation_generation: int,
         expected_prompt_length: int | None = None,
-    ):
+    ) -> None:
         self.id = id
         self._manager = manager
         self._reuse_scope = reuse_scope
         self._get_priority = custom_priority_callback
         self._cuda_stream = None
         self._status = self.Status.SUSPENDED
+        self._allocation_identity = AllocationIdentity(
+            allocator_domain_id=manager.allocator_domain_id,
+            request_id=id,
+            allocation_generation=allocation_generation,
+        )
+        self._close_requested = False
         self._beam_width = BeamIndex(1)
         self._expected_prompt_length = (
             max(expected_prompt_length, 0) if expected_prompt_length is not None else None
@@ -361,6 +374,7 @@ class _KVCache:
         Note that base page indices are not meant for direct use in the kernels. They need to
         be scaled by kv_cache_manager.page_index_scale().
         """
+        self._assert_mutable()
         length = self.num_blocks
         old_indices = self._base_page_indices[beam_idx][layer_group_id]
         new_indices: IndexSeq
@@ -378,11 +392,38 @@ class _KVCache:
         return self._manager
 
     @property
+    def allocation_identity(self) -> AllocationIdentity:
+        """Immutable allocator identity of this concrete cache allocation."""
+        return self._allocation_identity
+
+    @property
+    def allocation_generation(self) -> int:
+        """Monotonic allocator generation of this concrete cache allocation."""
+        return self._allocation_identity.allocation_generation
+
+    @property
+    def close_requested(self) -> bool:
+        """Whether logical close has permanently stopped cache mutation."""
+        return self._close_requested
+
+    @property
+    def close_pending(self) -> bool:
+        """Whether close is waiting for one or more allocation leases."""
+        return self._close_requested and self.status != self.Status.CLOSED
+
+    def _assert_mutable(self) -> None:
+        if self._close_requested:
+            raise RuntimeError("KV cache mutation is forbidden after logical close")
+        if self.manager._has_allocation_leases(self):
+            raise RuntimeError("KV cache mutation is forbidden while allocation leases are active")
+
+    @property
     def cuda_stream(self) -> CudaStream:
         return unwrap_optional(self._cuda_stream)
 
     @cuda_stream.setter
     def cuda_stream(self, cuda_stream: CudaStream) -> None:
+        self._assert_mutable()
         if self._cuda_stream is not None:
             if self.is_active:
                 CachedCudaEvent(self._cuda_stream).wait_in_stream(cuda_stream)
@@ -570,20 +611,46 @@ class _KVCache:
         assert NDEBUG or self._check_sanity()
         if self.status == self.Status.CLOSED:
             return
-        self.discard_pending_stats()
-        self.stop_committing()
+        if not self._close_requested:
+            self._close_requested = True
+        if self.manager._has_allocation_leases(self):
+            return
+        self._finalize_close()
+
+    def _finalize_close(self) -> None:
+        """Physically retire a logically closed allocation after all leases settle."""
+        assert self._close_requested
+        assert not self.manager._has_allocation_leases(self)
+        if self.status == self.Status.CLOSED:
+            return
         assert NDEBUG or self._check_sanity()
         manager = self.manager
+        if self.__rawref__ not in manager._living_kv_caches:
+            raise RuntimeError("KV cache is missing from its manager before physical retirement")
+
+        # Complete every validation and fallible bookkeeping operation before
+        # returning the first page to a pool. If any operation below fails, the
+        # settlement path retains this allocation as IN_DOUBT with all of its
+        # page ownership intact.
+        self.discard_pending_stats()
         if self.capacity > 0:
             self._avg_capacity.update(self.capacity)
             manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
             manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
             manager._num_sampled_kv_caches += 1
             manager._try_update_target_ratios()
-        with self._record_event():
-            self._clear_blocks()
-        self._status = self.Status.CLOSED
         manager._living_kv_caches.remove(self.__rawref__)
+
+        # From here onward, failure after a partial release cannot be made safe
+        # by retaining this Python object: a returned slot may already have a
+        # new owner. Treat such an invariant violation as endpoint-fatal.
+        try:
+            self._stop_committing()
+            with self._record_event():
+                self._clear_blocks()
+        except BaseException:
+            os.abort()
+        self._status = self.Status.CLOSED
 
     def __del__(self) -> None:
         self.close()
@@ -644,6 +711,122 @@ class _KVCache:
             else:
                 yield holder.page.slot_id
 
+    def _validate_transferable_page_lock(
+        self,
+        page: _SharedPageLock,
+        layer_group_id: LayerGroupId,
+        beam_id: BeamIndex,
+        block_ordinal: BlockOrdinal,
+    ) -> int:
+        """Validate that ``page`` is the exact GPU lock owned by this allocation."""
+        owner = page._user
+        try:
+            owner_cache = unwrap_rawref(owner.kv_cache)
+        except ValueError as error:
+            raise RuntimeError(
+                "cannot lease a page whose allocation owner is no longer live"
+            ) from error
+        if (
+            owner_cache is not self
+            or owner.life_cycle != layer_group_id
+            or owner.beam_index != beam_id
+            or owner.ordinal != block_ordinal
+        ):
+            raise RuntimeError(
+                "cannot lease a page lock whose owner does not match the exact "
+                f"allocation slice at block {int(block_ordinal)}, "
+                f"layer group {int(layer_group_id)}, beam {int(beam_id)}"
+            )
+        page_index = page.page.slot_id
+        if page_index < 0:
+            raise RuntimeError("cannot lease a page lock without a valid GPU slot")
+        return page_index
+
+    def _snapshot_transferable_page_ranges(
+        self,
+        layer_group_id: LayerGroupId,
+        beam_id: BeamIndex,
+        block_begin: int,
+        block_end: int,
+    ) -> tuple[tuple[int, int, tuple[int, ...]], ...]:
+        """Snapshot exact pinned segments while omitting intentional SWA holes."""
+        assert self.is_active
+        life_cycle = self.manager._life_cycles[layer_group_id]
+        stale_range = self._get_stale_range(
+            self.tokens_per_block,
+            self.history_length,
+            life_cycle,
+        )
+        scratch_range = self._get_scratch_range(life_cycle)
+        segments = list[tuple[int, int, tuple[int, ...]]]()
+        segment_begin: int | None = None
+        segment_page_indices = list[int]()
+
+        def finish_segment(segment_end: int) -> None:
+            nonlocal segment_begin
+            if segment_begin is None:
+                return
+            segments.append((segment_begin, segment_end, tuple(segment_page_indices)))
+            segment_begin = None
+            segment_page_indices.clear()
+
+        for block_ordinal in range(block_begin, block_end):
+            typed_block_ordinal = BlockOrdinal(block_ordinal)
+            if typed_block_ordinal in scratch_range:
+                raise RuntimeError(
+                    "cannot lease a slice containing a scratch-backed page at "
+                    f"block {block_ordinal}, layer group {int(layer_group_id)}, "
+                    f"beam {int(beam_id)}"
+                )
+            page = self._blocks[BlockOrdinal(block_ordinal)].pages[beam_id][layer_group_id]
+            if page is None:
+                if typed_block_ordinal in stale_range:
+                    finish_segment(block_ordinal)
+                    continue
+                raise RuntimeError(
+                    "cannot lease a slice containing an unexpectedly unallocated "
+                    f"page at block {block_ordinal}, "
+                    f"layer group {int(layer_group_id)}, beam {int(beam_id)}"
+                )
+            if not isinstance(page, _SharedPageLock):
+                raise RuntimeError(
+                    "cannot lease an evictable page without an active GPU lock "
+                    f"at block {block_ordinal}, layer group {int(layer_group_id)}, "
+                    f"beam {int(beam_id)}"
+                )
+            if segment_begin is None:
+                segment_begin = block_ordinal
+            segment_page_indices.append(
+                self._validate_transferable_page_lock(
+                    page,
+                    layer_group_id,
+                    beam_id,
+                    typed_block_ordinal,
+                )
+            )
+        finish_segment(block_end)
+        return tuple(segments)
+
+    def _snapshot_transferable_ssm_page_index(
+        self,
+        layer_group_id: LayerGroupId,
+        beam_id: BeamIndex,
+    ) -> int:
+        """Snapshot an SSM state slot only while its exact GPU page is pinned."""
+        assert self.is_active
+        page = self._ssm_blocks[beam_id][layer_group_id]
+        if not isinstance(page, _SharedPageLock):
+            raise RuntimeError(
+                "cannot lease an unallocated or evictable SSM page at "
+                f"layer group {int(layer_group_id)}, beam {int(beam_id)}"
+            )
+        return self._validate_transferable_page_lock(
+            page,
+            layer_group_id,
+            beam_id,
+            BAD_BLOCK_ORDINAL,
+        )
+
     def get_scratch_desc(self, layer_group_id: LayerGroupId) -> "ScratchDesc | None":
         """
         Get scratch metadata for the given layer group, or None if scratch is not active.
@@ -676,6 +859,7 @@ class _KVCache:
 
     @enable_swa_scratch_reuse.setter
     def enable_swa_scratch_reuse(self, enable: bool) -> None:
+        self._assert_mutable()
         if enable == self._enable_swa_scratch_reuse:
             return
         if enable:
@@ -716,6 +900,7 @@ class _KVCache:
     # this. Usually this is a concern only for prefill phase where we create many tokens in one step. For
     # other cases, we can just set the capacity and history_length properties instead.
     def resize(self, capacity: int | None, history_length: int | None = None) -> bool:
+        self._assert_mutable()
         assert self.status == self.Status.ACTIVE
         tokens_per_block = self.tokens_per_block
         assert div_up(self._capacity, tokens_per_block) == len(self._blocks)
@@ -967,7 +1152,8 @@ class _KVCache:
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
         is_end: bool = False,
-    ):
+    ) -> None:
+        self._assert_mutable()
         if self.beam_width != 1:
             raise NotImplementedError("Not implemented yet for beam search")
         if not accepted_input_tokens:
@@ -1060,6 +1246,7 @@ class _KVCache:
         turns may still need them. This must be called after stop_committing().
         Returns None without creating a plan if any required page is unavailable.
         """
+        self._assert_mutable()
         if self._commit_state != self.CommitState.USER_STOP:
             raise LogicError("plan_committed_block_drop() requires stop_committing()")
 
@@ -1099,6 +1286,10 @@ class _KVCache:
     # (eg. CoT), this helps us drop (instead of evict) out-of-window blocks for SWA layers.
     # If there is a uncommitted block containing committed tokens, we will commit the block immediately.
     def stop_committing(self) -> None:
+        self._assert_mutable()
+        self._stop_committing()
+
+    def _stop_committing(self) -> None:
         assert self.status != self.Status.CLOSED
         if self._commit_state == self.CommitState.USER_STOP:
             return
@@ -1121,6 +1312,7 @@ class _KVCache:
     # Suspend, allow the KV cache manager to evict buffers from GPU, but don't drop them.
     # suspend+resume allows us to implement dynamic batch size. May also be used to support HSTU model.
     def suspend(self) -> None:
+        self._assert_mutable()
         assert self.status == self.Status.ACTIVE
         assert self._check_sanity()
         assert self._finish_event is None
@@ -1146,6 +1338,7 @@ class _KVCache:
 
     # Resume, migrate buffers to GPU memory.
     def resume(self, cuda_stream: CudaStream | None = None) -> bool:
+        self._assert_mutable()
         assert self.status == self.Status.SUSPENDED
         if cuda_stream is not None:
             self.cuda_stream = cuda_stream
@@ -1340,6 +1533,7 @@ class _KVCache:
         Returns:
             True if the prefetch was dispatched, False if storage could not reserve enough pages.
         """
+        self._assert_mutable()
         assert self.status == self.Status.SUSPENDED
         manager = self.manager
         storage = manager._storage

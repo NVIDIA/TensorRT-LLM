@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
 #include "tensorrt_llm/batch_manager/radixBlockTree.h"
+#include "tensorrt_llm/batch_manager/transceiverLifecycle.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -37,6 +38,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <list>
 #include <memory>
@@ -92,6 +94,145 @@ using WindowSizeType = SizeType32;
 
 template <typename T>
 using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
+
+//! \brief Identifies one allocator-owned incarnation of a request's KV allocation.
+struct AllocationIdentity
+{
+    std::uint64_t allocatorDomainId{0};
+    LlmRequest::RequestIdType requestId{0};
+    std::uint64_t allocationGeneration{0};
+
+    [[nodiscard]] bool operator==(AllocationIdentity const& other) const noexcept
+    {
+        return allocatorDomainId == other.allocatorDomainId && requestId == other.requestId
+            && allocationGeneration == other.allocationGeneration;
+    }
+
+    [[nodiscard]] bool operator!=(AllocationIdentity const& other) const noexcept
+    {
+        return !(*this == other);
+    }
+};
+
+//! \brief Selects a logical per-beam block range from one or all attention windows.
+struct AllocationLeaseSliceSpec
+{
+    std::optional<SizeType32> windowSize{std::nullopt};
+    SizeType32 firstBlockIndex{0};
+    std::optional<SizeType32> blockCount{std::nullopt};
+};
+
+//! \brief Immutable, pointer-free description of one selected KV block position.
+class AllocationLeaseBlockDescriptor
+{
+public:
+    AllocationLeaseBlockDescriptor(SizeType32 windowSize, SizeType32 blockIndex, SizeType32 beamIndex,
+        SizeType32 blockId, kernels::KVCacheIndex::UnderlyingType primaryPoolIndex, bool shared)
+        : mWindowSize{windowSize}
+        , mBlockIndex{blockIndex}
+        , mBeamIndex{beamIndex}
+        , mBlockId{blockId}
+        , mPrimaryPoolIndex{primaryPoolIndex}
+        , mShared{shared}
+    {
+    }
+
+    [[nodiscard]] SizeType32 getWindowSize() const noexcept
+    {
+        return mWindowSize;
+    }
+
+    [[nodiscard]] SizeType32 getBlockIndex() const noexcept
+    {
+        return mBlockIndex;
+    }
+
+    [[nodiscard]] SizeType32 getBeamIndex() const noexcept
+    {
+        return mBeamIndex;
+    }
+
+    [[nodiscard]] SizeType32 getBlockId() const noexcept
+    {
+        return mBlockId;
+    }
+
+    [[nodiscard]] kernels::KVCacheIndex::UnderlyingType getPrimaryPoolIndex() const noexcept
+    {
+        return mPrimaryPoolIndex;
+    }
+
+    [[nodiscard]] bool isShared() const noexcept
+    {
+        return mShared;
+    }
+
+private:
+    SizeType32 mWindowSize{0};
+    SizeType32 mBlockIndex{0};
+    SizeType32 mBeamIndex{0};
+    SizeType32 mBlockId{0};
+    kernels::KVCacheIndex::UnderlyingType mPrimaryPoolIndex{0};
+    bool mShared{false};
+};
+
+//! \brief Allocator-owned lease handle and immutable allocation snapshot.
+//! \details Destroying this value does not release the allocator-owned lease.
+class AllocationLeaseSnapshot
+{
+public:
+    AllocationLeaseSnapshot(
+        std::uint64_t leaseId, AllocationIdentity identity, std::vector<AllocationLeaseBlockDescriptor> blocks)
+        : mLeaseId{leaseId}
+        , mIdentity{identity}
+        , mBlocks{std::move(blocks)}
+    {
+    }
+
+    [[nodiscard]] std::uint64_t getLeaseId() const noexcept
+    {
+        return mLeaseId;
+    }
+
+    [[nodiscard]] AllocationIdentity const& getIdentity() const noexcept
+    {
+        return mIdentity;
+    }
+
+    [[nodiscard]] std::vector<AllocationLeaseBlockDescriptor> const& getBlocks() const noexcept
+    {
+        return mBlocks;
+    }
+
+private:
+    std::uint64_t mLeaseId{0};
+    AllocationIdentity mIdentity;
+    std::vector<AllocationLeaseBlockDescriptor> mBlocks;
+};
+
+//! \brief Result of attempting to settle an allocator-owned lease.
+enum class AllocationLeaseSettlement : std::uint8_t
+{
+    kRELEASED,
+    kALREADY_RELEASED,
+    kNOT_QUIESCED,
+    kSTALE_GENERATION,
+    kNOT_FOUND,
+};
+
+//! \brief Current allocator-owned lease accounting used to gate pool teardown.
+struct AllocationLeaseAccounting
+{
+    std::uint64_t outstandingLeaseCount{0};
+    std::uint64_t outstandingBlockPinCount{0};
+    bool leaseStateKnown{false};
+    bool shutdownStarted{false};
+
+    [[nodiscard]] bool safeToReleasePools() const noexcept
+    {
+        return leaseStateKnown && outstandingLeaseCount == 0 && outstandingBlockPinCount == 0;
+    }
+};
 
 //! \brief Split vector into list of blocks of given size.
 //! \param vec vector to split
@@ -999,7 +1140,8 @@ public:
 
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
-    //! \brief Pin blocks associated with a sequence to prevent eviction.
+    //! \brief Pin each distinct physical block associated with a sequence once.
+    //! \details Blocks shared by multiple beams acquire one pin reference, not one per beam.
     void pinBlocks(GenerationRequest& sequence);
 
     //! \brief Release blocks of the sequence.
@@ -1262,7 +1404,8 @@ public:
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
         std::vector<BlockKey> const& blockKeys);
 
-    //! \brief Unpin blocks by block ids directly
+    //! \brief Unpin blocks by block ids directly.
+    //! \details Every id must be unique and identify an outstanding pin reference.
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     //! \brief Pin a block: claim it from the eviction policy if free, then take a reference.
@@ -1372,6 +1515,8 @@ private:
     }
 
 private:
+    friend class BlockManager;
+
     tensorrt_llm::DataType mDataType;
     SizeType32 mWindowSize;
 
@@ -1574,8 +1719,9 @@ public:
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
-    /// @brief Pin all blocks associated with a sequence across all window managers.
+    /// @brief Pin each distinct physical block associated with a sequence once across all window managers.
     /// @param sequence The generation request whose blocks should be pinned.
+    /// @note Block-ID unpinning currently supports single-window managers only.
     void pinBlocks(GenerationRequest& sequence);
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
@@ -1939,6 +2085,27 @@ public:
     }
 
 private:
+    friend class KVCacheManager;
+
+    //! \brief Internal exact block pin retained only by the allocator-owned lease registry.
+    struct AllocationLeaseBlockPin
+    {
+        AllocationLeaseBlockDescriptor descriptor;
+        BlockPtr block;
+    };
+
+    //! \brief Snapshot and pin the exact blocks currently backing the selected request range.
+    //! \details Shared beam blocks are pinned once while descriptors retain every selected beam position.
+    [[nodiscard]] std::pair<std::vector<AllocationLeaseBlockDescriptor>, std::vector<AllocationLeaseBlockPin>>
+    snapshotAndPinAllocation(
+        LlmRequest::RequestIdType requestId, SizeType32 beamWidth, AllocationLeaseSliceSpec const& sliceSpec);
+
+    //! \brief Drop exactly the pins acquired by snapshotAndPinAllocation without resolving block IDs.
+    // Settlement is an allocator safety boundary. If unpinning cannot
+    // complete, the process must terminate instead of continuing with a
+    // partially released allocation that is still reported as leased.
+    void unpinAllocation(std::vector<AllocationLeaseBlockPin> const& pins) noexcept;
+
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const
     {
         return mWindowBlockManagers.at(mLayerToWindowSize.at(layerIdx));
@@ -2002,6 +2169,10 @@ public:
 
     virtual void allocatePools(bool useUvm = false) = 0;
 
+    //! \brief Start terminal manager shutdown and release the backing pools when safe.
+    //! \details Once called, implementations may reject new allocation leases even when
+    //! teardown is initially vetoed by outstanding leases. Callers must settle those leases
+    //! and retry releasePools(); they must not resume normal manager operation.
     virtual void releasePools() = 0;
 
     virtual void startScheduling() = 0;
@@ -2054,6 +2225,42 @@ public:
     /// @brief Pin blocks associated with a request to prevent eviction.
     /// @param requestId The ID of the request whose blocks should be pinned.
     virtual void pinBlocks(LlmRequest::RequestIdType requestId) = 0;
+
+    //! \brief Return the current allocation identity for a locally owned request.
+    //! \details The default implementation keeps non-V1/custom managers fail-closed.
+    [[nodiscard]] virtual std::optional<AllocationIdentity> getAllocationIdentity(
+        LlmRequest::RequestIdType requestId) const
+    {
+        (void) requestId;
+        return std::nullopt;
+    }
+
+    //! \brief Snapshot and lease an exact allocation generation.
+    //! \details Callers must pass an identity obtained by the local allocation owner. A stale
+    //! identity never resolves through the raw request ID to a newer allocation.
+    [[nodiscard]] virtual std::optional<AllocationLeaseSnapshot> snapshotAndLease(
+        AllocationIdentity const& identity, AllocationLeaseSliceSpec const& sliceSpec = {})
+    {
+        (void) identity;
+        (void) sliceSpec;
+        return std::nullopt;
+    }
+
+    //! \brief Settle a lease after the protected accessor reaches a physical disposition.
+    [[nodiscard]] virtual AllocationLeaseSettlement settleAllocationLease(std::uint64_t leaseId,
+        AllocationIdentity const& identity, tensorrt_llm::batch_manager::PhysicalDisposition physicalDisposition)
+    {
+        (void) leaseId;
+        (void) identity;
+        (void) physicalDisposition;
+        return AllocationLeaseSettlement::kNOT_FOUND;
+    }
+
+    //! \brief Return allocator-owned lease accounting used to veto teardown.
+    [[nodiscard]] virtual AllocationLeaseAccounting getAllocationLeaseAccounting() const
+    {
+        return {};
+    }
 
     /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
     virtual void addToken(LlmRequest::RequestIdType requestId) = 0;
@@ -2244,6 +2451,8 @@ public:
         std::vector<BlockKey> const& blockKeys, SizeType32 windowSize)
         = 0;
 
+    /// @brief Consume one outstanding pin reference for each unique block id.
+    /// @note Callers must not pass duplicate ids or ids without an outstanding pin.
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
 
     /// @brief Release cached blocks for a token sequence beyond a given prefix length.
@@ -2356,7 +2565,11 @@ public:
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         std::vector<PoolConfiguration> const& poolConfigurations = {});
 
-    ~KVCacheManager() override = default;
+    //! \brief Programmer-error backstop that refuses to destroy leased storage.
+    //! \details Callers must explicitly quiesce and settle every allocator-owned lease before
+    //! destruction. Violating that contract terminates the process rather than implicitly
+    //! settling an in-doubt accessor or releasing storage that it may still use.
+    ~KVCacheManager() noexcept override;
 
     void allocatePools(bool useUvm = false) override;
 
@@ -2600,6 +2813,18 @@ public:
 
     void pinBlocks(LlmRequest::RequestIdType requestId) override;
 
+    [[nodiscard]] std::optional<AllocationIdentity> getAllocationIdentity(
+        LlmRequest::RequestIdType requestId) const override;
+
+    [[nodiscard]] std::optional<AllocationLeaseSnapshot> snapshotAndLease(
+        AllocationIdentity const& identity, AllocationLeaseSliceSpec const& sliceSpec = {}) override;
+
+    [[nodiscard]] AllocationLeaseSettlement settleAllocationLease(std::uint64_t leaseId,
+        AllocationIdentity const& identity,
+        tensorrt_llm::batch_manager::PhysicalDisposition physicalDisposition) override;
+
+    [[nodiscard]] AllocationLeaseAccounting getAllocationLeaseAccounting() const override;
+
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
 
     [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
@@ -2714,6 +2939,20 @@ public:
     void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep) override;
 
 private:
+    struct SequenceAllocationGeneration
+    {
+        std::uint64_t generation{0};
+        bool published{false};
+    };
+
+    struct AllocationLeaseRecord
+    {
+        AllocationIdentity identity;
+        std::vector<BlockManager::AllocationLeaseBlockPin> pins;
+    };
+
+    static constexpr std::size_t kMaxSettledAllocationLeaseTombstones = 4096U;
+
     // Maximum number of sequences
     SizeType32 mMaxNumSequences;
     // Maximum beam width
@@ -2733,6 +2972,8 @@ private:
     BlockManager mBlockManager;
     // Map of all sequences
     std::unordered_map<LlmRequest::RequestIdType, GenerationRequest> mSequences;
+    // Current allocator-issued generation and publication state for each live sequence.
+    std::unordered_map<LlmRequest::RequestIdType, SequenceAllocationGeneration> mSequenceAllocationGenerations;
     // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
     // Mutex to protect access to mSequences
@@ -2744,6 +2985,16 @@ private:
     runtime::ITensor::SharedPtr mIndexerKCachePoolPointers;
     // GPU bytes allocated for KV-cache
     std::size_t mAllocatedBytes{0};
+    // Process-local allocator domain and monotonically increasing identity counters.
+    std::uint64_t mAllocatorDomainId{0};
+    std::uint64_t mNextAllocationGeneration{1};
+    std::uint64_t mNextAllocationLeaseId{1};
+    // Allocator-owned exact block pins. Snapshot values never own or release these records.
+    mutable std::mutex mAllocationLeasesMtx;
+    std::unordered_map<std::uint64_t, AllocationLeaseRecord> mAllocationLeases;
+    std::unordered_map<std::uint64_t, AllocationIdentity> mSettledAllocationLeaseTombstones;
+    std::deque<std::uint64_t> mSettledAllocationLeaseTombstoneOrder;
+    bool mAllocationLeaseShutdownStarted{false};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
