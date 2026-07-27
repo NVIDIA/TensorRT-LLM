@@ -1530,11 +1530,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                               1) // tokens_per_block
         max_blocks_used = num_blocks_per_seq.max().item(
         ) if self.num_seqs > 0 else 1
-        # pool_indices already has correct values; set padding to -1
-        host_block_table = pool_indices[:, :max_blocks_used].clone()
-        for i in range(self.num_seqs):
-            if num_blocks_per_seq[i] < max_blocks_used:
-                host_block_table[i, num_blocks_per_seq[i]:] = -1
+        # pool_indices already has correct values; set padding to -1.
+        # Stage through a fresh pinned buffer: an async H2D from pageable
+        # memory would block the host behind the busy execution stream.
+        host_block_table = torch.empty((pool_indices.shape[0], max_blocks_used),
+                                       dtype=pool_indices.dtype,
+                                       pin_memory=prefer_pinned())
+        host_block_table.copy_(pool_indices[:, :max_blocks_used])
+        pad_cols = torch.arange(max_blocks_used, dtype=num_blocks_per_seq.dtype)
+        host_block_table.masked_fill_(
+            pad_cols.unsqueeze(0)
+            >= num_blocks_per_seq[:self.num_seqs].unsqueeze(1), -1)
         # Copy to GPU
         self.block_table[:self.num_seqs, :max_blocks_used].copy_(
             host_block_table, non_blocking=True)
@@ -2358,16 +2364,27 @@ class Indexer(nn.Module):
 
         return k_fp8, k_scale
 
-    def _call_mqa_logits(self, q_fp8: torch.Tensor, k_fp8: torch.Tensor,
-                         k_scale: torch.Tensor, weights: torch.Tensor,
-                         cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor,
-                         q_scale: Optional[torch.Tensor]) -> torch.Tensor:
+    def _call_mqa_logits(self,
+                         q_fp8: torch.Tensor,
+                         k_fp8: torch.Tensor,
+                         k_scale: torch.Tensor,
+                         weights: torch.Tensor,
+                         cu_seqlen_ks: torch.Tensor,
+                         cu_seqlen_ke: torch.Tensor,
+                         q_scale: Optional[torch.Tensor],
+                         clean_logits: bool = True) -> torch.Tensor:
         """Dispatch fp8_mqa_logits vs fp8_fp4_mqa_logits based on use_fp4.
 
         For FP4 the gather output keeps the legacy float8_e4m3fn dtype for
         API compatibility; reinterpret the bytes as the int8 / int32 layout
         the DeepGEMM kernel expects. The scale tensor is collapsed to 1D for
         the kv side and 2D for the q side per the kernel's asserts.
+
+        clean_logits=False skips DeepGEMM's smxx_clean_logits pass that fills
+        everything outside each row's [ks, ke) window with -inf. Safe only
+        when the consumer never reads outside that window (the custom
+        indexer_topk_prefill kernel); the torch topk fallback scans the full
+        padded row and needs the fill.
         """
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
@@ -2381,9 +2398,13 @@ class Indexer(nn.Module):
                 weights,
                 cu_seqlen_ks,
                 cu_seqlen_ke,
+                clean_logits=clean_logits,
             )
-        return fp8_mqa_logits(q_fp8, (k_fp8, k_scale.reshape(-1)), weights,
-                              cu_seqlen_ks, cu_seqlen_ke)
+        return fp8_mqa_logits(q_fp8, (k_fp8, k_scale.reshape(-1)),
+                              weights,
+                              cu_seqlen_ks,
+                              cu_seqlen_ke,
+                              clean_logits=clean_logits)
 
     def _call_paged_mqa_logits(self, q_decode: torch.Tensor,
                                k_cache: torch.Tensor,
@@ -2528,6 +2549,7 @@ class Indexer(nn.Module):
                             chunk.cu_seqlen_ks[c0:c1],
                             chunk.cu_seqlen_ke[c0:c1],
                             tile_q_scale,
+                            clean_logits=not use_custom_topk,
                         )
                         if use_custom_topk:
                             torch.ops.trtllm.indexer_topk_prefill(
@@ -2583,6 +2605,7 @@ class Indexer(nn.Module):
                     cu_seqlen_ks,
                     cu_seqlen_ke,
                     ctx_q_scale,
+                    clean_logits=not use_custom_topk,
                 )
                 if use_custom_topk:
                     torch.ops.trtllm.indexer_topk_prefill(

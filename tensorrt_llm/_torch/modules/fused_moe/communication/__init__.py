@@ -34,6 +34,7 @@ from .base import Communication
 from .communication_factory import CommunicationFactory
 from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
+from .nccl_ep import NcclEP
 from .nvlink_one_sided import NVLinkOneSided
 from .nvlink_two_sided import NVLinkTwoSided
 
@@ -46,6 +47,7 @@ __all__ = [
     "NVLinkOneSided",
     "DeepEP",
     "DeepEPLowLatency",
+    "NcclEP",
     # Factory
     "CommunicationFactory",
 ]

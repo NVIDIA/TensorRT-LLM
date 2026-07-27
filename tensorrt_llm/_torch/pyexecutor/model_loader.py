@@ -71,7 +71,7 @@ def validate_and_set_mamba_ssm_cache_dtype(
 
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,
-                                    pyt_kv_cache_dtype: str) -> QuantAlgo:
+                                    pyt_kv_cache_dtype: str) -> None:
     logger.info(
         f'Validating KV Cache config against kv_cache_dtype="{pyt_kv_cache_dtype}"'
     )
@@ -105,6 +105,14 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     # Apply explicit override from kv_cache_config.dtype.
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
+    # MIXED_PRECISION checkpoints carry per-layer QuantConfigs in
+    # quant_config_dict; modules built from them (e.g. attention) must agree
+    # with the global config on the KV element size, otherwise the KV pool is
+    # allocated with the overridden dtype while attention layers read/write
+    # with the checkpoint dtype -> out-of-bounds access.
+    if model_config.quant_config_dict is not None:
+        for layer_quant_config in model_config.quant_config_dict.values():
+            layer_quant_config.kv_cache_quant_algo = mapped_pyt_quant
 
 
 def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,

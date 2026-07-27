@@ -7035,6 +7035,46 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_hopper
+    @skip_post_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @parametrize_with_ids("mtp_nextn", [3])
+    def test_nvfp4_marlin_adp_4gpus(self, mtp_nextn):
+        """Accuracy guard for MARLIN under attention DP + EP with MTP.
+
+        The NVFP4 checkpoint is MIXED_PRECISION with deliberately-unquantized
+        MTP draft layers, so this also guards the per-layer
+        MARLIN -> Cutlass fallback in ``create_moe.get_moe_cls`` while the
+        main-model expert layers stay on MARLIN. Attention DP exercises the
+        external-comm dispatch path with scheduler-precomputed routing.
+        """
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn,
+                                       mtp_eagle_one_model=True)
+        with LLM(model_path,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="MARLIN"),
+                 kv_cache_config=KvCacheConfig(
+                     enable_block_reuse=False,
+                     mamba_ssm_cache_dtype="float16",
+                     free_gpu_memory_fraction=0.8,
+                 ),
+                 max_batch_size=32,
+                 cuda_graph_config=CudaGraphConfig(max_batch_size=32,
+                                                   enable_padding=True),
+                 speculative_config=mtp_config,
+                 nvfp4_gemm_config={"allowed_backends": ["marlin"]}) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(40000)
     @pytest.mark.parametrize(

@@ -177,6 +177,19 @@ def is_candidate_valid(
             "use DEP/TEP modes only"
         )
 
+    # MegaMoEDeepGemm does not support TEP: its DeepGEMM fp8_fp4_mega_moe kernel
+    # assumes the MoE input is partitioned across ranks (single rank, or DEP with
+    # ep_size == parallel_size). TEP replicates the input TP-wide, so
+    # MegaMoEDeepGemm.__init__ raises NotImplementedError (enable_attention_dp=False,
+    # parallel_size>1). Prune here so the sweep records status="skipped" instead of a
+    # hard build failure.
+    if config.backend.upper() == "MEGAMOE_DEEPGEMM" and not enable_dp and world_size > 1:
+        return False, (
+            f"MEGAMOE_DEEPGEMM does not support TEP (enable_attention_dp=False, "
+            f"parallel_size={world_size}>1); use DEP with ep_size==parallel_size "
+            "or enable attention-DP"
+        )
+
     # DENSEGEMM DTP: FC2 kernel requires (intermediate_size / moe_tp_size) % 256 == 0.
     # DENSEGEMM __init__ only checks the full intermediate_size, so a model like
     # DeepSeek V3 (intermediate_size=2048, 2048%256=0) passes __init__ but fails
