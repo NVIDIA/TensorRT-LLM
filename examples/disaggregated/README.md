@@ -253,10 +253,8 @@ it would look like:
 hostname: localhost
 port: 8000
 backend: pytorch
-# Optional: HTTP keep-alive timeout (in seconds) for the disaggregated server's
-# client-facing listener (default: 10). Raise it (e.g. 3600) for high-concurrency
-# or long-prefill workloads where clients hold large idle connection pools, to
-# avoid "Connection reset by peer" errors on reused connections.
+# Optional: HTTP keep-alive timeout in seconds (default: 10). Raise it when
+# clients hold large idle connection pools and hit "Connection reset by peer".
 # server_keep_alive_timeout: 3600
 context_servers:
   num_instances: 2

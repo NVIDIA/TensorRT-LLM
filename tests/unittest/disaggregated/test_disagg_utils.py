@@ -134,22 +134,22 @@ def test_extract_disagg_cfg_rejects_out_of_range_node_id(node_id):
 
 
 def test_server_keep_alive_timeout(tmp_path):
-    # Defaults to 10s when the key is absent (preserves historical behavior).
+    # Absent key keeps the historical 10s default.
     assert extract_disagg_cfg(
         **get_yaml_config()).server_keep_alive_timeout == 10
 
-    # A top-level override is threaded onto the config...
+    # A top-level override reaches the config...
     cfg = get_yaml_config()
     cfg["server_keep_alive_timeout"] = 3600
     assert extract_disagg_cfg(**cfg).server_keep_alive_timeout == 3600
 
-    # ...and survives a round-trip through the YAML file parser.
+    # ...and survives the YAML file parser.
     yaml_file = tmp_path / "keep_alive_config.yaml"
     with open(yaml_file, "w") as f:
         yaml.dump(cfg, f)
     assert parse_disagg_config_file(yaml_file).server_keep_alive_timeout == 3600
 
-    # Zero is a valid boundary value.
+    # Zero is valid.
     cfg["server_keep_alive_timeout"] = 0
     assert extract_disagg_cfg(**cfg).server_keep_alive_timeout == 0
 
