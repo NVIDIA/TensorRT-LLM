@@ -3583,6 +3583,46 @@ class ReorderRequestPolicyConfig(StrictBaseModel):
         description="The arguments of the request reordering policy.")
 
 
+class KVEventsConfig(StrictBaseModel):
+    """Configuration for native KV cache event publishing."""
+
+    enable_kv_cache_events: bool = Field(
+        default=False,
+        description="Whether to produce and publish native KV cache events.")
+    publisher: Optional[Literal["null", "zmq"]] = Field(
+        default=None,
+        description=
+        "Publisher implementation. Defaults to 'zmq' when events are enabled and 'null' otherwise."
+    )
+    endpoint: str = Field(
+        default="tcp://*:5557",
+        description="Base ZeroMQ endpoint used to publish KV cache events.")
+    replay_endpoint: Optional[str] = Field(
+        default=None,
+        description="Optional base ZeroMQ endpoint used to replay KV cache events."
+    )
+    buffer_steps: int = Field(
+        default=10_000,
+        ge=0,
+        description="Number of previously published batches retained for replay."
+    )
+    hwm: int = Field(default=100_000,
+                     ge=0,
+                     description="ZeroMQ publisher socket high-water mark.")
+    max_queue_size: int = Field(
+        default=100_000,
+        ge=0,
+        description="Maximum number of batches queued for background publishing."
+    )
+    topic: str = Field(
+        default="",
+        description="ZeroMQ subscription topic used for KV cache event batches.")
+
+    def model_post_init(self, __context) -> None:
+        if self.publisher is None:
+            self.publisher = "zmq" if self.enable_kv_cache_events else "null"
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -4241,6 +4281,10 @@ class BaseLlmArgs(StrictBaseModel):
     # Several options from ExecutorConfig, expanded here for less hierarchy
     kv_cache_config: KvCacheConfig = Field(default_factory=KvCacheConfig,
                                            description="KV cache config.")
+
+    kv_events_config: Optional[KVEventsConfig] = Field(
+        default=None,
+        description="Native KV cache event publishing configuration.")
 
     enable_chunked_prefill: bool = Field(default=False,
                                          description="Enable chunked prefill.")
@@ -5972,6 +6016,7 @@ def update_llm_args_with_extra_dict(
         "attention_dp_config": AttentionDpConfig,
         "reorder_policy_config": ReorderRequestPolicyConfig,
         "kv_cache_config": KvCacheConfig,
+        "kv_events_config": KVEventsConfig,
         "dwdp_config": DwdpConfig,
         "multimodal_config": MultimodalConfig,
         "telemetry_config": TelemetryConfig,
