@@ -670,6 +670,10 @@ class MiniMaxM3Attention(Attention):
     outputs [idx_q | idx_k], plus per-head index norms. The index value and
     output branch is omitted because the M3 checkpoint sets
     sparse_disable_index_value=True on every sparse layer.
+
+    NOTE: This model-specific integration is kept for compatibility.
+    New sparse algorithms should use the shared ``Attention``/``MLA``
+    modules and sparse hooks; MiniMax-M3 should migrate in a future refactor.
     """
 
     def __init__(
