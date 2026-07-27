@@ -80,19 +80,24 @@ class MultimodalEncoderRequestState:
 
     Created at admission by `initialize_multimodal_encoder_request` for
     requests whose raw MM payloads run through the item scheduler; the
-    request's `py_mm_encoder_state` is `None` otherwise. Item slots are
-    filled by the single `record()` writer from two sources — fresh encoder
-    outputs and read-through encoder-cache hits — so validation cannot
-    diverge between them.
+    request's `py_mm_encoder_state` is `None` otherwise. Items are written by
+    the single `record()` writer from two sources — fresh encoder outputs and
+    read-through encoder-cache hits — so validation cannot diverge between
+    them.
 
-    The state owns its storage until it publishes: `record()` clones every
-    incoming tensor, so a slot never aliases the encoder's batch output or a
-    cache entry (cache eviction is therefore harmless), and `finalize_into()`
-    then hands those tensors to the request's ``multimodal_data`` and clears
-    the slots, so exactly one owner exists at every point. Either way the
-    bytes are the request's own residency — the scheduler derives its byte
-    budget from live states each tick, so clearing the state *is* the
-    release; there is no release call to forget or replay.
+    The request's embeddings live in **one contiguous buffer**, sized from the
+    declared item lengths and allocated by the first `record()` (the point at
+    which the encoder's row shape, dtype and device become known). Each item
+    is copied into its own row range, so the buffer is the request's *final*
+    storage: it neither aliases the encoder's batch output nor a cache entry
+    that could be evicted under it, and the prefill path consumes it as-is
+    rather than concatenating per-item tensors into a second full copy.
+
+    That one allocation is the whole of the request's residency, so the byte
+    budget charges it once, from its first item until the request is
+    stripped. The scheduler derives the budget from live states each tick,
+    which makes clearing the state *the* release; there is no release call to
+    forget or replay.
 
     The state is rank-local and never crosses a serialization boundary:
     schedule distribution carries request/item IDs only, and every rank
@@ -103,129 +108,127 @@ class MultimodalEncoderRequestState:
     """Declared embedding row count of each atomic item, in prompt order.
     `record()` validates incoming tensors against these."""
 
-    outputs: List[Optional[torch.Tensor]]
-    """One slot per atomic item, in prompt order. ``None`` until the item is
-    recorded; then a clone owned by this request. Emptied by
-    `finalize_into()`, which hands the tensors to the request's
-    ``multimodal_data`` rather than keeping a second reference."""
+    recorded: List[bool]
+    """Whether each atomic item has been written into `embeddings`, in prompt
+    order."""
 
-    finalized: bool = False
-    """Whether `finalize_into()` published the items. Ownership then belongs
-    to ``multimodal_data['multimodal_embedding']``, so `outputs` is cleared
-    while the rows stay resident until the request is stripped. Progress and
-    byte accounting read this flag instead of the (now empty) slots."""
+    embeddings: Optional[torch.Tensor] = None
+    """Contiguous ``[sum(embedding_lengths), ...]`` storage for every item of
+    this request, allocated by the first `record()`. Published by reference at
+    `finalize_into()` and released when the request is stripped, so its
+    presence is exactly what the byte budget charges."""
 
     @classmethod
     def from_embedding_lengths(
             cls,
             embedding_lengths: List[int]) -> "MultimodalEncoderRequestState":
         return cls(embedding_lengths=list(embedding_lengths),
-                   outputs=[None] * len(embedding_lengths))
+                   recorded=[False] * len(embedding_lengths))
 
     def __post_init__(self) -> None:
-        if len(self.embedding_lengths) != len(self.outputs):
+        if len(self.embedding_lengths) != len(self.recorded):
             raise ValueError("MM encoder embedding lengths must have exactly "
                              "one entry per item slot")
 
     @property
     def num_items(self) -> int:
-        return len(self.outputs)
+        return len(self.recorded)
+
+    @property
+    def has_storage(self) -> bool:
+        """Whether this request's embedding buffer is allocated.
+
+        The scheduler reads this to charge the byte budget once per request:
+        the first scheduled item allocates storage for *all* of them, so
+        later items of the same request cost nothing more.
+        """
+        return self.embeddings is not None
 
     @property
     def progress(self) -> MultimodalEncoderProgress:
-        if self.finalized:
+        if all(self.recorded):
             return MultimodalEncoderProgress.READY
-        if all(output is not None for output in self.outputs):
-            return MultimodalEncoderProgress.READY
-        if any(output is not None for output in self.outputs):
+        if any(self.recorded):
             return MultimodalEncoderProgress.PARTIAL
         return MultimodalEncoderProgress.PENDING
 
     def pending_item_indices(self) -> List[int]:
         """Indices of items that still need an encoder output, prompt order."""
-        if self.finalized:
-            return []
         return [
-            item_idx for item_idx, output in enumerate(self.outputs)
-            if output is None
+            item_idx for item_idx, done in enumerate(self.recorded) if not done
         ]
 
     def record(self, item_idx: int, output: torch.Tensor) -> None:
-        """Record one item's encoder output into its slot, taking a clone.
+        """Copy one item's encoder output into its row range of the buffer.
 
-        ``output`` may be a view of a batched encoder output or a
-        read-through cache entry; the clone is the single choke point that
-        guarantees a recorded slot neither retains the whole batch
-        allocation through a view nor aliases a cache entry that can be
-        evicted under it. Raises when the tensor does not match the item's
-        declared row count, when the item was already recorded, or when it
-        disagrees with previously recorded items on trailing
-        shape/dtype/device (items of one request must concatenate cleanly at
-        fuse time).
+        The first call allocates the buffer for every item of the request,
+        which is why it is deferred to here: the row shape, dtype and device
+        only become known with the first encoder output. ``output`` may be a
+        view of a batched encoder output or a read-through cache entry, and
+        the copy is the single choke point that keeps the request from
+        retaining the whole batch allocation through a view or aliasing a
+        cache entry that can be evicted under it.
+
+        Raises when the tensor does not match the item's declared row count,
+        when the item was already recorded, or when it disagrees with the
+        buffer on trailing shape/dtype/device (items of one request share one
+        contiguous embedding).
         """
-        if self.finalized:
-            raise ValueError(
-                f"MM item {item_idx} cannot be recorded after the request's "
-                "items were published; items are encoded at most once")
         expected_rows = self.embedding_lengths[item_idx]
         if output.shape[0] != expected_rows:
             raise ValueError(f"MM item {item_idx} produced {output.shape[0]} "
                              f"embeddings; expected {expected_rows}")
-        if self.outputs[item_idx] is not None:
+        if self.recorded[item_idx]:
             raise ValueError(
                 f"MM item {item_idx} was already recorded; items are "
                 "encoded at most once per request")
-        reference = next((o for o in self.outputs if o is not None), None)
-        if reference is not None and (reference.shape[1:] != output.shape[1:]
-                                      or reference.dtype != output.dtype
-                                      or reference.device != output.device):
+        if self.embeddings is None:
+            self.embeddings = torch.empty(
+                (sum(self.embedding_lengths), *output.shape[1:]),
+                dtype=output.dtype,
+                device=output.device)
+        elif (self.embeddings.shape[1:] != output.shape[1:]
+              or self.embeddings.dtype != output.dtype
+              or self.embeddings.device != output.device):
             raise ValueError(
                 "MM encoder items for one request must have matching "
                 "output shape, dtype, and device")
-        self.outputs[item_idx] = output.detach().clone()
+        start = sum(self.embedding_lengths[:item_idx])
+        self.embeddings[start:start + expected_rows].copy_(output.detach())
+        self.recorded[item_idx] = True
 
     def resident_output_bytes(self, bytes_per_encoder_embedding: int) -> int:
-        """Bytes of recorded, not-yet-consumed outputs held by this request.
+        """Bytes of encoder output this request holds on the device.
 
         The scheduler sums this over live states every tick to derive the
         occupied share of the encoder output byte budget; there is no
         separate accounting to keep in sync.
 
-        After `finalize_into()` the slots are empty but every row is still
-        resident under ``multimodal_data``, so a published request keeps
-        charging its full footprint until it is stripped post-prefill.
+        The buffer covers every item from the first `record()` onward, so a
+        partially encoded request already charges its full footprint — which
+        is what it actually occupies — and keeps charging it after
+        `finalize_into()` until the request is stripped post-prefill.
         """
-        if self.finalized:
-            return sum(self.embedding_lengths) * bytes_per_encoder_embedding
-        return sum(
-            length
-            for length, output in zip(self.embedding_lengths, self.outputs)
-            if output is not None) * bytes_per_encoder_embedding
+        if self.embeddings is None:
+            return 0
+        return sum(self.embedding_lengths) * bytes_per_encoder_embedding
 
     def finalize_into(self, multimodal_data: Dict[str, Any]) -> bool:
-        """Publish the item outputs once every slot is recorded.
+        """Publish the request's embedding once every item is recorded.
 
-        Moves the prompt-ordered item tensors to ``multimodal_embedding`` and
-        drops the raw pre-encoder inputs. Ownership is *transferred*, not
-        shared: the slots are cleared so the published list is the only
-        reference. Sharing costs nothing while both point at the same
-        tensors, but the prefill path replaces the published list with its
-        contiguous form — and a slot still holding the per-item tensors keeps
-        them alive past that point, so the request pays for both.
+        Attaches the buffer as ``multimodal_embedding`` and drops the raw
+        pre-encoder inputs. The buffer is already the contiguous form the
+        prefill path wants, so publishing is a reference — nothing is copied
+        here and nothing downstream concatenates the items back together.
 
-        The per-request contiguous embedding is still materialized lazily
-        inside the prefill forward (`get_multimodal_embeddings`); the rows
-        remain resident, and `resident_output_bytes()` keeps charging them
-        via `finalized` until the request is stripped.
-        No-op returning ``False`` while any slot is still pending.
+        The state keeps its own reference so `resident_output_bytes()` still
+        charges the rows, which stay resident until the request is stripped
+        post-prefill. Both references die together at that strip.
+        No-op returning ``False`` while any item is still pending.
         """
-        if self.finalized:
-            return True
-        if not self.outputs or any(output is None for output in self.outputs):
+        if not self.recorded or not all(self.recorded):
             return False
-        multimodal_data["multimodal_embedding"] = list(self.outputs)
-        self.outputs = [None] * len(self.outputs)
-        self.finalized = True
+        multimodal_data["multimodal_embedding"] = self.embeddings
         strip_mm_encoder_inputs(multimodal_data)
         return True
 
