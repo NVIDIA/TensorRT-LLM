@@ -154,7 +154,14 @@ def _prepare_qwen_vl_mrope_config(
         if len(delta_tensors) != num_seq_slots:
             raise RuntimeError(
                 "Missing MRoPE position deltas for seq-slot cache update")
-        deltas = torch.cat(delta_tensors, dim=0)
+        # `delta_tensors` originate from per-request `multimodal_data` and may
+        # be CPU-resident when the owning model's `multimodal_data_device_paths`
+        # does not cover `mrope_config.*` (or a path skips the engine's H2D
+        # move), while the seq-slot cache and `seq_slots` live on the model
+        # device. `index_copy_` requires all tensors on the same device.
+        deltas = torch.cat(delta_tensors,
+                           dim=0).to(device=mrope_position_deltas_cache.device,
+                                     non_blocking=True)
         mrope_position_deltas_cache.index_copy_(0, seq_slots, deltas)
 
     if position_ids is not None \
@@ -1160,7 +1167,10 @@ class Qwen2_5_VLVisionAttention(Attention):
         # uses head_dim=80 (e.g. 1280 hidden / 16 heads), so use PyTorch RoPE.
         if IS_FLASHINFER_AVAILABLE and self.head_dim % 64 == 0 and position_ids is not None:
             try:
-                cos_sin_cache = torch.cat([cos, sin], dim=-1).contiguous()
+                # flashinfer requires cos_sin_cache in float32; upstream may cache
+                # cos/sin in the vision tower dtype (e.g. bf16) as a perf hint.
+                cos_sin_cache = torch.cat([cos, sin], dim=-1).to(
+                    torch.float32).contiguous()
                 flashinfer_apply_rope_with_cos_sin_cache_inplace(
                     position_ids,
                     q,
@@ -1170,7 +1180,7 @@ class Qwen2_5_VLVisionAttention(Attention):
                     is_neox=True,
                 )
                 return q, k, v
-            except RuntimeError as err:
+            except (RuntimeError, ValueError) as err:
                 logger.warning(
                     "Qwen2.5-VL vision RoPE: FlashInfer failed (%s); "
                     "falling back to PyTorch RotaryEmbedding.apply_rotary_pos_emb.",

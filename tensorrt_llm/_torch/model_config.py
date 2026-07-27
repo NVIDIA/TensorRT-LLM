@@ -51,8 +51,9 @@ from tensorrt_llm.quantization.modelopt_config import (
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig, LoraConfig,
-                                              SparseAttentionConfig,
+    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
+                                              KvCacheCompressionConfig,
+                                              LoraConfig, SparseAttentionConfig,
                                               SpeculativeConfig)
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
@@ -148,6 +149,7 @@ class ModelConfig(Generic[TConfig]):
     lm_head_gather_output: bool = True
     lora_config: Optional["LoraConfig"] = None
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
+    kv_cache_compression_config: Optional["KvCacheCompressionConfig"] = None
 
     is_generation: bool = True
     is_encoder_decoder: bool = False
@@ -492,12 +494,15 @@ class ModelConfig(Generic[TConfig]):
         # Read exclude_modules from HF config if present (HF format module names)
         hf_exclude_modules = hf_quant_config.get('modules_to_not_convert', None)
 
-        # DeepSeek V3 FP8 ckpt
-        if hf_quant_config.get("quant_method") == "fp8" and hf_quant_config.get(
-                "weight_block_size", []):
+        # FP8 ckpt: DeepSeek V3 style (weight_block_size) or
+        # per-tensor static activation scale style (activation_scheme="static",
+        # e.g. Ministral / Pixtral).
+        if hf_quant_config.get("quant_method") == "fp8" and (
+                hf_quant_config.get("weight_block_size")
+                or hf_quant_config.get("activation_scheme") == "static"):
             quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
 
-            block_size = hf_quant_config.get("weight_block_size", [])
+            block_size = hf_quant_config.get("weight_block_size", [128, 128])
             assert tuple(block_size) == (
                 128, 128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
             quant_config.group_size = block_size[0]
