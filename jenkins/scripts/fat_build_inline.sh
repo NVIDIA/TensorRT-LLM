@@ -65,10 +65,12 @@ python3 --version
 pip3 --version
 echo "[fat_build] Installing apt deps..."
 apt-get install -y libffi-dev
+echo "[fat_build] pip site-packages location:"
+python3 -c "import site; print(site.getsitepackages())"
 echo "[fat_build] Installing requirements-dev.txt..."
-pip3 install --retries 10 -r TensorRT-LLM/src/requirements-dev.txt
+pip3 install --no-user --retries 10 -r TensorRT-LLM/src/requirements-dev.txt
 echo "[fat_build] Installing trtllm wheel..."
-pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
+pip3 install --no-user --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
 echo "[fat_build] Installed TensorRT-LLM version:"
 pip3 show tensorrt-llm || true
 echo "$LLM_TARFILE_URL" > /tmp/trtllm_installed.txt
