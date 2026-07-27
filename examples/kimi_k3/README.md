@@ -14,16 +14,16 @@ other GPU architectures may be added in a future release.
   the TensorRT-LLM container, from the repository root:
 
   ```bash
-  python3 scripts/build_wheel.py --cuda_architectures 103-real
+  python3 scripts/build_wheel.py --cuda_architectures 103-real --skip_building_wheel --yes
   .venv-3.12/bin/python -m pip install --no-deps -e .
   ```
-  You can also build the wheel and then pip install the generated wheel.
-  Using editable mode is recommended for development and testing, see [build-from-source](./docs/source/installation/build-from-source.md) for details.
+  Using editable mode is recommended for development and testing; see
+  [build from source](../../docs/source/installation/build-from-source.md)
+  for details.
 
   `build_wheel.py` creates the `.venv-3.12` virtual environment at the
   repository root (named after the container's Python version). Adjust
-  `--cuda_architectures` to the target GPUs (`100-real` for GB200,
-  `103-real` for GB300). 
+  `--cuda_architectures` to the target GPUs (`103-real` for GB300).
 - A complete Hugging Face-format Kimi K3 checkpoint and tokenizer.
 - A Slurm cluster with 16 NVIDIA Blackwell GPUs and a TensorRT-LLM container
   image.
@@ -38,8 +38,9 @@ other GPU architectures may be added in a future release.
   revision into the same in-place environment after installing TensorRT-LLM:
 
   ```bash
-  python -u -m pip install --force-reinstall --no-deps --no-build-isolation \
-    "flashinfer-python[cu13] @ git+ssh://git@gitlab-master.nvidia.com:12051/jief/flashinfer.git@82eff087744246b16eab3b891edefd87e0d7b981"
+  .venv-3.12/bin/python -u -m pip install --force-reinstall --no-deps \
+      --no-build-isolation \
+      "flashinfer-python[cu13] @ git+https://github.com/PerkzZheng/flashinfer-k3.git@b6cc594918baf76c40c3a6236fd53f0f8fb9d2dc"
   ```
 
   The TensorRT-LLM environment already provides FlashInfer's runtime
@@ -47,9 +48,6 @@ other GPU architectures may be added in a future release.
   Triton, CUDA, and CuTeDSL packages. Install FlashInfer last: TensorRT-LLM
   currently pins `flashinfer-python==0.6.14`, so a later
   dependency-resolving TensorRT-LLM install can replace this source revision.
-
-  > **Note:** This is a private repository; make sure a working,
-  > authorized SSH key is available before running the install command.
 
 ## Run the model
 
