@@ -3499,49 +3499,56 @@ class GvrTopKKernel:
             cute.arch.barrier()
             if cutlass.const_expr(_P4_SUB_DBG):
                 sc2 = cute.arch.clock64()
-            # ---- warp0 high→low bin search → straddling bin b* + rank_above ----
-            # Single-warp shuffle scan replaces the 3-step block search:
-            # lane L owns the L-th DESCENDING chunk of bins, an inclusive
-            # warp scan finds the straddling lane (prefixes are monotone,
-            # so hit lanes form a suffix: target = 32 - popc(ballot)),
-            # and that lane resolves b* serially in its own chunk. Two of
-            # the three block barriers (~0.2us each) disappear.
-            if warp_id == cutlass.Int32(0):
-                lsum = cutlass.Int32(0)
-                for jb in cutlass.range_constexpr(bins_per_warp):
-                    bidx_s = (
+            # ---- 3-step high→low bin search → straddling bin b* + rank_above ----
+            warp_bin_sum = cutlass.Int32(0)
+            for jb in cutlass.range_constexpr(bins_per_warp):
+                bidx_s = (
+                    cutlass.Int32(kBins - 1)
+                    - warp_id * cutlass.Int32(bins_per_warp)
+                    - cutlass.Int32(jb)
+                )
+                warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
+            if lane == cutlass.Int32(0):
+                smem_wcnt[warp_id] = warp_bin_sum
+            cute.arch.barrier()
+            if tidx == cutlass.Int32(0):
+                cum = cutlass.Int32(0)
+                tw = cutlass.Int32(num_warps - 1)
+                found = cutlass.Int32(0)
+                for w2 in cutlass.range_constexpr(self.num_warps):
+                    cum = cum + smem_wcnt[w2]
+                    if cum >= cutlass.Int32(kK) and found == cutlass.Int32(0):
+                        tw = cutlass.Int32(w2)
+                        found = cutlass.Int32(1)
+                cum2 = cutlass.Int32(0)
+                for w3 in cutlass.range_constexpr(self.num_warps):
+                    if cutlass.Int32(w3) < tw:
+                        cum2 = cum2 + smem_wcnt[w3]
+                s_iscalars[2] = cum2  # prefix-count before target warp
+                s_iscalars[3] = tw
+            cute.arch.barrier()
+            target_warp = s_iscalars[3]
+            if warp_id == target_warp and lane == cutlass.Int32(0):
+                base_cum = s_iscalars[2]
+                b_star = cutlass.Int32(kBins - 1)
+                rank_above = base_cum
+                set_d = cutlass.Int32(0)
+                for jb2 in cutlass.range_constexpr(bins_per_warp):
+                    bidx2 = (
                         cutlass.Int32(kBins - 1)
-                        - lane * cutlass.Int32(bins_per_warp)
-                        - cutlass.Int32(jb)
+                        - target_warp * cutlass.Int32(bins_per_warp)
+                        - cutlass.Int32(jb2)
                     )
-                    lsum = lsum + smem_hist[bidx_s]
-                pref = warp_scan(lsum, tidx, lane, 32)
-                hit0 = cutlass.Int32(0)
-                if pref >= cutlass.Int32(kK):
-                    hit0 = cutlass.Int32(1)
-                mhit = cute.arch.vote_ballot_sync(hit0 != cutlass.Int32(0))
-                tl0 = cutlass.Int32(32) - cutlass.Int32(cute.arch.popc(mhit))
-                if lane == tl0:
-                    base_cum = pref - lsum  # exclusive prefix before chunk
-                    b_star = cutlass.Int32(kBins - 1)
-                    rank_above = base_cum
-                    set_d = cutlass.Int32(0)
-                    for jb2 in cutlass.range_constexpr(bins_per_warp):
-                        bidx2 = (
-                            cutlass.Int32(kBins - 1)
-                            - lane * cutlass.Int32(bins_per_warp)
-                            - cutlass.Int32(jb2)
-                        )
-                        ra_before = base_cum
-                        base_cum = base_cum + smem_hist[bidx2]
-                        if base_cum >= cutlass.Int32(kK) and set_d == cutlass.Int32(0):
-                            b_star = bidx2
-                            rank_above = ra_before  # count strictly above b*
-                            set_d = cutlass.Int32(1)
-                    s_iscalars[2] = rank_above
-                    s_iscalars[3] = b_star
-                    s_iscalars[4] = cutlass.Int32(0)  # cnt_above
-                    s_iscalars[1] = cutlass.Int32(0)  # cnt_straddle
+                    ra_before = base_cum
+                    base_cum = base_cum + smem_hist[bidx2]
+                    if base_cum >= cutlass.Int32(kK) and set_d == cutlass.Int32(0):
+                        b_star = bidx2
+                        rank_above = ra_before  # count in bins strictly above b*
+                        set_d = cutlass.Int32(1)
+                s_iscalars[2] = rank_above
+                s_iscalars[3] = b_star
+                s_iscalars[4] = cutlass.Int32(0)  # cnt_above
+                s_iscalars[1] = cutlass.Int32(0)  # cnt_straddle
             cute.arch.barrier()
             if cutlass.const_expr(_P4_SUB_DBG):
                 sc3 = cute.arch.clock64()
@@ -3582,50 +3589,66 @@ class GvrTopKKernel:
                         atomicAdd(smem_hist.iterator + sb, cutlass.Int32(1))
                     ifb = ifb + cutlass.Int32(num_threads)
                 cute.arch.barrier()
-                # fine warp0 search seeded at rank_above (over fbins bins);
-                # same single-warp shuffle-scan shape as the coarse search
-                # above - three block barriers collapse into one. sb*/ra
-                # go via smem_hist[2]/[3] (fine bins walked never reach
-                # slots 2/3 only when the target chunk excludes them, so
-                # publish AFTER the serial walk like before - the walk
-                # reads bins, the publish overwrites scratch slots).
-                if warp_id == cutlass.Int32(0):
-                    fls = cutlass.Int32(0)
-                    for jbf in cutlass.range_constexpr(fbpw):
-                        bif = (
+                # fine 3-step search seeded at rank_above (over fbins bins)
+                fws = cutlass.Int32(0)
+                for jbf in cutlass.range_constexpr(fbpw):
+                    bif = (
+                        cutlass.Int32(fbins - 1)
+                        - warp_id * cutlass.Int32(fbpw)
+                        - cutlass.Int32(jbf)
+                    )
+                    fws = fws + smem_hist[bif]
+                if lane == cutlass.Int32(0):
+                    smem_wcnt[warp_id] = fws
+                cute.arch.barrier()
+                if tidx == cutlass.Int32(0):
+                    cumf = rank_above
+                    twf = cutlass.Int32(num_warps - 1)
+                    fnd = cutlass.Int32(0)
+                    for w2 in cutlass.range_constexpr(self.num_warps):
+                        cumf = cumf + smem_wcnt[w2]
+                        if cumf >= cutlass.Int32(kK) and fnd == cutlass.Int32(0):
+                            twf = cutlass.Int32(w2)
+                            fnd = cutlass.Int32(1)
+                    pre = rank_above
+                    for w3 in cutlass.range_constexpr(self.num_warps):
+                        if cutlass.Int32(w3) < twf:
+                            pre = pre + smem_wcnt[w3]
+                    # Stage prefix/target-warp metadata in spare s_iscalars
+                    # slots, NOT smem_hist[0]/[1]: the last fine warp's reverse
+                    # scan below walks fine bins down to 0/1, so reusing those
+                    # histogram bins as scratch would corrupt sb_star/ra_fine
+                    # when twf2 == num_warps-1. Slots [4]/[1] are dead here
+                    # (re-zeroed at the cnt_above/cnt_strad reset below).
+                    s_iscalars[4] = pre  # prefix into target fine warp
+                    s_iscalars[1] = twf  # target fine warp
+                cute.arch.barrier()
+                pre_f = s_iscalars[4]
+                twf2 = s_iscalars[1]
+                if warp_id == twf2 and lane == cutlass.Int32(0):
+                    base_f = pre_f
+                    sb_star = cutlass.Int32(fbins - 1)
+                    ra_fine = base_f
+                    sd = cutlass.Int32(0)
+                    for jb3 in cutlass.range_constexpr(fbpw):
+                        sbi = (
                             cutlass.Int32(fbins - 1)
-                            - lane * cutlass.Int32(fbpw)
-                            - cutlass.Int32(jbf)
+                            - twf2 * cutlass.Int32(fbpw)
+                            - cutlass.Int32(jb3)
                         )
-                        fls = fls + smem_hist[bif]
-                    fpref = warp_scan(fls, tidx, lane, 32) + rank_above
-                    fhit = cutlass.Int32(0)
-                    if fpref >= cutlass.Int32(kK):
-                        fhit = cutlass.Int32(1)
-                    fm = cute.arch.vote_ballot_sync(fhit != cutlass.Int32(0))
-                    ftl = cutlass.Int32(32) - cutlass.Int32(cute.arch.popc(fm))
-                    if lane == ftl:
-                        base_f = fpref - fls
-                        sb_star = cutlass.Int32(fbins - 1)
-                        ra_fine = base_f
-                        sd = cutlass.Int32(0)
-                        for jb3 in cutlass.range_constexpr(fbpw):
-                            sbi = (
-                                cutlass.Int32(fbins - 1)
-                                - lane * cutlass.Int32(fbpw)
-                                - cutlass.Int32(jb3)
-                            )
-                            ra_b = base_f
-                            base_f = base_f + smem_hist[sbi]
-                            if base_f >= cutlass.Int32(kK) and sd == cutlass.Int32(0):
-                                sb_star = sbi
-                                ra_fine = ra_b
-                                sd = cutlass.Int32(1)
-                        smem_hist[2] = sb_star
-                        smem_hist[3] = ra_fine
-                        s_iscalars[4] = cutlass.Int32(0)  # cnt_above
-                        s_iscalars[0] = cutlass.Int32(0)  # cnt_mid (b*, sub>sb*)
-                        s_iscalars[1] = cutlass.Int32(0)  # cnt_strad (b*, sub==sb*)
+                        ra_b = base_f
+                        base_f = base_f + smem_hist[sbi]
+                        if base_f >= cutlass.Int32(kK) and sd == cutlass.Int32(0):
+                            sb_star = sbi
+                            ra_fine = ra_b
+                            sd = cutlass.Int32(1)
+                    smem_hist[2] = sb_star
+                    smem_hist[3] = ra_fine
+                cute.arch.barrier()
+                if tidx == cutlass.Int32(0):
+                    s_iscalars[4] = cutlass.Int32(0)  # cnt_above
+                    s_iscalars[0] = cutlass.Int32(0)  # cnt_mid (b*, sub>sb*)
+                    s_iscalars[1] = cutlass.Int32(0)  # cnt_strad (b*, sub==sb*)
                 cute.arch.barrier()
                 if cutlass.const_expr(_P4_SUB_DBG):
                     sc4 = cute.arch.clock64()
