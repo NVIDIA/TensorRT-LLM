@@ -69,7 +69,9 @@ def parse_profile_range() -> ProfileRange:
        executor iteration counter (one forward pass services all in-flight
        requests, so there is no "per request" index). A multi-stage pipeline
        runs more than one denoise loop per request, so a numeric range opens
-       one window per stage.
+       one window per stage. A window never outlives its loop: a stop index
+       past the loop's last step closes at the last step instead, so a
+       numeric range only ever covers denoise work.
 
        ``predenoise`` and ``postdenoise`` are **single-shot per process**:
        they fire once around the first user request after warmup and do not
@@ -179,9 +181,17 @@ class VisualGenProfiler:
             if i in stops:
                 self.close_window()
 
-        # Reached only when the loop runs to completion. A loop that raised
-        # or broke out early has no post-denoise work worth capturing, and
-        # ``request_scope`` closes whatever window is still open.
+        # Everything below is reached only when the loop runs to completion.
+        # A loop that raised or broke out early has no post-denoise work
+        # worth capturing, and ``request_scope`` closes whatever window is
+        # still open.
+        if starts:
+            # A numeric range selects denoise steps, so it must not outlive
+            # the loop. Without this, a range whose stop index is past the
+            # last step -- 0-4 against LTX-2 stage 2's three steps -- would
+            # stay open through VAE decode and, on a multi-stage pipeline,
+            # swallow the following stage as well.
+            self.close_window()
         if self._postdenoise_pending:
             self.open_window()
             self._postdenoise_pending = False

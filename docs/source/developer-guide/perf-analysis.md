@@ -81,6 +81,11 @@ steps of *every* stage, one trace file per stage, and `postdenoise` opens at
 the end of the first stage, so its window also covers the later stages'
 denoising. `all` and `predenoise` are unaffected.
 
+A numeric range never extends past the denoise loop it selects. If its stop
+index is beyond the loop's last step — for example `0-4` against a stage that
+runs three steps — the window closes at the last step rather than running on
+into VAE decode. Use `postdenoise` or `all` to capture decode.
+
 ### Visualize the PyTorch profiler results
 
 Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.

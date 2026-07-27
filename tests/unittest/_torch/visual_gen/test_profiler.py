@@ -287,6 +287,38 @@ def test_step_windows_follow_numeric_ranges(monkeypatch: pytest.MonkeyPatch) -> 
     assert events == ["step0", "start", "step1", "step2", "stop", "step3"]
 
 
+def test_numeric_window_does_not_outlive_a_short_denoise_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stage shorter than the range must still end its window at the loop.
+
+    LTX-2 two-stage runs a 3-step stage 2, so ``0-4`` opens on its step 0 and
+    never reaches the stop index. The window has to close when the loop
+    exhausts, or the stage-2 trace swallows VAE decode.
+    """
+    profiler, events = _recording_profiler(monkeypatch, "0-4")
+
+    with profiler.request_scope():
+        for i, _ in profiler.steps(range(10)):  # stage 1: longer than the range
+            events.append(f"s1_step{i}")
+        assert not profiler.active, "stage 1 should close on its stop index"
+        for i, _ in profiler.steps(range(3)):  # stage 2: shorter than the range
+            events.append(f"s2_step{i}")
+        assert not profiler.active, "stage 2 must close when its loop exhausts"
+        events.append("vae_decode")
+
+    assert events == [
+        "start",
+        *[f"s1_step{i}" for i in range(5)],
+        "stop",
+        *[f"s1_step{i}" for i in range(5, 10)],
+        "start",
+        *[f"s2_step{i}" for i in range(3)],
+        "stop",
+        "vae_decode",
+    ]
+
+
 class _StubPipeline:
     """Minimal stand-in exercising ``BasePipeline.run_inference`` glue."""
 
