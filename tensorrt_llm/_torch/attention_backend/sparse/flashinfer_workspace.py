@@ -62,7 +62,4 @@ def get_sparse_mla_workspace(
             device=device,
         )
 
-    out_lse.zero_()
-    mid_out.zero_()
-    mid_lse.fill_(float("-inf"))
     return out_lse, mid_out, mid_lse
