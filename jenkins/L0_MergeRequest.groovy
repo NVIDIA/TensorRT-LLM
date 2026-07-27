@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/zhanruis/TRTLLMINF-218-pr-label-approval']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -676,17 +676,20 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
         return false
     }
 
+    // Label missing or unauthorized — write description marker for wrapper
+    // to surface in PR comment, and return the block reason string.
     def existingDesc = currentBuild.description ?: ""
     currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
         "<span data-multi-gpu-label-required='true'>" +
         "Multi-GPU tests require label 'ci: full pre-merge approved'" +
         "</span>"
     def reason = !result.labelExists
-        ? "label not present"
-        : "label applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
-    error "${arch} Multi-GPU tests blocked: ${reason}. " +
-          "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, " +
-          "then re-trigger CI."
+        ? "label 'ci: full pre-merge approved' is not present on this PR"
+        : "label 'ci: full pre-merge approved' was applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
+    def blockMsg = "${arch} Multi-GPU tests blocked: ${reason}. " +
+         "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, then re-trigger CI."
+    echo "[requireMultiGpuApprovalLabel] ${blockMsg}"
+    return blockMsg
 }
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
@@ -1612,13 +1615,25 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
+                // Label gate: check before entering the Remote Run stage so a
+                // missing/unauthorized label shows as "Blocked" (not a Remote Run
+                // failure) and does not trigger fail-fast.
+                def x86LabelBlock = requireMultiGpuApprovalLabel(pipeline, globalVars, "x86_64")
+                if (x86LabelBlock) {
+                    stage("[Test-x86_64-Multi-GPU] Blocked") {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            error x86LabelBlock
+                        }
+                    }
+                    return
+                }
+
                 testStageName = "[Test-x86_64-Multi-GPU] Remote Run"
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "x86_64 test job is skipped due to Jenkins configuration"
                         return
                     }
-                    requireMultiGpuApprovalLabel(pipeline, globalVars, "x86_64")
                     try {
                         def testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
@@ -1729,13 +1744,22 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
+                def sbsaLabelBlock = requireMultiGpuApprovalLabel(pipeline, globalVars, "SBSA")
+                if (sbsaLabelBlock) {
+                    stage("[Test-SBSA-Multi-GPU] Blocked") {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            error sbsaLabelBlock
+                        }
+                    }
+                    return
+                }
+
                 testStageName = "[Test-SBSA-Multi-GPU] Remote Run"
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "SBSA test job is skipped due to Jenkins configuration"
                         return
                     }
-                    requireMultiGpuApprovalLabel(pipeline, globalVars, "SBSA")
                     try {
                         def testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
