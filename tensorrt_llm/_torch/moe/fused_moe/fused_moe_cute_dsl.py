@@ -76,6 +76,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner)
 
 _DIRECT_DEEP_EP_METADATA_ENV = "TRTLLM_CUTEDSL_DEEP_EP_DIRECT_METADATA"
+_COUNT_NATIVE_DEEP_EP_METADATA_ENV = "TRTLLM_CUTEDSL_DEEP_EP_COUNT_NATIVE_METADATA"
 _REMOVE_DEEP_EP_ADAPTER_ENV = "TRTLLM_CUTEDSL_DEEP_EP_REMOVE_ADAPTER"
 
 
@@ -107,6 +108,35 @@ def _runner_tactics_match_tile_size(
             if mma_tiler_mn[0] != tile_size:
                 return False
     return True
+
+
+def _expert_count_tile_plan(
+    expert_counts: List[int],
+    capacity: int,
+    tile_size: int,
+) -> List[Tuple[int, int, int]]:
+    """Return the reference tile plan for count-native scheduling.
+
+    Each tuple is ``(expert_idx, permuted_mn_limit, expanded_row_start)`` for
+    one MMA M tile. Source-contract tests use this helper to cover empty
+    experts and boundary counts without requiring a GPU build.
+    """
+    if capacity <= 0 or tile_size <= 0:
+        raise ValueError("capacity and tile_size must be positive")
+
+    plan = []
+    tile_idx = 0
+    for expert_idx, raw_count in enumerate(expert_counts):
+        count = min(max(raw_count, 0), capacity)
+        for row_in_expert in range(0, count, tile_size):
+            rows_in_tile = min(tile_size, count - row_in_expert)
+            plan.append((
+                expert_idx,
+                tile_idx * tile_size + rows_in_tile,
+                expert_idx * capacity + row_in_expert,
+            ))
+            tile_idx += 1
+    return plan
 
 
 @dataclass
@@ -313,6 +343,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  output_dtype: torch.dtype = torch.bfloat16,
                  scaling_vector_size: int = 16,
                  use_direct_expert_metadata: bool = False,
+                 use_count_native_expert_metadata: bool = False,
                  deep_ep_expert_capacity: Optional[int] = None,
                  workload_identity: Optional[Tuple] = None):
         super().__init__()
@@ -324,6 +355,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.enable_finalize_fusion = enable_finalize_fusion
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
+        self.use_count_native_expert_metadata = use_count_native_expert_metadata
+        if self.use_count_native_expert_metadata and not self.use_direct_expert_metadata:
+            raise ValueError(
+                "Count-native expert metadata requires direct expert metadata")
         self.deep_ep_expert_capacity = deep_ep_expert_capacity
 
         assert output_dtype == torch.bfloat16
@@ -349,6 +384,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 "direct_expert_metadata",
                 self.deep_ep_expert_capacity,
             )
+        if self.use_count_native_expert_metadata:
+            identity += ("count_native_expert_metadata", )
         return identity
 
     def get_valid_tactics(
@@ -425,7 +462,9 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             enable_alltoall=self.enable_alltoall,
             tile_size=tile_size,
             recv_expert_count=recv_expert_count,
-            deep_ep_expert_capacity=self.deep_ep_expert_capacity)
+            deep_ep_expert_capacity=self.deep_ep_expert_capacity,
+            use_count_native_expert_metadata=self.
+            use_count_native_expert_metadata)
 
     @AutoTuner.TacticsCapture.register_runner_tactic_comb_checker
     @staticmethod
@@ -814,11 +853,19 @@ class CuteDslFusedMoE(MoEImplBase):
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.enable_deep_ep_direct_metadata = os.environ.get(
             _DIRECT_DEEP_EP_METADATA_ENV, "0") == "1"
+        self.enable_deep_ep_count_native_metadata = os.environ.get(
+            _COUNT_NATIVE_DEEP_EP_METADATA_ENV, "0") == "1"
         self.enable_deep_ep_remove_adapter = os.environ.get(
             _REMOVE_DEEP_EP_ADAPTER_ENV, "0") == "1"
         if self.enable_deep_ep_remove_adapter and not self.enable_deep_ep_direct_metadata:
             raise ValueError(f"{_REMOVE_DEEP_EP_ADAPTER_ENV}=1 requires "
                              f"{_DIRECT_DEEP_EP_METADATA_ENV}=1")
+        if self.enable_deep_ep_count_native_metadata and not self.enable_deep_ep_direct_metadata:
+            raise ValueError(f"{_COUNT_NATIVE_DEEP_EP_METADATA_ENV}=1 requires "
+                             f"{_DIRECT_DEEP_EP_METADATA_ENV}=1")
+        if self.enable_deep_ep_count_native_metadata and not self.enable_deep_ep_remove_adapter:
+            raise ValueError(f"{_COUNT_NATIVE_DEEP_EP_METADATA_ENV}=1 requires "
+                             f"{_REMOVE_DEEP_EP_ADAPTER_ENV}=1")
 
         # Read by run_moe_nvfp4* to pick the fused-finalize epilogue, which
         # leaves no seam for a LoRA GEMM.
@@ -1025,7 +1072,8 @@ class CuteDslFusedMoE(MoEImplBase):
         use_direct_expert_metadata = (
             self.enable_deep_ep_direct_metadata
             and recv_expert_count is not None
-            and not use_locality_domain)
+            and not use_locality_domain
+            and is_sm_100f())
 
         if use_locality_domain:
             forward_impl = self._run_moe_nvfp4_locality_domain
@@ -1063,6 +1111,9 @@ class CuteDslFusedMoE(MoEImplBase):
             enable_alltoall=enable_alltoall,
             workload_identity=workload_identity,
             use_direct_expert_metadata=use_direct_expert_metadata,
+            use_count_native_expert_metadata=(
+                use_direct_expert_metadata
+                and self.enable_deep_ep_count_native_metadata),
             deep_ep_expert_capacity=(deep_ep_expert_capacity
                                      if use_direct_expert_metadata else None),
         )
@@ -1089,6 +1140,7 @@ class CuteDslFusedMoE(MoEImplBase):
         tile_size: int = 128,
         recv_expert_count: Optional[torch.Tensor] = None,
         deep_ep_expert_capacity: Optional[int] = None,
+        use_count_native_expert_metadata: bool = False,
     ) -> torch.Tensor:
         """Non-DWDP NVFP4 MoE implementation using single-tensor ops."""
         output_dtype = torch.bfloat16
@@ -1105,11 +1157,22 @@ class CuteDslFusedMoE(MoEImplBase):
             assert recv_expert_count.dim() == 1
             assert recv_expert_count.numel() == esp
             assert x.size(0) == esp * deep_ep_expert_capacity
-            tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_metadata_from_expert_counts(
-                expert_counts=recv_expert_count,
-                capacity=deep_ep_expert_capacity,
-                tile_size=tile_size,
-            )
+            if use_count_native_expert_metadata:
+                # The custom-op schema is shared with the direct-metadata path.
+                # Count-native runners interpret each metadata argument as the
+                # same expert-count tensor and do not materialize adapter arrays.
+                tile_idx_to_expert_idx = recv_expert_count
+                tile_idx_to_mn_limit = recv_expert_count
+                expanded_idx_to_permuted_idx = recv_expert_count
+                permuted_idx_to_expanded_idx = recv_expert_count
+                total_num_padded_tokens = None
+                num_non_exiting_tiles = recv_expert_count
+            else:
+                tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_metadata_from_expert_counts(
+                    expert_counts=recv_expert_count,
+                    capacity=deep_ep_expert_capacity,
+                    tile_size=tile_size,
+                )
         else:
             tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
                 token_selected_experts=token_selected_experts,
@@ -1128,17 +1191,26 @@ class CuteDslFusedMoE(MoEImplBase):
             moe_output.record_stream(memset_stream)
             with torch.cuda.stream(memset_stream):
                 self.event_dict[EventType.Main].wait()
-                torch.ops.trtllm.moe_output_memset_inplace(
-                    input=moe_output,
-                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-                    num_non_exiting_tiles=num_non_exiting_tiles,
-                    tile_tokens_dim=tile_size,
-                    top_k=effective_top_k,
-                    ep_size=self.mapping.moe_ep_size,
-                    enable_alltoall=enable_alltoall,
-                )
+                if use_count_native_expert_metadata:
+                    torch.ops.trtllm.moe_output_memset_from_expert_counts_inplace(
+                        input=moe_output,
+                        expert_counts=recv_expert_count,
+                        expert_capacity=deep_ep_expert_capacity,
+                        ep_size=self.mapping.moe_ep_size,
+                        enable_alltoall=enable_alltoall,
+                    )
+                else:
+                    torch.ops.trtllm.moe_output_memset_inplace(
+                        input=moe_output,
+                        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                        num_non_exiting_tiles=num_non_exiting_tiles,
+                        tile_tokens_dim=tile_size,
+                        top_k=effective_top_k,
+                        ep_size=self.mapping.moe_ep_size,
+                        enable_alltoall=enable_alltoall,
+                    )
                 self.event_dict[EventType.MoeOutputMemset].record()
 
         # Fused gather + GEMM + activation + quantize for FC1.
@@ -1166,6 +1238,9 @@ class CuteDslFusedMoE(MoEImplBase):
             local_expert_offset=slot_start,
             tile_size=tile_size,
         )
+        if use_count_native_expert_metadata:
+            gather_act_kwargs["expert_counts"] = recv_expert_count
+            gather_act_kwargs["expert_capacity"] = deep_ep_expert_capacity
         if use_rubin:
             gather_act_kwargs["output_tensor"] = None
             gather_act_kwargs["output_sf_tensor"] = None
@@ -1179,6 +1254,14 @@ class CuteDslFusedMoE(MoEImplBase):
         if self.use_fused_finalize:
             if has_aux_streams:
                 self.event_dict[EventType.MoeOutputMemset].wait()
+            elif use_count_native_expert_metadata:
+                torch.ops.trtllm.moe_output_memset_from_expert_counts_inplace(
+                    input=moe_output,
+                    expert_counts=recv_expert_count,
+                    expert_capacity=deep_ep_expert_capacity,
+                    ep_size=self.mapping.moe_ep_size,
+                    enable_alltoall=enable_alltoall,
+                )
             else:
                 torch.ops.trtllm.moe_output_memset_inplace(
                     input=moe_output,
@@ -1217,6 +1300,10 @@ class CuteDslFusedMoE(MoEImplBase):
                 local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
+                expert_counts=(recv_expert_count
+                               if use_count_native_expert_metadata else None),
+                expert_capacity=(deep_ep_expert_capacity
+                                 if use_count_native_expert_metadata else 0),
             )
         else:
             if use_rubin:

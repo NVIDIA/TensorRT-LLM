@@ -156,6 +156,34 @@ def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
         _select_explicit_fallback_tactic([])
 
 
+def test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts():
+    forward_impl = MagicMock(return_value=torch.empty(1))
+    runner = CuteDslFusedMoENvfp4Runner(
+        forward_impl=forward_impl,
+        num_experts=256,
+        top_k=1,
+        num_local_experts=8,
+        local_expert_offset=0,
+        use_direct_expert_metadata=True,
+        use_count_native_expert_metadata=True,
+        deep_ep_expert_capacity=32,
+    )
+    counts = torch.tensor([0, 1, 31, 32, 7, 0, 16, 2], dtype=torch.int32)
+    inputs = [torch.empty(1) for _ in range(6)] + [counts]
+
+    runner.forward(inputs, tactic=256)
+
+    assert runner.unique_id()[-3:] == (
+        "direct_expert_metadata",
+        32,
+        "count_native_expert_metadata",
+    )
+    assert runner.get_valid_tactics([], OptimizationProfile()) == [128, 256]
+    assert runner.get_tuning_config().inputs_pre_hook is None
+    assert forward_impl.call_args.kwargs["recv_expert_count"] is counts
+    assert forward_impl.call_args.kwargs["use_count_native_expert_metadata"] is True
+
+
 def test_cutedsl_direct_metadata_tuning_is_static_and_legacy_remains_dynamic():
     common_kwargs = {
         "forward_impl": MagicMock(),
@@ -194,6 +222,7 @@ def test_cutedsl_deep_ep_direct_metadata_env_gating(
     monkeypatch, enable_direct_metadata: bool, remove_adapter: bool, expect_error: bool
 ):
     monkeypatch.delenv("TRTLLM_CUTEDSL_DEEP_EP_DIRECT_METADATA", raising=False)
+    monkeypatch.delenv("TRTLLM_CUTEDSL_DEEP_EP_COUNT_NATIVE_METADATA", raising=False)
     monkeypatch.delenv("TRTLLM_CUTEDSL_DEEP_EP_REMOVE_ADAPTER", raising=False)
     if enable_direct_metadata:
         monkeypatch.setenv("TRTLLM_CUTEDSL_DEEP_EP_DIRECT_METADATA", "1")
@@ -221,7 +250,39 @@ def test_cutedsl_deep_ep_direct_metadata_env_gating(
 
     backend = CuteDslFusedMoE(**constructor_kwargs)
     assert backend.enable_deep_ep_direct_metadata is enable_direct_metadata
+    assert backend.enable_deep_ep_count_native_metadata is False
     assert backend.enable_deep_ep_remove_adapter is remove_adapter
+
+
+@pytest.mark.parametrize("remove_adapter,expect_error", [(False, True), (True, False)])
+def test_cutedsl_count_native_metadata_env_gating(monkeypatch, remove_adapter, expect_error):
+    monkeypatch.setenv("TRTLLM_CUTEDSL_DEEP_EP_DIRECT_METADATA", "1")
+    monkeypatch.setenv("TRTLLM_CUTEDSL_DEEP_EP_COUNT_NATIVE_METADATA", "1")
+    if remove_adapter:
+        monkeypatch.setenv("TRTLLM_CUTEDSL_DEEP_EP_REMOVE_ADAPTER", "1")
+    else:
+        monkeypatch.delenv("TRTLLM_CUTEDSL_DEEP_EP_REMOVE_ADAPTER", raising=False)
+
+    def mock_base_init(self, **kwargs):
+        self.aux_stream_dict = {}
+        self.event_dict = {}
+
+    monkeypatch.setattr(CutlassFusedMoE, "__init__", mock_base_init)
+    monkeypatch.setattr(torch.cuda, "Stream", MagicMock(return_value=object()))
+    monkeypatch.setattr(torch.cuda, "Event", MagicMock(return_value=object()))
+    constructor_kwargs = {
+        "routing_method": MagicMock(),
+        "num_experts": 8,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+    }
+    if expect_error:
+        with pytest.raises(ValueError, match="COUNT_NATIVE_METADATA=1 requires"):
+            CuteDslFusedMoE(**constructor_kwargs)
+        return
+
+    backend = CuteDslFusedMoE(**constructor_kwargs)
+    assert backend.enable_deep_ep_count_native_metadata is True
 
 
 def test_deep_ep_adapter_free_output_matches_schema_and_reuses_cache(monkeypatch):

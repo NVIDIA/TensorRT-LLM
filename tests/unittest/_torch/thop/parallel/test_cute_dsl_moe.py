@@ -41,6 +41,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
     _LocalityDomainConcurrentTunableRunner,
     _runner_tactics_match_tile_size,
+    _expert_count_tile_plan,
     cute_dsl_nvfp4_grouped_gemm_ref,
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import interleave_linear_and_gate
@@ -96,6 +97,56 @@ def test_grouped_gemm_inputs_helper(top_k: int, ep_size: int, tile_size: int):
     assert set([helper.map_to_tuning_buckets(x) for x in max_num_permuted_tokens_list]) == set(
         buckets
     )
+
+
+@pytest.mark.parametrize("tile_size", [128, 256])
+def test_count_native_tile_plan_empty_and_boundary_experts(tile_size: int):
+    """Count-native scheduling must preserve expert-major rows at M boundaries."""
+    capacity = 2 * tile_size + 1
+    counts = [0, 1, tile_size - 1, tile_size, tile_size + 1, 0, 2 * tile_size, capacity]
+
+    plan = _expert_count_tile_plan(counts, capacity, tile_size)
+
+    expected = []
+    global_tile_idx = 0
+    for expert_idx, count in enumerate(counts):
+        for row_in_expert in range(0, count, tile_size):
+            rows_in_tile = min(tile_size, count - row_in_expert)
+            expected.append(
+                (
+                    expert_idx,
+                    global_tile_idx * tile_size + rows_in_tile,
+                    expert_idx * capacity + row_in_expert,
+                )
+            )
+            global_tile_idx += 1
+
+    assert plan == expected
+    assert all(expert_idx not in (0, 5) for expert_idx, _, _ in plan)
+    assert sum(expert_idx == 3 for expert_idx, _, _ in plan) == 1
+    assert sum(expert_idx == 4 for expert_idx, _, _ in plan) == 2
+    assert sum(expert_idx == 6 for expert_idx, _, _ in plan) == 2
+    assert sum(expert_idx == 7 for expert_idx, _, _ in plan) == 3
+
+    for tile_idx, (expert_idx, mn_limit, expanded_row_start) in enumerate(plan):
+        assert expanded_row_start // capacity == expert_idx
+        row_in_expert = expanded_row_start - expert_idx * capacity
+        expected_rows = min(tile_size, counts[expert_idx] - row_in_expert)
+        assert mn_limit == tile_idx * tile_size + expected_rows
+
+
+@pytest.mark.parametrize("tile_size", [128, 256])
+def test_count_native_tile_plan_clamps_counts(tile_size: int):
+    capacity = tile_size + 1
+
+    plan = _expert_count_tile_plan([0, -1, capacity, capacity + tile_size], capacity, tile_size)
+
+    assert plan == [
+        (2, tile_size, 2 * capacity),
+        (2, tile_size + 1, 2 * capacity + tile_size),
+        (3, 3 * tile_size, 3 * capacity),
+        (3, 3 * tile_size + 1, 3 * capacity + tile_size),
+    ]
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
@@ -295,6 +346,292 @@ def test_moe_metadata_from_expert_counts_rejects_int32_padded_size_overflow():
             capacity=int32_max // 2,
             tile_size=int32_max,
         )
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.parametrize("tile_size", [128, 256])
+def test_count_native_cutedsl_matches_direct_metadata_bitwise(tile_size: int):
+    """Exercise count-native FC1, FC2, and output initialization on the GPU."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+    )
+
+    torch.manual_seed(20260727 + tile_size)
+    sf_vec_size = 16
+    ep_size = 32
+    num_local_experts = 4
+    num_experts = ep_size * num_local_experts
+    capacity = tile_size + 1
+    hidden_size = 4096
+    interm_size = 256
+    counts = torch.tensor(
+        [0, 1, tile_size, capacity],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    num_input_rows = num_local_experts * capacity
+
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        _,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_metadata_from_expert_counts(
+        expert_counts=counts,
+        capacity=capacity,
+        tile_size=tile_size,
+    )
+
+    input_bf16 = torch.randint(
+        -2,
+        3,
+        (num_input_rows, hidden_size),
+        dtype=torch.int32,
+        device="cuda",
+    ).to(torch.bfloat16)
+    fc1_weight_bf16 = torch.randint(
+        -2,
+        3,
+        (num_local_experts, 2 * interm_size, hidden_size),
+        dtype=torch.int32,
+        device="cuda",
+    ).to(torch.bfloat16)
+
+    input_global_sf = input_bf16.abs().max().float() / (448 * 6)
+    input_fp4, input_sf_swizzled = torch.ops.trtllm.fp4_quantize(
+        input_bf16,
+        1 / input_global_sf,
+        sf_vec_size,
+        False,
+    )
+    input_fp4 = input_fp4.view(torch.float4_e2m1fn_x2)
+    padded_input_rows = (num_input_rows + 127) // 128 * 128
+    input_sf = unswizzle_sf(
+        input_sf_swizzled,
+        padded_input_rows,
+        hidden_size,
+        sf_vec_size,
+    )[:num_input_rows]
+
+    fc1_weight_global_sf = fc1_weight_bf16.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    fc1_weight_fp4, fc1_weight_sf = torch.ops.trtllm.fp4_quantize(
+        fc1_weight_bf16,
+        1 / fc1_weight_global_sf,
+        sf_vec_size,
+        False,
+    )
+    fc1_weight_fp4 = fc1_weight_fp4.view(torch.float4_e2m1fn_x2)
+    fc1_weight_sf = fc1_weight_sf.view(
+        num_local_experts,
+        2 * interm_size,
+        hidden_size // sf_vec_size,
+    )
+    fc1_weight_fp4 = interleave_linear_and_gate(
+        fc1_weight_fp4.view(torch.uint8),
+        group_size=64,
+        dim=1,
+    ).view(torch.float4_e2m1fn_x2)
+    fc1_weight_sf = unswizzle_sf(
+        fc1_weight_sf,
+        2 * interm_size,
+        hidden_size,
+        sf_vec_size,
+    ).view(num_local_experts, 2 * interm_size, hidden_size // sf_vec_size)
+    fc1_weight_sf = interleave_linear_and_gate(fc1_weight_sf, group_size=64, dim=1)
+    fc1_weight_sf = swizzle_sf(
+        fc1_weight_sf,
+        2 * interm_size,
+        hidden_size,
+        sf_vec_size,
+    ).view(num_local_experts, 2 * interm_size, hidden_size // sf_vec_size)
+    fc1_alpha = input_global_sf * fc1_weight_global_sf
+    fc2_input_global_sf = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+
+    direct_fc1_runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+        num_experts=num_experts,
+        top_k=1,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        scaling_vector_size=sf_vec_size,
+        activation_type=ActivationType.Swiglu,
+    )
+    count_native_fc1_runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+        num_experts=num_experts,
+        top_k=1,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        scaling_vector_size=sf_vec_size,
+        activation_type=ActivationType.Swiglu,
+        use_expert_counts=True,
+        expert_capacity=capacity,
+    )
+    direct_fc1_inputs = [
+        input_fp4,
+        fc1_weight_fp4,
+        input_sf,
+        fc1_weight_sf,
+        fc1_alpha,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        fc2_input_global_sf,
+    ]
+    count_native_fc1_inputs = [
+        input_fp4,
+        fc1_weight_fp4,
+        input_sf,
+        fc1_weight_sf,
+        fc1_alpha,
+        counts,
+        counts,
+        counts,
+        counts,
+        fc2_input_global_sf,
+    ]
+    direct_fc1, direct_fc1_sf = direct_fc1_runner.forward(direct_fc1_inputs, tactic=None)
+    count_native_fc1, count_native_fc1_sf = count_native_fc1_runner.forward(
+        count_native_fc1_inputs,
+        tactic=None,
+    )
+
+    max_num_permuted_tokens = permuted_idx_to_expanded_idx.numel()
+    row_indices = torch.arange(max_num_permuted_tokens, device="cuda")
+    valid_rows = row_indices < tile_idx_to_mn_limit[row_indices // tile_size]
+    assert torch.equal(
+        direct_fc1.view(torch.uint8)[valid_rows],
+        count_native_fc1.view(torch.uint8)[valid_rows],
+    )
+    direct_fc1_sf_unswizzled = unswizzle_sf(
+        direct_fc1_sf,
+        max_num_permuted_tokens,
+        interm_size,
+        sf_vec_size,
+    )
+    count_native_fc1_sf_unswizzled = unswizzle_sf(
+        count_native_fc1_sf,
+        max_num_permuted_tokens,
+        interm_size,
+        sf_vec_size,
+    )
+    assert torch.equal(
+        direct_fc1_sf_unswizzled[valid_rows],
+        count_native_fc1_sf_unswizzled[valid_rows],
+    )
+
+    fc2_weight_bf16 = torch.randint(
+        -2,
+        3,
+        (num_local_experts, hidden_size, interm_size),
+        dtype=torch.int32,
+        device="cuda",
+    ).to(torch.bfloat16)
+    fc2_weight_global_sf = fc2_weight_bf16.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    fc2_weight_fp4, fc2_weight_sf = torch.ops.trtllm.fp4_quantize(
+        fc2_weight_bf16,
+        1 / fc2_weight_global_sf,
+        sf_vec_size,
+        False,
+    )
+    fc2_weight_fp4 = fc2_weight_fp4.view(torch.float4_e2m1fn_x2)
+    fc2_weight_sf = fc2_weight_sf.view(
+        num_local_experts,
+        hidden_size,
+        interm_size // sf_vec_size,
+    )
+    fc2_alpha = fc2_input_global_sf * fc2_weight_global_sf
+    token_final_scales = torch.ones(
+        num_input_rows,
+        1,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    direct_output = torch.full(
+        (num_input_rows, hidden_size),
+        3.25,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    count_native_output = direct_output.clone()
+    torch.ops.trtllm.moe_output_memset_inplace(
+        input=direct_output,
+        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles=num_non_exiting_tiles,
+        tile_tokens_dim=tile_size,
+        top_k=1,
+        ep_size=ep_size,
+        enable_alltoall=True,
+    )
+    torch.ops.trtllm.moe_output_memset_from_expert_counts_inplace(
+        input=count_native_output,
+        expert_counts=counts,
+        expert_capacity=capacity,
+        ep_size=ep_size,
+        enable_alltoall=True,
+    )
+    assert torch.equal(direct_output, count_native_output)
+
+    direct_fc2_runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+        num_experts=num_experts,
+        top_k=1,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        output_dtype=torch.bfloat16,
+        scaling_vector_size=sf_vec_size,
+    )
+    count_native_fc2_runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+        num_experts=num_experts,
+        top_k=1,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        output_dtype=torch.bfloat16,
+        scaling_vector_size=sf_vec_size,
+        use_expert_counts=True,
+        expert_capacity=capacity,
+    )
+    direct_fc2_inputs = [
+        direct_fc1,
+        fc2_weight_fp4,
+        direct_fc1_sf,
+        fc2_weight_sf,
+        fc2_alpha,
+        direct_output,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        token_final_scales,
+    ]
+    count_native_fc2_inputs = [
+        count_native_fc1,
+        fc2_weight_fp4,
+        count_native_fc1_sf,
+        fc2_weight_sf,
+        fc2_alpha,
+        count_native_output,
+        counts,
+        counts,
+        counts,
+        counts,
+        token_final_scales,
+    ]
+    direct_fc2_runner.forward(direct_fc2_inputs, tactic=None)
+    count_native_fc2_runner.forward(count_native_fc2_inputs, tactic=None)
+    torch.cuda.synchronize()
+
+    assert torch.equal(direct_output, count_native_output)
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
