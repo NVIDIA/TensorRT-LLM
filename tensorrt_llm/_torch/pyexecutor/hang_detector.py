@@ -124,6 +124,8 @@ class HangDetector:
         with self.lock:
             status_providers = tuple(self._status_providers)
 
+        # All diagnostics are best-effort: nothing may prevent on_detected()
+        # (hard-kill propagation) from firing.
         _best_effort_log_error(f"Hang detected after {self.timeout} seconds.")
         for provider in status_providers:
             try:
@@ -134,7 +136,13 @@ class HangDetector:
                 _best_effort_log_error(
                     f"HangDetector: status provider failed with {type(error).__name__}: {error}"
                 )
-        print_all_stacks()
+        try:
+            print_all_stacks()
+        except Exception:  # noqa: BLE001 - stack dump must not block hard kill
+            pass
+
+        # Set _detected last so observers (and tests) see it only once
+        # diagnostics are done and on_detected is about to fire.
         with self.lock:
             self._detected = True
         self.on_detected()
