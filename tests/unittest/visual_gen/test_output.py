@@ -827,11 +827,20 @@ def test_single_prompt_failure_raises_by_error_class(error_type, expected):
         fx.stop()
 
 
-def test_batch_failure_never_raises_regardless_of_error_class():
-    """Batch handles keep Option B semantics: per-item ``error``, no raise."""
+@pytest.mark.parametrize(
+    "error_type",
+    ["client", "capacity", None],
+    ids=["client", "capacity", "unclassified"],
+)
+def test_batch_failure_never_raises_regardless_of_error_class(error_type):
+    """Batch handles keep Option B semantics for every failure class.
+
+    Per-item ``error`` is set and nothing raises, unlike the single-prompt
+    path which raises by class.
+    """
     from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
-    resp = DiffusionResponse(request_id=21, error_msg="boom", error_type="client")
+    resp = DiffusionResponse(request_id=21, error_msg="boom", error_type=error_type)
     fx = _FakeExecutor(resp)
     try:
         handle = VisualGenResult(request_id=21, executor=fx, batch_size=2)
