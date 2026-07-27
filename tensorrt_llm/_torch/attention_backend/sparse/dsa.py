@@ -1868,10 +1868,6 @@ class Indexer(nn.Module):
         self._enable_heuristic_topk = (sparse_params.enable_heuristic_topk
                                        and get_sm_version() >= 100)
 
-        # No explicit CuTe DSL top-k warmup needed: the ops are registered on
-        # import of custom_ops (guarded by IS_CUTLASS_DSL_AVAILABLE), and the
-        # CUDA-graph runner's WARMUP_STEPS run a full forward on each capture
-        # geometry before capture, which JIT-compiles the exact kernel variant.
         if self._enable_heuristic_topk and layer_idx == 0:
             # Populate static caches (sm_count, L2 cache size) inside the C++
             # Scheme X dispatcher before any CUDA Graph capture so the host
