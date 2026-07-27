@@ -122,7 +122,7 @@ McastDeviceMemory::McastDeviceMemory(
         {
             TLLM_THROW("[McastDeviceMemory] Device does not support fabric handle.");
         }
-        allocMnMcastMem(mBufSize);
+        createAndMapMnMcastMem(mBufSize);
     }
     else
     {
@@ -164,7 +164,7 @@ McastDeviceMemory::~McastDeviceMemory() noexcept
     {
         if (mMapped)
         {
-            cleanupNoThrow("MNNVL mappings", [this]() { releaseMnMcastMem(); });
+            cleanupNoThrow("MNNVL mappings", [this]() { unmapAndReleaseMnMcastMem(); });
         }
         if (mUcBasePtr != 0)
         {
@@ -193,7 +193,7 @@ McastDeviceMemory::~McastDeviceMemory() noexcept
     }
 }
 
-void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
+void McastDeviceMemory::createAndMapMnMcastMem(size_t bufSize)
 {
     CUmemAllocationHandleType const handle_type = CU_MEM_HANDLE_TYPE_FABRIC;
     CUmemAllocationProp prop = {};
@@ -292,7 +292,7 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     mMapped = true;
 }
 
-void McastDeviceMemory::releaseMnMcastMem()
+void McastDeviceMemory::unmapAndReleaseMnMcastMem()
 {
     TLLM_CU_CHECK(cuMulticastUnbind(mMcHandle, mDeviceIdx, 0, mAllocationSize));
     TLLM_CU_CHECK(cuMemUnmap(mMcPtr, mAllocationSize));
@@ -321,7 +321,7 @@ void McastDeviceMemory::checkpointPrepare()
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
     TLLM_CUDA_CHECK(cudaDeviceSynchronize());
     mGroupComm.barrier();
-    releaseMnMcastMem();
+    unmapAndReleaseMnMcastMem();
     mGroupComm.barrier();
 }
 
@@ -342,7 +342,7 @@ void McastDeviceMemory::checkpointRestore(int64_t mpiCommFortranHandle)
         mGroupComm.getRank() == static_cast<int>(mGroupRank) && mGroupComm.getSize() == static_cast<int>(mGroupSize),
         "[McastDeviceMemory] Restore communicator does not match the original rank or group size.");
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
-    allocMnMcastMem(mBufSize);
+    createAndMapMnMcastMem(mBufSize);
     initializePointerTables();
     mGroupComm.barrier();
 }

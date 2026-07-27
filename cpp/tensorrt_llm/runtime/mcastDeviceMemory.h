@@ -126,8 +126,8 @@ private:
     // For intra-node mcast
     tensorrt_llm::runtime::IpcNvlsHandle* mNvlsHandle;
 
-    void allocMnMcastMem(size_t bufSize);
-    void releaseMnMcastMem();
+    void createAndMapMnMcastMem(size_t bufSize);
+    void unmapAndReleaseMnMcastMem();
     void allocNvlsMcastMem(size_t bufSize);
     void initializePointerTables();
 };
