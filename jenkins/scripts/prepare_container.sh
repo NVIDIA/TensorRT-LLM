@@ -21,7 +21,13 @@ if ! mkdir -p "${FAT_SQSH_DIR}" 2>&1; then
     exit 0
 fi
 
-fatHash=$(printf '%s' "${FAT_LLM_TARFILE}|${FAT_LLM_DOCKER_IMAGE}" | sha256sum | cut -d' ' -f1 | head -c 16)
+# Include fat_build_inline.sh content hash so this script polls for the same sqsh path
+# that fat_build_sbatch_body.sh actually builds (same cache key formula).
+fatBuildScriptHash=""
+if [ -n "${FAT_BUILD_SCRIPT_PATH:-}" ] && [ -f "${FAT_BUILD_SCRIPT_PATH}" ]; then
+    fatBuildScriptHash=$(sha256sum "${FAT_BUILD_SCRIPT_PATH}" | cut -d' ' -f1 | head -c 8)
+fi
+fatHash=$(printf '%s' "${FAT_LLM_TARFILE}|${FAT_LLM_DOCKER_IMAGE}|${fatBuildScriptHash}" | sha256sum | cut -d' ' -f1 | head -c 16)
 fatSqshPath="${FAT_SQSH_DIR}/fat-${fatHash}.sqsh"
 
 if [ -f "$fatSqshPath" ]; then

@@ -888,6 +888,7 @@ bash "${scriptFatBuildBodyPathNode}"
 export FAT_SQSH_DIR="${fatSqshDir}"
 export FAT_LLM_TARFILE="${llmTarfile}"
 export FAT_LLM_DOCKER_IMAGE="${LLM_DOCKER_IMAGE}"
+export FAT_BUILD_SCRIPT_PATH="${scriptFatBuildPathNode}"
 export FAT_BUILD_SBATCH_PATH="${scriptFatBuildSbatchPathNode}"
 export FAT_BUILD_LOG_TEMPLATE="${fatBuildLogPath}"
 bash "${scriptPrepareBodyPathNode}"
@@ -933,15 +934,19 @@ bash "${scriptPrepareBodyPathNode}"
                 def containerImageForAgent = LLM_DOCKER_IMAGE
                 if (cluster.fatBuilderArgs != null) {
                     def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
-                    // Include fat_build_inline.sh content hash in the cache key so that changes
-                    // to the build script (e.g. adding --no-user) invalidate the cached sqsh.
+                    // Compute the fat sqsh path entirely on the Jenkins controller to avoid
+                    // SSH quoting issues ($()/\${} expansion in remote bash commands).
                     def fatBuildScriptHash = sh(returnStdout: true, script: "sha256sum ${scriptFatBuildLocalPath} | cut -d' ' -f1 | head -c 8").trim()
+                    def fatHash = sh(returnStdout: true, script: "printf '%s' '${llmTarfile}|${LLM_DOCKER_IMAGE}|${fatBuildScriptHash}' | sha256sum | cut -d' ' -f1 | head -c 16").trim()
+                    def fatSqshPath = "${fatSqshDir}/fat-${fatHash}.sqsh"
+                    echo "Fat sqsh check: hash=${fatHash} path=${fatSqshPath}"
+                    // Simple SSH check: just test the pre-computed literal path.
                     def fatCheckResult = Utils.exec(
                         pipeline,
                         returnStdout: true,
                         script: Utils.sshUserCmd(
                             remote,
-                            "\"fatHash=\$(printf '%s' '${llmTarfile}|${LLM_DOCKER_IMAGE}|${fatBuildScriptHash}' | sha256sum | cut -d' ' -f1 | head -c 16); fatSqshPath=${fatSqshDir}/fat-\${fatHash}.sqsh; test -f \"\$fatSqshPath\" && echo \"\$fatSqshPath\" || echo MISSING\""
+                            "\"test -f '${fatSqshPath}' && echo '${fatSqshPath}' || echo MISSING\""
                         )
                     ).trim()
                     if (fatCheckResult != "MISSING" && fatCheckResult) {
@@ -1699,25 +1704,22 @@ bash "${scriptFatBuildBodyPathNode}"
                     containerImageArg = "\${enrootImagePath}"
                     def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
                     def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
-                    // Embed fat_build_inline.sh content hash so cache is invalidated when
-                    // the build script changes (e.g. adding --no-user to pip install).
+                    // Compute fat sqsh path on Jenkins controller (same formula as fat_build_sbatch_body.sh)
+                    // to avoid bash quoting issues in the srunPrologue.
                     def fatBuildScriptHash = sh(returnStdout: true, script: "sha256sum ${scriptFatBuildLocalPath} | cut -d' ' -f1 | head -c 8").trim()
+                    def fatHash = sh(returnStdout: true, script: "printf '%s' '${llmTarfile}|${LLM_DOCKER_IMAGE}|${fatBuildScriptHash}' | sha256sum | cut -d' ' -f1 | head -c 16").trim()
+                    def fatSqshPath = "${fatSqshDir}/fat-${fatHash}.sqsh"
 
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
 
                     # Fat sqsh: pre-built on CPU node; if present, skip all pip installs.
-                    # Cache key includes fat_build_inline.sh content hash (${fatBuildScriptHash})
-                    # so that build script changes automatically invalidate the cached sqsh.
-                    fatSqshDir="$fatSqshDir"
-                    fatHash=\$(printf '%s' "$llmTarfile|$LLM_DOCKER_IMAGE|${fatBuildScriptHash}" | sha256sum | cut -d' ' -f1 | head -c 16)
-                    fatSqshPath="\$fatSqshDir/fat-\${fatHash}.sqsh"
-
-                    if [ -f "\$fatSqshPath" ]; then
-                        echo "Reusing fat sqsh: \$fatSqshPath (SKIP_INSTALL=1)"
-                        export enrootImagePath="\$fatSqshPath"
+                    # Path pre-computed on Jenkins controller (hash=${fatBuildScriptHash}, fatHash=${fatHash}).
+                    if [ -f "${fatSqshPath}" ]; then
+                        echo "Reusing fat sqsh: ${fatSqshPath} (SKIP_INSTALL=1)"
+                        export enrootImagePath="${fatSqshPath}"
                         export SKIP_INSTALL=1
-                        touch "\$fatSqshPath" || true
+                        touch "${fatSqshPath}" || true
                     else
                         # Fat sqsh not ready; use digest-cached base sqsh + full install.
                         containerDir="$containerDir"
@@ -1957,6 +1959,7 @@ bash "${scriptFatBuildBodyPathNode}"
 export FAT_SQSH_DIR="${fatSqshDir}"
 export FAT_LLM_TARFILE="${llmTarfile}"
 export FAT_LLM_DOCKER_IMAGE="${LLM_DOCKER_IMAGE}"
+export FAT_BUILD_SCRIPT_PATH="${scriptFatBuildPathNode}"
 export FAT_BUILD_SBATCH_PATH="${scriptFatBuildSbatchPathNode}"
 export FAT_BUILD_LOG_TEMPLATE="${fatBuildLogPath}"
 bash "${scriptPrepareBodyPathNode}"
