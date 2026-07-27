@@ -31,13 +31,13 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer, vanilla
 # These op wrappers are safe to import without flashinfer installed; they are
 # only called on the flashinfer sampler / speculative-worker paths.
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    min_p_sampling_from_probs_op,
     sampling_from_probs_op,
     softmax_op,
     top_k_mask_logits_op,
     top_k_renorm_probs_op,
     top_k_sampling_from_probs_op,
     top_k_top_p_sampling_from_logits_op,
+    top_k_top_p_sampling_from_probs_op,
     top_p_renorm_probs_op,
     top_p_sampling_from_probs_op,
 )
@@ -74,6 +74,7 @@ __all__ = [
     "top_k_sampling_from_probs_op",
     "top_k_top_p_sampling_batch",
     "top_k_top_p_sampling_from_logits_op",
+    "top_k_top_p_sampling_from_probs_op",
     "top_p_renorm_probs_op",
     "top_p_sampling_from_probs_op",
 ]
@@ -398,17 +399,25 @@ class _StrategyImpls:
             min_p: Optional[torch.Tensor],
             temperature: torch.Tensor,
         ) -> torch.Tensor:
-            """Temperature + softmax + optional top-k / top-p / min-p renorm."""
+            """Temperature + softmax + optional min-p / top-k / top-p renorm.
+
+            min_p runs first (vLLM semantics): its threshold is relative to the
+            max probability of the unfiltered row, and top_k/top_p renormalize,
+            which inflates that max and would make a later min_p stricter.
+            ``compute_probs_from_logits`` must keep the same order, or
+            speculative decoding would sample from a different distribution than
+            this sampler for the same request.
+            """
             probs = cls._prepare_probs_with_temperature(logits, group_logit_indices, temperature)
+            if min_p is not None:
+                probs = min_p_renorm_probs(probs, min_p)
+
             if top_k is not None:
                 top_k = sanitize_top_k(top_k, probs.shape[-1])
                 probs = top_k_renorm_probs_op(probs, top_k)
 
             if top_p is not None:
                 probs = top_p_renorm_probs_op(probs, top_p)
-
-            if min_p is not None:
-                probs = min_p_renorm_probs(probs, min_p)
 
             return probs
 
@@ -873,18 +882,21 @@ class _StrategyImpls:
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            # min_p=None here: the fused kernel below does the min-p filter + sample.
+            # With min_p applied first, nothing has to run after top_k/top_p, so
+            # the fused kernel can filter and sample in one pass instead of two
+            # renorms plus a separate sampling step.
             probs = self._compute_probs(
                 logits,
                 group_logit_indices=group_logit_indices,
-                top_k=self._top_k,
-                top_p=self._top_p,
-                min_p=None,
+                top_k=None,
+                top_p=None,
+                min_p=self._min_p,
                 temperature=self._temperature,
             )
-            return min_p_sampling_from_probs_op(
+            return top_k_top_p_sampling_from_probs_op(
                 probs,
-                self._min_p,
+                sanitize_top_k(self._top_k, probs.shape[-1]),
+                self._top_p,
                 generator=generator,
                 check_nan=self._flashinfer_check_nans(probs),
             ), None
@@ -1083,15 +1095,25 @@ def compute_probs_from_logits(
     """Compute filtered+normalized probs via flashinfer (hard dependency).
 
     ``temperatures``, ``top_k``, ``top_p``, ``min_p`` are per-request tensors
-    matching the spec-decoding call sites in interface.py. min_p is applied as a
-    final ``min_p_renorm_probs`` stage (a no-op when 0); pass ``None`` to skip it.
+    matching the spec-decoding call sites in interface.py; a filter whose tensor
+    is ``None`` is skipped. Filter order is min_p, then top_k, then top_p, and
+    must stay in sync with ``_StrategyImpls._compute_probs`` -- otherwise the
+    same request would sample from a different distribution with and without
+    speculative decoding.
     """
     if top_k is not None:
         top_k = sanitize_top_k(top_k, logits.shape[-1])
 
-    probs = flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
+    # top_k stays folded into the pre-softmax logit mask even though min_p is
+    # nominally first: masking then softmax rescales every survivor by the same
+    # factor, so each p_i / p_max ratio -- and hence the min_p decision -- is
+    # unchanged. top_p thresholds cumulative mass, which min_p's renorm *does*
+    # change, so top_p must genuinely come after min_p.
+    probs = flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p=None)
     if min_p is not None:
         probs = min_p_renorm_probs(probs, min_p)
+    if top_p is not None:
+        probs = top_p_renorm_probs_op(probs, top_p)
     return probs
 
 
@@ -1101,7 +1123,7 @@ def sampling_batch_spec_dec_one_model(
     temperatures: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
-    min_p: Optional[torch.Tensor] = None,
+    min_p: torch.Tensor,
     seed: Optional[torch.Tensor] = None,
     offset: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -1113,20 +1135,22 @@ def sampling_batch_spec_dec_one_model(
     is_greedy = temperatures <= vanilla.GREEDY_TEMPERATURE_THRESHOLD
     top_k = torch.where(is_greedy, torch.ones_like(top_k), top_k)
     top_p = torch.where(is_greedy, torch.ones_like(top_p), top_p)
-    if min_p is None:
-        # No request in the batch uses min_p: mainline fast path (single fused
-        # kernel, no probs materialization). The only variant a CUDA graph
-        # captures -- min-p batches are gated to eager in maybe_get_cuda_graph,
-        # since the two branches bake different kernels into the graph.
-        logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
-        return flashinfer.top_k_top_p_sampling_from_logits_op(
-            logits, top_k, top_p, seed=seed, offset=offset
-        )
-    # min_p active: flashinfer has no fused top_k+top_p+min_p kernel, so route
-    # through the probs pipeline (top_k/top_p/min_p renorm) shared with the
-    # rejection path.
-    probs = compute_probs_from_logits(logits, temperatures, top_k, top_p, min_p)
-    return flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
+    min_p = torch.where(is_greedy, torch.zeros_like(min_p), min_p)
+    # top_k, top_p and min_p are per-request tensors applied as one unconditional
+    # renorm chain: a filter no request uses carries its neutral value (vocab_size
+    # / 1.0 / 0.0) and degrades to a no-op. Keeping the kernel sequence independent
+    # of which filters the batch happens to use is what lets a single captured
+    # graph serve every batch -- a Python branch here would bake one variant into
+    # the graph and silently apply it to batches that need the other.
+    # The order (min_p, then top_k/top_p) is the one compute_probs_from_logits
+    # and the main sampler use. Because nothing runs after top_k/top_p, the fused
+    # kernel filters and samples in a single pass and never materializes a
+    # filtered full-vocab tensor.
+    probs = flashinfer.softmax_op(logits, temperatures)
+    probs = min_p_renorm_probs(probs, min_p)
+    return flashinfer.top_k_top_p_sampling_from_probs_op(
+        probs, top_k, top_p, seed=seed, offset=offset
+    )
 
 
 @torch.compile(options={"max-autotune": True})
@@ -1135,7 +1159,7 @@ def sampling_batch_spec_dec_one_model_for_rejection(
     temperatures: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
-    min_p: Optional[torch.Tensor] = None,
+    min_p: torch.Tensor,
     seed: Optional[torch.Tensor] = None,
     offset: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:

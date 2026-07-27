@@ -1263,8 +1263,8 @@ def test_min_p_sample_top_k_disabled_sentinel():
 def test_compute_probs_from_logits_applies_min_p():
     """compute_probs_from_logits applies the min_p renorm stage used by the
     one-model speculative-decoding kernels (flashinfer has no min_p kernel, so
-    this is the repo's min_p_renorm_probs stage after top_k/top_p). Tokens below
-    min_p * max are zeroed and the row renormalizes to 1."""
+    this is the repo's min_p_renorm_probs stage, run before top_k/top_p). Tokens
+    below min_p * max are zeroed and the row renormalizes to 1."""
     from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import compute_probs_from_logits
 
     torch.manual_seed(0)
@@ -1288,6 +1288,32 @@ def test_compute_probs_from_logits_applies_min_p():
     kept = probs > 0
     assert torch.all((probs_ref >= min_p_val * max_ref - 1e-6)[kept])
     assert (probs == 0).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_min_p_runs_before_top_p():
+    """min_p is applied before top_k/top_p (vLLM semantics).
+
+    The two orders are not interchangeable once top_p is active: top_p
+    thresholds cumulative mass, and min_p's renorm redistributes that mass. With
+    p = [.4, .3, .2, .1], min_p=0.6 and top_p=0.5, filtering min_p first drops
+    everything below 0.24, renormalizes to [.571, .429], and top_p then needs
+    only the first token; the reverse order keeps two. Asserting the support
+    size pins the order down without depending on exact probabilities.
+    """
+    from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import compute_probs_from_logits
+
+    logits = torch.log(torch.tensor([[0.4, 0.3, 0.2, 0.1]], device="cuda"))
+    ones = torch.ones(1, device="cuda")
+    probs = compute_probs_from_logits(
+        logits,
+        ones,  # temperature
+        torch.zeros(1, dtype=torch.int32, device="cuda"),  # top_k: 0 -> keep all
+        torch.full((1,), 0.5, device="cuda"),  # top_p
+        torch.full((1,), 0.6, device="cuda"),  # min_p
+    )
+    assert int((probs > 0).sum()) == 1, f"expected min_p-then-top_p support of 1, got {probs}"
+    torch.testing.assert_close(probs.sum(dim=-1), ones)
 
 
 class TestBatchedSampling:
@@ -2117,6 +2143,52 @@ class TestBatchedSampling:
             flashinfer.sampling,
             "top_k_top_p_sampling_from_logits",
             _mock_flashinfer_top_k_top_p,
+        )
+
+        def _mock_flashinfer_top_k_top_p_from_probs(
+            probs: torch.Tensor,
+            *,
+            top_k: torch.Tensor,
+            top_p: torch.Tensor,
+            filter_apply_order: str,
+            deterministic: bool,
+            check_nan: bool,
+            generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
+        ) -> torch.Tensor:
+            # The min_p strategy terminates its renorm chain here, so the probs
+            # recorded below already have min_p applied; min_p itself never
+            # reaches a flashinfer kernel and thus cannot be captured as a param.
+            # Patching this is not optional: unpatched, the real flashinfer
+            # implementation delegates to the *patched* top_p_sampling_from_probs
+            # with kwargs its mock does not accept.
+            assert filter_apply_order == "top_k_first"
+            assert deterministic
+            assert not check_nan, "check_nan syncs"
+            assert generator is sampler.get_generator(probs.device)
+            nonlocal mock_sampling_log
+            new_entries = [
+                TestBatchedSampling._MockSamplingLogEntry(
+                    probs=probs[row_idx],
+                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
+                        top_k=top_k[row_idx],
+                        top_p=top_p[row_idx],
+                        temperature=None,
+                    ),
+                )
+                for row_idx in range(probs.size(0))
+            ]
+            mock_tokens = torch.arange(
+                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
+            )
+            mock_sampling_log += new_entries
+            return mock_tokens
+
+        patch_ctx.setattr(
+            flashinfer.sampling,
+            "top_k_top_p_sampling_from_probs",
+            _mock_flashinfer_top_k_top_p_from_probs,
         )
 
         def _mock_flashinfer_from_logits(

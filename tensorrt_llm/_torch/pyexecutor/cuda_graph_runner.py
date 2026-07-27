@@ -340,11 +340,6 @@ class CUDAGraphRunner:
             # do carry a delta must first populate the model-side cache for their
             # current seq slot before graph replay.
             return None, None, None
-        # min_p is not part of the graph key; min-p batches run eager so a single
-        # advanced-sampling graph doesn't have to be duplicated per min_p variant.
-        # (Without this, a min-p batch would replay the min-p-free fused graph.)
-        if spec_metadata and not spec_metadata.skip_min_p:
-            return None, None, None
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager, spec_metadata)
 

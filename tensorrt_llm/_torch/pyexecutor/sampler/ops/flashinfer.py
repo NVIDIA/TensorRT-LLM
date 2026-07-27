@@ -104,6 +104,41 @@ def top_k_top_p_sampling_from_logits_op(
 
 
 @_compiler_disable
+def top_k_top_p_sampling_from_probs_op(
+    probs: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+    seed: Optional[SeedOrTensor] = None,
+    offset: Optional[SeedOrTensor] = None,
+    check_nan: bool = False,
+) -> torch.Tensor:
+    """Fused top-k + top-p filtering and sampling from a probability distribution.
+
+    ``filter_apply_order="top_k_first"`` matches the renorm pipeline (top-k, then
+    top-p over the renormalized survivors). Sampling straight from probs skips
+    the filtered full-vocab tensor that separate renorm + sample would
+    materialize, so this is the cheapest way to terminate a renorm chain --
+    at the cost that no filter may run after it.
+    Randomness: pass ``generator`` (eager) or ``seed``/``offset`` (CUDA graph);
+    see module docstring for the full contract.
+    """
+    tokens: torch.Tensor = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        probs,
+        top_k=top_k,
+        top_p=top_p,
+        filter_apply_order="top_k_first",
+        deterministic=True,
+        check_nan=check_nan,
+        generator=generator,
+        seed=seed,
+        offset=offset,
+    )
+    return tokens
+
+
+@_compiler_disable
 def sampling_from_probs_op(
     probs: torch.Tensor,
     *,

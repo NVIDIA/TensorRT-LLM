@@ -102,16 +102,17 @@ def test_min_p_only_request_is_not_greedy():
     assert meta.skip_top_p is True
 
 
-def test_capture_override_keeps_min_p_disabled():
-    # The captured advanced-sampling graph must bake the min_p-free kernel
-    # variant: maybe_get_cuda_graph routes min_p batches to eager, so a
-    # capture-time skip_min_p of False would both trip that gate (skipping the
-    # capture) and record kernels no replaying batch can use. The other filters
-    # stay forced on so the graph covers the advanced path.
+def test_capture_override_forces_every_filter_on():
+    # The captured advanced-sampling graph must hold the superset of renorm
+    # kernels, min_p included: a batch that leaves a filter unused replays the
+    # graph against that filter's neutral buffer value, which is a no-op, while
+    # capturing a subset would silently drop the filter for batches needing it.
+    # min_p is not part of the graph key, so this is the only thing keeping the
+    # single captured graph valid for min-p and non-min-p batches alike.
     meta = _fake_meta(force_capture=True)
-    _scan(meta, [_fake_request(min_p=0.1)])
+    _scan(meta, [_fake_request()])
     assert meta.is_all_greedy_sample is False
-    assert meta.skip_min_p is True
+    assert meta.skip_min_p is False
     assert meta.skip_temperature is False
     assert meta.skip_top_k is False
     assert meta.skip_top_p is False
