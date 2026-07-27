@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_mistral import Mistral3InputProcessor
+from tensorrt_llm._torch.models.modeling_mistral import MistralHFInputProcessor
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
@@ -818,7 +818,7 @@ def test_qwen_item_metadata_collapses_frame_spans_into_original_video():
 
 
 def test_mistral_item_metadata_separates_patch_and_embedding_units():
-    processor = object.__new__(Mistral3InputProcessor)
+    processor = object.__new__(MistralHFInputProcessor)
     processor._vision_geometry = lambda: (14, 2, 3, 1024)
 
     metadata = processor.get_mm_encoder_item_metadata(
