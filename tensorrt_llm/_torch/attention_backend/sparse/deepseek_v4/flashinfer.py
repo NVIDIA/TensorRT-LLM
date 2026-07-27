@@ -12,18 +12,12 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 
 from ...interface import AttentionForwardArgs, AttentionInputType
-from ..flashinfer_workspace import get_sparse_mla_workspace
+from ..flashinfer_workspace import get_sparse_mla_op, get_sparse_mla_workspace
 from ..kernel import deepseek_v4_local_to_global_indices
 from . import footer_scale_kv
 from .deepseek_v4 import DeepseekV4AttentionType, DeepseekV4TrtllmAttentionMetadata, get_token_bytes
 
 _KV_SPLIT_TILE = 64  # BLOCK_SIZE_N of the SM120 kernels; sizes split-K scratch
-
-
-def _sparse_mla_op():
-    from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
-
-    return _sparse_mla_sm120_paged_attention
 
 
 def _footer_scale_pool_2d(
@@ -241,7 +235,7 @@ def run_flashinfer_sparse_mla(
     if extra_pool is not None:
         extra_pool_paged = extra_pool.view(extra_pool.shape[0], -1, footer_scale_kv.TOKEN_BYTES)
 
-    _sparse_mla_op()(
+    get_sparse_mla_op()(
         q_view.contiguous(),
         swa_pool_paged,
         swa_indices,

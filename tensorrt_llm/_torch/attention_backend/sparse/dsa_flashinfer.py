@@ -12,15 +12,9 @@ from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from ..interface import AttentionForwardArgs, AttentionInputType
 from . import inline_scale_kv
 from .dsa import DSAtrtllmAttentionMetadata
-from .flashinfer_workspace import get_sparse_mla_workspace
+from .flashinfer_workspace import get_sparse_mla_op, get_sparse_mla_workspace
 
 _KV_SPLIT_TILE = 64  # BLOCK_SIZE_N of the SM120 kernels; sizes split-K scratch
-
-
-def _sparse_mla_op():
-    from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
-
-    return _sparse_mla_sm120_paged_attention
 
 
 def _inline_scale_pool_paged(metadata: DSAtrtllmAttentionMetadata) -> torch.Tensor:
@@ -182,7 +176,7 @@ def run_flashinfer_sparse_mla(
     qk_head_dim = attn.mla_params.qk_nope_head_dim + attn.mla_params.qk_rope_head_dim
     sm_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_head_dim))
 
-    _sparse_mla_op()(
+    get_sparse_mla_op()(
         q_view.contiguous(),
         _inline_scale_pool_paged(metadata),
         topk_indices_global,

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.sparse.flashinfer_workspace import get_sparse_mla_op
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._utils import get_sm_version
 
@@ -23,19 +24,13 @@ if TYPE_CHECKING:
 _SUPPORTED_ALGORITHMS = frozenset({"deepseek_v4", "dsa"})
 
 
-def _sparse_mla_op():
-    from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
-
-    return _sparse_mla_sm120_paged_attention
-
-
 def is_flashinfer_sparse_mla_enabled(algorithm: Optional[str]) -> bool:
     """Whether FlashInfer sparse MLA is available for this model."""
     if algorithm not in _SUPPORTED_ALGORITHMS or get_sm_version() not in (120, 121):
         return False
 
     try:
-        _sparse_mla_op()
+        get_sparse_mla_op()
     except (AttributeError, ImportError):
         return False
     return True

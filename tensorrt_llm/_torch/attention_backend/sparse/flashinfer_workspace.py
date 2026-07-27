@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CUDA-graph-safe workspace buffers for FlashInfer sparse MLA."""
+"""Shared helpers for FlashInfer sparse MLA."""
 
 from typing import TYPE_CHECKING
 
@@ -9,6 +9,12 @@ import torch
 
 if TYPE_CHECKING:
     from ..interface import AttentionMetadata
+
+
+def get_sparse_mla_op():
+    from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
+
+    return _sparse_mla_sm120_paged_attention
 
 
 def get_sparse_mla_workspace(
