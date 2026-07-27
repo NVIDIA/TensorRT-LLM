@@ -5259,9 +5259,11 @@ class PyExecutor:
                         max_num_tokens=self.model_engine.encoder_max_num_tokens,
                         max_output_bytes=self.model_engine.
                         mm_encoder_output_budget_bytes,
-                        embedding_row_bytes=getattr(self.model_engine,
-                                                    "mm_embedding_row_bytes",
-                                                    0))
+                        bytes_per_encoder_embedding=getattr(
+                            self.model_engine,
+                            "bytes_per_mm_encoder_embedding",
+                            0,
+                        ))
                 return False
             except Exception as e:
                 self._handle_errors(str(e),

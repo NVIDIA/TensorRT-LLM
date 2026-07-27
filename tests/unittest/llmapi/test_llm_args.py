@@ -303,7 +303,7 @@ class TestEncoderRuntimeSizes:
 
 
 class TestEagerEncoderSchedulingCompatibility:
-    """Eager MM encoder scheduling rejects unsupported feature combinations."""
+    """Args parsing defers capability-dependent EAGER checks until model load."""
 
     def test_eager_alone_is_accepted(self):
         args = TorchLlmArgs(model=llama_model_path,
@@ -311,20 +311,21 @@ class TestEagerEncoderSchedulingCompatibility:
                                 encoder_scheduling_policy="EAGER"))
         assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
 
-    def test_eager_rejects_attention_dp(self):
-        with pytest.raises(ValidationError, match="attention DP"):
-            TorchLlmArgs(model=llama_model_path,
-                         enable_attention_dp=True,
-                         multimodal_config=MultimodalConfig(
-                             encoder_scheduling_policy="EAGER"))
+    def test_eager_with_attention_dp_is_accepted_before_model_load(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            enable_attention_dp=True,
+                            multimodal_config=MultimodalConfig(
+                                encoder_scheduling_policy="EAGER"))
+        assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
 
-    def test_eager_rejects_disaggregated_serving(self):
-        with pytest.raises(ValidationError, match="disaggregated"):
-            TorchLlmArgs(
-                model=llama_model_path,
-                cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
-                multimodal_config=MultimodalConfig(
-                    encoder_scheduling_policy="EAGER"))
+    def test_eager_with_disaggregated_serving_is_accepted_before_model_load(
+            self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+            multimodal_config=MultimodalConfig(
+                encoder_scheduling_policy="EAGER"))
+        assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
 
 
 @pytest.mark.cpu_only

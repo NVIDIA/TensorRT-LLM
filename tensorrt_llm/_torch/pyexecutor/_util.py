@@ -2972,7 +2972,8 @@ def create_py_executor_instance(
             max_num_items=model_engine.encoder_max_num_items,
             max_num_tokens=model_engine.encoder_max_num_tokens,
             output_budget_bytes=model_engine.mm_encoder_output_budget_bytes,
-            embedding_row_bytes=model_engine.mm_embedding_row_bytes,
+            bytes_per_encoder_embedding=(
+                model_engine.bytes_per_mm_encoder_embedding),
         )
 
     config = model_engine.model.model_config.pretrained_config

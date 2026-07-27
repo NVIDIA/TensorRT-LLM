@@ -506,7 +506,7 @@ class MultimodalScheduler(RequestScheduler):
         max_num_tokens: int,
         *,
         output_budget_bytes: int | None = None,
-        embedding_row_bytes: int = 0,
+        bytes_per_encoder_embedding: int = 0,
     ) -> None:
         self.scheduler = scheduler
         self.max_num_items = max_num_items
@@ -516,13 +516,14 @@ class MultimodalScheduler(RequestScheduler):
         # occupancy is *derived* each pass from live request states (their
         # recorded, not-yet-consumed outputs) — there is no counter to
         # release or keep in sync; a stripped or aborted request simply
-        # stops contributing. `embedding_row_bytes` converts declared
+        # stops contributing. `bytes_per_encoder_embedding` converts declared
         # embedding rows to bytes and must be positive alongside a budget.
         self.output_budget_bytes = output_budget_bytes
-        self.embedding_row_bytes = embedding_row_bytes
-        if output_budget_bytes is not None and embedding_row_bytes <= 0:
+        self.bytes_per_encoder_embedding = bytes_per_encoder_embedding
+        if output_budget_bytes is not None and bytes_per_encoder_embedding <= 0:
             raise ValueError(
-                "embedding_row_bytes must be positive when a byte budget bounds MM encoder outputs"
+                "bytes_per_encoder_embedding must be positive when a byte "
+                "budget bounds MM encoder outputs"
             )
         self.has_separate_stages = hasattr(scheduler, "capacity_scheduler") and hasattr(
             scheduler, "micro_batch_scheduler"
@@ -536,7 +537,7 @@ class MultimodalScheduler(RequestScheduler):
         so the accounting self-heals with no release bookkeeping.
         """
         return sum(
-            state.resident_output_bytes(self.embedding_row_bytes)
+            state.resident_output_bytes(self.bytes_per_encoder_embedding)
             for request in active_requests
             if (state := request.py_mm_encoder_state) is not None
         )
@@ -610,7 +611,9 @@ class MultimodalScheduler(RequestScheduler):
                 if remaining_items == 0 or cost > remaining_tokens:
                     break
                 if budget is not None:
-                    item_bytes = state.embedding_lengths[item_idx] * self.embedding_row_bytes
+                    item_bytes = (
+                        state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
+                    )
                     if resident_bytes + reserved_bytes + item_bytes > budget:
                         break
                     reserved_bytes += item_bytes
@@ -632,9 +635,11 @@ class MultimodalScheduler(RequestScheduler):
                         state.embedding_lengths[item_idx]
                         for item_idx in pending[len(request_items) :]
                     )
-                    * self.embedding_row_bytes
+                    * self.bytes_per_encoder_embedding
                 )
-                total_request_bytes = sum(state.embedding_lengths) * self.embedding_row_bytes
+                total_request_bytes = (
+                    sum(state.embedding_lengths) * self.bytes_per_encoder_embedding
+                )
                 if total_request_bytes > budget:
                     # Liveness backstop: admission
                     # (`initialize_multimodal_encoder_request`) already
@@ -645,8 +650,8 @@ class MultimodalScheduler(RequestScheduler):
                         f"Multimodal request {request.py_request_id} needs "
                         f"{total_request_bytes} bytes of resident encoder "
                         "output but the encoder output budget is only "
-                        f"{budget} bytes (one prefill iteration); raise "
-                        "max_num_tokens to serve inputs of this size"
+                        f"{budget} bytes; raise encoder_max_num_tokens to "
+                        "serve inputs of this size"
                     )
                 reserved_bytes += remaining_request_bytes
                 head_of_line_reserved = True

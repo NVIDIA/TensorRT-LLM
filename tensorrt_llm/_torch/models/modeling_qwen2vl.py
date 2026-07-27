@@ -590,6 +590,16 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             self._num_vision_tokens(width=size["width"], height=size["height"])
         }
 
+    def get_max_mm_encoder_output_embeddings(
+            self, max_num_items: int, max_num_encoder_tokens: int) -> int:
+        """Bound post-merger embeddings from one Qwen encoder iteration.
+
+        Every scheduled image or video contributes one output embedding per
+        ``spatial_merge_unit`` physical encoder tokens. Item count cannot
+        increase the aggregate output beyond the shared encoder-token budget.
+        """
+        return max_num_encoder_tokens // self.spatial_merge_unit
+
     def _post_merge_frame_area_bounds(self) -> Tuple[int, int]:
         """Return startup frame-area bounds in merged-grid units.
 

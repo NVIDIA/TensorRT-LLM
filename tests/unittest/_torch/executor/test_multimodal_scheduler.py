@@ -21,6 +21,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine,
     _resolve_mm_encoder_token_budget,
+    _validate_mm_encoder_scheduling_compatibility,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
@@ -36,6 +37,7 @@ from tensorrt_llm.inputs.multimodal import (
     strip_mm_encoder_inputs,
 )
 from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
+from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy
 
 
 class _CapacityScheduler:
@@ -123,6 +125,34 @@ def test_mm_encoder_readiness_is_derived_from_request_local_outputs():
     assert is_multimodal_encoder_ready(request)
 
 
+def test_item_scheduling_rejects_raw_payload_without_item_metadata():
+    request = _llm_request(
+        1,
+        multimodal_data={"image": {"pixel_values": torch.empty(1, 1)}},
+    )
+
+    with pytest.raises(ValueError, match="requires multimodal_encoder_item_metadata"):
+        initialize_multimodal_encoder_request(request, max_num_tokens=8)
+
+
+def test_item_scheduling_rejects_raw_payload_with_no_declared_items():
+    request = _llm_request(
+        1,
+        multimodal_data={
+            "image": {"pixel_values": torch.empty(0, 1)},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+                item_refs=[],
+                encoder_token_lengths=[],
+                output_embedding_lengths=[],
+            ),
+            "multimodal_embedding_lengths": [],
+        },
+    )
+
+    with pytest.raises(ValueError, match="at least one encoder item"):
+        initialize_multimodal_encoder_request(request, max_num_tokens=8)
+
+
 def test_multimodal_scheduler_keeps_items_atomic_and_backfills_requests():
     scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=2, max_num_tokens=10)
     first = _request(1, [7, 7])
@@ -143,7 +173,7 @@ def test_scheduler_defers_items_beyond_output_byte_budget():
         max_num_items=8,
         max_num_tokens=1 << 20,
         output_budget_bytes=4,
-        embedding_row_bytes=4,
+        bytes_per_encoder_embedding=4,
     )
     first = _request(1, [3])
     second = _request(2, [3])
@@ -163,7 +193,7 @@ def test_resident_outputs_of_active_requests_block_new_admissions():
         max_num_items=8,
         max_num_tokens=1 << 20,
         output_budget_bytes=4,
-        embedding_row_bytes=4,
+        bytes_per_encoder_embedding=4,
     )
     holder = _request(1, [3], ready=(0,))  # 1 row resident = full budget
     newcomer = _request(2, [3])
@@ -188,7 +218,7 @@ def test_head_of_line_reservation_blocks_later_requests():
         max_num_items=8,
         max_num_tokens=5,
         output_budget_bytes=8,
-        embedding_row_bytes=4,
+        bytes_per_encoder_embedding=4,
     )
     head = _request(1, [5, 5])  # second item exceeds this iteration's tokens
     follower = _request(2, [3])
@@ -204,7 +234,7 @@ def test_head_of_line_reservation_blocks_later_requests():
 def test_admission_rejects_requests_larger_than_output_budget():
     # A long-video request whose total embedding footprint can never fit
     # the output budget fails at admission (failing only that request),
-    # with guidance to raise max_num_tokens. Reachable once LLM
+    # with guidance to raise encoder_max_num_tokens. Reachable once LLM
     # chunked prefill admits prompts longer than max_num_tokens.
     request = _llm_request(
         1,
@@ -218,12 +248,12 @@ def test_admission_rejects_requests_larger_than_output_budget():
             "multimodal_embedding_lengths": [3],
         },
     )
-    with pytest.raises(ValueError, match="raise max_num_tokens"):
+    with pytest.raises(ValueError, match="raise encoder_max_num_tokens"):
         initialize_multimodal_encoder_request(
             request,
             max_num_tokens=1 << 30,
             max_output_bytes=2 * 4,  # fits 2 rows; the video needs 3
-            embedding_row_bytes=4,
+            bytes_per_encoder_embedding=4,
         )
 
 
@@ -233,16 +263,16 @@ def test_oversized_request_fails_fast_instead_of_starving():
         max_num_items=8,
         max_num_tokens=1 << 20,
         output_budget_bytes=4,
-        embedding_row_bytes=4,
+        bytes_per_encoder_embedding=4,
     )
     request = _request(1, [3, 3])  # 2 rows = 8 bytes > 4-byte budget
 
-    with pytest.raises(RuntimeError, match="raise max_num_tokens"):
+    with pytest.raises(RuntimeError, match="raise encoder_max_num_tokens"):
         scheduler.schedule_request([request], set())
 
 
-def test_scheduler_requires_row_bytes_alongside_budget():
-    with pytest.raises(ValueError, match="embedding_row_bytes"):
+def test_scheduler_requires_bytes_per_embedding_alongside_budget():
+    with pytest.raises(ValueError, match="bytes_per_encoder_embedding"):
         MultimodalScheduler(
             _BaseScheduler(),
             max_num_items=1,
@@ -287,6 +317,67 @@ def test_multimodal_scheduler_preserves_non_multimodal_requests():
 
 def test_encoder_token_budget_auto_raises_for_atomic_item():
     assert _resolve_mm_encoder_token_budget(8192, 65536) == 65536
+
+
+@pytest.mark.parametrize("llm_max_num_tokens", [8192, 65536])
+def test_output_budget_uses_encoder_embedding_capacity(llm_max_num_tokens):
+    engine = object.__new__(PyTorchModelEngine)
+    engine.max_num_tokens = llm_max_num_tokens
+    engine.encoder_max_num_items = 8
+    engine.encoder_max_num_tokens = 65536
+    engine.input_processor = SimpleNamespace(
+        get_max_mm_encoder_output_embeddings=lambda max_num_items,
+        max_num_encoder_tokens: max_num_encoder_tokens // 4
+    )
+    engine._resolve_bytes_per_mm_encoder_embedding = lambda: 32768
+
+    budget = engine._resolve_mm_encoder_output_budget_bytes()
+
+    assert engine.max_mm_encoder_output_embeddings == 16384
+    assert engine.bytes_per_mm_encoder_embedding == 32768
+    assert budget == 512 * 1024**2
+
+
+def test_output_budget_requires_processor_embedding_capacity():
+    engine = object.__new__(PyTorchModelEngine)
+    engine.encoder_max_num_items = 8
+    engine.encoder_max_num_tokens = 65536
+    engine.input_processor = SimpleNamespace(get_max_mm_encoder_output_embeddings=lambda *_: None)
+
+    with pytest.raises(ValueError, match="get_max_mm_encoder_output_embeddings"):
+        engine._resolve_mm_encoder_output_budget_bytes()
+
+
+def _eager_compatibility_args(*, enable_attention_dp=False, disagg_backend=None):
+    return SimpleNamespace(
+        multimodal_config=SimpleNamespace(
+            encoder_scheduling_policy=MultimodalEncoderSchedulingPolicy.EAGER
+        ),
+        enable_attention_dp=enable_attention_dp,
+        cache_transceiver_config=(
+            SimpleNamespace(backend=disagg_backend) if disagg_backend is not None else None
+        ),
+    )
+
+
+def test_unsupported_model_ignores_eager_compatibility_restrictions():
+    args = _eager_compatibility_args(enable_attention_dp=True, disagg_backend="NIXL")
+
+    _validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=False)
+
+
+def test_item_scheduled_model_rejects_eager_with_attention_dp():
+    args = _eager_compatibility_args(enable_attention_dp=True)
+
+    with pytest.raises(ValueError, match="attention DP"):
+        _validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
+
+
+def test_item_scheduled_model_rejects_eager_with_disaggregated_serving():
+    args = _eager_compatibility_args(disagg_backend="NIXL")
+
+    with pytest.raises(ValueError, match="disaggregated"):
+        _validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
 
 
 def test_request_rejects_item_above_effective_startup_maximum():
@@ -624,7 +715,6 @@ def test_cache_hit_at_encode_skips_only_hit_items(monkeypatch):
         [[1, 2], [3, 4]], [("image", 0), ("image", 1)], [2, 3], "kw"
     )
     cache.put(key0, torch.full((2, 2), 7.0))  # entry from an earlier request
-
     engine.forward_multimodal_encoder_items([request], {1: [0, 1]})
 
     assert engine.model.encoded_item_counts == [1]  # only the miss encoded
@@ -717,6 +807,18 @@ def test_qwen_item_metadata_uses_prompt_order_and_pre_merger_costs():
     assert metadata.output_embedding_lengths == [8, 4]
 
 
+def test_qwen_output_capacity_converts_encoder_tokens_after_spatial_merge():
+    processor = object.__new__(Qwen2VLInputProcessorBase)
+    processor._config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
+
+    assert (
+        processor.get_max_mm_encoder_output_embeddings(
+            max_num_items=8, max_num_encoder_tokens=65536
+        )
+        == 16384
+    )
+
+
 def test_qwen_item_metadata_collapses_frame_spans_into_original_video():
     processor = object.__new__(Qwen2VLInputProcessorBase)
     processor._config = SimpleNamespace(
@@ -749,6 +851,18 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
     assert metadata.item_refs == [("image", 0), ("image", 1)]
     assert metadata.encoder_token_lengths == [8, 16]
     assert metadata.output_embedding_lengths == [2, 4]
+
+
+def test_mistral_output_capacity_converts_encoder_tokens_after_spatial_merge():
+    processor = object.__new__(Mistral3InputProcessor)
+    processor._vision_geometry = lambda: (14, 2, 3, 1024)
+
+    assert (
+        processor.get_max_mm_encoder_output_embeddings(
+            max_num_items=8, max_num_encoder_tokens=65536
+        )
+        == 16384
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -151,6 +151,25 @@ def _resolve_mm_encoder_token_budget(base_budget: int,
     return max(base_budget, model_max_atomic_item_tokens)
 
 
+def _validate_mm_encoder_scheduling_compatibility(
+        llm_args: TorchLlmArgs, item_scheduling_enabled: bool) -> None:
+    """Validate EAGER-only combinations after the model capability is known."""
+    policy = llm_args.multimodal_config.encoder_scheduling_policy
+    if (not item_scheduling_enabled
+            or policy != MultimodalEncoderSchedulingPolicy.EAGER):
+        return
+    if llm_args.enable_attention_dp:
+        raise ValueError(
+            "multimodal_config.encoder_scheduling_policy=EAGER does not yet "
+            "support attention DP (enable_attention_dp=True)")
+    cache_transceiver_config = llm_args.cache_transceiver_config
+    if (cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None):
+        raise ValueError(
+            "multimodal_config.encoder_scheduling_policy=EAGER does not yet "
+            "support disaggregated serving (cache_transceiver_config)")
+
+
 class ModelEngine(ABC):
 
     @abstractmethod
@@ -494,8 +513,11 @@ class PyTorchModelEngine(ModelEngine):
             isinstance(self.model, MultimodalModelMixin)
             and self.model.supports_mm_encoder_item_scheduling and
             _mm_scheduling_policy != MultimodalEncoderSchedulingPolicy.DISABLED)
+        _validate_mm_encoder_scheduling_compatibility(
+            self.llm_args, self.mm_encoder_item_scheduling_enabled)
         self.mm_encoder_attention_metadata_capacity: Optional[Dict[str,
                                                                    int]] = None
+        self.max_mm_encoder_output_embeddings: Optional[int] = None
         self.mm_encoder_output_budget_bytes: Optional[int] = None
         # Item scheduling bounds three distinct MM encoder resources. They are
         # owned in different places and measured in different units, so they
@@ -504,17 +526,15 @@ class PyTorchModelEngine(ModelEngine):
         #       in encoder attention tokens, clamped up to the largest atomic
         #       item; profiled by the warmup dummy encoder forwards.
         #   (B) resident output bytes — `mm_encoder_output_budget_bytes`
-        #       (`_resolve_mm_encoder_output_budget_bytes`), the embeddings held
-        #       between encode and prefill. Floored at one prefill iteration
-        #       (`max_num_tokens x row_bytes`): the rows co-resident for a
-        #       single iteration are bounded by the LLM token budget, not the
-        #       encoder one. Enforced by the scheduler; reserved in KV
-        #       estimation.
+        #       (`_resolve_mm_encoder_output_budget_bytes`), the maximum
+        #       post-encoder embeddings produced by one legal encoder iteration,
+        #       converted to bytes. Enforced by the scheduler and reserved in
+        #       KV-capacity estimation.
         #   (C) reuse cache bytes — `encoder_cache_max_bytes` on the mixin's
-        #       `TensorLRUCache`, self-bounded by LRU; reserved in KV
-        #       estimation on top of (B) for cache-enabled models.
-        # Item-level chunked MM prefill (see the roadmap doc) collapses (B) to a
-        # single item and merges it with (C), leaving one resident budget.
+        #       `TensorLRUCache`, self-bounded by LRU; reserved on top of (B)
+        #       for cache-enabled models.
+        # Prefill currently waits for every item in a request, so admission
+        # rejects a request whose complete MM embedding exceeds (B).
         if self.mm_encoder_item_scheduling_enabled:
             if self.encoder_max_num_tokens is None:
                 raise ValueError(
@@ -2813,25 +2833,33 @@ class PyTorchModelEngine(ModelEngine):
     def _resolve_mm_encoder_output_budget_bytes(self) -> int:
         """Resolve the byte budget for resident MM encoder outputs.
 
-        The budget is one prefill iteration's embeddings,
-        `max_num_tokens x embedding-row bytes` — the rows co-resident for a
-        single iteration are bounded by `max_num_tokens`, mirroring vLLM's
-        default encoder budget of `max_num_batched_tokens` (expressed here
-        in bytes). It caps the outputs held by in-flight requests between
-        encode and prefill (the scheduler derives occupancy from request
-        states each tick), and is reserved from the KV pool during memory
-        profiling. There is no user knob: it is not the reuse cache
-        (`encoder_cache_max_bytes`), which the item path does not use.
+        Encoder attention tokens and output embeddings use different units:
+        `encoder_max_num_tokens` bounds pre-merge encoder attention tokens in
+        one encoder iteration, while the input processor converts that runtime
+        capacity into a model-specific upper bound on aggregate post-encoder
+        embeddings. The byte budget is that embedding capacity multiplied by
+        bytes per encoder embedding; the LLM-side `max_num_tokens` does not
+        participate.
 
-        Until item-level chunked MM prefill lands (see
-        `notes/design_docs/item_level_chunked_mm_prefill_roadmap.md`), a
-        request holds its full embedding resident, so a single request whose
-        total embedding exceeds this budget is rejected at admission; raising
-        `max_num_tokens` raises the budget with it.
+        It caps outputs held between encode and prefill and is reserved during
+        KV-capacity estimation. It is separate from the optional reuse cache
+        (`encoder_cache_max_bytes`). A request whose total embedding exceeds
+        this budget is rejected at admission.
         """
-        row_bytes = self._resolve_mm_embedding_row_bytes()
-        self.mm_embedding_row_bytes = row_bytes
-        return self.max_num_tokens * row_bytes
+        max_output_embeddings = (
+            self.input_processor.get_max_mm_encoder_output_embeddings(
+                self.encoder_max_num_items,
+                self.encoder_max_num_tokens,
+            ))
+        if max_output_embeddings is None or max_output_embeddings <= 0:
+            raise ValueError(
+                "A model with MM encoder item scheduling must implement "
+                "get_max_mm_encoder_output_embeddings() and return a positive "
+                "aggregate embedding capacity")
+        self.max_mm_encoder_output_embeddings = max_output_embeddings
+        bytes_per_embedding = self._resolve_bytes_per_mm_encoder_embedding()
+        self.bytes_per_mm_encoder_embedding = bytes_per_embedding
+        return max_output_embeddings * bytes_per_embedding
 
     @property
     def mm_encoder_cache(self) -> Optional[TensorLRUCache]:
@@ -2874,8 +2902,8 @@ class PyTorchModelEngine(ModelEngine):
             mm_data.get("mm_processor_kwargs_hash"),
         )
 
-    def _resolve_mm_embedding_row_bytes(self) -> int:
-        """Bytes of one MM embedding row (hidden size x element size).
+    def _resolve_bytes_per_mm_encoder_embedding(self) -> int:
+        """Bytes occupied by one multimodal encoder output embedding.
 
         Prefers the mixin's explicit `embedding_dim`/`embedding_dtype`
         contract, then the text embedding layer's weight, then the
