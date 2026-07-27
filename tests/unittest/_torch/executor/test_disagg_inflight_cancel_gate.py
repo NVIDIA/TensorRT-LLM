@@ -200,6 +200,7 @@ def test_flag_unset_context_timeout_preserves_legacy_cleanup():
     request.py_kv_transfer_start_time = 1.0
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     executor = object.__new__(PyExecutor)
+    executor.canceled_req_ids = []
     executor.kv_cache_transceiver = Mock()
     executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
     executor.kv_cache_transceiver.take_context_cancelled_request_ids.return_value = []
@@ -230,6 +231,7 @@ def test_enabled_context_timeout_defers_cleanup_until_cpp_terminal_state(monkeyp
     request.py_kv_transfer_start_time = 1.0
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     executor = object.__new__(PyExecutor)
+    executor.canceled_req_ids = []
     executor.kv_cache_transceiver = Mock()
     executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
     executor.kv_cache_transceiver.take_context_cancelled_request_ids.return_value = []
@@ -902,6 +904,58 @@ def test_shutdown_waits_for_deferred_transfer_teardown_before_resource_release(
     assert completion.is_set()
     assert executor.kv_cache_transceiver.shutdown.call_count == 2
     resource_manager.shutdown.assert_called_once_with()
+
+
+@pytest.mark.parametrize("failure_step", ["release", "synchronize"])
+def test_shutdown_preserves_resource_managers_when_cuda_graph_teardown_fails(
+    monkeypatch,
+    failure_step,
+):
+    executor = object.__new__(PyExecutor)
+    executor.executor_request_queue = Mock()
+    executor.shutdown_event = Mock()
+    executor.hang_detector = Mock()
+    executor.hang_detector.detected.return_value = False
+    executor.worker_thread = Mock()
+    executor.dist = SimpleNamespace(pp_size=1)
+    executor._shutdown_sleep_wakeup_listeners = Mock()
+    executor.worker_started = True
+    model_engine = Mock()
+    model_engine._release_cuda_graphs = Mock()
+    executor.model_engine = model_engine
+    draft_model_engine = Mock()
+    draft_model_engine._release_cuda_graphs = Mock()
+    executor.draft_model_engine = draft_model_engine
+    executor.kv_cache_transceiver = None
+    resource_manager = Mock()
+    executor.resource_manager = SimpleNamespace(resource_managers={"kv": resource_manager})
+    virtual_memory_pools = {0: object(), 1: object()}
+    executor.virtual_memory_pools = virtual_memory_pools
+    executor.sampler = object()
+    executor.dwdp_manager = None
+
+    if failure_step == "release":
+        model_engine._release_cuda_graphs.side_effect = RuntimeError("CUDA graph release failed")
+        monkeypatch.setattr(executor_module.torch.cuda, "is_available", lambda: False)
+        expected_error = "CUDA graph release failed"
+    else:
+        monkeypatch.setattr(executor_module.torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(
+            executor_module.torch.cuda,
+            "synchronize",
+            Mock(side_effect=RuntimeError("CUDA graph synchronize failed")),
+        )
+        expected_error = "CUDA graph synchronize failed"
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        PyExecutor.shutdown(executor)
+
+    model_engine._release_cuda_graphs.assert_called_once_with()
+    draft_model_engine._release_cuda_graphs.assert_called_once_with()
+    resource_manager.shutdown.assert_not_called()
+    assert executor.model_engine is model_engine
+    assert executor.draft_model_engine is draft_model_engine
+    assert executor.virtual_memory_pools is virtual_memory_pools
 
 
 def test_flag_unset_generation_driver_skips_cancel_pipeline():

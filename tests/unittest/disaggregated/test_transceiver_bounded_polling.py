@@ -48,6 +48,10 @@ class _FakeRequest:
     state: Optional[LlmRequestState] = None
     request_id: int = 0
     py_disaggregated_params: Optional[object] = None
+    kv_cache_transfer_start: Optional[int] = None
+
+    def set_kv_cache_transfer_start(self, value: int) -> None:
+        self.kv_cache_transfer_start = value
 
 
 class _FakeTransferWorker:
@@ -1791,9 +1795,8 @@ def test_async_peer_ready_cancel_withdraws_and_tombstones_request() -> None:
     transceiver = _make_transceiver({})
     coordinator = _enable_fake_async_consensus(transceiver, peer_ready=True)
     req = _FakeRequest(request_id=32)
-    transceiver._wait_reqs[32] = req
     transceiver._transfer_worker.ready_request_ids.add(32)
-    transceiver._prepare_context_requests_async()
+    transceiver.prepare_context_requests([req])
 
     assert not transceiver.cancel_request(req)
     assert coordinator.ready_withdrawals == [(32, 0)]

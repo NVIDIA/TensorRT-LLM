@@ -195,6 +195,30 @@ def test_make_kv_result_msg_uses_binary_frame(result_name):
     assert tfr._AGENT_RESULT_BY_CODE[code] is result
 
 
+def test_make_kv_result_msg_v2_preserves_identity_size_and_tail():
+    """The v2 prefix adds identity without dropping timing or bounce framing."""
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    tail = [b"dst", b"sizes", b"base"]
+    msg = tfr._make_kv_result_msg(
+        3,
+        12345,
+        7,
+        True,
+        tfr.AgentResult.SUCCESS,
+        transfer_size=8192,
+        tail=tail,
+        request_epoch=99,
+        sender_endpoint="tcp://sender",
+    )
+
+    assert msg[0] == tfr.MessageType.KV_AGENT_RESULT
+    assert msg[2] == b"tcp://sender"
+    assert msg[3:] == tail
+    rank, rid, epoch, slice_id, last, code, size = tfr._KV_RESULT_PREFIX_V2.unpack(msg[1])
+    assert (rank, rid, epoch, slice_id, last, size) == (3, 12345, 99, 7, True, 8192)
+    assert tfr._AGENT_RESULT_BY_CODE[code] is tfr.AgentResult.SUCCESS
+
+
 # --------------------------------------------------------------------------- #
 # fan-in safety gate — equal total//num_writers split only for uniform TP-by-head
 # --------------------------------------------------------------------------- #

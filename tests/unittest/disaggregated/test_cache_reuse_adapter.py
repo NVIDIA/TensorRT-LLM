@@ -14,6 +14,7 @@
 # limitations under the License.
 """Tests for CacheReuseAdapter, _create_kv_slice SWA trim, and Sender token-start derivation."""
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -672,7 +673,20 @@ class TestTransceiverContextManager:
         tc._recv_sessions = {}
         tc._send_reqs = {}
         tc._recv_reqs = {}
+        tc._legacy_failed_sessions = set()
+        tc._shutdown = False
+        tc._shutdown_complete = False
+        tc._shutdown_metadata_leases_complete = False
+        tc._shutdown_sessions_complete = False
+        tc._shutdown_consensus_complete = False
+        tc._shutdown_worker_complete = False
+        tc._shutdown_worker_event = None
+        tc._shutdown_deferred_errors = []
+        tc._async_ready_idle_wakeup = threading.Event()
+        tc._async_ready_metadata_leases = set()
+        tc._async_consensus = None
         tc._transfer_worker = MagicMock()
+        tc._transfer_worker.shutdown.return_value = None
         return tc
 
     def test_enter_returns_self(self):
