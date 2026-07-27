@@ -345,7 +345,6 @@ unittest/_torch/modeling/test_modeling_nemotron_nano_v2_vl.py::test_nemotron_nan
 unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
 unittest/_torch/modules/tests_lora_modules/test_qwen3_sanity.py::TestQwen3LoRA::test_qwen3_fp8_lora SKIP (https://nvbugs/6668777)
 unittest/_torch/moe/test_moe_backend.py::test_moe_backend[act=Relu2-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/5989912)
-unittest/_torch/multi_gpu/test_linear.py::test_row_linear_norm_fusion[2-hidden:16-seqlen:2] SKIP (https://nvbugs/6501404)
 unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[False] SKIP (https://nvbugs/6535767)
 unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[True] SKIP (https://nvbugs/6535767)
 unittest/_torch/speculative/hw_agnostic/test_ngram.py::test_llama_ngram[True-True-TRTLLM] SKIP (https://nvbugs/6507102)
