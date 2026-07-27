@@ -350,6 +350,14 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             if _needed < 1:
                 _needed = 1
             need_cluster_sync = _needed >= 2
+            # _eff <= top_k: whole row is selected, and the cluster radix path
+            # can't find a threshold (histogram total == _eff never exceeds
+            # top_k). Collapse to solo trivial -- only cta 0 runs (guard below,
+            # cluster-uniform so no deadlock) and takes the full row.
+            if _eff <= self.top_k:
+                need_cluster_sync = False
+                row_start = 0
+                length = _eff
             # score/dst index the row (not the global block).
             bidx = row_id
 

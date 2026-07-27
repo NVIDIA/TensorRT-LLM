@@ -815,6 +815,23 @@ def test_cute_dsl_topk_decode_high_and_odd_k(batch_size, index_topk, num_tokens)
                 run_fn,
             )
 
+    # Regression (effective row length <= top_k in a radix-filter cluster):
+    # fp32 num_tokens=32768, top_k=16384 routes the indexer to a 4-CTA cluster
+    # (chunk=8192). A row whose effective length spans >1 chunk but is <= top_k
+    # (eff=12000) has a merged histogram total (== eff) that never exceeds
+    # top_k, so the cluster radix threshold search cannot fire; the kernel must
+    # fall back to the solo trivial path (select all valid columns, pad -1).
+    if batch_size == 1 and index_topk == 16384 and num_tokens == 32768:
+        eff = 12000  # chunk (8192) < eff <= top_k
+        logits = torch.full((1, num_tokens), float("-inf"), dtype=torch.float32, device="cuda")
+        logits[0, :eff] = torch.randn(eff, dtype=torch.float32, device="cuda")
+        seq_lens = torch.tensor([eff], dtype=torch.int32, device="cuda")
+        got = run_indexer(logits, seq_lens)[0].cpu()
+        valid = got[got != -1]
+        assert valid.numel() == eff, f"expected {eff} valid, got {valid.numel()}"
+        assert set(valid.tolist()) == set(range(eff)), "selected set != all valid columns"
+        assert (got == -1).sum().item() == index_topk - eff, "wrong -1 pad count"
+
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
