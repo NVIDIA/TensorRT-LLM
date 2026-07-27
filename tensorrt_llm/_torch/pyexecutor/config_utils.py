@@ -96,6 +96,11 @@ def is_mla(config):
     return False
 
 
+def is_minimax_m3(sparse_attention_config):
+    """True when the sparse attention config selects the MiniMax-M3 algorithm."""
+    return sparse_attention_config is not None and sparse_attention_config.algorithm == "minimax_m3"
+
+
 def is_qwen3_next(config):
     return hasattr(
         config, 'architectures'
@@ -387,6 +392,11 @@ def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
                            checkpoint_format: Optional[str] = None,
                            **kwargs) -> transformers.PretrainedConfig:
+    if checkpoint_format in ("mistral", "mistral_large_3"):
+        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
+            MistralConfigLoader
+        return MistralConfigLoader().load(model_name_or_path).pretrained_config
+
     config_dict, _ = transformers.PretrainedConfig.get_config_dict(
         model_name_or_path, **kwargs)
     model_type = config_dict.get("model_type")

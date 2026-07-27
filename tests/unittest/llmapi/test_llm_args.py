@@ -34,6 +34,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
+                                          DSparkDecodingConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
@@ -104,6 +105,53 @@ def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
     assert explicit_config.max_draft_len == 1
     assert explicit_config.max_total_draft_tokens == 1
     assert "max_draft_len" in explicit_config.model_fields_set
+
+
+def test_rejection_sampling_allows_attention_dp(monkeypatch):
+    """ADP (incl. ADP+LM-head-TP) supports rejection sampling.
+
+    The draft path bypasses LM-head-TP for advanced sampling and the greedy
+    flag is group-synchronized, so the former attention-DP gate is lifted.
+    """
+    import tensorrt_llm._torch.flashinfer_utils as fi_utils
+    monkeypatch.setattr(fi_utils, "IS_FLASHINFER_AVAILABLE", True)
+
+    # Vanilla MTP is one of the "newly wired" methods the parallel gate used
+    # to cover: lifting the ADP gate is the actual behavior change here.
+    for lm_head_tp in (False, True):
+        spec_cfg = MTPDecodingConfig(max_draft_len=2,
+                                     use_rejection_sampling=True,
+                                     use_mtp_vanilla=True)
+        args = TorchLlmArgs(model=llama_model_path,
+                            enable_attention_dp=True,
+                            enable_lm_head_tp_in_adp=lm_head_tp,
+                            speculative_config=spec_cfg)
+        assert args.speculative_config.use_rejection_sampling is True
+
+    # MTP-Eagle (default) was never parallel-gated; keep it as a regression
+    # guard that the gate rework did not accidentally start rejecting it.
+    spec_cfg = MTPDecodingConfig(max_draft_len=2, use_rejection_sampling=True)
+    args = TorchLlmArgs(model=llama_model_path,
+                        enable_attention_dp=True,
+                        enable_lm_head_tp_in_adp=True,
+                        speculative_config=spec_cfg)
+    assert args.speculative_config.use_rejection_sampling is True
+
+
+def test_rejection_sampling_still_gated_on_context_parallel():
+    """Context parallelism remains an unsupported rejection combination.
+
+    Explicit opt-in raises; default-inherited silently disables. The parallel
+    gate applies to the newly wired methods (vanilla MTP, PARD, DFlash,
+    DraftTarget one-model), so use vanilla MTP here.
+    """
+    spec_cfg = MTPDecodingConfig(max_draft_len=2,
+                                 use_rejection_sampling=True,
+                                 use_mtp_vanilla=True)
+    with pytest.raises(ValueError, match="context parallelism"):
+        TorchLlmArgs(model=llama_model_path,
+                     context_parallel_size=2,
+                     speculative_config=spec_cfg)
 
 
 class TestYaml:
@@ -239,6 +287,145 @@ def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
     assert any(
         "EAGLE (v1/v2) draft checkpoints are incompatible with Eagle3" in m
         for m in warnings_seen)
+
+
+def test_dspark_block_size_resolved_from_checkpoint(tmp_path):
+    (tmp_path / "config.json").write_text('{"dspark_block_size": 5}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path))
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+    )
+
+    assert args.speculative_config.block_size == 5
+
+
+def test_dspark_block_size_must_match_max_draft_len(tmp_path):
+    (tmp_path / "config.json").write_text('{"dspark_block_size": 4}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path))
+
+    with pytest.raises(ValueError, match="block_size must equal max_draft_len"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_target_layer_ids_resolved_from_checkpoint(tmp_path):
+    # When the user leaves target_layer_ids unset, the checkpoint's ordered
+    # dspark_target_layer_ids must be adopted verbatim.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [3, 1, 2]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path))
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+    )
+
+    # Order is preserved (projection columns are order-dependent).
+    assert args.speculative_config.target_layer_ids == [3, 1, 2]
+
+
+def test_dspark_target_layer_ids_matching_override_accepted(tmp_path):
+    # An explicit override that matches the checkpoint list exactly is fine.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [1, 2, 3]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    target_layer_ids=[1, 2, 3])
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+    )
+
+    assert args.speculative_config.target_layer_ids == [1, 2, 3]
+
+
+def test_dspark_target_layer_ids_mismatched_count_rejected(tmp_path):
+    # A different number of layers would mismatch main_proj.in_features.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [1, 2, 3]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    target_layer_ids=[1, 2])
+
+    with pytest.raises(ValueError, match="must match the checkpoint"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_target_layer_ids_same_count_different_layers_rejected(tmp_path):
+    # Same count but different layers: shapes line up, but the draft would see
+    # hidden states it was not trained on, so this must be rejected too.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [1, 2, 3]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    target_layer_ids=[1, 2, 4])
+
+    with pytest.raises(ValueError, match="must match the checkpoint"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_target_layer_ids_order_mismatch_rejected(tmp_path):
+    # Same set but different order: projection columns are order-dependent, so a
+    # reordered override must be rejected rather than silently accepted.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [1, 2, 3]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    target_layer_ids=[3, 2, 1])
+
+    with pytest.raises(ValueError, match="must match the checkpoint"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_requires_speculative_model():
+    # The DSpark draft weights live in the checkpoint's mtp.* namespace, so an
+    # unset speculative_model must fail fast at config validation instead of
+    # raising an opaque TypeError deep inside engine construction.
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5)
+
+    with pytest.raises(ValueError,
+                       match="requires speculative_config.speculative_model"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_requires_positive_max_draft_len(tmp_path):
+    (tmp_path / "config.json").write_text('{"dspark_block_size": 5}')
+    spec_cfg = DSparkDecodingConfig(speculative_model=str(tmp_path))
+
+    with pytest.raises(ValueError, match="max_draft_len must be > 0"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
 
 
 def test_post_processor_hook_rejected_with_skip_tokenizer_init():
@@ -409,6 +596,8 @@ def test_KvCacheConfig_declaration():
         use_kv_cache_manager_v2=False).use_kv_cache_manager_v2 is False
     with pytest.raises(ValidationError, match="use_kv_cache_manager_v2"):
         KvCacheConfig(use_kv_cache_manager_v2="invalid")
+    with pytest.raises(ValidationError, match="max_util_for_resume"):
+        KvCacheConfig(max_util_for_resume=0)
 
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
@@ -461,6 +650,8 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
+    assert (KvCacheConfig(block_reuse_policy="per_conversation").
+            block_reuse_policy == "per_conversation")
     with pytest.raises(ValidationError):
         KvCacheConfig(block_reuse_policy="invalid")
 
@@ -3196,3 +3387,60 @@ class TestTransceiverRuntimeAutoResolution:
         # An explicit backend bypasses the env vars entirely.
         assert CacheTransceiverConfig(
             backend="UCX")._resolve_default_backend() == ("UCX", None)
+
+
+class TestGlm5TransceiverPreference:
+    """GLM-5 defaults to the Python KV-cache transceiver in disagg.
+
+    DeepseekV3ForCausalLM is shared by DeepSeek-V3/V3.2 and GLM-5
+    (GlmMoeDsaForCausalLM); the preference must apply to GLM checkpoints
+    only.
+    """
+
+    @staticmethod
+    def _pretrained_config(architectures, model_type):
+        from transformers import PretrainedConfig
+        cfg = PretrainedConfig(architectures=architectures)
+        cfg.model_type = model_type
+        return cfg
+
+    @pytest.mark.parametrize(
+        "architectures,model_type,expected",
+        [
+            (["GlmMoeDsaForCausalLM"], "glm_moe_dsa", "PYTHON"),
+            (["DeepseekV3ForCausalLM"], "deepseek_v3", None),
+            (["DeepseekV32ForCausalLM"], "deepseek_v32", None),
+            # Each predicate in isolation: the architecture match and the
+            # model_type fallback must each suffice on their own.
+            (["GlmMoeDsaForCausalLM"], "deepseek_v32", "PYTHON"),
+            (["DeepseekV32ForCausalLM"], "glm_moe_dsa", "PYTHON"),
+        ])
+    def test_preference_per_architecture(self, architectures, model_type,
+                                         expected):
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        cfg = self._pretrained_config(architectures, model_type)
+        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
+            cfg) == expected
+
+    def test_no_config_defers_to_cpp(self):
+        """Without a pretrained config the class defers to the C++ default."""
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime() is None
+
+    def test_glm5_resolves_auto_to_python_on_nixl(self):
+        """GLM-5 on NIXL adopts the Python transceiver from 'auto'.
+
+        End-to-end through _resolve_transceiver_runtime_auto with the real
+        model class and a GLM pretrained config.
+        """
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+        )
+        cfg = self._pretrained_config(["GlmMoeDsaForCausalLM"], "glm_moe_dsa")
+        _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"

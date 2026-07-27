@@ -64,8 +64,20 @@ In standalone mode the package uses the PyTorch, Triton, and FlashInfer kernel p
 
 ### Run the bundled tests
 
+The generated repository contains every AutoDeploy test selected by the
+TensorRT-LLM test-name classifier. Tests that need TensorRT-LLM skip cleanly
+when its optional wheel is absent.
+
 ```bash
 pytest tests/
+```
+
+To include tests that exercise TensorRT-LLM kernels, runtime, or test helpers,
+install the optional wheel and explicitly enable the Paragraf redirect:
+
+```bash
+uv pip install -e ".[dev,trtllm]"
+TRTLLM_REDIRECT_AD_TO_PARAGRAF=true pytest tests/
 ```
 
 ______________________________________________________________________

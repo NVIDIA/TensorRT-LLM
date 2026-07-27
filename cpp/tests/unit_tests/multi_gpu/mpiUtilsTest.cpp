@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,11 +20,12 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #if ENABLE_MULTI_DEVICE
-#include "tensorrt_llm/plugins/common/plugin.h"
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
 
 #include <algorithm>
+#include <cstdint>
+#include <thread>
 
 namespace mpi = tensorrt_llm::mpi;
 namespace tr = tensorrt_llm::runtime;
@@ -46,6 +47,29 @@ TEST(MPIUtils, WorldRankAndSize)
     auto const size = comm.getSize();
     EXPECT_LE(rank, size);
 }
+
+#if ENABLE_MULTI_DEVICE
+TEST(MPIUtils, AsyncSendCanBePolled)
+{
+    auto& comm = mpi::MpiComm::world();
+    auto const rank = comm.getRank();
+    auto const size = comm.getSize();
+    auto const destination = (rank + 1) % size;
+    auto const source = (rank + size - 1) % size;
+    std::uint64_t const sentValue = static_cast<std::uint64_t>(rank);
+    std::uint64_t receivedValue = 0;
+
+    auto request
+        = comm.sendAsync(&sentValue, 1, mpi::MpiType::kUINT64, destination, mpi::MpiTag::kContextTransferEvent);
+    static_cast<void>(comm.recv(&receivedValue, 1, mpi::MpiType::kUINT64, source, mpi::MpiTag::kContextTransferEvent));
+    while (!request->isCompleted())
+    {
+        std::this_thread::yield();
+    }
+
+    EXPECT_EQ(receivedValue, static_cast<std::uint64_t>(source));
+}
+#endif // ENABLE_MULTI_DEVICE
 
 template <typename T>
 void testBroadcast()
@@ -91,11 +115,6 @@ TEST(MPIUtils, BroadcastNcclId)
     comm.bcastValue(id, root);
     EXPECT_TRUE(std::any_of(
         id.internal, id.internal + sizeof(id.internal) / sizeof(id.internal[0]), [](auto x) { return x != 0; }));
-}
-
-TEST(MPIUtils, GlobalSessionHandle)
-{
-    EXPECT_EQ(tensorrt_llm::plugins::getCommSessionHandle(), &COMM_SESSION);
 }
 #endif // ENABLE_MULTI_DEVICE
 

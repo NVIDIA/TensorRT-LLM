@@ -13,13 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import logging
+import re
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Iterator, Literal
 
 import yaml
-from pydantic import BaseModel, Field, RootModel, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PositiveInt,
+    RootModel,
+    field_validator,
+    model_validator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +39,21 @@ CURATED_LIST_PATH = Path(__file__).parent.parent / "curated" / "lookup.yaml"
 LOW_LATENCY_CONCURRENCY_THRESHOLD = 8
 HIGH_THROUGHPUT_CONCURRENCY_THRESHOLD = 32
 KEY_PROFILES = {"Min Latency", "Balanced", "Max Throughput"}
+PROFILE_DISPLAY_NAMES = {
+    "latency": "Min Latency",
+    "balanced": "Balanced",
+    "throughput": "Max Throughput",
+}
+PROFILE_ORDER = {profile: idx for idx, profile in enumerate(PROFILE_DISPLAY_NAMES)}
+VALIDATED_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+VALIDATED_VERSION_PATTERN = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]*$")
+Profile = Literal["latency", "balanced", "throughput"]
 
 
 class CuratedRecipe(BaseModel):
     """A curated (hand-tuned) recipe entry."""
+
+    model_config = ConfigDict(extra="forbid")
 
     model: str = Field(description="HuggingFace model ID")
     arch: str = Field(description="Model architecture class name")
@@ -51,7 +71,7 @@ class CuratedRecipe(BaseModel):
         return v
 
 
-class CuratedRecipeList(RootModel[List[CuratedRecipe]]):
+class CuratedRecipeList(RootModel[list[CuratedRecipe]]):
     """Validated list of curated recipe entries."""
 
     @classmethod
@@ -75,15 +95,58 @@ class CuratedRecipeList(RootModel[List[CuratedRecipe]]):
 class Recipe(BaseModel):
     """Recipe record for scenario list."""
 
-    model: str = Field(description="Model name")
-    gpu: str = Field(description="GPU name")
-    isl: int = Field(description="Input sequence length")
-    osl: int = Field(description="Output sequence length")
-    concurrency: int = Field(description="Concurrency")
-    config_path: str = Field(description="Configuration path")
-    num_gpus: int = Field(description="Number of GPUs")
+    model_config = ConfigDict(extra="forbid")
 
-    def load_config(self) -> Dict[str, Any]:
+    model: str = Field(min_length=1, description="Model name")
+    arch: str = Field(min_length=1, description="Model architecture class name")
+    gpu: str = Field(min_length=1, description="GPU name")
+    isl: PositiveInt = Field(description="Input sequence length")
+    osl: PositiveInt = Field(description="Output sequence length")
+    concurrency: PositiveInt = Field(description="Concurrency")
+    config_path: str = Field(min_length=1, description="Configuration path")
+    num_gpus: PositiveInt = Field(description="Number of GPUs")
+    profile: Profile | None = Field(
+        default=None,
+        description="Profile discriminator used only when the workload key has multiple configs",
+    )
+    validated_trtllm_commit: str | None = Field(
+        default=None,
+        description="Full TensorRT-LLM commit SHA against which the recipe was validated",
+    )
+    validated_trtllm_version: str | None = Field(
+        default=None,
+        description="TensorRT-LLM release version reported by the validation source",
+    )
+
+    @field_validator("validated_trtllm_commit")
+    @classmethod
+    def _validate_commit(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not VALIDATED_COMMIT_PATTERN.fullmatch(normalized):
+            raise ValueError("validated_trtllm_commit must be a full 40-character Git SHA")
+        return normalized
+
+    @field_validator("validated_trtllm_version")
+    @classmethod
+    def _validate_version(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not VALIDATED_VERSION_PATTERN.fullmatch(normalized):
+            raise ValueError("validated_trtllm_version must be a release-tag-safe version")
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_provenance_pair(self) -> "Recipe":
+        if bool(self.validated_trtllm_commit) != bool(self.validated_trtllm_version):
+            raise ValueError(
+                "validated_trtllm_commit and validated_trtllm_version must be provided together"
+            )
+        return self
+
+    def load_config(self) -> dict[str, Any]:
         """Load and return the YAML config at config_path."""
         config_relative_path = Path(self.config_path)
         # Ensure config path is within the repo root
@@ -96,7 +159,41 @@ class Recipe(BaseModel):
             return yaml.safe_load(f)
 
 
-class RecipeList(RootModel[List[Recipe]]):
+class RecipeList(RootModel[list[Recipe]]):
+    @model_validator(mode="after")
+    def _validate_conflict_profiles(self) -> "RecipeList":
+        groups = defaultdict(list)
+        for recipe in self.root:
+            key = (
+                recipe.model,
+                recipe.gpu,
+                recipe.num_gpus,
+                recipe.isl,
+                recipe.osl,
+                recipe.concurrency,
+            )
+            groups[key].append(recipe)
+
+        required_profiles = {"latency", "throughput"}
+        for key, recipes in groups.items():
+            profiles = [recipe.profile for recipe in recipes]
+            if len(recipes) == 1:
+                if profiles[0] is not None:
+                    raise ValueError(f"profile is only allowed for conflicting workload key {key}")
+                continue
+            profile_set = set(profiles)
+            if (
+                None in profile_set
+                or len(profile_set) != len(profiles)
+                or not required_profiles.issubset(profile_set)
+            ):
+                raise ValueError(
+                    "conflicting workload key "
+                    f"{key} must have exactly one latency and throughput profile, "
+                    "with an optional balanced profile"
+                )
+        return self
+
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> "RecipeList":
         """Load and validate recipe list from YAML file."""
@@ -132,12 +229,15 @@ def assign_profile(num_recipes: int, idx: int, concurrency: int) -> str:
         return "High Throughput"
 
 
-def select_key_recipes(recipes: List[Recipe]) -> List[Tuple[Recipe, str]]:
+def select_key_recipes(recipes: list[Recipe]) -> list[tuple[Recipe, str]]:
     """Select key recipes (min latency, balanced, max throughput) from a list of recipes."""
     if not recipes:
         return []
 
-    sorted_recipes = sorted(recipes, key=lambda r: r.concurrency)
+    sorted_recipes = sorted(
+        recipes,
+        key=lambda r: (r.concurrency, PROFILE_ORDER.get(r.profile, -1)),
+    )
     n = len(sorted_recipes)
 
     result = []

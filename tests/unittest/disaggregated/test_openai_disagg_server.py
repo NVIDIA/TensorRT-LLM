@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import Request
 from starlette.datastructures import Headers
 
 from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
@@ -27,6 +29,39 @@ from tensorrt_llm.serve.openai_protocol import (
 
 def _raw_request(headers: dict[str, str]):
     return SimpleNamespace(headers=Headers(headers=headers))
+
+
+@pytest.mark.asyncio
+async def test_http_cluster_storage_request_is_proxied_to_coordinator():
+    payload = b'{"key":"worker","value":"ready"}'
+
+    async def receive():
+        return {"type": "http.request", "body": payload, "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/set",
+            "query_string": b"source=worker",
+            "headers": [(b"content-type", b"application/json")],
+        },
+        receive,
+    )
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._coordinator = SimpleNamespace(
+        proxy_cluster_storage_request=AsyncMock(
+            return_value=(b'{"result":true}', 200, "application/json")
+        )
+    )
+
+    response = await server._proxy_cluster_storage_request(request)
+
+    server._coordinator.proxy_cluster_storage_request.assert_awaited_once_with(
+        "POST", "/set", [("source", "worker")], payload, "application/json"
+    )
+    assert response.status_code == 200
+    assert response.body == b'{"result":true}'
 
 
 def test_extract_conversation_id_from_headers():

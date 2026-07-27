@@ -218,9 +218,10 @@ class ConversationHistoryStore:
                                  Union[list[Message],
                                        list[ChatCompletionMessageParam]]] = [],
                              prev_resp_id: Optional[str] = None) -> None:
-        """
-        Store the response and its messages(model output messages) in the conversation store. If the previous response id is provided,
-        the messages will be appended to the conversation. Otherwise, a new conversation will be created.
+        """Store a response and its model-output messages.
+
+        If the previous response ID is provided, the messages are appended to
+        that conversation. Otherwise, a new conversation is created.
 
         Args:
             resp: ResponsesResponse
@@ -330,8 +331,8 @@ class ConversationHistoryStore:
             return []
 
     def _update_visited_conversation(self, conversation_id) -> None:
-        """
-        Update the visited conversation to the front of the conversation store.
+        """Move the visited conversation to the front of the store.
+
         This function is used to keep the conversation store sorted by the visited time.
         And also remove the least recently visited conversation if the number of conversations exceeds the limit.
 
@@ -356,8 +357,8 @@ class ConversationHistoryStore:
             self.conversation_to_response.pop(removed_id)
 
     def _pop_conversation(self, resp_id) -> None:
-        """
-        Pop the oldest conversation messages from a conversation.
+        """Pop the oldest messages from a conversation.
+
         The conversation is starting by a user message and ending by an assistant message.
         This function is used to keep the number of messages in a conversation within the limit.
 
@@ -1375,9 +1376,10 @@ class ResponsesStreamingEventsHelper:
     def _get_output_added_events(
         self, output_item: ResponseOutputMessage | ResponseReasoningItem
     ) -> list[StreamingResponsesResponse]:
-        """
-        Get item added event and content part added event for a message item which is starting
-        to be generated.
+        """Get the added events for a message item.
+
+        Returns the item-added and content-part-added events when generation
+        starts.
 
         Returns:
             list[StreamingResponsesResponse]: A list of streaming responses responses
@@ -1995,6 +1997,36 @@ class ServerArrivalTimeMiddleware:
         await self.app(scope, receive, send)
 
 
+class PeriodicLatencyLogger:
+    """Periodically log latency percentiles for a named coordinator API.
+
+    This lock-free, self-resetting logger runs on one asyncio loop and profiles
+    the in-process owner and HTTP client without per-call log spam.
+    """
+
+    def __init__(self, name: str, window: int = 500):
+        self._name = name
+        self._window = window
+        self._samples: List[float] = []
+        self._n = 0
+
+    def record(self, dt_s: float) -> None:
+        self._samples.append(dt_s * 1000.0)  # ms
+        self._n += 1
+        if self._n % self._window == 0:
+            s = sorted(self._samples)
+            m = len(s)
+
+            def percentile(q):
+                return s[min(int(q * m), m - 1)]
+
+            logger.info(f"[coord_api] {self._name} n={self._n} ms: "
+                        f"mean={sum(s)/m:.2f} p50={percentile(0.5):.2f} "
+                        f"p90={percentile(0.9):.2f} "
+                        f"p99={percentile(0.99):.2f} max={s[-1]:.2f}")
+            self._samples = []
+
+
 class ResponseHooks(ABC):
     """
     Hooks for response processing and (disagg) service perf observability.
@@ -2003,6 +2035,13 @@ class ResponseHooks(ABC):
     @abstractmethod
     def on_req_begin(self, request: UCompletionRequest):
         pass
+
+    def on_ctx_dispatch(self, request: UCompletionRequest):
+        """Record when the disaggregated service starts context placement.
+
+        Arrival to this point measures the pre-context wait in the orchestrator
+        or fleet. The default is a no-op for non-instrumented implementations.
+        """
 
     @abstractmethod
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
