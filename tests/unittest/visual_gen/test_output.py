@@ -785,3 +785,58 @@ def test_media_output_unimportable():
     """``MediaOutput`` is not importable from any path."""
     with pytest.raises(ImportError):
         from tensorrt_llm._torch.visual_gen.output import MediaOutput  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# Single-prompt failure classes reach the caller as distinct exception types
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error_type, expected",
+    [
+        ("client", ValueError),
+        ("capacity", "capacity"),  # resolved below; avoids a module-level import
+        (None, RuntimeError),
+    ],
+    ids=["client", "capacity", "unclassified"],
+)
+def test_single_prompt_failure_raises_by_error_class(error_type, expected):
+    """The worker's failure class survives to the public API.
+
+    ``VisualGenCapacityError`` subclasses ``RuntimeError``, so these assert the
+    *exact* type — otherwise the unclassified case would pass for a capacity
+    failure and the distinction the routes rely on (400 vs 503) would be
+    untested.
+    """
+    from tensorrt_llm._torch.visual_gen.media_decode import VisualGenCapacityError
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
+
+    if expected == "capacity":
+        expected = VisualGenCapacityError
+
+    resp = DiffusionResponse(request_id=20, error_msg="boom", error_type=error_type)
+    fx = _FakeExecutor(resp)
+    try:
+        handle = VisualGenResult(request_id=20, executor=fx, batch_size=None)
+        with pytest.raises(expected) as excinfo:
+            handle.result(timeout=5.0)
+        assert type(excinfo.value) is expected
+        assert "boom" in str(excinfo.value)
+    finally:
+        fx.stop()
+
+
+def test_batch_failure_never_raises_regardless_of_error_class():
+    """Batch handles keep Option B semantics: per-item ``error``, no raise."""
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
+
+    resp = DiffusionResponse(request_id=21, error_msg="boom", error_type="client")
+    fx = _FakeExecutor(resp)
+    try:
+        handle = VisualGenResult(request_id=21, executor=fx, batch_size=2)
+        outs = handle.result(timeout=5.0)
+        assert len(outs) == 2
+        assert all(o.error is not None for o in outs)
+    finally:
+        fx.stop()

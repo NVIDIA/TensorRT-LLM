@@ -51,7 +51,12 @@ class VisualGenResult:
     A single instance backs both single-prompt and batch-prompt requests:
 
     - Single prompt: ``await handle`` resolves to a :class:`VisualGenOutput`.
-      Underlying-request failure raises :class:`RuntimeError`.
+      Underlying-request failure raises by failure class:
+      :class:`ValueError` for client errors (unusable request content — an
+      undecodable media reference, out-of-range conditioning),
+      ``VisualGenCapacityError`` for capacity failures (a valid request that
+      does not fit this deployment), and :class:`RuntimeError` for anything
+      unclassified.
     - Batch prompt: ``await handle`` resolves to ``List[VisualGenOutput]``.
       Per-item or whole-batch failure never raises; failed items carry
       ``error != None`` (Option B semantics).
@@ -90,8 +95,10 @@ class VisualGenResult:
     async def aresult(self, timeout: Optional[float] = None):
         """Wait for the underlying request and return the resolved value.
 
-        For single-prompt requests, returns a :class:`VisualGenOutput`. Raises
-        :class:`RuntimeError` on underlying-request failure.
+        For single-prompt requests, returns a :class:`VisualGenOutput`.
+        Underlying-request failure raises :class:`ValueError` (client),
+        ``VisualGenCapacityError`` (capacity), or :class:`RuntimeError`
+        (unclassified) — see the class docstring.
 
         For batch-prompt requests, returns ``List[VisualGenOutput]``. Never
         raises; failed items carry ``error != None``.
