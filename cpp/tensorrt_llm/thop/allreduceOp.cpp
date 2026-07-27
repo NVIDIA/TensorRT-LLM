@@ -563,19 +563,30 @@ private:
             inputPtr = windowBuffer0.ptr;
         }
 
-        // Use window-backed output buffer
-        auto [normOut, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
-        torch::Tensor outputTensor = windowBuffer1.isValid() ? normOut : torch::empty_like(inputTensor);
-        void* outputPtr = windowBuffer1.isValid() ? windowBuffer1.ptr : outputTensor.data_ptr();
-        if (!windowBuffer1.isValid())
+        // Use a window-backed output buffer under the same threshold gate as the input above.
+        // minRegistrationThreshold is SIZE_MAX without NVLink/MNNVL, where the collective
+        // ncclAllReduce plus cudaStreamSynchronize inside allocateAndRegisterBuffer cannot
+        // complete, so allocating here unconditionally hangs every rank.
+        torch::Tensor outputTensor;
+        if (windowBuffer0.isValid() || bufferSizeBytes >= minRegistrationThreshold)
+        {
+            auto [windowOutput, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
+            if (windowBuffer1.isValid())
+            {
+                outputTensor = windowOutput;
+            }
+        }
+        if (!outputTensor.defined())
         {
             TLLM_LOG_DEBUG(
                 "[runNCCLAllReduceSymmetric] No valid symmetric buffer available; "
                 "using plain CUDA tensor for output");
+            outputTensor = torch::empty_like(inputTensor);
         }
 
         // Perform allreduce
-        NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
+        NCCLCHECK_THROW(
+            ncclAllReduce(inputPtr, outputTensor.data_ptr(), size, (*getDtypeMap())[mType], ncclSum, comm, stream));
 
         if (mOp == AllReduceFusionOp::NONE)
         {
