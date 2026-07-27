@@ -157,7 +157,27 @@ def test_apply_eagle3_fc_with_fc_norm(num_capture_layers):
 # SpecDecOneEngineForCausalLM: optional hidden_size / vocab_size
 # ---------------------------------------------------------------------------
 
-_SUPER_PATH = "tensorrt_llm._torch.models.modeling_utils.DecoderModelForCausalLM.__init__"
+_BASE_CLS = "tensorrt_llm._torch.models.modeling_utils.DecoderModelForCausalLM"
+
+
+def _init_specdec_with_mocked_base(model_config, **kwargs):
+    """Instantiate SpecDecOneEngineForCausalLM with the base class stubbed out.
+
+    DecoderModelForCausalLM is built on the PostInitCaller metaclass, which
+    invokes __post_init__/__pp_init__ right after __init__ returns. Those
+    hooks must be stubbed too: the mocked __init__ never sets the attributes
+    (model_config, lm_head, ...) they rely on.
+
+    Returns the kwargs captured by the mocked base __init__.
+    """
+    with (
+        patch(f"{_BASE_CLS}.__init__", return_value=None) as mock_init,
+        patch(f"{_BASE_CLS}.__post_init__"),
+        patch(f"{_BASE_CLS}.__pp_init__"),
+    ):
+        SpecDecOneEngineForCausalLM(MagicMock(), model_config, **kwargs)
+    _, captured_kwargs = mock_init.call_args
+    return captured_kwargs
 
 
 def test_specdec_one_engine_reads_from_pretrained_config() -> None:
@@ -168,10 +188,7 @@ def test_specdec_one_engine_reads_from_pretrained_config() -> None:
         pretrained_config=PretrainedConfig(hidden_size=hidden_size, vocab_size=vocab_size)
     )
 
-    with patch(_SUPER_PATH, return_value=None) as mock_super:
-        SpecDecOneEngineForCausalLM(MagicMock(), model_config)
-
-    _, kwargs = mock_super.call_args
+    kwargs = _init_specdec_with_mocked_base(model_config)
     assert kwargs["hidden_size"] == hidden_size
     assert kwargs["vocab_size"] == vocab_size
 
@@ -184,12 +201,9 @@ def test_specdec_one_engine_accepts_explicit_sizes() -> None:
     # supplies them instead.
     model_config = ModelConfig(pretrained_config=PretrainedConfig())
 
-    with patch(_SUPER_PATH, return_value=None) as mock_super:
-        SpecDecOneEngineForCausalLM(
-            MagicMock(), model_config, hidden_size=hidden_size, vocab_size=vocab_size
-        )
-
-    _, kwargs = mock_super.call_args
+    kwargs = _init_specdec_with_mocked_base(
+        model_config, hidden_size=hidden_size, vocab_size=vocab_size
+    )
     assert kwargs["hidden_size"] == hidden_size
     assert kwargs["vocab_size"] == vocab_size
 
@@ -202,11 +216,8 @@ def test_specdec_one_engine_explicit_overrides_pretrained_config() -> None:
         pretrained_config=PretrainedConfig(hidden_size=4096, vocab_size=32000)
     )
 
-    with patch(_SUPER_PATH, return_value=None) as mock_super:
-        SpecDecOneEngineForCausalLM(
-            MagicMock(), model_config, hidden_size=hidden_size, vocab_size=vocab_size
-        )
-
-    _, kwargs = mock_super.call_args
+    kwargs = _init_specdec_with_mocked_base(
+        model_config, hidden_size=hidden_size, vocab_size=vocab_size
+    )
     assert kwargs["hidden_size"] == hidden_size
     assert kwargs["vocab_size"] == vocab_size
