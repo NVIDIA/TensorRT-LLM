@@ -733,22 +733,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
 
     @property
-    def model(self):
-        return self.llm.model
-
-    @property
-    def lm_head(self):
-        return self.llm.lm_head
-
-    @property
-    def epilogue(self):
-        return self.llm.epilogue
-
-    @property
-    def spec_worker(self):
-        return self.llm.spec_worker
-
-    @property
     def draft_config(self):
         return self.llm.draft_config
 

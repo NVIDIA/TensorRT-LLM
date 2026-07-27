@@ -774,7 +774,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         torch.testing.assert_close(second, first)
         self.assertEqual(len(model._multimodal_encoder_cache), 1)
 
-    def test_speculative_runtime_contract_is_proxied_to_language_model(self):
+    def test_draft_weight_loading_contract_is_proxied_to_language_model(self):
         model = self._make_model()
 
         self.assertIs(model.model, model.llm.model)
