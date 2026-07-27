@@ -76,6 +76,15 @@ def _case_counts(
         return 0, 0
 
 
+def _fmt_reason(r) -> str:
+    """Render a structured reason dict as one human line: `[source] k=v, ...`."""
+    if not isinstance(r, dict):
+        return str(r)
+    src = r.get("source", "?")
+    rest = ", ".join(f"{k}={v}" for k, v in r.items() if k != "source")
+    return f"[{src}] {rest}" if rest else f"[{src}]"
+
+
 def build_document(
     decision: dict,
     status: str,
@@ -89,7 +98,7 @@ def build_document(
     affected = sorted(decision.get("affected_stages") or [])
     # deferred has no decision; fall back to --reason.
     if not reason:
-        reason = " | ".join(decision.get("reasons") or [])
+        reason = " | ".join(_fmt_reason(r) for r in decision.get("reasons") or [])
 
     case_skip_rate = (1 - cbts_cases / total_cases) if total_cases else 0.0
 

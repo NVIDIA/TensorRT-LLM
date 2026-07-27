@@ -6065,9 +6065,14 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // they only run when explicitly listed in affected_stages.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null) {
-        // Match the -cbts rename cbtsResizeSplits applies to narrowed stages.
+        // cbtsResizeSplits renames only narrowed stages (those in
+        // affected_stage_split_counts) to `-cbts`; affected-but-not-narrowed
+        // stages keep their original name, so match each per its actual key.
         def stageSuffix = cbts.cbts_test_db_artifact_path ? CBTS_STAGE_SUFFIX : ""
-        def affectedSet = (cbts.affected_stages ?: []).collect { it + stageSuffix } as Set
+        def narrowed = (cbts.affected_stage_split_counts ?: [:]).keySet()
+        def affectedSet = (cbts.affected_stages ?: []).collect {
+            (stageSuffix && narrowed.contains(it)) ? (it + stageSuffix) : it
+        } as Set
         def needsSanity = cbts.sanity_required
         def needsPerfSanity = cbts.perfsanity_required
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->
@@ -6088,6 +6093,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                  "(sanity_required=${needsSanity}, perfsanity_required=${needsPerfSanity})"
         } else {
             echo "CBTS [${cbts.scope}]: empty stage set after filtering"
+        }
+        // coverage tier omits multi-GPU; re-add under baseline gate
+        if (cbts.enable_multi_gpu && testFilter[(MULTI_GPU_FILE_CHANGED)]) {
+            parallelJobsFiltered += multiGpuJobs
+            echo "CBTS [${cbts.scope}]: multi-GPU file changed → running ${multiGpuJobs.size()} multi-GPU stage(s) at baseline"
         }
     }
 

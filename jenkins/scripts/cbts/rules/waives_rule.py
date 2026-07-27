@@ -116,4 +116,5 @@ class WaivesRule(Rule):
                 f"waives.txt: +{len(added)} / -{len(removed)} → "
                 f"{len(block_filters)} blocks, {len(affected_stages)} stages{miss_note}"
             ),
+            detail={"added": len(added), "removed": len(removed)},
         )

@@ -45,6 +45,13 @@ diff rather than replaying each commit separately)::
 
     python3 jenkins/scripts/cbts/tools/dryrun.py \\
         --range origin/main...HEAD --out /tmp/cbts_range
+
+Coverage tier (Tier 2) is OFF by default. To include coverage-based selection
+(merged with the rules by `main.py`), download the post-merge touch DB and pass
+`--coverage-db`::
+
+    python3 jenkins/scripts/cbts/tools/dryrun.py \\
+        --window 40 --filter all --coverage-db /path/to/cbts_touchmap.sqlite
 """
 
 from __future__ import annotations
@@ -127,27 +134,27 @@ def _resolve_pr(subject: str, sha: str) -> tuple[str, str]:
 # --- run main.py ------------------------------------------------------------
 
 
-def _run_cbts(payload: dict, test_db: Path, groovy: Path, repo: Path) -> dict:
+def _run_cbts(
+    payload: dict, test_db: Path, groovy: Path, repo: Path, coverage_db: Optional[str] = None
+) -> dict:
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(payload, f)
         path = f.name
+    argv = [
+        sys.executable,
+        str(CBTS_MAIN),
+        path,
+        "--repo-root",
+        str(repo),
+        "--test-db",
+        str(test_db),
+        "--groovy-file",
+        str(groovy),
+    ]
+    if coverage_db:
+        argv += ["--coverage-db", coverage_db]
     try:
-        res = subprocess.run(
-            [
-                sys.executable,
-                str(CBTS_MAIN),
-                path,
-                "--repo-root",
-                str(repo),
-                "--test-db",
-                str(test_db),
-                "--groovy-file",
-                str(groovy),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        res = subprocess.run(argv, capture_output=True, text=True, check=False)
     finally:
         os.unlink(path)
     if res.returncode != 0:
@@ -200,8 +207,18 @@ def _fmt_summary(
         lines.append(f"split sizing ({len(splits)} stages, kept_entries -> shards):")
         for s in sorted(splits):
             lines.append(f"  - {s}: {counts.get(s, '?')} -> {splits[s]}")
+    dropped = result.get("coverage_dropped_stages", [])
+    if dropped:
+        lines.append(f"coverage dropped stages ({len(dropped)}, emptied -> not run):")
+        lines.extend(f"  - {s}" for s in dropped)
     lines.append("reasons:")
-    lines.extend(f"  - {r}" for r in result.get("reasons", []))
+    for r in result.get("reasons", []):
+        if isinstance(r, dict):
+            src = r.get("source", "?")
+            rest = ", ".join(f"{k}={v}" for k, v in r.items() if k != "source")
+            lines.append(f"  - [{src}] {rest}" if rest else f"  - [{src}]")
+        else:
+            lines.append(f"  - {r}")
     return "\n".join(lines) + "\n"
 
 
@@ -260,6 +277,7 @@ def _cbts_for_snapshot(
     diffs: dict[str, str],
     post_merge: bool,
     pr_dir: Path,
+    coverage_db: Optional[str] = None,
 ) -> dict:
     """Run CBTS against the tree at `tip_sha` over `files`/`diffs`.
 
@@ -278,7 +296,7 @@ def _cbts_for_snapshot(
             test_db = wt / TEST_DB_REL
             groovy = wt / GROOVY_REL
             shared_out = wt / "cbts_test_db"
-            result = _run_cbts(payload, test_db, groovy, wt)
+            result = _run_cbts(payload, test_db, groovy, wt, coverage_db)
             if shared_out.exists():
                 for yml in shared_out.glob("*.yml"):
                     shutil.copy2(yml, pr_dir / yml.name)
@@ -292,6 +310,7 @@ def _replay_one(
     sha: str,
     out_dir: Path,
     post_merge: bool,
+    coverage_db: Optional[str] = None,
 ) -> tuple[str, str, list[str], str, dict, bool]:
     subject = _git(repo, "log", "-1", "--pretty=%s", sha).stdout.strip()
     label, pr_url = _resolve_pr(subject, sha)
@@ -299,7 +318,7 @@ def _replay_one(
     tests_only = _is_tests_only(files)
     pr_dir = _prep_pr_dir(out_dir, label)
     diffs = {f: _file_diff(repo, sha, f) for f in files}
-    result = _cbts_for_snapshot(repo, sha, files, diffs, post_merge, pr_dir)
+    result = _cbts_for_snapshot(repo, sha, files, diffs, post_merge, pr_dir, coverage_db)
     (pr_dir / "summary.txt").write_text(
         _fmt_summary(pr_url, sha, subject, files, result, post_merge, tests_only)
     )
@@ -311,6 +330,7 @@ def _replay_range(
     range_expr: str,
     out_dir: Path,
     post_merge: bool,
+    coverage_db: Optional[str] = None,
 ) -> tuple[str, str, list[str], str, dict, bool]:
     """Replay the cumulative diff of a git range as a single CBTS run.
 
@@ -329,7 +349,7 @@ def _replay_range(
     pr_url = f"range {range_expr} (base={base_disp}, tip={tip_sha[:8]})"
     pr_dir = _prep_pr_dir(out_dir, label)
     diffs = {f: _file_diff_range(repo, diff_arg, f) for f in files}
-    result = _cbts_for_snapshot(repo, tip_sha, files, diffs, post_merge, pr_dir)
+    result = _cbts_for_snapshot(repo, tip_sha, files, diffs, post_merge, pr_dir, coverage_db)
     (pr_dir / "summary.txt").write_text(
         _fmt_summary(pr_url, tip_sha, subject, files, result, post_merge, tests_only)
     )
@@ -438,6 +458,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         "ignores --ref/--window/--filter/--sha/--limit",
     )
     ap.add_argument("--post-merge", action="store_true", help="set post_merge=True")
+    ap.add_argument(
+        "--coverage-db",
+        default=None,
+        help="path to cbts_touchmap.sqlite; enables the coverage tier (Tier 2) in main.py",
+    )
     ap.add_argument("--out", default="cbts_dryrun", help="output directory (default: cbts_dryrun)")
     ap.add_argument(
         "--repo-root",
@@ -457,6 +482,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"error: cbts main.py not found at {CBTS_MAIN}", file=sys.stderr)
         return 2
 
+    # Coverage tier is opt-in: it needs the post-merge touch DB, which the user
+    # must download separately. Default replays rules only.
+    if args.coverage_db:
+        print(f"coverage tier ON (merged with rules) via {args.coverage_db}", file=sys.stderr)
+    else:
+        print(
+            "coverage tier OFF (rules only). To include coverage-based selection, download the "
+            "post-merge cbts_pystart_report.tar.gz (.../L0_PostMerge/cbts-coverage/), extract "
+            "cbts_touchmap.sqlite, and pass --coverage-db <path>.",
+            file=sys.stderr,
+        )
+
     # Drop stale worktree metadata from interrupted prior runs so
     # `git worktree add` doesn't trip on dangling entries.
     _git(repo, "worktree", "prune", check=False)
@@ -474,7 +511,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.range_expr:
         print(f"Replaying cumulative range: {args.range_expr}", file=sys.stderr)
         try:
-            row = _replay_range(repo, args.range_expr, out_dir, args.post_merge)
+            row = _replay_range(repo, args.range_expr, out_dir, args.post_merge, args.coverage_db)
         except subprocess.CalledProcessError as e:
             print(f"git error: {e.stderr.strip()}", file=sys.stderr)
             return 1
@@ -502,7 +539,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
         for sha in shas:
             try:
-                row = _replay_one(repo, sha, out_dir, args.post_merge)
+                row = _replay_one(repo, sha, out_dir, args.post_merge, args.coverage_db)
             except subprocess.CalledProcessError as e:
                 print(f"  {sha[:8]}: git error: {e.stderr.strip()}", file=sys.stderr)
                 continue
