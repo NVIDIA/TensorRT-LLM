@@ -488,6 +488,18 @@ class ExternalCommMoEScheduler(MoEScheduler):
             dispatch_kwargs = dict(eplb_dispatch_kwargs)
             if isinstance(moe.comm, DeepEP) and isinstance(moe.backend, TRTLLMGenFusedMoE):
                 dispatch_kwargs["enable_sanitize_expert_ids"] = True
+            if isinstance(moe.comm, DeepEPLowLatency) and moe.backend.__class__ == CuteDslFusedMoE:
+                remove_adapter = moe.backend.enable_deep_ep_remove_adapter
+                if remove_adapter and not moe.backend.has_nvfp4:
+                    raise ValueError("The adapter-free DeepEP CuteDSL path supports only NVFP4")
+                if remove_adapter and not supports_post_quant:
+                    raise ValueError(
+                        "The adapter-free DeepEP CuteDSL path requires post-quant dispatch"
+                    )
+                dispatch_kwargs["use_direct_expert_metadata"] = (
+                    moe.backend.enable_deep_ep_direct_metadata
+                )
+                dispatch_kwargs["remove_adapter"] = remove_adapter
 
             if supports_post_quant:
                 # Quantize -> Dispatch
@@ -776,7 +788,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         Backend-specific kwargs:
             - Cutlass: is_sf_swizzled, enable_alltoall, tuner_*, moe_output, lora_params
-            - CuteDSL: enable_alltoall, moe_output
+            - CuteDSL: enable_alltoall, moe_output, optional DeepEP expert-major metadata
             - DeepGemm: workspace
             - TRTLLMGen: router_logits, do_finalize, moe_output
 
@@ -815,6 +827,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
                 all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
+            if isinstance(moe.comm, DeepEPLowLatency):
+                recv_expert_count, expert_capacity = moe.comm.get_expert_major_dispatch_metadata()
+                kwargs["recv_expert_count"] = recv_expert_count
+                kwargs["deep_ep_expert_capacity"] = expert_capacity
 
         elif moe.backend.__class__ == DeepGemmFusedMoE:
             if workspace is not None:

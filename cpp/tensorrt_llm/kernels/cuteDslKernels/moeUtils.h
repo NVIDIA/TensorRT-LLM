@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,11 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels::cute_dsl
 {
+void moeMetadataFromExpertCounts(int32_t const* expertCounts, int32_t* tileIdxToExpertIdx, int32_t* tileIdxToMnLimit,
+    int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* totalNumPaddedTokens,
+    int32_t* numNonExitingTiles, int32_t numLocalExperts, int32_t capacity, int32_t tileSize, int32_t maxNumTiles,
+    int32_t maxNumPermutedTokens, cudaStream_t stream);
+
 template <typename InputType, typename SFType>
 void moePermute(InputType const* input, InputType* permuted_output, SFType const* input_sf, SFType* permuted_sf,
     int32_t const* tile_idx_to_mn_limit, int32_t const* permuted_idx_to_expanded_idx,
