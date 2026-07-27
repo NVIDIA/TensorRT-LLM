@@ -4,7 +4,19 @@
 import itertools
 import os
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+)
 
 import torch
 import torch.distributed as dist
@@ -98,33 +110,20 @@ class BasePipeline(nn.Module):
         with self._profiler.request_scope():
             return self.infer(req)
 
-    # ------------------------------------------------------------------
-    # Denoise-loop profiling hooks.
-    #
-    # ``BasePipeline.denoise()`` calls these, and so must any pipeline that
-    # writes its own denoise loop (Qwen-Image, LTX-2 stage 2) — otherwise
-    # that loop is silently absent from every trace.
-    # ------------------------------------------------------------------
+    def _profile_denoise_steps(self, timesteps: Iterable[Any]) -> Iterator[Tuple[int, Any]]:
+        """Enumerate a denoise loop's steps within its profiling windows.
 
-    def _close_predenoise_window(self) -> None:
-        """Call just before a denoise loop's first step."""
-        if not self._is_warmup:
-            self._profiler.close_predenoise_window()
+        ``BasePipeline.denoise()`` uses this, and so must any pipeline that
+        writes its own denoise loop (Qwen-Image, LTX-2 stage 2) — otherwise
+        that loop is silently absent from every trace. Substitute it for the
+        loop's ``enumerate()``; it owns every window boundary the loop has::
 
-    def _open_postdenoise_window(self) -> None:
-        """Call just after a denoise loop's last step."""
-        if not self._is_warmup:
-            self._profiler.open_postdenoise_window()
-
-    def _open_step_window(self, step_index: int) -> None:
-        """Call at the top of each denoise step."""
-        if not self._is_warmup:
-            self._profiler.open_step_window(step_index)
-
-    def _close_step_window(self, step_index: int) -> None:
-        """Call at the bottom of each denoise step."""
-        if not self._is_warmup:
-            self._profiler.close_step_window(step_index)
+            for i, t in self._profile_denoise_steps(timesteps):
+                ...
+        """
+        if self._is_warmup:
+            return enumerate(timesteps)
+        return self._profiler.steps(timesteps)
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay.
@@ -1044,13 +1043,7 @@ class BasePipeline(nn.Module):
 
         start_time = time.time()
 
-        # Close the request-level pre-denoise window before the first step.
-        # Numeric ranges start/stop at specific indices.
-        self._close_predenoise_window()
-
-        for i, t in enumerate(timesteps):
-            self._open_step_window(i)
-
+        for i, t in self._profile_denoise_steps(timesteps):
             step_start = time.time()
 
             current_guidance_scale = self._resolve_step_guidance_scale(
@@ -1125,13 +1118,6 @@ class BasePipeline(nn.Module):
                     f"(trans={t_trans:.2f}s cfg={t_cfg:.3f}s sched={t_sched:.3f}s) | "
                     f"Avg={avg_time:.2f}s/step ETA={eta:.1f}s"
                 )
-
-            # Step-level profiler stop
-            self._close_step_window(i)
-
-        # ``postdenoise`` mode: arm the profiler now so the VAE decode and
-        # remaining request work are captured. run_inference() closes it.
-        self._open_postdenoise_window()
 
         if self.rank == 0:
             total_time = time.time() - start_time

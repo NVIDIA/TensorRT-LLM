@@ -225,22 +225,21 @@ def _recording_profiler(
     return profiler, events
 
 
-def _drive_request(profiler: VisualGenProfiler, events: List[str]) -> None:
+def _drive_request(profiler: VisualGenProfiler, events: List[str], num_steps: int = 0) -> None:
     """Replay the boundaries a pipeline hits over one request."""
     with profiler.request_scope():
         events.append("text_encode")
-        profiler.close_predenoise_window()
-        events.append("denoise")
-        profiler.open_postdenoise_window()
+        for i, _ in profiler.steps(range(num_steps)):
+            events.append(f"step{i}")
         events.append("vae_decode")
 
 
 @pytest.mark.parametrize(
     ("profile_range", "expected_events"),
     [
-        ("all", ["start", "text_encode", "denoise", "vae_decode", "stop"]),
-        ("predenoise", ["start", "text_encode", "stop", "denoise", "vae_decode"]),
-        ("postdenoise", ["text_encode", "denoise", "start", "vae_decode", "stop"]),
+        ("all", ["start", "text_encode", "step0", "vae_decode", "stop"]),
+        ("predenoise", ["start", "text_encode", "stop", "step0", "vae_decode"]),
+        ("postdenoise", ["text_encode", "step0", "start", "vae_decode", "stop"]),
     ],
 )
 def test_request_scope_owns_phase_boundaries(
@@ -248,7 +247,7 @@ def test_request_scope_owns_phase_boundaries(
 ) -> None:
     profiler, events = _recording_profiler(monkeypatch, profile_range)
 
-    _drive_request(profiler, events)
+    _drive_request(profiler, events, num_steps=1)
 
     assert events == expected_events
     assert not profiler.active
@@ -261,8 +260,8 @@ def test_request_scope_closes_window_when_inference_raises(
 
     with pytest.raises(RuntimeError, match="boom"):
         with profiler.request_scope():
-            profiler.open_step_window(0)
-            raise RuntimeError("boom")
+            for _ in profiler.steps(range(4)):
+                raise RuntimeError("boom")
 
     assert events == ["start", "stop"]
     assert not profiler.active
@@ -271,21 +270,19 @@ def test_request_scope_closes_window_when_inference_raises(
 def test_single_shot_phases_do_not_rearm(monkeypatch: pytest.MonkeyPatch) -> None:
     profiler, events = _recording_profiler(monkeypatch, "predenoise")
 
-    _drive_request(profiler, events)
+    _drive_request(profiler, events, num_steps=1)
     events.clear()
-    _drive_request(profiler, events)
+    _drive_request(profiler, events, num_steps=1)
 
-    assert events == ["text_encode", "denoise", "vae_decode"]
+    assert events == ["text_encode", "step0", "vae_decode"]
 
 
 def test_step_windows_follow_numeric_ranges(monkeypatch: pytest.MonkeyPatch) -> None:
     profiler, events = _recording_profiler(monkeypatch, "1-2")
 
     with profiler.request_scope():
-        for i in range(4):
-            profiler.open_step_window(i)
+        for i, _ in profiler.steps(range(4)):
             events.append(f"step{i}")
-            profiler.close_step_window(i)
 
     assert events == ["step0", "start", "step1", "step2", "stop", "step3"]
 
@@ -327,8 +324,7 @@ def test_run_inference_skips_profiling_during_warmup(
 
 _VISUAL_GEN_ROOT = Path(tensorrt_llm._torch.visual_gen.__file__).parent
 
-_STEP_HOOKS = {"_open_step_window", "_close_step_window"}
-_PHASE_HOOKS = {"_close_predenoise_window", "_open_postdenoise_window"}
+_PROFILE_STEPS_HOOK = "_profile_denoise_steps"
 
 
 def _self_calls(node: ast.AST) -> set:
@@ -364,13 +360,9 @@ def test_every_denoise_loop_is_instrumented() -> None:
     # base denoise(), Qwen-Image forward(), LTX-2 stage 2 _refinement_denoise()
     assert len(loops) == 3, [(f, n) for f, n, _, _ in loops]
 
-    for filename, fn_name, loop, fn in loops:
-        where = f"{filename}::{fn_name}"
-        assert _STEP_HOOKS <= _self_calls(loop), (
-            f"{where} steps a transformer without the per-step profiler hooks; "
-            "numeric TLLM_PROFILE_VISUAL_GEN_START_STOP ranges would skip it"
-        )
-        assert _PHASE_HOOKS <= _self_calls(fn), (
-            f"{where} is missing the denoise-loop phase hooks; "
-            "predenoise/postdenoise windows would land on the wrong boundary"
+    for filename, fn_name, loop, _ in loops:
+        assert _PROFILE_STEPS_HOOK in _self_calls(loop.iter), (
+            f"{filename}::{fn_name} steps a transformer over a plain iterator; "
+            f"use self.{_PROFILE_STEPS_HOOK}() so the loop appears in "
+            "TLLM_PROFILE_VISUAL_GEN_START_STOP traces"
         )

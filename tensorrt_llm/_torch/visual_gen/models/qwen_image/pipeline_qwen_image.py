@@ -488,9 +488,7 @@ class QwenImagePipeline(BasePipeline):
         logger.info("Denoising (%d steps)...", len(timesteps))
         pipeline_config = getattr(self, "pipeline_config", None)
         cuda_graph_enabled = getattr(getattr(pipeline_config, "cuda_graph", None), "enable", False)
-        self._close_predenoise_window()
-        for i, t in enumerate(timesteps):
-            self._open_step_window(i)
+        for i, t in self._profile_denoise_steps(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
             noise_pred = self.transformer(
                 hidden_states=latents,
@@ -524,9 +522,7 @@ class QwenImagePipeline(BasePipeline):
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)
-            self._close_step_window(i)
 
-        self._open_postdenoise_window()
         timer.mark_post_start()
         logger.info("Decoding...")
         image = self._decode_latents(latents, height, width)

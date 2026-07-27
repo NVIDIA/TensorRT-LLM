@@ -24,7 +24,7 @@ separate invocations.
 
 import os
 from contextlib import contextmanager
-from typing import Iterator, Optional, Tuple, Union
+from typing import Any, Iterable, Iterator, Optional, Tuple, Union
 
 import torch
 
@@ -108,10 +108,10 @@ class VisualGenProfiler:
     * :meth:`request_scope` wraps the whole request. It opens the ``all`` or
       ``predenoise`` window and guarantees every window is closed on the way
       out, including after an exception.
-    * :meth:`close_predenoise_window` runs just before a denoise loop's first
-      step; :meth:`open_postdenoise_window` runs just after its last one.
-    * :meth:`open_step_window` / :meth:`close_step_window` run per denoise
-      step and act only on the indices a numeric range names.
+    * :meth:`steps` wraps one denoise loop's iterator. It closes the
+      ``predenoise`` window before the first step, opens and closes windows
+      on the step indices a numeric range names, and opens the
+      ``postdenoise`` window after the last step.
 
     Callers are responsible for skipping warmup passes. Each closed window
     exports its own trace file, so repeated windows in one process never
@@ -142,7 +142,7 @@ class VisualGenProfiler:
         return self._active
 
     # ------------------------------------------------------------------
-    # Window boundaries
+    # Window boundaries a pipeline drives
     # ------------------------------------------------------------------
 
     @contextmanager
@@ -160,26 +160,31 @@ class VisualGenProfiler:
             # if inference raises before the range's own stop index.
             self.close_window()
 
-    def close_predenoise_window(self) -> None:
-        """Close the pre-denoise window at a denoise loop's first step."""
+    def steps(self, timesteps: Iterable[Any]) -> Iterator[Tuple[int, Any]]:
+        """Enumerate one denoise loop's steps, driving every window it owns.
+
+        Wrapping the iterator rather than exposing separate
+        before-loop/per-step/after-loop hooks means a pipeline cannot
+        instrument half a loop: the phase boundaries ride along with the
+        enumeration a denoise loop already needs.
+        """
         if self.range == "predenoise":
             self.close_window()
 
-    def open_postdenoise_window(self) -> None:
-        """Open the single-shot post-denoise window; request_scope closes it."""
+        starts, stops = self.range if isinstance(self.range, tuple) else (frozenset(), frozenset())
+        for i, t in enumerate(timesteps):
+            if i in starts:
+                self.open_window()
+            yield i, t
+            if i in stops:
+                self.close_window()
+
+        # Reached only when the loop runs to completion. A loop that raised
+        # or broke out early has no post-denoise work worth capturing, and
+        # ``request_scope`` closes whatever window is still open.
         if self._postdenoise_pending:
             self.open_window()
             self._postdenoise_pending = False
-
-    def open_step_window(self, step_index: int) -> None:
-        """Open a window when this denoise step begins a configured range."""
-        if isinstance(self.range, tuple) and step_index in self.range[0]:
-            self.open_window()
-
-    def close_step_window(self, step_index: int) -> None:
-        """Close the window when this denoise step ends a configured range."""
-        if isinstance(self.range, tuple) and step_index in self.range[1]:
-            self.close_window()
 
     # ------------------------------------------------------------------
     # Window primitives
