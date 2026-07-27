@@ -285,7 +285,12 @@ class GvrRegKernel(GvrTpKernel):
 
         npad = cutlass.Int32(logits.shape[1])
         logits_row = logits[row, None]
-        pre_idx_row = pre_idx[row, None]
+        # Hint sharing: pre_idx is request-level ([num_rows // next_n, K]) —
+        # see the tp tier for the in-tree run_one_row parity notes.
+        if cutlass.const_expr(self.next_n == 1):
+            pre_idx_row = pre_idx[row, None]
+        else:
+            pre_idx_row = pre_idx[row // cutlass.Int32(self.next_n), None]
         out_row = out_idx[row, None]
         row_addr = logits_row.iterator.toint()
 
@@ -414,7 +419,25 @@ class GvrRegKernel(GvrTpKernel):
             cbase = cutlass.Int32(0)
             m_gt = cutlass.Int32(-1)
 
-            self.phase1(logits_row, pre_idx_row, n_eff, tidx, s_hist, s_fwred, s_hminmax, s_rungs)
+            # cr==1 hint temporal shift (in-tree pre_idx_offset parity); the
+            # cr>1 branch keeps the exact pre-MTP trace — see the tp tier.
+            if cutlass.const_expr(self.compress_ratio == 1):
+                hint_off = (row % cutlass.Int32(self.next_n)) + cutlass.Int32(1)
+                self.phase1(
+                    logits_row,
+                    pre_idx_row,
+                    n_eff,
+                    tidx,
+                    s_hist,
+                    s_fwred,
+                    s_hminmax,
+                    s_rungs,
+                    hint_off=hint_off,
+                )
+            else:
+                self.phase1(
+                    logits_row, pre_idx_row, n_eff, tidx, s_hist, s_fwred, s_hminmax, s_rungs
+                )
             # Pre-zero the P4 round-0 radix histogram now that P1 is done with
             # hist. The first exchange's cluster barrier (release) publishes it
             # before any CTA reaches the P3 collect that increments it in flight.
@@ -805,18 +828,30 @@ class GvrRegKernel(GvrTpKernel):
 _LAUNCH_CACHE = {}
 
 
-def _get_compiled(K: int, CS: int, TB: int, MAXV: int, AR: int):
-    key = (K, CS, TB, MAXV, AR)
+def _get_compiled(K: int, CS: int, TB: int, MAXV: int, AR: int, next_n: int = 1, cr: int = 4):
+    key = (K, CS, TB, MAXV, AR, next_n, cr)
     compiled = _LAUNCH_CACHE.get(key)
     if compiled is None:
         kC = 8192 if K >= 2048 else 6144
-        kern = GvrRegKernel(top_k=K, kC=kC, cluster_size=CS, ar=AR, maxv=MAXV, num_threads=TB)
+        kern = GvrRegKernel(
+            top_k=K,
+            kC=kC,
+            cluster_size=CS,
+            ar=AR,
+            maxv=MAXV,
+            num_threads=TB,
+            next_n=next_n,
+            compress_ratio=cr,
+        )
         n_rows, n_cols, n_batch = cute.sym_int(), cute.sym_int(), cute.sym_int()
+        # pre_idx is request-level (num_rows // next_n rows); keep the shared
+        # n_rows sym at next_n == 1 (identical compiled artifact to v1).
+        n_pre = n_rows if next_n == 1 else cute.sym_int()
         logits_fake = _crt.make_fake_compact_tensor(
             cutlass.Float32, (n_rows, n_cols), stride_order=(1, 0), assumed_align=16
         )
         pre_idx_fake = _crt.make_fake_compact_tensor(
-            cutlass.Int32, (n_rows, K), stride_order=(1, 0), assumed_align=16
+            cutlass.Int32, (n_pre, K), stride_order=(1, 0), assumed_align=16
         )
         seq_lens_fake = _crt.make_fake_compact_tensor(cutlass.Int32, (n_batch,), stride_order=(0,))
         out_fake = _crt.make_fake_compact_tensor(
@@ -849,15 +884,17 @@ def reg_topk(
     tb: int,
     maxv: int,
     ar: int,
+    next_n: int = 1,
+    cr: int = 4,
 ) -> None:
     """CuTe DSL gvr_topk_reg<cs, tb, maxv, ar>. logits [BS, npad] fp32 (npad
     mult of 64; tail beyond each row's N_eff may be garbage — masked at the
-    register load), pre_idx [BS, K] int32 hint, seq_lens [BS] int32
-    (uncompressed-token space), out [BS, K] int32. Variant params are
-    explicit — the dispatcher selects; compile cache keyed
-    (K, cs, tb, maxv, ar)."""
+    register load), pre_idx [BS // next_n, K] int32 hint (request-level),
+    seq_lens [BS // next_n] int32 (uncompressed-token space), out [BS, K]
+    int32. Variant params are explicit — the dispatcher selects; compile
+    cache keyed (K, cs, tb, maxv, ar, next_n, cr)."""
     npad = logits.shape[1]
-    key = (K, cs, tb, maxv, ar, npad)
+    key = (K, cs, tb, maxv, ar, npad, next_n, cr)
     fn = _FAST.get(key)
     if fn is None:
         assert npad % 64 == 0, f"npad {npad} not a multiple of 64"
@@ -867,6 +904,6 @@ def reg_topk(
         )
         kc = 8192 if K >= 2048 else 6144
         assert npad > kc, f"npad {npad} <= kC {kc}: reg path has no trivial branch"
-        fn = _get_compiled(K, cs, tb, maxv, ar)
+        fn = _get_compiled(K, cs, tb, maxv, ar, next_n, cr)
         _FAST[key] = fn
     fn(logits, pre_idx, seq_lens, out)

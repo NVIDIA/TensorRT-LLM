@@ -7573,17 +7573,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             ``counters`` without ``order_row`` is rejected.
             """
-            # BSX tier fast path (op43 port): fp32 / next_n=1 / cr=4 /
-            # npad <= 262144 decode rows route to the direct/reg/tp CuTe DSL
-            # tiers; everything else (half-prec, LB, sort-indirect, V3.2,
-            # oversize npad, hw cluster cap) falls through to the in-tree
-            # kernel below. Host-only guard — no device sync. The op
-            # signature and output contract are unchanged (unordered int32
-            # indices, -1 pad only for degenerate rows).
+            # BSX tier fast path (op43 port): fp32 / next_n >= 1 (MTP) /
+            # cr in {1, 4} / npad <= 262144 decode rows route to the
+            # direct/reg/tp CuTe DSL tiers; everything else (half-prec, LB,
+            # sort-indirect, oversize npad, hw cluster cap) falls through
+            # to the in-tree kernel below. Host-only guard — no device
+            # sync. The op signature and output contract are unchanged
+            # (unordered int32 indices, -1 pad only for degenerate rows).
             if _is_bsx_supported(logits, pre_idx, seq_lens, output_indices,
                                  top_k, next_n, compress_ratio, order_row,
                                  counters):
-                _bsx_topk(logits, pre_idx, seq_lens, output_indices, top_k)
+                _bsx_topk(logits, pre_idx, seq_lens, output_indices, top_k,
+                          next_n, compress_ratio)
                 return
 
             cute_dtype = _TORCH_TO_CUTLASS_DTYPE[logits.dtype]

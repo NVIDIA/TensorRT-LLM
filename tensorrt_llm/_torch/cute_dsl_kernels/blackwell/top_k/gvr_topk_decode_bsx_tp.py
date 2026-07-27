@@ -270,9 +270,11 @@ class GvrTpKernel:
     """CuTe DSL port of gvr_topk_tp<TB, CS, AR, UF> (fp32, B200/B300).
 
     Ctor knobs mirror the CUDA template params plus the production
-    ``next_n`` / ``compress_ratio`` contract (v1 dispatcher guard pins
-    next_n=1, cr=4; the N_eff arithmetic is kept general to mirror the
-    in-tree ``run_one_row`` formula exactly).
+    ``next_n`` / ``compress_ratio`` contract (compile-time constexpr:
+    N_eff arithmetic, request-level hint-row sharing and the cr==1 hint
+    temporal shift all mirror the in-tree ``run_one_row`` /
+    ``phase1_preidx_stats`` formulas exactly; the next_n==1 / cr==4 hot
+    path traces identically to the v1 port).
     """
 
     WARP_SIZE = 32
@@ -540,7 +542,18 @@ class GvrTpKernel:
     # phase1<TB, AR>: hint gather + stats + rung ladder from hint-value CCDF.
     # ------------------------------------------------------------------
     @cute.jit
-    def phase1(self, logits_row, pre_idx_row, n_eff, tidx, s_hist, s_fwred, s_hminmax, s_rungs):
+    def phase1(
+        self,
+        logits_row,
+        pre_idx_row,
+        n_eff,
+        tidx,
+        s_hist,
+        s_fwred,
+        s_hminmax,
+        s_rungs,
+        hint_off=None,  # cr==1 temporal shift ((row % next_n) + 1); None => 0
+    ):
         TB = cutlass.const_expr(self.num_threads)
         AR = cutlass.const_expr(self.ar)
         NWARP = cutlass.const_expr(self.num_warps)
@@ -565,6 +578,12 @@ class GvrTpKernel:
                 # hint cannot collapse the ladder onto FLT_MAX and force a
                 # pathological one-value-per-pass plateau descent.
                 hidx = pre_idx_row[j]
+                # cr==1 temporal shift, mirroring the in-tree run_one_row
+                # pre_idx_offset ((row % next_n) + 1); shifted-out-of-range
+                # hints fall into the same clamp below. const_expr'd out on
+                # cr>1 builds (hint_off is None => identical trace).
+                if cutlass.const_expr(hint_off is not None):
+                    hidx = hidx + hint_off
                 if hidx < cutlass.Int32(0):
                     hidx = cutlass.Int32(0)
                 if hidx > n_eff - cutlass.Int32(1):
@@ -868,7 +887,13 @@ class GvrTpKernel:
 
         npad = cutlass.Int32(logits.shape[1])
         logits_row = logits[row, None]
-        pre_idx_row = pre_idx[row, None]
+        # Hint sharing: pre_idx is request-level ([num_rows // next_n, K]);
+        # the next_n MTP rows of one request share the same hint row —
+        # mirrors the in-tree run_one_row's pre_idx_row_idx = row // next_n.
+        if cutlass.const_expr(self.next_n == 1):
+            pre_idx_row = pre_idx[row, None]
+        else:
+            pre_idx_row = pre_idx[row // cutlass.Int32(self.next_n), None]
         out_row = out_idx[row, None]
         row_addr = logits_row.iterator.toint()
 
@@ -992,9 +1017,27 @@ class GvrTpKernel:
                 self.collect_at(row_addr, v0, v1, n_eff, thr, tidx, s_cand, s_isc)
                 cute.arch.barrier()
             else:
-                self.phase1(
-                    logits_row, pre_idx_row, n_eff, tidx, s_hist, s_fwred, s_hminmax, s_rungs
-                )
+                # cr==1 hint temporal shift (in-tree pre_idx_offset parity:
+                # (row % next_n) + 1 maps prev-step indices into this step's
+                # KV space); cr>1 keeps the exact pre-MTP trace (no offset
+                # value is even computed).
+                if cutlass.const_expr(self.compress_ratio == 1):
+                    hint_off = (row % cutlass.Int32(self.next_n)) + cutlass.Int32(1)
+                    self.phase1(
+                        logits_row,
+                        pre_idx_row,
+                        n_eff,
+                        tidx,
+                        s_hist,
+                        s_fwred,
+                        s_hminmax,
+                        s_rungs,
+                        hint_off=hint_off,
+                    )
+                else:
+                    self.phase1(
+                        logits_row, pre_idx_row, n_eff, tidx, s_hist, s_fwred, s_hminmax, s_rungs
+                    )
                 hmin_floor = s_rungs[AR - 1]
                 span0 = cute.arch.fmax(s_hminmax[1] - s_hminmax[0], cutlass.Float32(1e-3))
                 # P2a: sampled ladder count -> pivot pick. The exchanged rows
@@ -1547,18 +1590,31 @@ def _p2floor(x: int) -> int:
     return p
 
 
-def _get_compiled(K: int, CS: int, AR: int, UF: int, TB: int):
-    key = (K, CS, AR, UF, TB)
+def _get_compiled(K: int, CS: int, AR: int, UF: int, TB: int, next_n: int = 1, cr: int = 4):
+    key = (K, CS, AR, UF, TB, next_n, cr)
     compiled = _LAUNCH_CACHE.get(key)
     if compiled is None:
         kC = 8192 if K >= 2048 else 6144
-        kern = GvrTpKernel(top_k=K, kC=kC, cluster_size=CS, ar=AR, uf=UF, num_threads=TB)
+        kern = GvrTpKernel(
+            top_k=K,
+            kC=kC,
+            cluster_size=CS,
+            ar=AR,
+            uf=UF,
+            num_threads=TB,
+            next_n=next_n,
+            compress_ratio=cr,
+        )
         n_rows, n_cols, n_batch = cute.sym_int(), cute.sym_int(), cute.sym_int()
+        # pre_idx is request-level: num_rows // next_n rows. At next_n == 1
+        # keep the shared n_rows sym (identical compiled artifact to the v1
+        # port); at next_n > 1 the row counts differ, so use a distinct sym.
+        n_pre = n_rows if next_n == 1 else cute.sym_int()
         logits_fake = _crt.make_fake_compact_tensor(
             cutlass.Float32, (n_rows, n_cols), stride_order=(1, 0), assumed_align=16
         )
         pre_idx_fake = _crt.make_fake_compact_tensor(
-            cutlass.Int32, (n_rows, K), stride_order=(1, 0), assumed_align=16
+            cutlass.Int32, (n_pre, K), stride_order=(1, 0), assumed_align=16
         )
         seq_lens_fake = _crt.make_fake_compact_tensor(cutlass.Int32, (n_batch,), stride_order=(0,))
         out_fake = _crt.make_fake_compact_tensor(
@@ -1594,7 +1650,7 @@ def tp_cluster_size(bs: int, npad: int) -> int:
     return cs
 
 
-def _dispatch(K: int, bs: int, npad: int):
+def _dispatch(K: int, bs: int, npad: int, next_n: int = 1, cr: int = 4):
     """launch_tp<512> selection: CS by co-residency + slice floor, UF by depth."""
     assert npad % 64 == 0
     TB = 512
@@ -1604,21 +1660,27 @@ def _dispatch(K: int, bs: int, npad: int):
         uf = 4
     else:
         uf = 8 if npad >= 16384 else 4
-    return _get_compiled(K, cs, AR, uf, TB)
+    return _get_compiled(K, cs, AR, uf, TB, next_n, cr)
 
 
 def tp_topk(
-    logits: torch.Tensor, pre_idx: torch.Tensor, seq_lens: torch.Tensor, out: torch.Tensor, K: int
+    logits: torch.Tensor,
+    pre_idx: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    K: int,
+    next_n: int = 1,
+    cr: int = 4,
 ) -> None:
     """CuTe DSL gvr_topk_tp. logits [BS, npad] fp32 (npad mult of 64;
     tail beyond each row's N_eff may be garbage — masked in-kernel),
-    pre_idx [BS, K] int32 hint, seq_lens [BS] int32 (uncompressed-token
-    space), out [BS, K] int32. Launch-time CS/UF selection replicates
-    launch_tp<512>."""
+    pre_idx [BS // next_n, K] int32 hint (request-level), seq_lens
+    [BS // next_n] int32 (uncompressed-token space), out [BS, K] int32.
+    Launch-time CS/UF selection replicates launch_tp<512>."""
     sh = logits.shape
-    key = (K, sh[0], sh[1])
+    key = (K, sh[0], sh[1], next_n, cr)
     fn = _FAST.get(key)
     if fn is None:
-        fn = _dispatch(K, sh[0], sh[1])
+        fn = _dispatch(K, sh[0], sh[1], next_n, cr)
         _FAST[key] = fn
     fn(logits, pre_idx, seq_lens, out)

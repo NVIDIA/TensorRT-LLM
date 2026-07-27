@@ -22,14 +22,17 @@ The gvr streaming tier (cs=16 fallback for npad > 262144) is intentionally
 NOT ported: it is unreachable inside the deployment envelope
 (npad <= 262144), which :func:`is_bsx_supported` enforces.
 
-v1 dispatcher guard (anything else falls back to the in-tree
+Dispatcher guard (anything else falls back to the in-tree
 ``GvrTopKKernel`` path in ``CuteDSLGvrTopKDecodeRunner.forward``):
-  dtype == fp32, next_n == 1, compress_ratio == 4, order_row is None,
-  counters is None, K in {512, 1024, 2048}, npad <= 262144, npad % 64 == 0,
-  contiguous 16B-aligned tensors, and the routed tier's cluster size within
-  the queried hardware max (never silently degrade the cluster shape).
-Per-row degeneracy (N_eff <= K) and ragged N are handled INSIDE the tiers,
-so the guard needs no device sync.
+  dtype == fp32, next_n >= 1 (MTP; num_rows divisible by next_n),
+  compress_ratio in {1, 4}, order_row is None, counters is None,
+  K in {512, 1024, 2048}, npad <= 262144, npad % 64 == 0, contiguous
+  16B-aligned tensors, and the routed tier's cluster size within the
+  queried hardware max (never silently degrade the cluster shape).
+pre_idx / seq_lens are request-level ([num_rows // next_n, K] /
+[num_rows // next_n]) — the in-tree contract. Per-row degeneracy
+(N_eff <= K) and ragged N are handled INSIDE the tiers, so the guard
+needs no device sync.
 
 Env knobs (identical semantics to the CUDA arm's ``GVR_BSX_*`` static locals,
 renamed for the production tree; cached at first use like the CUDA static
@@ -147,19 +150,19 @@ def route_cluster_size(bs: int, npad: int, K: int) -> int:
 # on <20us kernels (op43 S-E). The routing decision is pure in (bs, npad, K)
 # [env thresholds are cached at first use, like the CUDA static locals], so
 # bind it once per key to a closure.
-_DISPATCH_CACHE = {}  # (bs, npad, K) -> callable(logits, pre, seq_lens, out)
+_DISPATCH_CACHE = {}  # (bs, npad, K, next_n, cr) -> callable(logits, pre, seq_lens, out)
 
 
-def _bind(bs, npad, K):
+def _bind(bs, npad, K, next_n, cr):
     tier = route(bs, npad, K)
     if tier == "tp":
 
         def fn(lg, pre, sl, out):
-            tp_topk(lg, pre, sl, out, K)
+            tp_topk(lg, pre, sl, out, K, next_n, cr)
     elif tier == "direct":
 
         def fn(lg, pre, sl, out):
-            direct_topk(lg, sl, out, K)
+            direct_topk(lg, sl, out, K, next_n, cr)
     elif tier.startswith("gvr"):
         raise ValueError(
             f"bsx gvr tier is not ported (npad beyond the deployment "
@@ -170,7 +173,7 @@ def _bind(bs, npad, K):
         cs, tb, maxv, ar = _parse_reg(tier)
 
         def fn(lg, pre, sl, out):
-            reg_topk(lg, pre, sl, out, K, cs, tb, maxv, ar)
+            reg_topk(lg, pre, sl, out, K, cs, tb, maxv, ar, next_n, cr)
 
     return fn
 
@@ -186,17 +189,20 @@ def is_bsx_supported(
     order_row,
     counters,
 ) -> bool:
-    """Host-only v1 guard for the bsx tiers (no device sync; see module
+    """Host-only guard for the bsx tiers (no device sync; see module
     docstring). Returns False -> caller uses the in-tree kernel."""
     if logits.dtype != torch.float32:
         return False
-    if next_n != 1 or compress_ratio != 4:
+    if next_n < 1 or compress_ratio not in (1, 4):
         return False
     if order_row is not None or counters is not None:
         return False
     if top_k not in (512, 1024, 2048):
         return False
     bs, npad = logits.shape
+    if bs % next_n != 0:
+        return False
+    n_req = bs // next_n
     if npad > 262144 or npad % 64 != 0:
         return False
     if not (
@@ -206,9 +212,9 @@ def is_bsx_supported(
         and seq_lens.is_contiguous()
     ):
         return False
-    if pre_idx.shape != (bs, top_k) or output_indices.shape != (bs, top_k):
+    if pre_idx.shape != (n_req, top_k) or output_indices.shape != (bs, top_k):
         return False
-    if seq_lens.shape != (bs,) or seq_lens.dtype != torch.int32:
+    if seq_lens.shape != (n_req,) or seq_lens.dtype != torch.int32:
         return False
     if pre_idx.dtype != torch.int32 or output_indices.dtype != torch.int32:
         return False
@@ -231,19 +237,23 @@ def bsx_topk(
     seq_lens: torch.Tensor,
     output_indices: torch.Tensor,
     top_k: int,
+    next_n: int = 1,
+    compress_ratio: int = 4,
 ) -> None:
     """Unified bsx tier dispatch, replicating gvr_topk_launch_batched.
 
-    logits [BS, npad] fp32 (npad multiple of 64; per-row tail beyond N_eff
-    may be garbage — masked in-kernel), pre_idx [BS, K] int32, seq_lens
-    [BS] int32 (request-level, uncompressed-token space), output_indices
-    [BS, K] int32. Caller must have passed :func:`is_bsx_supported`.
+    logits [BS, npad] fp32 (BS = num_requests * next_n; npad multiple of
+    64; per-row tail beyond N_eff may be garbage — masked in-kernel),
+    pre_idx [BS // next_n, K] int32 (request-level), seq_lens
+    [BS // next_n] int32 (request-level, uncompressed-token space),
+    output_indices [BS, K] int32. Caller must have passed
+    :func:`is_bsx_supported`.
     """
     bs, npad = logits.shape
-    key = (bs, npad, top_k)
+    key = (bs, npad, top_k, next_n, compress_ratio)
     fn = _DISPATCH_CACHE.get(key)
     if fn is None:
-        fn = _DISPATCH_CACHE[key] = _bind(bs, npad, top_k)
+        fn = _DISPATCH_CACHE[key] = _bind(bs, npad, top_k, next_n, compress_ratio)
     fn(logits, pre_idx, seq_lens, output_indices)
 
 

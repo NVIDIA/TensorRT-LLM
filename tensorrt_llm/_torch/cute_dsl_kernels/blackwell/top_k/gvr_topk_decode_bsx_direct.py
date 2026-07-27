@@ -67,7 +67,8 @@ class DirectTopKKernel:
 
     Ctor knobs (compile-time): ``top_k`` in {512, 1024, 2048}, ``num_threads``
     (TB, default 1024), ``next_n`` / ``compress_ratio`` for the per-row
-    N_eff arithmetic (v1 dispatcher guard pins next_n=1, cr=4). SMEM layout
+    N_eff arithmetic (constexpr; the direct tier reads no hints, so MTP
+    support is the N_eff formula alone). SMEM layout
     mirrors gvr_bsx.cu's DSmem<TB> with the same packed (key << 32 | idx)
     u64 layout (op43 S-E round 6: split key/idx arrays cost 2x smem
     transactions in collect + emits vs CUDA's single STS.64 / LDS.64 per
@@ -526,13 +527,15 @@ class DirectTopKKernel:
 _COMPILE_CACHE: dict = {}
 
 
-def _get_compiled(top_k: int, num_threads: int = 1024):
-    key = (top_k, num_threads)
+def _get_compiled(top_k: int, num_threads: int = 1024, next_n: int = 1, cr: int = 4):
+    key = (top_k, num_threads, next_n, cr)
     compiled = _COMPILE_CACHE.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
-        kernel = DirectTopKKernel(top_k=top_k, num_threads=num_threads)
+        kernel = DirectTopKKernel(
+            top_k=top_k, num_threads=num_threads, next_n=next_n, compress_ratio=cr
+        )
         n_rows, n_cols, n_batch = cute.sym_int(), cute.sym_int(), cute.sym_int()
         logits_fake = _crt.make_fake_compact_tensor(
             cutlass.Float32, (n_rows, n_cols), stride_order=(1, 0), assumed_align=16
@@ -568,25 +571,32 @@ def _check_contract(logits, seq_lens, out, K):
     assert logits.data_ptr() % 16 == 0 and out.data_ptr() % 16 == 0
 
 
-def direct_topk(logits: torch.Tensor, seq_lens: torch.Tensor, out: torch.Tensor, K: int) -> None:
+def direct_topk(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    K: int,
+    next_n: int = 1,
+    cr: int = 4,
+) -> None:
     """Exact top-K indices of ``logits`` rows into ``out`` (direct path).
 
     logits:   [BS, npad] fp32 contiguous; the tail beyond each row's N_eff
               may be stale garbage (masked in-kernel).
-    seq_lens: [BS] int32, request-level, uncompressed-token space.
+    seq_lens: [BS // next_n] int32, request-level, uncompressed-token space.
     out:      [BS, K] int32 contiguous.
     K:        512 / 1024 / 2048.
 
     Contract checks run once per (shape, K) signature to keep the hot
     launch path at bare tvm-ffi cost.
     """
-    sig = (logits.shape, out.shape, K)
+    sig = (logits.shape, out.shape, K, next_n, cr)
     if sig not in _CHECKED_SIGS:
         _check_contract(logits, seq_lens, out, K)
         _CHECKED_SIGS.add(sig)
-    compiled = _COMPILE_CACHE.get((K, 1024))
+    compiled = _COMPILE_CACHE.get((K, 1024, next_n, cr))
     if compiled is None:
-        compiled = _get_compiled(K)
+        compiled = _get_compiled(K, next_n=next_n, cr=cr)
     compiled(logits, seq_lens, out)
 
 
