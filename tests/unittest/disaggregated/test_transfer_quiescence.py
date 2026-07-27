@@ -34,6 +34,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
     TransferWorker,
     TxSession,
+    WriteMeta,
     _ControlPlane,
     _decode_protocol_capabilities,
     _encode_protocol_capabilities,
@@ -247,6 +248,7 @@ def _make_tx_session(task_status: TaskStatus = TaskStatus.INIT) -> tuple[TxSessi
     session._sender = _Sender()
     session._aux_buffer = None
     session.aux_slot = None
+    session.transfer_start_time = None
     session._base_args = SimpleNamespace(
         params=SimpleNamespace(disagg_request_id=11, ctx_request_id=None),
         prompt_len=None,
@@ -265,6 +267,9 @@ def _make_rx_session(task_status: TaskStatus = TaskStatus.INIT) -> tuple[RxSessi
     session._close_requested = False
     session._terminal_status = None
     session._exception = None
+    session.transfer_start_time = None
+    session.transfer_end_time = None
+    session.kv_cache_size_bytes = 0
     session._kv_tasks = [task]
     session._need_aux = False
     session._outstanding_operations = 0
@@ -510,10 +515,12 @@ def test_rx_wrong_v2_result_identity_fails_closed_without_retiring_credit(
         0,
         True,
         AgentResult.SUCCESS,
+        transfer_size=4096,
         sender_endpoint=sender_endpoint,
         request_epoch=request_epoch,
     )
 
+    assert session.kv_cache_size_bytes == 0
     assert session._outstanding_operations == 1
     assert task.status == TaskStatus.TRANSFERRING
     assert session.status == SessionStatus.ERROR
@@ -537,12 +544,15 @@ def test_rx_exact_v2_result_retires_once_and_duplicate_is_idempotent() -> None:
             0,
             True,
             AgentResult.SUCCESS,
+            transfer_size=4096,
             sender_endpoint="tcp://sender",
             request_epoch=session.request_epoch,
         )
 
+    assert session.kv_cache_size_bytes == 4096
     assert session._outstanding_operations == 0
     assert task.status == TaskStatus.TRANSFERRED
+    assert session.transfer_end_time is not None
     assert session._retired_operation_keys == {("kv", 0, 0)}
 
 
@@ -1122,6 +1132,166 @@ def test_sender_shutdown_gate_rejects_enqueue_after_worker_sentinels() -> None:
 
     with pytest.raises(RuntimeError, match="shutting down"):
         sender._enqueue(write_meta)
+
+
+class _FailingTerminalDealer:
+    def send(self, _message) -> None:
+        raise RuntimeError("injected direct terminal-send failure")
+
+
+class _DurableTerminalControl:
+    def __init__(self, mode: str):
+        self.mode = mode
+        self.callback = None
+
+    def send(self, _endpoint, _message, *, on_sent, **_kwargs) -> None:
+        if self.mode == "reject":
+            raise RuntimeError("injected durable-queue rejection")
+        if self.mode == "inline":
+            on_sent()
+        else:
+            self.callback = on_sent
+
+
+def _make_enqueue_failure_sender(
+    durable_mode: str,
+) -> tuple[Sender, TxSession, list[WriteMeta], _DurableTerminalControl, list[WriteMeta]]:
+    sender = object.__new__(Sender)
+    sender._instance_rank = 0
+    sender._messenger = SimpleNamespace(endpoint="tcp://sender")
+    sender._stalled_operations_lock = threading.Lock()
+    sender._stalled_operations = []
+    sender._stalled_session_owners = []
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda _name, rank: SimpleNamespace(
+            self_endpoint=f"tcp://receiver-{rank}"
+        )
+    )
+    sender._get_or_connect_thread_dealer = lambda _endpoint: _FailingTerminalDealer()
+    control = _DurableTerminalControl(durable_mode)
+    sender._control = control
+
+    task = object.__new__(KVSendTask)
+    task.status = TaskStatus.INIT
+    task._event = threading.Event()
+    task._exception = None
+    task._unique_rid = 11
+    task._perf_timer = None
+    owner, _ = _make_tx_session()
+    owner.kv_tasks = []
+    owner._outstanding_operations = 1
+    metas = [
+        WriteMeta(
+            task=task,
+            expected_transfers=1,
+            peer_name=f"receiver{rank}",
+            peer_rank=rank,
+            peer_endpoint=f"tcp://receiver-{rank}",
+            unique_rid=11,
+            src_ptrs=np.array([], dtype=np.int64),
+            dst_ptrs=np.array([], dtype=np.int64),
+            sizes=np.array([], dtype=np.int64),
+            slice_id=0,
+        )
+        for rank in range(2)
+    ]
+    sender._build_kv_write_meta = lambda _task, info: metas[info.instance_rank]
+    queued = []
+
+    def enqueue(write_meta) -> None:
+        if write_meta.peer_rank == 0:
+            raise RuntimeError("injected enqueue failure")
+        queued.append(write_meta)
+
+    sender._enqueue = enqueue
+    infos = {
+        rank: SimpleNamespace(
+            instance_name="receiver",
+            instance_rank=rank,
+            request_epoch=100 + rank,
+        )
+        for rank in range(2)
+    }
+    sender.dispatch_task(task, infos, operation_owner=owner)
+    return sender, owner, metas, control, queued
+
+
+def test_sender_enqueue_failure_inline_terminal_callback_retires_exactly_once() -> None:
+    sender, owner, metas, _control, queued = _make_enqueue_failure_sender("inline")
+
+    assert metas[0].terminal_sent
+    assert metas[0].operation_retired
+    assert owner._outstanding_operations == 1
+    assert sender._stalled_operations == []
+    assert queued == [metas[1]]
+
+
+def test_sender_enqueue_failure_delayed_terminal_callback_removes_stalled_owner() -> None:
+    sender, owner, metas, control, queued = _make_enqueue_failure_sender("delayed")
+
+    assert not metas[0].terminal_sent
+    assert not metas[0].operation_retired
+    assert owner._outstanding_operations == 2
+    assert sender._stalled_operations == [metas[0]]
+    assert queued == [metas[1]]
+
+    assert control.callback is not None
+    control.callback()
+
+    assert metas[0].terminal_sent
+    assert metas[0].operation_retired
+    assert owner._outstanding_operations == 1
+    assert sender._stalled_operations == []
+
+
+def test_sender_stalled_operation_membership_uses_identity_for_nonempty_slices() -> None:
+    sender = object.__new__(Sender)
+    sender._instance_rank = 0
+    sender._messenger = SimpleNamespace(endpoint="tcp://sender")
+    sender._stalled_operations_lock = threading.Lock()
+    sender._get_or_connect_thread_dealer = lambda _endpoint: _FailingTerminalDealer()
+    control = _DurableTerminalControl("delayed")
+    sender._control = control
+
+    owner, _ = _make_tx_session()
+    owner._outstanding_operations = 1
+    task = object()
+    metas = [
+        WriteMeta(
+            task=task,
+            expected_transfers=1,
+            peer_name="receiver0",
+            peer_rank=0,
+            peer_endpoint="tcp://receiver-0",
+            unique_rid=11,
+            src_ptrs=np.array([100, 101], dtype=np.int64),
+            dst_ptrs=np.array([200, 201], dtype=np.int64),
+            sizes=np.array([4096, 4096], dtype=np.int64),
+            slice_id=slice_id,
+            operation_owner=owner if slice_id == 1 else None,
+        )
+        for slice_id in range(2)
+    ]
+    sender._stalled_operations = list(metas)
+
+    sender._send_write_result(metas[1], AgentResult.FAILED)
+    assert control.callback is not None
+    control.callback()
+
+    assert len(sender._stalled_operations) == 1
+    assert sender._stalled_operations[0] is metas[0]
+    assert owner._outstanding_operations == 0
+
+
+def test_sender_enqueue_failure_retains_owner_when_durable_queue_rejects() -> None:
+    sender, owner, metas, _control, queued = _make_enqueue_failure_sender("reject")
+
+    assert not metas[0].terminal_sent
+    assert not metas[0].terminal_queued
+    assert not metas[0].operation_retired
+    assert owner._outstanding_operations == 2
+    assert sender._stalled_operations == [metas[0]]
+    assert queued == [metas[1]]
 
 
 def test_sender_metadata_failure_retains_owner_if_notification_cannot_queue() -> None:

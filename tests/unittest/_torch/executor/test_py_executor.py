@@ -33,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
     ScheduledRequests,
     SerializableSchedulerOutput,
+    create_waiting_queue,
 )
 from tensorrt_llm.bindings.executor import FinishReason, RequestType
 from tensorrt_llm.llmapi import DisaggScheduleStyle
@@ -961,8 +962,8 @@ class TestGenerationFirstPreActiveRequests:
         assert list(queue) == [item]
 
     def test_pre_active_extraction_does_not_consume_compute_capacity(self):
-        executor = self._executor(max_num_active_requests=1)
-        executor.active_requests = [self._request(99)]
+        executor = self._executor(max_num_active_requests=3)
+        executor.active_requests = [self._request(request_id) for request_id in (97, 98, 99)]
         queue = FCFSWaitingQueue()
         items = [
             RequestQueueItem(id=request_id, request=self._request(request_id))
@@ -972,7 +973,88 @@ class TestGenerationFirstPreActiveRequests:
 
         assert PyExecutor._take_pre_active_context_items(executor, queue) == items
         assert list(queue) == []
-        assert executor.active_requests[0].request_id == 99
+        assert [request.request_id for request in executor.active_requests] == [97, 98, 99]
+
+    def test_pre_active_metadata_admission_is_bounded_and_leaves_backlog(self):
+        executor = self._executor((10,), max_num_active_requests=2)
+        executor.kv_cache_transceiver.is_context_request_ready_for_activation.return_value = False
+        queue = FCFSWaitingQueue()
+        items = [
+            RequestQueueItem(id=request_id, request=self._request(request_id))
+            for request_id in (1, 2, 3)
+        ]
+        queue.add_requests(items)
+
+        admitted = PyExecutor._take_pre_active_context_items(executor, queue)
+
+        assert admitted == [items[0]]
+        assert list(queue) == items[1:]
+
+        # Model the subsequent materialization while readiness remains absent.
+        executor._gen_first_pre_active_requests[1] = admitted[0].request
+        executor._gen_first_pre_active_order[1] = 1
+        assert PyExecutor._select_ready_pre_active_context_request_ids(executor) == []
+        assert PyExecutor._take_pre_active_context_items(executor, queue) == []
+        assert list(queue) == items[1:]
+
+    @pytest.mark.parametrize(
+        "waiting_queue_policy",
+        [WaitingQueuePolicy.FCFS, WaitingQueuePolicy.PRIORITY],
+    )
+    def test_full_fetch_defers_pre_active_overflow_without_blocking_ordinary_requests(
+        self,
+        monkeypatch,
+        waiting_queue_policy,
+    ):
+        executor = self._executor(
+            (10,),
+            max_num_active_requests=2,
+            waiting_queue_policy=waiting_queue_policy,
+        )
+        executor.enable_attention_dp = False
+        executor.enable_iter_perf_stats = False
+        executor.is_benchmark_disagg = False
+        executor.num_fetch_requests = 0
+        executor.dist = SimpleNamespace(cp_config={}, cp_rank=0, cp_size=1)
+        executor.should_exclude_last_generation_logits = False
+        executor._fetch_and_enqueue_requests = Mock()
+        queue = create_waiting_queue(waiting_queue_policy)
+
+        priorities = {1: 9.0, 2: 8.0, 3: 7.0, 4: 6.0, 5: 5.0}
+        requests = {
+            request_id: self._request(
+                request_id,
+                priority=priorities[request_id],
+            )
+            for request_id in priorities
+        }
+        for request_id in (3, 5):
+            requests[
+                request_id
+            ].py_disaggregated_params.schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+        items = {
+            request_id: RequestQueueItem(
+                id=request_id,
+                request=requests[request_id],
+            )
+            for request_id in priorities
+        }
+        queue.add_requests(items.values())
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
+            lambda requests, **_kwargs: requests,
+        )
+
+        new_requests, pre_active_items = PyExecutor._fetch_new_requests(
+            executor,
+            queue,
+            active_requests=[],
+        )
+
+        assert [item.id for item in pre_active_items] == [1]
+        assert [item.id for item in new_requests] == [3, 5]
+        assert [item.id for item in queue] == [2, 4]
+        assert executor.num_fetch_requests == 3
 
     def test_rank_local_capacity_cannot_diverge_pre_active_cohort(self):
         executors = [
