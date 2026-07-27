@@ -31,8 +31,6 @@
 #include <mutex>
 #include <thread>
 
-using tensorrt_llm::common::op::OpCustomHash;
-
 TRTLLM_NAMESPACE_BEGIN
 #if ENABLE_MULTI_DEVICE
 
@@ -230,7 +228,7 @@ public:
     PerCudaCtxPerThreadSingletonCreator(CreatorFunc creator, DeleterFunc deleter)
         : mCreator{std::move(creator)}
         , mDeleter{std::move(deleter)}
-        , mObservers{std::make_unique<CacheTy>()}
+        , mObservers{std::make_unique<CacheType>()}
     {
     }
 
@@ -299,8 +297,8 @@ private:
     mutable std::mutex mMutex;
     // CUDA resources are per-context and per-thread.
     using CacheKey = std::tuple<CUcontext, std::thread::id>;
-    using CacheTy = std::unordered_map<CacheKey, std::weak_ptr<T>, OpCustomHash<CacheKey>>;
-    std::unique_ptr<CacheTy> mObservers;
+    using CacheType = std::unordered_map<CacheKey, std::weak_ptr<T>, common::op::OpCustomHash<CacheKey>>;
+    std::unique_ptr<CacheType> mObservers;
 };
 
 // Structure to hold memory information
