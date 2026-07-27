@@ -3225,28 +3225,39 @@ class PyExecutor:
             # 1. Resolve runtime draft length from schedule
             runtime_draft_len = get_draft_len_for_batch_size(
                 self.model_engine.spec_config.draft_len_schedule,
-                scheduled_batch.batch_size, self.model_engine.max_draft_len)
+                scheduled_batch.batch_size, self.model_engine.max_draft_len,
+                self.model_engine.spec_config.min_runtime_draft_len)
             # 2. Pad or truncate draft tokens to the resolved length
             DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
             rejection_on = getattr(self.model_engine.spec_config,
                                    "use_rejection_sampling", False)
             for request in scheduled_batch.generation_requests:
                 current_num_draft_tokens = len(request.py_draft_tokens)
-                # One-model rejection: a gen request entering with 0 real draft
-                # tokens produced no draft-prob scatter for its slot last iter,
-                # so next iter's rejection kernel would read a stale draft_probs
-                # row. Mark it (pre-pad signal) so _prepare_tp_inputs writes a
-                # one-hot placeholder row after spec_metadata.prepare().
-                request.py_needs_onehot_draft_probs = (
-                    rejection_on and current_num_draft_tokens == 0)
                 if spec_dec_mode.is_pard():
-                    # special case: PARD carries 2K-1 draft tokens per request
+                    # PARD carries 2K-1 draft tokens per request, so its
+                    # logical draft length is not the buffer length.
+                    current_runtime_draft_len = (
+                        (current_num_draft_tokens + 1) //
+                        2 if current_num_draft_tokens > 0 else 0)
+                else:
+                    current_runtime_draft_len = current_num_draft_tokens
+                # One-model rejection: the draft sampler only scattered
+                # draft_probs rows [0, current_runtime_draft_len) for this slot
+                # last iteration, so every row the padding below adds is stale
+                # (or uninitialized) and next iteration's rejection kernel would
+                # read it. Record where the stale suffix starts (pre-pad signal)
+                # so _prepare_tp_inputs can one-hot it after
+                # spec_metadata.prepare(). Both a re-enable from the shortest
+                # draft length and any upward schedule transition land here.
+                onehot_start = min(current_runtime_draft_len, runtime_draft_len)
+                request.py_needs_onehot_draft_probs = (rejection_on
+                                                       and onehot_start
+                                                       < runtime_draft_len)
+                request.py_onehot_draft_probs_start = onehot_start
+                if spec_dec_mode.is_pard():
                     runtime_draft_token_buffer_width = (
                         self.model_engine.spec_config.
                         get_runtime_tokens_per_gen_step(runtime_draft_len) - 1)
-                    current_runtime_draft_len = (
-                        current_num_draft_tokens +
-                        1) // 2 if current_num_draft_tokens > 0 else 0
                     real_draft_tokens = request.py_draft_tokens[:min(
                         current_runtime_draft_len, runtime_draft_len)]
                     real_draft_tokens.extend(

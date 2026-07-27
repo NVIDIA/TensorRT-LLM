@@ -577,6 +577,31 @@ def update_spec_config_from_model_config(spec_config, model_config):
     if not spec_config.use_dynamic_tree:
         spec_config.max_total_draft_tokens = spec_config.max_draft_len
 
+    # max_concurrency is only translated into a schedule for modes that support
+    # dynamic draft length, so check it separately: a config that already reads
+    # as vanilla MTP (use_mtp_vanilla) never gets a schedule to begin with.
+    from_max_concurrency = (
+        getattr(spec_config, "max_concurrency", None) is not None
+        or getattr(spec_config, "_translated_from_max_concurrency", False))
+    # Vanilla MTP builds one MTP module per draft token, each owning its own
+    # KV-cache layer, and the draft loop only runs mtp_layers[:runtime_draft_len].
+    # Shortening the draft length therefore leaves the trailing modules' KV
+    # allocated but unwritten, and they attend to those rows once the draft
+    # length rises again. The mode opts out of dynamic draft length for that
+    # reason (SpeculativeDecodingMode.support_dynamic_draft_len); say so here,
+    # because the knob is only known to be inert once the checkpoint has
+    # resolved this as vanilla MTP.
+    if (is_vanilla and spec_config.max_draft_len > 1 and
+        (spec_config.draft_len_schedule is not None or from_max_concurrency)):
+        knob = "max_concurrency" if from_max_concurrency else "draft_len_schedule"
+        logger.warning(
+            f"MTP: {knob} is ignored for vanilla MTP with "
+            f"{spec_config.max_draft_len} MTP modules. Reducing the draft "
+            "length below the module count would leave the unused modules' KV "
+            "cache stale and silently degrade the acceptance rate, so "
+            f"speculation stays at max_draft_len={spec_config.max_draft_len}. "
+            "Use MTP-Eagle if you need dynamic draft lengths.")
+
 
 def update_spec_config_from_loaded_model(spec_config, model) -> None:
     """Populate spec config fields from loaded target and draft model configs."""
@@ -603,7 +628,9 @@ class SpecDecodingTensor:
 
 
 def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
-                                 batch_size: int, max_draft_len: int) -> int:
+                                 batch_size: int,
+                                 max_draft_len: int,
+                                 min_draft_len: int = 0) -> int:
     """
     Get the appropriate draft length for the given batch size using binary search.
 
@@ -615,13 +642,18 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
 
     Args:
         draft_len_schedule: Mapping from batch size thresholds to draft lengths.
-                            Example: {4: 4, 8: 2, 32: 1} means:
+                            Example: {4: 4, 8: 2, 32: 1} with min_draft_len=1:
                             - batch size 1-4:   use draft_len=4 (up to key 4)
                             - batch size 5-8:   use draft_len=2 (up to key 8)
                             - batch size 9-32:  use draft_len=1 (up to key 32)
-                            - batch size 33+:   use draft_len=0 (speculation disabled, implicit)
+                            - batch size 33+:   use draft_len=1 (min_draft_len, implicit)
         batch_size: Current batch size.
         max_draft_len: Maximum draft length to use if no schedule is provided.
+        min_draft_len: Floor applied to every scheduled draft length, including the
+                       implicit one above the largest key. Drafting has to keep
+                       running for algorithms whose drafter carries cross-iteration
+                       state, otherwise that state goes stale while the target keeps
+                       committing tokens. See DecodingBaseConfig.min_runtime_draft_len.
 
     Returns:
         The draft length to use for this batch size.
@@ -638,7 +670,8 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
     idx = bisect_left(schedule_batch_sizes, batch_size)
 
     if idx < len(schedule_batch_sizes):
-        return draft_len_schedule[schedule_batch_sizes[idx]]
+        return max(draft_len_schedule[schedule_batch_sizes[idx]], min_draft_len)
 
-    # batch_size > all batch sizes in draft_len_schedule: speculation disabled (implicit)
-    return 0
+    # batch_size > all batch sizes in draft_len_schedule: speculation drops to the
+    # shortest draft length this algorithm can sustain (implicit).
+    return min_draft_len

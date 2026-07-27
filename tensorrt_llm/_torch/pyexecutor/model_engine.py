@@ -10,6 +10,7 @@ import math
 import os
 import weakref
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -1665,12 +1666,18 @@ class PyTorchModelEngine(ModelEngine):
         """Compute graph_bs → draft_len mapping for dynamic draft length feature.
 
         Example: draft_len_schedule = {4:4, 8:2, 32:1}, cuda_graph_batch_sizes = [1,2,3,4,5,6,7,8,16,24,32,64]
+        with min_runtime_draft_len = 1:
         - Batch sizes 1-4:   use draft_len=4 (up to key 4)
         - Batch sizes 5-8:   use draft_len=2 (up to key 8)
         - Batch sizes 9-32:  use draft_len=1 (up to key 32)
-        - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled)
+        - Batch sizes 33+:   use draft_len=1 (min_runtime_draft_len, implicit)
 
-        Returns: {1:4, 2:4, 3:4, 4:4, 5:2, 6:2, 7:2, 8:2, 16:1, 24:1, 32:1, 64:0}
+        Returns: {1:4, 2:4, 3:4, 4:4, 5:2, 6:2, 7:2, 8:2, 16:1, 24:1, 32:1, 64:1}
+
+        The floor applied here must match the one applied when the runtime draft
+        length is resolved (PyExecutor._handle_dynamic_draft_len); graph lookup is
+        an exact (batch_size, draft_len) match, so a mismatch silently drops those
+        batches to eager execution.
         """
         # Dynamic draft length for CUDA graphs is only supported for one-model path
         if (not self.spec_config or not self.spec_config.draft_len_schedule or
@@ -1679,6 +1686,7 @@ class PyTorchModelEngine(ModelEngine):
 
         schedule = self.spec_config.draft_len_schedule
         schedule_keys = list(schedule.keys())
+        min_draft_len = self.spec_config.min_runtime_draft_len
 
         mapping = {}
         key_idx = 0
@@ -1687,9 +1695,9 @@ class PyTorchModelEngine(ModelEngine):
                     schedule_keys) and schedule_keys[key_idx] < graph_bs:
                 key_idx += 1
             if key_idx < len(schedule_keys):
-                draft_len = schedule[schedule_keys[key_idx]]
+                draft_len = max(schedule[schedule_keys[key_idx]], min_draft_len)
             else:
-                draft_len = 0
+                draft_len = min_draft_len
             mapping[graph_bs] = draft_len
         return mapping
 
@@ -3870,10 +3878,11 @@ class PyTorchModelEngine(ModelEngine):
         draft_tokens = []
         draft_lens = []
         gen_request_seq_slots = []  # per generation request
-        # One-model rejection: slots of gen requests that produced 0 real draft
-        # tokens this step (marked in _handle_dynamic_draft_len); their stale
-        # draft_probs rows are one-hot'd after spec_metadata.prepare().
-        padding_gen_slots = []
+        # One-model rejection: slots of gen requests whose draft_probs rows were
+        # only partly written this step (marked in _handle_dynamic_draft_len),
+        # keyed by the row the stale suffix starts at; those rows are one-hot'd
+        # after spec_metadata.prepare().
+        padding_gen_slots = defaultdict(list)
         multimodal_params_list = []
         mrope_position_ids = [
         ]  # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
@@ -4125,7 +4134,8 @@ class PyTorchModelEngine(ModelEngine):
         for request in extend_requests:
             if getattr(request, "py_needs_onehot_draft_probs", False):
                 if request.py_seq_slot is not None:
-                    padding_gen_slots.append(request.py_seq_slot)
+                    start = getattr(request, "py_onehot_draft_probs_start", 0)
+                    padding_gen_slots[start].append(request.py_seq_slot)
                 request.py_needs_onehot_draft_probs = False  # consume once
             request_ids.append(request.py_request_id)
             request_accepted_path[
@@ -4876,10 +4886,12 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests.all_requests())
             spec_metadata.prepare()
             # One-model rejection: one-hot the stale draft_probs rows of gen
-            # requests that produced no draft tokens this step, so the (possibly
-            # captured) rejection kernel reads a legal placeholder distribution.
-            spec_metadata.write_padding_onehot_draft_probs(
-                padding_gen_slots, self.runtime_draft_len)
+            # requests that produced fewer draft tokens than the runtime draft
+            # length this step, so the (possibly captured) rejection kernel reads
+            # a legal placeholder distribution.
+            for start, slots in padding_gen_slots.items():
+                spec_metadata.write_padding_onehot_draft_probs(
+                    slots, self.runtime_draft_len, start)
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:

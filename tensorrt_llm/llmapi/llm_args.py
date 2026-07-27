@@ -1712,9 +1712,13 @@ class DecodingBaseConfig(StrictBaseModel):
     max_concurrency: Optional[PositiveInt] = Field(
         default=None,
         description=
-        "When specified (>0), speculation will be disabled at batch sizes above this value. Otherwise, "
-        "speculation will always be on. PyTorch backend only. "
-        "Mutually exclusive with max_concurrency since draft_len_schedule implicitly supports max concurrency control."
+        "When specified (>0), speculation is reduced to the shortest draft length the algorithm can "
+        "sustain at batch sizes above this value. Otherwise, speculation will always be on. "
+        "For one-model speculation that shortest length is 1 rather than 0: the drafter carries "
+        "cross-iteration state (draft KV cache, hidden-state pools) that goes stale if drafting stops "
+        "while the target keeps committing tokens. To turn speculation off for good, use "
+        "acceptance_rate_window_size together with acceptance_rate_threshold. PyTorch backend only. "
+        "Mutually exclusive with draft_len_schedule since draft_len_schedule implicitly supports max concurrency control."
     )
 
     draft_len_schedule: Optional[dict[int, int]] = Field(
@@ -1726,7 +1730,9 @@ class DecodingBaseConfig(StrictBaseModel):
         " - Batch sizes 1-4:   use draft_len=4"
         " - Batch sizes 5-8:   use draft_len=2"
         " - Batch sizes 9-32:  use draft_len=1"
-        " - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). "
+        " - Batch sizes 33+:   use draft_len=1 (implicit, the shortest sustainable draft length). "
+        "Scheduled draft lengths are floored at min_runtime_draft_len, so speculation is never fully "
+        "disabled mid-flight; see max_concurrency for how to turn it off permanently. "
         "Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control."
     )
 
@@ -1896,6 +1902,24 @@ class DecodingBaseConfig(StrictBaseModel):
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.from_string(
             self.decoding_type.upper())
+
+    @property
+    def min_runtime_draft_len(self) -> int:
+        """Smallest runtime draft length that keeps the drafter's state coherent.
+
+        One-engine speculation carries cross-iteration drafter state (draft KV
+        cache, hidden-state pools, per-request context buffers) that is only
+        written while drafting runs. Letting a ``draft_len_schedule`` drive the
+        runtime draft length to 0 stops those writes while the target keeps
+        committing tokens, so the drafter later attends to positions that were
+        allocated but never written and its acceptance rate silently collapses.
+        Resolved draft lengths are therefore floored at this value.
+
+        Returns 0 for algorithms that carry no such state, which is also the
+        value an algorithm reports once it can refresh its state without
+        producing draft tokens.
+        """
+        return 1 if self.spec_dec_mode.use_one_engine() else 0
 
     @functools.cached_property
     def is_linear_tree(self) -> bool:
