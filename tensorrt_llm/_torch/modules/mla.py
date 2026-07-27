@@ -67,10 +67,12 @@ from .multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
-# Import FlashMLA sparse attention kernel
+# Import FlashMLA sparse attention kernels.
 try:
+    import tensorrt_llm.flash_mla_cpp_tllm as flash_mla_cuda
     from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
 except ImportError:
+    flash_mla_cuda = None
     flash_mla_sparse_fwd = None
 
 
@@ -1037,6 +1039,8 @@ class MLA(nn.Module):
             return False
         if not self.is_deepseek_v4:
             return False
+        if get_sm_version() < 100:
+            return False
         if self.qk_head_dim != 512 or self.kv_lora_rank != 448:
             return False
         if num_generations > 0:
@@ -1829,6 +1833,7 @@ class MLA(nn.Module):
         # to disable. Bias and quantization are not handled.
         _use_q_b_cute = (
             self.has_dsv4_indexer
+            and get_sm_version() >= 100
             and os.environ.get("TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "1") == "1"
             and self.q_b_proj.bias is None
             and self.q_b_proj.weight.dtype == torch.bfloat16
@@ -2124,11 +2129,18 @@ class MLA(nn.Module):
                 enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
                 dsv4_epilogue_output=dsv4_epilogue_output,
             )
-        else:
-            assert not self.is_deepseek_v4, "DeepSeek-V4 is not supported on pre-blackwell GPUs."
-            return self.forward_sparse_mla_kvcache_bf16(
-                q, latent_cache, attn_metadata, output, topk_indices, is_generation=False
+        if self.is_deepseek_v4:
+            return self.forward_sparse_mla_deepseek_v4_bf16(
+                q,
+                latent_cache,
+                attn_metadata,
+                output,
+                topk_indices,
+                is_generation=False,
             )
+        return self.forward_sparse_mla_kvcache_bf16(
+            q, latent_cache, attn_metadata, output, topk_indices, is_generation=False
+        )
 
     def forward_generation_sparse_mla(
         self,
@@ -2156,11 +2168,22 @@ class MLA(nn.Module):
                 enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
                 dsv4_epilogue_output=dsv4_epilogue_output,
             )
-        else:
-            assert not self.is_deepseek_v4, "DeepSeek-V4 is not supported on pre-blackwell GPUs."
-            return self.forward_sparse_mla_kvcache_bf16(
-                q, latent_cache, attn_metadata, output, topk_indices, is_generation=True
+        if self.is_deepseek_v4:
+            if flash_mla_cuda is not None and topk_indices is not None:
+                return self.forward_sparse_decode_deepseek_v4_fp8(
+                    q, latent_cache, attn_metadata, output, topk_indices
+                )
+            return self.forward_sparse_mla_deepseek_v4_bf16(
+                q,
+                latent_cache,
+                attn_metadata,
+                output,
+                topk_indices,
+                is_generation=True,
             )
+        return self.forward_sparse_mla_kvcache_bf16(
+            q, latent_cache, attn_metadata, output, topk_indices, is_generation=True
+        )
 
     def forward_context_with_cached_kv(
         self,
@@ -2905,6 +2928,631 @@ class MLA(nn.Module):
 
         return output
 
+    def _prepare_deepseek_v4_hopper_q_and_cache(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        attn_metadata: TrtllmAttentionMetadata,
+        *,
+        is_generation: bool,
+    ) -> None:
+        """Apply RoPE and update the DeepSeek-V4 paged cache on Hopper."""
+        trtllm_attention = cast(TrtllmAttention, self.mqa)
+        if not is_generation:
+            if getattr(attn_metadata, "max_ctx_seq_len", 0) > 0:
+                with nvtx_range_debug("mla_rope_append_paged_kv_assign_q_deepseek_v4_hopper"):
+                    trtllm_attention.mla_rope_append_paged_kv_assign_q(
+                        q, latent_cache, attn_metadata, is_generation=False
+                    )
+            return
+
+        num_tokens = q.shape[0]
+        q_view = q.view(-1, self.num_heads_tp, self.qk_head_dim)
+        q_pe = q_view[..., self.qk_nope_head_dim :]
+        num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
+        cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
+        cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
+        fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=q.device)
+
+        mla_bmm1_scale = None
+        mla_bmm2_scale = None
+        quant_q_buffer = None
+        if getattr(trtllm_attention, "has_fp8_kv_cache", False):
+            mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=q.device)
+            mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=q.device)
+            quant_q_buffer = torch.empty(
+                num_tokens,
+                self.num_heads_tp,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                dtype=torch.uint8,
+                device=q.device,
+            )
+
+        with nvtx_range_debug("mla_rope_generation_deepseek_v4_hopper"):
+            trtllm_attention.mla_rope_generation(
+                q,
+                q_pe,
+                latent_cache,
+                attn_metadata,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                fmha_scheduler_counter,
+                mla_bmm1_scale,
+                mla_bmm2_scale,
+                quant_q_buffer,
+            )
+
+    def _deepseek_v4_hopper_pool_indices(
+        self,
+        attn_metadata: TrtllmAttentionMetadata,
+        topk_indices: Optional[torch.Tensor],
+        *,
+        is_generation: bool,
+    ) -> tuple[torch.Tensor, int, int]:
+        """Convert DeepSeek-V4 local dual-pool indices to pool-relative indices."""
+        from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+            DEEPSEEK_V4_SPARSE_RATIO,
+            DeepseekV4AttentionType,
+            get_token_bytes,
+        )
+        from ..attention_backend.sparse.kernel import deepseek_v4_local_to_global_indices
+
+        trtllm_attention = self.mqa
+        compress_ratio = trtllm_attention.compress_ratio
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        window_size = attn_metadata.window_size
+        start_idx = attn_metadata.num_ctx_tokens if is_generation else 0
+        end_idx = attn_metadata.num_tokens if is_generation else attn_metadata.num_ctx_tokens
+
+        req_id = attn_metadata.req_idx_per_token[start_idx:end_idx]
+        swa_local_indices = attn_metadata.swa_local_indices_cuda[start_idx:end_idx]
+        local_layer_idx = kv_cache_manager.layer_offsets[self.layer_idx]
+        block_table_swa = attn_metadata.sliding_block_tables[
+            local_layer_idx, DeepseekV4AttentionType.SWA.value
+        ]
+        swa_buffer_ptr = attn_metadata.swa_buffer_ptrs[self.layer_idx]
+
+        block_table_compressed = None
+        compressed_local_indices = None
+        compressed_buffer_ptr = 0
+        if compress_ratio > 1:
+            compressed_buffer_ptr = attn_metadata.compressed_buffer_ptrs[self.layer_idx]
+            block_table_compressed = attn_metadata.compress_block_tables[compress_ratio]
+            if compress_ratio == DEEPSEEK_V4_SPARSE_RATIO:
+                if topk_indices is None:
+                    raise ValueError("DeepSeek-V4 ratio-4 attention requires top-k indices")
+                compressed_local_indices = topk_indices
+            else:
+                compressed_local_indices = attn_metadata.compressed_local_indices_cuda[
+                    start_idx:end_idx
+                ]
+
+        # Both pool base pointers intentionally equal their layer-view pointers.
+        # This makes the converted indices pool-relative, so the same indices
+        # address a dequantized BF16 view or its MODEL1 FP8 shadow.
+        token_stride = get_token_bytes(
+            kv_cache_manager.head_dim,
+            attn_metadata.indexer_head_dim,
+            compress_ratio,
+            DeepseekV4AttentionType.SWA,
+            False,
+        )
+        global_indices = deepseek_v4_local_to_global_indices(
+            req_id=req_id,
+            block_table_swa=block_table_swa,
+            swa_local_indices=swa_local_indices,
+            swa_pool_base_ptr=swa_buffer_ptr,
+            swa_buffer_ptr=swa_buffer_ptr,
+            tokens_per_block=kv_cache_manager.tokens_per_block,
+            token_stride=token_stride,
+            block_table_compressed=block_table_compressed,
+            compressed_local_indices=compressed_local_indices,
+            compress_pool_base_ptr=compressed_buffer_ptr,
+            compressed_buffer_ptr=compressed_buffer_ptr,
+            compress_ratio=compress_ratio,
+            num_compressed_indices=attn_metadata.max_compressed_indices[compress_ratio],
+        )
+        return global_indices, compress_ratio, window_size
+
+    @staticmethod
+    def _pad_sparse_indices(indices: torch.Tensor, alignment: int) -> torch.Tensor:
+        aligned_topk = ((indices.shape[-1] + alignment - 1) // alignment) * alignment
+        if aligned_topk == indices.shape[-1]:
+            return indices
+        padding = indices.new_full((*indices.shape[:-1], aligned_topk - indices.shape[-1]), -1)
+        return torch.cat([indices, padding], dim=-1)
+
+    def _deepseek_v4_attention_sink(self, padded_heads: int) -> Optional[torch.Tensor]:
+        attn_sink = getattr(self.mqa, "attn_sink", None)
+        if attn_sink is None:
+            return None
+        sink = attn_sink.data
+        if sink.shape[0] == padded_heads:
+            return sink
+        if sink.shape[0] > padded_heads:
+            raise ValueError(
+                f"DeepSeek-V4 attention sink has {sink.shape[0]} heads, "
+                f"but the Hopper path has {padded_heads}"
+            )
+        return torch.cat([sink, sink.new_zeros(padded_heads - sink.shape[0])])
+
+    @staticmethod
+    def _prepare_deepseek_v4_hopper_bf16_pool(
+        pool: torch.Tensor,
+        indices: torch.Tensor,
+        head_dim: int,
+        kv_scale: torch.Tensor | float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dequantize only the FP8 cache entries selected by sparse attention."""
+        pool_flat = pool.reshape(-1, 1, head_dim)
+        if pool.dtype == torch.bfloat16:
+            return pool_flat, indices
+
+        valid = indices >= 0
+        safe_indices = indices.clamp_min(0).to(torch.long)
+        selected_pool = pool_flat.view(torch.float8_e4m3fn)[safe_indices.reshape(-1)].to(
+            torch.bfloat16
+        )
+        selected_pool *= kv_scale
+
+        selected_indices = torch.arange(
+            indices.numel(), dtype=torch.int32, device=indices.device
+        ).view_as(indices)
+        selected_indices.masked_fill_(~valid, -1)
+        return selected_pool, selected_indices
+
+    @staticmethod
+    def _merge_deepseek_v4_hopper_pools(
+        pool_outputs: list[torch.Tensor],
+        pool_lses: list[torch.Tensor],
+        attention_sink: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Merge independently normalized pools and apply one global sink."""
+        if len(pool_outputs) != len(pool_lses) or not pool_outputs:
+            raise ValueError("DeepSeek-V4 Hopper attention requires matching non-empty pools")
+
+        finite_pool_lses = [
+            torch.where(torch.isfinite(pool_lse), pool_lse, -torch.inf) for pool_lse in pool_lses
+        ]
+        max_lse = torch.stack(finite_pool_lses).amax(dim=0)
+        pool_weights = [torch.exp(pool_lse - max_lse) for pool_lse in finite_pool_lses]
+        denominator = torch.stack(pool_weights).sum(dim=0)
+        output = sum(
+            torch.where(
+                torch.isfinite(pool_lse).unsqueeze(-1),
+                pool_output,
+                torch.zeros_like(pool_output),
+            )
+            * pool_weight.unsqueeze(-1)
+            for pool_output, pool_lse, pool_weight in zip(pool_outputs, pool_lses, pool_weights)
+        ) / denominator.unsqueeze(-1)
+
+        if attention_sink is not None:
+            merged_lse = max_lse + torch.log(denominator)
+            output *= torch.sigmoid(merged_lse - attention_sink.unsqueeze(0)).unsqueeze(-1)
+        return output
+
+    @nvtx_range("forward_sparse_mla_deepseek_v4_bf16")
+    def forward_sparse_mla_deepseek_v4_bf16(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        attn_metadata: TrtllmAttentionMetadata,
+        output: torch.Tensor,
+        topk_indices: Optional[torch.Tensor],
+        is_generation: bool = False,
+    ) -> torch.Tensor:
+        """Run DeepSeek-V4 dual-pool sparse MLA on Hopper using BF16 prefill kernels."""
+        from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+            DeepseekV4AttentionType,
+            DeepseekV4TrtllmAttentionMetadata,
+        )
+
+        if not isinstance(attn_metadata, DeepseekV4TrtllmAttentionMetadata):
+            raise TypeError(
+                "DeepSeek-V4 Hopper attention requires DeepseekV4TrtllmAttentionMetadata"
+            )
+        if not is_generation:
+            self._fp8_shadow_needs_bulk = True
+
+        self._prepare_deepseek_v4_hopper_q_and_cache(
+            q, latent_cache, attn_metadata, is_generation=is_generation
+        )
+
+        num_tokens = q.shape[0]
+        q_concat = q.view(num_tokens, self.num_heads_tp, self.qk_head_dim)
+        padded_heads = ((self.num_heads_tp + 63) // 64) * 64
+        if self.num_heads_tp != padded_heads:
+            logger.warning_once(
+                f"Padding num_heads from {self.num_heads_tp} to {padded_heads} "
+                "for the Hopper FlashMLA sparse attention kernel",
+                key="deepseek_v4_sparse_mla_hopper_padding",
+            )
+            q_padded = q_concat.new_zeros((num_tokens, padded_heads, self.qk_head_dim))
+            q_padded[:, : self.num_heads_tp] = q_concat
+            q_concat = q_padded
+
+        global_indices, compress_ratio, window_size = self._deepseek_v4_hopper_pool_indices(
+            attn_metadata, topk_indices, is_generation=is_generation
+        )
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        head_dim = kv_cache_manager.head_dim
+        kv_scale = getattr(self.mqa, "kv_scale_quant_orig", 1.0)
+
+        swa_pool = kv_cache_manager.get_buffers(self.layer_idx, DeepseekV4AttentionType.SWA)
+        swa_pool_flat, swa_indices = self._prepare_deepseek_v4_hopper_bf16_pool(
+            swa_pool, global_indices[:, :window_size], head_dim, kv_scale
+        )
+        swa_indices = self._pad_sparse_indices(swa_indices, alignment=128).view(num_tokens, 1, -1)
+
+        if flash_mla_sparse_fwd is None:
+            raise RuntimeError(
+                "flash_mla_sparse_fwd is unavailable; build TensorRT-LLM with FlashMLA"
+            )
+        swa_out, _, swa_lse = flash_mla_sparse_fwd(
+            q_concat,
+            swa_pool_flat,
+            swa_indices,
+            self.softmax_scale,
+            d_v=self.v_head_dim,
+        )
+
+        pool_outputs = [swa_out]
+        pool_lses = [swa_lse]
+        if compress_ratio > 1:
+            compressed_pool = kv_cache_manager.get_buffers(
+                self.layer_idx, DeepseekV4AttentionType.COMPRESS
+            )
+            compressed_pool_flat, compressed_indices = self._prepare_deepseek_v4_hopper_bf16_pool(
+                compressed_pool,
+                global_indices[:, window_size:],
+                head_dim,
+                kv_scale,
+            )
+            compressed_indices = self._pad_sparse_indices(compressed_indices, alignment=128).view(
+                num_tokens, 1, -1
+            )
+            compressed_out, _, compressed_lse = flash_mla_sparse_fwd(
+                q_concat,
+                compressed_pool_flat,
+                compressed_indices,
+                self.softmax_scale,
+                d_v=self.v_head_dim,
+            )
+            pool_outputs.append(compressed_out)
+            pool_lses.append(compressed_lse)
+
+        with nvtx_range_debug("merge_deepseek_v4_hopper_attention_pools"):
+            attn_out = self._merge_deepseek_v4_hopper_pools(
+                pool_outputs,
+                pool_lses,
+                self._deepseek_v4_attention_sink(padded_heads),
+            )
+
+        attn_out = attn_out[:, : self.num_heads_tp, : self.v_head_dim]
+        if self.num_heads_tp != padded_heads:
+            attn_out = attn_out.contiguous()
+        output.copy_(attn_out.reshape(num_tokens, -1))
+        return output
+
+    @nvtx_range("forward_sparse_decode_deepseek_v4_fp8")
+    def forward_sparse_decode_deepseek_v4_fp8(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        attn_metadata: TrtllmAttentionMetadata,
+        output: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run DeepSeek-V4 Hopper decode with FlashMLA's MODEL1 FP8 kernel."""
+        from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+            DeepseekV4AttentionType,
+            DeepseekV4TrtllmAttentionMetadata,
+        )
+
+        if not isinstance(attn_metadata, DeepseekV4TrtllmAttentionMetadata):
+            raise TypeError("DeepSeek-V4 Hopper decode requires DeepseekV4TrtllmAttentionMetadata")
+        if self.num_heads_tp not in (64, 128):
+            raise ValueError(
+                "FlashMLA Hopper sparse decode supports 64 or 128 query heads, "
+                f"got {self.num_heads_tp}"
+            )
+
+        self._prepare_deepseek_v4_hopper_q_and_cache(
+            q, latent_cache, attn_metadata, is_generation=True
+        )
+
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        swa_pool = kv_cache_manager.get_buffers(self.layer_idx, DeepseekV4AttentionType.SWA)
+        swa_fp8 = self._ensure_deepseek_v4_fp8_shadow_current(
+            swa_pool, attn_metadata, DeepseekV4AttentionType.SWA, compress_ratio=1
+        )
+
+        global_indices, compress_ratio, window_size = self._deepseek_v4_hopper_pool_indices(
+            attn_metadata, topk_indices, is_generation=True
+        )
+        swa_indices = self._pad_sparse_indices(
+            global_indices[:, :window_size].unsqueeze(1), alignment=64
+        )
+
+        compressed_fp8 = None
+        compressed_indices = None
+        if compress_ratio > 1:
+            compressed_pool = kv_cache_manager.get_buffers(
+                self.layer_idx, DeepseekV4AttentionType.COMPRESS
+            )
+            compressed_fp8 = self._ensure_deepseek_v4_fp8_shadow_current(
+                compressed_pool,
+                attn_metadata,
+                DeepseekV4AttentionType.COMPRESS,
+                compress_ratio,
+            )
+            compressed_indices = self._pad_sparse_indices(
+                global_indices[:, window_size:].unsqueeze(1), alignment=64
+            )
+
+        self._fp8_shadow_needs_bulk = False
+        num_generation_tokens = q.shape[0]
+        q_decode = q.view(num_generation_tokens, 1, self.num_heads_tp, self.qk_head_dim)
+        attention_sink = self._deepseek_v4_attention_sink(self.num_heads_tp)
+
+        if flash_mla_cuda is None:
+            raise RuntimeError(
+                "FlashMLA sparse decode is unavailable; "
+                "build TensorRT-LLM with the upgraded FlashMLA"
+            )
+        with nvtx_range_debug("flash_mla_sparse_decode_deepseek_v4_hopper"):
+            if compressed_fp8 is not None:
+                decode_out, _, _, _ = flash_mla_cuda.sparse_decode_fwd(
+                    q_decode,
+                    compressed_fp8,
+                    compressed_indices,
+                    None,
+                    attention_sink,
+                    None,
+                    None,
+                    swa_fp8,
+                    swa_indices,
+                    None,
+                    self.v_head_dim,
+                    self.softmax_scale,
+                )
+            else:
+                decode_out, _, _, _ = flash_mla_cuda.sparse_decode_fwd(
+                    q_decode,
+                    swa_fp8,
+                    swa_indices,
+                    None,
+                    attention_sink,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    self.v_head_dim,
+                    self.softmax_scale,
+                )
+
+        output.copy_(
+            decode_out.squeeze(1)[:, : self.num_heads_tp, : self.v_head_dim].reshape(
+                num_generation_tokens, -1
+            )
+        )
+        return output
+
+    def _ensure_deepseek_v4_fp8_shadow_current(
+        self,
+        pool_raw: torch.Tensor,
+        attn_metadata: TrtllmAttentionMetadata,
+        attn_type,
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        """Update a persistent MODEL1 FP8 shadow of a DeepSeek-V4 paged pool."""
+        from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import DeepseekV4AttentionType
+
+        pool = pool_raw
+        is_fp8_pool = pool.dtype != torch.bfloat16
+        kv_scale = getattr(self.mqa, "kv_scale_quant_orig", 1.0)
+
+        num_blocks, tokens_per_block, head_dim = pool.shape
+        nope_dim = 448
+        rope_dim = 64
+        quant_block = 64
+        num_scales = nope_dim // quant_block
+        data_bytes = nope_dim + rope_dim * 2
+        bytes_per_token = data_bytes + 8
+        device = pool.device
+        if head_dim != nope_dim + rope_dim:
+            raise ValueError(
+                f"DeepSeek-V4 MODEL1 expects head_dim={nope_dim + rope_dim}, got {head_dim}"
+            )
+
+        local_layer_idx = attn_metadata.kv_cache_manager.layer_offsets[self.layer_idx]
+        if attn_type == DeepseekV4AttentionType.SWA:
+            block_table = attn_metadata.sliding_block_tables[
+                local_layer_idx, DeepseekV4AttentionType.SWA.value
+            ]
+        elif attn_type == DeepseekV4AttentionType.COMPRESS:
+            block_table = attn_metadata.compress_block_tables[compress_ratio]
+        else:
+            raise ValueError(f"Unsupported DeepSeek-V4 FP8 shadow type: {attn_type}")
+
+        kv_lens = attn_metadata.kv_lens_cuda_runtime
+        num_requests = kv_lens.shape[0]
+        max_blocks_per_sequence = block_table.shape[1]
+        self._ensure_deepseek_v4_shadow_state(
+            attn_type,
+            num_blocks,
+            tokens_per_block,
+            bytes_per_token,
+            device,
+        )
+
+        if getattr(self, "_fp8_shadow_needs_bulk", False):
+            for block_fill in self._fp8_block_fill_gpu.values():
+                block_fill.zero_()
+            self._fp8_shadow_needs_bulk = False
+
+        shadow = self._fp8_shadows[attn_type]
+        block_fill_gpu = self._fp8_block_fill_gpu[attn_type]
+        if num_requests == 0 or max_blocks_per_sequence == 0:
+            return shadow[:num_blocks].reshape(num_blocks, tokens_per_block, 1, bytes_per_token)
+
+        with nvtx_range_debug("deepseek_v4_fp8_shadow_update"):
+            effective_kv_lens = (
+                kv_lens // compress_ratio
+                if attn_type == DeepseekV4AttentionType.COMPRESS and compress_ratio > 1
+                else kv_lens
+            )
+            request_grid, block_grid, token_grid = self._get_fp8_shadow_update_grid(
+                num_requests, max_blocks_per_sequence, tokens_per_block, device
+            )
+            kv_len_per_slot = effective_kv_lens.to(torch.long)[request_grid]
+            token_position = block_grid * tokens_per_block + token_grid
+            physical_block = block_table.to(torch.long)[request_grid, block_grid]
+
+            physical_valid = (physical_block >= 0) & (physical_block < num_blocks)
+            physical_safe = torch.where(
+                physical_valid, physical_block, torch.zeros_like(physical_block)
+            )
+            current_fill = block_fill_gpu[physical_safe].to(torch.long)
+            valid = (
+                (token_position < kv_len_per_slot)
+                & (kv_len_per_slot > 0)
+                & physical_valid
+                & (token_grid >= current_fill)
+            )
+
+            scatter_block = torch.where(
+                valid,
+                physical_safe,
+                torch.full_like(physical_safe, num_blocks),
+            )
+            gather_block = torch.where(
+                physical_valid, physical_safe, torch.zeros_like(physical_safe)
+            )
+            token_data = pool[gather_block, token_grid]
+            if is_fp8_pool:
+                token_bf16 = (
+                    token_data.view(torch.float8_e4m3fn).to(torch.bfloat16) * kv_scale
+                ).to(torch.bfloat16)
+            else:
+                token_bf16 = token_data
+
+            num_slots = token_bf16.shape[0]
+            nope = token_bf16[:, :nope_dim].float()
+            rope = token_bf16[:, nope_dim:]
+            nope_blocked = nope.reshape(num_slots, num_scales, quant_block)
+            block_max = nope_blocked.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+            scale_log2 = torch.log2((block_max / 448.0).clamp(min=1e-4)).ceil()
+            scale = torch.exp2(scale_log2)
+            nope_fp8 = (nope_blocked / scale).reshape(num_slots, nope_dim).to(torch.float8_e4m3fn)
+
+            scale_e8m0 = (scale_log2.squeeze(-1) + 127).clamp(0, 255).byte()
+            scale_padding = self._get_fp8_scale_padding(num_slots, device)
+            scale_padding.zero_()
+            scale_padding[:, :num_scales] = scale_e8m0
+
+            nope_bytes = nope_fp8.view(torch.uint8).reshape(num_slots, nope_dim)
+            rope_bytes = rope.contiguous().view(torch.uint8).reshape(num_slots, rope_dim * 2)
+            row_stride = tokens_per_block * bytes_per_token
+            row_base = scatter_block * row_stride
+            shadow_flat = shadow.view(-1)
+
+            data_start = row_base + token_grid * data_bytes
+            nope_indices = (
+                data_start.unsqueeze(1)
+                + self._get_fp8_shadow_offsets(nope_dim, device).unsqueeze(0)
+            ).reshape(-1)
+            shadow_flat[nope_indices] = nope_bytes.reshape(-1)
+
+            rope_start = data_start + nope_dim
+            rope_indices = (
+                rope_start.unsqueeze(1)
+                + self._get_fp8_shadow_offsets(rope_dim * 2, device).unsqueeze(0)
+            ).reshape(-1)
+            shadow_flat[rope_indices] = rope_bytes.reshape(-1)
+
+            scale_start = row_base + tokens_per_block * data_bytes + token_grid * 8
+            scale_indices = (
+                scale_start.unsqueeze(1) + self._get_fp8_shadow_offsets(8, device).unsqueeze(0)
+            ).reshape(-1)
+            shadow_flat[scale_indices] = scale_padding.reshape(-1)
+
+            update_value = torch.where(valid, token_grid + 1, torch.zeros_like(token_grid))
+            block_fill_gpu.scatter_reduce_(
+                0,
+                physical_safe,
+                update_value.to(block_fill_gpu.dtype),
+                reduce="amax",
+                include_self=True,
+            )
+
+        return shadow[:num_blocks].reshape(num_blocks, tokens_per_block, 1, bytes_per_token)
+
+    def _ensure_deepseek_v4_shadow_state(
+        self,
+        shadow_key,
+        num_blocks: int,
+        tokens_per_block: int,
+        bytes_per_token: int,
+        device: torch.device,
+    ) -> None:
+        if not hasattr(self, "_fp8_shadows"):
+            self._fp8_shadows = {}
+            self._fp8_block_fill_gpu = {}
+            self._fp8_update_grids = {}
+            self._fp8_offsets_cache = {}
+            self._fp8_scale_pad_buf = torch.zeros(1, 8, dtype=torch.uint8, device=device)
+
+        required_rows = num_blocks + 1
+        shadow = self._fp8_shadows.get(shadow_key)
+        if shadow is None or shadow.shape[0] != required_rows:
+            self._fp8_shadows[shadow_key] = torch.zeros(
+                required_rows,
+                tokens_per_block * bytes_per_token,
+                dtype=torch.uint8,
+                device=device,
+            )
+
+        block_fill = self._fp8_block_fill_gpu.get(shadow_key)
+        if block_fill is None or block_fill.shape[0] != num_blocks:
+            self._fp8_block_fill_gpu[shadow_key] = torch.zeros(
+                num_blocks, dtype=torch.int32, device=device
+            )
+
+    def _get_fp8_shadow_update_grid(
+        self,
+        num_requests: int,
+        max_blocks: int,
+        tokens_per_block: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = (num_requests, max_blocks, tokens_per_block)
+        cached = self._fp8_update_grids.get(key)
+        if cached is not None:
+            return cached
+        total_slots = num_requests * max_blocks * tokens_per_block
+        all_slots = torch.arange(total_slots, device=device, dtype=torch.long)
+        token_grid = all_slots % tokens_per_block
+        block_grid = (all_slots // tokens_per_block) % max_blocks
+        request_grid = all_slots // (max_blocks * tokens_per_block)
+        grids = (request_grid, block_grid, token_grid)
+        self._fp8_update_grids[key] = grids
+        return grids
+
+    def _get_fp8_shadow_offsets(self, size: int, device: torch.device) -> torch.Tensor:
+        cached = self._fp8_offsets_cache.get(size)
+        if cached is None:
+            cached = torch.arange(size, device=device, dtype=torch.long)
+            self._fp8_offsets_cache[size] = cached
+        return cached
+
+    def _get_fp8_scale_padding(self, num_slots: int, device: torch.device) -> torch.Tensor:
+        if self._fp8_scale_pad_buf.shape[0] < num_slots:
+            self._fp8_scale_pad_buf = torch.zeros(num_slots, 8, dtype=torch.uint8, device=device)
+        return self._fp8_scale_pad_buf[:num_slots]
+
     @nvtx_range("forward_sparse_mla_kvcache_bf16")
     def forward_sparse_mla_kvcache_bf16(
         self,
@@ -3066,7 +3714,13 @@ class MLA(nn.Module):
         )
 
         dsv4_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None
-        if self.register_to_config:
+        use_custom_op = self.register_to_config
+        if use_custom_op and self.is_deepseek_v4 and get_sm_version() < 100:
+            # The Hopper FP8 path maintains persistent shadow-cache tensors
+            # that are not explicit custom-op arguments. Keep the path in
+            # Python so CUDA graph capture can track those mutations.
+            use_custom_op = not getattr(self.mqa, "has_fp8_kv_cache", False)
+        if use_custom_op:
             if self.is_deepseek_v4:
                 outputs = torch.ops.trtllm.create_mla_outputs(hidden_states, self.layer_idx_str)
                 attn_output = outputs[0]
