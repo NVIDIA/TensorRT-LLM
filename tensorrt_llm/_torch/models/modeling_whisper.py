@@ -39,7 +39,7 @@ Key differences from BART:
       key bias is materialized as zeros at weight-load time.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -67,6 +67,9 @@ from ..modules.linear import TensorParallelMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.mlp import MLP
 from .modeling_utils import PostInitCaller, register_auto_model
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -859,6 +862,14 @@ class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
             self.lm_head.weight = self.model.decoder.embed_tokens.weight
 
         self.logits_processor = LogitsProcessor()
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        # NCCL_SYMMETRIC has observed issues for TP>1 fp32 on NVLS-disabled Hopper
+        # (https://nvbugs/6522483). Temporary workaround to pin NCCL strategy
+        if llm_args.tensor_parallel_size > 1:
+            return {"allreduce_strategy": "NCCL"}
+        return {}
 
     def __post_init__(self):
         for _, module in self.named_modules():
