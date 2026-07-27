@@ -1897,25 +1897,14 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
     def get_preferred_transceiver_runtime(cls,
                                           pretrained_config: Any = None
                                           ) -> Optional[Literal["PYTHON"]]:
-        """GLM-5 family checkpoints default to the Python (v2) KV-cache transceiver.
+        """``DeepseekV3ForCausalLM``, ``DeepseekV32ForCausalLM``, and ``GlmMoeDsaForCausalLM`` all prefer the Python (v2) KV-cache transceiver.
 
-        This implementation class is shared by DeepSeek-V3/V3.2 and the GLM-5 family — both
-        GLM-5 and GLM-5.2 declare ``GlmMoeDsaForCausalLM`` / ``glm_moe_dsa`` — so the preference
-        is differentiated per checkpoint: only GLM checkpoints opt into the Python transceiver.
-        The MLA backbone transfers a large latent KV, which the Python transceiver handles better
-        in disaggregated serving. This is only adopted when the user leaves
-        ``cache_transceiver_config.transceiver_runtime`` at 'auto' and the effective backend is
-        NIXL; otherwise the C++ transceiver is used.
+        All three use MLA attention (``DeepseekV3Attention`` and ``DeepseekV32Attention`` both
+        extend ``MLA``), which transfers a large latent KV that the Python transceiver handles
+        better in disaggregated serving. Applied only when ``transceiver_runtime`` is 'auto'
+        and the backend is NIXL.
         """
-        if pretrained_config is None:
-            return None
-        architectures = getattr(pretrained_config, 'architectures', None) or []
-        # model_type is checked as a fallback: it is 'glm_moe_dsa' on GLM
-        # checkpoints until __init__ rewrites it to 'deepseek_v32'.
-        if ("GlmMoeDsaForCausalLM" in architectures or getattr(
-                pretrained_config, 'model_type', None) == 'glm_moe_dsa'):
-            return "PYTHON"
-        return None
+        return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         self.mapping_with_cp = None
