@@ -363,7 +363,7 @@ class WriteMetaType(Enum):
     AUX = "AUX"
 
 
-@dataclass
+@dataclass(eq=False)
 class WriteMeta:
     task: Union[SendTaskBase, "KVRecvTask"]
     expected_transfers: int
@@ -1610,12 +1610,40 @@ class Sender(SenderBase):
             try:
                 self._enqueue(write_meta)
             except Exception as error:
-                self._fail_write_meta(write_meta, error)
-                if write_meta.operation_owner is not None and write_meta.terminal_sent:
-                    write_meta.operation_owner.retire_operation()
-                elif write_meta.operation_owner is not None:
+                try:
+                    self._fail_write_meta(write_meta, error)
+                except Exception as notify_error:
+                    logger.error(
+                        "Unable to publish terminal failure for request %s: %s",
+                        write_meta.unique_rid,
+                        notify_error,
+                    )
+                owner = write_meta.operation_owner
+                if owner is None:
+                    continue
+                if write_meta.terminal_sent:
+                    try:
+                        self._retire_write_meta_operation(write_meta)
+                    except Exception as retire_error:
+                        logger.error(
+                            "Unable to retire terminal operation for request %s: %s",
+                            write_meta.unique_rid,
+                            retire_error,
+                        )
+                        with self._stalled_operations_lock:
+                            if write_meta not in self._stalled_operations:
+                                self._stalled_operations.append(write_meta)
+                else:
                     with self._stalled_operations_lock:
-                        self._stalled_operations.append(write_meta)
+                        # Serialize with the durable callback's retirement and
+                        # removal. It may have sent the terminal result between
+                        # the flag check above and this lock acquisition.
+                        if (
+                            not write_meta.terminal_sent
+                            and not write_meta.operation_retired
+                            and write_meta not in self._stalled_operations
+                        ):
+                            self._stalled_operations.append(write_meta)
 
     def _start_listener(self):
         def handle_message(messages: list[bytes]):
