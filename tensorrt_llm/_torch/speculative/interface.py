@@ -164,32 +164,35 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
         saved['saved_dsa_state'] = {
             'host_indexer_k_cache_block_offsets':
             m.host_indexer_k_cache_block_offsets,
-            'indexer_k_cache_block_offsets':
-            m.indexer_k_cache_block_offsets.clone(),
+            'indexer_k_cache_block_offsets': m.indexer_k_cache_block_offsets,
             'host_slot_mapping_fp8': m.host_slot_mapping_fp8,
             'host_slot_mapping_scale': m.host_slot_mapping_scale,
-            'slot_mapping_fp8': m.slot_mapping_fp8.clone(),
-            'slot_mapping_scale': m.slot_mapping_scale.clone(),
+            'slot_mapping_fp8': m.slot_mapping_fp8,
+            'slot_mapping_scale': m.slot_mapping_scale,
             'slot_mapping_fp8_fullkv': m.slot_mapping_fp8_fullkv,
             'slot_mapping_scale_fullkv': m.slot_mapping_scale_fullkv,
         }
-        # Keep the target's pinned host buffers untouched while asynchronous
-        # H2D copies from the draft mappings are in flight.  Restoring their
-        # contents in place can race those copies because CPU writes are not
-        # ordered with the CUDA stream.  The fresh host buffers stay attached
-        # to the metadata until after the draft forward has been enqueued.
-        m.host_indexer_k_cache_block_offsets = torch.empty_like(
-            m.host_indexer_k_cache_block_offsets,
-            pin_memory=m.host_indexer_k_cache_block_offsets.is_pinned())
-        m.host_slot_mapping_fp8 = torch.empty_like(
-            m.host_slot_mapping_fp8,
-            pin_memory=m.host_slot_mapping_fp8.is_pinned())
-        m.host_slot_mapping_scale = torch.empty_like(
-            m.host_slot_mapping_scale,
-            pin_memory=m.host_slot_mapping_scale.is_pinned())
+        # Rebind to the draft manager's dedicated buffers instead of
+        # overwriting the target tensors in place. Rebinding is invisible to
+        # CUDA graph capture, so the target and draft segments of the graph
+        # bake distinct addresses (like draft_kv_cache_block_offsets) and no
+        # graph-recorded copy from a transient host buffer is needed.
+        m.host_indexer_k_cache_block_offsets = (
+            m.host_draft_indexer_k_cache_block_offsets)
+        m.indexer_k_cache_block_offsets = m.draft_indexer_k_cache_block_offsets
+        m.host_slot_mapping_fp8 = m.host_draft_slot_mapping_fp8
+        m.slot_mapping_fp8 = m.draft_slot_mapping_fp8
+        m.host_slot_mapping_scale = m.host_draft_slot_mapping_scale
+        m.slot_mapping_scale = m.draft_slot_mapping_scale
+        # Recording a capture executes no kernels, so the draft mappings only
+        # need refreshing when the transfers actually run: eager forwards
+        # (warmup) and the pre-replay call from model_engine. The per-step
+        # advance inside the captured graph re-derives slot mappings on
+        # device from the rebound block-offset buffer.
         # kv_cache_manager was already swapped to the draft manager above.
-        m._update_indexer_k_cache_block_offsets()
-        Indexer.recompute_slot_mappings(m)
+        if not torch.cuda.is_current_stream_capturing():
+            m._update_indexer_k_cache_block_offsets()
+            Indexer.recompute_slot_mappings(m)
         Indexer.recompute_context_kv_gather_mappings(m)
     return saved
 
@@ -210,12 +213,12 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
         m = attn_metadata
         m.host_indexer_k_cache_block_offsets = saved_dsa[
             'host_indexer_k_cache_block_offsets']
-        m.indexer_k_cache_block_offsets.copy_(
-            saved_dsa['indexer_k_cache_block_offsets'], non_blocking=True)
+        m.indexer_k_cache_block_offsets = saved_dsa[
+            'indexer_k_cache_block_offsets']
         m.host_slot_mapping_fp8 = saved_dsa['host_slot_mapping_fp8']
         m.host_slot_mapping_scale = saved_dsa['host_slot_mapping_scale']
-        m.slot_mapping_fp8.copy_(saved_dsa['slot_mapping_fp8'])
-        m.slot_mapping_scale.copy_(saved_dsa['slot_mapping_scale'])
+        m.slot_mapping_fp8 = saved_dsa['slot_mapping_fp8']
+        m.slot_mapping_scale = saved_dsa['slot_mapping_scale']
         m.slot_mapping_fp8_fullkv = saved_dsa['slot_mapping_fp8_fullkv']
         m.slot_mapping_scale_fullkv = saved_dsa['slot_mapping_scale_fullkv']
 
