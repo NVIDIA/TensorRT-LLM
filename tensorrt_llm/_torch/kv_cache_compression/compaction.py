@@ -259,7 +259,9 @@ def compact(
     request_count: int,
 ) -> None:
     """Pack each cache's move sources and fire its native compacts, in order
-    (pure mover: the caller owns the decision rows and the round's completion ordering)."""
+    (pure mover: the caller owns the decision rows and the round's completion ordering).
+    ``request_count`` only sizes the Triton pack grid; the native op takes the batch
+    from the page-table view's row count and validates the companion tensors against it."""
     # One launch per (cache, pool group); each launch covers every layer in the group.
     for cache_params in params:
         _pack_move_sources_kernel[(request_count, cache_params.decision_rows)](
