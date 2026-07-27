@@ -2078,6 +2078,7 @@ class GvrTopKKernel:
         block_max_row=None,  # block-skip: per-32-position upper bounds
         smem_active=None,  # block-skip: int16 active list
         s_active_cnt=None,  # block-skip: [0]=list length, [1]=list-current flag
+        skip_veto=None,  # adaptive gate: 1 = pass rate too high, walk dense
     ):
         M = cutlass.const_expr(self.M_thr)
         num_threads = cutlass.const_expr(self.num_threads)
@@ -2127,6 +2128,15 @@ class GvrTopKKernel:
                 skip_ok = cutlass.Int32(0)
             if blk_hi_g > cutlass.Int32(32767):
                 skip_ok = cutlass.Int32(0)
+            # Closed-loop adaptive gate: when the emission (or harness)
+            # counted the blocks clearing the loosest line, a high pass
+            # rate proves the gather walk would read most of the row
+            # anyway PLUS the prefix - dense wins. Layer variance makes
+            # any static rule wrong on hard layers (measured 12-80%
+            # pass rates across layers on the same shape).
+            if cutlass.const_expr(skip_veto is not None):
+                if skip_veto == cutlass.Int32(1):
+                    skip_ok = cutlass.Int32(0)
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
             if skip_ok == cutlass.Int32(1):
                 head_end = (
@@ -6459,24 +6469,59 @@ class GvrTopKKernel:
                         ] == cutlass.Int32(1):
                             r0_par = cutlass.Int32(1)
                     if r0_par == cutlass.Int32(0):
-                        self.block_count_ge_multi(
-                            input_row,
-                            slice_start,
-                            slice_end,
-                            s_mt_thr,
-                            smem_ptcnt_multi,
-                            smem_wcnt_multi,
-                            s_mt_cnt,
-                            s_cluster_partial_m,
-                            do_cluster_sync,
-                            tidx,
-                            warp_id,
-                            lane,
-                            smem_ptcnt=smem_ptcnt,
-                            block_max_row=block_max_row,
-                            smem_active=smem_active,
-                            s_active_cnt=s_active_cnt,
-                        )
+                        if cutlass.const_expr(self.use_ext_counts and self.enable_block_skip):
+                            # adaptive skip gate from the packed seed row:
+                            # col 6 carries the emission's count of blocks
+                            # clearing the loosest line (0 = not provided,
+                            # keep static behavior). Pass rates past 3/8
+                            # make the gather walk lose to dense.
+                            sv_r = cutlass.Int32(0)
+                            bp_r = cutlass.Int32(seed_thr_row[6])
+                            nb_r = (
+                                slice_end - slice_start + cutlass.Int32(self.SKIP_BLOCK - 1)
+                            ) >> cutlass.Int32(self.SKIP_BLOCK_LOG2)
+                            if bp_r > cutlass.Int32(0) and bp_r * cutlass.Int32(
+                                8
+                            ) > nb_r * cutlass.Int32(3):
+                                sv_r = cutlass.Int32(1)
+                            self.block_count_ge_multi(
+                                input_row,
+                                slice_start,
+                                slice_end,
+                                s_mt_thr,
+                                smem_ptcnt_multi,
+                                smem_wcnt_multi,
+                                s_mt_cnt,
+                                s_cluster_partial_m,
+                                do_cluster_sync,
+                                tidx,
+                                warp_id,
+                                lane,
+                                smem_ptcnt=smem_ptcnt,
+                                block_max_row=block_max_row,
+                                smem_active=smem_active,
+                                s_active_cnt=s_active_cnt,
+                                skip_veto=sv_r,
+                            )
+                        else:
+                            self.block_count_ge_multi(
+                                input_row,
+                                slice_start,
+                                slice_end,
+                                s_mt_thr,
+                                smem_ptcnt_multi,
+                                smem_wcnt_multi,
+                                s_mt_cnt,
+                                s_cluster_partial_m,
+                                do_cluster_sync,
+                                tidx,
+                                warp_id,
+                                lane,
+                                smem_ptcnt=smem_ptcnt,
+                                block_max_row=block_max_row,
+                                smem_active=smem_active,
+                                s_active_cnt=s_active_cnt,
+                            )
                     cute.arch.barrier()
                     if tidx == 0 and r0_par == cutlass.Int32(0):
                         # tightest admissible rung = SMALLEST count in [K, kC].

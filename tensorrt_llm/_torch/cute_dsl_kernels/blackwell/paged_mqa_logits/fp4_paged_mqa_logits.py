@@ -1075,7 +1075,7 @@ class FP4MQALogitsKernel:
             hacc_cnt[t] = cutlass.Int32(0)
 
     @cute.jit
-    def _flush_seed_counts(self, mSeedCounts, q_idx, scnt, meta_lane):
+    def _flush_seed_counts(self, mSeedCounts, q_idx, scnt, meta_lane, spass=None):
         """Warp-redux the lane-local seed counters and fire one lane-0
         red.global.add per (t, threshold). Caller zero-initializes the
         count slots each step; cross-CTA totals accumulate atomically.
@@ -1100,6 +1100,18 @@ class FP4MQALogitsKernel:
                         ) * cutlass.Int64(4)
                         _red_global_add_s32(addr, w_cnt)
                 scnt[t * 3 + j] = cutlass.Int32(0)
+        if cutlass.const_expr(self.seed_packed and spass is not None):
+            # packed col 6: adaptive-skip pass count (lane0-accumulated,
+            # so the warp redux is exactly the warp's record total)
+            for t in cutlass.range_constexpr(next_n):
+                w_bp = cute.arch.warp_redux_sync(spass[t], "add")
+                if meta_lane == cutlass.Int32(0):
+                    row = q_idx * cutlass.Int32(next_n) + cutlass.Int32(t)
+                    addr = base_addr + (
+                        cutlass.Int64(row) * cutlass.Int64(8) + cutlass.Int64(6)
+                    ) * cutlass.Int64(4)
+                    _red_global_add_f32(addr, cutlass.Float32(w_bp))
+                spass[t] = cutlass.Int32(0)
 
     @cute.jit
     def _flush_cand_window(self, mCand, q_idx, cwbase, cwleft, meta_lane):
@@ -2158,6 +2170,9 @@ class FP4MQALogitsKernel:
                     if cutlass.const_expr(self.emit_seed_counts):
                         sthr = cute.make_fragment(next_n * 3, cutlass.Float32)
                         scnt = cute.make_fragment(next_n * 3, cutlass.Int32)
+                        spass = cute.make_fragment(next_n, cutlass.Int32)
+                        for _i in cutlass.range_constexpr(next_n):
+                            spass[_i] = cutlass.Int32(0)
                         for _i in cutlass.range_constexpr(next_n * 3):
                             sthr[_i] = cutlass.Float32(_META_FLT_MAX)
                             scnt[_i] = cutlass.Int32(0)
@@ -2233,7 +2248,9 @@ class FP4MQALogitsKernel:
                             # the aligned padding region out of block_max.
                             if cutlass.const_expr(self.emit_seed_counts):
                                 if q_idx_old < batch_size:
-                                    self._flush_seed_counts(mSeedCounts, q_idx_old, scnt, meta_lane)
+                                    self._flush_seed_counts(
+                                        mSeedCounts, q_idx_old, scnt, meta_lane, spass=spass
+                                    )
                                 # (re)load this q's thresholds - gated on
                                 # emit_seed_counts, NOT emit_cand: counts-
                                 # only mode needs them too (a stale
@@ -2484,6 +2501,15 @@ class FP4MQALogitsKernel:
                                 for _j in cutlass.range_constexpr(3):
                                     ge_j = cutlass.Int32(f32_t >= sthr[t * 3 + _j])
                                     scnt[t * 3 + _j] = scnt[t * 3 + _j] + (ge_j & valid_i1)
+                                if cutlass.const_expr(self.seed_packed):
+                                    # adaptive-skip pass count: one record
+                                    # per (tile, warp); r_bmax is warp-
+                                    # uniform so lane0 alone accumulates
+                                    # (the flush redux then sums warps)
+                                    if meta_lane == cutlass.Int32(0):
+                                        spass[t] = spass[t] + cutlass.Int32(
+                                            r_bmax >= sthr[t * 3 + 0]
+                                        )
                             if cutlass.const_expr(self.emit_cand):
                                 # L2 pre-collect at t_0 with per-warp claim
                                 # WINDOWS: refills claim (hits + CAND_WIN)
@@ -2648,7 +2674,7 @@ class FP4MQALogitsKernel:
                         )
                 if cutlass.const_expr(self.emit_seed_counts):
                     if q_idx < batch_size:
-                        self._flush_seed_counts(mSeedCounts, q_idx, scnt, meta_lane)
+                        self._flush_seed_counts(mSeedCounts, q_idx, scnt, meta_lane, spass=spass)
                 if cutlass.const_expr(self.emit_cand):
                     if q_idx < batch_size:
                         self._flush_cand_window(mCand, q_idx, cwbase, cwleft, meta_lane)
@@ -2706,6 +2732,9 @@ class FP4MQALogitsKernel:
                     if cutlass.const_expr(self.emit_seed_counts):
                         sthr = cute.make_fragment(next_n * 3, cutlass.Float32)
                         scnt = cute.make_fragment(next_n * 3, cutlass.Int32)
+                        spass = cute.make_fragment(next_n, cutlass.Int32)
+                        for _i in cutlass.range_constexpr(next_n):
+                            spass[_i] = cutlass.Int32(0)
                         for _i in cutlass.range_constexpr(next_n * 3):
                             sthr[_i] = cutlass.Float32(_META_FLT_MAX)
                             scnt[_i] = cutlass.Int32(0)
@@ -2781,7 +2810,9 @@ class FP4MQALogitsKernel:
                             # the aligned padding region out of block_max.
                             if cutlass.const_expr(self.emit_seed_counts):
                                 if q_idx_old < batch_size:
-                                    self._flush_seed_counts(mSeedCounts, q_idx_old, scnt, meta_lane)
+                                    self._flush_seed_counts(
+                                        mSeedCounts, q_idx_old, scnt, meta_lane, spass=spass
+                                    )
                                 # (re)load this q's thresholds - gated on
                                 # emit_seed_counts, NOT emit_cand (see the
                                 # WG0 twin above)
@@ -3025,6 +3056,15 @@ class FP4MQALogitsKernel:
                                 for _j in cutlass.range_constexpr(3):
                                     ge_j = cutlass.Int32(f32_t >= sthr[t * 3 + _j])
                                     scnt[t * 3 + _j] = scnt[t * 3 + _j] + (ge_j & valid_i1)
+                                if cutlass.const_expr(self.seed_packed):
+                                    # adaptive-skip pass count: one record
+                                    # per (tile, warp); r_bmax is warp-
+                                    # uniform so lane0 alone accumulates
+                                    # (the flush redux then sums warps)
+                                    if meta_lane == cutlass.Int32(0):
+                                        spass[t] = spass[t] + cutlass.Int32(
+                                            r_bmax >= sthr[t * 3 + 0]
+                                        )
                             if cutlass.const_expr(self.emit_cand):
                                 # L2 pre-collect at t_0 with per-warp claim
                                 # WINDOWS: refills claim (hits + CAND_WIN)
@@ -3189,7 +3229,7 @@ class FP4MQALogitsKernel:
                         )
                 if cutlass.const_expr(self.emit_seed_counts):
                     if q_idx < batch_size:
-                        self._flush_seed_counts(mSeedCounts, q_idx, scnt, meta_lane)
+                        self._flush_seed_counts(mSeedCounts, q_idx, scnt, meta_lane, spass=spass)
                 if cutlass.const_expr(self.emit_cand):
                     if q_idx < batch_size:
                         self._flush_cand_window(mCand, q_idx, cwbase, cwleft, meta_lane)

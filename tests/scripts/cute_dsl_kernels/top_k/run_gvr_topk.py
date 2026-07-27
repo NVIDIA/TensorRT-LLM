@@ -520,16 +520,23 @@ def derive_seed_lines_v4(
     return out.contiguous()
 
 
-def pack_seed(seed_thr: torch.Tensor, seed_counts: torch.Tensor) -> torch.Tensor:
+def pack_seed(
+    seed_thr: torch.Tensor,
+    seed_counts: torch.Tensor,
+    block_max: torch.Tensor = None,
+) -> torch.Tensor:
     """Pack lines + exact counts into one [rows, 8] fp32 seed row.
 
     Lines land at [0..2], counts as floats at [3..5] (exact to 2^24);
-    one 32B sector per row. Build ONCE per step, outside any timed
-    region.
+    col 6 optionally carries the adaptive-skip pass count (32-grain
+    block records clearing t_0; 0 = not provided). One 32B sector per
+    row. Build ONCE per step, outside any timed region.
     """
     pack = torch.zeros((seed_thr.shape[0], 8), dtype=torch.float32, device=seed_thr.device)
     pack[:, 0:3] = seed_thr
     pack[:, 3:6] = seed_counts.float()
+    if block_max is not None:
+        pack[:, 6] = (block_max >= seed_thr[:, 0:1]).sum(dim=1).float()
     return pack.contiguous()
 
 
