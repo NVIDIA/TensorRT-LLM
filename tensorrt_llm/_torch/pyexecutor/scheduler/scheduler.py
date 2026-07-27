@@ -600,14 +600,14 @@ class MultimodalScheduler(RequestScheduler):
         work by order alone.
 
         When a byte budget is configured, selection also performs
-        allocate-before-compute: an item is only selected if its embedding
-        bytes fit alongside (a) outputs already resident on live requests
-        (derived from `active_requests`) and (b) bytes claimed earlier in
-        this pass. The first request left incomplete additionally reserves
-        its remaining bytes so requests behind it cannot squat the space it
-        needs across iterations — without this head-of-line reservation,
-        several partially-complete requests could hold fragments of the
-        budget and deadlock waiting on one another.
+        allocate-before-compute, per request rather than per item: a request
+        starts only if its *whole* embedding fits alongside (a) storage
+        already held by live requests (derived from `active_requests`) and
+        (b) bytes claimed earlier in this pass. That matches how the storage
+        is allocated — the first recorded item sizes the buffer for all of
+        them — and means a started request can always finish, so no
+        head-of-line reservation is needed to keep later requests from
+        squatting the space it still needs.
 
         Returns the selected item indices per request id, plus the requests
         eligible for LLM microbatch scheduling this iteration (encoder
@@ -624,7 +624,6 @@ class MultimodalScheduler(RequestScheduler):
             else 0
         )
         reserved_bytes = 0
-        head_of_line_reserved = False
         selected: dict[int, list[int]] = {}
         llm_eligible: RequestList = []
 
@@ -651,18 +650,41 @@ class MultimodalScheduler(RequestScheduler):
                 )
 
             pending = state.pending_item_indices()
+            # The first item scheduled for a request allocates the storage for
+            # *all* of its items, so the byte budget is charged once per
+            # request rather than per item. A request that cannot be charged
+            # yet stays fully pending instead of occupying part of the budget
+            # with work that cannot be prefilled until it completes.
+            if (
+                budget is not None
+                and not state.has_storage
+                and pending
+                and remaining_items > 0
+                and token_lengths[pending[0]] <= remaining_tokens
+            ):
+                request_bytes = sum(state.embedding_lengths) * self.bytes_per_encoder_embedding
+                if request_bytes > budget:
+                    # Liveness backstop: admission
+                    # (`initialize_multimodal_encoder_request`) already
+                    # rejects requests whose outputs can never coexist
+                    # within the budget, so reaching this means an
+                    # accounting bug rather than a user input.
+                    raise RuntimeError(
+                        f"Multimodal request {request.py_request_id} needs "
+                        f"{request_bytes} bytes of resident encoder "
+                        "output but the encoder output budget is only "
+                        f"{budget} bytes; raise encoder_max_num_tokens to "
+                        "serve inputs of this size"
+                    )
+                if resident_bytes + reserved_bytes + request_bytes > budget:
+                    continue
+                reserved_bytes += request_bytes
+
             request_items: list[int] = []
             for item_idx in pending:
                 cost = token_lengths[item_idx]
                 if remaining_items == 0 or cost > remaining_tokens:
                     break
-                if budget is not None:
-                    item_bytes = (
-                        state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
-                    )
-                    if resident_bytes + reserved_bytes + item_bytes > budget:
-                        break
-                    reserved_bytes += item_bytes
                 request_items.append(item_idx)
                 remaining_items -= 1
                 remaining_tokens -= cost
@@ -672,35 +694,6 @@ class MultimodalScheduler(RequestScheduler):
 
             if pending and len(request_items) == len(pending):
                 llm_eligible.append(request)
-            elif budget is not None and not head_of_line_reserved:
-                # Head-of-line reservation: `request_items` is a prefix of
-                # `pending`, so the unselected suffix is what this request
-                # still needs in future iterations.
-                remaining_request_bytes = (
-                    sum(
-                        state.embedding_lengths[item_idx]
-                        for item_idx in pending[len(request_items) :]
-                    )
-                    * self.bytes_per_encoder_embedding
-                )
-                total_request_bytes = (
-                    sum(state.embedding_lengths) * self.bytes_per_encoder_embedding
-                )
-                if total_request_bytes > budget:
-                    # Liveness backstop: admission
-                    # (`initialize_multimodal_encoder_request`) already
-                    # rejects requests whose outputs can never coexist
-                    # within the budget, so reaching this means an
-                    # accounting bug rather than a user input.
-                    raise RuntimeError(
-                        f"Multimodal request {request.py_request_id} needs "
-                        f"{total_request_bytes} bytes of resident encoder "
-                        "output but the encoder output budget is only "
-                        f"{budget} bytes; raise encoder_max_num_tokens to "
-                        "serve inputs of this size"
-                    )
-                reserved_bytes += remaining_request_bytes
-                head_of_line_reserved = True
 
         return selected, llm_eligible
 
