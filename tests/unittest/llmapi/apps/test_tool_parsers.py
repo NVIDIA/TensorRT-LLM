@@ -875,6 +875,25 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         assert result.calls == []
         assert result.normal_text == text
 
+    def test_detect_and_parse_bare_json_with_trailing_content(
+            self, sample_tools, parser):
+        """Bare JSON followed by trailing non-whitespace text is still parsed.
+
+        NVBug 6240584 review follow-up: `json.loads(text.strip())` raises
+        `json.JSONDecodeError: Extra data` on `'{...} trailing text'`, which
+        used to drop the valid tool call into `normal_text`. The parser now
+        uses `raw_decode` to consume only the leading JSON value and must
+        recover the tool call regardless of what follows.
+        """
+        text = ('{"name":"get_weather","arguments":{"city":"Paris"}}\n'
+                'Extra text after the tool call.')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"city": "Paris"}
+
     # ------------------------------------------------------------------
     # NVBug 6240584: bare-JSON fallback in parse_streaming_increment
     #
@@ -930,6 +949,50 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
 
         assert result.normal_text == "Hello world"
         assert result.calls == []
+
+    def test_streaming_bare_json_with_trailing_content(self, sample_tools,
+                                                       parser):
+        """Bare-JSON tool call plus trailing text: emit calls, don't buffer.
+
+        NVBug 6240584 review follow-up: previously the streaming path called
+        `json.loads(stripped)`, which fails with `Extra data` when the
+        buffered content is `'{...} trailing text'`. The parser would then
+        keep buffering forever and never emit the tool call. With
+        `raw_decode`, the tool call must be emitted at the JSON boundary
+        and the trailing text must be dropped (bare-JSON mode already
+        suppresses subsequent chunks).
+        """
+        result = parser.parse_streaming_increment(
+            '{"name":"get_weather","arguments":{"city":"Paris"}}\n'
+            'Extra text after the tool call.', sample_tools)
+
+        names = [c.name for c in result.calls if c.name]
+        assert "get_weather" in names
+        params = "".join(c.parameters for c in result.calls if c.parameters)
+        assert "Paris" in params
+        # Trailing text must NOT be surfaced as normal_text — it would flip
+        # finish_reason back to "stop".
+        assert result.normal_text == ""
+
+    def test_streaming_bare_json_trailing_content_split_chunk(
+            self, sample_tools, parser):
+        """Same as above but the trailing text arrives in a later chunk.
+
+        This exercises the state machine: chunk 1 completes the JSON (parser
+        must emit calls now, not wait for more input), chunk 2 arrives after
+        the parser is already in `_STREAM_MODE_BARE_JSON` and must be
+        suppressed.
+        """
+        r1 = parser.parse_streaming_increment(
+            '{"name":"get_weather","arguments":{"city":"Paris"}}', sample_tools)
+        r2 = parser.parse_streaming_increment('\nExtra text.', sample_tools)
+
+        names = [c.name for c in r1.calls if c.name]
+        assert "get_weather" in names
+        assert r1.normal_text == ""
+        # Trailing chunk is fully suppressed.
+        assert r2.calls == []
+        assert r2.normal_text == ""
 
     def test_streaming_wrapped_form_unregressed(self, sample_tools, parser):
         """The pre-existing wrapped-form streaming path continues to work."""
@@ -2904,6 +2967,91 @@ class TestToolParserIntegration:
         assert args.has_tool_call.get(0) is True
         # And no bare JSON leaks into the visible content.
         assert normal_text == ""
+
+    def test_qwen3_5_reasoning_plus_qwen3_tool_parser_bare_json_streaming(
+            self, sample_tools):
+        r"""NVBug 6240584: streaming variant of reasoning+tool parser pipeline.
+
+        The bug most commonly reproduces on streamed chat completions —
+        the model emits tokens one at a time and the OpenAI server relies
+        on the tool parser to flip `finish_reason` to `tool_calls` before
+        the stream ends. Feed the same reasoning + bare-JSON payload
+        through `apply_reasoning_parser` / `apply_tool_parser` with
+        `streaming=True` in small chunks and assert:
+          - `args.has_tool_call[0]` is True at end-of-stream,
+          - the accumulated tool-call name/arguments are correct,
+          - the bare JSON never leaks into visible content.
+        """
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+        from tensorrt_llm.serve.postprocess_handlers import (
+            ChatPostprocArgs, apply_reasoning_parser, apply_tool_parser)
+
+        text = ('Reasoning here.</think>\n'
+                '{"name":"get_weather","arguments":{"city":"Paris"}}')
+
+        # Chunk the input to force the streaming state machines to buffer
+        # across boundaries. The split intentionally lands inside both the
+        # `</think>` tag and the JSON payload.
+        chunks = [
+            'Reasoning ',
+            'here.</thi',
+            'nk>\n{"name":"get_',
+            'weather","arguments":',
+            '{"city":"Pa',
+            'ris"}}',
+        ]
+
+        req = ChatCompletionRequest(
+            model="Qwen/Qwen3.6-27B-FP8",
+            messages=[{
+                "role": "user",
+                "content": "What is the weather in Paris?"
+            }],
+            tools=sample_tools,
+        )
+        args = ChatPostprocArgs.from_request(req)
+        args.reasoning_parser = "qwen3_5"
+        args.tool_parser = "qwen3"
+
+        accumulated_content = ""
+        accumulated_normal_text = ""
+        collected_calls = []
+
+        for chunk in chunks:
+            content, _reasoning = apply_reasoning_parser(args,
+                                                         output_index=0,
+                                                         text=chunk,
+                                                         streaming=True)
+            accumulated_content += content
+            if not content:
+                continue
+            normal_text, calls = apply_tool_parser(args,
+                                                   output_index=0,
+                                                   text=content,
+                                                   streaming=True)
+            if normal_text:
+                accumulated_normal_text += normal_text
+            collected_calls.extend(calls)
+
+        # The reasoning parser must have stripped everything through the
+        # `</think>` tag; the bare JSON survives into content.
+        assert '"name":"get_weather"' in accumulated_content
+
+        # The tool parser must have flipped `has_tool_call` before the
+        # stream ended — this is the exact condition
+        # `chat_response_post_processor` uses to set
+        # `finish_reason="tool_calls"`.
+        assert args.has_tool_call.get(0) is True
+
+        # We must have received the tool name and its arguments (potentially
+        # across multiple streaming increments).
+        names = [c.name for c in collected_calls if c.name]
+        assert names == ["get_weather"]
+        params = "".join(c.parameters for c in collected_calls if c.parameters)
+        assert json.loads(params) == {"city": "Paris"}
+
+        # And no visible content is leaked from the bare-JSON payload.
+        assert accumulated_normal_text == ""
 
     def test_end_to_end_single_tool(self, sample_tools):
         """Test end-to-end parsing of a single tool call."""

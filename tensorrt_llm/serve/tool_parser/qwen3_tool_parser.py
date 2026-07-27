@@ -79,13 +79,21 @@ class Qwen3ToolParser(BaseToolParser):
             # to recover those before dropping the text into normal_text. Use
             # an explicit type guard to avoid relying on AttributeError to
             # catch scalar JSON like "42" or null.
+            #
+            # Use `raw_decode` (not `json.loads`) so a valid leading JSON
+            # object followed by trailing content is still recognized as a
+            # tool call — `json.loads` would raise `Extra data` and drop the
+            # entire text into normal_text (see NVBug 6240584 review).
+            stripped = text.strip()
             try:
-                parsed = json.loads(text.strip())
+                parsed, _end = json.JSONDecoder().raw_decode(stripped)
             except json.JSONDecodeError:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
             if isinstance(parsed, (dict, list)):
                 calls = self.parse_base_json(parsed, tools)
                 if calls:
+                    # Match the wrapped-form convention: text outside the tool
+                    # call is not surfaced as normal_text.
                     return StreamingParseResult(normal_text="", calls=calls)
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
@@ -161,8 +169,12 @@ class Qwen3ToolParser(BaseToolParser):
             return self._wrapped_streaming(replay, tools)
 
         # Leading `{` or `[` — could be a bare JSON tool call, or partial.
+        # Use `raw_decode` (not `json.loads`) so a complete JSON prefix
+        # followed by trailing text is emitted immediately. `json.loads`
+        # would raise `Extra data` and keep buffering forever (NVBug 6240584
+        # follow-up review).
         try:
-            parsed = json.loads(stripped)
+            parsed, _end = json.JSONDecoder().raw_decode(stripped)
         except json.JSONDecodeError:
             # Not yet complete — buffer more.
             return StreamingParseResult()
@@ -189,8 +201,20 @@ class Qwen3ToolParser(BaseToolParser):
                 self._stream_mode = self._STREAM_MODE_BARE_JSON
                 self._bare_json_buffer = ""
                 # Best-effort bookkeeping for callers that inspect these.
+                # NOTE: This intentionally diverges from `BaseToolParser`,
+                # which increments `current_tool_id` past the last completed
+                # tool. The bare-JSON path emits all calls in a single batch
+                # and never falls back to wrapped streaming afterwards, so
+                # we leave `current_tool_id` at the last emitted index and
+                # `current_tool_name_sent = True` as best-effort state for
+                # any downstream inspection.
                 self.current_tool_id = max(0, len(calls) - 1)
                 self.current_tool_name_sent = True
+                # Any content after the parsed JSON value is trailing text
+                # (e.g. prose after the tool call). Drop it: `_STREAM_MODE_BARE_JSON`
+                # already suppresses subsequent chunks, and surfacing this
+                # tail as `normal_text` would flip `finish_reason` back to
+                # `stop`.
                 return StreamingParseResult(normal_text="",
                                             calls=streaming_calls)
 
