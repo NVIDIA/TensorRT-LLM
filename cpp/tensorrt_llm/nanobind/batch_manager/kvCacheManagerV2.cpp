@@ -97,6 +97,38 @@ static std::pair<std::vector<kv::TokenIdExt>, bool> castTokenIterable(nb::handle
     return {std::move(vec), knownNoDigest};
 }
 
+// Zero-copy-friendly token ingestion. Invokes fn(TokenSpan, knownNoDigest) with a non-owning
+// view of the tokens; fn must consume it synchronously (it may release the GIL — the backing
+// buffer must outlive the call).
+//
+// Fast path: a contiguous 1-D int32 buffer (numpy view, memoryview, array.array, torch tensor) is
+// reinterpret_cast to TokenIdExt const* — no copy, no per-token boxing — since a normal token id
+// is bit-identical to a 4-byte TokenIdExt (see tokenIdExt.h). convert=false keeps it strictly
+// zero-copy; a non-int32 / non-contiguous input falls through.
+//
+// Fallback: any int|bytes(32) iterable via castTokenIterable — the multimodal/digest path.
+template <class Fn>
+static auto withTokens(nb::handle tokens, Fn&& fn)
+{
+    nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig> arr;
+    if (nb::try_cast(tokens, arr, /*convert=*/false))
+    {
+        auto const count = static_cast<int32_t>(arr.shape(0));
+        auto const* raw = arr.data();
+        // Every element must be a normal id (high/digest bit clear); a negative int32 would look
+        // like a pooled digest (see tokenIdExt.h) and corrupt the hash. Digests never reach here —
+        // they take the fallback — so knownNoDigest=true holds; this asserts it in debug builds.
+        TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(raw, raw + count, [](int32_t id) { return id >= 0; }),
+            "token id must be in [0, 2^31) for the zero-copy path");
+        // Sound reinterpret: TokenIdExt is bit-identical to its int32 id (tokenIdExt.h) and this
+        // buffer is only ever read const (never written through the alias).
+        auto const* data = reinterpret_cast<kv::TokenIdExt const*>(raw);
+        return fn(kv::TokenSpan{data, count}, /*knownNoDigest=*/true);
+    }
+    auto [vec, knownNoDigest] = castTokenIterable(tokens);
+    return fn(kv::toSpan(vec), knownNoDigest);
+}
+
 static kv::TypedVec<kv::PoolIndex, size_t> typedPoolSizeList(std::vector<size_t> const& slotSizeList)
 {
     return kv::TypedVec<kv::PoolIndex, size_t>{slotSizeList};
@@ -1437,14 +1469,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "commit",
             [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
             {
-                // commit() sources knownNoDigest from the KvCache's text_only flag. Guard
-                // that claim against the actual tokens: a text_only sequence committing a
-                // digest would silently corrupt the block-key hash. Free today (the flag is
-                // a byproduct of building the vector); revisit if C++/Python conversion
-                // becomes zero-copy and this becomes a dedicated scan.
-                auto [vec, knownNoDigest] = castTokenIterable(acceptedInputTokens);
-                TLLM_CHECK_WITH_INFO(!(self.textOnly() && !knownNoDigest),
-                    "commit() received a digest token on a text_only sequence — hashing would be corrupted");
                 if (!beamSearchIndices.is_none())
                 {
                     PyErr_SetString(PyExc_AssertionError, "beam_search_indices must be None");
@@ -1452,8 +1476,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 }
                 // Note: an empty token list with is_end=True must still stop committing,
                 // so we do not early-return on empty; commit() handles it.
-                nb::gil_scoped_release release;
-                self.commit(vec, isEnd);
+                withTokens(acceptedInputTokens,
+                    [&](kv::TokenSpan view, bool knownNoDigest)
+                    {
+                        // commit() sources knownNoDigest from the KvCache's text_only flag. Guard
+                        // that claim against the actual tokens: a text_only sequence committing a
+                        // digest would silently corrupt the block-key hash.
+                        TLLM_CHECK_WITH_INFO(!(self.textOnly() && !knownNoDigest),
+                            "commit() received a digest token on a text_only sequence — hashing would be corrupted");
+                        nb::gil_scoped_release release;
+                        self.commit(view, isEnd);
+                    });
             },
             nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none(),
             nb::arg("is_end") = false)
@@ -1685,26 +1718,31 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         [](kv::KvCacheManager& manager, nb::object reuseScope, nb::object tokens, int lcId, bool enablePartial)
         {
             auto rs = castReuseScope(reuseScope);
-            auto [vec, knownNoDigest] = castTokenIterable(tokens);
             int numTokens = 0;
             std::vector<std::optional<std::pair<int, int>>> pages;
-            {
-                nb::gil_scoped_release release;
-                auto matchResult = manager.radixTree().match(rs, vec, knownNoDigest, enablePartial);
-                numTokens = matchResult.numTokens;
-                kv::LifeCycleId lc{lcId};
-                pages.reserve(matchResult.blocks.stdSize());
-                for (auto* block : matchResult.blocks)
+            withTokens(tokens,
+                [&](kv::TokenSpan view, bool knownNoDigest)
                 {
-                    auto* page = block->getPage(lc);
-                    if (page == nullptr)
+                    nb::gil_scoped_release release;
+                    auto matchResult = manager.radixTree().match(rs, view, knownNoDigest, enablePartial);
+                    numTokens = matchResult.numTokens;
+                    kv::LifeCycleId lc{lcId};
+                    pages.reserve(matchResult.blocks.stdSize());
+                    for (auto* block : matchResult.blocks)
                     {
-                        pages.emplace_back(std::nullopt);
-                        continue;
+                        auto* page = block->storage.at(lc);
+                        if (page == nullptr)
+                        {
+                            pages.emplace_back(std::nullopt);
+                            continue;
+                        }
+                        int const slotId = page->slotId().value();
+                        int numTokensInBlock = -1;
+                        if (auto* ssm = dynamic_cast<kv::SsmCommittedPage*>(page))
+                            numTokensInBlock = ssm->numTokensInBlock;
+                        pages.emplace_back(std::make_pair(slotId, numTokensInBlock));
                     }
-                    pages.emplace_back(std::make_pair(page->slotId().value(), page->numTokensInBlock));
-                }
-            }
+                });
             return std::make_tuple(numTokens, std::move(pages));
         },
         nb::arg("manager"), nb::arg("reuse_scope"), nb::arg("tokens"), nb::arg("lc_id"),
@@ -1716,24 +1754,25 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         [](kv::KvCacheManager& manager, nb::object reuseScope, nb::object tokens, int lcId, bool enablePartial)
         {
             auto rs = castReuseScope(reuseScope);
-            auto vec = castTokenIterable(tokens);
             int numTokens = 0;
             std::vector<std::optional<int>> counts;
-            {
-                nb::gil_scoped_release release;
-                auto matchResult = manager.radixTree().match(rs, vec, enablePartial);
-                numTokens = matchResult.numTokens;
-                kv::LifeCycleId lc{lcId};
-                counts.reserve(matchResult.blocks.stdSize());
-                for (auto* block : matchResult.blocks)
+            withTokens(tokens,
+                [&](kv::TokenSpan view, bool knownNoDigest)
                 {
-                    auto* page = block->storage.at(lc);
-                    if (page == nullptr)
-                        counts.emplace_back(std::nullopt);
-                    else
-                        counts.emplace_back(page->plannedDropCount);
-                }
-            }
+                    nb::gil_scoped_release release;
+                    auto matchResult = manager.radixTree().match(rs, view, knownNoDigest, enablePartial);
+                    numTokens = matchResult.numTokens;
+                    kv::LifeCycleId lc{lcId};
+                    counts.reserve(matchResult.blocks.stdSize());
+                    for (auto* block : matchResult.blocks)
+                    {
+                        auto* page = block->storage.at(lc);
+                        if (page == nullptr)
+                            counts.emplace_back(std::nullopt);
+                        else
+                            counts.emplace_back(page->plannedDropCount);
+                    }
+                });
             return std::make_tuple(numTokens, std::move(counts));
         },
         nb::arg("manager"), nb::arg("reuse_scope"), nb::arg("tokens"), nb::arg("lc_id"),
@@ -1824,26 +1863,30 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<int> expectedPromptLength, std::optional<bool> textOnly)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
-                std::vector<kv::TokenIdExt> tokens;
-                bool const hasInputTokens = !inputTokens.is_none();
-                if (hasInputTokens)
-                {
-                    bool knownNoDigest = true;
-                    std::tie(tokens, knownNoDigest) = castTokenIterable(inputTokens);
-                    // Guard the text_only claim against the actual input tokens (see commit()).
-                    bool const resolvedTextOnly = textOnly.value_or(self->textOnly());
-                    TLLM_CHECK_WITH_INFO(!(resolvedTextOnly && !knownNoDigest),
-                        "create_kv_cache received digest input_tokens on a text_only sequence — hashing would be "
-                        "corrupted");
-                }
-                if (!expectedPromptLength.has_value() && hasInputTokens)
-                {
-                    expectedPromptLength = static_cast<int>(tokens.size());
-                }
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
-                nb::gil_scoped_release release;
-                return self->createKvCache(
-                    std::move(reuseScope), tokens, id, std::move(priorityCb), expectedPromptLength, textOnly);
+                if (inputTokens.is_none())
+                {
+                    nb::gil_scoped_release release;
+                    return self->createKvCache(std::move(reuseScope), kv::TokenSpan{}, id, std::move(priorityCb),
+                        expectedPromptLength, textOnly);
+                }
+                return withTokens(inputTokens,
+                    [&](kv::TokenSpan view, bool knownNoDigest)
+                    {
+                        // Guard the text_only claim against the actual input tokens (see commit()).
+                        bool const resolvedTextOnly = textOnly.value_or(self->textOnly());
+                        TLLM_CHECK_WITH_INFO(!(resolvedTextOnly && !knownNoDigest),
+                            "create_kv_cache received digest input_tokens on a text_only sequence — hashing would be "
+                            "corrupted");
+                        std::optional<int> promptLen = expectedPromptLength;
+                        if (!promptLen.has_value() && view.size() != 0)
+                        {
+                            promptLen = static_cast<int>(view.size());
+                        }
+                        nb::gil_scoped_release release;
+                        return self->createKvCache(
+                            std::move(reuseScope), view, id, std::move(priorityCb), promptLen, textOnly);
+                    });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt,
@@ -1853,14 +1896,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
-                std::vector<kv::TokenIdExt> tokens;
-                bool knownNoDigest = true;
-                if (!inputTokens.is_none())
+                if (inputTokens.is_none())
                 {
-                    std::tie(tokens, knownNoDigest) = castTokenIterable(inputTokens);
+                    nb::gil_scoped_release release;
+                    return self->probeReuse(std::move(reuseScope), kv::TokenSpan{}, /*knownNoDigest=*/true);
                 }
-                nb::gil_scoped_release release;
-                return self->probeReuse(std::move(reuseScope), tokens, knownNoDigest);
+                return withTokens(inputTokens,
+                    [&](kv::TokenSpan view, bool knownNoDigest)
+                    {
+                        nb::gil_scoped_release release;
+                        return self->probeReuse(std::move(reuseScope), view, knownNoDigest);
+                    });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())
         .def("get_mem_pool_base_address", &kv::KvCacheManager::getMemPoolBaseAddress, nb::arg("layer_id"),

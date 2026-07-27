@@ -20,15 +20,18 @@
 #include "kv_cache_manager_v2/tokenIdExt.h" // TokenId, Digest, TokenIdExt
 #include "kv_cache_manager_v2/utils/typedIndex.h"
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/common/assert.h"
 
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <string>
 #include <sys/types.h>
 #include <type_traits>
 #include <variant>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -119,6 +122,64 @@ inline constexpr Priority kPriorityDefault = 35;
 
 // Optional sliding window size (nullopt = no sliding window).
 using SlidingWindowSize = std::optional<int>;
+
+// ---------------------------------------------------------------------------
+// Span<T> — non-owning view into a contiguous buffer (a C++17 stand-in for
+// std::span). Aggregate, so `Span<T>{}` value-initializes to an empty view and
+// `Span<T>{ptr, len}` is a plain brace-init. Supports operator[] for uniform
+// access with std::vector<T>.
+// ---------------------------------------------------------------------------
+template <typename T>
+struct Span
+{
+    T* ptr;
+    int len;
+
+    T& operator[](int idx)
+    {
+        return ptr[idx];
+    }
+
+    T const& operator[](int idx) const
+    {
+        return ptr[idx];
+    }
+
+    int size() const noexcept
+    {
+        return len;
+    }
+
+    T* data() const noexcept
+    {
+        return ptr;
+    }
+
+    T* begin() const noexcept
+    {
+        return ptr;
+    }
+
+    T* end() const noexcept
+    {
+        return ptr + len;
+    }
+};
+
+// Non-owning const Span over a std::vector — for call sites that hold an owning vector but
+// need a Span (e.g. the per-element/multimodal fallback).
+template <typename T>
+inline Span<T const> toSpan(std::vector<T> const& vec) noexcept
+{
+    TLLM_CHECK_DEBUG(vec.size() <= static_cast<size_t>(std::numeric_limits<int>::max()));
+    return Span<T const>{vec.data(), static_cast<int>(vec.size())};
+}
+
+// Non-owning view of a token sequence — a C++17 stand-in for std::span<TokenIdExt const>.
+// Used on the hot ingest path: a digest-free int32 token buffer can be reinterpret_cast to
+// TokenIdExt const* and matched/hashed with no per-token copy. TokenIdExt is 4 bytes and
+// bit-identical to a normal int32 token (see tokenIdExt.h).
+using TokenSpan = Span<TokenIdExt const>;
 
 // ---------------------------------------------------------------------------
 // Address types

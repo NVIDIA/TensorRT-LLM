@@ -718,15 +718,15 @@ int numMatchedTokens(std::vector<BlockRadixTree::MatchResult> const& matched, in
 
 } // anonymous namespace
 
-std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(ReuseScope const& reuseScope,
-    std::vector<TokenIdExt> const& tokens, bool knownNoDigest, bool enablePartialMatch) const
+std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
+    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {
     drainPendingRootErases();
 
     std::vector<MatchResult> results;
 
     // Lazily compute one key per iteration — no wasted hashing on early miss.
-    auto gen = sequenceToBlockchainKeys(mTokensPerBlock, reuseScope, tokens.data(), tokens.size(), knownNoDigest);
+    auto gen = sequenceToBlockchainKeys(mTokensPerBlock, reuseScope, tokens.begin(), tokens.size(), knownNoDigest);
 
     // First step is the root key (empty token range).
     auto rootStep = gen();
@@ -762,7 +762,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(ReuseSco
     if (missed && enablePartialMatch)
     {
         auto [best, bestMatch]
-            = findBestPartialMatchInNextNodes(*currentNext, tokens.data() + missedRange.beg, missedRange.length());
+            = findBestPartialMatchInNextNodes(*currentNext, tokens.begin() + missedRange.beg, missedRange.length());
         if (best)
             results.push_back({best, bestMatch});
     }
@@ -863,8 +863,8 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<
     return matched;
 }
 
-BlockRadixTree::ReuseMatch BlockRadixTree::match(ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens,
-    bool knownNoDigest, bool enablePartialMatch) const
+BlockRadixTree::ReuseMatch BlockRadixTree::match(
+    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {
     auto const matched = pruneMatch(matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch));
     ReuseMatch result{};
