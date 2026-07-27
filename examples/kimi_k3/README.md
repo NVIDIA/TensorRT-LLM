@@ -24,7 +24,10 @@ other GPU architectures may be added in a future release.
   `build_wheel.py` creates the `.venv-3.12` virtual environment at the
   repository root (named after the container's Python version). Adjust
   `--cuda_architectures` to the target GPUs (`103-real` for GB300).
-- A complete Hugging Face-format Kimi K3 checkpoint and tokenizer.
+- A complete Hugging Face-format Kimi K3 checkpoint and tokenizer, e.g.
+  [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) downloaded
+  from the Hugging Face Hub (the example scripts take a local filesystem
+  path).
 - A Slurm cluster with 16 NVIDIA Blackwell GPUs and a TensorRT-LLM container
   image.
 - The `fla-core` and `einops` packages, installed into the same in-place

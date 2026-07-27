@@ -20,7 +20,7 @@ This guide uses Slurm and the `trtllm-llmapi-launch` multi-node launcher. The co
 
 ## Models
 
-* A complete Hugging Face-format Kimi K3 checkpoint and tokenizer (`model_type: kimi_k3`, architecture `KimiK3ForConditionalGeneration`). The checkpoint ships the routed-expert weights pre-quantized to MXFP4; no additional quantization step is needed.
+* A complete Hugging Face-format Kimi K3 checkpoint and tokenizer, e.g. [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) downloaded from the Hugging Face Hub (`model_type: kimi_k3`, architecture `KimiK3ForConditionalGeneration`). The checkpoint ships the routed-expert weights pre-quantized to MXFP4; no additional quantization step is needed.
 
 The checkpoint and the configuration file must live on a shared filesystem visible to all nodes. The examples below use `/path/to/kimi-k3-checkpoint` — replace it with your local path.
 
