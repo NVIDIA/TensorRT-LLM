@@ -81,6 +81,171 @@ from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_
 # and flash SDPA does not accept attn_mask.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
+# Experimental A/B gate for producing compact FP8 Q while inserting main K/V
+# directly into the MSA paged cache during supported eager pure-prefill steps.
+_FUSED_MAIN_KV_WRITE_ENV = "TRTLLM_MINIMAX_M3_FUSED_MAIN_KV_WRITE"
+
+
+class MiniMaxM3QKVIndexerLinear(Linear):
+    """Five-way MiniMax-M3 projection with vLLM-compatible TP sharding.
+
+    Each rank emits ``[Q | K | V | index-Q | index-K]``. Q follows normal
+    attention head sharding, K/V/index-Q follow KV-head sharding (including
+    replication when TP exceeds the KV-head count), and the single index-K
+    head is replicated. The underlying :class:`Linear` remains the standard
+    quantized implementation; only checkpoint packing is model-specific.
+    """
+
+    _SHARD_NAMES = ("q", "k", "v", "index_q", "index_k")
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        head_dim: int,
+        total_num_heads: int,
+        total_num_kv_heads: int,
+        total_num_index_heads: int,
+        index_head_dim: int,
+        dtype: torch.dtype,
+        mapping: Mapping,
+        quant_config: Optional[QuantConfig],
+        skip_create_weights_in_init: bool,
+        force_dynamic_quantization: bool,
+        disable_deep_gemm: bool,
+        use_custom_cublas_mm: bool,
+        use_cute_dsl_blockscaling_mm: bool,
+    ) -> None:
+        if total_num_index_heads != total_num_kv_heads:
+            raise ValueError(
+                "MiniMax-M3 fused QKV+index projection requires index heads "
+                f"({total_num_index_heads}) to equal KV heads ({total_num_kv_heads})."
+            )
+        if index_head_dim != head_dim:
+            raise ValueError(
+                "MiniMax-M3 fused QKV+index projection requires index_head_dim "
+                f"({index_head_dim}) to equal head_dim ({head_dim})."
+            )
+
+        tp_size = int(mapping.tp_size)
+        if total_num_heads % tp_size != 0:
+            raise ValueError(f"Q heads ({total_num_heads}) must be divisible by TP ({tp_size}).")
+        if total_num_kv_heads >= tp_size:
+            if total_num_kv_heads % tp_size != 0:
+                raise ValueError(
+                    f"KV heads ({total_num_kv_heads}) must be divisible by TP ({tp_size})."
+                )
+            local_num_kv_heads = total_num_kv_heads // tp_size
+        else:
+            if tp_size % total_num_kv_heads != 0:
+                raise ValueError(
+                    f"TP ({tp_size}) must be divisible by KV heads "
+                    f"({total_num_kv_heads}) for replication."
+                )
+            local_num_kv_heads = 1
+
+        self.total_num_heads = int(total_num_heads)
+        self.total_num_kv_heads = int(total_num_kv_heads)
+        self.total_num_index_heads = int(total_num_index_heads)
+        self.head_dim = int(head_dim)
+        self.index_head_dim = int(index_head_dim)
+        self.local_num_heads = total_num_heads // tp_size
+        self.local_num_kv_heads = local_num_kv_heads
+        self.local_num_index_heads = local_num_kv_heads
+        self.local_output_sizes = (
+            self.local_num_heads * head_dim,
+            local_num_kv_heads * head_dim,
+            local_num_kv_heads * head_dim,
+            local_num_kv_heads * index_head_dim,
+            index_head_dim,
+        )
+        local_out_features = sum(self.local_output_sizes)
+
+        super().__init__(
+            hidden_size,
+            tp_size * local_out_features,
+            bias=False,
+            dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            quant_config=quant_config,
+            weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.FUSED_QKV_LINEAR),
+            reduce_output=False,
+            skip_create_weights_in_init=skip_create_weights_in_init,
+            force_dynamic_quantization=force_dynamic_quantization,
+            disable_deep_gemm=disable_deep_gemm,
+            use_custom_cublas_mm=use_custom_cublas_mm,
+            use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+        )
+
+    def _shard_geometry(self, shard_name: str) -> Tuple[int, int]:
+        """Return effective (world size, rank) for one checkpoint shard."""
+        if shard_name == "q":
+            return self.tp_size, self.tp_rank
+        if shard_name == "index_k":
+            return 1, 0
+
+        total_heads = (
+            self.total_num_index_heads if shard_name == "index_q" else self.total_num_kv_heads
+        )
+        if self.tp_size <= total_heads:
+            return self.tp_size, self.tp_rank
+        replicas = self.tp_size // total_heads
+        return total_heads, self.tp_rank // replicas
+
+    def load_five_way_weights(self, shards: Dict[str, Dict]) -> None:
+        """Load five checkpoint projections into this rank's packed MXFP8 matrix."""
+        local_shards: Dict[str, Dict[str, torch.Tensor]] = {}
+        for shard_name in self._SHARD_NAMES:
+            shard = shards[shard_name]
+            if "weight" not in shard:
+                raise KeyError(f"Missing {shard_name} projection weight.")
+            shard_world, shard_rank = self._shard_geometry(shard_name)
+            local = {}
+            for key in ("weight", "weight_scale_inv", "weight_scale", "bias"):
+                if key in shard:
+                    local[key] = load_weight_shard(
+                        shard[key],
+                        shard_world,
+                        shard_rank,
+                        TensorParallelMode.COLUMN,
+                        device=torch.device("cuda"),
+                    )
+            local_shards[shard_name] = local
+
+        combined: Dict[str, torch.Tensor] = {
+            "weight": torch.cat(
+                [local_shards[name]["weight"] for name in self._SHARD_NAMES], dim=0
+            ).contiguous()
+        }
+        for key in ("weight_scale_inv", "weight_scale", "bias"):
+            present = [key in local_shards[name] for name in self._SHARD_NAMES]
+            if any(present):
+                if not all(present):
+                    raise KeyError(f"Incomplete {key} across fused QKV+index shards.")
+                combined[key] = torch.cat(
+                    [local_shards[name][key] for name in self._SHARD_NAMES], dim=0
+                ).contiguous()
+
+        # The checkpoint tensors above are already rank-local and packed.
+        # Temporarily select vanilla loading so Linear copies them without a
+        # second TP split or the three-shard QKV loader.
+        saved_tp_size = self.tp_size
+        saved_tp_rank = self.tp_rank
+        saved_tp_mode = self.tp_mode
+        saved_loading_config = self.weights_loading_config
+        try:
+            self.tp_size = 1
+            self.tp_rank = 0
+            self.tp_mode = None
+            self.weights_loading_config = WeightsLoadingConfig(weight_mode=WeightMode.VANILLA)
+            self.load_weights([combined])
+        finally:
+            self.tp_size = saved_tp_size
+            self.tp_rank = saved_tp_rank
+            self.tp_mode = saved_tp_mode
+            self.weights_loading_config = saved_loading_config
+
 
 # ---------------------------------------------------------------------------
 # Config normalization helpers
@@ -723,6 +888,7 @@ class MiniMaxM3Attention(Attention):
             and quant_config.quant_mode is not None
             and quant_config.quant_mode.has_fp8_kv_cache()
         )
+        self.enable_fused_main_kv_write = os.environ.get(_FUSED_MAIN_KV_WRITE_ENV, "0") == "1"
 
         # Per-head Gemma RMSNorm — one set of weights shared across heads.
         self.q_norm = RMSNorm(
@@ -749,9 +915,16 @@ class MiniMaxM3Attention(Attention):
 
         self.is_sparse_attention_layer = bool(is_sparse_attention_layer)
         self.disable_index_value = bool(disable_index_value)
+        sparse_runtime_cfg = getattr(model_config, "sparse_attention_config", None)
+        self.enable_fused_qkv_index_projection = bool(
+            self.is_sparse_attention_layer
+            and sparse_runtime_cfg is not None
+            and getattr(sparse_runtime_cfg, "fuse_qkv_index_projection", False)
+        )
         if self.is_sparse_attention_layer:
             sparse_cfg = getattr(config, "sparse_attention_config", None) or {}
-            self.sparse_num_index_heads = int(sparse_cfg.get("sparse_num_index_heads", 4))
+            total_num_index_heads = int(sparse_cfg.get("sparse_num_index_heads", 4))
+            self.sparse_num_index_heads = total_num_index_heads
             self.sparse_index_dim = int(sparse_cfg.get("sparse_index_dim", 128))
             self.sparse_block_size = int(sparse_cfg.get("sparse_block_size", 128))
             self.sparse_topk_blocks = int(sparse_cfg.get("sparse_topk_blocks", 16))
@@ -759,25 +932,44 @@ class MiniMaxM3Attention(Attention):
             self.sparse_local_block = int(sparse_cfg.get("sparse_local_block", 1))
             self.sparse_score_type = str(sparse_cfg.get("sparse_score_type", "max"))
 
-            # Index Q and K are both replicated (no head sharding) and project
-            # the same hidden_states, so fuse them into one index_qk_proj GEMM
-            # with output [idx_q | idx_k]. idx_q holds all num_index_heads heads;
-            # idx_k is a single K per token, broadcast across heads when scoring.
+            if self.enable_fused_qkv_index_projection:
+                old_qkv_proj = self.qkv_proj
+                self.qkv_proj = MiniMaxM3QKVIndexerLinear(
+                    hidden_size=config.hidden_size,
+                    head_dim=self.head_dim,
+                    total_num_heads=config.num_attention_heads,
+                    total_num_kv_heads=config.num_key_value_heads,
+                    total_num_index_heads=total_num_index_heads,
+                    index_head_dim=self.sparse_index_dim,
+                    dtype=config.torch_dtype,
+                    mapping=old_qkv_proj.mapping,
+                    quant_config=old_qkv_proj.quant_config,
+                    skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                    force_dynamic_quantization=old_qkv_proj.force_dynamic_quantization,
+                    disable_deep_gemm=old_qkv_proj.disable_deep_gemm,
+                    use_custom_cublas_mm=old_qkv_proj.use_custom_cublas_mm,
+                    use_cute_dsl_blockscaling_mm=old_qkv_proj.use_cute_dsl_blockscaling_mm,
+                )
+                self.sparse_num_index_heads = self.qkv_proj.local_num_index_heads
+            else:
+                # The compatibility path keeps index Q and K replicated and
+                # emits them from a separate GEMM.
+                self.index_qk_proj = Linear(
+                    config.hidden_size,
+                    total_num_index_heads * self.sparse_index_dim + self.sparse_index_dim,
+                    bias=False,
+                    dtype=config.torch_dtype,
+                    mapping=model_config.mapping,
+                    tensor_parallel_mode=None,
+                    quant_config=None,
+                    weights_loading_config=WeightsLoadingConfig(
+                        weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
+                    ),
+                    skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                )
+
             self.index_q_size = self.sparse_num_index_heads * self.sparse_index_dim
             self.index_k_size = self.sparse_index_dim
-            self.index_qk_proj = Linear(
-                config.hidden_size,
-                self.index_q_size + self.index_k_size,
-                bias=False,
-                dtype=config.torch_dtype,
-                mapping=model_config.mapping,
-                tensor_parallel_mode=None,
-                quant_config=None,
-                weights_loading_config=WeightsLoadingConfig(
-                    weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
-                ),
-                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
-            )
             # Per-head Gemma RMSNorm of width ``sparse_index_dim``;
             # applied to the projected index Q/K before partial RoPE in
             # the sparse forward path.
@@ -1019,6 +1211,207 @@ class MiniMaxM3Attention(Attention):
             position_ids.reshape(-1).contiguous().to(torch.int32),
         ).flatten(1)
 
+    def _fused_fp8_main_qk_norm_rope_kv_insert(
+        self,
+        qkv: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> Optional[torch.Tensor]:
+        """Produce compact FP8 Q and insert main K/V into their final cache.
+
+        This path is intentionally narrower than the #16755 fused Triton
+        scatter. Unsupported decode, mixed, CUDA-graph, BF16-cache, or layout
+        cases return ``None`` and retain that general producer-plus-scatter
+        path unchanged. Sparse index-K remains owned by the existing FP8 index
+        producer and is not handled by this main-QKV kernel.
+        """
+        if not self.enable_fused_main_kv_write or not self._emit_fp8_main_qkv():
+            return None
+        if (
+            is_torch_compiling()
+            or getattr(attn_metadata, "is_cuda_graph", False)
+            or int(getattr(attn_metadata, "num_generations", 0)) != 0
+            or int(getattr(attn_metadata, "num_contexts", 0)) == 0
+            or int(qkv.shape[0]) != int(attn_metadata.num_tokens)
+        ):
+            return None
+        if (
+            qkv.dtype != torch.bfloat16
+            or position_ids is None
+            or self.head_dim != 128
+            or not self.use_gemma_norm
+            or self.pos_embd_params is None
+            or not self.pos_embd_params.is_neox
+            or self.rotary_emb is None
+            or self.pos_embd_params.rope is None
+            or int(self.pos_embd_params.rope.dim) != 64
+            or self.q_norm.weight.dtype != torch.bfloat16
+            or self.k_norm.weight.dtype != torch.bfloat16
+        ):
+            return None
+        # Sparse layers must leave index-K ownership with the #16742 direct
+        # FP8 producer. Do not create a second write path for BF16 index-K.
+        if self.is_sparse_attention_layer and self.attn.indexer_kv_dtype != "fp8":
+            return None
+
+        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+        if kv_cache_manager is None:
+            return None
+        buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
+        if buffers is None:
+            return None
+        expected_head_stride = 128 * 128
+        supported_hnd = (
+            buffers.is_cuda
+            and buffers.dtype == torch.float8_e4m3fn
+            and buffers.dim() == 5
+            and int(buffers.shape[0]) > 0
+            and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 128)
+            and buffers.stride(4) == 1
+            and buffers.stride(3) == 128
+            and buffers.stride(2) == expected_head_stride
+            and buffers.stride(1) >= self.num_key_value_heads * expected_head_stride
+            and buffers.stride(0) >= 2 * buffers.stride(1)
+            and buffers.stride(0) % 4 == 0
+            and buffers.stride(1) % 4 == 0
+        )
+        out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
+        num_tokens = int(qkv.shape[0])
+        if (
+            not supported_hnd
+            or out_cache_loc is None
+            or not out_cache_loc.is_cuda
+            or out_cache_loc.dtype != torch.int32
+            or out_cache_loc.dim() != 1
+            or not out_cache_loc.is_contiguous()
+            or out_cache_loc.numel() < num_tokens
+        ):
+            return None
+
+        q = torch.ops.trtllm.minimax_m3_fp8_qk_norm_rope_kv_insert(
+            qkv.contiguous(),
+            buffers,
+            out_cache_loc[:num_tokens],
+            self.num_heads,
+            self.num_key_value_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            64,
+            self.q_norm.variance_epsilon,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.pos_embd_params.rope.theta,
+            True,
+            position_ids.reshape(-1).contiguous().to(torch.int32),
+        ).flatten(1)
+        # #16755 consumes this marker in run_msa_paged_gqa. It also lets the
+        # model core distinguish the direct producer from the general path and
+        # skip only this layer's fused Triton K/V scatter.
+        attn_metadata._msa_prewritten_layer = self.attn.layer_idx
+        return q
+
+    def _fused_fp8_qkv_indexer_norm_rope_kv_insert(
+        self,
+        packed: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Run the vLLM-style horizontal sparse producer for pure prefill."""
+        if (
+            not self.enable_fused_qkv_index_projection
+            or not isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+            or not self._emit_fp8_main_qkv()
+            or self.attn.indexer_kv_dtype != "fp8"
+        ):
+            return None
+        if (
+            is_torch_compiling()
+            or getattr(attn_metadata, "is_cuda_graph", False)
+            or int(getattr(attn_metadata, "num_generations", 0)) != 0
+            or int(getattr(attn_metadata, "num_contexts", 0)) == 0
+            or int(packed.shape[0]) != int(attn_metadata.num_tokens)
+        ):
+            return None
+        if (
+            packed.dtype != torch.bfloat16
+            or position_ids is None
+            or self.head_dim != 128
+            or self.sparse_index_dim != 128
+            or self.sparse_num_index_heads != self.num_key_value_heads
+            or not self.use_gemma_norm
+            or self.pos_embd_params is None
+            or not self.pos_embd_params.is_neox
+            or self.rotary_emb is None
+            or self.pos_embd_params.rope is None
+            or int(self.pos_embd_params.rope.dim) != 64
+        ):
+            return None
+
+        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+        if kv_cache_manager is None:
+            return None
+        buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
+        index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+        out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
+        num_tokens = int(packed.shape[0])
+        supported_main_cache = (
+            buffers is not None
+            and buffers.is_cuda
+            and buffers.dtype == torch.float8_e4m3fn
+            and buffers.dim() == 5
+            and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 128)
+            and buffers.stride(4) == 1
+            and buffers.stride(3) == 128
+        )
+        supported_index_cache = (
+            index_k_cache.is_cuda
+            and index_k_cache.dtype == torch.float8_e4m3fn
+            and index_k_cache.dim() == 4
+            and tuple(index_k_cache.shape[1:]) == (1, 128, 128)
+            and index_k_cache.stride(3) == 1
+            and index_k_cache.stride(2) == 128
+        )
+        rotary_cos_sin = self.rotary_emb.rotary_cos_sin
+        supported_rope_cache = (
+            rotary_cos_sin.is_cuda
+            and rotary_cos_sin.dtype == torch.float32
+            and rotary_cos_sin.is_contiguous()
+            and rotary_cos_sin.dim() == 3
+            and tuple(rotary_cos_sin.shape[1:]) == (2, 32)
+        )
+        if (
+            not supported_main_cache
+            or not supported_index_cache
+            or not supported_rope_cache
+            or out_cache_loc is None
+            or not out_cache_loc.is_cuda
+            or out_cache_loc.dtype != torch.int32
+            or not out_cache_loc.is_contiguous()
+            or out_cache_loc.numel() < num_tokens
+        ):
+            return None
+
+        q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
+            packed.contiguous(),
+            buffers,
+            index_k_cache,
+            out_cache_loc[:num_tokens],
+            self.num_heads,
+            self.num_key_value_heads,
+            self.sparse_num_index_heads,
+            self.head_dim,
+            64,
+            self.q_norm.variance_epsilon,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+            rotary_cos_sin,
+            position_ids.reshape(-1).contiguous().to(torch.int32),
+        )
+        attn_metadata._msa_prewritten_layer = self.attn.layer_idx
+        return q.flatten(1), index_q.flatten(1)
+
     def _expect_fused_qk_norm_rope(self, position_ids: Optional[torch.Tensor]) -> bool:
         """Whether the fused path must run rather than fall back.
 
@@ -1179,30 +1572,34 @@ class MiniMaxM3Attention(Attention):
         # Per-head Gemma RMSNorm and partial RoPE on Q/K. The bf16 fast
         # path fuses both into one kernel over the fused qkv; otherwise fall
         # back to separate norm and RoPE.
-        fused_qkv = self._fused_qk_norm_rope(
-            qkv,
-            position_ids,
-            num_heads_q=self.num_heads,
-            num_heads_k=self.num_key_value_heads,
-            num_heads_v=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            out_fp8=self._emit_fp8_main_qkv(),
-        )
-        if fused_qkv is not None:
-            q, k, v = self._split_main_qkv(fused_qkv)
+        fused_q = self._fused_fp8_main_qk_norm_rope_kv_insert(qkv, position_ids, attn_metadata)
+        if fused_q is not None:
+            q, k, v = fused_q, None, None
         else:
-            assert not self._expect_fused_qk_norm_rope(position_ids), (
-                f"MiniMax-M3 dense attention (layer {self.layer_idx}) expected the "
-                f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
-                f"{self.head_dim}) but fell back to the separate path; qkv dtype "
-                f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+            fused_qkv = self._fused_qk_norm_rope(
+                qkv,
+                position_ids,
+                num_heads_q=self.num_heads,
+                num_heads_k=self.num_key_value_heads,
+                num_heads_v=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                out_fp8=self._emit_fp8_main_qkv(),
             )
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self.apply_qk_norm(q, k)
-            if self.rotary_emb is not None and position_ids is not None:
-                q, k = self.rotary_emb(position_ids, [q, k])
+            if fused_qkv is not None:
+                q, k, v = self._split_main_qkv(fused_qkv)
+            else:
+                assert not self._expect_fused_qk_norm_rope(position_ids), (
+                    f"MiniMax-M3 dense attention (layer {self.layer_idx}) expected the "
+                    f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
+                    f"{self.head_dim}) but fell back to the separate path; qkv dtype "
+                    f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q, k = self.apply_qk_norm(q, k)
+                if self.rotary_emb is not None and position_ids is not None:
+                    q, k = self.rotary_emb(position_ids, [q, k])
 
         # Keep token-wise projections and the output projection visible to
         # torch.compile. Only the metadata/cache-dependent attention core is
@@ -1416,8 +1813,8 @@ class MiniMaxM3Attention(Attention):
     def _forward_attention_core(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
         idx_q: Optional[torch.Tensor],
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
@@ -1445,8 +1842,8 @@ class MiniMaxM3Attention(Attention):
     def _dispatch_attention_backend(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
         idx_q: Optional[torch.Tensor],
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
@@ -1465,6 +1862,7 @@ class MiniMaxM3Attention(Attention):
         """
         if isinstance(self.attn, MiniMaxM3MsaSparseAttention):
             return self._msa_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+        assert k is not None and v is not None
         if self.is_sparse_attention_layer:
             assert idx_q is not None and idx_k is not None
             return self._triton_sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
@@ -1474,8 +1872,8 @@ class MiniMaxM3Attention(Attention):
     def _msa_attention_core(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
         idx_q: Optional[torch.Tensor],
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
@@ -1487,29 +1885,36 @@ class MiniMaxM3Attention(Attention):
         inherited FMHA forward; this layer selects the top-k blocks (sparse
         only) and builds the ``forward_args`` the FMHA reads.
         """
+        prewritten_main_kv = k is None or v is None
+        assert (k is None) == (v is None)
+        if prewritten_main_kv:
+            assert attn_metadata._msa_prewritten_layer == self.attn.layer_idx
+
         if self.is_sparse_attention_layer:
             assert idx_q is not None
-            # One launch writes this layer's K/V and, on the bf16 path, index-K,
-            # ahead of the proxy pass that reads the index-K cache. On the FP8
-            # indexer path idx_k is None because the fused producer already
-            # inserted FP8 index-K into the side cache; the fused write then
-            # stores K/V only.
-            attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v, idx_k)
+            if not prewritten_main_kv:
+                # General #16755 path: one Triton launch writes this layer's
+                # K/V and, on the BF16 path, index-K.
+                attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v, idx_k)
             # Publish the selected blocks so the FMHA runs the sparse path.
-            # idx_k_prewritten marks that index-K is already in the cache (via
-            # the fused write above on bf16, or the FP8 producer when idx_k is
-            # None), so run_indexer must not write it again.
             kv_block_indexes = self.attn.run_indexer(
-                idx_q, idx_k, attn_metadata, idx_k_prewritten=True
+                idx_q,
+                idx_k,
+                attn_metadata,
+                idx_k_prewritten=(not prewritten_main_kv or idx_k is None),
             )
             forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
         else:
             assert idx_q is None and idx_k is None
-            # Dense layers get the same fused K/V write.
-            attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v)
+            if not prewritten_main_kv:
+                # Dense layers retain the same general #16755 K/V scatter.
+                attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v)
             # No top-k selection means the FMHA attends the full page table.
             forward_args = AttentionForwardArgs(output=output)
-        self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
+        if prewritten_main_kv:
+            self.attn.forward_prepopulated_kv(q, attn_metadata, forward_args)
+        else:
+            self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
         return output
 
     def _sparse_forward(
@@ -1567,8 +1972,27 @@ class MiniMaxM3Attention(Attention):
         # only hidden_states and write disjoint outputs, so each runs its
         # projection, norm, and RoPE concurrently on the aux stream when
         # multi-stream is enabled, joining before the attention core.
+        packed_qkv = None
+        packed_idx_qk = None
+        if self.enable_fused_qkv_index_projection:
+            packed = self.qkv_proj(hidden_states)
+            horizontal = self._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+                packed, position_ids, attn_metadata
+            )
+            if horizontal is not None:
+                q, idx_q = horizontal
+                o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
+                return self.o_proj(o, all_reduce_params=all_reduce_params)
+            main_size = self.q_size + 2 * self.kv_size
+            packed_qkv, packed_idx_qk = packed.split(
+                [main_size, self.index_q_size + self.index_k_size], dim=-1
+            )
+
         def _main_norm_rope():
-            qkv = self.qkv_proj(hidden_states)
+            qkv = packed_qkv if packed_qkv is not None else self.qkv_proj(hidden_states)
+            fused_q = self._fused_fp8_main_qk_norm_rope_kv_insert(qkv, position_ids, attn_metadata)
+            if fused_q is not None:
+                return fused_q, None, None
             fused_qkv = self._fused_qk_norm_rope(
                 qkv,
                 position_ids,
@@ -1595,7 +2019,9 @@ class MiniMaxM3Attention(Attention):
             return q, k, v
 
         def _index_norm_rope():
-            idx_qk = self.index_qk_proj(hidden_states)
+            idx_qk = (
+                packed_idx_qk if packed_idx_qk is not None else self.index_qk_proj(hidden_states)
+            )
             fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
             if fp8_idx_q is not None:
                 # Index-K was inserted directly into the paged side cache.
@@ -2123,6 +2549,32 @@ def _load_index_qk_proj_weights(model: nn.Module, weights) -> None:
                     del weights[key]
 
 
+def _load_qkv_index_proj_weights(model: nn.Module, weights) -> List[str]:
+    """Pack five checkpoint shards and return generic-loader module skips."""
+    checkpoint_names = ("q_proj", "k_proj", "v_proj", "index_q_proj", "index_k_proj")
+    shard_names = MiniMaxM3QKVIndexerLinear._SHARD_NAMES
+    loaded_modules = []
+    for name, module in model.named_modules():
+        if not isinstance(module, MiniMaxM3QKVIndexerLinear):
+            continue
+        parent = name.rsplit(".", 1)[0]
+        shards = {
+            shard_name: filter_weights(f"{parent}.{checkpoint_name}", weights)
+            for shard_name, checkpoint_name in zip(shard_names, checkpoint_names)
+        }
+        module.load_five_way_weights(shards)
+        loaded_modules.append(name)
+        for checkpoint_name in checkpoint_names:
+            prefix = f"{parent}.{checkpoint_name}"
+            if hasattr(weights, "mark_consumed"):
+                weights.mark_consumed(prefix)
+            else:
+                for key in list(weights.keys()):
+                    if key.startswith(f"{prefix}."):
+                        del weights[key]
+    return loaded_modules
+
+
 # Layer-boundary RMSNorms whose Gemma (1 + weight) scaling is folded into the
 # stored weight at load time so the runtime norm is a plain RMSNorm (see
 # MiniMaxM3DecoderLayer.__init__ / MiniMaxM3Model.__init__). These are exactly
@@ -2177,8 +2629,10 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         params_map: Optional[Dict[str, str]] = None,
         allow_partial_loading: bool = False,
     ) -> None:
-        # Fuse index_q/index_k into each index_qk_proj module (also covers
-        # the VL path, which routes text weights through here).
+        # The opt-in vLLM-style path packs all five projections with
+        # MiniMax-specific TP sharding. The compatibility path fuses only the
+        # replicated index Q/K pair.
+        packed_projection_modules = _load_qkv_index_proj_weights(self, weights)
         _load_index_qk_proj_weights(self, weights)
         # Fold Gemma (1 + weight) into the layer-boundary RMSNorm weights so the
         # runtime norms can be plain (non-Gemma) and drive the fused
@@ -2188,6 +2642,11 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             weights = _fold_gemma_boundary_norm_weights(weights)
         if weight_mapper is None:
             weight_mapper = MiniMaxM3HfWeightMapper()
+        # These five-way modules were loaded above with model-specific
+        # Q/K/V/index-Q/index-K sharding. The generic HF mapper only knows
+        # three-way Q/K/V fusion; after the source keys are marked consumed it
+        # would still invoke that callback with three empty dictionaries.
+        weight_mapper.add_skip_modules(packed_projection_modules)
         weight_mapper.init_model_and_config(self, self.model_config)
         merged_params_map = {**MINIMAX_M3_PARAMS_MAP, **(params_map or {})}
         super().load_weights(

@@ -479,14 +479,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         params = self._msa_params
         if params is not None:
             fmha_sm100 = require_msa_module()
+            num_index_heads = params.sharded_index_head_count(self.mapping)
             max_k_tiles = _worst_case_proxy_max_k_tiles(
                 fmha_sm100,
-                num_index_heads=params.num_index_heads,
+                num_index_heads=num_index_heads,
                 kv_cache_manager=kv_cache_manager,
                 max_batch=max_num_sequences,
             )
             self._alloc_msa_proxy_scratch(
-                num_index_heads=params.num_index_heads,
+                num_index_heads=num_index_heads,
                 max_tokens=self._msa_max_decode_tokens(),
                 max_k_tiles=max_k_tiles,
                 capture_graph=capture_graph,
@@ -747,7 +748,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         params = self._msa_params
         if params is None:
             return
-        num_index_heads = params.num_index_heads
+        num_index_heads = params.sharded_index_head_count(self.mapping)
         num_q_heads, num_kv_heads = params.sharded_head_counts(self.mapping)
         topk = params.topk
 
@@ -1162,6 +1163,9 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         if idx_k is not None and not idx_k_prewritten:
             idx_k_view = idx_k.reshape(num_tokens, 1, config.sparse_index_dim)
             metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
+            # Lightweight metadata implementations may install their cache on
+            # first write, so refresh the handle before the proxy reads it.
+            idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
         elif idx_k is None and (
             idx_k_cache.dtype != torch.float8_e4m3fn or idx_q_view.dtype != torch.float8_e4m3fn
         ):
@@ -1236,6 +1240,48 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         forward_args: "AttentionForwardArgs",
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         return None, None
+
+    def forward_prepopulated_kv(
+        self,
+        q: torch.Tensor,
+        metadata: MiniMaxM3MsaSparseAttentionMetadata,
+        forward_args: "AttentionForwardArgs",
+    ) -> None:
+        """Run MSA after the eager-prefill producer inserted main K/V.
+
+        ``TrtllmAttention.forward`` interprets ``k=None`` as a fused QKV
+        buffer, so it cannot represent compact Q with prewritten paged K/V.
+        Dispatch the same MSA paged-GQA helper directly; the #16755 prewritten
+        marker is consumed there exactly as on its general scatter path.
+        """
+        output = forward_args.output
+        if output is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.forward_prepopulated_kv requires an output buffer."
+            )
+
+        kv_block_indexes = forward_args.topk_indices
+        if kv_block_indexes is not None:
+            plan = metadata.msa_decode_gqa_plan
+            if plan is None:
+                plan = metadata.msa_eager_gqa_plan
+        else:
+            plan = metadata.msa_decode_dense_plan
+            if plan is None:
+                plan = metadata.msa_eager_dense_plan
+
+        from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_paged_gqa
+
+        run_msa_paged_gqa(
+            self,
+            q,
+            None,
+            None,
+            metadata,
+            output,
+            kv_block_indexes=kv_block_indexes,
+            plan=plan,
+        )
 
 
 __all__ = [
