@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,13 @@
 
 #include <string.h>
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <numaif.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include "gdrwrap.h"
 #include "hostAccessibleDeviceAllocator.h"
@@ -32,6 +34,58 @@
 
 namespace tensorrt_llm::runtime
 {
+
+namespace
+{
+
+//! Probe whether this process may actually bind pages to \p numaNodeId.
+//! Reporting a usable GPU-memory NUMA node is not enough: mbind(MPOL_BIND) also requires
+//! CAP_SYS_NICE, which restricted containers may drop. Without this probe the allocator
+//! commits to the NUMA huge-page path and only fails once it is too late to fall back.
+bool probeNumaBindAllowed(int numaNodeId)
+{
+    size_t const probeSize = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void* probeAddr = mmap(nullptr, probeSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (probeAddr == MAP_FAILED)
+    {
+        return false;
+    }
+    unsigned long nodemask = 1UL << numaNodeId;
+    bool allowed = mbind(probeAddr, probeSize, MPOL_BIND, &nodemask, sizeof(nodemask) * 8, 0) == 0;
+    if (!allowed)
+    {
+        TLLM_LOG_WARNING(
+            "mbind to NUMA node %d is not permitted (errno=%d: %s). Host accessible device memory will not use the "
+            "NUMA huge page pool.",
+            numaNodeId, errno, strerror(errno));
+    }
+    munmap(probeAddr, probeSize);
+    return allowed;
+}
+
+//! NUMA id of the current GPU's memory, or -1 if there is none or it cannot be bound to.
+//! The NUMA id is queried per call because it depends on the current CUDA device, while the
+//! probe result is memoized per node so the answer stays consistent across
+//! isSupported()/init()/maybeInit() without repeating the syscalls on every allocation.
+int getUsableGpuMemNumaId()
+{
+    int const numaNodeId = TopologyDetector::getInstance().getCurrentGpuMemoryNumaId();
+    if (numaNodeId < 0)
+    {
+        return -1;
+    }
+    static std::mutex probeMutex;
+    static std::map<int, bool> probeCache;
+    std::lock_guard<std::mutex> lock(probeMutex);
+    auto it = probeCache.find(numaNodeId);
+    if (it == probeCache.end())
+    {
+        it = probeCache.emplace(numaNodeId, probeNumaBindAllowed(numaNodeId)).first;
+    }
+    return it->second ? numaNodeId : -1;
+}
+
+} // namespace
 
 class NumaHugePagePoolAllocator
 {
@@ -146,7 +200,7 @@ void NumaHugePagePoolAllocator::maybeInit()
     }
 
     TLLM_CUDA_CHECK(cudaGetDevice(&mDevId));
-    mGpuMemNumaId = TopologyDetector::getInstance().getCurrentGpuMemoryNumaId();
+    mGpuMemNumaId = getUsableGpuMemNumaId();
     TLLM_CHECK_WITH_INFO(mGpuMemNumaId >= 0, "NUMA memory not supported.");
     // allocate a range of virtual address
     mMmapBasePtr = static_cast<uint8_t*>(
@@ -170,8 +224,7 @@ bool HostAccessibleDeviceAllocator::mAllowManagedFallback = false;
 
 bool HostAccessibleDeviceAllocator::isSupported()
 {
-    if (!tensorrt_llm::common::getEnvEplbForceGdrcopy()
-        && TopologyDetector::getInstance().getCurrentGpuMemoryNumaId() >= 0)
+    if (!tensorrt_llm::common::getEnvEplbForceGdrcopy() && getUsableGpuMemNumaId() >= 0)
     {
         // we are on systems that GPU memory is also a NUMA node.
         return true;
@@ -204,7 +257,7 @@ void HostAccessibleDeviceAllocator::init()
     }
     else
     {
-        mGpuMemNumaId = TopologyDetector::getInstance().getCurrentGpuMemoryNumaId();
+        mGpuMemNumaId = getUsableGpuMemNumaId();
     }
 
     if (mGpuMemNumaId < 0)

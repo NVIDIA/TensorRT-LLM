@@ -512,12 +512,23 @@ void SingleLayerMoeLoadBalancer::createResources()
 
 void SingleLayerMoeLoadBalancer::destroyResources()
 {
+    // Runs from the destructor, so it must tolerate a partially-constructed object: if
+    // createResources() threw, destroying a resource it never created would throw during
+    // unwinding and terminate the process, hiding the original failure.
     mWeightUpdater.reset();
     freeStatisticInfo(&mStatisticInfo);
     freePlacementInfo(&mCpuPlacementInfo.placementInfoForGPU, true);
     freePlacementInfo(&mGpuPlacementGpuAccess, false);
-    freeSingleLayerSignal(mSingleLayerSignal);
-    TLLM_CUDA_CHECK(cudaEventDestroy(mUpdateWeightsDoneEvent));
+    if (mSingleLayerSignal != nullptr)
+    {
+        freeSingleLayerSignal(mSingleLayerSignal);
+        mSingleLayerSignal = nullptr;
+    }
+    if (mUpdateWeightsDoneEvent != nullptr)
+    {
+        TLLM_CUDA_CHECK(cudaEventDestroy(mUpdateWeightsDoneEvent));
+        mUpdateWeightsDoneEvent = nullptr;
+    }
 }
 
 void SingleLayerMoeLoadBalancer::finalizeModel()
