@@ -460,6 +460,10 @@ class MultimodalModelMixin:
           `[total_patches, feat]` + `image_grid_thw` `[B, 3]`; prefix-summed patch
           counts locate each item's slice, and `image_grid_thw` is sliced in parallel.
 
+        Any additional sibling field in the modality dict whose first-axis length equals
+        the item count is also sliced -- covers per-item metadata such as
+        `second_per_grid_ts` on Qwen2.5-VL video without model-specific code.
+
         Models with a different layout (e.g. mixed-modality per param, custom packed
         formats) override this method. The parallel per-item metadata
         (`multimodal_embedding_lengths`, `multimodal_hashes`) is re-sliced by the mixin
@@ -485,10 +489,10 @@ class MultimodalModelMixin:
             # Packed layout: prefix-sum patch counts to locate each item's slab, then
             # concat the requested subset in item-index order.
             grids = modality_data[grid_key]
+            n_items = grids.shape[0]
             patch_counts = [int(c) for c in torch.prod(grids, dim=1).tolist()]
             per_item = torch.split(modality_data[pixel_key], patch_counts, dim=0)
             sliced = {
-                **modality_data,
                 pixel_key: torch.cat([per_item[i] for i in indices], dim=0),
                 grid_key: grids[indices],
             }
@@ -498,8 +502,8 @@ class MultimodalModelMixin:
             and "image_sizes" in modality_data
         ):
             # Stacked layout: dim-0 select from `pixel_values` and list-index `image_sizes`.
+            n_items = modality_data["pixel_values"].shape[0]
             sliced = {
-                **modality_data,
                 "pixel_values": modality_data["pixel_values"][indices],
                 "image_sizes": [modality_data["image_sizes"][i] for i in indices],
             }
@@ -508,6 +512,15 @@ class MultimodalModelMixin:
                 f"Default `build_multimodal_encoder_input` cannot slice {modality} layout "
                 f"with fields {sorted(modality_data)}; override this method."
             )
+
+        # Sibling per-item fields (e.g. `second_per_grid_ts` on Qwen2.5-VL video)
+        # must be sliced alongside the load-bearing keys above, or the residual
+        # carries a shape-mismatched encoder input.
+        sliced = {
+            **modality_data,
+            **sliced,
+            **self._slice_per_item_sibling_fields(modality_data, n_items, indices, sliced.keys()),
+        }
 
         # Shallow-copy `multimodal_input` so `_apply_metadata_slice` can rewrite
         # `multimodal_hashes` on the residual without mutating the source.
@@ -518,6 +531,30 @@ class MultimodalModelMixin:
             multimodal_data={**param.multimodal_data, modality: sliced},
             multimodal_input=residual_input,
         )
+
+    @staticmethod
+    def _slice_per_item_sibling_fields(
+        modality_data: Dict[str, Any],
+        n_items: int,
+        item_indices: Sequence[int],
+        already_sliced: Iterable[str],
+    ) -> Dict[str, Any]:
+        """Slice modality-dict siblings whose first axis is parallel to items.
+
+        Anything with `shape[0] == n_items` (tensor) or `len == n_items` (list) is
+        assumed to be per-item metadata and sliced by `item_indices`. Fields already
+        handled by the caller (`already_sliced`) and everything else pass through.
+        """
+        skip = set(already_sliced)
+        sliced: Dict[str, Any] = {}
+        for key, value in modality_data.items():
+            if key in skip:
+                continue
+            if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == n_items:
+                sliced[key] = value[item_indices]
+            elif isinstance(value, list) and len(value) == n_items:
+                sliced[key] = [value[i] for i in item_indices]
+        return sliced
 
     # A future optional mixin-owned forward can build on the same template method.
     def prepare_multimodal_inputs(
@@ -849,6 +886,14 @@ class MultimodalModelMixin:
         cached.
         """
         for param, partition in partials:
+            # Cross-iter prefetch may have staged this request's raw MM tensors on the
+            # aux stream. If its own encoder call then raised, the request reaches this
+            # iteration with an `encoder_event` but no `multimodal_embedding`; slicing
+            # those tensors on the main stream before the event would race the aux-stream
+            # H2D copy. Mirror the wait `get_multimodal_embeddings` does downstream.
+            if param.encoder_event is not None:
+                torch.cuda.current_stream().wait_event(param.encoder_event)
+
             residual = self.build_multimodal_encoder_input(param, partition.miss_indices)
             self._apply_metadata_slice(residual, param, partition.miss_indices)
 

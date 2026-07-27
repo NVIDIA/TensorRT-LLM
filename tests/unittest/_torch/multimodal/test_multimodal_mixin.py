@@ -557,9 +557,13 @@ def test_assemble_full_embedding_preserves_item_order():
 
 def test_build_multimodal_encoder_input_slices_packed_grid_thw():
     # Qwen-VL-style layout: `pixel_values` is a single packed tensor sized by the
-    # cumulative patch counts declared in `image_grid_thw`.
+    # cumulative patch counts declared in `image_grid_thw`. `second_per_grid_ts`
+    # stands in for any per-item sibling field (e.g. Qwen2.5-VL video timing) that
+    # must stay in sync with the sliced items; `per_request_scalar` stands in for
+    # non-per-item siblings that must pass through unchanged.
     grids = torch.tensor([[1, 1, 2], [1, 1, 3], [1, 1, 1]])  # 2 + 3 + 1 patches
     pixels = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    per_item_meta = torch.tensor([0.1, 0.2, 0.3])
     param = MultimodalParams(
         multimodal_input=MultimodalInput(
             multimodal_hashes=[[i] * 8 for i in range(3)],
@@ -567,7 +571,13 @@ def test_build_multimodal_encoder_input_slices_packed_grid_thw():
             multimodal_lengths=[2, 3, 1],
         ),
         multimodal_data={
-            "image": {"pixel_values": pixels, "image_grid_thw": grids},
+            "image": {
+                "pixel_values": pixels,
+                "image_grid_thw": grids,
+                "second_per_grid_ts": per_item_meta,
+                "per_item_list": ["a", "b", "c"],
+                "per_request_scalar": torch.tensor(42.0),
+            },
             "multimodal_embedding_lengths": [2, 3, 1],
             "mm_processor_kwargs_hash": "kw",
         },
@@ -577,12 +587,15 @@ def test_build_multimodal_encoder_input_slices_packed_grid_thw():
     residual = model.build_multimodal_encoder_input(param, [2, 0])
 
     # Item 2 spans rows [5], item 0 spans rows [0, 1]; residual concatenates them in
-    # the requested item order.
+    # the requested item order and slices every parallel sibling the same way.
+    residual_image = residual.multimodal_data["image"]
     torch.testing.assert_close(
-        residual.multimodal_data["image"]["pixel_values"],
-        torch.cat([pixels[5:6], pixels[0:2]], dim=0),
+        residual_image["pixel_values"], torch.cat([pixels[5:6], pixels[0:2]], dim=0)
     )
-    torch.testing.assert_close(residual.multimodal_data["image"]["image_grid_thw"], grids[[2, 0]])
+    torch.testing.assert_close(residual_image["image_grid_thw"], grids[[2, 0]])
+    torch.testing.assert_close(residual_image["second_per_grid_ts"], per_item_meta[[2, 0]])
+    assert residual_image["per_item_list"] == ["c", "a"]
+    torch.testing.assert_close(residual_image["per_request_scalar"], torch.tensor(42.0))
 
 
 @pytest.mark.parametrize(
