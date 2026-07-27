@@ -89,6 +89,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     impl_class_for,
     resolve_moe_impl,
 )
+from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
@@ -195,6 +196,89 @@ def test_deep_ep_nvfp4_fused_output_scale_skips_standalone_scale_op(monkeypatch)
     assert call_args[3] is topk_idx
     assert call_args[4] is topk_weights
     assert call_args[5] is deep_ep_handle
+
+
+def test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fused_moe.moe_scheduler.get_calibrator",
+        lambda: SimpleNamespace(maybe_collect_or_replay_slots=lambda _num_slots, slots: slots),
+    )
+    x = torch.empty(4, 8, dtype=torch.bfloat16)
+    selected_slots = torch.zeros(4, 1, dtype=torch.int32)
+    final_scales = torch.ones(4, 1, dtype=torch.float32)
+    input_scale = torch.tensor(0.75, dtype=torch.float32)
+
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    comm.supports_post_quant_dispatch = MagicMock(return_value=True)
+    comm.should_fuse_bf16_nvfp4_dispatch = MagicMock(return_value=True)
+    comm.dispatch = MagicMock(return_value=(x, None, selected_slots, final_scales))
+    comm.combine = MagicMock(side_effect=lambda output, **_kwargs: output)
+
+    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend._weights_created = True
+    backend.fc31_input_scale = input_scale
+    backend._supports_load_balancer = MagicMock(return_value=False)
+    backend.quantize_input = MagicMock(
+        side_effect=AssertionError("standalone NVFP4 quantization must not run")
+    )
+    backend.run_moe = MagicMock(return_value=x)
+
+    moe = SimpleNamespace(
+        backend=backend,
+        comm=comm,
+        routing_method=SimpleNamespace(requires_separated_routing=False),
+        apply_router_weight_on_input=False,
+        layer_load_balancer=None,
+        layer_idx=0,
+        num_slots=1,
+        enable_dummy_allreduce=False,
+        enable_alltoall=False,
+        _using_load_balancer=MagicMock(return_value=False),
+        _load_balancer_start_wait_gpu_stage=MagicMock(),
+        _load_balancer_start_set_cpu_stage=MagicMock(),
+        _load_balancer_done_set_cpu_stage=MagicMock(),
+    )
+    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler.moe = moe
+
+    scheduler._forward_chunk_impl(
+        x,
+        torch.empty(4, 1),
+        torch.bfloat16,
+        [4],
+        False,
+        True,
+        True,
+    )
+
+    backend.quantize_input.assert_not_called()
+    dispatch_kwargs = comm.dispatch.call_args.kwargs
+    assert dispatch_kwargs["hidden_states"] is x
+    assert dispatch_kwargs["hidden_states_sf"] is None
+    assert dispatch_kwargs["fuse_bf16_nvfp4_quantization"] is True
+    assert dispatch_kwargs["nvfp4_input_scale"] is input_scale
+
+
+def test_deep_ep_bf16_nvfp4_fusion_gate_falls_back_for_unsupported_input():
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    comm._fuse_nvfp4_bf16_dispatch = True
+    comm.enable_postquant_alltoall = True
+    comm.hidden_size = 8
+    comm.SUPPORTED_HIDDEN_SIZES_EXTENSION = frozenset({8})
+    comm.quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=lambda: True,
+            has_fp8_qdq=lambda: False,
+        )
+    )
+    scale = torch.tensor(0.75, dtype=torch.float32)
+
+    assert comm.should_fuse_bf16_nvfp4_dispatch(torch.empty(4, 8, dtype=torch.bfloat16), scale)
+    assert not comm.should_fuse_bf16_nvfp4_dispatch(torch.empty(4, 8, dtype=torch.float32), scale)
+    assert not comm.should_fuse_bf16_nvfp4_dispatch(torch.empty(4, 16, dtype=torch.bfloat16), scale)
+    assert not comm.should_fuse_bf16_nvfp4_dispatch(
+        torch.empty(4, 8, dtype=torch.bfloat16), torch.ones(2, dtype=torch.float32)
+    )
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:

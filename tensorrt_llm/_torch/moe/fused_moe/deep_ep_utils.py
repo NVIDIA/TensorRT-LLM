@@ -182,6 +182,23 @@ class VariableLengthLowLatencyBuffer:
 
         return recv_hidden_states, recv_scales, recv_expert_count, handle
 
+    def low_latency_dispatch_bf16_to_fp4(self, hidden_states: torch.Tensor,
+                                         global_scale: torch.Tensor,
+                                         topk_idx: torch.Tensor,
+                                         num_max_dispatch_tokens_per_rank: int,
+                                         num_experts: int):
+        """Pack BF16 to NVFP4 in the DeepEP dispatch send phase."""
+        assert num_experts == self.num_experts
+
+        recv_hidden_states, recv_scales, recv_expert_count, handle, event, hook = \
+            self.buffer.low_latency_dispatch_bf16_to_fp4(
+                hidden_states, global_scale, topk_idx,
+                num_max_dispatch_tokens_per_rank, num_experts)
+        assert event.event is None
+        assert hook is None
+
+        return recv_hidden_states, recv_scales, recv_expert_count, handle
+
     def low_latency_combine_low_precision(self, precision: str,
                                           hidden_states: torch.Tensor,
                                           global_scales: Optional[torch.Tensor],
