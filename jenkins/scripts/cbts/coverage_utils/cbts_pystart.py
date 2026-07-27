@@ -18,6 +18,7 @@ import secrets
 import socket
 import sqlite3
 import sys
+import threading
 
 _MON = getattr(sys, "monitoring", None)
 _DEFAULT_TOOL_ID = int(os.environ.get("CBTS_PYSTART_TOOL_ID", "4"))
@@ -37,6 +38,7 @@ class PyStartTracker:
         self._expected = {}  # context -> pool workers the coordinator spawned for it
         self._file_ok = {}  # co_filename -> bool (cached source-membership)
         self._active = False
+        self._save_lock = threading.Lock()  # serialize periodic-thread and atexit saves
         self._new_suffix()
 
     @property
@@ -126,32 +128,38 @@ class PyStartTracker:
         expected = dict(self._expected)
         if not snap and not outcomes and not expected:
             return None
-        os.makedirs(self.data_dir, exist_ok=True)
-        path = os.path.join(self.data_dir, f".cbtscov.{self.stage}.{self._suffix}.sqlite")
-        tmp = path + ".tmp"
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        con = sqlite3.connect(tmp)
-        try:
-            con.execute("CREATE TABLE touch (test TEXT, file TEXT, qualname TEXT)")
-            rows = ((ctx, f, q) for ctx, fs in snap.items() for (f, q) in fs.copy())
-            con.executemany("INSERT INTO touch VALUES (?, ?, ?)", rows)
-            # Stage rides in the file content so the merge attributes rows without parsing the filename.
-            con.execute("CREATE TABLE proc_meta (stage TEXT)")
-            con.execute("INSERT INTO proc_meta VALUES (?)", (self.stage,))
-            # Per-test completeness signal; only the coordinator process fills outcome / expected.
-            con.execute(
-                "CREATE TABLE test_meta "
-                "(test TEXT PRIMARY KEY, outcome TEXT, expected_workers INTEGER)"
-            )
-            con.executemany(
-                "INSERT OR REPLACE INTO test_meta VALUES (?, ?, ?)",
-                [(k, outcomes.get(k), expected.get(k, 0)) for k in set(outcomes) | set(expected)],
-            )
-            con.commit()
-        finally:
-            con.close()
-        os.replace(tmp, path)
+        # Serialize saves so the periodic-save thread and the atexit final save never race on the
+        # shared temp file (a concurrent os.remove(tmp) mid-write surfaces as a sqlite disk I/O error).
+        with self._save_lock:
+            os.makedirs(self.data_dir, exist_ok=True)
+            path = os.path.join(self.data_dir, f".cbtscov.{self.stage}.{self._suffix}.sqlite")
+            tmp = path + ".tmp"
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            con = sqlite3.connect(tmp)
+            try:
+                con.execute("CREATE TABLE touch (test TEXT, file TEXT, qualname TEXT)")
+                rows = ((ctx, f, q) for ctx, fs in snap.items() for (f, q) in fs.copy())
+                con.executemany("INSERT INTO touch VALUES (?, ?, ?)", rows)
+                # Stage rides in the file content so the merge attributes rows without parsing the filename.
+                con.execute("CREATE TABLE proc_meta (stage TEXT)")
+                con.execute("INSERT INTO proc_meta VALUES (?)", (self.stage,))
+                # Per-test completeness signal; only the coordinator process fills outcome / expected.
+                con.execute(
+                    "CREATE TABLE test_meta "
+                    "(test TEXT PRIMARY KEY, outcome TEXT, expected_workers INTEGER)"
+                )
+                con.executemany(
+                    "INSERT OR REPLACE INTO test_meta VALUES (?, ?, ?)",
+                    [
+                        (k, outcomes.get(k), expected.get(k, 0))
+                        for k in set(outcomes) | set(expected)
+                    ],
+                )
+                con.commit()
+            finally:
+                con.close()
+            os.replace(tmp, path)
         return path
 
     def stop(self):
