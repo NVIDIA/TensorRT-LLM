@@ -167,6 +167,9 @@ def test_forward_stage_honors_enable_fused_hc(monkeypatch, enable_fused_hc):
     model = types.SimpleNamespace(
         use_real_mla=False,
         _attn_params={"window_size": 2, "head_dim": 1},
+        model_config=types.SimpleNamespace(
+            mapping=types.SimpleNamespace(enable_attention_dp=False, tp_size=8)
+        ),
     )
 
     actual = DSparkDraftModel._forward_stage(
@@ -184,6 +187,10 @@ def test_forward_stage_honors_enable_fused_hc(monkeypatch, enable_fused_hc):
         stage.mlp.call_args.args[0],
         normed_ffn_input.reshape(num_requests * block_size, hidden_size),
     )
+    # Non-attention-DP multi-GPU (enable_attention_dp=False, tp_size>1): the draft
+    # MoE must all-reduce its TP-sharded output, mirroring the target MoE. The
+    # attention-DP and single-GPU paths keep it disabled.
+    assert stage.mlp.call_args.kwargs["final_all_reduce_params"].enable_allreduce is True
     if enable_fused_hc:
         assert events == ["fused", "ffn_post"]
         hc_ffn.fused_hc.assert_called_once()

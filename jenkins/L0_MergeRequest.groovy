@@ -186,7 +186,7 @@ def globalVars = [
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
     (IMAGE_KEY_TO_TAG): [:],
-    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
+    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', 'main'),
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -325,10 +325,10 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
     if (env.gitlabMergeRequestLastCommit) {
         env.gitlabCommit = env.gitlabMergeRequestLastCommit
-        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
     } else {
         branch = env.gitlabBranch ? env.gitlabBranch : "main"
-        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, false, true)
+        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
         checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
         env.gitlabCommit = checkoutCommit
     }
@@ -451,7 +451,7 @@ def launchReleaseCheck(pipeline, globalVars)
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
         // Step 1: Clone TRT-LLM source codes
-        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
 
         // Step 2: Run guardwords scan
@@ -774,6 +774,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
+        // Shadow audit: download the latest merged touch DB and log its health + HEAD coverage gap (diagnostic only).
+        _cbtsCoverageAudit(pipeline)
+
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
             script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py --list-needed-diffs",
@@ -839,6 +842,33 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     } catch (Exception e) {
         pipeline.echo("CBTS failed, falling back to full run: ${e}")
         return null
+    }
+}
+
+// Download the latest merged touch DB and run coverage_audit.py on it; best-effort, never changes the CBTS decision.
+def _cbtsCoverageAudit(pipeline)
+{
+    try {
+        def covDir = "${LLM_ROOT}/cbts_cov"
+        def url = sh(
+            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py --print-url || true",
+            returnStdout: true,
+        ).trim()
+        if (!url) {
+            pipeline.echo("CBTS audit: no coverage DB artifact found — skipping")
+            return
+        }
+        sh "mkdir -p ${covDir}"
+        // wget the tarball (retrying) and extract the sqlite.
+        trtllm_utils.llmExecStepWithRetry(pipeline, script:
+            "wget -nv '${url}' -O ${covDir}/cbts_pystart_report.tar.gz && " +
+            "tar xzf ${covDir}/cbts_pystart_report.tar.gz -C ${covDir}")
+        sh "python3 ${LLM_ROOT}/jenkins/scripts/cbts/tools/coverage_audit.py " +
+           "--db ${covDir}/cbts_touchmap.sqlite"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
     }
 }
 
@@ -1183,7 +1213,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
             echo "Result File Number: ${resultFileNumber}, Downloaded: ${resultFileDownloadedNumber}"
 
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
-            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
 
@@ -1475,6 +1505,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "Skipping x86_64 tests (GenPostMergeBuilds mode: builds only)"
                     return
                 }
+                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                    echo "Skipping x86_64 tests (PLC container scanning)"
+                    return
+                }
 
                 testStageName = "[Test-x86_64-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
@@ -1585,6 +1619,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
                 if (GEN_POST_MERGE_BUILDS_ONLY) {
                     echo "Skipping SBSA tests (GenPostMergeBuilds mode: builds only)"
+                    return
+                }
+
+                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                    echo "Skipping SBSA tests (PLC container scanning)"
                     return
                 }
 
@@ -1732,6 +1771,88 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         stages.remove("x86_64-Linux")
         stages.remove("SBSA-Linux")
         echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
+    }
+
+    def plcContainerScanningJob = [
+        "PLC Container Scanning": {
+            script {
+                stage("[Build-Release-Docker-Images] Remote Run") {
+                    try {
+                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                        if (globalVars[GITHUB_PR_API_URL]) {
+                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                        }
+
+                        // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
+                        // instead of the BuildDockerImages helper job's own counter.
+                        def shortCommit = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
+                        def branchTag = branch.replaceAll('/', '_')
+                        def defaultTag = "${shortCommit}-${branchTag}-${env.BUILD_NUMBER}"
+
+                        def additionalParameters = [
+                            'branch': branch,
+                            'action': "push",
+                            'triggerType': "post-merge",
+                            'runSanityCheck': false,
+                            'defaultTag': defaultTag,
+                            'buildInternalRelease': false,
+                            'buildCiImage': false,
+                            'artifactPath': ARTIFACT_PATH,
+                            'nspect_id': "",
+                            'uploadPath': UPLOAD_PATH
+                        ]
+                        launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (BUILD_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "Build-Docker-Images job failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            throw e
+                        }
+                    }
+                }
+                stage("[NGC-Container-Compliance-Check] Run") {
+                    echo "Triggering OSS Compliance (PLC) container scan for ref: "
+                    try {
+                        def params = [
+                            string(name: 'postMergePipelineName', value: env.JOB_NAME),
+                            string(name: 'postMergeBuildNumber', value: env.BUILD_NUMBER),
+                            string(name: 'scanMode', value: 'pre_merge'),
+                            string(name: 'runSourceCodeScanning', value: 'false'),
+                            string(name: 'runContainerScanning', value: 'true'),
+                            string(name: 'runSonarQube', value: 'false'),
+                        ]
+                        def logger = new Logger(pipeline)
+                        def handle = build(
+                            job: "/LLM/helpers/PLCScanningSetup",
+                            parameters: params,
+                            propagate: false
+                        )
+                        if (handle.result != "SUCCESS") {
+                            catchError(buildResult: currentBuild.result ?: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                error "Risks detected on NGC Containers"
+                            }
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                            error "OSS Compliance Check failed: ${e.getMessage()}"
+                        }
+                    }
+                }
+            }
+        }
+    ]
+    if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+        stages += plcContainerScanningJob
+        testFilter[(TEST_STAGE_LIST)]?.remove("NGC-Container-Scanning")
+        echo "Will run job to build ngc containers and running in-pipeline scanning for them"
     }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {

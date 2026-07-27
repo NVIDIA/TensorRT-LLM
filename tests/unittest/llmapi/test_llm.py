@@ -1206,6 +1206,7 @@ class _FakeCompletionGeneratorArgs:
     gather_generation_logits = False
     num_postprocess_workers = 0
     return_perf_metrics = False
+    reasoning_parser = None
 
 
 class _FakeModelConfig:
@@ -1304,6 +1305,7 @@ def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
         server.tokenizer = None
         server.metrics_collector = None
         server.perf_metrics = None
+        server._input_proc_executor = None
 
         request = CompletionRequest(model="test-model",
                                     prompt=["A", "B"],

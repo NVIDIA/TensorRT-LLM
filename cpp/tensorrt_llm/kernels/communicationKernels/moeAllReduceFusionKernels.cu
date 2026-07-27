@@ -557,11 +557,20 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
         }
 
         // * MoE finalize
-        ACC_TYPE accumulator;
+        // Accumulate the top-k weighted expert sum and the shared-expert add in
+        // fp32 (local `facc`), rounding to DType (bf16/fp16) only once when packing
+        // into `accumulator` for the 128-bit Lamport all-reduce store below.
+        // Accumulating directly in DType here rounds after every one of the top_k
+        // terms; across the many routed MoE layers this rounding bias is large
+        // enough to visibly degrade the routed output, and with attention-DP
+        // disabled + MTP speculative decoding it drifts the target hidden states
+        // enough to lower the acceptance length. The non-deferred in-kernel
+        // finalize (do_finalize=true) already accumulates in fp32; match it here.
+        float facc[kElemsPerAccess];
 #pragma unroll
         for (int i = 0; i < kElemsPerAccess; ++i)
         {
-            accumulator.unpacked[i] = static_cast<DType>(0);
+            facc[i] = 0.f;
         }
 
         for (int k = 0; k < top_k; k++)
@@ -583,17 +592,15 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
             permuted_data.packed
                 = reinterpret_cast<float4 const*>(params.allreduce_in)[thread_offset_across_token / kElemsPerAccess];
 
-            // * acc += scale(data)
+            // * acc += scale(data)  (fp32 accumulation)
 #pragma unroll
             for (int i = 0; i < kElemsPerAccess; ++i)
             {
-                // assume computation is done in ScaleType
-                accumulator.unpacked[i]
-                    += static_cast<DType>((static_cast<float>(permuted_data.unpacked[i]) * block_scale));
+                facc[i] += static_cast<float>(permuted_data.unpacked[i]) * block_scale;
             }
         }
 
-        // * Add shared expert output
+        // * Add shared expert output  (fp32 accumulation)
         if (params.shared_expert_output)
         {
             // * Load shared expert output
@@ -604,8 +611,16 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
 #pragma unroll
             for (int i = 0; i < kElemsPerAccess; ++i)
             {
-                accumulator.unpacked[i] += shared_expert_output.unpacked[i];
+                facc[i] += static_cast<float>(shared_expert_output.unpacked[i]);
             }
+        }
+
+        // Round the fp32 accumulator to DType once, packed for the Lamport AR store.
+        ACC_TYPE accumulator;
+#pragma unroll
+        for (int i = 0; i < kElemsPerAccess; ++i)
+        {
+            accumulator.unpacked[i] = static_cast<DType>(facc[i]);
         }
 
         // * AR Store

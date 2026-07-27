@@ -387,11 +387,46 @@ class DecoderModelForCausalLM(nn.Module,
         self.pp_size = config.mapping.pp_size
         self.has_custom_lm_head = False
 
+        # Per-layer quant entry for lm_head (e.g. ModelOpt MIXED_PRECISION
+        # checkpoints that quantize lm_head to NVFP4). Model-specific
+        # config normalizers opt in by keeping/synthesizing this entry;
+        # exclude_modules still wins. Applies to both the attention-DP
+        # (replicated) and TP lm_head below.
+        lm_head_quant_config = None
+        if config.quant_config_dict is not None:
+            lm_head_quant_config = config.quant_config_dict.get("lm_head")
+            if (lm_head_quant_config is not None
+                    and config.quant_config is not None and config.quant_config.
+                    is_module_excluded_from_quantization("lm_head")):
+                lm_head_quant_config = None
+            if (lm_head_quant_config is not None and getattr(
+                    config.pretrained_config, 'tie_word_embeddings', False)):
+                # Tied embeddings replace lm_head.weight with the dense
+                # bf16 embedding weight below, which would silently clash
+                # with a quantized (packed) weight and its quant method.
+                logger.info(
+                    "Ignoring lm_head quant entry: tie_word_embeddings "
+                    "shares the dense embedding weight, so lm_head stays "
+                    "unquantized")
+                lm_head_quant_config = None
+            if (lm_head_quant_config is not None
+                    and config.mapping.enable_attention_dp
+                    and config.mapping.enable_lm_head_tp_in_adp):
+                # lm_head TP in ADP slices the dense weight at forward time
+                # for the spec-decoding head (see LMHead.forward), which is
+                # incompatible with quantized (packed) weights — LMHead
+                # rejects that combination at construction.
+                logger.info(
+                    "Ignoring lm_head quant entry: lm_head TP in ADP "
+                    "slices the dense weight, so lm_head stays unquantized")
+                lm_head_quant_config = None
+
         if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
+                quant_config=lm_head_quant_config,
             )
         else:
             if (hasattr(config, 'lora_config')
@@ -405,29 +440,10 @@ class DecoderModelForCausalLM(nn.Module,
                         self.has_custom_lm_head = True
                         vocab_size = lora_loader.vocab_size
 
-            # Per-layer quant entry for lm_head (e.g. ModelOpt MIXED_PRECISION
-            # checkpoints that quantize lm_head to NVFP4). Model-specific
-            # config normalizers opt in by keeping/synthesizing this entry;
-            # exclude_modules still wins.
-            lm_head_quant_config = None
-            if not self.has_custom_lm_head and config.quant_config_dict is not None:
-                lm_head_quant_config = config.quant_config_dict.get("lm_head")
-                if (lm_head_quant_config is not None
-                        and config.quant_config is not None
-                        and config.quant_config.
-                        is_module_excluded_from_quantization("lm_head")):
-                    lm_head_quant_config = None
-                if (lm_head_quant_config is not None
-                        and getattr(config.pretrained_config,
-                                    'tie_word_embeddings', False)):
-                    # Tied embeddings replace lm_head.weight with the dense
-                    # bf16 embedding weight below, which would silently clash
-                    # with a quantized (packed) weight and its quant method.
-                    logger.info(
-                        "Ignoring lm_head quant entry: tie_word_embeddings "
-                        "shares the dense embedding weight, so lm_head stays "
-                        "unquantized")
-                    lm_head_quant_config = None
+            # A custom LoRA lm_head replaces the checkpoint weight with a
+            # dense bf16 tensor, so the quant entry must not apply.
+            if self.has_custom_lm_head:
+                lm_head_quant_config = None
 
             self.lm_head = LMHead(
                 vocab_size,
