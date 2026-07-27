@@ -262,14 +262,17 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
     auto optTaskId = llmRequest->getLoraTaskId();
     auto optLoraWeights = llmRequest->getLoraWeights();
     auto optLoraConfig = llmRequest->getLoraConfig();
-    if (optLoraWeights)
-    {
-        configureDataType(optLoraWeights.value()->getDataType());
-    }
     if (optTaskId || optLoraWeights || optLoraConfig)
     {
+        auto const requestDataType = optLoraWeights
+            ? std::optional<tensorrt_llm::DataType>{optLoraWeights.value()->getDataType()}
+            : std::nullopt;
         runtime::lora::loraValidateRequestTensors(
-            optTaskId, optLoraWeights, optLoraConfig, mModelConfig, mWorldConfig, getDataType());
+            optTaskId, optLoraWeights, optLoraConfig, mModelConfig, mWorldConfig, requestDataType);
+        if (optLoraWeights)
+        {
+            configureDataType(optLoraWeights.value()->getDataType());
+        }
     }
     else
     {
@@ -382,6 +385,17 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
 
 void PeftCacheManager::configureDataType(tensorrt_llm::DataType dataType)
 {
+    auto const modelDataType = mModelConfig.getDataType();
+#ifdef ENABLE_FP8
+    TLLM_CHECK_WITH_INFO(dataType == modelDataType || dataType == tensorrt_llm::DataType::kFP8,
+        "Unsupported LoRA weights dtype %s for PEFT cache; expected model dtype %s or FP8",
+        runtime::IBuffer::getDataTypeName(dataType), runtime::IBuffer::getDataTypeName(modelDataType));
+#else
+    TLLM_CHECK_WITH_INFO(dataType == modelDataType,
+        "Unsupported LoRA weights dtype %s for PEFT cache; expected model dtype %s",
+        runtime::IBuffer::getDataTypeName(dataType), runtime::IBuffer::getDataTypeName(modelDataType));
+#endif
+
     std::lock_guard<std::mutex> lock(mDataTypeMutex);
     if (mDataType)
     {

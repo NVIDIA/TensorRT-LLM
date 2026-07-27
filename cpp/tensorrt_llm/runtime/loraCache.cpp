@@ -800,9 +800,6 @@ void LoraCache::copyTask(TaskIdType taskId, LoraCache& deviceCache, bool markDon
     TLLM_CHECK_WITH_INFO(deviceCache.mPageManagerConfig.getMemoryType() == runtime::MemoryType::kGPU
             && !deviceCache.mDeviceBufferManagers.empty(),
         "The deviceCache must hold GPU memory and have at least one bufferManager / copy stream");
-    TLLM_CHECK_WITH_INFO(mPageManagerConfig.getDataType() == deviceCache.mPageManagerConfig.getDataType(),
-        "LoRA host and device cache dtypes must match");
-
     // First get the taskValue from this cache
     // TaskValue& taskValue = copyTaskGetThisTaskValue(taskId);
     TaskValuePtr taskValue = [&]() -> TaskValuePtr
@@ -832,6 +829,10 @@ void LoraCache::copyTask(TaskIdType taskId, LoraCache& deviceCache, bool markDon
     std::optional<TaskValuePtr> optOtherTaskValuePtr = [&]() -> std::optional<TaskValuePtr>
     {
         std::lock_guard<std::mutex> deviceCacheLock(deviceCache.mCacheMutex);
+        // setDataType also holds mCacheMutex, so the check and target task
+        // insertion are atomic with respect to cache reconfiguration.
+        TLLM_CHECK_WITH_INFO(mPageManagerConfig.getDataType() == deviceCache.mPageManagerConfig.getDataType(),
+            "LoRA host and device cache dtypes must match");
         auto otherStatus = deviceCache.getStatus(taskId);
         if (kVALUE_STATUS_MISSING != otherStatus)
         {

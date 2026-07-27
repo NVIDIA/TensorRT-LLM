@@ -45,13 +45,17 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+#ifdef ENABLE_FP8
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
 namespace
 {
 
-constexpr int kFp8TmaAlignment = 16;
-
 void checkFp8GroupedGemmAlignment(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, char const* kernelName)
 {
+    int const smVersion = tensorrt_llm::common::getSMVersion();
+    TLLM_CHECK_WITH_INFO(
+        smVersion >= 90, "%s requires Hopper (SM90) or newer, but the current device is SM%d", kernelName, smVersion);
+
     for (size_t problemIdx = 0; problemIdx < problemSizes.size(); ++problemIdx)
     {
         auto const& problem = problemSizes[problemIdx];
@@ -68,6 +72,8 @@ void checkFp8GroupedGemmAlignment(std::vector<cutlass::gemm::GemmCoord> const& p
 }
 
 } // namespace
+#endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
+#endif // ENABLE_FP8
 
 int64_t inline getGemmCoordSize(int64_t problemCount)
 {

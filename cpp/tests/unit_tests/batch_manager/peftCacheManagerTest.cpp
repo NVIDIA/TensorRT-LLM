@@ -143,7 +143,50 @@ TEST_F(PeftCacheManagerTest, addRequestPeftMissingTask)
     mPeftManager->addRequestPeft(llmRequest);
 }
 
+TEST_F(PeftCacheManagerTest, unsupportedAdapterDataTypeDoesNotConfigureCache)
+{
+    SamplingConfig samplingConfig;
+    auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
+    TensorPtr int8Weights = mManager->cpu(loraWeightsTp2->getShape(), tensorrt_llm::DataType::kINT8);
+    auto int8Request = std::make_shared<LlmRequest>(0, 4, tokens, samplingConfig, false);
+    int8Request->setLoraTaskId(1234);
+    int8Request->setLoraWeights(int8Weights);
+    int8Request->setLoraConfig(loraConfigTp2);
+
+    EXPECT_THAT([&]() { mPeftManager->addRequestPeft(int8Request); },
+        testing::Throws<std::runtime_error>(testing::Property(
+            &std::runtime_error::what, testing::HasSubstr("Unsupported LoRA weights dtype int8 for PEFT cache"))));
+
+    auto floatRequest = std::make_shared<LlmRequest>(1, 4, tokens, samplingConfig, false);
+    floatRequest->setLoraTaskId(5678);
+    floatRequest->setLoraWeights(loraWeightsTp2);
+    floatRequest->setLoraConfig(loraConfigTp2);
+    EXPECT_NO_THROW(mPeftManager->addRequestPeft(floatRequest));
+    EXPECT_EQ(mPeftManager->getDataType(), tensorrt_llm::DataType::kFLOAT);
+}
+
 #if defined(ENABLE_FP8)
+TEST_F(PeftCacheManagerTest, invalidAdapterDoesNotConfigureCacheDataType)
+{
+    SamplingConfig samplingConfig;
+    auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
+    TensorPtr fp8Weights = mManager->cpu(loraWeightsTp2->getShape(), tensorrt_llm::DataType::kFP8);
+    auto invalidRequest = std::make_shared<LlmRequest>(0, 4, tokens, samplingConfig, false);
+    invalidRequest->setLoraTaskId(1234);
+    invalidRequest->setLoraWeights(fp8Weights);
+
+    EXPECT_THAT([&]() { mPeftManager->addRequestPeft(invalidRequest); },
+        testing::Throws<std::runtime_error>(testing::Property(
+            &std::runtime_error::what, testing::HasSubstr("must have both lora_weights and lora_keys"))));
+
+    auto floatRequest = std::make_shared<LlmRequest>(1, 4, tokens, samplingConfig, false);
+    floatRequest->setLoraTaskId(5678);
+    floatRequest->setLoraWeights(loraWeightsTp2);
+    floatRequest->setLoraConfig(loraConfigTp2);
+    EXPECT_NO_THROW(mPeftManager->addRequestPeft(floatRequest));
+    EXPECT_EQ(mPeftManager->getDataType(), tensorrt_llm::DataType::kFLOAT);
+}
+
 TEST_F(PeftCacheManagerTest, adapterSelectsHomogeneousCacheDataType)
 {
     SamplingConfig samplingConfig;
