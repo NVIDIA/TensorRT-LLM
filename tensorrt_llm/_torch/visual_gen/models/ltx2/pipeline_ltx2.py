@@ -1026,7 +1026,9 @@ class LTX2Pipeline(BasePipeline):
         """Finalize after weight loading: TeaCache, Cache-DiT, derived attributes."""
         super().post_load_weights()
 
-        # LTX-2: single transformer (one DiT for video+audio); TeaCache only with explicit coefficients.
+        # LTX-2: single transformer (one DiT for video+audio); TeaCache only with
+        # explicit coefficients. Cache acceleration itself is enabled by the
+        # loader after torch.compile (see PipelineLoader.load).
         if self.transformer is not None and self.pipeline_config.cache_backend == "teacache":
             if self.pipeline_config.teacache.coefficients is None:
                 raise ValueError(
@@ -1037,11 +1039,6 @@ class LTX2Pipeline(BasePipeline):
                 "LTXModel",
                 LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
             )
-            self._setup_cache_acceleration()
-
-        # Cache-DiT
-        if self.transformer is not None and self.pipeline_config.cache_backend == "cache_dit":
-            self._setup_cache_acceleration()
 
         # Compression ratios from native scale factors
         self.vae_spatial_compression_ratio = VIDEO_SCALE_FACTORS.width
