@@ -144,6 +144,13 @@ def build_compaction_params(
     params.decision_rows = int(kept_ordinal_rows.shape[0]) // max_requests
     # Pool shape [pages, K/V, heads, tokens, dim].
     num_kv_heads = int(first_pool.shape[2])
+    if params.decision_rows * max_requests != int(kept_ordinal_rows.shape[0]):
+        raise ValueError("kept_ordinal_rows rows must be a multiple of max_requests")
+    if params.decision_rows not in (1, num_kv_heads, len(dense_layers) * num_kv_heads):
+        raise ValueError(
+            f"unsupported decision layout: {params.decision_rows} rows for "
+            f"{num_kv_heads} heads x {len(dense_layers)} dense layers"
+        )
     per_layer_sources = (
         len(dense_layers) > 1 and params.decision_rows == len(dense_layers) * num_kv_heads
     )
