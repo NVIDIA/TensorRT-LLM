@@ -110,33 +110,28 @@ stage. `is_lite` changes the projection structure, not just a small code path.
 
 Dense and sparse MLA variants use the same `MLA` module. `MLA.forward_impl()`
 selects the dense implementation or the sparse facade in
-`attention_backend/sparse/hooks.py`. The hook facade then dispatches by sparse
-algorithm to its `module.py`; MLA-specific dispatch is intentionally not part
-of the generic `AttentionBackend` interface.
+`attention_backend/sparse/hooks.py`. Each algorithm registers a typed adapter
+from its `module.py`; MLA-specific dispatch is intentionally not part of the
+generic `AttentionBackend` interface.
 
-The sparse hook facade defines the uniform contract for module initialization,
-weight lifecycle, forward, optional output preparation, custom-op bridging,
-and output projection. Every hook is optional at registration time: an
-algorithm implements only the module paths it needs, while a caller that
-requires a hook fails explicitly if it is absent. Shared `MLA` code creates the
-sparse-aware MQA and the ordinary dense MHA exactly once, then invokes the
-sparse initialization hook. The hook removes dense modules that the algorithm
-does not use and initializes only algorithm-specific module state. Dense
-create/transform behavior remains inline in `MLA` and is used whenever the
-algorithm does not override it.
+`MLASparseHooks` and `AttentionSparseHooks` define separate typed module
+contracts. Concrete adapters override only the lifecycle methods their
+algorithm needs; default adapter methods preserve the dense behavior for
+optional paths. Shared `MLA` code creates the sparse-aware MQA and the ordinary
+dense MHA exactly once, then invokes the adapter initialization method. The
+adapter removes dense modules that the algorithm does not use and initializes
+only algorithm-specific module state.
 
-`Attention` and `MLA` resolve and cache `self.sparse_attn_hooks` during module
+`Attention` and `MLA` resolve and cache their typed adapter during module
 initialization. Later lifecycle methods use that cached contract instead of
 redispatching from `sparse_params`. Dense modules and algorithms without
-module-layer overrides receive an empty hook set, so optional call sites only
-need to test the relevant callable. A module path that requires an override
-uses `require()` and fails explicitly when that hook is absent.
+module-layer overrides receive no adapter.
 
-`Attention` invokes the same lifecycle contract at initialization,
-`forward_impl()`, and output projection. Its initialization hook runs before
-rotary embedding and backend construction so an algorithm can configure
-module-level choices that affect both. Forward and projection signatures are
-module-specific and validated as either the `Attention` or `MLA` contract.
+`Attention` invokes its adapter at initialization, `forward_impl()`, and output
+projection. Its initialization method runs before rotary embedding and backend
+construction so an algorithm can configure module-level choices that affect
+both. The separate adapter types make the `Attention` and `MLA` signatures
+statically checkable without runtime signature inspection.
 
 Ordinary sparse variants use `attention_output_hidden_size` and the shared
 output allocation. DeepSeek-V4's fused epilogue is the exception: it requires

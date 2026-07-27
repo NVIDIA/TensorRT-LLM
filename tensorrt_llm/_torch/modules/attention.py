@@ -17,7 +17,7 @@ from ..attention_backend import (AttentionForwardArgs, AttentionMetadata,
 from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
-from ..attention_backend.sparse.hooks import get_sparse_attn_hooks
+from ..attention_backend.sparse.hooks import get_sparse_attention_hooks
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
@@ -604,7 +604,7 @@ class Attention(nn.Module):
             pretrained_config=config.pretrained_config,
             layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
         self.sparse_params = sparse_params
-        self.sparse_attn_hooks = get_sparse_attn_hooks(self)
+        self.sparse_attn_hooks = get_sparse_attention_hooks(self)
 
         attn_cls = get_attention_backend(self.attn_backend,
                                          sparse_params=sparse_params)
@@ -634,8 +634,8 @@ class Attention(nn.Module):
             logger.info_once(f"Using sparse attention: {algo} {cfg_dump}",
                              key="sparse_attention_config")
 
-        if initialize_sparse_attn := self.sparse_attn_hooks.initialize_sparse_attn:
-            initialize_sparse_attn(
+        if self.sparse_attn_hooks is not None:
+            self.sparse_attn_hooks.initialize(
                 self,
                 config=config,
                 mapping=mapping,
@@ -939,8 +939,8 @@ class Attention(nn.Module):
         has_lora: bool = False,
         **kwargs,
     ):
-        if forward_sparse_attn := self.sparse_attn_hooks.forward_sparse_attn:
-            return forward_sparse_attn(
+        if self.sparse_attn_hooks is not None:
+            sparse_output = self.sparse_attn_hooks.forward(
                 self,
                 q,
                 k,
@@ -956,6 +956,8 @@ class Attention(nn.Module):
                 has_lora,
                 **kwargs,
             )
+            if sparse_output is not None:
+                return sparse_output
 
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
@@ -1105,14 +1107,16 @@ class Attention(nn.Module):
         if self.attn_output_gate:
             attn_output = self.apply_output_gate(attn_output, gate)
 
-        if project_sparse_attn_output := self.sparse_attn_hooks.project_sparse_attn_output:
-            return project_sparse_attn_output(
+        if self.sparse_attn_hooks is not None:
+            sparse_output = self.sparse_attn_hooks.project_output(
                 self,
                 attn_output,
                 attn_metadata,
                 all_reduce_params,
                 lora_params,
             )
+            if sparse_output is not None:
+                return sparse_output
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,

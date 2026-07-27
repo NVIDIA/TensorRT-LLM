@@ -155,7 +155,8 @@ Algorithm implementations live under
 - `deepseek_v4/` — DeepSeek-V4 backend, indexer, metadata, cache manager,
   parameters, module hooks, and index conversion kernels.
 - `skip_softmax/` — SkipSoftmax parameter parsing and runtime scheduler.
-- `hooks.py` — module hooks and common backend prediction orchestration.
+- `hooks.py` — typed MLA/Attention module adapters and common backend
+  prediction orchestration.
 - `registry.py` — backend, metadata, and cache-manager dispatch helpers.
 
 ### AttentionOp behavior
@@ -295,6 +296,9 @@ If the algorithm needs extra tensors beyond the main KV cache:
   `tensorrt_llm/_torch/attention_backend/sparse/registry.py` and
   `tensorrt_llm/_torch/pyexecutor/_util.py` so the runtime routes
   requests to your backend when the config is present.
+- If the algorithm customizes module-layer behavior, implement and register a
+  concrete `MLASparseHooks` or `AttentionSparseHooks` adapter from the
+  algorithm's `module.py`.
 - If your algorithm exposes new C++ parameters, plumb them through
   `cpp/tensorrt_llm/thop/attentionOp.cpp` and
   `cpp/tensorrt_llm/kernels/sparseAttentionKernels.h`.

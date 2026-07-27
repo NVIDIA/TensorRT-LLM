@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """DSA integration for the shared MLA module."""
 
+from __future__ import annotations
+
 import os
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -17,8 +19,15 @@ from tensorrt_llm._torch.utils import Fp4QuantizedTensor, is_torch_compiling
 from tensorrt_llm._utils import get_sm_version, nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 
+from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSABackendForwardArgs
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.mla import MLA
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
 
 try:
     from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
@@ -583,3 +592,66 @@ def forward_sparse_mla_kvcache_bf16(
     else:
         raise NotImplementedError(f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
     return output
+
+
+class DSAHooks(MLASparseHooks):
+    """Typed DSA adapter for the shared MLA module."""
+
+    def initialize(
+        self,
+        mla: MLA,
+        *,
+        config: ModelConfig,
+        mapping: Mapping,
+        mapping_o: Mapping,
+        rms_norm_eps: float,
+        quant_config: QuantConfig,
+        q_scaling: float,
+        bias: bool,
+        dtype: torch.dtype,
+        reduce_output: bool,
+        aux_stream: Optional[torch.cuda.Stream],
+    ) -> None:
+        initialize_sparse_attn(
+            mla,
+            config=config,
+            mapping=mapping,
+            mapping_o=mapping_o,
+            rms_norm_eps=rms_norm_eps,
+            quant_config=quant_config,
+            q_scaling=q_scaling,
+            bias=bias,
+            dtype=dtype,
+            reduce_output=reduce_output,
+            aux_stream=aux_stream,
+        )
+
+    def forward(
+        self,
+        mla: MLA,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        attn_output: list[torch.Tensor],
+    ) -> None:
+        forward_sparse_attn(mla, position_ids, hidden_states, attn_metadata, attn_output)
+
+    def forward_custom_op(
+        self,
+        mla: MLA,
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_output: list[torch.Tensor],
+        latent_cache_gen: Optional[torch.Tensor],
+    ) -> bool:
+        forward_sparse_attn_custom_op(
+            mla,
+            hidden_states,
+            position_ids,
+            attn_output,
+            latent_cache_gen,
+        )
+        return True
+
+
+register_mla_sparse_hooks("dsa", DSAHooks)

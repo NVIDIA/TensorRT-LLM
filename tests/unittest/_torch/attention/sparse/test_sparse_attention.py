@@ -33,8 +33,10 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa.kernels import (
     triton_convert_req_index_to_global_index,
 )
 from tensorrt_llm._torch.attention_backend.sparse.hooks import (
-    SparseAttnHooks,
-    get_sparse_attn_hooks,
+    AttentionSparseHooks,
+    MLASparseHooks,
+    get_sparse_attention_hooks,
+    get_sparse_mla_hooks,
     prepare_sparse_runtime_params,
 )
 from tensorrt_llm._torch.attention_backend.sparse.params import SparseParams, SparseRuntimeParams
@@ -200,19 +202,28 @@ def test_sparse_runtime_params() -> None:
     )
 
 
-def test_invalid_sparse_attn_hook() -> None:
-    hook_module = ModuleType("invalid_sparse_attn_hook")
-    hook_module.forward_sparse_attn = lambda module: None
-    with pytest.raises(TypeError, match="expected"):
-        SparseAttnHooks.from_module("test", hook_module)
+def test_sparse_attn_hook_registration() -> None:
+    hook_module = ModuleType("sparse_attn_hook_registration")
+    hook_module.sparse_params = MockSparseParams()
+
+    hook_module.sparse_params.algorithm = "dsa"
+    assert isinstance(get_sparse_mla_hooks(hook_module), MLASparseHooks)
+    assert get_sparse_attention_hooks(hook_module) is None
+
+    hook_module.sparse_params.algorithm = "deepseek_v4"
+    assert isinstance(get_sparse_mla_hooks(hook_module), MLASparseHooks)
+
+    hook_module.sparse_params.algorithm = "rocket"
+    assert isinstance(get_sparse_attention_hooks(hook_module), AttentionSparseHooks)
+    assert get_sparse_mla_hooks(hook_module) is None
 
 
 def test_mla_backend_only_forward() -> None:
     backend_only_module = ModuleType("backend_only_sparse_attention")
     backend_only_module.sparse_params = MockSparseParams()
     backend_only_module.sparse_params.algorithm = "skip_softmax"
-    hooks = get_sparse_attn_hooks(backend_only_module)
-    assert not hooks
+    hooks = get_sparse_mla_hooks(backend_only_module)
+    assert hooks is None
 
     mla = MLA.__new__(MLA)
     torch.nn.Module.__init__(mla)

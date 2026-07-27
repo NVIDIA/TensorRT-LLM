@@ -40,7 +40,7 @@ from ..attention_backend.interface import (
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
 )
-from ..attention_backend.sparse.hooks import get_sparse_attn_hooks
+from ..attention_backend.sparse.hooks import get_sparse_mla_hooks
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -325,7 +325,7 @@ class MLA(nn.Module):
             else None
         )
         self.sparse_params = sparse_params
-        self.sparse_attn_hooks = get_sparse_attn_hooks(self)
+        self.sparse_attn_hooks = get_sparse_mla_hooks(self)
         if self.sparse_attn_hooks and not fuse_qkv_a_proj:
             # forward_dsa_proj assumes the fused [q_a | kv_a | k_pe]
             # projection layout; the separate q_a_proj layout (Kimi K3 MLA)
@@ -333,7 +333,7 @@ class MLA(nn.Module):
             raise NotImplementedError(
                 "Sparse MLA requires "
                 "fuse_qkv_a_proj=True; the separate q_a_proj layout is not "
-                "supported with them."
+                "supported with sparse MLA."
             )
 
         # Fold the residual-less q_a_layernorm -> q_b_proj NVFP4 input
@@ -563,7 +563,7 @@ class MLA(nn.Module):
 
         # MHA is the dense expanded-KV path. Algorithms that do not use it
         # remove it in their initialization hook.
-        mha_sparse_params = self.sparse_params if not self.sparse_attn_hooks else None
+        mha_sparse_params = self.sparse_params if self.sparse_attn_hooks is None else None
         self.mha = create_attention(
             config.attn_backend,
             self.layer_idx,
@@ -584,8 +584,8 @@ class MLA(nn.Module):
             sparse_params=mha_sparse_params,
         )
 
-        if initialize_sparse_attn := self.sparse_attn_hooks.initialize_sparse_attn:
-            initialize_sparse_attn(
+        if self.sparse_attn_hooks is not None:
+            self.sparse_attn_hooks.initialize(
                 self,
                 config=config,
                 mapping=mapping,
@@ -636,8 +636,7 @@ class MLA(nn.Module):
 
         # Although we use FP8 MLA for context/generation phase, the output is still in BF16
         self.out_scale = None
-        if create_sparse_attn_weights := self.sparse_attn_hooks.create_sparse_attn_weights:
-            create_sparse_attn_weights(self)
+        if self.sparse_attn_hooks is not None and self.sparse_attn_hooks.create_weights(self):
             self._weights_transformed = False
             return
 
@@ -790,8 +789,10 @@ class MLA(nn.Module):
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> list[torch.Tensor]:
         """Create the standard output and any algorithm-specific output buffers."""
-        if prepare_outputs := self.sparse_attn_hooks.prepare_sparse_attn_outputs:
-            return prepare_outputs(self, hidden_states, attn_metadata)
+        if self.sparse_attn_hooks is not None:
+            outputs = self.sparse_attn_hooks.prepare_outputs(self, hidden_states, attn_metadata)
+            if outputs is not None:
+                return outputs
         return [self.create_output(hidden_states, attn_metadata.num_contexts)]
 
     def _attention_scaling(self, q, position_ids):
@@ -842,8 +843,8 @@ class MLA(nn.Module):
         latent_cache_gen: Optional[torch.Tensor] = None,
     ) -> None:
         """Run the dense or sparse implementation of the shared MLA module."""
-        if forward_sparse_attn := self.sparse_attn_hooks.forward_sparse_attn:
-            forward_sparse_attn(
+        if self.sparse_attn_hooks is not None:
+            self.sparse_attn_hooks.forward(
                 self,
                 position_ids,
                 hidden_states,
@@ -1700,14 +1701,13 @@ class MLA(nn.Module):
         latent_cache_gen: Optional[torch.Tensor],
     ) -> None:
         """Run the dense or sparse registered custom-op implementation."""
-        if custom_op := self.sparse_attn_hooks.forward_sparse_attn_custom_op:
-            custom_op(
-                self,
-                hidden_states,
-                position_ids,
-                attn_output,
-                latent_cache_gen,
-            )
+        if self.sparse_attn_hooks is not None and self.sparse_attn_hooks.forward_custom_op(
+            self,
+            hidden_states,
+            position_ids,
+            attn_output,
+            latent_cache_gen,
+        ):
             return
 
         output = attn_output[0]
@@ -1751,8 +1751,16 @@ class MLA(nn.Module):
         all_reduce_params: Optional[AllReduceParams],
     ) -> torch.Tensor:
         """Apply the MLA output projection."""
-        if project_output := self.sparse_attn_hooks.project_sparse_attn_output:
-            return project_output(self, attn_output, position_ids, attn_metadata, all_reduce_params)
+        if self.sparse_attn_hooks is not None:
+            output = self.sparse_attn_hooks.project_output(
+                self,
+                attn_output,
+                position_ids,
+                attn_metadata,
+                all_reduce_params,
+            )
+            if output is not None:
+                return output
 
         return self._project_output_impl(
             attn_output[0], position_ids, attn_metadata, all_reduce_params
@@ -1837,10 +1845,8 @@ class MLA(nn.Module):
     def transform_weights(self) -> None:
         if self._weights_transformed:
             return
-        if transform_sparse_attn_weights := getattr(
-            getattr(self, "sparse_attn_hooks", None), "transform_sparse_attn_weights", None
-        ):
-            transform_sparse_attn_weights(self)
+        sparse_attn_hooks = getattr(self, "sparse_attn_hooks", None)
+        if sparse_attn_hooks is not None and sparse_attn_hooks.transform_weights(self):
             self._weights_transformed = True
             return
 

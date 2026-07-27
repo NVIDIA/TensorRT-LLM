@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """DeepSeek-V4 integration for the shared MLA module."""
 
+from __future__ import annotations
+
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -18,10 +20,15 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
+from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from ..params import SparseBackendForwardArgs
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed import AllReduceParams
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.mla import MLA
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _q_b_proj_cute_dsl_import_ok: Optional[bool] = None
 
@@ -815,3 +822,81 @@ def forward_sparse_attn(
             topk_indices=topk_indices_gen,
             sparse_epilogue_output=sparse_epilogue_output,
         )
+
+
+class DeepSeekV4Hooks(MLASparseHooks):
+    """Typed DeepSeek-V4 adapter for the shared MLA module."""
+
+    def initialize(
+        self,
+        mla: MLA,
+        *,
+        config: ModelConfig,
+        mapping: Mapping,
+        mapping_o: Mapping,
+        rms_norm_eps: float,
+        quant_config: QuantConfig,
+        q_scaling: float,
+        bias: bool,
+        dtype: torch.dtype,
+        reduce_output: bool,
+        aux_stream: Optional[torch.cuda.Stream],
+    ) -> None:
+        initialize_sparse_attn(
+            mla,
+            config=config,
+            mapping=mapping,
+            mapping_o=mapping_o,
+            rms_norm_eps=rms_norm_eps,
+            quant_config=quant_config,
+            q_scaling=q_scaling,
+            bias=bias,
+            dtype=dtype,
+            reduce_output=reduce_output,
+            aux_stream=aux_stream,
+        )
+
+    def create_weights(self, mla: MLA) -> bool:
+        create_sparse_attn_weights(mla)
+        return True
+
+    def transform_weights(self, mla: MLA) -> bool:
+        transform_sparse_attn_weights(mla)
+        return True
+
+    def prepare_outputs(
+        self,
+        mla: MLA,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> list[torch.Tensor]:
+        return prepare_sparse_attn_outputs(mla, hidden_states, attn_metadata)
+
+    def forward(
+        self,
+        mla: MLA,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        attn_output: list[torch.Tensor],
+    ) -> None:
+        forward_sparse_attn(mla, position_ids, hidden_states, attn_metadata, attn_output)
+
+    def project_output(
+        self,
+        mla: MLA,
+        attn_output: list[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams],
+    ) -> torch.Tensor:
+        return project_sparse_attn_output(
+            mla,
+            attn_output,
+            position_ids,
+            attn_metadata,
+            all_reduce_params,
+        )
+
+
+register_mla_sparse_hooks("deepseek_v4", DeepSeekV4Hooks)
