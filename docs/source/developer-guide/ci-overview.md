@@ -134,7 +134,7 @@ default pre-merge set:
 
 Both options accept stage names and wildcard patterns defined in
 `jenkins/L0_Test.groovy`. Explicit Post-merge stage test doesn't need
-`ci: post-merge` approved PR label to run. However, the `"*"`,
+`ci: post-merge approved` PR label to run. However, the `"*"`,
 `"*Post-Merge*"`, and `"*PerfSanity*"` selectors require the same approval
 label, including when they appear in a comma-separated list. Equivalent escaped
 or repeated-star forms are treated the same. Other stage selectors, including
