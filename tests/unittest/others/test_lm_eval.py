@@ -21,6 +21,8 @@ Consolidates the pure-Python tests that guard:
 * ``tensorrt_llm.evaluate.lm_eval_tasks.mmmu_pro.utils`` —
   ``parse_multi_choice_response`` reverse-scan and the
   ``MMMU_PRO_PROMPT_MODE`` env switch.
+* ``LmEvalWrapper._log_spec_stats`` — the ``TLLM_EVAL_SPEC_STATS``-gated
+  speculative-decoding acceptance-length (AL) corpus summary.
 """
 
 from __future__ import annotations
@@ -950,3 +952,136 @@ def test_generate_until_invokes_partial_scorer():
 
     mock_update.assert_called_once_with(fake_request, "42")
     mock_log.assert_called_once_with(1, 1)
+
+
+# ===========================================================================
+# TLLM_EVAL_SPEC_STATS — speculative-decoding AL stats
+# ===========================================================================
+#
+# Only AL (acceptance length) is reported for now; AR needs the
+# request_perf_metrics.speculative_decoding counters, which the TorchSampler
+# used by one-engine spec-dec does not populate (see _log_spec_stats).
+
+
+def _make_spec_output(tokens_per_iter: float | None = None) -> MagicMock:
+    """Fake RequestOutput with an optional per-request AL sample.
+
+    ``tokens_per_iter`` as None models a request without speculative
+    metrics (non-spec-dec run, or a response that never reported them).
+    """
+    output = MagicMock()
+    output.avg_decoded_tokens_per_iter = tokens_per_iter
+    output.outputs = [MagicMock()]
+    return output
+
+
+def test_spec_stats_env_unset_disables(monkeypatch):
+    """Unset env leaves the feature off."""
+    from tensorrt_llm.evaluate.lm_eval import SPEC_STATS_ENV_VAR
+
+    monkeypatch.delenv(SPEC_STATS_ENV_VAR, raising=False)
+    wrapper = _make_lm_eval_wrapper()
+    assert wrapper.spec_stats is False
+
+
+def test_spec_stats_env_enabled(monkeypatch):
+    """TLLM_EVAL_SPEC_STATS=1 turns the feature on."""
+    from tensorrt_llm.evaluate.lm_eval import SPEC_STATS_ENV_VAR
+
+    monkeypatch.setenv(SPEC_STATS_ENV_VAR, "1")
+    wrapper = _make_lm_eval_wrapper()
+    assert wrapper.spec_stats is True
+
+
+@pytest.mark.parametrize("value", ["0", "true", "yes", ""])
+def test_spec_stats_env_non_one_values_disable(monkeypatch, value):
+    """Only the literal "1" enables the feature."""
+    from tensorrt_llm.evaluate.lm_eval import SPEC_STATS_ENV_VAR
+
+    monkeypatch.setenv(SPEC_STATS_ENV_VAR, value)
+    wrapper = _make_lm_eval_wrapper()
+    assert wrapper.spec_stats is False
+
+
+def test_log_spec_stats_reports_al_mean_min_max():
+    """AL is the mean of per-request avg_decoded_tokens_per_iter."""
+    wrapper = _make_lm_eval_wrapper()
+    outputs = [
+        _make_spec_output(tokens_per_iter=2.0),
+        _make_spec_output(tokens_per_iter=4.0),
+    ]
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        wrapper._log_spec_stats(outputs)
+    assert mock_logger.info.call_count == 1
+    al_message = mock_logger.info.call_args[0][0]
+    assert "AL" in al_message
+    assert "3.000" in al_message  # mean of 2.0 and 4.0
+    assert "min 2.000" in al_message
+    assert "max 4.000" in al_message
+    assert "n=2" in al_message
+
+
+def test_log_spec_stats_skips_requests_without_metrics():
+    """Requests lacking spec metrics are excluded, not counted as zero."""
+    wrapper = _make_lm_eval_wrapper()
+    outputs = [
+        _make_spec_output(tokens_per_iter=3.0),
+        _make_spec_output(),  # no metrics (e.g. dropped by the engine)
+    ]
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        wrapper._log_spec_stats(outputs)
+    assert mock_logger.info.call_count == 1
+    message = mock_logger.info.call_args[0][0]
+    assert "3.000" in message
+    assert "n=1" in message
+
+
+def test_log_spec_stats_silent_on_non_spec_run():
+    """A run with no speculative metrics at all logs nothing."""
+    wrapper = _make_lm_eval_wrapper()
+    outputs = [_make_spec_output(), _make_spec_output()]
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        wrapper._log_spec_stats(outputs)
+    mock_logger.info.assert_not_called()
+
+
+def test_generate_until_logs_spec_stats_when_enabled(monkeypatch):
+    """generate_until forwards the collected outputs to _log_spec_stats."""
+    from tensorrt_llm.evaluate.lm_eval import SPEC_STATS_ENV_VAR, LmEvalWrapper
+
+    monkeypatch.setenv(SPEC_STATS_ENV_VAR, "1")
+    fake_result = MagicMock()
+    fake_result.outputs = [MagicMock(text="42")]
+    fake_output = MagicMock()
+    fake_output.result.return_value = fake_result
+    fake_llm = MagicMock()
+    fake_llm.generate_async.return_value = fake_output
+
+    wrapper = LmEvalWrapper(llm=fake_llm)
+    fake_request = MagicMock()
+    fake_request.args = ("hello world", {})
+
+    with patch.object(LmEvalWrapper, "_log_spec_stats") as mock_stats:
+        wrapper.generate_until([fake_request], disable_tqdm=True)
+
+    mock_stats.assert_called_once_with([fake_result])
+
+
+def test_generate_until_skips_spec_stats_when_disabled(monkeypatch):
+    """Without the env var, generate_until never touches _log_spec_stats."""
+    from tensorrt_llm.evaluate.lm_eval import SPEC_STATS_ENV_VAR, LmEvalWrapper
+
+    monkeypatch.delenv(SPEC_STATS_ENV_VAR, raising=False)
+    fake_output = MagicMock()
+    fake_output.result.return_value.outputs = [MagicMock(text="42")]
+    fake_llm = MagicMock()
+    fake_llm.generate_async.return_value = fake_output
+
+    wrapper = LmEvalWrapper(llm=fake_llm)
+    fake_request = MagicMock()
+    fake_request.args = ("hello world", {})
+
+    with patch.object(LmEvalWrapper, "_log_spec_stats") as mock_stats:
+        wrapper.generate_until([fake_request], disable_tqdm=True)
+
+    mock_stats.assert_not_called()
