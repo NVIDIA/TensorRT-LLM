@@ -22,12 +22,12 @@ hitting any external endpoint.
 
 Requirements:
     - GPU (loads TinyLlama via PyTorch backend)
-    - LLM_MODELS_ROOT set (or /home/scratch.trt_llm_data accessible)
+    - LLM_MODELS_ROOT set (or /home/scratch.trt_llm_data_ci accessible)
     - Must be run with TRTLLM_USAGE_FORCE_ENABLED=1 to bypass pytest
       auto-detection (conftest or env)
 
 Usage:
-    TRTLLM_USAGE_FORCE_ENABLED=1 LLM_MODELS_ROOT=/home/scratch.trt_llm_data/llm-models \
+    TRTLLM_USAGE_FORCE_ENABLED=1 LLM_MODELS_ROOT=/home/scratch.trt_llm_data_ci/llm-models \
         python -m pytest tests/unittest/usage/test_e2e_capture.py -v -s
 """
 
@@ -51,7 +51,7 @@ def _get_model_path():
     root = os.environ.get("LLM_MODELS_ROOT")
     if root is None:
         # Fallback to standard scratch path
-        fallback = Path("/home/scratch.trt_llm_data/llm-models")
+        fallback = Path("/home/scratch.trt_llm_data_ci/llm-models")
         if fallback.exists():
             root = str(fallback)
     if root is None:
@@ -111,6 +111,24 @@ def capture_server():
     yield url
 
     server.shutdown()
+
+
+def _assert_llm_api_config_capture(params):
+    """Assert that the public LLM entrypoint populated config telemetry."""
+    assert "llmApiConfigJson" in params
+    assert "llmApiConfigMetaJson" in params
+
+    config = json.loads(params["llmApiConfigJson"])
+    meta = json.loads(params["llmApiConfigMetaJson"])
+
+    assert config["tensor_parallel_size"] == 1
+    assert config["pipeline_parallel_size"] == 1
+    # Sensitive identifiers must never be captured.
+    assert "model" not in config
+    assert "tokenizer" not in config
+    assert meta["args_class"] == "TorchLlmArgs"
+    assert meta["capture_succeeded"] is True
+    assert meta["captured_field_count"] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -220,15 +238,19 @@ class TestE2ECapture:
             "cuda_graphs",
             "chunked_context",
             "data_parallel_size",
+            "checkpoint_format",
+            "load_format",
         }
         assert set(features.keys()) == expected_keys
 
         # Schema version
-        assert payload["eventSchemaVer"] == "0.1"
+        assert payload["eventSchemaVer"] == "0.2"
 
         # Disagg fields present (may be empty strings)
         assert "disaggRole" in params
         assert "deploymentId" in params
+
+        _assert_llm_api_config_capture(params)
 
     def test_cli_serve_context_e2e(self, capture_server, monkeypatch):
         """Verify CLI_SERVE context flows through to the captured payload."""
@@ -259,3 +281,4 @@ class TestE2ECapture:
         payload = CaptureHandler.captured_payloads[0]
         params = payload["events"][0]["parameters"]
         assert params["ingressPoint"] == "cli_serve"
+        _assert_llm_api_config_capture(params)

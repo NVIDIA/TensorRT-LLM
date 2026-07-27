@@ -36,7 +36,12 @@ try:
         get_harmony_adapter,
         handle_streaming_response,
     )
-    from tensorrt_llm.serve.openai_protocol import StreamOptions
+    from tensorrt_llm.serve.openai_protocol import StreamOptions, _logit_bias_to_embedding_bias
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+    from tensorrt_llm.serve.postprocess_handlers import (
+        ChatCompletionPostprocArgs,
+        chat_harmony_streaming_post_processor,
+    )
 
     _harmony_available = True
 except (ImportError, ModuleNotFoundError):
@@ -96,12 +101,22 @@ def _make_mock_result(
     output.token_ids = token_ids or [1, 2, 3]
     output.finish_reason = finish_reason
     output.stop_reason = stop_reason
+    output.disaggregated_params = None
 
     result = Mock()
     result.outputs = [output]
     result._done = True
     result.cached_tokens = cached_tokens
     return result
+
+
+def _stream_payloads(responses):
+    payloads = []
+    for response in responses:
+        for line in response.splitlines():
+            if line.startswith("data: "):
+                payloads.append(json.loads(line[len("data: ") :].strip()))
+    return payloads
 
 
 # ===========================================================================
@@ -615,6 +630,114 @@ class TestReasoningContentField:
 
         assert "reasoning" not in result
         assert "reasoning_content" not in result
+
+
+class TestStreamMetadata:
+    """Verify Harmony chat streams reuse one response ID and timestamp."""
+
+    def test_postprocessor_passes_cached_stream_metadata(self):
+        mock_result = _make_mock_result(token_ids_diff=[1, 2, 3])
+        mock_result.id = 456
+        mock_result._done = False
+        args = ChatCompletionPostprocArgs(
+            model="test-model",
+            tools=[],
+            tool_choice=None,
+            num_prompt_tokens=5,
+        )
+
+        with patch(
+            "tensorrt_llm.serve.postprocess_handlers.handle_streaming_response", return_value=[]
+        ) as mock_handle:
+            chat_harmony_streaming_post_processor(mock_result, args)
+            first_created = args.stream_created
+            chat_harmony_streaming_post_processor(mock_result, args)
+
+        assert mock_handle.call_count == 2
+        call_kwargs = mock_handle.call_args_list[0].kwargs
+        second_call_kwargs = mock_handle.call_args_list[1].kwargs
+        assert call_kwargs["stream_response_id"] == "chatcmpl-456"
+        assert call_kwargs["stream_created"] == first_created
+        assert second_call_kwargs["stream_response_id"] == "chatcmpl-456"
+        assert second_call_kwargs["stream_created"] == first_created
+        assert args.stream_response_id == "chatcmpl-456"
+        assert isinstance(args.stream_created, int)
+
+    def test_adapter_streaming_chunks_use_supplied_metadata(self):
+        adapter = HarmonyAdapter(harmony_input=False, harmony_output=False)
+        request_id = "test-stream-metadata"
+        adapter.create_stream_state(request_id=request_id, available_tools=None, tool_choice=None)
+        try:
+            with patch.object(
+                adapter,
+                "stateful_stream_harmony_tokens_to_openai_deltas",
+                return_value=[{"content": "hello"}, {"reasoning": "thinking"}],
+            ):
+                responses, _ = adapter.create_openai_streaming_response(
+                    request_id=request_id,
+                    tokens=[1, 2, 3],
+                    available_tools=None,
+                    model_name="test-model",
+                    tool_choice=None,
+                    stream_response_id="chatcmpl-fixed",
+                    stream_created=123456,
+                )
+
+            payloads = _stream_payloads(responses)
+            assert len(payloads) == 2
+            assert {payload["id"] for payload in payloads} == {"chatcmpl-fixed"}
+            assert {payload["created"] for payload in payloads} == {123456}
+        finally:
+            adapter.cleanup_stream_state(request_id)
+
+    def test_handle_streaming_response_uses_supplied_metadata(self):
+        mock_result = _make_mock_result(token_ids_diff=[10, 20])
+        harmony_adapter = get_harmony_adapter()
+        request_id = "test-handle-stream-metadata"
+        harmony_adapter.create_stream_state(
+            request_id=request_id, available_tools=None, tool_choice=None
+        )
+        streamed_chunk = json.dumps(
+            {
+                "id": "chatcmpl-fixed",
+                "object": "chat.completion.chunk",
+                "created": 123456,
+                "model": "test-model",
+                "choices": [{"index": 0, "delta": {"content": "hi"}}],
+            }
+        )
+        try:
+            with patch.object(
+                harmony_adapter,
+                "create_openai_streaming_response",
+                return_value=([f"data: {streamed_chunk}\n\n"], False),
+            ) as mock_create:
+                responses = handle_streaming_response(
+                    tools=[],
+                    tool_choice=None,
+                    result=mock_result,
+                    model="test-model",
+                    request_id=request_id,
+                    done=True,
+                    num_prompt_tokens=5,
+                    first_iteration=True,
+                    stream_options=StreamOptions(include_usage=True),
+                    stream_response_id="chatcmpl-fixed",
+                    stream_created=123456,
+                )
+
+            mock_create.assert_called_once()
+            call_kwargs = mock_create.call_args.kwargs
+            assert call_kwargs["stream_response_id"] == "chatcmpl-fixed"
+            assert call_kwargs["stream_created"] == 123456
+
+            payloads = _stream_payloads(responses)
+            assert len(payloads) == 4
+            assert {payload["id"] for payload in payloads} == {"chatcmpl-fixed"}
+            assert {payload["created"] for payload in payloads} == {123456}
+        finally:
+            if request_id in harmony_adapter._stream_states:
+                harmony_adapter.cleanup_stream_state(request_id)
 
 
 class TestRemainingTokensOnDone:
@@ -1190,6 +1313,14 @@ class TestStreamOptionsUsage:
         finally:
             if request_id in harmony_adapter._stream_states:
                 harmony_adapter.cleanup_stream_state(request_id)
+
+
+def test_none_tokenizer_num_postprocess_workers():
+    server = object.__new__(OpenAIServer)
+    server.tokenizer = None
+    assert server._vocab_size is None
+    with pytest.raises(ValueError, match="logit_bias requires a tokenizer"):
+        _logit_bias_to_embedding_bias({"0": 1.0}, vocab_size=None)
 
 
 if __name__ == "__main__":

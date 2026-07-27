@@ -10,11 +10,10 @@ import pytest_asyncio
 import uvicorn
 from fastapi import FastAPI
 
-from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
-                                                StorageItem, WatchEvent,
-                                                WatchEventType,
-                                                create_cluster_storage,
-                                                create_cluster_storage_client)
+from tensorrt_llm.serve.cluster_storage import (
+    HttpClusterStorageServer, StorageItem, WatchEvent, WatchEventType,
+    create_cluster_storage, create_cluster_storage_client, is_loopback_host,
+    validate_http_cluster_storage_scope)
 
 _counter = 0
 
@@ -42,6 +41,53 @@ class Server(uvicorn.Server):
 
 
 timeout = pytest.mark.timeout
+
+
+@pytest.mark.parametrize(
+    "host", ["localhost", "LOCALHOST", "LocalHost", "127.0.0.1", "::1"])
+def test_is_loopback_host_accepts_loopback_hosts(host):
+    assert is_loopback_host(host)
+
+
+@pytest.mark.parametrize("host",
+                         [None, "", "0.0.0.0", "10.0.0.1", "example.com"])
+def test_is_loopback_host_rejects_non_loopback_hosts(host):
+    assert not is_loopback_host(host)
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+@pytest.mark.parametrize("uri_host", ["localhost", "127.0.0.1", "[::1]"])
+@pytest.mark.parametrize("server_host", ["localhost", "127.0.0.1", "::1"])
+def test_http_cluster_storage_scope_allows_loopback_only(
+        scheme, uri_host, server_host):
+    validate_http_cluster_storage_scope(f"{scheme}://{uri_host}:18000",
+                                        server_host)
+
+
+@pytest.mark.parametrize(
+    "cluster_uri, server_host",
+    [
+        ("http://10.0.0.1:18000", "localhost"),
+        ("http://localhost:18000", "0.0.0.0"),
+        ("https://example.com:18000", "127.0.0.1"),
+        ("https://127.0.0.1:18000", "10.0.0.1"),
+    ],
+)
+def test_http_cluster_storage_scope_rejects_non_loopback_scope(
+        cluster_uri, server_host):
+    with pytest.raises(ValueError, match="loopback-only"):
+        validate_http_cluster_storage_scope(cluster_uri, server_host)
+
+
+@pytest.mark.parametrize(
+    "cluster_uri",
+    [
+        "etcd://10.0.0.1:2379",
+        "etcd://example.com:2379",
+    ],
+)
+def test_etcd_cluster_storage_scope_is_unchanged(cluster_uri):
+    validate_http_cluster_storage_scope(cluster_uri, "0.0.0.0")
 
 
 @pytest_asyncio.fixture(scope="function")

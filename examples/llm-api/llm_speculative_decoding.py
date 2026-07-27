@@ -16,8 +16,7 @@ prompts = [
 
 
 def run_MTP(model: Optional[str] = None):
-    spec_config = MTPDecodingConfig(num_nextn_predict_layers=1,
-                                    use_relaxed_acceptance_for_thinking=True,
+    spec_config = MTPDecodingConfig(use_relaxed_acceptance_for_thinking=True,
                                     relaxed_topk=10,
                                     relaxed_delta=0.01)
 

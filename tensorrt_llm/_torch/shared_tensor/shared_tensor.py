@@ -1,6 +1,9 @@
 import base64
+import itertools
 import logging
-from typing import Any, Callable, Dict, Tuple
+import os
+import threading
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 from torch.multiprocessing import get_sharing_strategy, set_sharing_strategy
@@ -11,6 +14,35 @@ from torch.multiprocessing.reductions import (rebuild_cuda_tensor,
                                               reduce_storage, reduce_tensor)
 
 logger = logging.getLogger(__name__)
+
+
+class _LocalTensorStore:
+    """Process-local stash for same-process tensor handoff.
+
+    CUDA IPC handles (reduce_tensor / cudaIpc) cannot be opened by the exporting
+    process, so cross-process sharing fails when producer and consumer are threads
+    of one process (e.g. external-launch VisualGen: rank 0's worker and the response
+    coordinator share a process). The producer stashes the live tensor here and the
+    same-process consumer looks it up by token -- the token survives the pickled
+    handle round-trip, the tensor does not.
+    """
+
+    _store: Dict[int, torch.Tensor] = {}
+    _lock = threading.Lock()
+    _counter = itertools.count()
+
+    @classmethod
+    def stash(cls, tensor: torch.Tensor) -> int:
+        token = next(cls._counter)
+        with cls._lock:
+            cls._store[token] = tensor
+        return token
+
+    @classmethod
+    def pop(cls, token: int) -> Optional[torch.Tensor]:
+        with cls._lock:
+            return cls._store.pop(token, None)
+
 
 DTYPE_MAPPING = {
     'torch.float32': torch.float32,
@@ -48,6 +80,7 @@ class _SharedTensorRebuildMethodRegistry:
     # Fixed keys for common rebuild methods
     REBUILD_CUDA = 1
     REBUILD_CPU = 2
+    REBUILD_LOCAL = 3
 
     _registry: Dict[int, Callable] = {}
 
@@ -310,7 +343,9 @@ class SharedTensorContainer:
             raise ValueError(f"Failed to deserialize tensor information: {e}")
 
     @classmethod
-    def from_tensor(cls, tensor: torch.Tensor) -> 'SharedTensorContainer':
+    def from_tensor(cls,
+                    tensor: torch.Tensor,
+                    local: bool = False) -> 'SharedTensorContainer':
         """Create a SharedTensorContainer from a local tensor (Producer side).
 
         This method is called by the producer process to prepare a tensor for sharing
@@ -322,10 +357,20 @@ class SharedTensorContainer:
 
         Args:
             tensor: The tensor to share
+            local: When True, keep the tensor in a process-local store and
+                skip the cross-process IPC handle, for a consumer in the same
+                process (e.g. external-launch where producer and consumer are
+                threads of one process). CUDA IPC handles are invalid same-process.
 
         Returns:
             SharedTensorContainer instance that can be serialized later for IPC
         """
+        if local:
+            token = _LocalTensorStore.stash(tensor)
+            return cls(_SharedTensorRebuildMethodRegistry.REBUILD_LOCAL, {
+                "local_token": token,
+                "producer_pid": os.getpid()
+            })
         rebuild_method, tensor_handle = reduce_tensor(tensor)
         method_key = _SharedTensorRebuildMethodRegistry.register(rebuild_method)
         return cls(method_key, tensor_handle)
@@ -348,6 +393,12 @@ class SharedTensorContainer:
             ValueError: If the method_key is not supported
         """
         method_key = tensor_info['method_key']
+        if method_key == _SharedTensorRebuildMethodRegistry.REBUILD_LOCAL:
+            return cls(
+                method_key, {
+                    "local_token": tensor_info["local_token"],
+                    "producer_pid": tensor_info["producer_pid"],
+                })
         if method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
             tensor_handle = SharedTensorContainer.dict_to_cuda_handle(
                 tensor_info)
@@ -368,6 +419,16 @@ class SharedTensorContainer:
         Returns:
             The reconstructed tensor
         """
+        if self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_LOCAL:
+            if self.tensor_handle["producer_pid"] != os.getpid():
+                raise RuntimeError(
+                    "REBUILD_LOCAL handle crossed a process boundary; it is only "
+                    "valid within the producing process.")
+            tensor = _LocalTensorStore.pop(self.tensor_handle["local_token"])
+            if tensor is None:
+                raise RuntimeError(
+                    "REBUILD_LOCAL tensor missing from same-process registry.")
+            return tensor
         rebuild_method = _SharedTensorRebuildMethodRegistry.get_method(
             self.method_key)
         return rebuild_method(*self.tensor_handle)
@@ -381,6 +442,12 @@ class SharedTensorContainer:
         Returns:
             Dictionary containing the serialized tensor information
         """
+        if self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_LOCAL:
+            return {
+                "method_key": self.method_key,
+                "local_token": self.tensor_handle["local_token"],
+                "producer_pid": self.tensor_handle["producer_pid"],
+            }
         if self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
             tensor_dict = SharedTensorContainer.cuda_handle_to_dict(
                 self.tensor_handle)

@@ -53,6 +53,10 @@ The exported graph then undergoes a series of automated transformations, includi
 
 - [Support Matrix](support_matrix.md)
 
+## API Reference
+
+- [AutoDeploy Transforms](transforms.rst)
+
 ## Advanced Usage
 
 - [Example Run Script](./advanced/example_run.md)
@@ -61,7 +65,6 @@ The exported graph then undergoes a series of automated transformations, includi
 - [Expert Configurations](./advanced/expert_configurations.md)
 - [Performance Benchmarking](./advanced/benchmarking_with_trtllm_bench.md)
 - [KV Cache Architecture](./advanced/kv_cache_architecture.md)
-- [Export ONNX for EdgeLLM](./advanced/export_onnx.md)
 - [Testing Strategy](./advanced/testing_strategy.md)
 
 ## Roadmap

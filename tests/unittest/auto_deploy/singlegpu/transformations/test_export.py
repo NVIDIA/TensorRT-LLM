@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from abc import ABC, abstractmethod
 from typing import Optional, Set, Type
 
@@ -11,6 +25,11 @@ from torch.export import Dim, export
 from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+
+
+class AddOne(nn.Module):
+    def forward(self, input_ids):
+        return input_ids + 1
 
 
 def _torch_export_non_strict(model, *args, **kwargs):
@@ -33,6 +52,12 @@ class ModuleForExport(ABC, nn.Module):
     @abstractmethod
     def get_dynamic_shapes(self):
         pass
+
+
+def test_torch_export_to_gm_strips_input_constraint_pre_hook():
+    gm = torch_export_to_gm(AddOne(), args=(torch.ones(2, 4),))
+
+    assert torch.equal(gm(torch.ones(1, 4)), torch.full((1, 4), 2.0))
 
 
 class MLPForExport(ModuleForExport):

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -68,7 +69,36 @@ inline constexpr int kRecurrentStates = -1;
 class UnifiedBlockTree : public templated_trie::Trie<BlockKey, BlockKeyHasher, int, std::hash<int>, BlockPtr, true>
 {
 public:
+    using Base = templated_trie::Trie<BlockKey, BlockKeyHasher, int, std::hash<int>, BlockPtr, true>;
+
     UnifiedBlockTree() = default;
+
+    // std::mutex is not movable, so define move operations explicitly.
+    // The trie contents (parent class data) are moved; each instance keeps its own mutex.
+    UnifiedBlockTree(UnifiedBlockTree&& other) noexcept
+        : Base(std::move(other))
+    {
+    }
+
+    UnifiedBlockTree& operator=(UnifiedBlockTree&& other) noexcept
+    {
+        if (this != &other)
+        {
+            Base::operator=(std::move(other));
+        }
+        return *this;
+    }
+
+    //! \brief Returns the shared mutex that guards all trie operations.
+    //! All reads and writes to the trie (insertions, lookups, detachFromLookupNode)
+    //! must be performed while holding this mutex.  A recursive mutex is used so
+    //! that call paths which hold the tree lock (e.g. BlockManager::addSequenceBatch
+    //! two-phase claim) can safely invoke helpers (e.g. getFreeBlock / detachFromLookupNode)
+    //! that also need to acquire it without deadlocking.
+    [[nodiscard]] std::recursive_mutex& getMutex() noexcept
+    {
+        return mMutex;
+    }
 
     //! \brief Insert a block into the tree at the given prefix position for a specific window size.
     //! \details This is a tree-only insertion: it does NOT set block->mLookupNode. The block is
@@ -203,6 +233,9 @@ public:
             }
         }
     }
+
+private:
+    std::recursive_mutex mMutex;
 };
 
 } // namespace tensorrt_llm::batch_manager::radix_block_tree

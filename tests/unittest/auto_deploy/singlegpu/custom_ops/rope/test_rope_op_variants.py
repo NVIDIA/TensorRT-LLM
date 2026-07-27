@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import flashinfer
 import pytest
 import torch
@@ -9,7 +23,12 @@ from _model_test_utils import (
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
 
-torch.manual_seed(1234)
+# NOTE: the existing tests below seed the RNG explicitly (torch.manual_seed) at
+# their start. They use tight (near-ULP) half-precision tolerances that only
+# hold for specific inputs, so without a fixed seed the standalone-package run
+# (pytest-xdist, dynamic test distribution) used order-dependent inputs and
+# failed intermittently. New tests should NOT copy this seeding crutch: choose
+# tolerances that reflect the dtype error floor so the test holds for any input.
 
 
 @pytest.mark.parametrize("head_dim", [64, 256])  # head_dim must be a multiple of 64
@@ -28,6 +47,7 @@ def test_flashinfer_custom_op_and_hf_impl(dtype, atol, rtol, head_dim):
     - cos_sin_cache: [S, D] = [cos||sin] concatenated.
     - HF path: Q/K -> [B, N, S, D], cos_new/sin_new: [S, D] duplicated, then broadcast to [B, S, D].
     """
+    torch.manual_seed(1234)
     device = "cuda"
     batch = 2
     seq_len = 4
@@ -107,6 +127,7 @@ def test_flashinfer_custom_op_and_complex_impl(dtype, atol, rtol, head_dim):
     - freqs_cis: [B, S, D/2] complex polar values.
     - flashinfer uses cos_sin_cache: [S, D] interleaved from real/imag of freqs_cis.
     """
+    torch.manual_seed(1234)
     device = "cuda"
     batch = 2
     seq_len = 4
@@ -179,6 +200,7 @@ def test_triton_custom_op_and_hf_impl(layout, head_dim, dtype, atol, rtol):
     - cosin_cache: [S, D/2, 2] interleaved [cos,sin].
     - HF path: cos_full/sin_full: [S, D] then expanded to [B, S, D].
     """
+    torch.manual_seed(1234)
     device = "cuda"
     batch, seq_len, n_head = 2, 4, 3
 
@@ -240,6 +262,7 @@ def test_ds_impl_and_hf_impl(dtype, head_dim, atol, rtol):
     - cos_new/sin_new: [S, D] duplicated real values.
     - HF path: Q/K -> [B,N,S,D], cos_expand/sin_expand: [B,S,D], unsqueezed at dim=1.
     """
+    torch.manual_seed(1234)
     device = "cuda"
     batch = 2
     seq_len = 4
@@ -308,6 +331,7 @@ def test_flashinfer_custom_op_strided_interleaved(dtype, atol, rtol, head_dim):
     Tests is_neox=False (interleaved mode), matching contiguous-input results
     and complex-multiplication reference.
     """
+    torch.manual_seed(1234)
     device = "cuda"
     batch = 2
     seq_len = 4
@@ -374,6 +398,7 @@ def test_rope_deinterleave_load_hook(has_bias):
     - kv_a_proj: first kv_lora_rank rows unchanged, last qk_rope_head_dim rows permuted.
     - bias (when present): same split+permute pattern as kv_a_proj weight.
     """
+    torch.manual_seed(1234)
     from tensorrt_llm._torch.auto_deploy.models.custom.mla_rope_utils import (
         _rope_deinterleave_load_hook,
     )

@@ -55,11 +55,13 @@ struct BatchedGemmData
         int32_t mNumTokens{0};
         // Whether the batch is on the M dimension.
         bool mBatchM{true};
-        // The maximum number of CTAs in the token dimension.
+        // The maximum number of CTAs (CGAs) in the token dimension.
         // Need to be set if mNumTokens > 0 and the token per batch
         // distribution is not known at launch time.
-        // In this case, the kernel will launch mMaxNumCtasInTokenDim CTAs in token dim and exit early
-        // if the idx of CTAs is larger or equal to mPtrNumNonExitingCtas.
+        // In this case, the kernel will launch mMaxNumCtasInTokenDim units in token dim and exit
+        // early if the batched-dim index is larger or equal to ptrNumNonExitingCtas.
+        // The legacy CTA-based name is kept for interface compatibility even though they are indexed at
+        // CGA granularity.
         int32_t mMaxNumCtasInTokenDim{0};
 
         // Either mBatchedM or mBatchedN must be set when mNumTokens == 0, otherwise not used.
@@ -282,8 +284,40 @@ struct BatchedGemmData
         // If batchN BiasType must be M, and bias shape is [B, M].
         // The bias is broadcasted along the N dimension.
         //
+        // If BiasType is Mn, the bias is a full 2D matrix applied element-wise (D = A*B + C):
+        //   The row dimension is:
+        //     If mPtrPermutedIdxToBiasRowIdx == nullptr:
+        //       If batchM: sum(divUpMul(M[bi], tileM) for bi in B).
+        //       If batchN: sum(divUpMul(N[bi], tileN) for bi in B).
+        //     If mPtrPermutedIdxToBiasRowIdx != nullptr:
+        //       The first dimension is indexed by `mPtrPermutedIdxToBiasRowIdx[permuted_padded_index]`.
+        //   The hidden dimension is:
+        //     If batchM: N.
+        //     If batchN: M.
+        //   If `mFusedBiasShuffleMode == gemm::FusedBiasShuffleMode::None`, the buffer is row-major
+        //   after any fused-act interleave and after the shuffled-matrix reordering expected by the
+        //   epilogue.
+        //   If `mFusedBiasShuffleMode == gemm::FusedBiasShuffleMode::Shuffle`, the buffer is row-major
+        //   [biasRow, hidden] after any fused-act interleave, but before shuffled-matrix reordering.
+        //   If `mFusedBiasShuffleMode == gemm::FusedBiasShuffleMode::ReorderAndShuffle`, the buffer is
+        //   row-major [biasRow, hidden] before both fused-act bias interleave and shuffled-matrix
+        //   reordering.
+        //
         // The dtype is float32.
         void const* mPtrBias{nullptr};
+
+        // Optional map from permuted padded row index in the batched dimension to the row index in
+        // mPtrBias to load for BiasType::Mn.
+        //
+        // If this pointer is nullptr, mPtrBias is interpreted directly in the permuted padded row-major
+        // layout described above, i.e. biasRow = permutedRow.
+        //
+        // If this pointer is non-null, the shape is
+        // [sum(divUpMul(M[bi], tileM) for bi in B)] for batchM or
+        // [sum(divUpMul(N[bi], tileN) for bi in B)] for batchN.
+        //
+        // The dtype is int32_t.
+        int32_t const* mPtrPermutedIdxToBiasRowIdx{nullptr};
 
         // The output tensor scaling factor for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
         // TensorRT-LLM API requires a scaling factor on the device.
@@ -418,8 +452,8 @@ struct BatchedGemmData
         int32_t const* mPtrTotalNumPaddedTokens;
 
         // Pointer to the map from the CTA index (in X/Y dim) to the batch index.
-        // Maps CTA index in batch dim (i.e. blockDim.x if batchM, otherwise blockDim.y)
-        // to batch index.
+        // The legacy CTA-based name is kept for interface compatibility even though routed MoE paths
+        // index this map at CGA granularity.
         // E.g. with listM = 128,255,32 and tileM = 128, should be equal to
         // ctaIdxXyToBatchIdx = [0, 1, 1, 2]
         // If isStaticBatch == true, ptrCtaIdxXyToBatchIdx should be set to nullptr and
@@ -438,6 +472,8 @@ struct BatchedGemmData
         // expandIdx += <index in the batch>
         // E.g. with numTokens = [128,255,32] and tileM = 128, should be equal to
         // ptrCtaIdxXyToMnLimit = [128, 256, 383, 416]
+        // The legacy CTA-based name is kept for interface compatibility even though routed MoE paths
+        // index this map at CGA granularity.
         // The shape is
         // [divUp(numTokens + numBatches * (tileM/N - 1), tileM/N)]
         int32_t const* mPtrCtaIdxXyToMnLimit;
@@ -542,7 +578,11 @@ public:
     //
     // pinnedHostBuffer: if provided, it must be pinned host memory buffer of 4 bytes.
     int32_t run(BatchedGemmConfig const& config, void* workspace, BatchedGemmData const& batchedGemmData,
-        void* cudaStream, int32_t multiProcessorCount, bool usePdl = true, void* pinnedHostBuffer = nullptr,
+        void* cudaStream,
+#ifdef TLLM_TEST
+        void* cudaEvent,
+#endif // TLLM_TEST
+        int32_t multiProcessorCount, bool usePdl = true, void* pinnedHostBuffer = nullptr,
         std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt)
     {
         // Get options from config and data.
@@ -610,12 +650,12 @@ public:
             batchedGemmData.mInputBuffers.mPtrSfA, batchedGemmData.mInputBuffers.mPtrSfB,
             batchedGemmData.mInputBuffers.mPtrPerTokenSfA, batchedGemmData.mInputBuffers.mPtrPerTokenSfB,
             batchedGemmData.mInputBuffers.mPtrSparsityInfoA, batchedGemmData.mInputBuffers.mPtrBias,
-            batchedGemmData.mOutputBuffers.mPtrSfC, batchedGemmData.mInputBuffers.mPtrScaleC,
-            batchedGemmData.mInputBuffers.mPtrScaleAct, batchedGemmData.mInputBuffers.mPtrScaleGate,
-            batchedGemmData.mInputBuffers.mPtrClampLimit, batchedGemmData.mInputBuffers.mPtrGatedActAlpha,
-            batchedGemmData.mInputBuffers.mPtrGatedActBeta, batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax,
-            dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
-            batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
+            batchedGemmData.mInputBuffers.mPtrPermutedIdxToBiasRowIdx, batchedGemmData.mOutputBuffers.mPtrSfC,
+            batchedGemmData.mInputBuffers.mPtrScaleC, batchedGemmData.mInputBuffers.mPtrScaleAct,
+            batchedGemmData.mInputBuffers.mPtrScaleGate, batchedGemmData.mInputBuffers.mPtrClampLimit,
+            batchedGemmData.mInputBuffers.mPtrGatedActAlpha, batchedGemmData.mInputBuffers.mPtrGatedActBeta,
+            batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax, dPtrRowMaxBars,
+            batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas, batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
             batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit,
             numCtaBatch, batchedGemmData.mInputBuffers.mPtrDynamicTileCounter);
 
@@ -633,7 +673,12 @@ public:
         TLLM_CHECK_ERROR(batchedGemmConfig.mCudaRunner != nullptr, "CudaRunner is not set");
         batchedGemmConfig.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid,
             /* cluster */ {},
-            /* instanceId */ batchedGemmConfig.mInstanceIdx);
+            /* instanceId */ batchedGemmConfig.mInstanceIdx
+#ifdef TLLM_TEST
+            ,
+            (void*) cudaEvent
+#endif // TLLM_TEST
+        );
         return 0;
 #endif
 
@@ -777,6 +822,7 @@ public:
         BatchedGemmOptions const& options, std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt) const
     {
         bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
+        int32_t const clusterDimInBatchDim = batchM ? options.mClusterDimX : options.mClusterDimY;
 
         int32_t numCtasBatch{0};
         // For normal BMM, mNumTokens == 0 and the number of CTAs is known to host.
@@ -789,27 +835,20 @@ public:
                     : gemm::divUp(options.mBatchedN[bi], options.mTileN * options.mClusterDimY) * options.mClusterDimY;
             }
         }
-        // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
-        // We launch maximally possible number of CTAs and use ptrNumNonExitingCtas to determine the
-        // actual number of CTAs to run.
+        // For MoE, mNumTokens != 0 and the number of active batched-dimension entries is known only
+        // at runtime. We launch maximally possible number of CTAs and use ptrNumNonExitingCtas to
+        // determine the actual number of active entries to run. The legacy CTA-based name is kept for
+        // interface compatibility even though routed MoE paths may count these entries at CGA
+        // granularity.
         else if ((options.mEnablesEarlyExit || options.mEnablesDelayedEarlyExit) && options.mNumTokens != 0)
         {
             assert(maxNumCtasInBatchDim.has_value()
                 && "maxNumCtasInBatchDim must be provided when options.mNumTokens != 0");
-            numCtasBatch = maxNumCtasInBatchDim.value();
+            numCtasBatch = maxNumCtasInBatchDim.value() * clusterDimInBatchDim;
         }
         else
         {
             throw std::invalid_argument("Invalid combination of options");
-        }
-
-        if (batchM)
-        {
-            numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimX);
-        }
-        else
-        {
-            numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimY);
         }
 
         int32_t numCtasTile

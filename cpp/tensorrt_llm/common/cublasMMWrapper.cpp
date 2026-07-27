@@ -570,16 +570,16 @@ float const* getBetaDevicePointer()
 // BlockScaleGemm Version 1: Default algorithm (uses first valid heuristic)
 void CublasMMWrapper::BlockScaleGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n,
     int const k, void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
-    void const* b_sf, float const* alpha)
+    void const* b_sf, float const* alpha, void const* bias)
 {
     // Forward to the overloaded version with nullptr (use default algorithm)
-    BlockScaleGemm(transa, transb, m, n, k, A, lda, B, ldb, C, ldc, a_sf, b_sf, alpha, nullptr);
+    BlockScaleGemm(transa, transb, m, n, k, A, lda, B, ldb, C, ldc, a_sf, b_sf, alpha, nullptr, bias);
 }
 
 // BlockScaleGemm Version 2: Specified algorithm (unified implementation)
 void CublasMMWrapper::BlockScaleGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n,
     int const k, void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
-    void const* b_sf, float const* alpha, cublasLtMatmulAlgo_t const* algo)
+    void const* b_sf, float const* alpha, cublasLtMatmulAlgo_t const* algo, void const* bias)
 {
     // Verify input data types (currently supports FP4, can be extended to more formats in the future)
     TLLM_CHECK_WITH_INFO(mAType == CUDA_R_4F_E2M1 && mBType == CUDA_R_4F_E2M1,
@@ -606,6 +606,11 @@ void CublasMMWrapper::BlockScaleGemm(cublasOperation_t transa, cublasOperation_t
 
     // Set block-wise scaling descriptors
     setScaleDescriptors(const_cast<void*>(a_sf), const_cast<void*>(b_sf));
+
+    if (bias != nullptr)
+    {
+        setBiasDescriptor(const_cast<void*>(bias));
+    }
 
     // Validate cuBLASLt handle
     TLLM_CHECK_WITH_INFO(mCublasLtHandle != nullptr, "cuBLASLt handle is null");

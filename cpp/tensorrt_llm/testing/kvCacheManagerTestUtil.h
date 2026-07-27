@@ -31,9 +31,9 @@ public:
     /// NEVER CALL FROM PRODUCTION CODE. This is solely for use in unit tests.
     ///
     /// Most BlockManager/KVCacheManager functions (storeContextBlocks, releaseBlocks,
-    /// removeSequence, releaseSequence) require prefill to be complete before they are
-    /// called. This method updates llmRequest state as if prefill has just finished,
-    /// allowing unit tests to invoke those functions correctly.
+    /// removeSequence) require prefill to be complete before they are called. This
+    /// method updates llmRequest state as if prefill has just finished, allowing unit
+    /// tests to invoke those functions correctly.
     static void simulatePrefillCompletion(batch_manager::LlmRequest& llmRequest)
     {
         llmRequest.setContextCurrentPosition(llmRequest.getPromptLen());

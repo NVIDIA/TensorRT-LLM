@@ -19,8 +19,26 @@ class Qwen3VLMoeHfWeightMapper(Qwen3MoeHfWeightMapper):
         allow_partial_loading: bool = False,
     ) -> None:
         if isinstance(module, MoE):
+            # Qwen3VL MoE uses MoEWeightLoadingMode.FUSED_GATE_UP_PROJ, whose
+            # loader expects gate_up_proj in [E, H, 2*I] and down_proj in
+            # [E, I, H] format, but HF stores them transposed:
+            #   gate_up_proj: [E, 2*I, H]  ->  transpose to [E, H, 2*I]
+            #   down_proj:    [E, H,  I]   ->  transpose to [E, I,  H]
+            # Also rename FP8 scale_inv -> weight_scale.
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():
+                if weight_name == "gate_up_proj" and weight_value.ndim == 3:
+                    if (
+                        weight_value.shape[-2] == 2 * module.intermediate_size
+                        and weight_value.shape[-1] == module.hidden_size
+                    ):
+                        weight_value = weight_value.transpose(-1, -2).contiguous()
+                elif weight_name == "down_proj" and weight_value.ndim == 3:
+                    if (
+                        weight_value.shape[-2] == module.hidden_size
+                        and weight_value.shape[-1] == module.intermediate_size
+                    ):
+                        weight_value = weight_value.transpose(-1, -2).contiguous()
                 new_weight_name = weight_name.replace("scale_inv", "weight_scale")
                 updated_module_weights[new_weight_name] = weight_value
             module.load_weights(

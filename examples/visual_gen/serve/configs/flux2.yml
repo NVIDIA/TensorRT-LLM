@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-cache:
+cache_config:
   cache_backend: teacache
   teacache_thresh: 0.2
-attention:
+attention_config:
    backend: VANILLA
-parallel:
-   dit_cfg_size: 1
-   dit_ulysses_size: 2
+parallel_config:
+   cfg_size: 1
+   ulysses_size: 2

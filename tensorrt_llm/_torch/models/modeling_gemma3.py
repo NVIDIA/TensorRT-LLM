@@ -66,7 +66,20 @@ class Gemma3Attention(QKNormRoPEAttention):
         rope_params = RopeParams.from_config(config)
         self.attention_window_size = None
         if is_sliding:
-            rope_params.theta = config.rope_local_base_freq
+            # transformers 5.x moved rope_local_base_freq into
+            # rope_parameters["sliding_attention"]["rope_theta"]
+            local_freq = getattr(config, 'rope_local_base_freq', None)
+            if local_freq is None:
+                rp = getattr(config, 'rope_parameters', None) or {}
+                local_freq = rp.get('sliding_attention', {}).get('rope_theta')
+            if local_freq is None:
+                raise ValueError(
+                    "Gemma3 sliding attention requires a local RoPE base "
+                    "frequency, but neither `config.rope_local_base_freq` "
+                    "(transformers 4.x) nor "
+                    "`config.rope_parameters['sliding_attention']['rope_theta']` "
+                    "(transformers 5.x) is set on the model config.")
+            rope_params.theta = local_freq
             rope_params.scale_type = RotaryScalingType.none
             rope_params.scale = 1.0
             self.attention_window_size = config.sliding_window

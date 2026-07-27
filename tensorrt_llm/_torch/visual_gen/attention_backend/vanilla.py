@@ -71,6 +71,7 @@ class VanillaAttention(AttentionBackend):
         v: torch.Tensor,
         *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        key_padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -83,6 +84,9 @@ class VanillaAttention(AttentionBackend):
             k: Key tensor [batch_size, num_kv_heads, seq_len_kv, head_dim]
             v: Value tensor [batch_size, num_kv_heads, seq_len_kv, head_dim]
             attention_mask: Attention mask type (CAUSAL or FULL)
+            key_padding_mask: Optional ``[B, S_kv]`` bool tensor; True = valid,
+                False = pad. Expanded internally to ``[B, 1, 1, S_kv]`` and
+                passed as ``attn_mask`` to SDPA. Non-causal only.
 
         Returns:
             Output tensor [batch_size, num_heads, seq_len, head_dim]
@@ -99,7 +103,25 @@ class VanillaAttention(AttentionBackend):
             f"Invalid v shape: expected [B={q.shape[0]}, H_kv, S_kv, D={self.head_dim}], got {v.shape}"
         )
 
-        return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, scale=self.scale)
+        enable_gqa = self.num_heads != self.num_kv_heads
+        if key_padding_mask is not None:
+            assert not is_causal, "key_padding_mask is not supported with causal attention"
+            assert key_padding_mask.dim() == 2 and key_padding_mask.shape == (
+                q.shape[0],
+                k.shape[2],
+            ), (
+                f"Invalid key_padding_mask shape: expected [B={q.shape[0]}, "
+                f"S_kv={k.shape[2]}], got {tuple(key_padding_mask.shape)}"
+            )
+            # [B, S_kv] -> [B, 1, 1, S_kv] so SDPA broadcasts over H and S_q.
+            attn_mask = key_padding_mask[:, None, None, :]
+            return F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, scale=self.scale, enable_gqa=enable_gqa
+            )
+
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=is_causal, scale=self.scale, enable_gqa=enable_gqa
+        )
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:

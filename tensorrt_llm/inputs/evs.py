@@ -4,11 +4,37 @@
 import torch
 
 
+def compute_retained_tokens_from_tubelet_budget(num_tubelets: int,
+                                                tokens_per_tubelet: int,
+                                                pruning_ratio: float) -> int:
+    """This is Nemotron Nano V3 OMNI-specific at the moment.
+
+    Compute the number of retained tokens for a video given a precomputed per-tubelet token count.
+
+    Ensures that at least one tubelet's worth of tokens is always retained —
+    i.e. pruning never drops the whole video.
+
+    Args:
+        num_tubelets: Number of temporal units (tubelets) in the video.
+        tokens_per_tubelet: Post-spatial-merge token count per tubelet. For a
+            video with spatial grid (H, W) after patchification and
+            pixel-shuffle, this equals
+            ``(H // spatial_merge_size) * (W // spatial_merge_size)``.
+        pruning_ratio: The pruning ratio in [0, 1).
+
+    Returns:
+        The number of retained tokens across all tubelets.
+    """
+    evs_num_tokens = int(num_tubelets * tokens_per_tubelet *
+                         (1 - pruning_ratio))
+    return max(tokens_per_tubelet, evs_num_tokens)
+
+
 def compute_retained_tokens_count(video_size: torch.LongTensor,
                                   spatial_merge_size: int,
                                   pruning_ratio: float) -> int:
-    """
-    Compute the number of retained tokens for a given video.
+    """Compute the number of retained tokens for a given video.
+
     Method ensures that we retain all the tokens from the first frame
     regardless of the pruning rate.
 
@@ -25,9 +51,9 @@ def compute_retained_tokens_count(video_size: torch.LongTensor,
     # Tuple of ints input came from Preprocessing stage, while in actual forward() it was a Tensor.
     # To make sure number of output tokens stays the case - an explicit cast was added.
     T, H, W = map(int, video_size)
-    min_num_tokens = (H // spatial_merge_size) * (W // spatial_merge_size)
-    evs_num_tokens = int(T * min_num_tokens * (1 - pruning_ratio))
-    return max(min_num_tokens, evs_num_tokens)
+    tokens_per_tubelet = (H // spatial_merge_size) * (W // spatial_merge_size)
+    return compute_retained_tokens_from_tubelet_budget(T, tokens_per_tubelet,
+                                                       pruning_ratio)
 
 
 def compute_retention_mask(
@@ -37,8 +63,7 @@ def compute_retention_mask(
     pruning_ratio: float,
     flatten_output: bool = True,
 ) -> torch.Tensor:
-    """
-    Computes the retention mask for input video embeddings.
+    """Computes the retention mask for input video embeddings.
 
     Args:
         video_embeds (`torch.Tensor`): The input video embeddings

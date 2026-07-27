@@ -25,7 +25,6 @@ from unittest.mock import patch
 import pytest
 
 from tensorrt_llm import LLM as LLM_torch
-from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi import KvCacheConfig, llm_args
 from tensorrt_llm.usage import usage_lib
 
@@ -41,7 +40,7 @@ _kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 def _get_model_path():
     root = llm_models_root()
     assert root is not None, (
-        "LLM_MODELS_ROOT must be set or /home/scratch.trt_llm_data must be "
+        "LLM_MODELS_ROOT must be set or /home/scratch.trt_llm_data_ci must be "
         "accessible to run telemetry integration tests"
     )
     return str(root / MODEL_NAME)
@@ -81,54 +80,6 @@ class TestTelemetryPyTorchBackend:
         assert pretrained_config.architectures[0] == "LlamaForCausalLM"
 
         assert captured.get("llm_args") is not None, "report_usage was not called with llm_args"
-
-
-class TestTelemetryTRTBackend:
-    """Verify pretrained_config lifecycle with TensorRT backend (engine build).
-
-    When starting from an HF model, _TrtLLM builds a TRT engine and
-    overwrites self.args.model to point to the engine dir.  The telemetry
-    hook must still receive the *original* HF PretrainedConfig (loaded from
-    _hf_model_dir before the overwrite), not the TRT-LLM engine config.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _setup(self):
-        self.model_path = _get_model_path()
-
-    def test_telemetry_receives_hf_config_trt(self):
-        captured, spy = _make_spy()
-
-        with patch("tensorrt_llm.usage.report_usage", side_effect=spy):
-            with LLM(model=self.model_path, kv_cache_config=_kv_cache_config) as _:
-                pass
-
-        pretrained_config = captured.get("pretrained_config")
-        assert pretrained_config is not None, "report_usage was not called with pretrained_config"
-        # The config should be an HF PretrainedConfig with .architectures
-        # (plural list), NOT a TRT-LLM config with .architecture (singular).
-        assert hasattr(pretrained_config, "architectures"), (
-            "pretrained_config missing .architectures attribute"
-        )
-        assert isinstance(pretrained_config.architectures, list)
-        assert len(pretrained_config.architectures) > 0
-        assert pretrained_config.architectures[0] == "LlamaForCausalLM"
-
-        assert captured.get("llm_args") is not None, "report_usage was not called with llm_args"
-
-    def test_telemetry_arch_extraction_trt(self):
-        """End-to-end: _extract_architecture_class_name with TRT backend config."""
-        captured, spy = _make_spy()
-
-        with patch("tensorrt_llm.usage.report_usage", side_effect=spy):
-            with LLM(model=self.model_path, kv_cache_config=_kv_cache_config) as _:
-                pass
-
-        pretrained_config = captured.get("pretrained_config")
-        assert pretrained_config is not None
-
-        arch = usage_lib._extract_architecture_class_name(pretrained_config)
-        assert arch == "LlamaForCausalLM", f"Expected 'LlamaForCausalLM', got '{arch}'"
 
 
 class TestTelemetryArchitectureExtraction:
@@ -280,7 +231,7 @@ class TestFeatureTrackingIntegration:
         self.model_path = _get_model_path()
 
     def test_features_json_present_in_report_pytorch(self):
-        """_collect_features returns valid JSON with all 6 keys from real llm_args."""
+        """_collect_features returns valid JSON with all feature keys."""
         import json
 
         captured, spy = _make_spy()
@@ -294,15 +245,7 @@ class TestFeatureTrackingIntegration:
 
         features_str = usage_lib._collect_features(llm_args)
         features = json.loads(features_str)
-        expected_keys = {
-            "lora",
-            "speculative_decoding",
-            "prefix_caching",
-            "cuda_graphs",
-            "chunked_context",
-            "data_parallel_size",
-        }
-        assert set(features.keys()) == expected_keys
+        assert set(features.keys()) == set(usage_lib._FEATURES_DEFAULTS.keys())
 
     def test_features_json_default_values_pytorch(self):
         """Default TinyLlama config has expected feature defaults."""

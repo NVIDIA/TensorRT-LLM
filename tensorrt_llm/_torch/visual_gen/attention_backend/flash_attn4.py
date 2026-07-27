@@ -17,14 +17,10 @@ Flash Attention 4 Backend for Visual Generation Models
 
 Uses Flash Attention 4 with the CUTE JIT kernel.
 Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
-
-Cute kernel source: tensorrt_llm/_torch/visual_gen/jit_kernels/flash_attention/cute/
-(https://github.com/Dao-AILab/flash-attention/tree/main/flash_attn/cute
-at commit ea8f73506369d7cdd498396474107a978858138c)
 """
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -33,9 +29,7 @@ from .interface import AttentionBackend, AttentionTensorLayout
 
 _flash_attn_fwd_import_error = None
 try:
-    from tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.interface import (
-        _flash_attn_fwd,
-    )
+    from flash_attn.cute.interface import _flash_attn_fwd
 except (ImportError, OSError) as e:
     _flash_attn_fwd = None
     _flash_attn_fwd_import_error = e
@@ -77,12 +71,14 @@ class FlashAttn4Attention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         causal: bool,
-    ) -> torch.Tensor:
-        """Calls _flash_attn_fwd with torch.compile disabled."""
-        output, _lse = _flash_attn_fwd(
+        seqused_k: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Calls _flash_attn_fwd with torch.compile disabled. Returns (output, lse)."""
+        output, lse = _flash_attn_fwd(
             q,
             k,
             v,
+            seqused_k=seqused_k,
             softmax_scale=self.scale,
             causal=causal,
             window_size_left=None,
@@ -93,32 +89,18 @@ class FlashAttn4Attention(AttentionBackend):
             mask_mod=None,
             block_sparse_tensors=None,
             return_lse=True,
+            num_splits=0,
         )
-        return output
+        return output, lse
 
-    def forward(
+    def _prepare_inputs(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        *,
-        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Forward pass using Flash Attention 4.
-
-        Dimensions are derived from tensor shapes (NHD layout: ``[B, S, H, D]``).
-
-        Args:
-            q: Query tensor [batch_size, seq_len, num_heads, head_dim]
-            k: Key tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
-            v: Value tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
-            attention_mask: Attention mask type (CAUSAL or FULL)
-
-        Returns:
-            Output tensor [batch_size, seq_len, num_heads, head_dim]
-        """
+        attention_mask: PredefinedAttentionMask,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, torch.dtype]:
+        """Cast inputs to FA4-compatible dtype and resolve causal flag."""
         if _flash_attn_fwd is None:
             raise ImportError(
                 f"FlashAttention 4 is not available. Import error: {_flash_attn_fwd_import_error}"
@@ -132,13 +114,85 @@ class FlashAttn4Attention(AttentionBackend):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
             v = v.to(torch.bfloat16)
+        return q, k, v, is_causal, origin_dtype
 
-        output = self._fwd(q, k, v, is_causal)
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Forward pass using Flash Attention 4.
 
+        Dimensions are derived from tensor shapes (NHD layout: ``[B, S, H, D]``).
+
+        Args:
+            q: Query tensor [batch_size, seq_len, num_heads, head_dim]
+            k: Key tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
+            v: Value tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
+            attention_mask: Attention mask type (CAUSAL or FULL)
+            key_padding_mask: Optional ``[B, S_kv]`` bool tensor; True = valid,
+                False = pad. Translated to FA4's ``seqused_k = mask.sum(dim=1)``
+                (assumes True-prefix layout). Non-causal only.
+
+        Returns:
+            Output tensor [batch_size, seq_len, num_heads, head_dim]
+        """
+        output, _ = self.forward_with_lse(
+            q,
+            k,
+            v,
+            attention_mask=attention_mask,
+            key_padding_mask=key_padding_mask,
+            **kwargs,
+        )
+        return output
+
+    def forward_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass returning both output and log-sum-exp (LSE).
+
+        Returns:
+            output: [batch_size, seq_len, num_heads, head_dim]
+            lse:    [batch_size, num_heads, seq_len] — log-sum-exp per query position,
+                    always in float32. Used for numerically stable combination of
+                    partial attention results in Attention2D parallelism.
+        """
+        q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
+        seqused_k = None
+        if key_padding_mask is not None:
+            assert not is_causal, "key_padding_mask is not supported with causal attention"
+            assert key_padding_mask.dim() == 2 and key_padding_mask.shape == (
+                q.shape[0],
+                k.shape[1],
+            ), (
+                f"Invalid key_padding_mask shape: expected [B={q.shape[0]}, "
+                f"S_kv={k.shape[1]}], got {tuple(key_padding_mask.shape)}"
+            )
+            # FA4 seqused_k assumes a True-prefix layout: positions [0, valid)
+            # are kept, [valid, S_kv) are masked. mask.sum gives the prefix length.
+            seqused_k = key_padding_mask.sum(dim=1).to(torch.int32)
+        output, lse = self._fwd(q, k, v, is_causal, seqused_k=seqused_k)
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
+        return output, lse
 
-        return output
+    @classmethod
+    def support_lse(cls) -> bool:
+        return True
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:

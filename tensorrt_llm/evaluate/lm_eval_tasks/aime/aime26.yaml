@@ -1,0 +1,32 @@
+# AIME 2026 (no tools). Mirrors upstream lm-evaluation-harness aime25.yaml
+# but points at MathArena/aime_2026 (30 problems, fields: problem_idx / problem
+# / answer). "no tools" = no code interpreter / calculator, which is the
+# default behaviour for lm-eval generate_until tasks.
+tag:
+  - math_word_problems
+task: aime26
+dataset_path: MathArena/aime_2026
+output_type: generate_until
+training_split: train
+fewshot_split: train
+test_split: train
+doc_to_text: "Question: {{problem}}\nPlease reason step by step, and put your final answer within \\boxed{}.\nAnswer:"
+doc_to_target: "{{answer}}"
+process_results: !function utils.process_results
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+generation_kwargs:
+  until:
+    - "Question:"
+    - "</s>"
+    - "<|im_end|>"
+    - "<|eot_id|>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 32768
+repeats: 4
+num_fewshot: 0
+metadata:
+  version: 0.0

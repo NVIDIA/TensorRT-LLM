@@ -1,5 +1,7 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/configs/qwen3_next.py
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # coding=utf-8
 # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
@@ -15,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -24,12 +27,13 @@ import torch
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3NextConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.modules.fused_shared_expert import \
+    fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
@@ -38,7 +42,7 @@ from tensorrt_llm._utils import get_sm_version
 from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams)
+                           MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -56,6 +60,58 @@ from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
+
+
+def _fused_norm_weight(norm: RMSNorm) -> torch.Tensor:
+    """Weight to feed the fused AllReduce+RMSNorm op for ``norm``.
+
+    Gemma RMSNorm scales by ``(1 + weight)`` (see RMSNorm.forward), but the
+    fused AR+RMSNorm kernels (and the NCCL / NCCL_SYMMETRIC fallbacks the
+    AUTO strategy may pick) only apply ``weight``. Baking the ``+1`` into the
+    weight makes EVERY allreduce backend produce the correct gemma result
+    without any backend-specific flag.
+
+    For gemma norms the ``(1 + weight)`` tensor is precomputed once in
+    ``Qwen3NextForCausalLM.cache_derived_state`` and cached on the module as
+    ``_fused_norm_weight``. Computing it inline here would re-run a cast+add
+    elementwise kernel every forward inside the CUDA graph. The inline path
+    below is only a correctness fallback if the cache is absent.
+    """
+    cached = getattr(norm, "_fused_norm_weight", None)
+    if cached is not None:
+        return cached
+    w = norm.weight
+    if getattr(norm, "use_gemma", False):
+        return (w.float() + 1.0).to(w.dtype)
+    return w
+
+
+def _precompute_fused_norm_weights(module: nn.Module) -> None:
+    """Bake ``(1 + weight)`` once for every gemma RMSNorm under ``module``.
+
+    Caches the result on each norm as ``_fused_norm_weight`` so the fused
+    AllReduce+RMSNorm path reads a ready tensor instead of recomputing the
+    cast+add every forward. Non-gemma norms are left untouched (the fused op
+    uses their ``weight`` directly). Must run after weights are loaded onto the
+    device; the cached tensor is a plain attribute, not a registered buffer, so
+    it stays out of the state dict.
+
+    Norms whose ``weight`` was stripped are skipped: the layer-wise benchmark
+    runs ``remove_weights`` on unused layers (``skip_forward``), leaving a
+    ``use_gemma`` norm without a ``weight`` parameter; those layers never run
+    the fused path, so there is nothing to precompute.
+    """
+    for norm in module.modules():
+        if isinstance(norm, RMSNorm) and getattr(norm, "use_gemma", False):
+            w = getattr(norm, "weight", None)
+            if w is None:
+                continue
+            norm._fused_norm_weight = (w.float() + 1.0).to(w.dtype)
+
+
+def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
+    return (os.environ.get("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
+            and not enable_attention_dp)
 
 
 class Qwen3NextGate(nn.Module):
@@ -123,7 +179,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.mapping = model_config.mapping
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
 
         self.aux_stream = aux_stream
 
@@ -144,6 +201,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         weight_loading_mode = (MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
                                if config.model_type == "qwen3_5_moe_text" else
                                MoEWeightLoadingMode.VANILLA)
+        # For MIXED_PRECISION checkpoints (e.g. ModelOpt), the experts' real
+        # quant algo lives in the per-layer quant_config_dict keyed by TRT-LLM
+        # module name. Pass it as override_quant_config so the backend resolves
+        # the correct quant method (e.g. NVFP4) at construction, instead of
+        # inheriting the unquantized MIXED_PRECISION global and relying on
+        # apply_layerwise_quant_config (which rebinds the ConfigurableMoE
+        # wrapper but not its delegated backend).
+        expert_quant_config = None
+        quant_config_dict = getattr(model_config, "quant_config_dict", None)
+        if quant_config_dict and layer_idx is not None:
+            expert_quant_config = quant_config_dict.get(
+                f"model.layers.{layer_idx}.mlp.experts")
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -155,6 +224,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
             weight_loading_mode=weight_loading_mode,
+            override_quant_config=expert_quant_config,
         )
 
         self.shared_expert = GatedMLP(
@@ -223,11 +293,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 hidden_states,
                 lora_params=lora_params,
             )
-            shared_expert_output = F.sigmoid(
-                self.shared_expert_gate(hidden_states)) * shared_expert_output
-            return shared_expert_output
+            shared_expert_gate_logits = self.shared_expert_gate(hidden_states)
+            return shared_expert_output, shared_expert_gate_logits
 
-        final_hidden_states, shared_expert_output = maybe_execute_in_parallel(
+        final_hidden_states, shared_expert_outputs = maybe_execute_in_parallel(
             _compute_routed_output,
             _compute_shared_output,
             self.event_dict[EventType.Main],
@@ -238,12 +307,23 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if not do_finalize:
             return final_hidden_states
 
-        final_hidden_states = final_hidden_states + shared_expert_output
-
+        shared_expert_output, shared_expert_gate_logits = shared_expert_outputs
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            output_tensor, _ = torch.ops.trtllm.allocate_output(
+                final_hidden_states, self.allreduce.output_buffer_kind,
+                self.mapping.tp_group)
+            final_hidden_states = fused_sigmoid_gate_mul_add(
+                final_hidden_states,
+                shared_expert_gate_logits,
+                shared_expert_output,
+                output=output_tensor,
+            )
             final_hidden_states = self.allreduce(
                 final_hidden_states, all_reduce_params=all_reduce_params)
-
+        else:
+            final_hidden_states = fused_sigmoid_gate_mul_add(
+                final_hidden_states, shared_expert_gate_logits,
+                shared_expert_output)
         return final_hidden_states.view(orig_shape)
 
 
@@ -334,22 +414,21 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
 
         self.next_layer_layernorm: RMSNorm = None
 
         self.fusion_config = EagerFusionConfig()
-        ### TODO: enable eager_fusion by default
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "1") == "0"
-        self.enable_fusion &= not self.enable_attention_dp
+        self.enable_fusion = _eager_fusion_enabled(self.enable_attention_dp)
 
         has_tp = self.mapping.has_tp()
         has_pp = self.mapping.has_pp()
 
         self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
-        self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp and self.enable_attention_dp
-        self.disable_attn_allreduce = (self.mapping.tp_size == 1
+        self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
+        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
+                                       or self.mapping.tp_size == 1
                                        or self.enable_attention_dp)
 
         self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
@@ -386,21 +465,18 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
                 all_reduce_params=AllReduceParams(
                     fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                     residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
+                    norm_weight=_fused_norm_weight(
+                        self.post_attention_layernorm),
                     eps=self.post_attention_layernorm.variance_epsilon,
-                    enable_allreduce=not self.disable_attn_allreduce,
                 ))
         else:
             # No fusion
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
-        do_finalize = not (self.fusion_config.POST_MOE_FUSION
-                           and hidden_states.shape[0]
-                           <= self.moe_allreduce.max_token
-                           and self.model_config.moe_backend == 'TRTLLM'
-                           and self.mlp.experts.has_nvfp4)
+        # Qwen3NextSparseMoeBlock does not implement do_finalize=False. Defer
+        # only its final all-reduce so the decoder can fuse it with RMSNorm.
+        do_finalize = True
 
         hidden_states = self.mlp(
             hidden_states,
@@ -419,7 +495,8 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
                     all_reduce_params=AllReduceParams(
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                         residual=residual,
-                        norm_weight=self.next_layer_layernorm.weight,
+                        norm_weight=_fused_norm_weight(
+                            self.next_layer_layernorm),
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
             else:
@@ -462,6 +539,7 @@ class Qwen3NextAttention(Qwen3Attention):
                          fuse_qk_norm_rope=fuse_qk_norm_rope,
                          attn_output_gate=True,
                          use_gemma_rms_norm=True)
+        self._fuse_qk_norm_rope_gate = True
 
 
 class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
@@ -478,7 +556,10 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         self.self_attn = Qwen3NextAttention(
             model_config,
             layer_idx=layer_idx,
-            fuse_qk_norm_rope=False,
+            # Gemma-style QK-norm is now supported by the fused qk_norm_rope
+            # kernel (use_gemma path), so fuse instead of running separate
+            # split + q/k RMSNorm + RoPE kernels.
+            fuse_qk_norm_rope=True,
         )
 
         self.mlp = _create_mlp(model_config, aux_stream, layer_idx)
@@ -495,22 +576,30 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
 
         self.next_layer_layernorm: RMSNorm = None
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
-        self.enable_fusion &= not self.enable_attention_dp
+        self.enable_fusion = _eager_fusion_enabled(self.enable_attention_dp)
 
         has_tp = self.mapping.has_tp()
         has_pp = self.mapping.has_pp()
 
         self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
 
-        self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp and self.enable_attention_dp
-        self.disable_attn_allreduce = (self.mapping.tp_size == 1
+        # POST_MOE_FUSION fuses the MoE-output all-reduce with the next layer's
+        # RMSNorm. It is a tensor-parallel (TEP) optimization: it is only valid
+        # when ranks share the same tokens (not attention_dp, where each rank holds
+        # different tokens and the MoE block does no cross-rank all-reduce). This
+        # mirrors the DeepSeek-V3 pattern (POST == PRE in the non-attention_dp path).
+        self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
+        # When PRE_MOE_FUSION is on, the attention all-reduce is deferred to the
+        # fused PRE all-reduce+RMSNorm, so disable the in-attention all-reduce to
+        # avoid reducing twice.
+        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
+                                       or self.mapping.tp_size == 1
                                        or self.enable_attention_dp)
         self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
@@ -543,13 +632,14 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             **kwargs,
         )
 
-        if self.fusion_config.PRE_MOE_FUSION and self.enable_attention_dp:
+        if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
                     fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                     residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
+                    norm_weight=_fused_norm_weight(
+                        self.post_attention_layernorm),
                     eps=self.post_attention_layernorm.variance_epsilon,
                 ))
         else:
@@ -557,12 +647,12 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
-        do_finalize = not (hidden_states.shape[0]
-                           <= self.moe_allreduce.max_token
-                           and self.fusion_config.POST_MOE_FUSION
-                           and self.model_config.moe_backend == 'TRTLLM'
-                           and self.mlp.experts.has_nvfp4)
+        # The fully-fused do_finalize=False MoE path (MoEAllReduce on the
+        # unfinalized expert output) is not implemented by Qwen3NextSparseMoeBlock
+        # (it raises NotImplementedError). Keep do_finalize=True so POST_MOE_FUSION
+        # still fuses the *finalized* MoE all-reduce with the next layer's RMSNorm
+        # via the do_finalize branch below, without hitting the unimplemented path.
+        do_finalize = True
         hidden_states = self.mlp(
             hidden_states,
             attn_metadata,
@@ -580,7 +670,8 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
                     all_reduce_params=AllReduceParams(
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                         residual=residual,
-                        norm_weight=self.next_layer_layernorm.weight,
+                        norm_weight=_fused_norm_weight(
+                            self.next_layer_layernorm),
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
             else:
@@ -675,10 +766,34 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
     def __init__(self, model_config: ModelConfig[Qwen3NextConfig],
                  layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
                                                        torch.cuda.Stream]):
-        super().__init__(model_config, layer_idx,
+        # Some HF checkpoints (e.g. Qwen3.5 NVFP4) keep the MTP layer entirely
+        # unquantized -- including its MoE experts (no weight_scale tensors).
+        # Most non-CUTLASS MoE backends (TRTLLMGen, CuteDsl, ...) reject
+        # unquantized / kv-cache-only quant_modes at create_weights or
+        # forward time (e.g. "TRTLLMGenFusedMoE doesn't support
+        # fp16/bf16/fp32 MoE", "CuteDslFusedMoE doesn't support quantization
+        # mode [128]" where bit 128 is FP8_KV_CACHE only).  CUTLASS MoE
+        # supports both BF16 and quantized MoE, so when the checkpoint marks
+        # MTP as excluded from quantization, fall back to CUTLASS *only* for
+        # the MTP layer.  Regular layers (0..num_hidden_layers-1) keep the
+        # user-selected backend.
+        mtp_model_config = model_config
+        if (model_config.moe_backend != "CUTLASS"
+                and Qwen3NextMTP._is_mtp_excluded_from_quant(model_config)):
+            original_backend = model_config.moe_backend
+            mtp_model_config = copy.copy(model_config)
+            mtp_model_config._frozen = False
+            mtp_model_config.moe_backend = "CUTLASS"
+            mtp_model_config._frozen = True
+            logger.warning(
+                "Qwen3Next MTP layer is unquantized in the checkpoint; "
+                "falling back to moe_backend=CUTLASS for the MTP layer "
+                f"(regular layers keep moe_backend={original_backend}).")
+
+        super().__init__(mtp_model_config, layer_idx,
                          aux_stream_dict[AuxStreamType.Attention])
-        config = model_config.pretrained_config
-        self.model_config = model_config
+        config = mtp_model_config.pretrained_config
+        self.model_config = mtp_model_config
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
             key: torch.cuda.Event()
@@ -698,13 +813,13 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
             use_gemma=True,
         )
 
-        if model_config.mapping.enable_attention_dp:
+        if mtp_model_config.mapping.enable_attention_dp:
             self.fc = Linear(
                 config.hidden_size * 2,
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
-                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init=mtp_model_config.
                 skip_create_weights_in_init,
                 use_cute_dsl_blockscaling_mm=False,
             )
@@ -715,13 +830,43 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
                 bias=False,
                 dtype=config.torch_dtype,
                 tensor_parallel_mode=TensorParallelMode.ROW,
-                mapping=model_config.mapping,
+                mapping=mtp_model_config.mapping,
                 reduce_output=True,
-                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init=mtp_model_config.
                 skip_create_weights_in_init,
                 use_cute_dsl_blockscaling_mm=False,
             )
-        self.shared_head = Qwen3NextMTPHead(model_config)
+        self.shared_head = Qwen3NextMTPHead(mtp_model_config)
+        # MTP applies shared_head.norm after the base decoder forward, so its
+        # MoE-output all-reduce cannot consume next_layer_layernorm.
+        self.fusion_config.POST_MOE_FUSION = False
+
+    @staticmethod
+    def _is_mtp_excluded_from_quant(
+            model_config: ModelConfig[Qwen3NextConfig]) -> bool:
+        """Heuristic: did the checkpoint mark MTP as excluded from quantization?
+
+        ``apply_quant_config_exclude_modules`` runs *after* this constructor.
+        For Qwen3.5 paths the exclude_modules list has already been
+        translated to ``model.layers.<n_hidden_layers>*`` by
+        ``_normalize_qwen35_exclude_modules`` -- detect that.  Raw HF
+        ``mtp.*`` patterns are also accepted (defensive: if some future
+        weight mapper does not translate them, this still triggers the
+        backend fallback so the MoE path doesn't crash).
+        """
+        qc = getattr(model_config, "quant_config", None)
+        if qc is None or not getattr(qc, "exclude_modules", None):
+            return False
+        n_layers = getattr(model_config.pretrained_config, "num_hidden_layers",
+                           None)
+        target_prefix = (f"model.layers.{n_layers}"
+                         if n_layers is not None else None)
+        for pat in qc.exclude_modules:
+            if pat.startswith("mtp."):
+                return True
+            if target_prefix is not None and pat.startswith(target_prefix):
+                return True
+        return False
 
     def forward(
         self,
@@ -910,11 +1055,20 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         # is supported for Mamba/SSM-based models
         return {"kv_cache_config": {"enable_block_reuse": False}}
 
-    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
+    def load_weights(self,
+                     weights: dict,
+                     weight_mapper: BaseWeightMapper,
+                     params_map: Optional[Dict[str, str]] = None,
+                     allow_partial_loading: bool = False):
         new_weights = weight_mapper.preprocess_weights(weights)
-        super().load_weights(new_weights, weight_mapper)
+        super().load_weights(
+            new_weights,
+            weight_mapper=weight_mapper,
+            params_map=params_map,
+            allow_partial_loading=allow_partial_loading,
+        )
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
@@ -922,3 +1076,7 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        _precompute_fused_norm_weights(self)

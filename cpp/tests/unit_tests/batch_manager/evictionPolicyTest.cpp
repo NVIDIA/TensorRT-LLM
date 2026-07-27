@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -116,6 +116,40 @@ TEST_F(LRUPolicyTest, ReleaseBlockTest)
     policy->releaseBlock(origPrimaryBlock);
 
     EXPECT_NE(origPrimaryBlock->getBlockId(), std::get<0>(policy->getFreeBlock(0))->getBlockId());
+}
+
+TEST_F(LRUPolicyTest, PooledPlaceholderReleaseReturnsToPlaceholderQueue)
+{
+    constexpr SizeType32 kPlaceholderCacheLevel = 2;
+    constexpr SizeType32 kWindowSize = 64;
+    auto constexpr kPooledPlaceholderBlockId = KVCacheBlock::kCachedBlocksRootId - 1;
+
+    std::vector<BlockPtr> allPlaceholderBlocksById(static_cast<size_t>(-kPooledPlaceholderBlockId) + 1);
+    auto pooledPlaceholder = KVCacheBlock::createPlaceholder(kPooledPlaceholderBlockId, kWindowSize);
+    allPlaceholderBlocksById[static_cast<size_t>(-kPooledPlaceholderBlockId)] = pooledPlaceholder;
+    policy->initializePlaceholders(allPlaceholderBlocksById);
+
+    EXPECT_EQ(policy->getNumFreeBlocks(kPlaceholderCacheLevel), 1);
+    auto [block, canOffload] = policy->getFreeBlock(0, /*wantPlaceholder=*/true);
+    EXPECT_EQ(block, pooledPlaceholder);
+    EXPECT_FALSE(canOffload);
+
+    policy->claimBlock(block);
+    EXPECT_EQ(policy->getNumFreeBlocks(kPlaceholderCacheLevel), 0);
+
+    policy->releaseBlock(block);
+    EXPECT_EQ(policy->getNumFreeBlocks(kPlaceholderCacheLevel), 1);
+    EXPECT_EQ(std::get<0>(policy->getFreeBlock(0, /*wantPlaceholder=*/true)), pooledPlaceholder);
+}
+
+TEST_F(LRUPolicyTest, SentinelPlaceholderReleaseDoesNotEnterPlaceholderQueue)
+{
+    constexpr SizeType32 kPlaceholderCacheLevel = 2;
+
+    auto sentinelPlaceholder = KVCacheBlock::createPlaceholder();
+    policy->releaseBlock(sentinelPlaceholder);
+
+    EXPECT_EQ(policy->getNumFreeBlocks(kPlaceholderCacheLevel), 0);
 }
 
 TEST_F(LRUPolicyTest, LRUTest)

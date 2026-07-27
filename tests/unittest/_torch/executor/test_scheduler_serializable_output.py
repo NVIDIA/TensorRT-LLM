@@ -24,6 +24,7 @@ def test_serializable_scheduler_output_round_trip():
 
     # Create scheduler result: scheduled_requests, fitting_disagg_gen_init_requests, num_fitting_requests
     scheduled_requests = ScheduledRequests()
+    scheduled_requests.encoder_requests = [request_pool[7]]
     scheduled_requests.context_requests_last_chunk = [request_pool[1], request_pool[2]]
     scheduled_requests.generation_requests = [request_pool[3]]
     scheduled_requests.paused_requests = [request_pool[4]]
@@ -32,7 +33,10 @@ def test_serializable_scheduler_output_round_trip():
 
     # Create serializable scheduler output from scheduler result
     serializable_output = SerializableSchedulerOutput.from_scheduler_result(
-        scheduled_requests, fitting_disagg_gen_init_requests, num_fitting_requests
+        scheduled_requests,
+        fitting_disagg_gen_init_requests,
+        num_fitting_requests,
+        wait_for_disagg_gen_transfer_progress=True,
     )
 
     # Serialize and deserialize the serializable scheduler output
@@ -47,6 +51,10 @@ def test_serializable_scheduler_output_round_trip():
 
     # Verify the restored scheduler result is correct
     assert restored_num_fitting == num_fitting_requests
+    assert restored_output.wait_for_disagg_gen_transfer_progress
+    assert _request_ids(restored_schedule.encoder_requests) == _request_ids(
+        scheduled_requests.encoder_requests
+    )
     assert _request_ids(restored_schedule.context_requests_chunking) == _request_ids(
         scheduled_requests.context_requests_chunking
     )

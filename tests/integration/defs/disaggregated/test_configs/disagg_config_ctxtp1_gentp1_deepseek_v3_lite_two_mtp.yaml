@@ -6,7 +6,7 @@ cuda_graph_config: null
 disable_overlap_scheduler: true
 speculative_config:
   decoding_type: MTP
-  num_nextn_predict_layers: 2
+  max_draft_len: 2
 context_servers:
   num_instances: 1
   tensor_parallel_size: 1

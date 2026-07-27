@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Patches for Qwen3Next to make it compatible with torch.export and reduce export time.
 
 Includes:
@@ -16,12 +30,21 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from transformers.models.qwen3_next.modeling_qwen3_next import (
-    Qwen3NextDynamicCache,
     Qwen3NextGatedDeltaNet,
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     apply_mask_to_padding_states,
 )
+
+# transformers 5.5+ removed the model-specific Qwen3NextDynamicCache and routes
+# qwen3_next through the generic DynamicCache from cache_utils. Fall back to the
+# old symbol when running against transformers 5.3.x so this file still imports.
+try:
+    from transformers.models.qwen3_next.modeling_qwen3_next import (
+        Qwen3NextDynamicCache as _Qwen3NextCache,
+    )
+except ImportError:
+    from transformers.cache_utils import DynamicCache as _Qwen3NextCache
 
 from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
@@ -34,24 +57,29 @@ def _forward_moe(self: Qwen3NextSparseMoeBlock, hidden_states: torch.Tensor):
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     hidden_states = hidden_states.view(-1, hidden_dim)
 
-    # router_logits: (batch * sequence_length, n_experts)
-    router_logits = self.gate(hidden_states)
+    # In transformers 5.x, gate returns (router_logits, routing_weights, selected_experts).
+    # The routing logic (softmax, topk, normalization) is now inside the gate.
+    _, routing_weights, selected_experts = self.gate(hidden_states)
 
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-    if self.norm_topk_prob:
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-    # we cast back to the input dtype
-    routing_weights = routing_weights.to(hidden_states.dtype)
+    # In transformers 5.x, self.experts is a fused object with stacked weight tensors
+    # (Parameters directly, not modules with .weight).
+    # Use torch_moe_fused directly since weights are already stacked.
+    gate_up_param = self.experts.gate_up_proj
+    gate_up = gate_up_param.weight if hasattr(gate_up_param, "weight") else gate_up_param
+    down_param = self.experts.down_proj
+    down = down_param.weight if hasattr(down_param, "weight") else down_param
 
-    # Routed experts via torch_moe
-    final_hidden_states = torch.ops.auto_deploy.torch_moe(
+    # HF format: gate_up is [E, 2*I, H] with gate(w1) first, up(w3) second.
+    # TRT-LLM format: w3_w1 is [E, 2*I, H] with up(w3) first, gate(w1) second.
+    half = gate_up.shape[1] // 2
+    w3_w1_stacked = torch.cat([gate_up[:, half:, :], gate_up[:, :half, :]], dim=1)
+
+    final_hidden_states = torch.ops.auto_deploy.torch_moe_fused(
         hidden_states,
         selected_experts,
         routing_weights,
-        w1_weight=[expert.gate_proj.weight for expert in self.experts],
-        w2_weight=[expert.down_proj.weight for expert in self.experts],
-        w3_weight=[expert.up_proj.weight for expert in self.experts],
+        w3_w1_stacked_weight=w3_w1_stacked,
+        w2_stacked_weight=down,
     )
 
     # Shared expert path (unique to Qwen3Next vs Qwen3MoE)
@@ -60,7 +88,7 @@ def _forward_moe(self: Qwen3NextSparseMoeBlock, hidden_states: torch.Tensor):
     final_hidden_states = final_hidden_states + shared_expert_output
 
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-    return final_hidden_states, router_logits
+    return final_hidden_states
 
 
 @ExportPatchRegistry.register("hf_qwen3_next_moe")
@@ -91,7 +119,7 @@ class Qwen3NextMoePatch(BaseExportPatch):
 def _patched_gdn_forward(
     self: Qwen3NextGatedDeltaNet,
     hidden_states: torch.Tensor,
-    cache_params: Optional[Qwen3NextDynamicCache] = None,
+    cache_params: Optional[_Qwen3NextCache] = None,
     cache_position: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
 ):
@@ -203,12 +231,13 @@ class Qwen3NextGDNPatch(BaseExportPatch):
         self.original_values["Qwen3NextModel._update_linear_attn_mask"] = (
             Qwen3NextModel._update_linear_attn_mask
         )
-        # NOTE: Qwen3NextDynamicCache does not have __bool__ by default
-        # (it inherits from object), so we just set it and delete on revert.
+        # NOTE: the cache class (Qwen3NextDynamicCache pre-5.5 / generic
+        # DynamicCache 5.5+) does not define its own __bool__ — both fall back
+        # to Cache.__len__ — so we just set it and delete on revert.
 
         Qwen3NextGatedDeltaNet.forward = _patched_gdn_forward  # type: ignore
         Qwen3NextModel._update_linear_attn_mask = _patched_update_linear_attn_mask  # type: ignore
-        Qwen3NextDynamicCache.__bool__ = _cache_bool  # type: ignore
+        _Qwen3NextCache.__bool__ = _cache_bool  # type: ignore
 
     def _revert_patch(self):
         """Revert the GDN, mask, and cache patches."""
@@ -218,4 +247,4 @@ class Qwen3NextGDNPatch(BaseExportPatch):
         Qwen3NextModel._update_linear_attn_mask = self.original_values[  # type: ignore
             "Qwen3NextModel._update_linear_attn_mask"
         ]
-        del Qwen3NextDynamicCache.__bool__
+        del _Qwen3NextCache.__bool__

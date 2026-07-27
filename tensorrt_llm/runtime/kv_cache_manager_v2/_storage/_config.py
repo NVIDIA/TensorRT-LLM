@@ -15,6 +15,7 @@
 
 from collections import defaultdict
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import NamedTuple, cast
 
 from .._common import LayerId
@@ -28,6 +29,7 @@ from .._utils import (
     filled_list,
     get_uniform_attribute,
     is_sorted,
+    typed_enumerate,
     typed_map,
     value_or,
 )
@@ -98,6 +100,19 @@ class BufferAttr:
     expansion: int  # expansion factor of page due to heterogeneous tokens_per_block
 
 
+@dataclass(slots=True)
+class LayerAttr:
+    life_cycle_id: LifeCycleId
+    # Number of sub-pages within a single coalesced slot that belong to this layer.
+    # When multiple buffers from the same layer are coalesced into the same pool (e.g., K and V buffers
+    # of the same size), this equals the number of such buffers. For scratch allocation, each layer
+    # needs exactly this many sub-pages per block within the slot.
+    slot_util: TypedIndexList[PoolIndex, int]
+
+    # Fraction of slot_util to total number of buffers in the slot, max over all pools in the slot
+    slot_util_frac_max: Fraction
+
+
 @dataclass(slots=True, frozen=True)
 class StorageConfig:
     cache_tiers: HomoTuple[CacheTierConfig]
@@ -141,6 +156,30 @@ class StorageConfig:
                 life_cycle = slot.life_cycle_id
                 ret[life_cycle] = [cb.num_buffers for cb in slot.coalesced_buffers]
         return cast(TypedIndexList[LifeCycleId, TypedIndexList[PoolIndex, int]], ret)
+
+    def layer_attributes(self) -> dict[LayerId, LayerAttr]:
+        ret = dict[LayerId, LayerAttr]()
+        for pg in self.slot_desc_list:
+            for slot in pg.variants:
+                life_cycle_id = slot.life_cycle_id
+                num_pools = len(slot.coalesced_buffers)
+                for pool, cb in typed_enumerate(slot.coalesced_buffers):
+                    slot_util = defaultdict[LayerId, int](int)
+                    for b in cb.buffer_ids:
+                        slot_util[b.layer_id] += 1
+                    buffers_per_slots = cb.num_buffers
+                    for layer_id, count in slot_util.items():
+                        if layer_id not in ret:
+                            ret[layer_id] = LayerAttr(
+                                life_cycle_id, filled_list(0, num_pools), Fraction(0, 1)
+                            )
+                        attr = ret[layer_id]
+                        assert attr.life_cycle_id == life_cycle_id
+                        attr.slot_util[pool] = count
+                        attr.slot_util_frac_max = max(
+                            attr.slot_util_frac_max, Fraction(count, buffers_per_slots)
+                        )
+        return ret
 
     def layer_to_life_cycle_ids(self) -> dict[LayerId, LifeCycleId]:
         map = dict[LayerId, LifeCycleId]()

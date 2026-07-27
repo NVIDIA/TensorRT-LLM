@@ -15,8 +15,30 @@ fi
 
 cd $llmSrcNode/tests/integration/defs
 
+# Force PMIx to use the in-memory hash GDS instead of ds12/ds21 shared-memory.
+# Under `srun --mpi=pmix` with the DLFW 26.04 OpenMPI build, the shared-memory
+# GDS modes can fail to publish UCX worker addresses across nodes, producing:
+#   pml_ucx.c:178  Error: Failed to receive UCX worker address: Not found (-13)
+#   pml_ucx.c:482  Error: Failed to resolve UCX endpoint for rank N
+# See https://github.com/open-mpi/ompi/issues/6981. Setting this is a no-op
+# when PMIx isn't used.
+export PMIX_MCA_gds=hash
+
 # Turn off "exit on error" so the following lines always run
 set +e
+
+# For disaggregated benchmark/server runs, clear all environment variables
+# related to Slurm and MPI. This prevents test processes (e.g., pytest) from
+# incorrectly initializing MPI when running under srun --overlap without
+# --mpi=pmix. (Same fix as jenkins/scripts/slurm_run.sh)
+if [ "${DISAGG_SERVING_TYPE:-}" == "BENCHMARK" ] || \
+   [ "${DISAGG_SERVING_TYPE:-}" == "DISAGG_SERVER" ]; then
+    for v in ${!PMI@} ${!PMIX@} ${!MPI@} ${!OMPI@} ${!SLURM@}; do
+        if [ "$v" != "SLURM_PROCID" ]; then
+            unset "$v"
+        fi
+    done
+fi
 
 pytest_exit_code=0
 

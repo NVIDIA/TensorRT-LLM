@@ -122,6 +122,7 @@ def torch_attention(
     layer_idx: Optional[int] = None,
     shared_kv_source_layer_idx: Optional[int] = None,
     layer_type: str = "mha",
+    enable_sharding: bool = False,
 ) -> torch.Tensor:
     """
     SDPA attention (with optional GQA) that supports two memory layouts via `layout`:
@@ -173,7 +174,9 @@ def torch_attention(
         attn_scores = attn_scores + attn_mask
 
     # Apply causal mask if specified and only during the context phase
-    if is_causal and s_q == s_k:  # Only apply causal mask during context processing
+    if (
+        attn_mask is None and is_causal and s_q == s_k
+    ):  # Only apply causal mask during context processing
         causal_mask = torch.triu(
             torch.ones(s_q, s_k, device=query.device, dtype=torch.bool),
             diagonal=1,  # Use diagonal=1 for standard causal masking
@@ -250,5 +253,6 @@ def torch_attention_fake(
     layer_idx: Optional[int] = None,
     shared_kv_source_layer_idx: Optional[int] = None,
     layer_type: str = "mha",
+    enable_sharding: bool = False,
 ):
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()

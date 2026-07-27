@@ -756,7 +756,7 @@ class HCXVisionInputProcessor(BaseMultimodalDummyInputsBuilder,
         return input_ids, preprocessed_image
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
@@ -1111,9 +1111,13 @@ class HCXVisionForCausalLM(PreTrainedModel):
             mm_embeds = find_input_mm_embeds(
                 mm_embeds, multimodal_params[:num_context_requests])
 
-        input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
-                                                    input_ids, mm_embeds,
-                                                    **kwargs)
+        input_ids, input_embeds = fuse_input_embeds(
+            self.llm.model.embed_tokens,
+            input_ids,
+            mm_embeds,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
+        )
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,

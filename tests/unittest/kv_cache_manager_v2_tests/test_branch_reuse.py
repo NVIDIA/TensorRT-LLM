@@ -84,8 +84,8 @@ class TestPartialBlockRebase(unittest.TestCase):
         return TokenId(next(self._tok))
 
     def _page_addr(self, kv, block_ordinal):
-        lc = self.manager._storage._layer_to_life_cycle_ids[LID]
-        base_idx = list(kv.get_base_page_indices(lc, DEFAULT_BEAM_INDEX))[block_ordinal]
+        lc = self.manager.get_layer_group_id(LID)
+        base_idx = int(list(kv.get_base_page_indices(lc, DEFAULT_BEAM_INDEX))[block_ordinal])
         pool = self.manager.get_mem_pool_base_address(LID, KEY)
         stride = self.manager.get_page_stride(LID, KEY)
         scale = self.manager.get_page_index_scale(LID, KEY)

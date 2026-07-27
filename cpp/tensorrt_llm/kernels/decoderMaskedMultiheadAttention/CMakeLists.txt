@@ -31,7 +31,6 @@ add_library(decoder_attention_src OBJECT)
 filter_source_cuda_architectures(
   SOURCE_LIST SRC_CPP
   ARCHS 80 86 89 90 120
-  TARGET decoder_attention_src
   IMPLICIT_FAMILY)
 
 set(basic_heads 32 64 128)
@@ -40,6 +39,11 @@ foreach(HEAD ${basic_heads})
        instantiation/decoderMaskedMultiheadAttention${HEAD}*.cu)
   list(APPEND SRC_CU ${HEAD_SRCS})
 endforeach()
+
+# Cascade attention kernel. Compiled together with the basic heads so it lives
+# in the same shared library as the MMHA dispatcher that calls into it. Uses Dh
+# in {64, 128}.
+list(APPEND SRC_CU ${CMAKE_CURRENT_SOURCE_DIR}/cascadeAttentionKernel.cu)
 
 # skip mmha 48, 80, 96, 104, 112, 144, 160, 192 and 224 for fast build
 if(FAST_BUILD)

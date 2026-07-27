@@ -1,0 +1,25 @@
+version: 0.0.1
+l0_b200_visual_gen_perf_sanity:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: post_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  # FLUX.2-dev uses 4 GPUs (cfg=1, ulysses=4) but runs here: a dedicated
+  # 4-GPU stage is not justified for a single test case.
+  - perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_fp8_cfg1_ulysses4_teacache_on] TIMEOUT (120)
+  - perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-wan21_t2v_14b_blackwell-wan21_14b_nvfp4_trtllm_cfg2_ulysses4_teacache_on] TIMEOUT (180)
+  - perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-wan22_i2v_a14b_blackwell-wan22_i2v_a14b_nvfp4_trtllm_cfg2_ulysses4] TIMEOUT (180)
+  - perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-ltx2_blackwell-ltx2_2stage_bf16_i2v_cfg2_ulysses4_compile_on] TIMEOUT (180)
+  - perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-ltx2_blackwell-ltx2_2stage_bf16_t2v_cfg2_ulysses4_compile_on] TIMEOUT (180)
+  - perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-ltx2_blackwell-ltx2_nvfp4_i2v_cfg2_ulysses4_compile_on] TIMEOUT (120)
