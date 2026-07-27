@@ -691,7 +691,7 @@ class MultimodalPlaceholderPlacement(enum.Enum):
 @dataclass(frozen=True)
 class MultimodalPlaceholderMetadata:
     """
-    Metadata for the multimodal placeholder. It has 5 components:
+    Metadata for the multimodal placeholder. It has 6 components:
         - placeholder_map:
             A mapping from modality to placeholder string.
             Modality can be "image", "video", "audio", etc.
@@ -715,12 +715,21 @@ class MultimodalPlaceholderMetadata:
             user's message.
             When False (default), placeholders are bulk-prepended or appended
             according to placeholder_placement.
+        - prompt_modality_order:
+            Fixed modality-major order the chat template emits placeholders in
+            when it regroups them (e.g. Nano's Jinja counts modalities and
+            emits image → video → audio regardless of chat-part send order).
+            When set, `MultimodalDataTracker.item_order()` returns items sorted
+            by this priority so the framework's `mm_item_order == prompt order`
+            invariant holds. `None` (default) keeps chat-part send order for
+            templates that preserve it.
     """
     placeholder_map: Dict[str, str] = field(default_factory=dict)
     placeholder_placement: MultimodalPlaceholderPlacement = MultimodalPlaceholderPlacement.AFTER_TEXT
     placeholders_separator: str = "\n"
     content_format: Optional[ContentFormat] = None
     interleave_placeholders: bool = False
+    prompt_modality_order: Optional[Tuple[str, ...]] = None
 
 
 class MultimodalPlaceholderRegistry:
@@ -801,6 +810,14 @@ class MultimodalPlaceholderRegistry:
             return None
         return self._multimodal_placeholder_by_model_type[
             model_type].content_format
+
+    def get_prompt_modality_order(self,
+                                  model_type: str) -> Optional[Tuple[str, ...]]:
+        """Modality-major order the model's template emits placeholders in, or None to preserve send order."""
+        if model_type not in self._multimodal_placeholder_by_model_type:
+            return None
+        return self._multimodal_placeholder_by_model_type[
+            model_type].prompt_modality_order
 
     def get_registered_image_model_types(self) -> Tuple[str, ...]:
         return (
