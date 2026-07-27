@@ -6579,12 +6579,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
         cache_smem_values: bool = False,
         radix_filter_single_pass_multi_cta: bool = True,
     ) -> None:
-        """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA (2-pass multi-CTA) or
-        single-pass multi-CTA. When single_pass_multi_cta=True, it selects between single-CTA
-        and multi-CTA (1-pass multi-CTA). When single_pass_multi_cta=False, it selects between
-        single-CTA and multi-CTA (2-pass multi-CTA).
+        """Unified CuTE DSL decode Top-K. Writes results directly into the
+        pre-allocated ``output_indices`` buffer.
 
-        Writes results directly into the pre-allocated ``output_indices`` buffer.
+        Three mutually exclusive dispatch modes, selected by boolean with
+        precedence ``radix_filter_single_pass_multi_cta`` >
+        ``single_pass_multi_cta`` > 2-pass (evaluated as an if/elif chain, so
+        the first True wins and the others are ignored):
+
+        1. ``radix_filter_single_pass_multi_cta=True`` (default) -- ADAPTIVE,
+           best-performance path. Internally auto-selects among radix-SELECT
+           (small N), radix-FILTER single-pass multi-CTA cluster, and
+           single-CTA by (dtype, N, num_rows, overflow_policy); no caller
+           tuning needed. Prefer this. When it is enabled the other two mode
+           booleans MUST be left False (asserted below) -- they would be
+           silently ignored otherwise.
+        2. ``single_pass_multi_cta=True`` (only when mode 1 is False) -- legacy
+           single-pass multi-CTA path (kept for A/B and fallback). Auto-selects
+           single-CTA vs single-pass multi-CTA by the SM-wave heuristic below;
+           ``single_pass_multi_cta_cluster=True`` forces the cluster variant
+           within this mode (no effect in the other modes).
+        3. neither set -- legacy 2-pass multi-CTA path (A/B and fallback);
+           vocab-threshold + SM-utilization heuristic.
 
         Dispatch logic (``single_pass_multi_cta=True`` path):
 
@@ -6621,9 +6637,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n: Number of candidates per sequence (for speculative decoding)
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
             dynamic: Use dynamic multi-CTA scheduling (for 2-pass multi-CTA)
-            single_pass_multi_cta: Use single-pass multi-CTA radix top-k
-            single_pass_multi_cta_cluster: Force cluster-accelerated variant
-                (only effective when single_pass_multi_cta=True)
+            single_pass_multi_cta: Mode-2 override -- use the legacy single-pass
+                multi-CTA path. Only takes effect when
+                radix_filter_single_pass_multi_cta=False.
+            single_pass_multi_cta_cluster: Force the cluster-accelerated variant
+                within mode 2 (only effective when single_pass_multi_cta=True).
+            overflow_policy: Threshold-bucket SMEM overflow handling
+                ("REREAD" default, exact). See FilteredTopKKernelVarlen.
+            cache_smem_values: Cache ordered values in SMEM to skip a reload.
+            radix_filter_single_pass_multi_cta: Mode-1 (default True) -- the
+                adaptive best-performance path; see the mode list above. Set
+                False to select mode 2 or 3.
         """
         # Validate inputs
         if top_k <= 0 or top_k > 16384:
@@ -6635,6 +6659,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_tokens = input_values.shape[1]
 
         if radix_filter_single_pass_multi_cta:
+            # Mode 1 is the adaptive default and dominates the if/elif chain
+            # below. Reject a conflicting mode-2/3 override rather than silently
+            # ignoring it (set radix_filter_single_pass_multi_cta=False to opt
+            # into the legacy single_pass_multi_cta / 2-pass paths).
+            assert not single_pass_multi_cta and not single_pass_multi_cta_cluster, (
+                "radix_filter_single_pass_multi_cta (adaptive default) takes "
+                "precedence over single_pass_multi_cta / "
+                "single_pass_multi_cta_cluster; set it False to use those "
+                "legacy overrides.")
             _R = CuteDSLTopKDecodeRadixFilterSPMultiCTARunner
             _is_fp32 = input_values.dtype == torch.float32
             # At small N (bf16 <= 32K, fp16 <= 16K) radix-SELECT SP beats
