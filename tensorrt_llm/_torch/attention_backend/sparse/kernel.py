@@ -2193,8 +2193,6 @@ def _deepseek_v4_local_to_global_kernel(
                                            compressed_global_index, -1)
 
         if SPLIT_EXTRA:
-            # Store compressed results into their own tensor (consumers that
-            # take the two pools as separate contiguous segments).
             compressed_out_ptr = (out_extra_ptr + token_id * out_extra_stride0 +
                                   compressed_ids * out_extra_stride1)
         else:

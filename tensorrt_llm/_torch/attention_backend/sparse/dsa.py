@@ -1093,7 +1093,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device='cpu',
             pin_memory=prefer_pinned(),
         )
-        # Absolute cache position for each input token.
         self.token_positions_cuda = self.get_empty(
             self.cuda_graph_buffers,
             (self.max_num_tokens, ),
