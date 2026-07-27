@@ -704,39 +704,21 @@ def test_dummy_get_size_rejects_non_positive_budget():
 
 
 @pytest.mark.parametrize("budget", [4096, 8192])
-def test_dummy_get_dummy_mm_data_for_tokens_shapes_and_saturation(budget):
-    proc = _make_dummy_processor(num_channels=3)
-    data = proc.get_dummy_mm_data_for_tokens(
-        max_tokens_per_modality={"image": budget}, dtype=torch.float16
-    )
-    image = data["image"]
-    pv = image["pixel_values"]
-    sizes = image["image_sizes"]
-    n, c, h, w = pv.shape
-    assert c == 3 and pv.dtype == torch.float16
-    assert sizes == [[h, w]] * n
-    # The batch saturates the budget: total patches <= budget, within one image.
-    per_image = (h // 14) * (w // 14)
-    assert n * per_image <= budget
-    assert n * per_image + per_image > budget
-
-
-def test_dummy_get_dummy_mm_data_for_tokens_covers_many_item_boundary():
-    proc = _make_dummy_processor(num_channels=3)
-    data = proc.get_dummy_mm_data_for_tokens(
-        max_tokens_per_modality={"image": 8192},
-        max_items_per_modality={"image": 8},
-        dtype=torch.float16,
-    )
-
-    pixel_values = data["image"]["pixel_values"]
-    num_images, _, height, width = pixel_values.shape
-    tokens_per_image = (height // 14) * (width // 14)
-    assert num_images == 8
-    assert tokens_per_image == 1024
-    assert num_images * tokens_per_image == 8192
-
-
-def test_dummy_for_tokens_empty_without_image_budget():
+def test_dummy_get_dummy_mm_data_saturates_budget(budget):
     proc = _make_dummy_processor()
-    assert proc.get_dummy_mm_data_for_tokens(max_tokens_per_modality={"audio": 1024}) == {}
+    images = proc.get_dummy_mm_data(max_num_encoder_tokens=budget, max_num_items=1)["image"]
+    assert len(images) == 1
+    width, height = images[0].size
+    per_image = (height // 14) * (width // 14)
+    assert per_image <= budget
+    assert 2 * per_image > budget
+
+
+def test_dummy_get_dummy_mm_data_covers_many_item_boundary():
+    proc = _make_dummy_processor()
+    images = proc.get_dummy_mm_data(max_num_encoder_tokens=8192, max_num_items=8)["image"]
+    width, height = images[0].size
+    tokens_per_image = (height // 14) * (width // 14)
+    assert len(images) == 8
+    assert tokens_per_image == 1024
+    assert len(images) * tokens_per_image == 8192

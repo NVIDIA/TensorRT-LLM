@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 from torch.nn import functional as F
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
@@ -494,8 +495,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         """``(grid_t, grid_h, grid_w)`` patch-grid dimensions the processor would
         produce for an image/video of the given pixel size, after HF
         ``smart_resize`` (so the ``[min_pixels, max_pixels]`` clamp is honored).
-        Shared by :meth:`_num_vision_tokens` (product) and
-        :meth:`get_dummy_mm_data_for_size` (tensor shapes)."""
+        Shared by :meth:`_num_vision_tokens` and the profiling dummy builder."""
         cfg = self.config.vision_config
         patch_size = cfg.patch_size
         merge_size = cfg.spatial_merge_size
@@ -717,90 +717,31 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             "window_attention": window_capacity,
         }
 
-    def get_dummy_mm_data_for_tokens(
+    def get_dummy_mm_data(
         self,
         *,
-        max_tokens_per_modality: Dict[str, int],
-        max_items_per_modality: Optional[Dict[str, int]] = None,
-        dtype: Optional[torch.dtype] = None,
+        max_num_encoder_tokens: int,
+        max_num_items: int,
     ) -> Dict[str, Any]:
-        """Vision implementation of the modality-agnostic profiler entry: for the
-        ``"image"`` budget, pick the worst-case image size, fill it with identical
-        copies, and materialize the encoder tensors.
+        """Build raw images for a runtime-valid profiling request."""
+        if max_num_encoder_tokens <= 0:
+            raise ValueError("max_num_encoder_tokens must be positive")
+        if max_num_items <= 0:
+            raise ValueError("max_num_items must be positive")
 
-        ``max_items_per_modality`` selects the many-item profiling boundary.
-        ``num_images`` is computed from the *realized* token count of the chosen
-        size (which processor pixel bounds may clamp), so the batch stays within
-        both the item and token budgets.
-        """
-        max_tokens = max_tokens_per_modality.get("image")
-        if not max_tokens:
-            return {}
-        target_num_images = (None if max_items_per_modality is None else max(
-            1, max_items_per_modality.get("image", 1)))
-        per_image_budget = (max_tokens if target_num_images is None else max(
-            1, max_tokens // target_num_images))
+        per_image_budget = max(1, max_num_encoder_tokens // max_num_items)
         size = self.get_size_for_max_tokens(max_tokens=per_image_budget)
         tokens_per_image = max(
             1,
             self._num_vision_tokens(width=size["width"],
                                     height=size["height"],
                                     num_frames=size.get("num_frames", 1)))
-        if tokens_per_image > max_tokens:
+        if tokens_per_image > max_num_encoder_tokens:
             return {}
-        num_images = max(1, max_tokens // tokens_per_image)
-        if target_num_images is not None:
-            num_images = min(target_num_images, num_images)
-        return self.get_dummy_mm_data_for_size(width=size["width"],
-                                               height=size["height"],
-                                               num_frames=size.get(
-                                                   "num_frames", 1),
-                                               num_images=num_images,
-                                               dtype=dtype)
-
-    def get_dummy_mm_data_for_size(
-        self,
-        *,
-        width: int,
-        height: int,
-        num_frames: int = 1,
-        num_images: int = 1,
-        dtype: Optional[torch.dtype] = None,
-    ) -> Dict[str, Any]:
-        """Build the *processed* multimodal tensors for ``num_images`` identical
-        ``(width, height)`` images directly, skipping PIL image creation and the
-        HF processor (the encoder profiler's worst-case dummy batch).
-
-        The vision encoder forward consumes only ``pixel_values`` (shape
-        ``[num_patches, in_dim]``) and ``image_grid_thw`` (shape
-        ``[num_images, 3]``); the pixel *content* is irrelevant for memory
-        profiling, so zero tensors of the exact shape the processor would emit
-        suffice. Returns the ``multimodal_data`` dict consumed by
-        :meth:`Qwen2VisionModelBase._parse_and_batch_multimodal_data`.
-        """
-        cfg = self.config.vision_config
-        grid_t, grid_h, grid_w = self._grid_thw_for_size(width=width,
-                                                         height=height,
-                                                         num_frames=num_frames)
-        num_images = max(num_images, 1)
-        patches_per_image = grid_t * grid_h * grid_w
-        in_channels = getattr(cfg, "in_channels", None) or getattr(
-            cfg, "in_chans", 3)
-        temporal_patch_size = getattr(cfg, "temporal_patch_size", 1)
-        in_dim = in_channels * temporal_patch_size * cfg.patch_size * cfg.patch_size
-
-        pixel_values = torch.zeros(
-            (num_images * patches_per_image, in_dim),
-            dtype=dtype or self.dtype,
-        )
-        image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]] * num_images,
-                                      dtype=torch.long)
-        return {
-            "image": {
-                "pixel_values": pixel_values,
-                "image_grid_thw": image_grid_thw,
-            }
-        }
+        num_images = min(max_num_items,
+                         max_num_encoder_tokens // tokens_per_image)
+        image = Image.new("RGB", (size["width"], size["height"]))
+        return {"image": [image.copy() for _ in range(num_images)]}
 
     @classmethod
     def _build_temporal_block(

@@ -567,15 +567,15 @@ class PyTorchModelEngine(ModelEngine):
         # are enumerated here once:
         #   (A) encoder-forward workspace — `encoder_max_num_tokens` (below),
         #       in encoder attention tokens, clamped up to the largest atomic
-        #       item; profiled by the warmup dummy encoder forwards.
+        #       item; profiled by runtime-valid multimodal warmup requests.
         #   (B) resident output bytes — `mm_encoder_output_budget_bytes`
         #       (`_resolve_mm_encoder_output_budget_bytes`), the maximum
         #       post-encoder embeddings produced by one legal encoder iteration,
-        #       converted to bytes. Enforced by the scheduler and reserved in
-        #       KV-capacity estimation.
+        #       converted to bytes. Enforced by the scheduler; any capacity not
+        #       materialized by warmup is reserved in KV-capacity estimation.
         #   (C) reuse cache bytes — `encoder_cache_max_bytes` on the mixin's
-        #       `TensorLRUCache`, self-bounded by LRU; reserved on top of (B)
-        #       for cache-enabled models.
+        #       `TensorLRUCache`, self-bounded by LRU; unprofiled capacity is
+        #       reserved on top of (B) for cache-enabled models.
         # Prefill currently waits for every item in a request, so admission
         # rejects a request whose complete MM embedding exceeds (B).
         if self.mm_encoder_item_scheduling_enabled:

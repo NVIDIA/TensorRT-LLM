@@ -582,7 +582,7 @@ def test_qwen2_5_window_attention_uses_tighter_fixed_max_seq_len() -> None:
 #
 # CPU-only unit tests that reach into the InputProcessorBase classes directly
 # (no model load) and stub just enough of the HF config so the encoder-side
-# ``_num_vision_tokens`` / ``get_size_for_max_tokens`` / ``get_dummy_mm_data_*``
+# ``_num_vision_tokens`` / ``get_size_for_max_tokens`` / ``get_dummy_mm_data``
 # math runs. Token unit is pre-merger encoder attention, matching
 # ``encoder_max_num_tokens``.
 # ---------------------------------------------------------------------------
@@ -729,40 +729,6 @@ def test_get_size_rejects_non_positive_budget(processor_cls):
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_get_dummy_mm_data_shapes_match_token_count(processor_cls):
-    """Direct tensor build: pixel_values rows and the grid_thw product match ``_num_vision_tokens`` per image."""
-    proc = _make_dummy_processor(processor_cls)
-    cfg = proc._config.vision_config
-    width = height = 224
-    per_image = proc._num_vision_tokens(width=width, height=height)
-    in_dim = 3 * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
-
-    data = proc.get_dummy_mm_data_for_size(width=width,
-                                           height=height,
-                                           num_images=3,
-                                           dtype=torch.float32)
-    image = data["image"]
-    assert image["pixel_values"].shape == (3 * per_image, in_dim)
-    assert image["pixel_values"].dtype == torch.float32
-    assert image["image_grid_thw"].shape == (3, 3)
-    # Each grid row's product equals the per-image token count.
-    grid = image["image_grid_thw"]
-    assert int(grid[0].prod().item()) == per_image
-    assert torch.equal(grid[0], grid[1]) and torch.equal(grid[1], grid[2])
-
-
-@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_get_dummy_mm_data_single_image_default(processor_cls):
-    """Defaults to a single image; grid_thw is ``[1, 3]``."""
-    proc = _make_dummy_processor(processor_cls)
-    data = proc.get_dummy_mm_data_for_size(width=224,
-                                           height=224,
-                                           dtype=torch.float16)
-    assert data["image"]["image_grid_thw"].shape == (1, 3)
-    assert data["image"]["pixel_values"].dtype == torch.float16
-
-
-@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
 def test_mm_max_tokens_per_item_is_image_only(processor_cls):
     """Qwen-VL declares only ``image`` (image+video share one ViT), valued at the max single-image token count."""
     proc = _make_dummy_processor(processor_cls, max_pixels=512 * 512)
@@ -829,32 +795,27 @@ def test_qwen3_attention_capacity_keeps_long_video_safe():
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
 @pytest.mark.parametrize("budget", [1024, 4096, 16384])
-def test_get_dummy_mm_data_for_tokens_saturates_budget(processor_cls, budget):
-    """Agnostic entry: total pre-merger patches are ``<= budget`` and within one image of it (saturates the budget)."""
+def test_get_dummy_mm_data_saturates_budget(processor_cls, budget):
     proc = _make_dummy_processor(processor_cls)
-    data = proc.get_dummy_mm_data_for_tokens(
-        max_tokens_per_modality={"image": budget}, dtype=torch.float32)
-    grid = data["image"]["image_grid_thw"]
-    total_patches = int(grid.prod(dim=1).sum().item())
-    per_image = int(grid[0].prod().item())
-    # pixel_values rows == total patches across all batched images.
-    assert data["image"]["pixel_values"].shape[0] == total_patches
-    # Saturates: within the budget, and adding one more image would exceed it.
+    images = proc.get_dummy_mm_data(max_num_encoder_tokens=budget,
+                                    max_num_items=1)["image"]
+    assert len(images) == 1
+    width, height = images[0].size
+    per_image = proc._num_vision_tokens(width=width, height=height)
+    total_patches = len(images) * per_image
     assert total_patches <= budget
     assert total_patches + per_image > budget
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_get_dummy_mm_data_for_tokens_covers_many_item_boundary(processor_cls):
+def test_get_dummy_mm_data_covers_many_item_boundary(processor_cls):
     proc = _make_dummy_processor(processor_cls)
-    data = proc.get_dummy_mm_data_for_tokens(
-        max_tokens_per_modality={"image": 8192},
-        max_items_per_modality={"image": 8},
-        dtype=torch.float32,
-    )
-
-    grid = data["image"]["image_grid_thw"]
-    token_lengths = grid.prod(dim=1)
-    assert grid.shape[0] == 8
-    assert token_lengths.tolist() == [1024] * 8
-    assert int(token_lengths.sum().item()) == 8192
+    images = proc.get_dummy_mm_data(max_num_encoder_tokens=8192,
+                                    max_num_items=8)["image"]
+    token_lengths = [
+        proc._num_vision_tokens(width=image.width, height=image.height)
+        for image in images
+    ]
+    assert len(images) == 8
+    assert token_lengths == [1024] * 8
+    assert sum(token_lengths) == 8192

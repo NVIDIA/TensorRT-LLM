@@ -491,7 +491,7 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
     # Deterministic dummy sizing for KV-cache encoder profiling.
     #
     # These power the modality-agnostic dummy contract
-    # (``get_mm_max_tokens_per_item`` / ``get_dummy_mm_data_for_tokens``) and
+    # (``get_mm_max_tokens_per_item`` / ``get_dummy_mm_data``) and
     # are deliberately kept separate from the hashing path: the hashing path
     # (``get_num_tokens_per_image``) keeps using the processor's LLM-side
     # token count (Pixtral grid + ``[IMG_BREAK]``/``[IMG_END]`` framing), while
@@ -533,31 +533,6 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
             edge -= unit
         return {"width": edge, "height": edge, "num_frames": 1}
 
-    def get_dummy_mm_data_for_size(
-        self,
-        *,
-        width: int,
-        height: int,
-        num_frames: int = 1,
-        num_images: int = 1,
-        dtype: torch.dtype | None = None,
-    ) -> Dict[str, Any]:
-        """Processed Pixtral encoder tensors for ``num_images`` identical
-        ``(width, height)`` images: a ``[num_images, C, H, W]`` ``pixel_values``
-        zero tensor (content is irrelevant for memory profiling) plus the
-        matching ``image_sizes`` list the vision tower consumes."""
-        _, _, channels, _ = self._vision_geometry()
-        num_images = max(num_images, 1)
-        pixel_values = torch.zeros((num_images, channels, height, width),
-                                   dtype=dtype or self.dtype)
-        image_sizes = [[height, width]] * num_images
-        return {
-            "image": {
-                "pixel_values": pixel_values,
-                "image_sizes": image_sizes,
-            }
-        }
-
     def get_mm_max_tokens_per_item(self) -> Dict[str, int]:
         """Largest single image's ViT patch count (the ``max_image_size``-capped
         square), used to weight the shared-budget split. Image only -- image and
@@ -584,25 +559,19 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
             max(1, min(max_num_items, max_num_tokens // min_tokens_per_image))
         }
 
-    def get_dummy_mm_data_for_tokens(
+    def get_dummy_mm_data(
         self,
         *,
-        max_tokens_per_modality: Dict[str, int],
-        max_items_per_modality: Optional[Dict[str, int]] = None,
-        dtype: torch.dtype | None = None,
+        max_num_encoder_tokens: int,
+        max_num_items: int,
     ) -> Dict[str, Any]:
-        """Vision implementation of the agnostic profiler entry: fill the
-        ``"image"`` budget with identical worst-case images. ``num_images`` is
-        derived from the realized patch count so the batch stays within the
-        token budget. ``max_items_per_modality`` selects the many-item
-        profiling boundary when provided."""
-        budget = max_tokens_per_modality.get("image")
-        if not budget:
-            return {}
-        target_num_images = (None if max_items_per_modality is None else max(
-            1, max_items_per_modality.get("image", 1)))
-        per_image_budget = (budget if target_num_images is None else max(
-            1, budget // target_num_images))
+        """Build raw images for a runtime-valid profiling request."""
+        if max_num_encoder_tokens <= 0:
+            raise ValueError("max_num_encoder_tokens must be positive")
+        if max_num_items <= 0:
+            raise ValueError("max_num_items must be positive")
+
+        per_image_budget = max(1, max_num_encoder_tokens // max_num_items)
         patch, _, _, _ = self._vision_geometry()
         size = self.get_size_for_max_tokens(max_tokens=per_image_budget)
         tokens_per_image = max(
@@ -610,15 +579,12 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
             self._vit_tokens(width=size["width"],
                              height=size["height"],
                              patch=patch))
-        if tokens_per_image > budget:
+        if tokens_per_image > max_num_encoder_tokens:
             return {}
-        num_images = max(1, budget // tokens_per_image)
-        if target_num_images is not None:
-            num_images = min(target_num_images, num_images)
-        return self.get_dummy_mm_data_for_size(width=size["width"],
-                                               height=size["height"],
-                                               num_images=num_images,
-                                               dtype=dtype)
+        num_images = min(max_num_items,
+                         max_num_encoder_tokens // tokens_per_image)
+        image = Image.new("RGB", (size["width"], size["height"]))
+        return {"image": [image.copy() for _ in range(num_images)]}
 
     def get_vocab_size(self) -> int:
         """Return the vocab size of the model."""
