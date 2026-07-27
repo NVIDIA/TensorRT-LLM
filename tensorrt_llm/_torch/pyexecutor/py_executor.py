@@ -5910,7 +5910,8 @@ class PyExecutor:
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
 
-    def _apply_disagg_gen_first_token_stop_criteria(self, req, first_gen_tokens,
+    def _apply_disagg_gen_first_token_stop_criteria(self, req: LlmRequest,
+                                                    first_gen_tokens: List[int],
                                                     beam_width: int) -> None:
         """Enforce stop criteria on the context-side first token of a disagg
         generation request, mirroring the aggregated context-step behavior.
@@ -5921,9 +5922,21 @@ class PyExecutor:
         sampler applies in ``TorchSampler._handle_stop_criteria`` (END_ID, then
         max-token / OSL, then stop-words), in the same order.
         """
-        # max_seq_len is Optional on PyExecutor; when unset there is no seq-len cap
-        # to apply, only the per-request max_new_tokens budget.
-        max_seq_len = self.max_seq_len if self.max_seq_len is not None else (
+        # Prefer the engine's net max_seq_len for parity with the aggregated
+        # TorchSampler, whose _meet_max_token_stop_criteria is built with
+        # engine.max_seq_len. PyExecutor.max_seq_len is the speculative-decode /
+        # overlap-extended cap (net + speculative & overlap KV headroom), which
+        # would let a spec-decode request run a few tokens past the net limit
+        # before the LENGTH criterion fires. Some engines (e.g. AutoDeploy's
+        # ADEngine) do not expose a max_seq_len attribute; fall back to
+        # PyExecutor.max_seq_len there (AutoDeploy applies no speculative
+        # extension, so that value is already the net cap). When both are unset
+        # there is no seq-len cap to apply, only the per-request max_new_tokens
+        # budget.
+        net_max_seq_len = getattr(self.model_engine, "max_seq_len", None)
+        if net_max_seq_len is None:
+            net_max_seq_len = self.max_seq_len
+        max_seq_len = net_max_seq_len if net_max_seq_len is not None else (
             1 << 62)
         beam_finish_reasons: List[Optional[FinishReason]] = []
         for beam in range(0, beam_width):
@@ -6752,6 +6765,16 @@ class PyExecutor:
                 # double-count the token (nvbugs/6482606). Mirror the is_finished skip
                 # in _emit_first_token_responses.
                 if req.is_finished:
+                    # The terminal response is emitted by _handle_responses. Under
+                    # the overlap scheduler exclude_last_generation_logits is True,
+                    # which would drop the single prepended first_gen_logits chunk
+                    # (the only generation-logits entry, otherwise snapshotted
+                    # below). Because the request is already finished at injection,
+                    # _update_generation_requests_that_will_complete_next_iteration
+                    # skips it and never clears the flag, so clear it here to let the
+                    # terminal response carry the prepended logits (nvbugs/6482606).
+                    if self._has_prepended_logits(req):
+                        req.set_exclude_last_generation_logits(False)
                     continue
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
