@@ -17,7 +17,7 @@ import enum
 import os
 from typing import Optional
 
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -25,7 +25,9 @@ from .scheduler import (
     RequestList,
     RequestScheduler,
     SchedulerOutput,
+    _get_forced_context_chunk_size,
     _get_lora_task_id,
+    _is_forced_context_chunk_boundary,
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
 
@@ -175,8 +177,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.policy = scheduler_policy
         self.peft_cache_manager = peft_cache_manager
 
-        # Chunking config — only FCFS supported
+        # Chunking config.
         self.chunking_enabled = False
+        self.chunking_policy: Optional[ContextChunkingPolicy] = None
         self.chunk_unit_size = 0
         self.max_context_length = max_num_tokens
         self.tokens_per_block = kv_cache_manager.tokens_per_block
@@ -194,6 +197,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
+            self.chunking_policy = ctx_chunk_config[0]
             self.chunk_unit_size = ctx_chunk_config[1]
 
         # State value caches for fast comparison.
@@ -574,10 +578,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         """
         remaining_budget = budget.remaining_tokens
         pre_prepare_context_remaining = req.context_remaining_length
+        force_chunk = self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
 
-        # Min budget check — need at least one chunk unit
-        if remaining_budget is not None and remaining_budget < self.chunk_unit_size:
-            return ScheduleAction.SKIP, 0, False
+        if remaining_budget is not None:
+            no_budget = remaining_budget <= 0
+            fcfs_under_min = not force_chunk and remaining_budget < self.chunk_unit_size
+            if no_budget or fcfs_under_min:
+                return ScheduleAction.SKIP, 0, False
 
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self.kv_cache_manager.prepare_context(req):
@@ -587,22 +594,36 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Calculate chunk size from remaining budget
         #    (context_remaining_length is now correct after block reuse)
         context_remaining = req.context_remaining_length
-        budget_context_remaining = (
-            context_remaining
-            if self.enable_prefix_aware_scheduling
-            else pre_prepare_context_remaining
-        )
-        chunk_size = (
-            min(remaining_budget, budget_context_remaining)
-            if remaining_budget is not None
-            else budget_context_remaining
-        )
+        if force_chunk:
+            # Snapshot boundaries can be shorter than chunk_unit_size.
+            assert isinstance(req.expect_snapshot_points, list)
+            # With no remaining state to snapshot, avoid artificial boundaries.
+            chunk_size = _get_forced_context_chunk_size(req)
+            budget_context_remaining = context_remaining
+        else:
+            budget_context_remaining = (
+                context_remaining
+                if self.enable_prefix_aware_scheduling
+                else pre_prepare_context_remaining
+            )
+            chunk_size = (
+                min(remaining_budget, budget_context_remaining)
+                if remaining_budget is not None
+                else budget_context_remaining
+            )
 
         if self.max_context_length is not None:
             chunk_size = min(chunk_size, self.max_context_length)
 
-        # Round down to chunk_unit_size boundary (unless last chunk).
-        if chunk_size < budget_context_remaining:
+        chunk_size = min(
+            chunk_size, remaining_budget if remaining_budget is not None else chunk_size
+        )
+
+        # Round down to chunk_unit_size boundary only when not hitting the end
+        # or a checkpoint.
+        if chunk_size < budget_context_remaining and not (
+            force_chunk and _is_forced_context_chunk_boundary(req, chunk_size)
+        ):
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
 
         if chunk_size <= 0:

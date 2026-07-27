@@ -12,9 +12,11 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -27,6 +29,24 @@ def _make_mock_request(num_input_tokens, beam_width=1):
     req.input_token_ids = list(range(num_input_tokens))
     req.sampling_config.beam_width = beam_width
     return req
+
+
+class _TextModel:
+    def __init__(self, encoder_cache_max_bytes):
+        self.model_config = ModelConfig(
+            multimodal_config=MultimodalConfig(encoder_cache_max_bytes=encoder_cache_max_bytes)
+        )
+
+
+class _MultimodalModel(MultimodalModelMixin):
+    def __init__(self, encoder_cache_max_bytes):
+        self.model_config = ModelConfig(
+            multimodal_config=MultimodalConfig(encoder_cache_max_bytes=encoder_cache_max_bytes)
+        )
+
+
+class _EncoderCacheMultimodalModel(_MultimodalModel):
+    supports_encoder_cache = True
 
 
 def _make_creator(
@@ -173,6 +193,27 @@ def test_regression_without_fix_would_overcount():
     wrong = tp * 3 * tpb  # 768  (all duplicates summed)
     assert result == correct
     assert result != wrong
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "encoder_cache_max_bytes", "expected"),
+    [
+        (_TextModel, 64, 1000),
+        (_MultimodalModel, 0, 1000),
+        (_MultimodalModel, 64, 1000),
+        (_EncoderCacheMultimodalModel, 0, 1000),
+        (_EncoderCacheMultimodalModel, 64, 1064),
+    ],
+)
+def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
+    model_cls,
+    encoder_cache_max_bytes,
+    expected,
+):
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(model=model_cls(encoder_cache_max_bytes))
+
+    assert creator._reserve_multimodal_encoder_cache_memory(1000) == expected
 
 
 # ---------------------------------------------------------------------------

@@ -36,6 +36,24 @@ l0_l40s:
   # AutoDeploy: Nemotron-Nano-V3 on Ada uses flashinfer; trtllm has no
   # (E4M3 input, BF16 output, paged_kv, head_dim=128, sm_89) FMHA cubin.
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-attn_dp_off-flashinfer]
+  # ------------- Encoder-decoder tests ---------------
+  # Representative pre-merge set: eager smoke, CUDA-graph greedy/beam, kv-v2,
+  # overlap scheduler, mBART, mixed batches.
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-greedy-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-greedy-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-overlap-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_mbart_pytorch_generate_encoder_decoder_end_to_end
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-decoder-cuda-graph-on-greedy-batch2-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-greedy-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-flan-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-greedy-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-overlap-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-decoder-cuda-graph-on-greedy-batch2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_context_generation_batch
 - condition:
     ranges:
       system_gpu_count:
@@ -47,10 +65,8 @@ l0_l40s:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
-      backend: tensorrt
+      backend: pytorch
   tests:
-  # ------------- TRT tests ---------------
-  - examples/test_nemotron_nas.py::test_nemotron_nas_summary_1gpu[DeciLM-7B]
   - llmapi/test_llm_examples.py::test_llmapi_quickstart
   - examples/visual_gen/test_visual_gen.py::test_visual_gen_quickstart
   - examples/visual_gen/test_visual_gen.py::test_visual_gen_api_walkthrough
@@ -61,22 +77,6 @@ l0_l40s:
   - llmapi/test_llm_examples.py::test_llmapi_example_guided_decoding
   - llmapi/test_llm_examples.py::test_llmapi_example_logits_processor
   - examples/test_llm_api_with_mpi.py::test_llm_api_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*l40s*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: post_merge
-      backend: tensorrt
-  tests:
-  - examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] # 18mins
-  - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] # 8 mins
-  - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct] TIMEOUT (90)
 - condition:
     ranges:
       system_gpu_count:

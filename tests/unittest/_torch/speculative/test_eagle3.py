@@ -11,7 +11,8 @@ import pytest
 import torch
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
 from utils.llm_data import llm_models_root
-from utils.util import skip_blackwell, skip_num_gpus_less_than
+from utils.util import (skip_blackwell, skip_num_gpus_less_than,
+                        skip_pre_blackwell)
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
@@ -23,7 +24,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
-                                 KvCacheConfig)
+                                 KvCacheConfig, MoeConfig, MTPDecodingConfig)
 from tensorrt_llm.lora_helper import LoraConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -205,6 +206,81 @@ def test_kv_lens_runtime_with_eagle3_one_model():
     expected_kv_lens_with_extra = actual_kv_lengths + num_extra_kv_tokens
     assert torch.equal(kv_lens_internal, expected_kv_lens_with_extra), \
         f"kv_lens should be {expected_kv_lens_with_extra.tolist()}, but got {kv_lens_internal.tolist()}"
+
+
+def _make_mock_kv_cache_manager(num_seqs: int) -> MagicMock:
+    mock_kv_cache_manager = MagicMock()
+    mock_kv_cache_manager.tokens_per_block = 32
+    mock_kv_cache_manager.num_pools = 1
+    mock_kv_cache_manager.num_attention_op_pools = 1
+    mock_kv_cache_manager.max_blocks_per_seq = 16
+    mock_kv_cache_manager.max_batch_size = num_seqs
+    mock_kv_cache_manager.max_seq_len = 512
+    mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
+    return mock_kv_cache_manager
+
+
+@pytest.mark.parametrize("spec_signal", [
+    None, "num_extra_kv_tokens", "is_spec_decoding_enabled",
+    "has_speculative_draft_tokens", "draft_kv_cache_manager"
+])
+def test_block_offsets_staging_width_spec_gate(spec_signal):
+    """prepare() caps the staged block-table width by the batch's max KV
+    length only on the non-speculative path.
+
+    Any speculative-decoding signal must disable the cap (max_blocks=None):
+    spec kernels address block columns past the host kv_lens snapshot
+    (device-side kv_lens advances in draft/tree sub-steps, draft-token blocks
+    are allocated ahead), so a host-derived cap leaves columns they
+    dereference unstaged. Regression test for the EAGLE3 warmup illegal
+    memory access.
+    """
+    num_seqs = 3
+    prompt_lens = [50, 100, 75]
+    seq_lens_q = [1, 1, 1]
+    num_cached_tokens_per_seq = [
+        prompt_lens[i] - seq_lens_q[i] for i in range(num_seqs)
+    ]
+
+    mock_kv_cache_manager = _make_mock_kv_cache_manager(num_seqs)
+    metadata_kwargs = dict(
+        max_num_requests=num_seqs,
+        max_num_tokens=sum(seq_lens_q),
+        kv_cache_manager=mock_kv_cache_manager,
+    )
+    mock_draft_manager = None
+    if spec_signal == "draft_kv_cache_manager":
+        mock_draft_manager = _make_mock_kv_cache_manager(num_seqs)
+        metadata_kwargs["draft_kv_cache_manager"] = mock_draft_manager
+
+    attn_metadata = TrtllmAttentionMetadata(**metadata_kwargs)
+    if spec_signal == "is_spec_decoding_enabled":
+        attn_metadata.is_spec_decoding_enabled = True
+    elif spec_signal == "has_speculative_draft_tokens":
+        attn_metadata.runtime_features.has_speculative_draft_tokens = True
+
+    attn_metadata.request_ids = list(range(1, num_seqs + 1))
+    attn_metadata.prompt_lens = prompt_lens
+    attn_metadata._seq_lens = torch.tensor(seq_lens_q, dtype=torch.int32)
+    attn_metadata._seq_lens_kv = torch.tensor(seq_lens_q, dtype=torch.int32)
+    attn_metadata.kv_cache_params = KVCacheParams(
+        use_cache=True,
+        num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+        num_extra_kv_tokens=(7 if spec_signal == "num_extra_kv_tokens" else 0))
+
+    attn_metadata.prepare()
+
+    if spec_signal is None:
+        # Non-speculative: capped at ceil(max kv len / tokens_per_block).
+        expected_max_blocks = -(-max(prompt_lens) //
+                                mock_kv_cache_manager.tokens_per_block)
+    else:
+        expected_max_blocks = None
+    call_kwargs = mock_kv_cache_manager.copy_batch_block_offsets.call_args.kwargs
+    assert call_kwargs["max_blocks"] == expected_max_blocks
+    if mock_draft_manager is not None:
+        draft_kwargs = mock_draft_manager.copy_batch_block_offsets.call_args.kwargs
+        assert draft_kwargs["max_blocks"] is None
 
 
 @pytest.mark.parametrize(
@@ -1000,6 +1076,84 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
 
     assert len(results) == len(prompts)
     assert len(results[0].outputs[0].token_ids) > 0
+
+
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
+        use_cuda_graph: bool, disable_overlap_scheduler: bool):
+    if torch.cuda.device_count() < 8:
+        pytest.skip("Nemotron Super dynamic-tree MTP test requires 8 GPUs")
+
+    models_path = llm_models_root()
+    model_path = f"{models_path}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+
+    max_batch_size = 1
+    max_draft_len = 6
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                    mamba_ssm_cache_dtype="float16",
+                                    free_gpu_memory_fraction=0.8)
+    cuda_graph_config = CudaGraphConfig(
+        batch_sizes=[1]) if use_cuda_graph else None
+
+    llm_common_config = dict(
+        model=model_path,
+        tensor_parallel_size=8,
+        moe_expert_parallel_size=8,
+        pipeline_parallel_size=1,
+        moe_config=MoeConfig(backend="TRTLLM"),
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=cuda_graph_config,
+        max_batch_size=max_batch_size,
+        kv_cache_config=kv_cache_config,
+        max_seq_len=8192,
+    )
+    spec_config = MTPDecodingConfig(max_draft_len=max_draft_len,
+                                    mtp_eagle_one_model=True,
+                                    use_dynamic_tree=True,
+                                    dynamic_tree_max_topK=10,
+                                    max_total_draft_tokens=31)
+
+    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+    prompt = llm_spec.tokenizer.apply_chat_template(
+        [{
+            "role": "user",
+            "content": "The future of AI is"
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    tok_ids = llm_spec.tokenizer.encode(prompt)
+
+    sampling_params = SamplingParams(max_tokens=128, temperature=0)
+    num_tokens = 0
+    num_drafted = 0
+    num_accepted = 0
+    for output in llm_spec.generate_async(tok_ids,
+                                          sampling_params,
+                                          streaming=True):
+        new_tokens = output.outputs[0].token_ids
+        num_drafted += max_draft_len
+        num_accepted += len(new_tokens) - num_tokens - 1
+        num_tokens = len(new_tokens)
+
+    accept_rate = num_accepted / num_drafted
+    assert accept_rate > 0.20
+
+    sampling_params = SamplingParams(max_tokens=10, temperature=0)
+    results_spec = llm_spec.generate([prompt], sampling_params)
+    generated_text_spec = [result.outputs[0].text for result in results_spec]
+    llm_spec.shutdown()
+
+    llm_ref = LLM(**llm_common_config)
+    results_ref = llm_ref.generate([prompt], sampling_params)
+    generated_text_ref = [result.outputs[0].text for result in results_ref]
+    llm_ref.shutdown()
+
+    for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
+        assert text_spec == text_ref
 
 
 @pytest.mark.parametrize("use_cuda_graph", [True, False])

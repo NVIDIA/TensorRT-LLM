@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from fastapi import Request
 from starlette.datastructures import Headers
 
 from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
@@ -60,6 +61,39 @@ async def test_server_keep_alive_timeout_is_passed_to_uvicorn(
     assert config_factory.call_args.kwargs["timeout_keep_alive"] == expected_timeout
     server_factory.assert_called_once_with(uvicorn_config)
     uvicorn_server.serve.assert_awaited_once_with(sockets=None)
+
+
+@pytest.mark.asyncio
+async def test_http_cluster_storage_request_is_proxied_to_coordinator():
+    payload = b'{"key":"worker","value":"ready"}'
+
+    async def receive():
+        return {"type": "http.request", "body": payload, "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/set",
+            "query_string": b"source=worker",
+            "headers": [(b"content-type", b"application/json")],
+        },
+        receive,
+    )
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._coordinator = SimpleNamespace(
+        proxy_cluster_storage_request=AsyncMock(
+            return_value=(b'{"result":true}', 200, "application/json")
+        )
+    )
+
+    response = await server._proxy_cluster_storage_request(request)
+
+    server._coordinator.proxy_cluster_storage_request.assert_awaited_once_with(
+        "POST", "/set", [("source", "worker")], payload, "application/json"
+    )
+    assert response.status_code == 200
+    assert response.body == b'{"result":true}'
 
 
 def test_extract_conversation_id_from_headers():

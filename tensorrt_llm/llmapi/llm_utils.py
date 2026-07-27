@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import os
 import tempfile
@@ -513,6 +516,16 @@ def apply_model_defaults_to_llm_args(
     if not model_defaults_dict:
         return {}
 
+    # Key-presence check: any value form (dict, pydantic object, None) is
+    # rejected — the deep-merge could materialize a transceiver config in
+    # aggregated mode or silently enable a disabled one.
+    if "cache_transceiver_config" in model_defaults_dict:
+        raise ValueError(
+            "Model defaults must not contain 'cache_transceiver_config': the "
+            "deep-merge could materialize or silently enable a transceiver "
+            "config the user did not turn on. Declare a runtime preference "
+            "via get_preferred_transceiver_runtime() instead.")
+
     user_overrides = llm_args.model_dump(exclude_unset=True)
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
@@ -563,3 +576,51 @@ def _resolve_kv_cache_manager_v2_auto(
 
     llm_args.kv_cache_config.use_kv_cache_manager_v2 = model_default
     return model_default
+
+
+def _resolve_transceiver_runtime_auto(llm_args: 'TorchLlmArgs',
+                                      model_cls: Optional[type] = None,
+                                      pretrained_config: Any = None) -> None:
+    """Resolve the 'auto' sentinel in cache_transceiver_config.transceiver_runtime.
+
+    Semantics:
+    - Disagg disabled (config is None or backend is None): no-op. The model
+      preference must never materialize or alter a transceiver config that the
+      user did not enable.
+    - Explicit user value ('CPP'/'PYTHON'/None): left untouched.
+    - 'auto': adopt ``model_cls.get_preferred_transceiver_runtime()`` when the
+      effective backend supports it (the Python transceiver requires NIXL);
+      otherwise fall back to None (C++ transceiver).
+
+    ``pretrained_config`` is forwarded to the hook so implementation classes
+    shared by several architectures can differentiate per checkpoint.
+    """
+    cfg = llm_args.cache_transceiver_config
+    if cfg is None or cfg.backend is None:
+        return
+    if cfg.transceiver_runtime != "auto":
+        return
+
+    preferred = None
+    if model_cls is not None:
+        get_preferred = getattr(model_cls, 'get_preferred_transceiver_runtime',
+                                None)
+        if get_preferred is not None:
+            preferred = get_preferred(pretrained_config)
+    if preferred not in (None, "CPP", "PYTHON"):
+        raise ValueError(
+            f"{model_cls.__name__}.get_preferred_transceiver_runtime() must "
+            f"return 'CPP', 'PYTHON', or None, got {preferred!r}.")
+
+    effective_backend, _ = cfg._resolve_default_backend()
+    if preferred == "PYTHON" and effective_backend != "NIXL":
+        logger.info(
+            f"Model prefers the Python transceiver, but backend "
+            f"{effective_backend} does not support it; falling back to the "
+            f"C++ transceiver.")
+        preferred = None
+
+    cfg.transceiver_runtime = preferred
+    logger.info(
+        f"Resolved transceiver_runtime='auto' to {preferred!r} for "
+        f"{model_cls.__name__ if model_cls is not None else 'unknown model'}.")
