@@ -23,6 +23,7 @@ python models/flux1.py
 python models/flux2.py
 python models/cosmos3_ti2v.py --prompt "A robot arm picks fruit in a grocery store"
 python models/qwen_image.py
+python models/glm_image.py
 
 # With engine config (quant, parallelism, etc.)
 python models/wan_t2v.py --visual_gen_args configs/wan2.2-t2v-fp4-1gpu.yaml
