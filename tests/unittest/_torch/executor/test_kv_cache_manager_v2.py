@@ -1,5 +1,17 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -17,7 +29,9 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
+    BatchDesc,
     GpuCacheTierConfig,
+    KVCacheDesc,
     KVCacheManagerConfig,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
@@ -40,26 +54,37 @@ class _FakeKVCache:
         self.stopped_committing = True
 
 
-def _build_cache_config_for_test(
-    kv_cache_config: KvCacheConfig, *, is_draft: bool = False
+def _make_cache_config_for_test(
+    kv_cache_config: KvCacheConfig,
+    *,
+    is_draft: bool = False,
+    max_batch_size: int = 1,
+    max_seq_len: int = 1024,
+    max_num_tokens: int | None = None,
+    max_draft_len: int = 0,
+    num_extra_kv_tokens: int = 0,
 ) -> KVCacheManagerConfig:
     cache_manager = object.__new__(KVCacheManagerV2)
     cache_manager.kv_cache_type = CacheType.SELFKONLY
+    cache_manager.dtype = DataType.HALF
     cache_manager.head_dim_per_layer = [128]
     cache_manager.enable_swa_scratch_reuse = False
-    cache_manager.num_extra_kv_tokens = 0
+    cache_manager.num_extra_kv_tokens = num_extra_kv_tokens
     cache_manager.enable_stats = False
     cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_policy)
     cache_manager.is_draft = is_draft
     cache_manager.num_local_layers = 1
     cache_manager.pp_layers = [0]
     cache_manager.max_attention_window_vec = [None]
+    cache_manager.max_seq_len = max_seq_len
+    cache_manager.max_batch_size = max_batch_size
+    cache_manager.max_num_tokens = max_num_tokens
+    cache_manager.max_draft_len = max_draft_len
     cache_manager.get_layer_bytes_per_token = lambda **_: 128
 
-    return cache_manager._build_cache_config(
+    return cache_manager._build_base_config(
         kv_cache_config,
         tokens_per_block=128,
-        vocab_size=129280,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
     )
 
@@ -79,7 +104,7 @@ def test_commit_min_snapshot_follows_block_reuse_policy(
     is_draft: bool,
     commit_min_snapshot: bool,
 ) -> None:
-    config = _build_cache_config_for_test(
+    config = _make_cache_config_for_test(
         KvCacheConfig(
             enable_block_reuse=enable_block_reuse,
             block_reuse_policy=block_reuse_policy,
@@ -94,9 +119,84 @@ def test_commit_min_snapshot_follows_block_reuse_policy(
 
 @pytest.mark.parametrize("enable_partial_reuse", [False, True])
 def test_propagates_partial_reuse_config(enable_partial_reuse: bool) -> None:
-    config = _build_cache_config_for_test(KvCacheConfig(enable_partial_reuse=enable_partial_reuse))
+    config = _make_cache_config_for_test(KvCacheConfig(enable_partial_reuse=enable_partial_reuse))
 
     assert config.enable_partial_reuse is enable_partial_reuse
+
+
+def test_pool_ratio_overrides_constraints() -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(pool_ratio=[1.0], avg_seq_len=256, host_cache_size=0),
+        max_batch_size=3,
+        max_num_tokens=2048,
+    )
+
+    assert config.initial_pool_ratio == pytest.approx([1.0])
+    assert config.typical_step is None
+    assert config.constraints == []
+
+
+def test_builds_warmup_constraints() -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0),
+        max_batch_size=3,
+        max_seq_len=1024,
+        max_num_tokens=2048,
+        max_draft_len=2,
+    )
+
+    assert config.initial_pool_ratio is None
+    assert config.typical_step == BatchDesc(
+        [KVCacheDesc(capacity=2048, history_length=0)]
+        + [KVCacheDesc(capacity=1024, history_length=1021)] * 2
+    )
+    assert config.constraints == [
+        BatchDesc(
+            [
+                KVCacheDesc(capacity=1024, history_length=1023),
+                KVCacheDesc(capacity=3, history_length=0),
+                KVCacheDesc(capacity=3, history_length=0),
+            ]
+        ),
+        BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
+    ]
+
+
+def test_avg_seq_len_updates_typical_step() -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(avg_seq_len=256),
+        max_batch_size=3,
+        max_seq_len=1024,
+        max_num_tokens=2048,
+        max_draft_len=2,
+    )
+
+    assert config.typical_step == BatchDesc(
+        [KVCacheDesc(capacity=2048, history_length=0)]
+        + [KVCacheDesc(capacity=256, history_length=253)] * 2
+    )
+
+
+def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
+    with pytest.raises(ValueError, match="avg_seq_len"):
+        _make_cache_config_for_test(
+            KvCacheConfig(avg_seq_len=2048),
+            max_seq_len=1024,
+        )
+
+
+def test_extra_tokens_are_in_context_capacity() -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(),
+        max_batch_size=1,
+        max_seq_len=264,
+        max_num_tokens=256,
+        max_draft_len=3,
+        num_extra_kv_tokens=2,
+    )
+
+    assert config.typical_step == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
+    assert config.constraints[1] == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
 
 
 def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
@@ -408,3 +508,19 @@ def test_per_conversation_policy_ignores_overlapping_request(
         _free_if_active(manager, request_old_prompt)
         _free_if_active(manager, request_b)
         _free_if_active(manager, request_a)
+
+
+def test_disagg_role_mapper_kinds_default_to_indexed():
+    from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+
+    manager = object.__new__(KVCacheManagerV2)
+
+    # K/V default to the TRTLLM head-major layout; the index-key side cache
+    # defaults to REPLICATED (every shipped index-K — DSA V1, MiniMax M3 —
+    # is TP-replicated). The INDEX_KEY entry is inert unless a subclass
+    # registers such buffers.
+    assert manager.get_disagg_role_mapper_kinds() == {
+        Role.ALL: MapperKind.INDEXED,
+        Role.INDEX_KEY: MapperKind.REPLICATED,
+    }

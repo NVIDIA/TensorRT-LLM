@@ -34,7 +34,6 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_torch_dtype
@@ -42,11 +41,7 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-    GpuCacheTierConfig,
-    KVCacheManagerConfig,
-    PageIndexMode,
-)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BatchDesc, KVCacheDesc, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 _RequestCache = Dict[
@@ -82,35 +77,6 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
     cost = CacheCost.from_raw(size_per_token)
     assert cost.slope > 0
     assert cost.intercept == 0
-
-
-def test_mtp_extra_tokens_are_in_context_capacity():
-    cache_manager = object.__new__(DeepseekV4CacheManager)
-    cache_manager.pp_layers = [0]
-    cache_manager._compress_ratios = [1]
-    cache_manager._get_attn_bytes_per_block = lambda _attn_type, _layer_idx: 1
-    cache_manager._get_window_size = lambda _compress_ratio, _attn_type: 128
-    cache_manager.max_batch_size = 1
-    cache_manager.max_seq_len = 264
-    cache_manager._max_num_tokens = 256
-    cache_manager._max_draft_len = 3
-    cache_manager.num_extra_kv_tokens = 2
-    cache_manager.enable_stats = False
-    cache_manager.enable_swa_scratch_reuse = False
-    cache_manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
-
-    config = cache_manager._build_cache_config(
-        KvCacheConfig(),
-        tokens_per_block=128,
-        vocab_size=129280,
-        cache_tiers=[GpuCacheTierConfig(quota=1024)],
-    )
-
-    assert config.typical_step is not None
-    assert config.typical_step.kv_caches[0].capacity == 258
-    assert config.typical_step.kv_caches[0].history_length == 0
-    assert config.constraints[1].kv_caches[0].capacity == 258
-    assert config.constraints[1].kv_caches[0].history_length == 0
 
 
 def test_quota_from_max_tokens_models_context_swa_scratch():
@@ -214,117 +180,6 @@ def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
     if buffer.dtype == torch.float8_e4m3fn:
         return buffer.view(torch.uint8)
     return buffer
-
-
-def _build_deepseek_v4_cache_config_for_test(
-    kv_cache_config: KvCacheConfig,
-    *,
-    max_batch_size: int = 4,
-    max_seq_len: int = 1024,
-    max_num_tokens: int | None = 2048,
-    max_draft_len: int = 0,
-    is_draft: bool = False,
-) -> KVCacheManagerConfig:
-    cache_manager = object.__new__(DeepseekV4CacheManager)
-    cache_manager.pp_layers = [0, 1, 2]
-    cache_manager._compress_ratios = [1, 4, 128]
-    cache_manager._swa_window_size = 128
-    cache_manager._max_draft_len = max_draft_len
-    cache_manager._max_num_tokens = max_num_tokens
-    cache_manager.compressed_block_sizes = [128, 32, 1]
-    cache_manager.index_head_dim = 128
-    cache_manager.head_dim = 512
-    cache_manager.tokens_per_block = 128
-    cache_manager.dtype = DataType.BF16
-    cache_manager._indexer_k_dtype = "fp8"
-    cache_manager.max_batch_size = max_batch_size
-    cache_manager.max_seq_len = max_seq_len
-    cache_manager.enable_stats = False
-    cache_manager.enable_swa_scratch_reuse = False
-    cache_manager.num_extra_kv_tokens = 0
-    cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_policy)
-    cache_manager.is_draft = is_draft
-
-    return cache_manager._build_cache_config(
-        kv_cache_config,
-        tokens_per_block=128,
-        vocab_size=129280,
-        cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
-    )
-
-
-def test_deepseek_v4_pool_ratio_overrides_typical_step_and_constraints():
-    config = _build_deepseek_v4_cache_config_for_test(
-        KvCacheConfig(pool_ratio=[0.2, 0.3, 0.5], avg_seq_len=256)
-    )
-
-    assert config.initial_pool_ratio == pytest.approx([0.2, 0.3, 0.5])
-    assert config.typical_step is None
-    assert config.constraints == []
-
-
-def test_deepseek_v4_avg_seq_len_updates_typical_step():
-    config = _build_deepseek_v4_cache_config_for_test(
-        KvCacheConfig(avg_seq_len=256),
-        max_batch_size=3,
-        max_seq_len=1024,
-        max_num_tokens=2048,
-        max_draft_len=2,
-    )
-
-    assert config.initial_pool_ratio is None
-    assert config.typical_step is not None
-    assert config.typical_step.kv_caches[0].capacity == 2048
-    assert config.typical_step.kv_caches[0].history_length == 0
-    assert [kv.capacity for kv in config.typical_step.kv_caches[1:]] == [256, 256]
-    assert [kv.history_length for kv in config.typical_step.kv_caches[1:]] == [253, 253]
-    assert config.constraints[0].kv_caches[0].capacity == 1024
-    assert config.constraints[0].kv_caches[0].history_length == 1023
-
-
-def test_deepseek_v4_avg_seq_len_must_not_exceed_max_seq_len():
-    with pytest.raises(ValueError, match="avg_seq_len"):
-        _build_deepseek_v4_cache_config_for_test(
-            KvCacheConfig(avg_seq_len=2048),
-            max_seq_len=1024,
-        )
-
-
-@pytest.mark.parametrize(
-    ("enable_block_reuse", "block_reuse_policy", "is_draft", "commit_min_snapshot"),
-    [
-        (True, "all_reusable", False, False),
-        (True, "per_request", False, True),
-        (False, "per_request", False, False),
-        (True, "per_request", True, True),
-    ],
-)
-def test_deepseek_v4_commit_min_snapshot_follows_block_reuse_policy(
-    enable_block_reuse: bool,
-    block_reuse_policy: str,
-    is_draft: bool,
-    commit_min_snapshot: bool,
-) -> None:
-    config = _build_deepseek_v4_cache_config_for_test(
-        KvCacheConfig(
-            enable_block_reuse=enable_block_reuse,
-            block_reuse_policy=block_reuse_policy,
-            enable_partial_reuse=True,
-        ),
-        is_draft=is_draft,
-    )
-
-    assert config.commit_min_snapshot is commit_min_snapshot
-    assert config.enable_partial_reuse
-
-
-@pytest.mark.parametrize("enable_partial_reuse", [False, True])
-def test_deepseek_v4_propagates_partial_reuse_config(enable_partial_reuse: bool) -> None:
-    config = _build_deepseek_v4_cache_config_for_test(
-        KvCacheConfig(enable_partial_reuse=enable_partial_reuse)
-    )
-
-    assert config.enable_partial_reuse is enable_partial_reuse
 
 
 @pytest.fixture(params=[False, True], ids=["scratch_reuse_disabled", "scratch_reuse_enabled"])
@@ -1127,6 +982,28 @@ class TestDeepseekV4CacheManager:
                     atol=1e-5,
                     msg=f"Mismatch for layer {layer_idx}, attention type {attn_type.name} (scales)",
                 )
+
+    def test_max_num_tokens_is_used_by_base_config(self):
+        max_batch_size = 2
+        max_seq_len = 1024
+        max_input_len = 127
+        max_num_tokens = max_batch_size * (max_input_len + 1)
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+            max_input_len=max_input_len,
+            compress_ratios=[1, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        assert cache_manager.kv_cache_manager_py_config.typical_step == BatchDesc(
+            [
+                KVCacheDesc(capacity=max_num_tokens, history_length=0),
+                KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - 1),
+            ]
+        )
 
     def test_indexer_cache_layout_default(self):
         """DeepSeek-V4 defaults to FP4 indexer K cache on Blackwell+."""

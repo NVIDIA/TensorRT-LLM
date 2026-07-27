@@ -259,9 +259,8 @@ l0_b200:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
-      backend: tensorrt
+      backend: pytorch
   tests:
-  # ------------- TRT tests ---------------
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
   - unittest/disaggregated/test_openai_server_info.py
 - condition:

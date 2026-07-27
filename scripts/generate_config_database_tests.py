@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,12 +71,17 @@ def generate_server_name(recipe: Recipe) -> str:
     """Generate a unique server name from recipe."""
     model_slug = recipe.model.replace("/", "_").replace("-", "_").replace(".", "_")
     name = f"{model_slug}_{recipe.isl}_{recipe.osl}_conc{recipe.concurrency}_gpu{recipe.num_gpus}"
+    if recipe.profile:
+        name = f"{name}_{recipe.profile}"
     return name
 
 
 def generate_client_name(recipe: Recipe) -> str:
     """Generate client config name."""
-    return f"con{recipe.concurrency}_isl{recipe.isl}_osl{recipe.osl}"
+    name = f"con{recipe.concurrency}_isl{recipe.isl}_osl{recipe.osl}"
+    if recipe.profile:
+        name = f"{name}_{recipe.profile}"
+    return name
 
 
 def recipe_to_server_config(recipe: Recipe, llm_api_config: dict) -> dict:

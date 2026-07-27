@@ -28,6 +28,8 @@ from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
 from .eagle3_dynamic_tree import Eagle3OneModelDynamicTreeWorker
 from .model_drafter import ModelDrafter
 from .mtp import MTPHiddenStatesManager, MTPSampler, MTPSpecMetadata, MTPWorker
+from .mtp_dynamic_tree import (MTPEagleDynamicTreeResourceManager,
+                               MTPEagleDynamicTreeWorker)
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
 from .sa_worker import SASampler, SASpecMetadata, SAWorker
@@ -113,6 +115,7 @@ def get_spec_metadata(spec_config,
             num_seq_slots=num_seq_slots,
             draft_vocab_size=draft_vocab_size,
             spec_resource_manager=spec_resource_manager,
+            use_dynamic_tree=getattr(spec_config, 'use_dynamic_tree', False),
         )
     if spec_config.spec_dec_mode.is_mtp_vanilla():
         return MTPSpecMetadata(
@@ -289,6 +292,15 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         if sa_cfg is not None:
             sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
                                                 max_seq_len)
+        # Dynamic tree combines SpecTreeManager with MTP hidden-state slots.
+        if getattr(spec_config, 'use_dynamic_tree', False):
+            return MTPEagleDynamicTreeResourceManager(
+                spec_config,
+                model_config.torch_dtype,
+                model_config.hidden_size,
+                max_num_requests,
+                sa_manager=sa_manager,
+            )
         if spec_config.use_relaxed_acceptance_for_thinking or sa_manager is not None:
             # Unified resource manager: the unified worker reads
             # ``relaxed_delta_pool`` from ``Eagle3ResourceManager`` (mirrors the
@@ -377,7 +389,10 @@ def get_spec_decoder(
         # MTP Eagle one-model now uses the same sampler as Eagle3 one-model.
         return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
     if spec_config.spec_dec_mode.is_mtp_vanilla():
-        return MTPSampler(sampler_args, nextn=spec_config.max_draft_len)
+        nextn = spec_config.max_draft_len
+        if getattr(spec_config, "use_dynamic_tree", False):
+            nextn = spec_config.max_total_draft_tokens
+        return MTPSampler(sampler_args, nextn=nextn)
     if spec_config.spec_dec_mode.is_eagle3(
     ) or spec_config.spec_dec_mode.is_mtp_eagle():
         # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process
@@ -465,6 +480,11 @@ def get_spec_worker(spec_config,
                          use_separate_draft_kv_cache,
                          mapping=mapping)
     if spec_dec_mode.is_mtp_eagle_one_model():
+        if getattr(spec_config, 'use_dynamic_tree', False):
+            return MTPEagleDynamicTreeWorker(spec_config,
+                                             model_config,
+                                             use_separate_draft_kv_cache,
+                                             mapping=mapping)
         return MTPEagleWorker(spec_config,
                               model_config,
                               use_separate_draft_kv_cache,
@@ -554,7 +574,8 @@ def update_spec_config_from_model_config(spec_config, model_config):
             f"using max_draft_len={effective_draft_len} draft tokens.")
         spec_config.max_draft_len = effective_draft_len
 
-    spec_config.max_total_draft_tokens = spec_config.max_draft_len
+    if not spec_config.use_dynamic_tree:
+        spec_config.max_total_draft_tokens = spec_config.max_draft_len
 
 
 def update_spec_config_from_loaded_model(spec_config, model) -> None:

@@ -32,6 +32,9 @@ from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
+    MiniMaxM3HfWeightMapper,
+)
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
     _build_swiglu_oai_dense_mlp,
@@ -43,7 +46,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     get_text_config,
     is_minimax_m3_vl_config,
 )
-from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl
+from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
 from tensorrt_llm._torch.modules.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
@@ -763,8 +766,8 @@ def test_minimax_m3_routing_method_default_scale_is_identity():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 needs CUDA")
-def test_text_norm_weights_real_loader_smoke():
-    """real ``_load_weights_impl`` populates norm parameters.
+def test_text_norm_weights_real_loader_smoke(monkeypatch: pytest.MonkeyPatch):
+    """real ``_load_weights_impl_v2`` populates norm parameters.
 
     Constructs a memory-safe stub containing the top-level ``model.norm``
     and the first decoder layer's ``input_layernorm`` and
@@ -772,7 +775,7 @@ def test_text_norm_weights_real_loader_smoke():
     :class:`RMSNorm`, ~12 KB on CUDA), reads the corresponding tensors
     from the real checkpoint via ``safetensors``, strips the
     ``language_model.`` prefix exactly as the M3 VL wrapper does, and
-    invokes :func:`_load_weights_impl` end-to-end. The test fails if any
+    invokes :func:`_load_weights_impl_v2` end-to-end. The test fails if any
     target parameter remains at its zero-initialisation, proving the
     canonical loader walks the module tree and copies the correct source
     keys for these BF16 parameters.
@@ -871,17 +874,21 @@ def test_text_norm_weights_real_loader_smoke():
         "model.layers.0.post_attention_layernorm.weight",
     }
 
-    # Invoke the canonical loader. `_load_weights_impl` walks the stub's
+    # Invoke the canonical loader. `_load_weights_impl_v2` walks the stub's
     # module tree and uses the generic per-parameter copy fallback because
     # RMSNorm does not define ``load_weights``. Disable the parallel
     # executor so a failure surfaces immediately rather than as a thread
     # traceback (the parallel path is exercised in production; for this
     # tiny 3-module slice the serial walk is what the test should observe).
-    os.environ["TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"] = "True"
-    try:
-        _load_weights_impl(stub, text_weights, allow_partial_loading=True)
-    finally:
-        os.environ.pop("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", None)
+    monkeypatch.setenv("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "True")
+    weight_mapper = MiniMaxM3HfWeightMapper()
+    weight_mapper.init_model_and_config(stub, stub.model_config)
+    _load_weights_impl_v2(
+        stub,
+        text_weights,
+        weight_mapper,
+        allow_partial_loading=True,
+    )
 
     # The three norms should now hold the source tensors' values.
     torch.testing.assert_close(

@@ -90,6 +90,7 @@ class DSAMetadataParams(SparseMetadataParams):
     index_head_dim: int
     enable_indexer_skip: bool
     enable_heuristic_topk: bool
+    use_cute_dsl_topk: bool
     use_cute_dsl_paged_mqa_logits: bool
     q_split_threshold: int
 
@@ -673,6 +674,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.indexer_head_dim = sparse_metadata_params.index_head_dim
         self.indexer_quant_block_size = 128
         self.enable_indexer_skip = (sparse_metadata_params.enable_indexer_skip)
+        self.use_cute_dsl_topk = (sparse_metadata_params.use_cute_dsl_topk
+                                  and IS_CUTLASS_DSL_AVAILABLE)
+        self.kv_lens_row_reorder = None
         capture_graph = self.is_cuda_graph
         # Plain DSA has no compression and uses the default [1]. DeepSeek-V4's
         # metadata params carry the model-specific compression ratios.
@@ -856,7 +860,36 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     _DG_SCHEDULE_BLOCK_KV, self.num_sms)
                 self.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True)
+        self._compute_kv_lens_row_reorder()
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
+
+    def _compute_kv_lens_row_reorder(self):
+        """LJF (longest-job-first) row-reorder for the GVR DSL top-k path.
+
+        Writes ``argsort(gen_kv_lens, descending)`` into the stable buffer when
+        the multi-wave threshold is met, otherwise leaves ``order_row`` None.
+        Called from ``on_update_kv_lens()`` (both base and DeepSeek-V4 via
+        super()) unconditionally every forward step so the GVR op sees a fresh
+        valid permutation and never a stale one from a prior step.  Copies into
+        the stable buffer (not a fresh tensor) so the CUDA-Graph-captured op
+        reads a valid permutation on every replay.
+        """
+        # Gate on row count (num_generations * next_n) rather than request count
+        # so the threshold aligns with the kernel-side tuning note that records
+        # the win region starting at num_rows >= 2 * num_sms.  Using
+        # num_generations alone is only correct for next_n == 2; for next_n == 1
+        # it engages inside the measured regression band, and for next_n == 4 it
+        # misses the win region between 2*num_sms and 4*num_sms rows.
+        next_n = 1 + self.max_draft_tokens
+        if (self.enable_heuristic_topk and self.use_cute_dsl_topk
+                and self.num_generations * next_n >= 2 * self.num_sms):
+            gen_kv_lens = self.kv_lens_cuda[self.num_contexts:self.num_seqs]
+            order = torch.argsort(gen_kv_lens, descending=True).to(torch.int32)
+            self.kv_lens_row_reorder_buffer[:self.num_generations].copy_(order)
+            self.kv_lens_row_reorder = \
+                self.kv_lens_row_reorder_buffer[:self.num_generations]
+        else:
+            self.kv_lens_row_reorder = None
 
     def update_for_spec_dec(self):
         super().update_for_spec_dec()
@@ -1105,15 +1138,30 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # Pre-allocated with stable address for CUDA Graph compatibility
             # (replaces cudaMallocAsync/cudaFreeAsync inside the kernel launcher).
             # Shape: [max_gen_tokens, topK] where max_gen_tokens = max_batch * (1 + max_draft).
-            max_gen_tokens = self.max_num_sequences * (1 +
-                                                       self.max_draft_tokens)
-            self.heuristic_scratch_values = self.get_empty(
-                self.cuda_graph_buffers,
-                (max_gen_tokens, self.num_sparse_topk),
-                cache_name="heuristic_scratch_values",
-                dtype=torch.float32,
-                capture_graph=capture_graph,
-            )
+            # Only the C++ indexer_topk_decode path consumes it; the GVR DSL
+            # path does not, so skip the allocation when use_cute_dsl_topk.
+            if not self.use_cute_dsl_topk:
+                max_gen_tokens = self.max_num_sequences * (
+                    1 + self.max_draft_tokens)
+                self.heuristic_scratch_values = self.get_empty(
+                    self.cuda_graph_buffers,
+                    (max_gen_tokens, self.num_sparse_topk),
+                    cache_name="heuristic_scratch_values",
+                    dtype=torch.float32,
+                    capture_graph=capture_graph,
+                )
+            # Stable-address buffer for the GVR DSL LJF row-reorder
+            # (order_row = argsort(gen_kv_lens, descending)). Must not be
+            # fresh-allocated per step: under CUDA Graph the captured op reads
+            # a frozen address, so prepare() copies into this buffer instead.
+            if self.use_cute_dsl_topk:
+                self.kv_lens_row_reorder_buffer = self.get_empty(
+                    self.cuda_graph_buffers,
+                    (self.max_num_sequences, ),
+                    cache_name="kv_lens_row_reorder_buffer",
+                    dtype=torch.int32,
+                    capture_graph=capture_graph,
+                )
 
         # Persistent scratch for the Radix-split-work indexer path. Re-created
         # in update_spec_dec_param when max_draft_tokens changes so it stays
@@ -1210,7 +1258,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             self.create_expanded_buffers(capture_graph=capture_graph)
             # Resize heuristic scratch buffer for new max_draft_tokens.
-            if self.enable_heuristic_topk:
+            # Skip when use_cute_dsl_topk (GVR path never consumes it), matching
+            # the allocation guard in create_buffers_for_indexer.
+            if self.enable_heuristic_topk and not self.use_cute_dsl_topk:
                 max_gen_tokens = self.max_num_sequences * (
                     1 + self.max_draft_tokens)
                 self.heuristic_scratch_values = self.get_empty(
@@ -1480,11 +1530,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                               1) // tokens_per_block
         max_blocks_used = num_blocks_per_seq.max().item(
         ) if self.num_seqs > 0 else 1
-        # pool_indices already has correct values; set padding to -1
-        host_block_table = pool_indices[:, :max_blocks_used].clone()
-        for i in range(self.num_seqs):
-            if num_blocks_per_seq[i] < max_blocks_used:
-                host_block_table[i, num_blocks_per_seq[i]:] = -1
+        # pool_indices already has correct values; set padding to -1.
+        # Stage through a fresh pinned buffer: an async H2D from pageable
+        # memory would block the host behind the busy execution stream.
+        host_block_table = torch.empty((pool_indices.shape[0], max_blocks_used),
+                                       dtype=pool_indices.dtype,
+                                       pin_memory=prefer_pinned())
+        host_block_table.copy_(pool_indices[:, :max_blocks_used])
+        pad_cols = torch.arange(max_blocks_used, dtype=num_blocks_per_seq.dtype)
+        host_block_table.masked_fill_(
+            pad_cols.unsqueeze(0)
+            >= num_blocks_per_seq[:self.num_seqs].unsqueeze(1), -1)
         # Copy to GPU
         self.block_table[:self.num_seqs, :max_blocks_used].copy_(
             host_block_table, non_blocking=True)
@@ -1764,7 +1820,7 @@ class Indexer(nn.Module):
                 or self.use_cute_dsl_paged_mqa_logits) and layer_idx == 0:
             from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
-            if self.use_cute_dsl_topk:
+            if self.use_cute_dsl_topk and not self._enable_heuristic_topk:
                 # the dtype of topk input tensor, which is float32 now.
                 # Note, need to update it if the dtype of topk input tensor is changed.
                 cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
@@ -2308,16 +2364,27 @@ class Indexer(nn.Module):
 
         return k_fp8, k_scale
 
-    def _call_mqa_logits(self, q_fp8: torch.Tensor, k_fp8: torch.Tensor,
-                         k_scale: torch.Tensor, weights: torch.Tensor,
-                         cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor,
-                         q_scale: Optional[torch.Tensor]) -> torch.Tensor:
+    def _call_mqa_logits(self,
+                         q_fp8: torch.Tensor,
+                         k_fp8: torch.Tensor,
+                         k_scale: torch.Tensor,
+                         weights: torch.Tensor,
+                         cu_seqlen_ks: torch.Tensor,
+                         cu_seqlen_ke: torch.Tensor,
+                         q_scale: Optional[torch.Tensor],
+                         clean_logits: bool = True) -> torch.Tensor:
         """Dispatch fp8_mqa_logits vs fp8_fp4_mqa_logits based on use_fp4.
 
         For FP4 the gather output keeps the legacy float8_e4m3fn dtype for
         API compatibility; reinterpret the bytes as the int8 / int32 layout
         the DeepGEMM kernel expects. The scale tensor is collapsed to 1D for
         the kv side and 2D for the q side per the kernel's asserts.
+
+        clean_logits=False skips DeepGEMM's smxx_clean_logits pass that fills
+        everything outside each row's [ks, ke) window with -inf. Safe only
+        when the consumer never reads outside that window (the custom
+        indexer_topk_prefill kernel); the torch topk fallback scans the full
+        padded row and needs the fill.
         """
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
@@ -2331,9 +2398,13 @@ class Indexer(nn.Module):
                 weights,
                 cu_seqlen_ks,
                 cu_seqlen_ke,
+                clean_logits=clean_logits,
             )
-        return fp8_mqa_logits(q_fp8, (k_fp8, k_scale.reshape(-1)), weights,
-                              cu_seqlen_ks, cu_seqlen_ke)
+        return fp8_mqa_logits(q_fp8, (k_fp8, k_scale.reshape(-1)),
+                              weights,
+                              cu_seqlen_ks,
+                              cu_seqlen_ke,
+                              clean_logits=clean_logits)
 
     def _call_paged_mqa_logits(self, q_decode: torch.Tensor,
                                k_cache: torch.Tensor,
@@ -2478,6 +2549,7 @@ class Indexer(nn.Module):
                             chunk.cu_seqlen_ks[c0:c1],
                             chunk.cu_seqlen_ke[c0:c1],
                             tile_q_scale,
+                            clean_logits=not use_custom_topk,
                         )
                         if use_custom_topk:
                             torch.ops.trtllm.indexer_topk_prefill(
@@ -2533,6 +2605,7 @@ class Indexer(nn.Module):
                     cu_seqlen_ks,
                     cu_seqlen_ke,
                     ctx_q_scale,
+                    clean_logits=not use_custom_topk,
                 )
                 if use_custom_topk:
                     torch.ops.trtllm.indexer_topk_prefill(
@@ -2750,17 +2823,34 @@ class Indexer(nn.Module):
                     # handled inside the C++ kernel (preIdxOffset += 1).
                     pre_idx = metadata.heuristic_prev_topk[
                         local_layer, :num_generations]
-                    heuristic_scratch = \
-                        metadata.heuristic_scratch_values[
-                            :num_gen_tokens]
+                    # heuristic_scratch is only consumed by the C++
+                    # indexer_topk_decode path; the GVR DSL op does not take it.
+                    # Guard on the metadata flag so this stays consistent with
+                    # the buffer allocation (also gated on the same flag).
+                    if not metadata.use_cute_dsl_topk:
+                        heuristic_scratch = \
+                            metadata.heuristic_scratch_values[
+                                :num_gen_tokens]
 
-                # CuTE DSL top-k allocates O(num_gen_tokens * kv_len) global
-                # memory. Beyond 256 tokens the extra memory becomes significant,
-                # so we cap it at 256 for now and fall back to the CUDA C++
-                # indexer_topk_decode. This limit can be removed if GPU memory
-                # is not a bottleneck.
-                if (self.use_cute_dsl_topk and num_gen_tokens <= 256
-                        and (self.compress_ratio == 1 or next_n == 1)):
+                if self.use_cute_dsl_topk and self._enable_heuristic_topk:
+                    # GVR DSL: supports all compress_ratio and next_n values.
+                    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+                        logits_decode,
+                        pre_idx,
+                        gen_kv_lens_cuda,
+                        topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                            num_gen_tokens, :],
+                        self.index_topk,
+                        next_n=next_n,
+                        compress_ratio=self.compress_ratio,
+                        max_seq_len=indexer_max_seq_len,
+                        order_row=metadata.kv_lens_row_reorder,
+                    )
+                # CuTE DSL radix top-k allocates O(num_gen_tokens * kv_len)
+                # global memory. Beyond 256 tokens the extra memory becomes
+                # significant, so we cap it at 256 and fall back to C++.
+                elif (self.use_cute_dsl_topk and num_gen_tokens <= 256
+                      and (self.compress_ratio == 1 or next_n == 1)):
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode, context_lens
                         if self.compress_ratio > 1 else gen_kv_lens_cuda,

@@ -98,8 +98,8 @@ Each line contains the fully qualified test name followed by an optional
 specific hardware family. Example:
 
 ```text
-examples/test_openai.py::test_llm_openai_triton_1gpu SKIP (https://nvbugspro.nvidia.com/bug/4963654)
-full:GH200/examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct] SKIP (arm is not supported)
+accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
+full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6422318)
 ```
 
 Changes to `waives.txt` should include a bug link or brief explanation so other
@@ -133,11 +133,11 @@ default pre-merge set:
 ```
 
 Both options accept stage names and wildcard patterns defined in
-`jenkins/L0_Test.groovy`. The broad `"*"` and `"*Post-Merge*"` selectors
-require the same approval label, including when they appear in a comma-separated
-list. Equivalent escaped or repeated-star forms are treated the same. Other
-stage selectors, including explicit stage names and limited patterns such as
-`"*PerfSanity*"`, retain their existing behavior.
+`jenkins/L0_Test.groovy`. The `"*"`, `"*Post-Merge*"`, and `"*PerfSanity*"`
+selectors require the same approval label, including when they appear in a
+comma-separated list. Equivalent escaped or repeated-star forms are treated the
+same. Other stage selectors, including explicit stage names and other limited
+wildcard patterns, retain their existing behavior.
 
 Being selective keeps CI turnaround fast and conserves hardware resources.
 
