@@ -14,12 +14,12 @@
 # limitations under the License.
 
 import asyncio
+import itertools
 from unittest.mock import MagicMock
 
 import pytest
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.bench.benchmark.utils.asynchronous import LlmManager
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -59,7 +59,7 @@ async def test_llm_manager_duration():
         duration=1,  # 1 second
     )
 
-    req = InferenceRequest(input_ids=[1, 2, 3], output_tokens=10)
+    req = InferenceRequest(task_id=0, input_ids=[1, 2, 3], output_tokens=10)
     sampling_params = SamplingParams()
     post_proc_params = PostprocParams()
 
@@ -119,7 +119,10 @@ async def test_llm_manager_duration_bounds_runtime_with_eager_dispatch():
     mock_llm.generate_async.return_value = mock_output
 
     outbox = asyncio.Queue()
-    num_requests = 20
+    # Sized so that unenforced execution (num_requests / concurrency *
+    # request_latency = 5s) is far above the enforced runtime (~1s), leaving a
+    # wide margin for the wall-clock assertion below on a loaded machine.
+    num_requests = 50
     concurrency = 2
     duration = 1
 
@@ -131,7 +134,7 @@ async def test_llm_manager_duration_bounds_runtime_with_eager_dispatch():
         duration=duration,
     )
 
-    req = InferenceRequest(input_ids=[1, 2, 3], output_tokens=10)
+    req = InferenceRequest(task_id=0, input_ids=[1, 2, 3], output_tokens=10)
     sampling_params = SamplingParams()
     post_proc_params = PostprocParams()
 
@@ -143,15 +146,15 @@ async def test_llm_manager_duration_bounds_runtime_with_eager_dispatch():
     await asyncio.wait_for(manager._backend_task, timeout=30)
     elapsed = asyncio.get_running_loop().time() - start
 
-    # Unbounded behavior would process all 20 requests in ~2s
-    # (20 / 2 slots * 0.2s). With enforcement, roughly
-    # duration / request_latency * concurrency = 10 requests complete.
-    # Generous bounds to stay robust on loaded CI machines.
+    # With enforcement, roughly duration / request_latency * concurrency = 10
+    # requests complete; without it, all 50 would.
     assert outbox.qsize() < num_requests, (
         "Duration limit had no effect: all requests were processed."
     )
-    # Wall time is duration plus at most one in-flight drain, with slack.
-    assert elapsed < duration + request_latency + 0.5
+    # Wall time is duration plus at most one in-flight drain. The slack keeps
+    # this robust on a loaded machine while staying far below the ~5s an
+    # unenforced run would take.
+    assert elapsed < duration + request_latency + 1.5
 
     await manager.stop()
 
@@ -189,7 +192,7 @@ async def test_llm_manager_duration_not_exceeded():
         duration=5,  # 5 seconds, plenty of time
     )
 
-    req = InferenceRequest(input_ids=[1, 2, 3], output_tokens=10)
+    req = InferenceRequest(task_id=0, input_ids=[1, 2, 3], output_tokens=10)
     sampling_params = SamplingParams()
     post_proc_params = PostprocParams()
 
@@ -201,11 +204,15 @@ async def test_llm_manager_duration_not_exceeded():
 
     manager.run()
 
-    # Wait for them to complete
-    await asyncio.sleep(1.5)
+    # Await the perf items themselves rather than sleeping a fixed interval.
+    # The worker loops until the 5s duration elapses, so there is no task
+    # completion to await here, and a fixed sleep would race the requests on a
+    # loaded machine.
+    for _ in range(2):
+        await asyncio.wait_for(outbox.get(), timeout=10)
 
-    # All 2 requests should have been processed and put into outbox.
-    assert outbox.qsize() == 2
+    # Both requests were processed and none are left pending.
+    assert outbox.empty()
     assert manager._inbox.empty()
 
     await manager.stop()
@@ -223,23 +230,30 @@ async def test_async_benchmark_duration():
     mock_llm.args.parallel_config = MagicMock()
     mock_llm.args.parallel_config.world_size = 1
 
-    # Mock generate_async to return a mock output
-    mock_output = MagicMock()
-    mock_output.prompt_token_ids = [1, 2, 3]
-    mock_output.outputs = [MagicMock(token_ids=[4, 5])]
-    mock_output.finished = True
-    mock_output.id = 1
-    mock_output.decoding_iter = 1
+    # StatsKeeper records requests in a dict keyed by request id, so each
+    # response needs its own id -- a shared one would merge the requests into a
+    # single record and skew their timings.
+    def make_output(request_id):
+        output = MagicMock()
+        output.prompt_token_ids = [1, 2, 3]
+        output.outputs = [MagicMock(token_ids=[4, 5])]
+        output.finished = True
+        output.id = request_id
+        output.decoding_iter = 1
 
-    async def mock_aresult():
-        await asyncio.sleep(0.6)  # Make it take time
-        return mock_output
+        async def mock_aresult():
+            await asyncio.sleep(0.6)  # Make it take time
+            return output
 
-    mock_output.aresult = mock_aresult
-    mock_llm.generate_async.return_value = mock_output
+        output.aresult = mock_aresult
+        return output
 
-    req = InferenceRequest(input_ids=[1, 2, 3], output_tokens=10)
-    requests = [req, req, req]
+    response_ids = itertools.count()
+    mock_llm.generate_async.side_effect = lambda *args, **kwargs: make_output(next(response_ids))
+
+    requests = [
+        InferenceRequest(task_id=i, input_ids=[1, 2, 3], output_tokens=10) for i in range(3)
+    ]
 
     # Patch EnergyMonitor and tqdm so we don't depend on actual NVML / environment
     with (
