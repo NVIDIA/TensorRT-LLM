@@ -3775,21 +3775,22 @@ class TestDeepseekTransceiverPreference:
         (["DeepseekV3ForCausalLM"], "deepseek_v3"),
         (["DeepseekV32ForCausalLM"], "deepseek_v32"),
     ])
-    def test_preference_per_architecture(self, architectures, model_type):
+    def test_preference_per_architecture(self, architectures: list[str],
+                                         model_type: str) -> None:
         from tensorrt_llm._torch.models.modeling_deepseekv3 import \
             DeepseekV3ForCausalLM
         cfg = self._pretrained_config(architectures, model_type)
         assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
             cfg) == "PYTHON"
 
-    def test_prefers_python_without_config(self):
+    def test_prefers_python_without_config(self) -> None:
         """Preference is unconditional without a pretrained config."""
         from tensorrt_llm._torch.models.modeling_deepseekv3 import \
             DeepseekV3ForCausalLM
         assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
         ) == "PYTHON"
 
-    def test_deepseek_resolves_auto_to_python_on_nixl(self):
+    def test_deepseek_resolves_auto_to_python_on_nixl(self) -> None:
         """DeepseekV3ForCausalLM on NIXL adopts the Python transceiver from 'auto'."""
         from tensorrt_llm._torch.models.modeling_deepseekv3 import \
             DeepseekV3ForCausalLM
