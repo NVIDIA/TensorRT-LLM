@@ -2,9 +2,7 @@ diff --git a/csrc/deep_ep.cpp b/csrc/deep_ep.cpp
 index 7cb3372..123f723 100644
 --- a/csrc/deep_ep.cpp
 +++ b/csrc/deep_ep.cpp
-@@ -1378,6 +1378,90 @@ Buffer::low_latency_dispatch_fp4(const torch::Tensor& x, const torch::Tensor& x_
- #endif
- }
+@@ -1380,2 +1380,86 @@ Buffer::low_latency_dispatch_fp4(const torch::Tensor& x, const torch::Tensor& x_
  
 +std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
 +Buffer::low_latency_dispatch_bf16_to_fp4(const torch::Tensor& x, const torch::Tensor& global_scale,
@@ -91,23 +89,15 @@ index 7cb3372..123f723 100644
 +}
 +
  std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
- Buffer::low_latency_combine_low_precision(int precision, const torch::Tensor& x, const std::optional<torch::Tensor>& global_scale,
-                             const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
-@@ -1611,6 +1695,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-         .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
-         .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
+@@ -1613,2 +1697,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
          .def("low_latency_dispatch_fp4", &deep_ep::Buffer::low_latency_dispatch_fp4)
 +        .def("low_latency_dispatch_bf16_to_fp4", &deep_ep::Buffer::low_latency_dispatch_bf16_to_fp4)
          .def("low_latency_combine_low_precision", &deep_ep::Buffer::low_latency_combine_low_precision)
-         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
- 
 diff --git a/csrc/deep_ep.hpp b/csrc/deep_ep.hpp
 index 7377b72..6b73565 100644
 --- a/csrc/deep_ep.hpp
 +++ b/csrc/deep_ep.hpp
-@@ -155,6 +155,13 @@ public:
-                         const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
-                         int num_max_dispatch_tokens_per_rank, int num_experts,
+@@ -157,2 +157,9 @@ public:
                          bool async, bool return_recv_hook);
 +
 +    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
@@ -117,15 +107,11 @@ index 7377b72..6b73565 100644
 +                        int num_max_dispatch_tokens_per_rank, int num_experts,
 +                        bool async, bool return_recv_hook);
      std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
-     low_latency_combine_low_precision(int precision, const torch::Tensor& x, const std::optional<torch::Tensor>& global_scale,
-                                 const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
 diff --git a/csrc/kernels/extension_api.cuh b/csrc/kernels/extension_api.cuh
 index af13a4b..223c92b 100644
 --- a/csrc/kernels/extension_api.cuh
 +++ b/csrc/kernels/extension_api.cuh
-@@ -21,6 +21,17 @@ namespace extensions {
-         int num_topk, int num_experts, int rank, int num_ranks,
-         void* workspace, int num_device_sms,
+@@ -23,2 +23,13 @@ namespace extensions {
          cudaStream_t stream, int phases);
 +    void dispatch_bf16_to_fp4(void* packed_recv_x, void* packed_recv_x_scales,
 +        int* packed_recv_src_info, int64_t* packed_recv_layout_range,
@@ -139,57 +125,42 @@ index af13a4b..223c92b 100644
 +        void* workspace, int num_device_sms,
 +        cudaStream_t stream, int phases);
      void low_precision_combine(int precision, void* combined_x,
-         void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
-         const void* x, const float* global_scale_per_token,
-@@ -33,4 +44,4 @@ namespace extensions {
-         void* workspace, int num_device_sms,
-         cudaStream_t stream, int phases);
+@@ -35,2 +46,2 @@ namespace extensions {
  }
 -}
 \ No newline at end of file
 +}
 diff --git a/csrc/kernels/extension_kernels.cu b/csrc/kernels/extension_kernels.cu
-index 7867f60..c3e1e2f 100644
+index 7867f60..6ba5465 100644
 --- a/csrc/kernels/extension_kernels.cu
 +++ b/csrc/kernels/extension_kernels.cu
-@@ -261,14 +261,15 @@ switch (hidden) { \
-     default: EP_HOST_ASSERT(false && "Unsupported hidden"); \
- } while (false)
+@@ -1 +1,3 @@
++#include <cstdlib>
++
+ #include "configs.cuh"
+@@ -263,3 +265,3 @@ switch (hidden) { \
  
 -template <int kHidden>
 +template <int kHidden, bool kQuantizeBf16Input = false>
  __global__ __launch_bounds__(1024, 1) void
- dispatch_fp4(void* packed_recv_x, void* packed_recv_x_scales,
-             int* packed_recv_src_info, int64_t* packed_recv_layout_range,
-             int* packed_recv_count,
-             int* cumulative_local_expert_recv_stats,
+@@ -270,3 +272,4 @@ dispatch_fp4(void* packed_recv_x, void* packed_recv_x_scales,
              void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
 -            const void* x, const void* x_scales, const int* topk_idx,
 +            const void* x, const void* x_scales, const float* global_scale,
 +            const int* topk_idx,
              int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
-             int* next_clean, int num_next_clean_int,
-             int num_tokens, int num_max_dispatch_tokens_per_rank,
-@@ -287,6 +288,7 @@ dispatch_fp4(void* packed_recv_x, void* packed_recv_x_scales,
- 
-     constexpr size_t kHiddenBytes = kHidden / 2;
+@@ -289,2 +292,5 @@ dispatch_fp4(void* packed_recv_x, void* packed_recv_x_scales,
      constexpr size_t kHiddenVecAccessNum = kHiddenBytes / sizeof(int4);
 +    constexpr size_t kHiddenBf16VecAccessNum = kHidden / (sizeof(int4) / sizeof(nv_bfloat16));
++    EP_STATIC_ASSERT(kHiddenBf16VecAccessNum % 32 == 0,
++            "BF16-to-NVFP4 lane-pair quantization requires complete warps");
      constexpr size_t kScalesBytes = kHidden / 16;
-     constexpr size_t kScalesVecAccessNum = kScalesBytes / sizeof(int4);
- 
-@@ -308,8 +310,6 @@ dispatch_fp4(void* packed_recv_x, void* packed_recv_x_scales,
-         const auto num_threads = (num_warps - 1) * 32;
- 
+@@ -310,4 +316,2 @@ dispatch_fp4(void* packed_recv_x, void* packed_recv_x_scales,
          for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
 -            const auto x_int4 = reinterpret_cast<const int4*>(x) + token_idx * kHiddenVecAccessNum;
 -            const auto x_scales_int4  = reinterpret_cast<const int4*>(x_scales) + token_idx * kScalesVecAccessNum;
              const auto rdma_x_src_idx = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(rdma_x) + token_idx * kNumBytesPerMsg);
-             const auto rdma_x_vec = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int4));
-             const auto rdma_x_scales = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + kHiddenBytes);
-@@ -318,15 +318,32 @@ dispatch_fp4(void* packed_recv_x, void* packed_recv_x_scales,
-             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
-             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
+@@ -320,11 +324,31 @@ dispatch_fp4(void* packed_recv_x, void* packed_recv_x_scales,
  
 -            #pragma unroll
 -            for (int i = thread_id; i < kHiddenVecAccessNum; i += num_threads) {
@@ -207,10 +178,13 @@ index 7867f60..c3e1e2f 100644
 +                auto rdma_x_fp8_scales = reinterpret_cast<uint8_t*>(rdma_x_scales);
 +#pragma unroll
 +                for (int i = thread_id; i < kHiddenBf16VecAccessNum; i += num_threads) {
++                    // Adjacent lanes each own eight BF16 values. The helper
++                    // exchanges lane-pair maxima so both halves use one
++                    // 16-value NVFP4 block scale; the even lane stores it.
 +                    auto [e2m1_vec, fp8_scale_val] =
 +                        quantize_bf16_to_nvfp4(__ldg(x_bf16_int4 + i), global_scale_val);
 +                    rdma_x_fp4[i] = e2m1_vec;
-+                    if (i % 2 == 0)
++                    if (lane_id % 2 == 0)
 +                        rdma_x_fp8_scales[i / 2] = fp8_scale_val;
 +                }
 +            } else {
@@ -227,20 +201,12 @@ index 7867f60..c3e1e2f 100644
 +                    rdma_x_scales[i] = *reinterpret_cast<int4*>(&int4_value);
 +                }
              }
-             asm volatile("bar.sync 1, %0;" :: "r"(num_threads));
- 
-@@ -526,7 +543,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
-                 packed_recv_count, \
-                 cumulative_local_expert_recv_stats, \
+@@ -528,3 +552,3 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
                  rdma_recv_x, rdma_recv_count, rdma_x, \
 -                x, x_scales, topk_idx, \
 +                x, x_scales, nullptr, topk_idx, \
                  atomic_counter_per_expert, atomic_finish_counter_per_expert, \
-                 next_clean, num_next_clean_int, \
-                 num_tokens, num_max_dispatch_tokens_per_rank, \
-@@ -539,6 +556,53 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
- #undef DISPATCH_LAUNCH_CASE
- }
+@@ -541,2 +565,49 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
  
 +void dispatch_bf16_to_fp4(void* packed_recv_x, void* packed_recv_x_scales,
 +                int* packed_recv_src_info, int64_t* packed_recv_layout_range,
@@ -290,19 +256,20 @@ index 7867f60..c3e1e2f 100644
 +}
 +
  enum class LowPrecisionType : int {
-     FP8 = 0,
-     NVFP4 = 1
-@@ -658,7 +722,29 @@ low_precision_combine(void* combined_x,
-             float global_scale_val = 0.f;
-             if constexpr (LowPrecisionTypeTraits<kPrecision>::kUseGlobalScale) {
+@@ -584,2 +655,2 @@ struct LowPrecisionTypeTraits<LowPrecisionType::FP8> {
+-template <LowPrecisionType kPrecision, int kHidden, int kNumMaxTopk>
++template <LowPrecisionType kPrecision, int kHidden, int kNumMaxTopk, bool kStageRecvMetadata>
+ __global__ __launch_bounds__(1024, 1) void
+@@ -660,3 +731,26 @@ low_precision_combine(void* combined_x,
                  auto rdma_send_x_global_scale_vec = reinterpret_cast<float*>(rdma_send_x_current_expert + token_idx * kNumBytesPerSlot + kHiddenCommBytes + kScalesBytes);
 -                global_scale_val = __ldg(global_scale_per_token + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank + token_idx);
 +                if (global_scale_per_token != nullptr) {
 +                    global_scale_val = __ldg(global_scale_per_token + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank + token_idx);
 +                } else {
-+                    // Match calculate_nvfp4_global_scale exactly, but compute the
-+                    // per-token reduction in the combine warp to avoid a separate
-+                    // kernel launch and intermediate scale tensor.
++                    // Reproduce calculate_nvfp4_global_scale for finite BF16
++                    // inputs. Its getMaxAbs helper performs a block reduction
++                    // before thread 0 stores 448 * 6 / amax; this warp owns the
++                    // same complete token reduction.
 +                    float per_token_max_abs_val = 0.f;
 +                    const auto x_int4 = local_x + token_idx * kHiddenBf16VecAccessNum;
 +                    for (int i = lane_id; i < kHiddenBf16VecAccessNum; i += 32) {
@@ -321,19 +288,101 @@ index 7867f60..c3e1e2f 100644
 +                    global_scale_val = 448.f * 6.f / per_token_max_abs_val;
 +                }
                  rdma_send_x_global_scale_vec[0] = global_scale_val;
-             }
-             const auto x_int4 = local_x + token_idx * kHiddenBf16VecAccessNum;
-@@ -785,7 +871,6 @@ void low_precision_combine(int precision,void* combined_x,
- auto combine_func = low_precision_combine<LowPrecisionType::FP8, hidden, kNumMaxTopk>; \
- if(precision != 0) { \
-     combine_func = low_precision_combine<LowPrecisionType::NVFP4, hidden, kNumMaxTopk>; \
--    EP_HOST_ASSERT(global_scale_per_token != nullptr); \
- } else { \
-     EP_HOST_ASSERT(global_scale_per_token == nullptr); \
- } \
-@@ -808,4 +893,4 @@ LAUNCH_KERNEL(&cfg, combine_func, \
+@@ -718,2 +812,62 @@ low_precision_combine(void* combined_x,
+     cg::this_grid().sync();
++    if constexpr (kStageRecvMetadata) {
++        __shared__ int staged_topk_idx[kNumMaxTopk];
++        __shared__ float staged_topk_weights[kNumMaxTopk];
++        __shared__ float staged_global_scales[kNumMaxTopk];
++
++        for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
++            if (thread_id < num_topk) {
++                auto expert_idx = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + thread_id));
++                staged_topk_idx[thread_id] = expert_idx;
++                staged_topk_weights[thread_id] = __ldg(topk_weights + token_idx * num_topk + thread_id);
++                if constexpr (LowPrecisionTypeTraits<kPrecision>::kUseGlobalScale) {
++                    if (expert_idx >= 0) {
++                        auto rdma_x_buffer = reinterpret_cast<uint8_t*>(rdma_recv_x) +
++                                (expert_idx * num_max_dispatch_tokens_per_rank + token_idx) * kNumBytesPerSlot;
++                        auto rdma_x_scales_buffer = rdma_x_buffer + kHiddenCommBytes;
++                        auto rdma_global_scale_ptr = reinterpret_cast<float*>(rdma_x_scales_buffer + kScalesBytes);
++                        staged_global_scales[thread_id] = __ldg(rdma_global_scale_ptr);
++                    }
++                }
++            }
++            __syncthreads();
++
++            for(auto vec_id = thread_id; vec_id < kHiddenBf16VecAccessNum; vec_id += num_threads) {
++                float combined_values[kBF16ElemsNumPerVecAccess] = {0.f};
++                #pragma unroll
++                for (int i = 0; i < num_topk; ++ i) if (staged_topk_idx[i] >= 0) {
++                    auto rdma_x_buffer = reinterpret_cast<uint8_t*>(rdma_recv_x) +
++                            (staged_topk_idx[i] * num_max_dispatch_tokens_per_rank + token_idx) * kNumBytesPerSlot;
++                    auto rdma_x_scales_buffer = rdma_x_buffer + kHiddenCommBytes;
++
++                    float global_scale_val = 0.f;
++                    if constexpr (LowPrecisionTypeTraits<kPrecision>::kUseGlobalScale) {
++                        global_scale_val = staged_global_scales[i];
++                    }
++                    auto x_vec = ld_nc_global(reinterpret_cast<CommVecType*>(rdma_x_buffer) + vec_id);
++                    auto x_scale = ld_nc_global(reinterpret_cast<ScaleType*>(rdma_x_scales_buffer) + vec_id / kThreadsPerScale);
++                    float x_fp32[kBF16ElemsNumPerVecAccess];
++                    LowPrecisionTypeTraits<kPrecision>::dequantize(x_vec, global_scale_val, x_scale, x_fp32, staged_topk_weights[i]);
++                    #pragma unroll
++                    for (int j = 0; j < kBF16ElemsNumPerVecAccess; ++ j) {
++                        combined_values[j] += x_fp32[j];
++                    }
++                }
++
++                int4 combined_vec_bf16;
++                #pragma unroll
++                for (int j = 0; j < kBF16ElemsNumPerVecAccess; ++ j)
++                    reinterpret_cast<nv_bfloat16*>(&combined_vec_bf16)[j] = static_cast<nv_bfloat16>(combined_values[j]);
++                (reinterpret_cast<int4*>(combined_x) + token_idx * kHiddenBf16VecAccessNum)[vec_id] = combined_vec_bf16;
++            }
++
++            // Prevent the next token from replacing CTA-shared metadata while
++            // another thread is still consuming the current token's values.
++            // token_idx is CTA-uniform, so every thread reaches the conditional
++            // barrier on the same iterations.
++            if (token_idx + num_sms < num_combined_tokens) {
++                __syncthreads();
++            }
++        }
++    } else {
+     for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
+@@ -756,2 +910,13 @@ low_precision_combine(void* combined_x,
+     }
++    }
++}
++
++static bool low_precision_combine_recv_metadata_staging_enabled() {
++    static bool const enabled = []() {
++        auto const value = std::getenv("TRTLLM_DEEP_EP_LP_COMBINE_RECV_METADATA_STAGING");
++        EP_HOST_ASSERT(value == nullptr or
++                ((value[0] == '0' or value[0] == '1') and value[1] == '\0'));
++        return value != nullptr and value[0] == '1';
++    }();
++    return enabled;
  }
- #undef SWITCH_HIDDEN_FOR_EXTENSION_KERNELS
+@@ -776,2 +941,3 @@ void low_precision_combine(int precision,void* combined_x,
+     const auto num_warps = num_warp_groups * num_warps_per_group;
++    const auto stage_recv_metadata = low_precision_combine_recv_metadata_staging_enabled();
+     const auto num_sms = ceil_div(num_experts, num_warp_groups);
+@@ -784,6 +950,9 @@ void low_precision_combine(int precision,void* combined_x,
+ #define COMBINE_LAUNCH_CASE(hidden) { \
+-auto combine_func = low_precision_combine<LowPrecisionType::FP8, hidden, kNumMaxTopk>; \
++auto combine_func = stage_recv_metadata ? \
++        low_precision_combine<LowPrecisionType::FP8, hidden, kNumMaxTopk, true> : \
++        low_precision_combine<LowPrecisionType::FP8, hidden, kNumMaxTopk, false>; \
+ if(precision != 0) { \
+-    combine_func = low_precision_combine<LowPrecisionType::NVFP4, hidden, kNumMaxTopk>; \
+-    EP_HOST_ASSERT(global_scale_per_token != nullptr); \
++    combine_func = stage_recv_metadata ? \
++            low_precision_combine<LowPrecisionType::NVFP4, hidden, kNumMaxTopk, true> : \
++            low_precision_combine<LowPrecisionType::NVFP4, hidden, kNumMaxTopk, false>; \
+ } else { \
+@@ -810,2 +979,2 @@ LAUNCH_KERNEL(&cfg, combine_func, \
  }
 -}
 \ No newline at end of file
@@ -342,9 +391,7 @@ diff --git a/csrc/kernels/intranode.cu b/csrc/kernels/intranode.cu
 index ee9ca67..0031c07 100644
 --- a/csrc/kernels/intranode.cu
 +++ b/csrc/kernels/intranode.cu
-@@ -844,9 +844,15 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
- 
- #ifndef DISABLE_SM90_FEATURES
+@@ -846,5 +846,11 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                      // Wait TMA arrival
 +                    // hidden_int4 is not always divisible by a warp. The final tile can have
 +                    // only a subset of lanes active, so synchronize only participating lanes.
@@ -357,31 +404,21 @@ index ee9ca67..0031c07 100644
 -                    __syncwarp();
 +                    __syncwarp(sync_mask);
  
-                     // Write into TMA buffer
-                     auto tma_stage_idx = (i / 32) % kNumStages;
-@@ -854,13 +860,13 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
- 
-                     // Issue TMA
+@@ -856,3 +862,3 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                      tma_store_fence();
 -                    __syncwarp();
 +                    __syncwarp(sync_mask);
                      if (lane_id == 0) {
-                         auto tma_bytes = min(32, hidden_int4 - i) * static_cast<int>(sizeof(int4));
-                         tma_store_1d(reinterpret_cast<int4*>(tma_buffer) + tma_stage_idx * 32,
-                                      recv_int4 + token_idx * hidden_int4 + i, tma_bytes, false);
+@@ -862,3 +868,3 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                      }
 -                    __syncwarp();
 +                    __syncwarp(sync_mask);
  #else
-                     recv_int4[token_idx * hidden_int4 + i] = out_int4;
- #endif
 diff --git a/deep_ep/buffer.py b/deep_ep/buffer.py
 index bdc1181..79170ac 100644
 --- a/deep_ep/buffer.py
 +++ b/deep_ep/buffer.py
-@@ -643,6 +643,35 @@ class Buffer:
-                              cumulative_local_expert_recv_stats)
-         return packed_recv_x, packed_recv_x_scales, packed_recv_count, handle, \
+@@ -645,2 +645,31 @@ class Buffer:
              EventOverlap(event, tensors_to_record if async_finish else None), hook
 +
 +    # noinspection PyTypeChecker
@@ -413,30 +450,60 @@ index bdc1181..79170ac 100644
 +        return packed_recv_x, packed_recv_x_scales, packed_recv_count, handle, \
 +            EventOverlap(event, tensors_to_record if async_finish else None), hook
      
-     # noinspection PyTypeChecker
-     def low_latency_combine_low_precision(self, precision: str, x: torch.Tensor, global_scale: torch.Tensor, 
 diff --git a/tests/test_low_latency_fp4.py b/tests/test_low_latency_fp4.py
-index a455091..3a8484a 100644
+index a455091..9eb8b9d 100644
 --- a/tests/test_low_latency_fp4.py
 +++ b/tests/test_low_latency_fp4.py
-@@ -88,6 +88,20 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
+@@ -96,3 +96,15 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
+     x_global_scales = (448 * 6) / x.abs().max(dim=-1, keepdim=True).values.to(torch.float32)
+-    combined_x, event, hook = buffer.low_latency_combine_low_precision(1, x, x_global_scales, topk_idx[rank], topk_weights, handle)
++    combined_x, event, hook = buffer.low_latency_combine_low_precision(
++        "nvfp4", x, x_global_scales, topk_idx[rank], topk_weights, handle)
++
++    # Omitting the materialized per-token scales selects the fused dynamic
++    # reduction. Re-dispatch because a low-latency handle is single-use.
++    x_dynamic, recv_count_dynamic, dynamic_handle, event, hook = \
++        buffer.low_latency_dispatch(
++            tokens_bf16[rank], topk_idx[rank], num_tokens, num_experts, use_fp8=False)
++    assert torch.equal(recv_count_dynamic, recv_count)
++    combined_x_dynamic, event, hook = buffer.low_latency_combine_low_precision(
++        "nvfp4", x_dynamic, None, topk_idx[rank], topk_weights, dynamic_handle)
++    assert torch.equal(combined_x_dynamic, combined_x)
++
+     tokens_bf16_reconstructed = deep_ep.Buffer.dequantize_nvfp4_to_bf16(tokens_packed_fp4[rank], global_scales[rank], scales_fp8[rank])
+@@ -105,2 +117,3 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
+     assert torch.allclose(combined_x, combined_x_ref, atol=1e-1)
++    assert torch.allclose(combined_x_dynamic, combined_x_ref, atol=1e-1)
+     print(f'[rank {rank}] LL Combine FP4 accuracy verify pass', flush=True)
+@@ -111,3 +124,4 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
+         combined_x, event, hook = \
+-            buffer.low_latency_combine_low_precision(1, x, x_global_scales, topk_idx[rank], topk_weights, handle)
++            buffer.low_latency_combine_low_precision(
++                "nvfp4", x, x_global_scales, topk_idx[rank], topk_weights, handle)
      
-     verify_dispatch_fp4(packed_recv_x, packed_recv_scales, real_recv_count, tokens_packed_fp4, scales_fp8, topk_idx, num_tokens, num_experts, num_ranks, rank, hidden)
- 
-+    # The fused entry point must produce the same message payload as the
-+    # materialized-FP4 path for one exact static global scale.
+@@ -124,2 +138,21 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
+                         barrier_comm_profiling=True, suppress_kineto_output=True)
++
++    # Leave the existing dispatch/combine protocol above unchanged. Exercise
++    # the fused entry point last and compare its message payload against
++    # materialized FP4 produced with one exact static global scale.
 +    static_global_scale = torch.tensor(0.75, dtype=torch.float32, device='cuda')
 +    static_global_scales = static_global_scale.expand(num_ranks, num_tokens, 1).contiguous()
 +    static_tokens_packed_fp4, static_scales_fp8 = \
 +        deep_ep.Buffer.quantize_bf16_to_nvfp4(tokens_bf16, static_global_scales)
-+    fused_recv_x, fused_recv_scales, fused_recv_count, _, _, _ = \
++    fused_recv_x, fused_recv_scales, fused_recv_count, fused_handle, _, _ = \
 +        buffer.low_latency_dispatch_bf16_to_fp4(
 +            tokens_bf16[rank], static_global_scale, topk_idx[rank], num_tokens, num_experts)
++    assert fused_recv_x.shape == packed_recv_x.shape
++    assert fused_recv_scales.shape == packed_recv_scales.shape
++    assert fused_handle[3] == handle[3] == hidden
 +    verify_dispatch_fp4(
 +        fused_recv_x, fused_recv_scales, fused_recv_count,
 +        static_tokens_packed_fp4, static_scales_fp8, topk_idx,
 +        num_tokens, num_experts, num_ranks, rank, hidden)
 +
-     x, recv_count, handle, event, hook = buffer.low_latency_dispatch(tokens_bf16[rank], topk_idx[rank], num_tokens, num_experts, use_fp8=False)
-     assert torch.equal(recv_count, real_recv_count)
+     print(f'[rank {rank}] LL Dispatch FP4 bandwidth: {comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us, | '
+@@ -127,3 +160,2 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
      
+-
+ # noinspection PyUnboundLocalVariable
