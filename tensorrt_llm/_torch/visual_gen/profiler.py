@@ -1,0 +1,282 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Capture-window management for VisualGen pipeline profiling.
+
+A single :class:`VisualGenProfiler` owns every profiling decision for one
+pipeline: which windows open, when they close, and which collectors they
+drive. ``BasePipeline`` holds one instance and exposes thin hooks over it, so
+a pipeline with a hand-written denoise loop opts in without re-implementing
+any lifecycle logic.
+
+Two collectors share the same windows:
+
+* ``cudaProfilerStart``/``cudaProfilerStop`` — the capture gate an attached
+  Nsight Systems collector honours (``nsys profile -c cudaProfilerApi ...``).
+  These calls do **not** start Nsight on their own; with no collector
+  attached they are cheap no-ops.
+* ``torch.profiler`` — a Kineto trace, exported as a Chrome trace when
+  ``TLLM_TORCH_PROFILE_TRACE`` is set.
+
+Both collectors use CUPTI, so an Nsight run and a torch-trace run should be
+separate invocations.
+"""
+
+import os
+from contextlib import contextmanager
+from typing import Iterator, Optional, Tuple, Union
+
+import torch
+
+from tensorrt_llm.logger import logger
+
+PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_VISUAL_GEN_START_STOP"
+PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
+
+# Parsed form of PROFILE_START_STOP_ENV_VAR_NAME: a keyword mode, or
+# (step starts, step stops) for numeric ranges.
+ProfileRange = Union[str, Tuple[frozenset, frozenset], None]
+
+
+def parse_profile_range() -> ProfileRange:
+    """Parse ``TLLM_PROFILE_VISUAL_GEN_START_STOP`` for profiler scoping.
+
+    Visual-gen-specific env var (separate from the LLM path's
+    ``TLLM_PROFILE_START_STOP``). Use with ``nsys profile -c cudaProfilerApi ...``.
+
+    Supported formats:
+
+    * ``A-B``            – profile denoise steps A through B
+    * ``A-B,C-D,...``    – multiple ranges; profiler toggles on/off per range
+    * ``A,B,...``        – individual steps treated as single-step ranges
+    * ``predenoise``     – profile from request start through denoise-loop
+                           setup, including text encoding and latent
+                           preparation. Single-shot.
+    * ``postdenoise``    – profile from the end of the last denoise loop to
+                           request completion, covering VAE decode. Single-shot.
+    * ``all``            – profile the full request, from text encoding through
+                           VAE decode; skip warmup
+    * (unset)            – no profiler API calls; plain ``nsys profile`` captures everything
+
+    Returns ``None`` when unset, one of ``"all"`` / ``"predenoise"`` /
+    ``"postdenoise"`` for keyword modes, or ``(frozenset(starts), frozenset(stops))``
+    for numeric ranges.
+
+    .. note::
+       Step indices are **per-denoise-loop**: each loop resets the counter to
+       0, so e.g. ``0-4`` profiles steps 0-4 of *every* request. This differs
+       from the LLM path's ``TLLM_PROFILE_START_STOP``, which indexes a global
+       executor iteration counter (one forward pass services all in-flight
+       requests, so there is no "per request" index). A multi-stage pipeline
+       runs more than one denoise loop per request, so a numeric range opens
+       one window per stage.
+
+       ``predenoise`` and ``postdenoise`` are **single-shot per process**:
+       they fire once around the first user request after warmup and do not
+       re-arm on subsequent requests. Pair either mode with
+       ``nsys --capture-range-end=stop`` (keeps the app running cleanly after
+       collection ends). ``all`` and numeric ranges re-arm for each request;
+       use ``--capture-range-end=repeat:N`` to collect multiple requests.
+    """
+    val = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME)
+    if not val:
+        return None
+    val = val.strip()
+    if val.lower() in ("all", "predenoise", "postdenoise"):
+        return val.lower()
+    # Parse comma-separated ranges: "A-B,C-D,..." or single steps "A,B,..."
+    # Same format as the LLM path (PyExecutor._load_iteration_indexes).
+    starts, stops = [], []
+    for span in val.split(","):
+        span = span.strip()
+        if "-" in span:
+            start, stop = span.split("-", 1)
+            starts.append(int(start))
+            stops.append(int(stop))
+        else:
+            v = int(span)
+            starts.append(v)
+            stops.append(v)
+    return frozenset(starts), frozenset(stops)
+
+
+class VisualGenProfiler:
+    """Opens and closes profiling windows over a VisualGen request.
+
+    Window boundaries, in the order a request hits them:
+
+    * :meth:`request_scope` wraps the whole request. It opens the ``all`` or
+      ``predenoise`` window and guarantees every window is closed on the way
+      out, including after an exception.
+    * :meth:`close_predenoise_window` runs just before a denoise loop's first
+      step; :meth:`open_postdenoise_window` runs just after its last one.
+    * :meth:`open_step_window` / :meth:`close_step_window` run per denoise
+      step and act only on the indices a numeric range names.
+
+    Callers are responsible for skipping warmup passes. Each closed window
+    exports its own trace file, so repeated windows in one process never
+    overwrite each other.
+    """
+
+    def __init__(self, rank: int = 0) -> None:
+        self.range: ProfileRange = parse_profile_range()
+        self.rank = rank
+        self._active = False
+        self._torch_profiler = None
+        self._trace_path: Optional[str] = None
+        self._window: int = 0
+        # Single-shot guards: fire once around the first non-warmup request,
+        # then disarm.
+        self._predenoise_pending: bool = self.range == "predenoise"
+        self._postdenoise_pending: bool = self.range == "postdenoise"
+        self._setup_torch_profiler()
+
+    @property
+    def enabled(self) -> bool:
+        """Whether any profiling window can open."""
+        return self.range is not None
+
+    @property
+    def active(self) -> bool:
+        """Whether a window is currently open."""
+        return self._active
+
+    # ------------------------------------------------------------------
+    # Window boundaries
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def request_scope(self) -> Iterator[None]:
+        """Bracket one request with its request-level profiling windows."""
+        if self.range == "all":
+            self.open_window()
+        elif self._predenoise_pending:
+            self._predenoise_pending = False
+            self.open_window()
+        try:
+            yield
+        finally:
+            # Ends all/postdenoise windows, and safely closes a numeric range
+            # if inference raises before the range's own stop index.
+            self.close_window()
+
+    def close_predenoise_window(self) -> None:
+        """Close the pre-denoise window at a denoise loop's first step."""
+        if self.range == "predenoise":
+            self.close_window()
+
+    def open_postdenoise_window(self) -> None:
+        """Open the single-shot post-denoise window; request_scope closes it."""
+        if self._postdenoise_pending:
+            self.open_window()
+            self._postdenoise_pending = False
+
+    def open_step_window(self, step_index: int) -> None:
+        """Open a window when this denoise step begins a configured range."""
+        if isinstance(self.range, tuple) and step_index in self.range[0]:
+            self.open_window()
+
+    def close_step_window(self, step_index: int) -> None:
+        """Close the window when this denoise step ends a configured range."""
+        if isinstance(self.range, tuple) and step_index in self.range[1]:
+            self.close_window()
+
+    # ------------------------------------------------------------------
+    # Window primitives
+    # ------------------------------------------------------------------
+
+    def open_window(self) -> None:
+        """Open a capture window if configured and not already open."""
+        if not self.enabled or self._active:
+            return
+        if self._trace_path is not None and self._torch_profiler is None:
+            self._create_torch_profiler()
+        cudart = torch.cuda.cudart()
+        try:
+            cudart.cudaProfilerStart()
+            if self._torch_profiler is not None:
+                self._torch_profiler.start()
+        except RuntimeError:
+            cudart.cudaProfilerStop()
+            self._torch_profiler = None
+            raise
+        self._active = True
+        if self.rank == 0:
+            logger.info("CUDA profiler started")
+
+    def close_window(self) -> None:
+        """Close the open capture window, exporting its trace."""
+        if not self._active:
+            return
+        # End the window on an idle device. A collector may stop collecting —
+        # or end the process, as nsys --capture-range-end=stop-shutdown does —
+        # the moment the range closes, so no async work may still be in
+        # flight. Mirrors PyExecutor's profile_step().
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        torch_profiler = self._torch_profiler
+        try:
+            if torch_profiler is not None:
+                torch_profiler.stop()
+                trace_path = self._torch_profile_output_path()
+                torch_profiler.export_chrome_trace(trace_path)
+                self._window += 1
+                if self.rank == 0:
+                    logger.info(f"PyTorch profiler trace saved to {trace_path}")
+        finally:
+            self._torch_profiler = None
+            try:
+                torch.cuda.cudart().cudaProfilerStop()
+            finally:
+                self._active = False
+        if self.rank == 0:
+            logger.info("CUDA profiler stopped")
+
+    # ------------------------------------------------------------------
+    # torch.profiler plumbing
+    # ------------------------------------------------------------------
+
+    def _setup_torch_profiler(self) -> None:
+        """Configure PyTorch tracing for the VisualGen profiler range."""
+        torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME)
+        if not torch_trace_path:
+            return
+        if self.range is None:
+            logger.warning(
+                f"{PROFILE_START_STOP_ENV_VAR_NAME} environment variable "
+                "needs to be set to enable the torch trace. Example to profile "
+                f"denoise steps 0-4: export {PROFILE_START_STOP_ENV_VAR_NAME}=0-4"
+            )
+            return
+
+        # Append the rank so each rank writes its own file. Without this,
+        # multi-rank runs have every rank exporting to the same path
+        # concurrently, producing output that fails to parse.
+        trace_base, trace_ext = os.path.splitext(torch_trace_path)
+        self._trace_path = f"{trace_base}-rank-{self.rank}{trace_ext}"
+        self._create_torch_profiler()
+
+    def _create_torch_profiler(self) -> None:
+        """Create a fresh PyTorch profiler for the next capture window."""
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        elif (
+            hasattr(torch, "xpu")
+            and torch.xpu.is_available()
+            and hasattr(torch.profiler.ProfilerActivity, "XPU")
+        ):
+            activities.append(torch.profiler.ProfilerActivity.XPU)
+        self._torch_profiler = torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+        )
+
+    def _torch_profile_output_path(self) -> str:
+        """Return a non-overwriting path for the current capture window."""
+        if self._trace_path is None:
+            raise RuntimeError("PyTorch profiler trace path is not configured")
+        if self._window == 0:
+            return self._trace_path
+        trace_base, trace_ext = os.path.splitext(self._trace_path)
+        return f"{trace_base}-window-{self._window}{trace_ext}"

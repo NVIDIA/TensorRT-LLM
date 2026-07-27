@@ -21,9 +21,7 @@ from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
-
-PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_VISUAL_GEN_START_STOP"
-PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
+from .profiler import VisualGenProfiler
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -39,66 +37,6 @@ class ExtraParamSchema(StrictBaseModel):
     range: Optional[tuple] = Field(
         default=None, description="Optional (min, max) range for numeric params."
     )
-
-
-def _parse_profile_range():
-    """Parse ``TLLM_PROFILE_VISUAL_GEN_START_STOP`` for CUDA profiler scoping.
-
-    Visual-gen-specific env var (separate from the LLM path's
-    ``TLLM_PROFILE_START_STOP``). Use with ``nsys profile -c cudaProfilerApi ...``.
-
-    Supported formats:
-
-    * ``A-B``            – profile denoise steps A through B
-    * ``A-B,C-D,...``    – multiple ranges; profiler toggles on/off per range
-    * ``A,B,...``        – individual steps treated as single-step ranges
-    * ``predenoise``     – profile from request start through denoise-loop
-                           setup, including text encoding and latent
-                           preparation. Single-shot.
-    * ``postdenoise``    – profile from the end of the last denoise step to
-                           request completion, covering VAE decode. Single-shot.
-    * ``all``            – profile the full request, from text encoding through
-                           VAE decode; skip warmup
-    * (unset)            – no profiler API calls; plain ``nsys profile`` captures everything
-
-    Returns ``None`` when unset, one of ``"all"`` / ``"predenoise"`` /
-    ``"postdenoise"`` for keyword modes, or ``(frozenset(starts), frozenset(stops))``
-    for numeric ranges.
-
-    .. note::
-       Step indices are **per-request**: each denoise loop resets the
-       loop counter to 0, so e.g. ``0-4`` profiles steps 0-4 of *every*
-       request. This differs from the LLM path's ``TLLM_PROFILE_START_STOP``
-       which indexes a global executor iteration counter (one forward pass
-       services all in-flight requests, so there is no "per request" index).
-
-       ``predenoise`` and ``postdenoise`` are **single-shot per process**:
-       they fire once around the first user request after warmup and do not
-       re-arm on subsequent requests. Pair either mode with
-       ``nsys --capture-range-end=stop`` (keeps the app running cleanly after
-       collection ends). ``all`` and numeric ranges re-arm for each request;
-       use ``--capture-range-end=repeat:N`` to collect multiple requests.
-    """
-    val = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME)
-    if not val:
-        return None
-    val = val.strip()
-    if val.lower() in ("all", "predenoise", "postdenoise"):
-        return val.lower()
-    # Parse comma-separated ranges: "A-B,C-D,..." or single steps "A,B,..."
-    # Same format as the LLM path (PyExecutor._load_iteration_indexes).
-    starts, stops = [], []
-    for span in val.split(","):
-        span = span.strip()
-        if "-" in span:
-            start, stop = span.split("-", 1)
-            starts.append(int(start))
-            stops.append(int(stop))
-        else:
-            v = int(span)
-            starts.append(v)
-            stops.append(v)
-    return frozenset(starts), frozenset(stops)
 
 
 if TYPE_CHECKING:
@@ -142,17 +80,8 @@ class BasePipeline(nn.Module):
         self.scheduler: Optional[Any] = None
         self._is_warmup: bool = False
 
-        # CUDA profiler scoping (TLLM_PROFILE_VISUAL_GEN_START_STOP env var)
-        self._profile_range = _parse_profile_range()
-        self._profiling_active: bool = False
-        self._torch_profiler = None
-        self._torch_profile_trace_path: Optional[str] = None
-        self._torch_profile_window: int = 0
-        self._setup_torch_profiler()
-        # Single-shot guards for predenoise/postdenoise modes — fire once
-        # around the first non-warmup request, then disarm.
-        self._predenoise_pending: bool = self._profile_range == "predenoise"
-        self._postdenoise_pending: bool = self._profile_range == "postdenoise"
+        # Profiler window scoping (TLLM_PROFILE_VISUAL_GEN_START_STOP env var)
+        self._profiler = VisualGenProfiler(rank=self.rank)
 
         # Initialize transformer
         self._init_transformer()
@@ -162,131 +91,40 @@ class BasePipeline(nn.Module):
         # graphed transformer.forward if should_compute == True.
         self._setup_cuda_graphs()
 
-    def _setup_torch_profiler(self) -> None:
-        """Configure PyTorch tracing for the VisualGen profiler range."""
-        torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME)
-        if not torch_trace_path:
-            return
-        if self._profile_range is None:
-            logger.warning(
-                f"{PROFILE_START_STOP_ENV_VAR_NAME} environment variable "
-                "needs to be set to enable the torch trace. Example to profile "
-                f"denoise steps 0-4: export {PROFILE_START_STOP_ENV_VAR_NAME}=0-4"
-            )
-            return
-
-        trace_base, trace_ext = os.path.splitext(torch_trace_path)
-        self._torch_profile_trace_path = f"{trace_base}-rank-{self.rank}{trace_ext}"
-        self._create_torch_profiler()
-
-    def _create_torch_profiler(self) -> None:
-        """Create a fresh PyTorch profiler for the next capture window."""
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-        elif (
-            hasattr(torch, "xpu")
-            and torch.xpu.is_available()
-            and hasattr(torch.profiler.ProfilerActivity, "XPU")
-        ):
-            activities.append(torch.profiler.ProfilerActivity.XPU)
-        self._torch_profiler = torch.profiler.profile(
-            activities=activities,
-            record_shapes=True,
-        )
-
-    def _torch_profile_output_path(self) -> str:
-        """Return a non-overwriting path for the current capture window."""
-        if self._torch_profile_trace_path is None:
-            raise RuntimeError("PyTorch profiler trace path is not configured")
-        if self._torch_profile_window == 0:
-            return self._torch_profile_trace_path
-        trace_base, trace_ext = os.path.splitext(self._torch_profile_trace_path)
-        return f"{trace_base}-window-{self._torch_profile_window}{trace_ext}"
-
-    def _cuda_profiler_start(self) -> None:
-        """Start CUDA profiler if configured and not already active."""
-        if self._profile_range is not None and not self._profiling_active:
-            if self._torch_profile_trace_path is not None and self._torch_profiler is None:
-                self._create_torch_profiler()
-            cudart = torch.cuda.cudart()
-            try:
-                cudart.cudaProfilerStart()
-                if self._torch_profiler is not None:
-                    self._torch_profiler.start()
-            except RuntimeError:
-                cudart.cudaProfilerStop()
-                self._torch_profiler = None
-                raise
-            self._profiling_active = True
-            if self.rank == 0:
-                logger.info("CUDA profiler started")
-
-    def _cuda_profiler_stop(self) -> None:
-        """Stop CUDA profiler if currently active."""
-        if self._profiling_active:
-            torch_profiler = self._torch_profiler
-            try:
-                if torch_profiler is not None:
-                    torch_profiler.stop()
-                    trace_path = self._torch_profile_output_path()
-                    torch_profiler.export_chrome_trace(trace_path)
-                    self._torch_profile_window += 1
-                    if self.rank == 0:
-                        logger.info(f"PyTorch profiler trace saved to {trace_path}")
-            finally:
-                self._torch_profiler = None
-                try:
-                    torch.cuda.cudart().cudaProfilerStop()
-                finally:
-                    self._profiling_active = False
-            if self.rank == 0:
-                logger.info("CUDA profiler stopped")
-
     def run_inference(self, req: Any) -> Any:
         """Run model-specific inference within shared request profiler boundaries."""
-        profile_request = not self._is_warmup
-        try:
-            if profile_request and self._profile_range == "all":
-                self._cuda_profiler_start()
-            elif profile_request and self._predenoise_pending:
-                self._predenoise_pending = False
-                self._cuda_profiler_start()
+        if self._is_warmup:
             return self.infer(req)
-        finally:
-            if profile_request:
-                # Ends all/postdenoise windows and safely closes a numeric
-                # range if model inference raises before its normal stop.
-                self._cuda_profiler_stop()
+        with self._profiler.request_scope():
+            return self.infer(req)
 
-    def _profile_denoise_start(self) -> None:
-        """Close the pre-denoise window at the denoise-loop boundary."""
-        if self._profile_range == "predenoise" and not self._is_warmup:
-            self._cuda_profiler_stop()
+    # ------------------------------------------------------------------
+    # Denoise-loop profiling hooks.
+    #
+    # ``BasePipeline.denoise()`` calls these, and so must any pipeline that
+    # writes its own denoise loop (Qwen-Image, LTX-2 stage 2) — otherwise
+    # that loop is silently absent from every trace.
+    # ------------------------------------------------------------------
 
-    def _start_step_profile(self, step_index: int) -> None:
-        """Start profiling when the denoise step begins a configured range."""
-        if (
-            isinstance(self._profile_range, tuple)
-            and step_index in self._profile_range[0]
-            and not self._is_warmup
-        ):
-            self._cuda_profiler_start()
+    def _close_predenoise_window(self) -> None:
+        """Call just before a denoise loop's first step."""
+        if not self._is_warmup:
+            self._profiler.close_predenoise_window()
 
-    def _stop_step_profile(self, step_index: int) -> None:
-        """Stop profiling when the denoise step ends a configured range."""
-        if (
-            isinstance(self._profile_range, tuple)
-            and step_index in self._profile_range[1]
-            and not self._is_warmup
-        ):
-            self._cuda_profiler_stop()
+    def _open_postdenoise_window(self) -> None:
+        """Call just after a denoise loop's last step."""
+        if not self._is_warmup:
+            self._profiler.open_postdenoise_window()
 
-    def _profile_denoise_end(self) -> None:
-        """Start the single-shot post-denoise profiling window."""
-        if self._postdenoise_pending and not self._is_warmup:
-            self._cuda_profiler_start()
-            self._postdenoise_pending = False
+    def _open_step_window(self, step_index: int) -> None:
+        """Call at the top of each denoise step."""
+        if not self._is_warmup:
+            self._profiler.open_step_window(step_index)
+
+    def _close_step_window(self, step_index: int) -> None:
+        """Call at the bottom of each denoise step."""
+        if not self._is_warmup:
+            self._profiler.close_step_window(step_index)
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay.
@@ -1208,10 +1046,10 @@ class BasePipeline(nn.Module):
 
         # Close the request-level pre-denoise window before the first step.
         # Numeric ranges start/stop at specific indices.
-        self._profile_denoise_start()
+        self._close_predenoise_window()
 
         for i, t in enumerate(timesteps):
-            self._start_step_profile(i)
+            self._open_step_window(i)
 
             step_start = time.time()
 
@@ -1289,11 +1127,11 @@ class BasePipeline(nn.Module):
                 )
 
             # Step-level profiler stop
-            self._stop_step_profile(i)
+            self._close_step_window(i)
 
         # ``postdenoise`` mode: arm the profiler now so the VAE decode and
         # remaining request work are captured. run_inference() closes it.
-        self._profile_denoise_end()
+        self._open_postdenoise_window()
 
         if self.rank == 0:
             total_time = time.time() - start_time
@@ -1327,7 +1165,7 @@ class BasePipeline(nn.Module):
 
     def cleanup(self):
         """Call before dist.destroy_process_group()."""
-        self._cuda_profiler_stop()
+        self._profiler.close_window()
 
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
