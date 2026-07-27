@@ -797,6 +797,158 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         assert result.calls[0].name == "get_weather"
         assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
 
+    # ------------------------------------------------------------------
+    # NVBug 6240584: bare-JSON fallback in detect_and_parse
+    #
+    # Some Qwen3 chat templates (notably Qwen3.6 FP8 with
+    # `--reasoning_parser qwen3_5 --tool_parser qwen3`) emit tool calls
+    # as bare JSON, without a `<tool_call>...</tool_call>` wrapper, once
+    # the reasoning parser strips the `</think>` block. The parser must
+    # recover those before dropping the text into `normal_text`.
+    # ------------------------------------------------------------------
+
+    def test_detect_and_parse_bare_json_dict(self, sample_tools, parser):
+        """Bare JSON dict without <tool_call> wrapper is parsed as a tool call."""
+        text = '{"name":"get_weather","arguments":{"location":"Paris"}}'
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == ""
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Paris"}
+
+    def test_detect_and_parse_bare_json_list(self, sample_tools, parser):
+        """Bare JSON list of tool calls without wrapper is parsed."""
+        text = '[{"name":"get_weather","arguments":{"location":"Paris"}}]'
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == ""
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Paris"}
+
+    def test_detect_and_parse_bare_json_parameters_key(self, sample_tools,
+                                                       parser):
+        """Bare JSON with `parameters` (instead of `arguments`) is still parsed."""
+        text = '{"name":"get_weather","parameters":{"location":"Paris"}}'
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Paris"}
+
+    def test_detect_and_parse_non_json_text_falls_through(
+            self, sample_tools, parser):
+        """Plain non-JSON text passes through as normal_text with no calls."""
+        text = "Hello world"
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == "Hello world"
+        assert result.calls == []
+
+    def test_detect_and_parse_bare_json_scalar_falls_through(
+            self, sample_tools, parser):
+        """A JSON scalar (e.g. `"42"`) must fall through cleanly, not crash.
+
+        This exercises the explicit `isinstance(parsed, (dict, list))` guard —
+        `parse_base_json` would raise `AttributeError` on a bare int, so the
+        guard prevents relying on exception catching for scalar JSON.
+        """
+        text = "42"
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.calls == []
+        # No crash is the important part.
+
+    def test_detect_and_parse_malformed_bare_json_falls_through(
+            self, sample_tools, parser):
+        """Malformed JSON without <tool_call> wrapper falls through cleanly."""
+        text = '{"name": "get_weather", "arguments": MALFORMED}'
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.calls == []
+        assert result.normal_text == text
+
+    # ------------------------------------------------------------------
+    # NVBug 6240584: bare-JSON fallback in parse_streaming_increment
+    #
+    # The streaming path must also recover bare-JSON tool calls when the
+    # `<tool_call>` wrapper never appears. Without this, streaming clients
+    # receive the JSON as `delta.content` with `finish_reason="stop"`.
+    # ------------------------------------------------------------------
+
+    def test_streaming_bare_json_one_chunk(self, sample_tools, parser):
+        """A complete bare-JSON tool call arriving in a single chunk emits calls."""
+        result = parser.parse_streaming_increment(
+            '{"name":"get_weather","arguments":{"city":"Paris"}}', sample_tools)
+
+        names = [c.name for c in result.calls if c.name]
+        assert "get_weather" in names
+        params = "".join(c.parameters for c in result.calls if c.parameters)
+        assert "Paris" in params
+        assert result.normal_text == ""
+
+    def test_streaming_bare_json_split_across_chunks(self, sample_tools,
+                                                     parser):
+        """Bare-JSON tool call split across multiple chunks parses on completion."""
+        r1 = parser.parse_streaming_increment('{"name":"get_', sample_tools)
+        r2 = parser.parse_streaming_increment('weather","arguments":',
+                                              sample_tools)
+        r3 = parser.parse_streaming_increment('{"city":"Paris"}}', sample_tools)
+
+        all_calls = list(r1.calls) + list(r2.calls) + list(r3.calls)
+        names = [c.name for c in all_calls if c.name]
+        assert "get_weather" in names
+        params = "".join(c.parameters for c in all_calls if c.parameters)
+        assert "Paris" in params
+
+    def test_streaming_bare_json_does_not_leak_content(self, sample_tools,
+                                                       parser):
+        """After a bare-JSON tool call is emitted, trailing text is not leaked.
+
+        This must be the case even for subsequent empty/whitespace chunks:
+        leaking any normal_text would flip `finish_reason` back to `stop`.
+        """
+        r1 = parser.parse_streaming_increment(
+            '{"name":"get_weather","arguments":{"city":"Paris"}}', sample_tools)
+        # Any subsequent chunks must not emit normal_text either.
+        r2 = parser.parse_streaming_increment("", sample_tools)
+
+        assert r1.normal_text == ""
+        assert r2.normal_text == ""
+
+    def test_streaming_non_json_text_flushed_as_normal(self, sample_tools,
+                                                       parser):
+        """Non-JSON text without a wrapper is flushed to normal_text."""
+        result = parser.parse_streaming_increment("Hello world", sample_tools)
+
+        assert result.normal_text == "Hello world"
+        assert result.calls == []
+
+    def test_streaming_wrapped_form_unregressed(self, sample_tools, parser):
+        """The pre-existing wrapped-form streaming path continues to work."""
+        # Send bot token.
+        parser.parse_streaming_increment("<tool_call>\n", sample_tools)
+
+        # Partial JSON with name -> emits name with empty params.
+        r_name = parser.parse_streaming_increment('{"name":"get_weather"',
+                                                  sample_tools)
+        assert len(r_name.calls) == 1
+        assert r_name.calls[0].name == "get_weather"
+        assert r_name.calls[0].parameters == ""
+
+        # Complete the JSON and the wrapper.
+        r_args = parser.parse_streaming_increment(
+            ',"arguments":{"location":"SF"}}\n</tool_call>', sample_tools)
+        assert len(r_args.calls) == 1
+        assert json.loads(r_args.calls[0].parameters) == {"location": "SF"}
+
 
 class TestQwen3CoderToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3CoderToolParser class."""
@@ -2690,6 +2842,62 @@ class TestPoolsideV1ToolParserFactory:
 
 class TestToolParserIntegration:
     """Integration tests for tool parsers."""
+
+    def test_qwen3_5_reasoning_plus_qwen3_tool_parser_bare_json_pipeline(
+            self, sample_tools):
+        """NVBug 6240584: end-to-end reasoning + tool parser pipeline.
+
+        Reproduces the exact scenario from the bug report: the model emits
+        `<think>...</think>` followed by a bare JSON tool call (no
+        `<tool_call>` wrapper). The `qwen3_5` reasoning parser strips the
+        thinking block, then the `qwen3` tool parser must recover the tool
+        call so `args.has_tool_call[0]` is True and downstream logic sets
+        `finish_reason="tool_calls"` (see chat_response_post_processor).
+        """
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+        from tensorrt_llm.serve.postprocess_handlers import (
+            ChatPostprocArgs, apply_reasoning_parser, apply_tool_parser)
+
+        # Bug-report input: reasoning block + bare JSON tool call.
+        text = ('<think>Reasoning here.</think>\n'
+                '{"name":"get_weather","arguments":{"city":"Paris"}}')
+
+        # Build a minimal request so we can construct ChatPostprocArgs.
+        req = ChatCompletionRequest(
+            model="Qwen/Qwen3.6-27B-FP8",
+            messages=[{
+                "role": "user",
+                "content": "What is the weather in Paris?"
+            }],
+            tools=sample_tools,
+        )
+        args = ChatPostprocArgs.from_request(req)
+        args.reasoning_parser = "qwen3_5"
+        args.tool_parser = "qwen3"
+
+        # Non-streaming path.
+        content, reasoning_content = apply_reasoning_parser(args,
+                                                            output_index=0,
+                                                            text=text,
+                                                            streaming=False)
+        assert reasoning_content == "Reasoning here."
+        # The reasoning parser strips `<think>...</think>` — the remaining
+        # content is the bare JSON, possibly with a leading newline.
+        assert '"name":"get_weather"' in content
+
+        normal_text, calls = apply_tool_parser(args,
+                                               output_index=0,
+                                               text=content,
+                                               streaming=False)
+
+        assert len(calls) == 1
+        assert calls[0].name == "get_weather"
+        assert json.loads(calls[0].parameters) == {"city": "Paris"}
+        # Downstream (chat_response_post_processor) checks this flag to flip
+        # finish_reason from "stop" to "tool_calls".
+        assert args.has_tool_call.get(0) is True
+        # And no bare JSON leaks into the visible content.
+        assert normal_text == ""
 
     def test_end_to_end_single_tool(self, sample_tools):
         """Test end-to-end parsing of a single tool call."""
