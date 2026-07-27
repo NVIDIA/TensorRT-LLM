@@ -167,6 +167,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto const& windowSizes = blockRange.getWindowSizes();
     TLLM_CHECK_WITH_INFO(
         static_cast<int>(windowSizes.size()) == numPools, "window sizes should be the same as numPools");
+    auto transferLease = prepareBlockRangeForTransfer(*mCacheManager, blockRange, windowSizes, llmRequest.mRequestId);
 
     for (auto transferIndexerKCache : transferringIndexerKCache)
     {

@@ -38,6 +38,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <map>
 #include <optional>
@@ -1276,16 +1277,27 @@ void WindowBlockManager::releaseSubtree(BlockPtr const& block)
 
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
     std::optional<std::chrono::milliseconds> durationMs, executor::KvCacheTransferMode mode,
-    std::string const& directory, bool wantPlaceholder)
+    std::string const& directory, bool wantPlaceholder, bool countAllocationStats)
+{
+    return getFreeBlock(
+        sequence.getRequestId(), priority, durationMs, mode, directory, wantPlaceholder, countAllocationStats);
+}
+
+BlockPtr WindowBlockManager::getFreeBlock(LlmRequest::RequestIdType requestId, executor::RetentionPriority priority,
+    std::optional<std::chrono::milliseconds> durationMs, executor::KvCacheTransferMode mode,
+    std::string const& directory, bool wantPlaceholder, bool countAllocationStats)
 {
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     // eviction policy get free primary block
     auto [block, canOffload] = mEvictionPolicy->getFreeBlock(kPrimaryLevel, wantPlaceholder);
-    if (block->getUniqueTokens().empty())
+    if (countAllocationStats)
     {
-        ++mAllocNewBlocks;
+        if (block->getUniqueTokens().empty())
+        {
+            ++mAllocNewBlocks;
+        }
+        ++mAllocTotalBlocks;
     }
-    ++mAllocTotalBlocks;
     // Offloading is an option only when these conditions are met:
     // 1. Block contains state (evidenced by presence of tokens)
     // 2. Eviction policy indicated block can be offloaded
@@ -1344,7 +1356,7 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     // Claim the block in primary block queue
     mEvictionPolicy->claimBlock(block, priority, durationMs);
     TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d is now acquired by sequence %d", mLogPrefix.c_str(),
-        block->getBlockId(), sequence.getRequestId());
+        block->getBlockId(), requestId);
 
     return block;
 }
@@ -1420,6 +1432,70 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
         mEvictionPolicy->releaseBlock(block); // append block to offload queue
                                               // offloadBlock is now in primary memory pool
     }
+}
+
+std::pair<std::vector<KVCacheBlock::IdType>, bool> WindowBlockManager::pinAndOnboardBlocksById(
+    std::vector<KVCacheBlock::IdType> const& blockIds, LlmRequest::RequestIdType requestId,
+    executor::KvCacheTransferMode mode, std::string const& directory)
+{
+    std::vector<KVCacheBlock::IdType> pinnedBlockIds;
+    pinnedBlockIds.reserve(blockIds.size());
+    bool issuedOnboardCopies{false};
+
+    if (blockIds.empty())
+    {
+        return {std::move(pinnedBlockIds), issuedOnboardCopies};
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+    try
+    {
+        for (auto const blockId : blockIds)
+        {
+            TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
+                "Block id %d is out of range", blockId);
+            auto block = mAllBlocksById[blockId];
+            TLLM_CHECK_WITH_INFO(block != nullptr && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId,
+                "Block id %d is not a valid cache block", blockId);
+
+            if (!block->hasRefs())
+            {
+                mEvictionPolicy->claimBlock(block, block->getPriority(), block->getDurationMs());
+            }
+            block->incRefCount();
+            pinnedBlockIds.push_back(blockId);
+
+            if (!block->isPlaceholder() && !block->isPrimary())
+            {
+                auto scratchPrimaryBlock = getFreeBlock(requestId, block->getPriority(), block->getDurationMs(), mode,
+                    directory, /*wantPlaceholder=*/false, /*countAllocationStats=*/false);
+                mTransferManager->onboard(block, scratchPrimaryBlock, mPools, 0, mode, directory);
+                block->swapMemoryPoolBlockOffset(scratchPrimaryBlock);
+                issuedOnboardCopies = true;
+                // Transfer onboarding can consume primary capacity after startScheduling() snapshots
+                // availability. Keep the scheduler-side view conservative for the current iteration.
+                if (mSchedulingNumFreeBlocks > 0)
+                {
+                    --mSchedulingNumFreeBlocks;
+                }
+
+                if (mEventManager && blockInRadixTree(block))
+                {
+                    mEventManager->enqueueUpdatedEvent(
+                        tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
+                        mWindowSize);
+                }
+                mEvictionPolicy->releaseBlock(scratchPrimaryBlock);
+            }
+        }
+    }
+    catch (...)
+    {
+        unpinBlocksByIdNoLock(pinnedBlockIds);
+        throw;
+    }
+
+    return {std::move(pinnedBlockIds), issuedOnboardCopies};
 }
 
 void BlockManager::offloadBlock(
@@ -2236,6 +2312,19 @@ void WindowBlockManager::syncTransferManagerWithBufferManager()
     mTransferManager->syncWithBufferManager();
 }
 
+void BlockManager::syncTransferManagerToBufferManager()
+{
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.syncTransferManagerToBufferManager();
+    }
+}
+
+void WindowBlockManager::syncTransferManagerToBufferManager()
+{
+    mTransferManager->syncTransfers();
+}
+
 void BlockManager::refreshBlocks()
 {
     for (auto& [_, manager] : mWindowBlockManagers)
@@ -3049,6 +3138,118 @@ void WindowBlockManager::unpinBlock(BlockPtr const& block)
     }
 }
 
+void BlockManager::unpinBlocksById(
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow)
+{
+    for (auto const& [windowSize, blockIds] : blockIdsPerWindow)
+    {
+        mWindowBlockManagers.at(windowSize).unpinBlocksById(blockIds);
+    }
+}
+
+KvCacheTransferLease BlockManager::prepareBlocksForTransfer(
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow,
+    LlmRequest::RequestIdType requestId, executor::KvCacheTransferMode mode, std::string const& directory)
+{
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> pinnedBlockIdsPerWindow;
+    bool issuedOnboardCopies{false};
+
+    try
+    {
+        for (auto const& [windowSize, blockIds] : blockIdsPerWindow)
+        {
+            auto [pinnedBlockIds, windowIssuedOnboardCopies]
+                = mWindowBlockManagers.at(windowSize).pinAndOnboardBlocksById(blockIds, requestId, mode, directory);
+            if (!pinnedBlockIds.empty())
+            {
+                pinnedBlockIdsPerWindow.emplace(windowSize, std::move(pinnedBlockIds));
+            }
+            issuedOnboardCopies = issuedOnboardCopies || windowIssuedOnboardCopies;
+        }
+    }
+    catch (...)
+    {
+        unpinBlocksById(pinnedBlockIdsPerWindow);
+        throw;
+    }
+
+    return KvCacheTransferLease(*this, std::move(pinnedBlockIdsPerWindow), issuedOnboardCopies);
+}
+
+KvCacheTransferLease::KvCacheTransferLease(BlockManager& blockManager,
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> blockIdsPerWindow, bool issuedOnboardCopies)
+    : mBlockManager(&blockManager)
+    , mBlockIdsPerWindow(std::move(blockIdsPerWindow))
+    , mIssuedOnboardCopies(issuedOnboardCopies)
+{
+}
+
+KvCacheTransferLease::~KvCacheTransferLease()
+{
+    try
+    {
+        release();
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_ERROR("Failed to release KV cache transfer lease: %s", e.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_ERROR("Failed to release KV cache transfer lease: unknown error");
+    }
+}
+
+KvCacheTransferLease::KvCacheTransferLease(KvCacheTransferLease&& other) noexcept
+    : mBlockManager(std::exchange(other.mBlockManager, nullptr))
+    , mBlockIdsPerWindow(std::move(other.mBlockIdsPerWindow))
+    , mIssuedOnboardCopies(std::exchange(other.mIssuedOnboardCopies, false))
+{
+}
+
+KvCacheTransferLease& KvCacheTransferLease::operator=(KvCacheTransferLease&& other) noexcept
+{
+    if (this != &other)
+    {
+        try
+        {
+            release();
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_ERROR("Failed to release KV cache transfer lease during move assignment: %s", e.what());
+        }
+        catch (...)
+        {
+            TLLM_LOG_ERROR("Failed to release KV cache transfer lease during move assignment: unknown error");
+        }
+
+        mBlockManager = std::exchange(other.mBlockManager, nullptr);
+        mBlockIdsPerWindow = std::move(other.mBlockIdsPerWindow);
+        mIssuedOnboardCopies = std::exchange(other.mIssuedOnboardCopies, false);
+    }
+    return *this;
+}
+
+void KvCacheTransferLease::syncReadyForFormat()
+{
+    if (mBlockManager != nullptr && mIssuedOnboardCopies)
+    {
+        mBlockManager->syncTransferManagerToBufferManager();
+    }
+}
+
+void KvCacheTransferLease::release()
+{
+    if (mBlockManager != nullptr && !mBlockIdsPerWindow.empty())
+    {
+        mBlockManager->unpinBlocksById(mBlockIdsPerWindow);
+        mBlockIdsPerWindow.clear();
+    }
+    mBlockManager = nullptr;
+    mIssuedOnboardCopies = false;
+}
+
 void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
 {
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
@@ -3062,12 +3263,17 @@ void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
 
 void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
-    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     if (blockIds.empty())
     {
         return;
     }
 
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+    unpinBlocksByIdNoLock(blockIds);
+}
+
+void WindowBlockManager::unpinBlocksByIdNoLock(std::vector<KVCacheBlock::IdType> const& blockIds)
+{
     for (auto const& blockId : blockIds)
     {
         TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
@@ -3075,7 +3281,11 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
         auto block = mAllBlocksById[blockId];
         if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
         {
-            unpinBlock(block);
+            block->decRefCount();
+            if (!block->hasRefs())
+            {
+                mEvictionPolicy->releaseBlock(block);
+            }
         }
     }
 }
@@ -4046,6 +4256,13 @@ void KVCacheManager::pinBlocks(RequestIdType requestId)
 void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
     mBlockManager.unpinBlocksById(blockIds);
+}
+
+KvCacheTransferLease KVCacheManager::prepareBlocksForTransfer(
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow,
+    LlmRequest::RequestIdType requestId, executor::KvCacheTransferMode mode, std::string const& directory)
+{
+    return mBlockManager.prepareBlocksForTransfer(blockIdsPerWindow, requestId, mode, directory);
 }
 
 tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType blockId, SizeType32 windowSize) const

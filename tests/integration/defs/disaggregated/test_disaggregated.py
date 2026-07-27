@@ -24,7 +24,7 @@ import tempfile
 import time
 from collections import namedtuple
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Literal, Optional, TypeAlias
 
 import aiohttp
 import numpy as np
@@ -35,6 +35,7 @@ from defs.common import (parse_gsm8k_output, resolve_llm_model_path,
                          wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
+from defs.local_venv import PythonVenvRunnerImpl
 from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
@@ -44,6 +45,9 @@ from test_common.perf_metrics_utils import (get_timing_metrics,
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
+
+WorkerRole: TypeAlias = Literal["context_servers", "generation_servers"]
+KVCacheOffloadSummary: TypeAlias = dict[str, int]
 
 
 @dataclass
@@ -337,6 +341,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm_mtp.yaml",
         "gpt_oss_120b_trtllm_stress":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
+        "gpt_oss_120b_host_offload":
+        f"{test_configs_root}/disagg_config_ctxtp1_gentp1_gptoss_host_offload.yaml",
         "gpt_oss_120b_eagle_triton_stress":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_eagle_triton.yaml",
         "gpt_oss_120b_eagle_trtllm_stress":
@@ -905,22 +911,188 @@ def setup_disagg_cluster(
     return config, ctx_workers, gen_workers, disagg_server, server_port, work_dir
 
 
-def run_disaggregated_test(example_dir,
-                           test_desc,
-                           num_iters=5,
-                           env=None,
-                           prompt_file="prompts.json",
-                           extra_endpoints_test=None,
-                           model_path=None,
-                           cwd=None,
-                           disagg_schedule_style=None,
-                           post_client_test=None,
-                           assert_gen_log_contains=None):
+def _assert_worker_logs_contain(workers: list[ProcessWrapper], marker: str,
+                                role: str) -> None:
+    logs: list[str] = []
+    for worker in workers:
+        if worker.log_path and os.path.exists(worker.log_path):
+            with open(worker.log_path, 'r', errors='replace') as f:
+                logs.append(f.read())
+    assert any(marker in log for log in logs), (
+        f"expected marker {marker!r} in a {role} worker log, "
+        f"but none of {len(logs)} log(s) contained it")
+
+
+def _worker_urls_from_cluster_info(server_url: str,
+                                   role: WorkerRole) -> list[str]:
+    import requests as http_requests
+
+    response = http_requests.get(f"{server_url}/cluster_info", timeout=10)
+    assert response.status_code == 200, (
+        f"cluster_info fetch failed with {response.status_code}: "
+        f"{response.text}")
+    info = response.json()
+    current_workers = info.get("current_workers") or {}
+    assert isinstance(
+        current_workers,
+        dict), (f"cluster_info current_workers is not a dict: {info}")
+    workers = current_workers.get(role) or []
+    assert isinstance(workers,
+                      list), (f"cluster_info {role} is not a list: {info}")
+
+    worker_urls: list[str] = []
+    for worker in workers:
+        assert isinstance(
+            worker,
+            dict), (f"cluster_info {role} entry is not a dict: {worker}")
+        host = worker.get("host")
+        port = worker.get("port")
+        assert isinstance(
+            host,
+            str), (f"cluster_info {role} worker host is not a str: {worker}")
+        assert isinstance(port, int) and port > 0, (
+            f"cluster_info {role} worker port is not positive: {worker}")
+        if host in {"0.0.0.0", "::", ""}:  # nosec B104
+            host = "localhost"
+        worker_urls.append(f"http://{host}:{port}")
+
+    assert worker_urls, f"cluster_info contained no {role}: {info}"
+    return worker_urls
+
+
+def _iteration_kv_stat_groups(
+        iteration_stats: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("kvCacheIterationStatsByPoolGroup", "kvCacheIterationStats"):
+        grouped_stats = iteration_stats.get(key)
+        if not isinstance(grouped_stats, dict):
+            continue
+        stat_groups = [
+            stat_group for stat_group in grouped_stats.values()
+            if isinstance(stat_group, dict)
+        ]
+        if stat_groups:
+            return stat_groups
+    return []
+
+
+def _get_int_stat(stat_group: dict[str, Any], key: str) -> int:
+    value = stat_group.get(key, 0)
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    return 0
+
+
+def _summarize_kv_offload_stats(
+        iteration_stats: list[dict[str, Any]]) -> KVCacheOffloadSummary:
+    summary: KVCacheOffloadSummary = {
+        "iterations_with_kv_stats": 0,
+        "primary_max_blocks": 0,
+        "secondary_max_blocks": 0,
+        "secondary_peak_used_blocks": 0,
+        "iter_offload_blocks": 0,
+        "iter_offload_bytes": 0,
+        "iter_onboard_blocks": 0,
+        "iter_onboard_bytes": 0,
+    }
+
+    for iteration_stat in iteration_stats:
+        stat_groups = _iteration_kv_stat_groups(iteration_stat)
+        if not stat_groups:
+            continue
+        summary["iterations_with_kv_stats"] += 1
+        for stat_group in stat_groups:
+            summary["primary_max_blocks"] = max(
+                summary["primary_max_blocks"],
+                _get_int_stat(stat_group, "primaryMaxNumBlocks"))
+            summary["secondary_max_blocks"] = max(
+                summary["secondary_max_blocks"],
+                _get_int_stat(stat_group, "secondaryMaxNumBlocks"))
+            summary["secondary_peak_used_blocks"] = max(
+                summary["secondary_peak_used_blocks"],
+                _get_int_stat(stat_group, "secondaryUsedNumBlocks"),
+                _get_int_stat(stat_group, "secondaryPeakUsedNumBlocks"))
+            summary["iter_offload_blocks"] += _get_int_stat(
+                stat_group, "iterOffloadBlocks")
+            summary["iter_offload_bytes"] += _get_int_stat(
+                stat_group, "iterOffloadBytes")
+            summary["iter_onboard_blocks"] += _get_int_stat(
+                stat_group, "iterOnboardBlocks")
+            summary["iter_onboard_bytes"] += _get_int_stat(
+                stat_group, "iterOnboardBytes")
+
+    return summary
+
+
+def _assert_context_kv_offload_stats(server_url: str,
+                                     timeout_s: float = 60.0) -> None:
+    import requests as http_requests
+
+    worker_urls = _worker_urls_from_cluster_info(server_url, "context_servers")
+    deadline = time.monotonic() + timeout_s
+    collected_stats: list[dict[str, Any]] = []
+    last_error = ""
+
+    while time.monotonic() < deadline:
+        for worker_url in worker_urls:
+            try:
+                response = http_requests.get(f"{worker_url}/metrics",
+                                             timeout=10)
+                if response.status_code != 200:
+                    last_error = (f"{worker_url}/metrics returned "
+                                  f"{response.status_code}: {response.text}")
+                    continue
+                metrics = response.json()
+            except http_requests.RequestException as e:
+                last_error = f"{worker_url}/metrics failed: {e}"
+                continue
+            except ValueError as e:
+                last_error = f"{worker_url}/metrics JSON decode failed: {e}"
+                continue
+
+            if not isinstance(metrics, list):
+                last_error = (
+                    f"{worker_url}/metrics returned non-list JSON: {metrics}")
+                continue
+            collected_stats.extend(metric for metric in metrics
+                                   if isinstance(metric, dict))
+
+        summary = _summarize_kv_offload_stats(collected_stats)
+        print(
+            "[host_offload_e2e] context_kv_offload_stats="
+            f"{json.dumps(summary, sort_keys=True)}",
+            flush=True)
+        if (summary["secondary_max_blocks"] > 0
+                and summary["iter_offload_blocks"] > 0
+                and summary["iter_offload_bytes"] > 0):
+            return
+        time.sleep(1)
+
+    raise AssertionError(
+        "expected context worker metrics to prove host offload during "
+        "disaggregated KV transfer; "
+        f"summary={summary}, last_error={last_error!r}")
+
+
+def run_disaggregated_test(
+        example_dir: str,
+        test_desc: str,
+        num_iters: int = 5,
+        env: Optional[dict[str, str]] = None,
+        prompt_file: str = "prompts.json",
+        extra_endpoints_test: Optional[Callable[[str], None]] = None,
+        model_path: Optional[str] = None,
+        cwd: Optional[str] = None,
+        disagg_schedule_style: Optional[str] = None,
+        post_client_test: Optional[Callable[[str], None]] = None,
+        assert_gen_log_contains: Optional[str] = None,
+        assert_ctx_log_contains: Optional[str] = None) -> None:
     """Run disaggregated test using service discovery instead of MPI.
 
-    If assert_gen_log_contains is set, the generation-worker logs are captured and, after the
-    client tests, at least one of them must contain that substring (used to prove the KV-cache
-    bounce path actually engaged instead of silently falling back to the per-fragment path).
+    If a log assertion is set, worker logs are captured and checked after the
+    client tests. This is used for paths that must prove a configured transport
+    or memory tier was actually enabled, not only that requests succeeded.
     """
     if mpi_disabled():
         pytest.skip(
@@ -932,10 +1104,12 @@ def run_disaggregated_test(example_dir,
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
+    save_log = (assert_gen_log_contains is not None
+                or assert_ctx_log_contains is not None)
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              schedule_style=disagg_schedule_style,
-                             save_log=assert_gen_log_contains is not None)
+                             save_log=save_log)
 
     server_host = config.get("hostname", "localhost")
 
@@ -972,17 +1146,11 @@ def run_disaggregated_test(example_dir,
         if post_client_test is not None:
             post_client_test(server_url)
         if assert_gen_log_contains is not None:
-            # Fail loudly if the marker is absent: the transfer silently fell back to the
-            # per-fragment path, so the bounce path we meant to exercise never ran.
-            logs = []
-            for w in gen_workers:
-                if w.log_path and os.path.exists(w.log_path):
-                    with open(w.log_path, 'r', errors='replace') as f:
-                        logs.append(f.read())
-            assert any(assert_gen_log_contains in log for log in logs), (
-                f"expected marker {assert_gen_log_contains!r} in a generation-worker log, "
-                f"but none of {len(logs)} log(s) contained it (bounce did not engage)"
-            )
+            _assert_worker_logs_contain(gen_workers, assert_gen_log_contains,
+                                        "generation")
+        if assert_ctx_log_contains is not None:
+            _assert_worker_logs_contain(ctx_workers, assert_ctx_log_contains,
+                                        "context")
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1336,7 +1504,14 @@ def test_disaggregated_overlap_transceiver_runtime_python_bounce(
                            assert_gen_log_contains="[kv-bounce] coalesced")
 
 
-def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
+def _verify_python_transceiver_under_host_offload(
+        server_url: str,
+        model: str,
+        *,
+        max_tokens: int = 16,
+        prompt_repeats: int = 4,
+        replay_count: int = 5,
+        require_stable_output: bool = True) -> None:
     """End-to-end check: Python transceiver + ctx-side host offload.
 
     The fix translates logical block IDs to primary-pool slot indices in
@@ -1355,23 +1530,17 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
          succeeds; without it, the sender either crashes on a primary
          assertion or returns nonsense tokens.
 
-    Assertions are deliberately content-agnostic (TinyLlama outputs vary
-    run-to-run): we check that responses are non-empty, the server stays
-    up across the eviction/onboard cycle, and `cached_tokens > 0` on
-    repeats so we know reuse actually fired.
+    The caller's config must make the context primary pool smaller than
+    the concurrent replay working set and must provide a host cache. The
+    assertions are otherwise model-agnostic: responses must be non-empty,
+    the server must stay up across the eviction/onboard cycle, and
+    `cached_tokens > 0` on repeats proves prefix reuse actually fired.
     """
     timeout = aiohttp.ClientTimeout(total=180)
-    max_tokens = 16
-    # Workload sizing: ctx-side primary pool = max_tokens(1024) /
-    # tokens_per_block(64) = 16 blocks. Each prompt below tokenizes to
-    # ~200 tokens ≈ 4 KV blocks. We send 6 distinct prompts → ~24 blocks
-    # of primary demand > 16-block primary pool, forcing eviction of an
-    # earlier prefix to host. Replaying earlier prompts (Pass 2) then
-    # forces onboard from host back to primary, and onboard typically
-    # places the block in a *different* primary slot than its block_id.
-    # That divergence is exactly what the disagg pointer-arithmetic fix
-    # has to handle — without the fix, the sender computes
-    # `base + block_id * slot_bytes` and reads the wrong primary slot.
+    # Workload sizing is controlled jointly by the test config's primary
+    # KV capacity and `prompt_repeats`. Concurrent replays hold several
+    # reused prefixes at once, so a tight primary pool with a host cache
+    # forces host offload and later onboard before disagg transfer.
     _filler = (
         "This is filler context describing computer systems, distributed "
         "inference, KV cache management, host memory offload policies, "
@@ -1386,11 +1555,12 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
         "radix prefix tree block reuse",
     ]
     distinct_prompts = [
-        f"Topic: {topic}. {_filler * 4} Now answer briefly:"
+        f"Topic: {topic}. {_filler * prompt_repeats} Now answer briefly:"
         for topic in _topics
     ]
 
-    async def send(session, prompt):
+    async def send(session: aiohttp.ClientSession,
+                   prompt: str) -> dict[str, Any]:
         payload = {
             "model": model,
             "prompt": prompt,
@@ -1406,7 +1576,7 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
                 f"{await resp.text()}")
             return await resp.json()
 
-    def assert_sane(resp, label):
+    def assert_sane(resp: dict[str, Any], label: str) -> str:
         choices = resp.get("choices") or []
         assert choices, f"{label}: response missing 'choices': {resp}"
         text = choices[0].get("text") or ""
@@ -1417,7 +1587,7 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
             f"got {usage.get('completion_tokens')}")
         return text
 
-    async def drive():
+    async def drive() -> None:
         async with aiohttp.ClientSession() as session:
             # Pass 1: prime the radix tree with each distinct prompt and
             # capture the deterministic output (temperature=0).
@@ -1433,7 +1603,7 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
             # interleaving and onboard-to-different-slot for replayed
             # prompts. Strict serial sends (Pass 1 above) typically alloc
             # back to original slots and miss the bug.
-            for replay in range(5):
+            for replay in range(replay_count):
                 results = await asyncio.gather(
                     *[send(session, p) for p in distinct_prompts])
                 for idx, resp in enumerate(results):
@@ -1445,31 +1615,33 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
                     print(f"[host_offload_e2e] replay={replay} prompt={idx} "
                           f"prompt_tokens={usage.get('prompt_tokens')} "
                           f"cached_tokens={cached}")
-                    # Reuse must hit — otherwise we never exercise onboard
+                    # Reuse must hit; otherwise we never exercise onboard
                     # back from host, which is the path the fix protects.
                     assert cached > 0, (
                         f"replay={replay} prompt={idx}: expected reuse "
                         f"hit (cached_tokens > 0), got usage={usage}")
-                    # Primary regression check: deterministic decoding +
-                    # correct KV must reproduce Pass 1's output bit-for-bit.
-                    assert text == first_texts[idx], (
-                        f"replay={replay} prompt={idx}: output diverged "
-                        f"from Pass 1, indicating wrong KV was read after "
-                        f"offload/onboard.\n"
-                        f"  pass1: {first_texts[idx]!r}\n"
-                        f"  replay: {text!r}")
+                    if require_stable_output:
+                        # Primary regression check: deterministic decoding
+                        # with correct KV must reproduce Pass 1's output.
+                        assert text == first_texts[idx], (
+                            f"replay={replay} prompt={idx}: output diverged "
+                            f"from Pass 1, indicating wrong KV was read after "
+                            f"offload/onboard.\n"
+                            f"  pass1: {first_texts[idx]!r}\n"
+                            f"  replay: {text!r}")
 
     asyncio.run(drive())
 
 
 # Plain parametrize (not the `llama_model_root` indirect fixture) so the
 # test ID picks up the `[TinyLlama-1.1B-Chat-v1.0]` suffix that matches
-# the other disagg tests, without forcing LLM_MODELS_ROOT / NFS access —
+# the other disagg tests, without forcing LLM_MODELS_ROOT / NFS access -
 # trtllm-serve resolves the HuggingFace id directly.
 @pytest.mark.parametrize("llama_model_root", ["TinyLlama-1.1B-Chat-v1.0"])
 def test_disaggregated_python_transceiver_host_offload(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):  # noqa: ARG001 — used only for the parametrize label
+    disaggregated_test_root: str, llm_venv: PythonVenvRunnerImpl,
+    disaggregated_example_root: str, llama_model_root: str
+) -> None:  # noqa: ARG001 - used only for the parametrize label
     """E2E regression for block_id -> primary-slot translation in the Python disagg cache transceiver.
 
     See `_verify_python_transceiver_under_host_offload` for what this
@@ -1487,7 +1659,7 @@ def test_disaggregated_python_transceiver_host_offload(
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
 
-    def post_client_test(server_url: str):
+    def post_client_test(server_url: str) -> None:
         _verify_python_transceiver_under_host_offload(
             server_url, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
@@ -2732,6 +2904,42 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                            env=env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory())
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("model_path", ['gpt_oss/gpt-oss-120b'])
+def test_disaggregated_gpt_oss_120b_host_offload(
+        disaggregated_test_root: str, disaggregated_example_root: str,
+        llm_venv: PythonVenvRunnerImpl, model_path: str) -> None:
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    env = llm_venv._new_env.copy()
+    tiktoken_vocab = os.path.join(llm_models_root(), "datasets",
+                                  "tiktoken_vocab")
+    env["TIKTOKEN_RS_CACHE_DIR"] = tiktoken_vocab
+    env["TIKTOKEN_ENCODINGS_BASE"] = tiktoken_vocab
+
+    def post_client_test(server_url: str) -> None:
+        _verify_python_transceiver_under_host_offload(
+            server_url,
+            model_path,
+            max_tokens=8,
+            prompt_repeats=2,
+            replay_count=2,
+            require_stable_output=False)
+        _assert_context_kv_offload_stats(server_url)
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "gpt_oss_120b_host_offload",
+        num_iters=1,
+        env=env,
+        model_path=model_dir,
+        cwd=llm_venv.get_working_directory(),
+        post_client_test=post_client_test,
+        assert_ctx_log_contains=("primary blocks=16, secondary blocks=1820"))
 
 
 @skip_pre_hopper
