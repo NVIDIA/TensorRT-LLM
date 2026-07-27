@@ -1547,14 +1547,16 @@ class PyExecutor:
         self.worker_started = False
         shutdown_errors: List[Tuple[str, Exception]] = []
 
-        def run_shutdown_step(name: str, callback: Callable[[], None]) -> None:
+        def run_shutdown_step(name: str, callback: Callable[[], None]) -> bool:
             try:
                 callback()
+                return True
             except Exception as error:
                 logger.error(
                     f"Shutdown step {name!r} failed: {error}\n{traceback.format_exc()}"
                 )
                 shutdown_errors.append((name, error))
+                return False
 
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
@@ -1563,15 +1565,20 @@ class PyExecutor:
         # empty_cache), the subsequent CUDA graph teardown can trigger a
         # device-wide cudaErrorIllegalAddress when the driver touches metadata
         # for the now-freed memory regions.
+        cuda_graph_teardown_terminal = True
         for engine in (self.model_engine, self.draft_model_engine):
             if engine is not None and hasattr(engine, '_release_cuda_graphs'):
-                run_shutdown_step("release CUDA graphs",
-                                  engine._release_cuda_graphs)
+                released = run_shutdown_step("release CUDA graphs",
+                                             engine._release_cuda_graphs)
+                cuda_graph_teardown_terminal = (cuda_graph_teardown_terminal
+                                                and released)
         # Ensure graph destruction has fully completed on device before
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
-            run_shutdown_step("synchronize CUDA graph teardown",
-                              torch.cuda.synchronize)
+            synchronized = run_shutdown_step("synchronize CUDA graph teardown",
+                                             torch.cuda.synchronize)
+            cuda_graph_teardown_terminal = (cuda_graph_teardown_terminal
+                                            and synchronized)
         # Drain transfer workers and any dedicated consensus communicator
         # before KV-cache managers release registered memory. The transceiver
         # shutdown hook is idempotent and a no-op for implementations that do
@@ -1620,12 +1627,15 @@ class PyExecutor:
 
             run_shutdown_step("KV cache transceiver",
                               shutdown_cache_transceiver)
-        if transceiver_shutdown_terminal:
+        if cuda_graph_teardown_terminal and transceiver_shutdown_terminal:
             for manager in self.resource_manager.resource_managers.values():
                 if manager:
                     run_shutdown_step(
                         f"resource manager {type(manager).__name__}",
                         manager.shutdown)
+        elif not cuda_graph_teardown_terminal:
+            logger.error("Skipping resource-manager shutdown because CUDA "
+                         "graph teardown did not reach a terminal state")
         else:
             logger.error("Skipping resource-manager shutdown because KV cache "
                          "transceiver ownership did not reach a terminal state")
@@ -1639,13 +1649,18 @@ class PyExecutor:
         # The engine's __del__ still calls cleanup() at terminal teardown
         # (when the executor's reference is dropped), which is sufficient for
         # the GMS daemon registry eviction the cleanup hook was added for.
-        del self.model_engine
-        if self.draft_model_engine is not None:
-            del self.draft_model_engine
-        if self.virtual_memory_pools is not None:
-            keys = list(self.virtual_memory_pools.keys())
-            for key in keys:
-                del self.virtual_memory_pools[key]
+        if cuda_graph_teardown_terminal:
+            del self.model_engine
+            if self.draft_model_engine is not None:
+                del self.draft_model_engine
+            if self.virtual_memory_pools is not None:
+                keys = list(self.virtual_memory_pools.keys())
+                for key in keys:
+                    del self.virtual_memory_pools[key]
+        else:
+            logger.error("Retaining model engines and virtual-memory pools "
+                         "because CUDA graph teardown did not reach a "
+                         "terminal state")
         # Stop the sampler's async worker, if it was used
         if (isinstance(self.sampler, AsyncWorkerMixin)
                 and self.sampler.async_worker_enabled()):
@@ -5147,7 +5162,8 @@ class PyExecutor:
         self,
         waiting_queue: WaitingQueue,
         total_num_active_requests: int,
-        all_ranks_num_active_requests: Optional[List[int]] = None
+        all_ranks_num_active_requests: Optional[List[int]] = None,
+        deferred_request_ids: Optional[set[int]] = None,
     ) -> List[RequestQueueItem]:
         """Pop requests from waiting_queue based on available capacity."""
         if self.enable_attention_dp:
@@ -5171,7 +5187,8 @@ class PyExecutor:
             max_new_requests,
             enable_attention_dp=self.enable_attention_dp,
             max_num_active_requests=self.max_num_active_requests,
-            all_ranks_num_active_requests=all_ranks_num_active_requests)
+            all_ranks_num_active_requests=all_ranks_num_active_requests,
+            deferred_request_ids=deferred_request_ids)
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
@@ -5221,11 +5238,20 @@ class PyExecutor:
                                          total_num_active_requests)
 
         pre_active_items = self._take_pre_active_context_items(waiting_queue)
+        deferred_pre_active_request_ids = set()
+        if self._supports_pre_active_context_requests():
+            deferred_pre_active_request_ids = {
+                item.id
+                for item in waiting_queue
+                if self._is_pre_active_context_item(item)
+            }
 
         # 3. Pop requests from waiting queue
         new_requests = self._pop_from_waiting_queue(
-            waiting_queue, total_num_active_requests,
-            all_ranks_num_active_requests)
+            waiting_queue,
+            total_num_active_requests,
+            all_ranks_num_active_requests,
+            deferred_request_ids=deferred_pre_active_request_ids)
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -5292,10 +5318,27 @@ class PyExecutor:
         """Move qualified metadata waiters out of compute-active accounting."""
         if not self._supports_pre_active_context_requests():
             return []
-        items = [
-            item for item in waiting_queue
-            if self._is_pre_active_context_item(item)
-        ]
+
+        # Metadata-only waiters do not consume compute slots, but each admitted
+        # request materializes an LlmRequest and pins native peer metadata.
+        # Bound that ownership independently of rank-local active utilization.
+        # max_num_active_requests is identical across the qualified PP domain,
+        # so every rank extracts the same canonical prefix even when their
+        # active-request counts differ.
+        available = max(
+            0,
+            self.max_num_active_requests -
+            len(self._gen_first_pre_active_requests),
+        )
+        if available == 0:
+            return []
+        items = []
+        for item in waiting_queue:
+            if not self._is_pre_active_context_item(item):
+                continue
+            items.append(item)
+            if len(items) == available:
+                break
         waiting_queue.remove_by_ids({item.id for item in items})
         return items
 
