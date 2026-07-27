@@ -1404,8 +1404,7 @@ class KimiKDARuntime(nn.Module):
         if self._in_proj_weight is not None:
             # One GEMV over [q | k | v | g | f_a | b]; slices below are views.
             proj = torch.nn.functional.linear(x2d, self._in_proj_weight)
-            x_qkv = proj[:, : 3 * d]
-            onorm_g = proj[:, 3 * d : 4 * d]
+            x_qkvg = proj[:, : 4 * d]
             f_a = proj[:, 4 * d : 4 * d + hd]
             beta = proj[:, 4 * d + hd : 4 * d + hd + H]
         else:
@@ -1414,10 +1413,17 @@ class KimiKDARuntime(nn.Module):
             # slices below are views.
             qkvg = mixer.qkvg_proj(x2d)
             small = torch.nn.functional.linear(x2d, self._in_proj_small_weight)
-            x_qkv = qkvg[:, : 3 * d]
-            onorm_g = qkvg[:, 3 * d : 4 * d]
+            x_qkvg = qkvg[:, : 4 * d]
             f_a = small[:, :hd]
             beta = small[:, hd : hd + H]
+        x_qkv = x_qkvg[:, : 3 * d]
+        # The decode kernel takes q, k, v and the o-norm gate as four packed
+        # [1, B, H, head_dim] tensors, but the fused in-projection writes them
+        # side by side, so each column slice carries a 4*d row stride. Repack
+        # all four in one strided copy here; slicing the leading dim of the
+        # result yields the packed tensors the kernel wants, which is four
+        # fewer copies per layer than passing the column slices down.
+        qkvg_packed = x_qkvg.unflatten(-1, (4, H, hd)).permute(1, 0, 2, 3).contiguous()
         g = mixer.f_b_proj(f_a)  # [B, d]
 
         # Gather the HF-layout conv windows once, then repack the
@@ -1432,9 +1438,9 @@ class KimiKDARuntime(nn.Module):
         )
 
         o = mixer._dispatch.decode_kda(
-            x_q=x_qkv[:, :d].unflatten(-1, (H, hd)).unsqueeze(0),
-            x_k=x_qkv[:, d : 2 * d].unflatten(-1, (H, hd)).unsqueeze(0),
-            x_v=x_qkv[:, 2 * d :].unflatten(-1, (H, hd)).unsqueeze(0),
+            x_q=qkvg_packed[0:1],
+            x_k=qkvg_packed[1:2],
+            x_v=qkvg_packed[2:3],
             w_q_t=self._w_q_t,
             w_k_t=self._w_k_t,
             w_v_t=self._w_v_t,
@@ -1449,7 +1455,7 @@ class KimiKDARuntime(nn.Module):
             dt_bias=self._dt_bias_f32,
             beta=beta.unsqueeze(0),
             state=state,
-            onorm_g=onorm_g.unflatten(-1, (H, hd)).unsqueeze(0),
+            onorm_g=qkvg_packed[3:4],
             onorm_weight=self._onorm_w_f32,
             out=None,
             ssm_state_indices=ssm_state_indices,
