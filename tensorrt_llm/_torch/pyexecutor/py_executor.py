@@ -260,12 +260,12 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     if not mm_data:
         return
     strip_mm_data_for_generation(mm_data)
-    # Drop the per-item encoder state alongside the dict clear above: the
-    # state owns the request's encoder output tensors and the published
-    # `multimodal_embedding` list aliases them, so both alias sources
-    # disappear together and the GPU memory is actually freed. Clearing the
-    # state is also the byte-budget release: the scheduler derives occupancy
-    # from live states, so this request stops counting next tick.
+    # Drop the per-item encoder state alongside the dict clear above. The
+    # dict clear is what frees the GPU memory once the items are published
+    # (`finalize_into` moves them out of the state), and the state may still
+    # hold unpublished slots for a request stripped mid-encode. Clearing it
+    # is also the byte-budget release: the scheduler derives occupancy from
+    # live states, so this request stops counting next tick.
     request.py_mm_encoder_state = None
 
 

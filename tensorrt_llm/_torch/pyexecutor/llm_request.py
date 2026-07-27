@@ -85,12 +85,14 @@ class MultimodalEncoderRequestState:
     outputs and read-through encoder-cache hits — so validation cannot
     diverge between them.
 
-    The state owns its storage: `record()` clones every incoming tensor, so
-    a slot never aliases the encoder's batch output or a cache entry (cache
-    eviction is therefore harmless). The slot bytes are exactly the
-    request's own residency — the scheduler derives its byte budget from
-    live states each tick, so clearing the state *is* the release; there is
-    no release call to forget or replay.
+    The state owns its storage until it publishes: `record()` clones every
+    incoming tensor, so a slot never aliases the encoder's batch output or a
+    cache entry (cache eviction is therefore harmless), and `finalize_into()`
+    then hands those tensors to the request's ``multimodal_data`` and clears
+    the slots, so exactly one owner exists at every point. Either way the
+    bytes are the request's own residency — the scheduler derives its byte
+    budget from live states each tick, so clearing the state *is* the
+    release; there is no release call to forget or replay.
 
     The state is rank-local and never crosses a serialization boundary:
     schedule distribution carries request/item IDs only, and every rank
@@ -103,7 +105,15 @@ class MultimodalEncoderRequestState:
 
     outputs: List[Optional[torch.Tensor]]
     """One slot per atomic item, in prompt order. ``None`` until the item is
-    recorded; then a clone owned by this request."""
+    recorded; then a clone owned by this request. Emptied by
+    `finalize_into()`, which hands the tensors to the request's
+    ``multimodal_data`` rather than keeping a second reference."""
+
+    finalized: bool = False
+    """Whether `finalize_into()` published the items. Ownership then belongs
+    to ``multimodal_data['multimodal_embedding']``, so `outputs` is cleared
+    while the rows stay resident until the request is stripped. Progress and
+    byte accounting read this flag instead of the (now empty) slots."""
 
     @classmethod
     def from_embedding_lengths(
@@ -123,6 +133,8 @@ class MultimodalEncoderRequestState:
 
     @property
     def progress(self) -> MultimodalEncoderProgress:
+        if self.finalized:
+            return MultimodalEncoderProgress.READY
         if all(output is not None for output in self.outputs):
             return MultimodalEncoderProgress.READY
         if any(output is not None for output in self.outputs):
@@ -131,6 +143,8 @@ class MultimodalEncoderRequestState:
 
     def pending_item_indices(self) -> List[int]:
         """Indices of items that still need an encoder output, prompt order."""
+        if self.finalized:
+            return []
         return [
             item_idx for item_idx, output in enumerate(self.outputs)
             if output is None
@@ -149,6 +163,10 @@ class MultimodalEncoderRequestState:
         shape/dtype/device (items of one request must concatenate cleanly at
         fuse time).
         """
+        if self.finalized:
+            raise ValueError(
+                f"MM item {item_idx} cannot be recorded after the request's "
+                "items were published; items are encoded at most once")
         expected_rows = self.embedding_lengths[item_idx]
         if output.shape[0] != expected_rows:
             raise ValueError(f"MM item {item_idx} produced {output.shape[0]} "
@@ -172,7 +190,13 @@ class MultimodalEncoderRequestState:
         The scheduler sums this over live states every tick to derive the
         occupied share of the encoder output byte budget; there is no
         separate accounting to keep in sync.
+
+        After `finalize_into()` the slots are empty but every row is still
+        resident under ``multimodal_data``, so a published request keeps
+        charging its full footprint until it is stripped post-prefill.
         """
+        if self.finalized:
+            return sum(self.embedding_lengths) * bytes_per_encoder_embedding
         return sum(
             length
             for length, output in zip(self.embedding_lengths, self.outputs)
@@ -181,17 +205,27 @@ class MultimodalEncoderRequestState:
     def finalize_into(self, multimodal_data: Dict[str, Any]) -> bool:
         """Publish the item outputs once every slot is recorded.
 
-        Attaches the prompt-ordered list of owned item tensors as
-        ``multimodal_embedding`` and drops the raw pre-encoder inputs. The
-        per-request contiguous embedding is materialized lazily inside the
-        prefill forward (`get_multimodal_embeddings`), so between encode
-        and prefill the only GPU residency is the slots this state owns —
-        exactly what the scheduler's derived byte accounting counts.
+        Moves the prompt-ordered item tensors to ``multimodal_embedding`` and
+        drops the raw pre-encoder inputs. Ownership is *transferred*, not
+        shared: the slots are cleared so the published list is the only
+        reference. Sharing costs nothing while both point at the same
+        tensors, but the prefill path replaces the published list with its
+        contiguous form — and a slot still holding the per-item tensors keeps
+        them alive past that point, so the request pays for both.
+
+        The per-request contiguous embedding is still materialized lazily
+        inside the prefill forward (`get_multimodal_embeddings`); the rows
+        remain resident, and `resident_output_bytes()` keeps charging them
+        via `finalized` until the request is stripped.
         No-op returning ``False`` while any slot is still pending.
         """
+        if self.finalized:
+            return True
         if not self.outputs or any(output is None for output in self.outputs):
             return False
         multimodal_data["multimodal_embedding"] = list(self.outputs)
+        self.outputs = [None] * len(self.outputs)
+        self.finalized = True
         strip_mm_encoder_inputs(multimodal_data)
         return True
 

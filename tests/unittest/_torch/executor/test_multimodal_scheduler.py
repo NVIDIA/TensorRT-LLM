@@ -569,12 +569,19 @@ def test_item_outputs_accumulate_on_request_and_release_raw_data(monkeypatch):
     engine.forward_multimodal_encoder_items([request], {1: [1]})
 
     published = request.py_multimodal_data["multimodal_embedding"]
-    assert published == request.py_mm_encoder_state.outputs
     assert [slot.tolist() for slot in published] == [
         [[2.0, 2.0], [2.0, 2.0]],
         [[3.0, 3.0], [3.0, 3.0], [3.0, 3.0]],
     ]
     assert "image" not in request.py_multimodal_data
+    # Publishing transfers ownership rather than sharing it: the state drops
+    # its slots so the published list is the only reference, while the rows
+    # stay charged to the budget until the request is stripped.
+    state = request.py_mm_encoder_state
+    assert state.finalized
+    assert state.outputs == [None, None]
+    assert state.resident_output_bytes(8) == (2 + 3) * 8
+    assert is_multimodal_encoder_ready(request)
 
 
 # ---------------------------------------------------------------------------
@@ -649,10 +656,11 @@ def test_item_encode_populates_cache_with_independent_copies(monkeypatch):
         [[1, 2], [3, 4]], [("image", 0), ("image", 1)], [2, 3], "kw"
     )
     # The request records owned clones; the cache keeps its own copies —
-    # eviction can never invalidate a recorded slot.
-    assert torch.equal(cache.get(key0), request.py_mm_encoder_state.outputs[0])
-    assert cache.get(key0) is not request.py_mm_encoder_state.outputs[0]
-    assert torch.equal(cache.get(key1), request.py_mm_encoder_state.outputs[1])
+    # eviction can never invalidate a published item.
+    published = request.py_multimodal_data["multimodal_embedding"]
+    assert torch.equal(cache.get(key0), published[0])
+    assert cache.get(key0) is not published[0]
+    assert torch.equal(cache.get(key1), published[1])
 
 
 def test_duplicate_request_hits_cache_and_skips_encoding(monkeypatch):
@@ -670,8 +678,9 @@ def test_duplicate_request_hits_cache_and_skips_encoding(monkeypatch):
     assert engine.model.encoded_item_counts == [2]
     assert is_multimodal_encoder_ready(second)
     published = second.py_multimodal_data["multimodal_embedding"]
-    assert torch.equal(published[0], first.py_mm_encoder_state.outputs[0])
-    assert published[0] is not first.py_mm_encoder_state.outputs[0]
+    first_published = first.py_multimodal_data["multimodal_embedding"]
+    assert torch.equal(published[0], first_published[0])
+    assert published[0] is not first_published[0]
 
 
 def test_cache_hit_at_encode_skips_only_hit_items(monkeypatch):
@@ -685,7 +694,8 @@ def test_cache_hit_at_encode_skips_only_hit_items(monkeypatch):
     engine.forward_multimodal_encoder_items([request], {1: [0, 1]})
 
     assert engine.model.encoded_item_counts == [1]  # only the miss encoded
-    assert torch.equal(request.py_mm_encoder_state.outputs[0], torch.full((2, 2), 7.0))
+    published = request.py_multimodal_data["multimodal_embedding"]
+    assert torch.equal(published[0], torch.full((2, 2), 7.0))
     assert is_multimodal_encoder_ready(request)
 
 
@@ -694,7 +704,7 @@ def test_cache_eviction_leaves_recorded_slots_intact(monkeypatch):
     engine = _cache_engine(cache, monkeypatch)
     request = _cache_request(1, hashes=[[1, 2]], embedding_lengths=[2])
     engine.forward_multimodal_encoder_items([request], {1: [0]})
-    recorded = request.py_mm_encoder_state.outputs[0]
+    recorded = request.py_multimodal_data["multimodal_embedding"][0]
 
     cache.clear()  # simulate eviction of the entry the request came from
 
@@ -883,6 +893,40 @@ def test_mm_encoder_state_finalize_into_is_a_conditional_no_op():
     assert "multimodal_embedding" not in multimodal_data
 
     state.record(0, torch.ones(2, 2))
+    recorded = state.outputs[0]
     assert state.finalize_into(multimodal_data) is True
-    assert multimodal_data["multimodal_embedding"] == state.outputs
+    assert multimodal_data["multimodal_embedding"] == [recorded]
     assert "image" not in multimodal_data
+
+    # Idempotent once published: the slots are gone, so a second call must
+    # not report "still pending" and re-open the request for encoding.
+    assert state.finalize_into(multimodal_data) is True
+    assert multimodal_data["multimodal_embedding"] == [recorded]
+
+
+def test_mm_encoder_state_finalize_transfers_ownership():
+    """Publishing must not leave a second reference to the item tensors.
+
+    The prefill path swaps the published list for its contiguous form; a slot
+    that still references the per-item tensors keeps them alive past that
+    point, so the request holds both at once and the byte budget accounts for
+    neither.
+    """
+    state = MultimodalEncoderRequestState.from_embedding_lengths([2, 3])
+    multimodal_data = {"image": {"pixel_values": torch.empty(2, 1)}}
+    state.record(0, torch.ones(2, 2))
+    state.record(1, torch.ones(3, 2))
+
+    assert state.finalize_into(multimodal_data) is True
+
+    published = multimodal_data["multimodal_embedding"]
+    assert state.outputs == [None, None]
+    assert [tensor.shape for tensor in published] == [(2, 2), (3, 2)]
+    # Readiness and byte accounting survive the transfer: the rows are still
+    # resident, just owned by `multimodal_data` instead of the slots.
+    assert state.finalized
+    assert state.progress is MultimodalEncoderProgress.READY
+    assert state.pending_item_indices() == []
+    assert state.resident_output_bytes(4) == (2 + 3) * 4
+    with pytest.raises(ValueError, match="after the request's items"):
+        state.record(0, torch.ones(2, 2))
