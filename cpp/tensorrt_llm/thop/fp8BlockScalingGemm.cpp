@@ -153,6 +153,11 @@ void check_fp8_block_scaling_gemm_common_inputs(torch::Tensor const& mat1, torch
         mat1.sizes()[1], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], ")");
 }
 
+void check_hopper_block_scaling_k(int64_t k)
+{
+    TORCH_CHECK(k % 128 == 0, "Hopper FP8 block scaling GEMM requires K to be a multiple of 128, (K=", k, ")");
+}
+
 #if defined(TRTLLM_ENABLE_DEEP_GEMM_THOP)
 
 std::filesystem::path get_shared_library_path()
@@ -428,7 +433,7 @@ torch::Tensor fp8_block_scaling_gemm_hopper(torch::Tensor const& mat1, torch::Te
     auto const m = mat1.sizes()[0];
     auto const n = mat2.sizes()[0];
     auto const k = mat1.sizes()[1];
-    TORCH_CHECK(k % 16 == 0, "K must be a multiple of 16, (K=", k, ")");
+    check_hopper_block_scaling_k(k);
     TORCH_CHECK(n % 16 == 0, "N must be a multiple of 16, (N=", n, ")");
 
     at::Tensor out = at::detail::empty_cuda({m, n}, at::ScalarType::BFloat16, mat1.device(), std::nullopt);
@@ -600,7 +605,7 @@ torch::Tensor fp8_block_scaling_moe_gemm_hopper(torch::Tensor const& mat1, torch
     auto const n = mat2.sizes()[1];
     auto const k = mat2.sizes()[2];
     auto const expected_m = (m_total + num_problems - 1) / num_problems;
-    TORCH_CHECK(k % 16 == 0, "K must be a multiple of 16, (K=", k, ")");
+    check_hopper_block_scaling_k(k);
     TORCH_CHECK(n % 16 == 0, "N must be a multiple of 16, (N=", n, ")");
 
     at::Tensor out = at::detail::empty_cuda({m_total, n}, at::ScalarType::BFloat16, mat1.device(), std::nullopt);
@@ -707,7 +712,14 @@ torch::Tensor fp8_block_scaling_bmm_out(torch::Tensor const& mat1, torch::Tensor
     auto const m = mat1.sizes()[1];
     auto const n = mat2.sizes()[1];
     auto const k = mat1.sizes()[2];
-    TORCH_CHECK(k % 16 == 0, "K must be a multiple of 16, (K=", k, ")");
+    if (sm == 90)
+    {
+        check_hopper_block_scaling_k(k);
+    }
+    else
+    {
+        TORCH_CHECK(k % 16 == 0, "K must be a multiple of 16, (K=", k, ")");
+    }
     TORCH_CHECK(n % 16 == 0, "N must be a multiple of 16, (N=", n, ")");
 
     CHECK_TH_CUDA(out);

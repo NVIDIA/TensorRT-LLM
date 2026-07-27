@@ -16,9 +16,11 @@ import torch
 
 from tensorrt_llm._torch.custom_ops.fp8_block_scaling_dispatch import (
     BackendMeasurement,
+    CacheIdentity,
     DispatchBackend,
     DispatchCache,
     DispatchEntry,
+    DispatchKey,
     DispatchPolicy,
     choose_fastest_correct,
     select_static_backend,
@@ -164,6 +166,26 @@ def _safe_measure(
         )
 
 
+def _unsupported_measurement(
+    shape: GemmShape,
+    backend: DispatchBackend,
+    reason: str,
+) -> BackendMeasurement:
+    print(
+        f"warning={shape.m}x{shape.n}x{shape.k} backend={backend.value} skipped: {reason}",
+        file=sys.stderr,
+    )
+    return BackendMeasurement(
+        backend=backend,
+        correct=False,
+        median_ms=float("inf"),
+    )
+
+
+def _is_trtllm_measurement_supported(key: DispatchKey, identity: CacheIdentity) -> bool:
+    return identity.sm != 90 or key.k % 128 == 0
+
+
 def _build_entry(
     shape: GemmShape,
     args: argparse.Namespace,
@@ -177,15 +199,22 @@ def _build_entry(
     identity = make_runtime_identity(a)
     key = make_dispatch_key(a, b, a_scale, b_scale)
 
-    trt = _safe_measure(
-        shape,
-        DispatchBackend.TRTLLM,
-        lambda: torch.ops.trtllm.fp8_block_scaling_gemm_trtllm(a, b, a_scale, b_scale),
-        reference,
-        warmup=args.warmup,
-        iterations=args.iters,
-        correctness_threshold=args.correctness_threshold,
-    )
+    if _is_trtllm_measurement_supported(key, identity):
+        trt = _safe_measure(
+            shape,
+            DispatchBackend.TRTLLM,
+            lambda: torch.ops.trtllm.fp8_block_scaling_gemm_trtllm(a, b, a_scale, b_scale),
+            reference,
+            warmup=args.warmup,
+            iterations=args.iters,
+            correctness_threshold=args.correctness_threshold,
+        )
+    else:
+        trt = _unsupported_measurement(
+            shape,
+            DispatchBackend.TRTLLM,
+            "Hopper FP8 block scaling GEMM requires K to be a multiple of 128",
+        )
     measurements = [trt]
     if identity.deep_gemm_available and is_deep_gemm_compatible(
         key, (a, b, a_scale, b_scale)
@@ -218,7 +247,9 @@ def _build_entry(
 def main() -> None:
     args = _parse_args()
     entries = []
-    identity = None
+    identity = make_runtime_identity(
+        torch.empty(0, device="cuda", dtype=torch.float8_e4m3fn)
+    )
     weighted_trt_ms = 0.0
     weighted_selected_ms = 0.0
     print("shape,backend,correct,median_ms,selected")
@@ -248,18 +279,14 @@ def main() -> None:
         )
         weighted_trt_ms += trt_measurement.median_ms * shape.count
         weighted_selected_ms += selected_measurement.median_ms * shape.count
-        if identity is None:
-            identity = make_runtime_identity(
-                torch.empty(0, device="cuda", dtype=torch.float8_e4m3fn)
-            )
-
-    if identity is None:
-        raise RuntimeError("At least one shape is required")
     write_dispatch_cache(args.output, DispatchCache(identity, tuple(entries)))
     print(f"cache={args.output}")
     print(f"synthetic_replay_trt_ms={weighted_trt_ms:.6f}")
     print(f"synthetic_replay_dispatched_ms={weighted_selected_ms:.6f}")
-    print(f"synthetic_replay_speedup={weighted_trt_ms / weighted_selected_ms:.6f}")
+    if weighted_selected_ms > 0.0:
+        print(f"synthetic_replay_speedup={weighted_trt_ms / weighted_selected_ms:.6f}")
+    else:
+        print("synthetic_replay_speedup=nan")
 
 
 if __name__ == "__main__":
