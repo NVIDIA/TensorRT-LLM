@@ -8256,12 +8256,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      emit_seed_counts=False,
                      seed_packed=False,
                      emit_cand=False,
-                     cand_cap=5120):
+                     cand_cap=5120,
+                     emit_cand_bucketed=False,
+                     accept_cap=8192):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
-                   emit_seed_counts, seed_packed, emit_cand, cand_cap)
+                   emit_seed_counts, seed_packed, emit_cand, cand_cap,
+                   emit_cand_bucketed, accept_cap)
             if key in cls.kernel_cache:
                 return
 
@@ -8354,6 +8357,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cutlass.Int32, (cute.sym_int(), 2),
                     stride_order=(1, 0),
                     assumed_align=8)
+            cand_idx_fake = None
+            cand_cur_fake = None
+            if emit_cand_bucketed:
+                # bucketed SoA: cand slot reused as the fp32 VALUES tensor
+                wtot = 2 * accept_cap + cand_cap
+                cand_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Float32, (cute.sym_int(), wtot),
+                    stride_order=(1, 0),
+                    assumed_align=4)
+                cand_idx_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), wtot),
+                    stride_order=(1, 0),
+                    assumed_align=4)
+                cand_ctl_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), 4),
+                    stride_order=(1, 0),
+                    assumed_align=4)
+                cand_cur_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), 4),
+                    stride_order=(1, 0),
+                    assumed_align=4)
             seed_thr_fake = None
             seed_counts_fake = None
             if emit_seed_counts:
@@ -8400,6 +8424,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 seed_packed=seed_packed,
                 emit_cand=emit_cand,
                 cand_cap=cand_cap,
+                emit_cand_bucketed=emit_cand_bucketed,
+                accept_cap=accept_cap,
             )
 
             compiled = cute.compile(
@@ -8422,6 +8448,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 seed_counts=seed_counts_fake,
                 cand=cand_fake,
                 cand_ctl=cand_ctl_fake,
+                cand_idx_t=cand_idx_fake,
+                cand_cur=cand_cur_fake,
                 options="--enable-tvm-ffi",
             )
             cls.kernel_cache[key] = compiled
@@ -8453,6 +8481,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             emit_cand: bool = False,
             cand_out: Optional[torch.Tensor] = None,
             cand_ctl_out: Optional[torch.Tensor] = None,
+            emit_cand_bucketed: bool = False,
+            accept_cap: int = 8192,
+            cand_idx_out: Optional[torch.Tensor] = None,
+            cand_cur_out: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             """Execute FP4 paged MQA logits kernel.
 
@@ -8628,15 +8660,54 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             "emit_cand requires a caller-zeroed cand_ctl_out "
                             "int32 [B*next_n, 2]")
                 cand_cap = cand_out.shape[1] // 2
+            elif emit_cand_bucketed:
+                assert emit_seed_counts, (
+                    "emit_cand_bucketed requires emit_seed_counts")
+                # SoA v5 contract: cand_out = fp32 VALUES [rows, 2*segA+capC],
+                # cand_idx_out = int32 positions (same width), cand_cur_out =
+                # int32 [rows, 4] cursors (caller-zeroed), cand_ctl_out =
+                # int32 [rows, 4] {n0, void, n1, n2} (caller-zeroed)
+                W = cand_out.shape[1]
+                assert (
+                    cand_out is not None and cand_out.dtype == torch.float32
+                    and cand_out.is_cuda and cand_out.is_contiguous()
+                    and cand_out.dim() == 2 and cand_out.shape[0] == B * next_n
+                    and W > 2 * accept_cap), (
+                        "bucketed requires cand_out fp32 [rows, 2*segA+capC]")
+                assert (cand_idx_out is not None
+                        and cand_idx_out.dtype == torch.int32
+                        and cand_idx_out.is_cuda
+                        and cand_idx_out.is_contiguous()
+                        and cand_idx_out.shape == cand_out.shape), (
+                            "bucketed requires cand_idx_out int32, same shape")
+                assert (cand_ctl_out is not None
+                        and cand_ctl_out.dtype == torch.int32
+                        and cand_ctl_out.is_cuda
+                        and cand_ctl_out.is_contiguous()
+                        and cand_ctl_out.shape == (B * next_n, 4)), (
+                            "bucketed requires caller-zeroed cand_ctl_out "
+                            "int32 [rows, 4]")
+                assert (cand_cur_out is not None
+                        and cand_cur_out.dtype == torch.int32
+                        and cand_cur_out.is_cuda
+                        and cand_cur_out.is_contiguous()
+                        and cand_cur_out.shape == (B * next_n, 4)), (
+                            "bucketed requires caller-zeroed cand_cur_out "
+                            "int32 [rows, 4]")
+                cand_cap = W - 2 * accept_cap
             else:
                 cand_out = None
                 cand_ctl_out = None
+            if not emit_cand_bucketed:
+                cand_idx_out = None
+                cand_cur_out = None
 
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
-                   emit_seed_counts, seed_packed, emit_cand, cand_cap)
+                   emit_seed_counts, seed_packed, emit_cand, cand_cap,
+                   emit_cand_bucketed, accept_cap)
             if key not in cls.kernel_cache:
                 cls._compile(
                     compute_block_kv,
@@ -8654,7 +8725,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     emit_seed_counts=emit_seed_counts,
                     seed_packed=seed_packed,
                     emit_cand=emit_cand,
-                    cand_cap=cand_cap)
+                    cand_cap=cand_cap,
+                    emit_cand_bucketed=emit_cand_bucketed,
+                    accept_cap=accept_cap)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
@@ -8662,11 +8735,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
                          context_lens, schedule_meta, num_phys_blocks, B,
                          block_max_out, hit_stats_out, hit_bitmap, seed_thr,
-                         seed_counts_out, cand_out, cand_ctl_out)
+                         seed_counts_out, cand_out, cand_ctl_out, cand_idx_out,
+                         cand_cur_out)
                 return logits, block_max_out, hit_stats_out
             compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
                      context_lens, schedule_meta, num_phys_blocks, B, None,
-                     None, None, None, None, None, None)
+                     None, None, None, None, None, None, None, None)
             return logits
 
     @torch.library.custom_op("trtllm::cute_dsl_fp4_paged_mqa_logits",
