@@ -24,7 +24,7 @@ import tempfile
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 from safetensors.torch import save_file
@@ -51,13 +51,65 @@ class MockModelConfig:
 
 
 def _create_dummy_hf_lora_adapter(
-    adapter_dir: Path, hidden_size: int = 64, rank: int = 8, num_layers: int = 2
+    adapter_dir: Path,
+    hidden_size: int = 64,
+    output_size: int | None = None,
+    rank: int = 8,
+    num_layers: int = 2,
+    dtype: torch.dtype = torch.float16,
+    use_dora: bool = False,
+    input_dtype: torch.dtype | None = None,
+    lora_alpha: float | None = None,
+    weight_value: float | None = None,
 ):
     """Create a minimal HF-format LoRA adapter on disk."""
+    output_size = hidden_size if output_size is None else output_size
+    config = {
+        "r": rank,
+        "lora_alpha": rank if lora_alpha is None else lora_alpha,
+        "target_modules": ["q_proj", "k_proj", "v_proj"],
+        "bias": "none",
+        "peft_type": "LORA",
+        "task_type": "CAUSAL_LM",
+        "use_dora": use_dora,
+    }
+    with open(adapter_dir / "adapter_config.json", "w") as f:
+        json.dump(config, f)
+
+    weights = {}
+    input_dtype = dtype if input_dtype is None else input_dtype
+
+    def make_weight(shape, target_dtype):
+        if weight_value is None:
+            return torch.randn(*shape, dtype=torch.float16).to(target_dtype)
+        return torch.full(shape, weight_value, dtype=torch.float16).to(target_dtype)
+
+    for layer_idx in range(num_layers):
+        for module in ["q_proj", "k_proj", "v_proj"]:
+            prefix = f"base_model.model.model.layers.{layer_idx}.self_attn.{module}"
+            weights[f"{prefix}.lora_A.weight"] = make_weight((rank, hidden_size), input_dtype)
+            weights[f"{prefix}.lora_B.weight"] = make_weight((output_size, rank), dtype)
+            if use_dora:
+                weights[f"{prefix}.lora_magnitude_vector"] = torch.ones(
+                    output_size, dtype=torch.bfloat16
+                )
+
+    save_file(weights, str(adapter_dir / "adapter_model.safetensors"))
+
+
+def _create_dummy_hf_moe_lora_adapter(
+    adapter_dir: Path,
+    hidden_size: int = 64,
+    output_size: int = 128,
+    rank: int = 16,
+    num_experts: int = 2,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+):
+    """Create a minimal expert-indexed HF-format LoRA adapter on disk."""
     config = {
         "r": rank,
         "lora_alpha": rank,
-        "target_modules": ["q_proj", "k_proj", "v_proj"],
+        "target_modules": ["gate_proj"],
         "bias": "none",
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",
@@ -66,11 +118,14 @@ def _create_dummy_hf_lora_adapter(
         json.dump(config, f)
 
     weights = {}
-    for layer_idx in range(num_layers):
-        for module in ["q_proj", "k_proj", "v_proj"]:
-            prefix = f"base_model.model.model.layers.{layer_idx}.self_attn.{module}"
-            weights[f"{prefix}.lora_A.weight"] = torch.randn(rank, hidden_size, dtype=torch.float16)
-            weights[f"{prefix}.lora_B.weight"] = torch.randn(hidden_size, rank, dtype=torch.float16)
+    for expert_idx in range(num_experts):
+        prefix = f"base_model.model.model.layers.0.mlp.experts.{expert_idx}.gate_proj"
+        weights[f"{prefix}.lora_A.weight"] = torch.randn(rank, hidden_size, dtype=torch.float16).to(
+            dtype
+        )
+        weights[f"{prefix}.lora_B.weight"] = torch.randn(output_size, rank, dtype=torch.float16).to(
+            dtype
+        )
 
     save_file(weights, str(adapter_dir / "adapter_model.safetensors"))
 
@@ -160,6 +215,202 @@ class TestLoraManagerRetainDeviceTensors(unittest.TestCase):
 
         self.assertEqual(len(manager._lora_weights), 0)
         self.assertEqual(len(manager._cpp_lora_weights), num_adapters)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9,
+    "FP8 LoRA requires Hopper or newer",
+)
+class TestLoraManagerFp8(unittest.TestCase):
+    def test_fp8_dora_is_rejected(self):
+        model_config = MockModelConfig()
+        manager = LoraManager(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            model_config=model_config,
+            cpp_peft_cache_manager=MagicMock(),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+            _create_dummy_hf_lora_adapter(
+                adapter_dir,
+                rank=16,
+                num_layers=1,
+                dtype=torch.float8_e4m3fn,
+                use_dora=True,
+            )
+
+            with self.assertRaisesRegex(
+                NotImplementedError,
+                "DoRA is not supported with FP8 LoRA weights on Hopper",
+            ):
+                manager.load_from_hf(
+                    model_dirs=[str(adapter_dir)],
+                    model_config=model_config,
+                    uids=["fp8-dora"],
+                )
+
+    def test_fp8_moe_weights_are_converted_to_model_dtype(self):
+        model_config = MockModelConfig(
+            lora_target_modules=["moe_h_to_4h"],
+            trtllm_modules_to_hf_modules={"moe_h_to_4h": "mlp.experts.gate_proj"},
+            dtype="bfloat16",
+        )
+        manager = LoraManager(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            model_config=model_config,
+            cpp_peft_cache_manager=MagicMock(),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+            _create_dummy_hf_moe_lora_adapter(adapter_dir)
+
+            manager.load_from_hf(
+                model_dirs=[str(adapter_dir)],
+                model_config=model_config,
+                uids=["fp8-moe"],
+            )
+
+        self.assertEqual(manager.cpp_lora_weights["fp8-moe"].dtype, torch.bfloat16)
+
+    def test_fp8_e5m2_weights_are_converted_to_model_dtype(self):
+        model_config = MockModelConfig(dtype="bfloat16")
+        manager = LoraManager(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            model_config=model_config,
+            cpp_peft_cache_manager=MagicMock(),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+            _create_dummy_hf_lora_adapter(
+                adapter_dir,
+                rank=8,
+                num_layers=1,
+                dtype=torch.float8_e5m2,
+            )
+
+            manager.load_from_hf(
+                model_dirs=[str(adapter_dir)],
+                model_config=model_config,
+                uids=["fp8-e5m2"],
+            )
+
+        self.assertEqual(manager.cpp_lora_weights["fp8-e5m2"].dtype, torch.bfloat16)
+
+    def test_fp8_e4m3_input_output_dtype_mismatch_is_rejected(self):
+        model_config = MockModelConfig()
+        manager = LoraManager(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            model_config=model_config,
+            cpp_peft_cache_manager=MagicMock(),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+            _create_dummy_hf_lora_adapter(
+                adapter_dir,
+                rank=16,
+                num_layers=1,
+                dtype=torch.float8_e4m3fn,
+                input_dtype=torch.float8_e5m2,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "FP8 LoRA input and output weights must have the same dtype"
+            ):
+                manager.load_from_hf(
+                    model_dirs=[str(adapter_dir)],
+                    model_config=model_config,
+                    uids=["fp8-mismatched-dtype"],
+                )
+
+    def test_scaled_fp8_e4m3_weights_are_clamped_before_cast(self):
+        model_config = MockModelConfig()
+        manager = LoraManager(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            model_config=model_config,
+            cpp_peft_cache_manager=MagicMock(),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+            _create_dummy_hf_lora_adapter(
+                adapter_dir,
+                rank=16,
+                num_layers=1,
+                dtype=torch.float8_e4m3fn,
+                lora_alpha=32,
+                weight_value=torch.finfo(torch.float8_e4m3fn).max,
+            )
+
+            manager.load_from_hf(
+                model_dirs=[str(adapter_dir)],
+                model_config=model_config,
+                uids=["scaled-fp8"],
+            )
+
+        weights = manager.cpp_lora_weights["scaled-fp8"].float()
+        self.assertTrue(torch.isfinite(weights).all())
+        self.assertEqual(weights.abs().max(), torch.finfo(torch.float8_e4m3fn).max)
+
+
+class TestLoraManagerFp8Alignment(unittest.TestCase):
+    @staticmethod
+    def _create_manager(model_config):
+        return LoraManager(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            model_config=model_config,
+            cpp_peft_cache_manager=MagicMock(),
+        )
+
+    def test_misaligned_fp8_adapter_is_rejected_before_cuda_transfer(self):
+        cases = [
+            {"rank": 8, "hidden_size": 64, "output_size": 64, "match": "rank=8"},
+            {
+                "rank": 16,
+                "hidden_size": 72,
+                "output_size": 64,
+                "match": "input size=72",
+            },
+            {
+                "rank": 16,
+                "hidden_size": 64,
+                "output_size": 72,
+                "match": "output size=72",
+            },
+        ]
+
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmpdir:
+                adapter_dir = Path(tmpdir) / "adapter"
+                adapter_dir.mkdir()
+                _create_dummy_hf_lora_adapter(
+                    adapter_dir,
+                    hidden_size=case["hidden_size"],
+                    output_size=case["output_size"],
+                    rank=case["rank"],
+                    num_layers=1,
+                    dtype=torch.float8_e4m3fn,
+                )
+                model_config = MockModelConfig(hidden_size=case["hidden_size"])
+                manager = self._create_manager(model_config)
+
+                with (
+                    patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+                    self.assertRaisesRegex(ValueError, case["match"]),
+                ):
+                    manager.load_from_hf(
+                        model_dirs=[str(adapter_dir)],
+                        model_config=model_config,
+                        uids=["misaligned-fp8"],
+                    )
 
 
 if __name__ == "__main__":

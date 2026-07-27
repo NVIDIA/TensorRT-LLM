@@ -138,10 +138,6 @@ def test_fp8_cuda_graph_grouped_gemm_uses_live_device_problem_metadata():
     [
         ("groupGemm.cu", ["FP8 grouped GEMM requires CUTLASS modifiable TMA support"]),
         (
-            "splitkGroupGemm.cu",
-            ["FP8 split-K grouped GEMM requires CUTLASS modifiable TMA support"],
-        ),
-        (
             "cuda_graph_grouped_gemm.cu",
             [
                 "FP8 CUDA graph grouped GEMM requires CUTLASS modifiable TMA support",
@@ -158,12 +154,38 @@ def test_fp8_grouped_gemm_dispatch_has_explicit_unsupported_cutlass_guard(filena
         assert message in source
 
 
-@pytest.mark.parametrize("filename", ["groupGemm.cu", "splitkGroupGemm.cu"])
-def test_fp8_grouped_gemm_alignment_checks_require_multiples_of_16(filename):
+@pytest.mark.parametrize("filename", ["groupGemm.cu", "cuda_graph_grouped_gemm.cu"])
+def test_fp8_grouped_gemm_dispatch_requires_sm90_or_newer(filename):
     source = _kernel_source(filename)
+
+    assert "getSMVersion()" in source
+    assert "smVersion >= 90" in source
+    assert "requires Hopper (SM90) or newer" in source
+
+
+def test_fp8_grouped_gemm_alignment_checks_require_multiples_of_16():
+    source = _kernel_source("groupGemm.cu")
 
     assert "problem.n() % kFp8TmaAlignment == 0" in source
     assert "problem.k() % kFp8TmaAlignment == 0" in source
+
+
+def test_fp8_splitk_grouped_gemm_delegates_to_regular_grouped_gemm():
+    source = _kernel_source("splitkGroupGemm.cu")
+
+    assert "fp8SplitkGroupedGemm" not in source
+    assert "groupedGemm(problemSizes" in source
+
+
+def test_fp8_tma_alignment_has_one_cpp_definition():
+    kernels_dir = _REPO_ROOT / "cpp" / "tensorrt_llm" / "kernels"
+    definitions = sorted(
+        path
+        for path in kernels_dir.iterdir()
+        if path.suffix in {".cu", ".h"} and "kFp8TmaAlignment = 16" in path.read_text()
+    )
+
+    assert definitions == [kernels_dir / "groupGemm.h"]
 
 
 def test_fp8_cuda_graph_alignment_check_requires_rank_multiple_of_16():

@@ -234,8 +234,7 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
     case torch::kFloat8_e4m3fn: loraRuntimeDataType = tensorrt_llm::DataType::kFP8; break;
 #endif
     default:
-        TORCH_CHECK(
-            false, "Invalid dtype, only supports float16, bfloat16, float8_e4m3fn, got %s", c10::toString(dtype));
+        TORCH_CHECK(false, "Invalid dtype, only supports float16, bfloat16, float8_e4m3fn, got ", c10::toString(dtype));
     }
 
     int const minKnInt = std::max(1, static_cast<int>(minKN));
@@ -319,8 +318,7 @@ void lora_group_gemm_param_fill_row_reorder_fusion(th::Tensor const& in_sizes, /
     case torch::kFloat8_e4m3fn: loraRuntimeDataType = tensorrt_llm::DataType::kFP8; break;
 #endif
     default:
-        TORCH_CHECK(
-            false, "Invalid dtype, only supports float16, bfloat16, float8_e4m3fn, got %s", c10::toString(dtype));
+        TORCH_CHECK(false, "Invalid dtype, only supports float16, bfloat16, float8_e4m3fn, got ", c10::toString(dtype));
     }
 
     int64_t const dtype_element_size = input.element_size();

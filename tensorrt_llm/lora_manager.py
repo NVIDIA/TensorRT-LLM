@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from .runtime import ModelConfig
 
 NEMO_SUPPORTED_LORA_MODULES = {"attn_qkv"}
+_FP8_LORA_TMA_ALIGNMENT = 16
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,34 @@ def _is_moe_module_weights(module_weights: Dict) -> bool:
     return all(isinstance(k, int) for k in module_weights.keys()) and all(
         isinstance(v, dict) for v in module_weights.values()
     )
+
+
+def _validate_fp8_lora_alignment(
+    *,
+    rank: int,
+    input_size: int,
+    output_size: int,
+    layer_idx: int,
+    lora_module: str,
+) -> None:
+    dimensions = {
+        "rank": rank,
+        "input size": input_size,
+        "output size": output_size,
+    }
+    misaligned_dimensions = {
+        name: size for name, size in dimensions.items() if size % _FP8_LORA_TMA_ALIGNMENT != 0
+    }
+    if misaligned_dimensions:
+        formatted_dimensions = ", ".join(
+            f"{name}={size}" for name, size in misaligned_dimensions.items()
+        )
+        raise ValueError(
+            f"FP8 LoRA weights on Hopper require rank, input size, and output size "
+            f"to be multiples of {_FP8_LORA_TMA_ALIGNMENT} for 128-bit TMA alignment. "
+            f"Layer {layer_idx} module '{lora_module}' has {formatted_dimensions}. "
+            f"Use aligned adapter dimensions or non-FP8 LoRA weights."
+        )
 
 
 def get_all_nemo_lora_weights(
@@ -1049,6 +1078,30 @@ class LoraManager(object):
                     t_out = prepare_fused_lora_modules_for_tp(lora_module, t_out, rank_dim)
 
                     effective_rank = t_in.shape[rank_dim]
+                    is_fp8 = t_out.dtype == torch.float8_e4m3fn
+                    use_fp8_kernel = (
+                        is_fp8
+                        and not has_expert_indices
+                        and torch.cuda.get_device_capability()[0] >= 9
+                    )
+                    if use_fp8_kernel:
+                        if t_in.dtype != t_out.dtype:
+                            raise ValueError(
+                                "FP8 LoRA input and output weights must have the same dtype; "
+                                f"got {t_in.dtype} and {t_out.dtype} for layer {layer_idx} "
+                                f"module {lora_module}"
+                            )
+                        _validate_fp8_lora_alignment(
+                            rank=effective_rank,
+                            input_size=t_in.shape[-1],
+                            output_size=t_out.shape[-2],
+                            layer_idx=layer_idx,
+                            lora_module=lora_module,
+                        )
+                        if is_dora:
+                            raise NotImplementedError(
+                                "DoRA is not supported with FP8 LoRA weights on Hopper"
+                            )
 
                     t_in = t_in.cuda().contiguous()
                     t_out = t_out.cuda().contiguous()
@@ -1060,11 +1113,15 @@ class LoraManager(object):
                     else:
                         scale = float(hf_config["lora_alpha"]) / effective_rank
 
-                    is_fp8 = t_out.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-                    if is_fp8 and torch.cuda.get_device_capability()[0] >= 9:
+                    if use_fp8_kernel:
                         # Keep weights in FP8 for the native Hopper kernel.
                         # FP8 has no scalar multiply, so scale through BF16.
-                        t_out = (t_out.to(torch.bfloat16) * scale).to(t_out.dtype)
+                        fp8_max = torch.finfo(t_out.dtype).max
+                        t_out = (
+                            (t_out.to(torch.bfloat16) * scale)
+                            .clamp(-fp8_max, fp8_max)
+                            .to(t_out.dtype)
+                        )
                     else:
                         # Pre-Hopper kernels require the model compute dtype.
                         model_dtype = str_dtype_to_torch(model_config.dtype)

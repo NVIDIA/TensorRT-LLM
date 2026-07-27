@@ -24,6 +24,8 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+inline constexpr int kFp8TmaAlignment = 16;
+
 int64_t getGroupedGemmParamsWorkSpaceSize(int64_t problem_count);
 
 //! @brief Returns the parameter workspace size for the FP8 grouped GEMM path.

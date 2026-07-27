@@ -15,6 +15,7 @@
  */
 
 #include "cuda_graph_grouped_gemm.h"
+#include "groupGemm.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
@@ -43,14 +44,18 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+#ifdef ENABLE_FP8
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
 namespace
 {
-
-constexpr int kFp8TmaAlignment = 16;
 
 void checkFp8CudaGraphAlignment(
     cutlass::gemm::GemmCoord const* hostMaxProblemSizesPtr, int problemCount, int minKN, char const* kernelName)
 {
+    static int const smVersion = tensorrt_llm::common::getSMVersion();
+    TLLM_CHECK_WITH_INFO(
+        smVersion >= 90, "%s requires Hopper (SM90) or newer, but the current device is SM%d", kernelName, smVersion);
+
     TLLM_CHECK_WITH_INFO(minKN >= kFp8TmaAlignment && minKN % kFp8TmaAlignment == 0,
         "%s requires active LoRA ranks to be multiples of %d elements for 128-bit TMA alignment. "
         "The minimum K/N dimension is %d.",
@@ -72,6 +77,8 @@ void checkFp8CudaGraphAlignment(
 }
 
 } // namespace
+#endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
+#endif // ENABLE_FP8
 
 /**
  * Template for CUDA Graph compatible grouped GEMM that directly uses GPU tensors
