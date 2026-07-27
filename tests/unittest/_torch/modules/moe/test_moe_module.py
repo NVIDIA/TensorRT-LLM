@@ -1575,9 +1575,9 @@ def test_configurable_moe_single_gpu(
 # ============================================================================
 # FP32 Routing Bias Tests
 # ============================================================================
-# MiniMax-M2 and DeepSeek models can have fp32 routing_bias with bf16 model dtype.
-# These tests verify that the trtllmGen MoE backend correctly handles fp32 bias
-# across all quantization paths (fp4, fp8, mxfp4, fp8_per_tensor).
+# MiniMax-M2/M3 and DeepSeek models can have fp32 routing_bias with bf16 model
+# dtype. These tests verify that the trtllmGen MoE backend correctly handles
+# fp32 bias across all quantization paths (fp4, fp8, mxfp4, fp8_per_tensor).
 
 
 def _create_routing_method_with_bias(routing_method_cls, top_k, num_experts, bias_tensor):
@@ -1607,6 +1607,7 @@ def _create_routing_method_with_bias(routing_method_cls, top_k, num_experts, bia
     "routing_method_cls,moe_model_config",
     [
         (MiniMaxM2MoeRoutingMethod, MoeModelConfig(256, 6, 2048, 1408)),
+        (MiniMaxM3MoeRoutingMethod, MoeModelConfig(128, 4, 512, 512)),
         (DeepSeekV3MoeRoutingMethod, MoeModelConfig(256, 8, 7168, 2048, n_group=8, topk_group=4)),
     ],
 )
@@ -1624,10 +1625,12 @@ def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quan
     """
     Test that trtllmGen MoE backend correctly handles fp32 routing_bias.
 
-    MiniMax-M2 and DeepSeek models emit fp32 routing_bias from trust_remote_code
-    model definitions. This test verifies that the fp32 bias is correctly plumbed
-    through the thop boundary (TORCH_CHECK), Runner::run() (dtypeRoutingBias),
-    and routing kernels (mDtypeBias) without silent corruption (reading fp32 as bf16).
+    MiniMax-M2/M3 and DeepSeek models emit fp32 routing_bias from
+    trust_remote_code model definitions. This test verifies that the fp32 bias
+    is correctly plumbed through the thop boundary (TORCH_CHECK), Runner::run()
+    (dtypeRoutingBias), and routing kernels (mDtypeBias) without silent
+    corruption (reading fp32 as bf16). The MiniMax-M3 case also verifies its
+    routed scaling factor through the unified ConfigurableMoE output reference.
 
     Compares fused trtllmGen output against the PyTorch reference module.
     """
@@ -1658,9 +1661,9 @@ def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quan
     )
 
     dtype_routing_logits = None
-    if (
-        moe_backend == MoeBackendType.TRTLLM.value
-        and routing_method_cls == DeepSeekV3MoeRoutingMethod
+    if moe_backend == MoeBackendType.TRTLLM.value and routing_method_cls in (
+        DeepSeekV3MoeRoutingMethod,
+        MiniMaxM3MoeRoutingMethod,
     ):
         dtype_routing_logits = torch.float32
 
@@ -1673,40 +1676,6 @@ def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quan
         enable_autotune=True,
         routing_method_cls=routing_method_cls,
         dtype_routing_logits=dtype_routing_logits,
-        bias_dtype=torch.float32,
-    )
-
-
-def test_trtllm_gen_minimax_m3_integrated_routing_scale():
-    """TRTLLM-Gen integrated routing must preserve M3's routed scale."""
-    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
-        pytest.skip("TRTLLM-Gen NVFP4 integrated routing requires Blackwell")
-
-    model_config = MoeModelConfig(128, 4, 512, 512)
-    skip_reason = should_skip_trtllm(
-        MoeBackendType.TRTLLM,
-        QuantAlgo.NVFP4,
-        model_config,
-        routing_method_cls=MiniMaxM3MoeRoutingMethod,
-    )
-    if skip_reason:
-        pytest.skip(skip_reason)
-
-    # A single-rank, non-attention-DP mapping makes ConfigurableMoE pass
-    # router_logits into TRTLLM-Gen, exercising the integrated MiniMax2/M3
-    # routing kernel rather than the scheduler's separated routing path.
-    _test_moe_worker(
-        moe_backend=MoeBackendType.TRTLLM.value,
-        dtype=torch.bfloat16,
-        quant_algo=QuantAlgo.NVFP4,
-        model_config=model_config,
-        seq_len=8,
-        enable_autotune=True,
-        routing_method_cls=MiniMaxM3MoeRoutingMethod,
-        dtype_routing_logits=torch.float32,
-        swiglu_alpha=1.702,
-        swiglu_beta=1.0,
-        swiglu_limit=7.0,
         bias_dtype=torch.float32,
     )
 

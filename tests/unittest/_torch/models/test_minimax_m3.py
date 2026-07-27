@@ -767,7 +767,9 @@ def test_minimax_m3_routing_method_default_scale_is_identity():
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="fused MiniMax-M3 routing requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 64, 8192])
-def test_minimax_m3_fused_routing_matches_reference(num_tokens, monkeypatch):
+def test_minimax_m3_fused_routing_matches_reference(
+    num_tokens: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     num_experts = 128
     top_k = 4
     routed_scaling_factor = 2.0
@@ -814,7 +816,7 @@ def test_minimax_m3_fused_routing_matches_reference(num_tokens, monkeypatch):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="fused MiniMax-M3 routing requires CUDA")
-def test_minimax_m3_fused_routing_cuda_graph_replay_tracks_inputs():
+def test_minimax_m3_fused_routing_cuda_graph_replay_tracks_inputs() -> None:
     num_tokens = 64
     num_experts = 128
     torch.manual_seed(1)
