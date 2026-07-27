@@ -16,7 +16,7 @@ from tensorrt_llm._torch.speculative.interface import (
 from tensorrt_llm._torch.speculative.utils import (
     get_num_extra_kv_tokens,
     get_num_spec_layers,
-    update_spec_config_from_loaded_model,
+    update_spec_config_from_model_config,
 )
 from tensorrt_llm.llmapi import MTPDecodingConfig
 
@@ -38,6 +38,12 @@ def test_external_checkpoint_does_not_imply_shared_kv_cache():
         speculative_model="/tmp/assistant",
         mtp_eagle_one_model=True,
     )
+    model_config = SimpleNamespace(
+        architectures=["LlamaForCausalLM"],
+        num_nextn_predict_layers=1,
+    )
+
+    update_spec_config_from_model_config(spec_config, model_config)
 
     assert not uses_shared_kv_cache(spec_config)
     assert get_num_spec_layers(spec_config) == 1
@@ -45,21 +51,24 @@ def test_external_checkpoint_does_not_imply_shared_kv_cache():
     assert should_use_separate_draft_kv_cache(spec_config)
 
 
-def test_loaded_draft_capability_updates_runtime_spec_config():
+@pytest.mark.parametrize("one_model,expected", [(True, True), (False, False)])
+def test_gemma4_config_sets_shared_kv_cache_for_one_model_only(
+    one_model,
+    expected,
+):
     spec_config = MTPDecodingConfig(
         max_draft_len=3,
         speculative_model="/tmp/gemma4-assistant",
-        mtp_eagle_one_model=True,
+        mtp_eagle_one_model=one_model,
     )
-    model = SimpleNamespace(
-        config=SimpleNamespace(num_nextn_predict_layers=1),
-        draft_config=None,
-        draft_model=SimpleNamespace(shares_target_kv_cache=True),
+    model_config = SimpleNamespace(
+        architectures=["Gemma4ForConditionalGeneration"],
+        num_nextn_predict_layers=1,
     )
 
-    update_spec_config_from_loaded_model(spec_config, model)
+    update_spec_config_from_model_config(spec_config, model_config)
 
-    assert uses_shared_kv_cache(spec_config)
+    assert uses_shared_kv_cache(spec_config) is expected
 
 
 def test_external_shared_kv_uses_no_draft_kv_cache():

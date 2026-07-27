@@ -1226,8 +1226,6 @@ class Gemma4TextModel(DecoderModel):
 
 @register_auto_model("Gemma4ForCausalLM")
 class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
-    external_draft_shares_target_kv_cache = True
-
     def __init__(
         self,
         model_config: ModelConfig[Gemma4TextConfig],

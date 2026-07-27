@@ -843,8 +843,6 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
     - mm_token_type_ids-based bidirectional masking
     """
 
-    external_draft_shares_target_kv_cache = True
-
     def __init__(self, model_config: ModelConfig[Gemma4Config]):
         if _is_mm_disagg():
             raise NotImplementedError(
