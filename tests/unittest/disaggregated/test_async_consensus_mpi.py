@@ -36,15 +36,11 @@ def test_async_consensus_real_mpi_four_rank_protocol() -> None:
         pytest.skip("mpirun not found on PATH")
 
     worker = Path(__file__).with_name("async_consensus_mpi_worker.py")
-    repository_root = worker.parents[3]
     env = os.environ.copy()
     env.update(
         {
             "OMPI_ALLOW_RUN_AS_ROOT": "1",
             "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
-            "PYTHONPATH": os.pathsep.join(
-                filter(None, (str(repository_root), env.get("PYTHONPATH")))
-            ),
             "PYTHONUNBUFFERED": "1",
         }
     )

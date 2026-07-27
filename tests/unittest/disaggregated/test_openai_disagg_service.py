@@ -412,7 +412,12 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
         service._ctx_client = AsyncMock()
         service._gen_client = AsyncMock()
         ctx_server_info = {
-            "server_info": {"disaggregated_params": {"encoded_opaque_state": opaque_state}}
+            "server_info": {
+                "disaggregated_params": {
+                    "encoded_opaque_state": opaque_state,
+                    "ctx_info_endpoint": ["tcp://ctx:9000"],
+                }
+            }
         }
         service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", ctx_server_info))
         service._gen_router.get_next_server = AsyncMock(
@@ -511,7 +516,18 @@ async def test_send_disagg_request_leaves_streaming_usage_to_gen_server(schedule
     service = _make_service(schedule_style)
     service._ctx_client = AsyncMock()
     service._gen_client = AsyncMock()
-    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    service._ctx_router.get_next_server = AsyncMock(
+        return_value=(
+            "ctx:9000",
+            {
+                "server_info": {
+                    "disaggregated_params": {
+                        "ctx_info_endpoint": ["tcp://ctx:9000"],
+                    }
+                }
+            },
+        )
+    )
     service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
 
     async def _ctx_response(request, *_args, **_kwargs):
