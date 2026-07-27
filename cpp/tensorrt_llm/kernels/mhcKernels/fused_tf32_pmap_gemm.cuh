@@ -101,48 +101,57 @@ __device__ __forceinline__ uint32_t get_swizzled_smem_offset(uint32_t const& off
 
 // Packed fp32x2 helpers (sm_100 f32x2 ALU). Per-lane IEEE fp32, identical
 // numerics to scalar fmaf/mul chains, at half the instruction count.
-__device__ __forceinline__ unsigned long long mhc_f2ll(float2 v)
+__device__ __forceinline__ unsigned long long bitcast_f32x2_to_u64(float2 v)
 {
     unsigned long long r;
     memcpy(&r, &v, sizeof(r));
     return r;
 }
 
-__device__ __forceinline__ float2 mhc_ll2f(unsigned long long v)
+__device__ __forceinline__ float2 bitcast_u64_to_f32x2(unsigned long long v)
 {
     float2 r;
     memcpy(&r, &v, sizeof(r));
     return r;
 }
 
-__device__ __forceinline__ float2 mhc_mul2(float a, float2 b)
+__device__ __forceinline__ float2 mul_f32x2(float a, float2 b)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
     unsigned long long d;
-    asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(d) : "l"(mhc_f2ll(float2{a, a})), "l"(mhc_f2ll(b)));
-    return mhc_ll2f(d);
+    asm("mul.rn.ftz.f32x2 %0, %1, %2;"
+        : "=l"(d)
+        : "l"(bitcast_f32x2_to_u64(float2{a, a})), "l"(bitcast_f32x2_to_u64(b)));
+    return bitcast_u64_to_f32x2(d);
 #else
     return float2{a * b.x, a * b.y};
 #endif
 }
 
-__device__ __forceinline__ float2 mhc_fma2(float a, float2 b, float2 c)
+// Scalar `a` is broadcast to both lanes: {a * b.x + c.x, a * b.y + c.y}.
+__device__ __forceinline__ float2 fma_f32x2(float a, float2 b, float2 c)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
     unsigned long long d;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(d) : "l"(mhc_f2ll(float2{a, a})), "l"(mhc_f2ll(b)), "l"(mhc_f2ll(c)));
-    return mhc_ll2f(d);
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
+        : "=l"(d)
+        : "l"(bitcast_f32x2_to_u64(float2{a, a})), "l"(bitcast_f32x2_to_u64(b)), "l"(bitcast_f32x2_to_u64(c)));
+    return bitcast_u64_to_f32x2(d);
 #else
     return float2{fmaf(a, b.x, c.x), fmaf(a, b.y, c.y)};
 #endif
 }
 
-__device__ __forceinline__ float2 mhc_fma2v(float2 a, float2 b, float2 c)
+// `_vv`: vector-by-vector, i.e. all three operands are per-lane vectors
+// (no broadcast): {a.x * b.x + c.x, a.y * b.y + c.y}.
+__device__ __forceinline__ float2 fma_f32x2_vv(float2 a, float2 b, float2 c)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
     unsigned long long d;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(d) : "l"(mhc_f2ll(a)), "l"(mhc_f2ll(b)), "l"(mhc_f2ll(c)));
-    return mhc_ll2f(d);
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
+        : "=l"(d)
+        : "l"(bitcast_f32x2_to_u64(a)), "l"(bitcast_f32x2_to_u64(b)), "l"(bitcast_f32x2_to_u64(c)));
+    return bitcast_u64_to_f32x2(d);
 #else
     return float2{fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y)};
 #endif
@@ -553,17 +562,17 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 #pragma unroll
                 for (uint32_t hc = 0; hc < HC_MULT; ++hc)
                 {
-                    float2 nu0 = mhc_mul2(pm_u[hc], xf[0][i + 0]);
-                    float2 nu1 = mhc_mul2(pm_u[hc], xf[0][i + 1]);
-                    float2 nl0 = mhc_mul2(pm_l[hc], xf[1][i + 0]);
-                    float2 nl1 = mhc_mul2(pm_l[hc], xf[1][i + 1]);
+                    float2 nu0 = mul_f32x2(pm_u[hc], xf[0][i + 0]);
+                    float2 nu1 = mul_f32x2(pm_u[hc], xf[0][i + 1]);
+                    float2 nl0 = mul_f32x2(pm_l[hc], xf[1][i + 0]);
+                    float2 nl1 = mul_f32x2(pm_l[hc], xf[1][i + 1]);
 #pragma unroll
                     for (uint32_t j = 0; j < HC_MULT; ++j)
                     {
-                        nu0 = mhc_fma2(cm_u[j][hc], r_u[j][0], nu0);
-                        nu1 = mhc_fma2(cm_u[j][hc], r_u[j][1], nu1);
-                        nl0 = mhc_fma2(cm_l[j][hc], r_l[j][0], nl0);
-                        nl1 = mhc_fma2(cm_l[j][hc], r_l[j][1], nl1);
+                        nu0 = fma_f32x2(cm_u[j][hc], r_u[j][0], nu0);
+                        nu1 = fma_f32x2(cm_u[j][hc], r_u[j][1], nu1);
+                        nl0 = fma_f32x2(cm_l[j][hc], r_l[j][0], nl0);
+                        nl1 = fma_f32x2(cm_l[j][hc], r_l[j][1], nl1);
                     }
                     nv_bfloat162 b_u0 = __float22bfloat162_rn(nu0);
                     nv_bfloat162 b_u1 = __float22bfloat162_rn(nu1);
@@ -573,10 +582,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                     float2 ru1 = __bfloat1622float2(b_u1);
                     float2 rl0 = __bfloat1622float2(b_l0);
                     float2 rl1 = __bfloat1622float2(b_l1);
-                    sqr2_u = mhc_fma2v(ru0, ru0, sqr2_u);
-                    sqr2_u = mhc_fma2v(ru1, ru1, sqr2_u);
-                    sqr2_l = mhc_fma2v(rl0, rl0, sqr2_l);
-                    sqr2_l = mhc_fma2v(rl1, rl1, sqr2_l);
+                    sqr2_u = fma_f32x2_vv(ru0, ru0, sqr2_u);
+                    sqr2_u = fma_f32x2_vv(ru1, ru1, sqr2_u);
+                    sqr2_l = fma_f32x2_vv(rl0, rl0, sqr2_l);
+                    sqr2_l = fma_f32x2_vv(rl1, rl1, sqr2_l);
                     cute::SM100_TMEM_STORE_16dp256b1x::copy(*reinterpret_cast<uint32_t*>(&ru0.x),
                         *reinterpret_cast<uint32_t*>(&ru0.y), *reinterpret_cast<uint32_t*>(&rl0.x),
                         *reinterpret_cast<uint32_t*>(&rl0.y), hc * BLOCK_K + (i + 0) * 8);
