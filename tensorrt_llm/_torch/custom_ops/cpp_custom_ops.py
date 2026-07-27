@@ -301,6 +301,23 @@ def _register_fake():
         # In-place operation, no return value.
         pass
 
+    @torch.library.register_fake("trtllm::fp8_block_scaling_gemm_trtllm")
+    def _(a, b, a_scale, b_scale):
+        m = a.shape[0]
+        n = b.shape[0]
+        return a.new_empty((m, n), dtype=torch.bfloat16)
+
+    @torch.library.register_fake("trtllm::fp8_block_scaling_gemm_deep_gemm")
+    def _(a, b, a_scale, b_scale):
+        m = a.shape[0]
+        n = b.shape[0]
+        return a.new_empty((m, n), dtype=torch.bfloat16)
+
+    @torch.library.register_fake(
+        "trtllm::fp8_block_scaling_gemm_deep_gemm_available")
+    def _(reference):
+        return False
+
     @torch.library.register_fake("tensorrt_llm::quantize_e4m3_per_tensor")
     def _(input: torch.Tensor):
         scale_shape = [1] * input.dim()

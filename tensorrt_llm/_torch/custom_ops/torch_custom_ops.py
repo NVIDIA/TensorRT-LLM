@@ -39,6 +39,11 @@ from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from .fast_custom_op import fast_custom_op
+from .fp8_block_scaling_dispatch import DispatchBackend
+from .fp8_block_scaling_dispatch_runtime import (
+    get_dispatch_decision,
+    legacy_backend_override_enabled,
+)
 
 if IS_FLASHINFER_AVAILABLE:
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
@@ -1953,54 +1958,32 @@ def _(
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
 
-# The runner is used to trigger deepgemm jit during autotune.
 class Fp8BlockScalingGemmRunner(TunableRunner):
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
-        tune_max_num_tokens=4096,
-    )
-
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
-    ) -> List[int]:
-        return [0]
+    ) -> List[DispatchBackend]:
+        del profile
+        tactics = [DispatchBackend.TRTLLM]
+        if torch.ops.trtllm.fp8_block_scaling_gemm_deep_gemm_available(inputs[0]):
+            tactics.append(DispatchBackend.DEEP_GEMM)
+        return tactics
 
     def forward(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: DispatchBackend = DispatchBackend.TRTLLM,
     ) -> torch.Tensor:
         a, b, a_scale, b_scale = inputs
-        return torch.ops.trtllm.fp8_block_scaling_gemm_impl(
-            a, b, a_scale, b_scale)
-
-
-def _fp8_block_scaling_gemm_sm100_constraint(inputs: List[List[int]]) -> int:
-    return inputs[0][0]
-
-
-def _fp8_quantize_1x128_sm90_constraint(inputs: List[List[int]]) -> int:
-    # The implementation aligns with the fp8_quantize_1x128 custom op.
-    pad_m = fp4_utils.pad_up(inputs[0][0], 4)
-    blocked_n = (inputs[0][1] + 127) // 128
-    return fp4_utils.pad_up(pad_m * blocked_n * 4, 128) // 4
-
-
-@lru_cache(maxsize=None)
-def _get_fp8_block_scaling_gemm_constraint_spec(
-        sm_version: int) -> Tuple[ConstraintSpec, ...]:
-    if sm_version >= 100:
-        return (ConstraintSpec(2, 1,
-                               _fp8_block_scaling_gemm_sm100_constraint), )
-    else:
-        return (ConstraintSpec(2, 0, _fp8_quantize_1x128_sm90_constraint), )
-
-
-def get_fp8_block_scaling_gemm_constraint_spec() -> Tuple[ConstraintSpec, ...]:
-    return _get_fp8_block_scaling_gemm_constraint_spec(get_sm_version())
+        match tactic:
+            case DispatchBackend.TRTLLM:
+                return torch.ops.trtllm.fp8_block_scaling_gemm_trtllm(
+                    a, b, a_scale, b_scale)
+            case DispatchBackend.DEEP_GEMM:
+                return torch.ops.trtllm.fp8_block_scaling_gemm_deep_gemm(
+                    a, b, a_scale, b_scale)
+        raise ValueError(f"Unsupported FP8 block-scaling GEMM tactic: {tactic}")
 
 
 @torch.library.custom_op("trtllm::fp8_block_scaling_gemm", mutates_args=())
@@ -2011,22 +1994,15 @@ def fp8_block_scaling_gemm(
     b_scale: torch.Tensor,
     tune_max_num_tokens: int = 4096,
 ) -> torch.Tensor:
-    tuner = AutoTuner.get()
+    if legacy_backend_override_enabled():
+        return torch.ops.trtllm.fp8_block_scaling_gemm_impl(
+            a, b, a_scale, b_scale)
     fp8_block_scaling_gemm_runner = Fp8BlockScalingGemmRunner()
-    Fp8BlockScalingGemmRunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
-
-    Fp8BlockScalingGemmRunner.tuning_config.constraint_specs = get_fp8_block_scaling_gemm_constraint_spec(
-    )
-
-    _, best_tactic = tuner.choose_one(
-        "trtllm::fp8_block_scaling_gemm",
-        [fp8_block_scaling_gemm_runner],
-        Fp8BlockScalingGemmRunner.tuning_config,
-        [a, b, a_scale, b_scale],
-    )
+    del tune_max_num_tokens
+    decision = get_dispatch_decision(a, b, a_scale, b_scale)
     return fp8_block_scaling_gemm_runner(
         inputs=[a, b, a_scale, b_scale],
-        tactic=best_tactic,
+        tactic=decision.backend,
     )
 
 

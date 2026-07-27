@@ -572,6 +572,16 @@ torch::Tensor fp8_block_scaling_gemm_deep_gemm(torch::Tensor const& mat1, torch:
 #endif
 }
 
+bool fp8_block_scaling_gemm_deep_gemm_available(torch::Tensor const& reference)
+{
+    static_cast<void>(reference);
+#if defined(TRTLLM_ENABLE_DEEP_GEMM_THOP)
+    return tensorrt_llm::common::getSMVersion() == 90;
+#else
+    return false;
+#endif
+}
+
 torch::Tensor fp8_block_scaling_moe_gemm_hopper(torch::Tensor const& mat1, torch::Tensor const& mat2,
     torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset)
 {
@@ -774,6 +784,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     // Internal forced-backend ops for the shape-gated dispatcher (deterministic, env-var-free).
     m.def("fp8_block_scaling_gemm_trtllm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale) -> Tensor");
     m.def("fp8_block_scaling_gemm_deep_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale) -> Tensor");
+    m.def("fp8_block_scaling_gemm_deep_gemm_available(Tensor reference) -> bool");
     m.def(
         "fp8_block_scaling_bmm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, ScalarType? "
         "out_dtype=None) -> Tensor");
@@ -790,6 +801,8 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("fp8_block_scaling_gemm_impl", &tensorrt_llm::torch_ext::fp8_block_scaling_gemm);
     m.impl("fp8_block_scaling_gemm_trtllm", &tensorrt_llm::torch_ext::fp8_block_scaling_gemm_trtllm);
     m.impl("fp8_block_scaling_gemm_deep_gemm", &tensorrt_llm::torch_ext::fp8_block_scaling_gemm_deep_gemm);
+    m.impl("fp8_block_scaling_gemm_deep_gemm_available",
+        &tensorrt_llm::torch_ext::fp8_block_scaling_gemm_deep_gemm_available);
     m.impl("fp8_block_scaling_bmm", &tensorrt_llm::torch_ext::fp8_block_scaling_bmm);
     m.impl("fp8_block_scaling_bmm_out", &tensorrt_llm::torch_ext::fp8_block_scaling_bmm_out);
     m.impl("fp8_block_scaling_moe_gemm", &tensorrt_llm::torch_ext::fp8_block_scaling_moe_gemm);
