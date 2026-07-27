@@ -8254,13 +8254,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      emit_block_meta=False,
                      emit_hit_stats=True,
                      emit_seed_counts=False,
+                     seed_packed=False,
                      emit_cand=False,
                      cand_cap=5120):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
-                   emit_seed_counts, emit_cand, cand_cap)
+                   emit_seed_counts, seed_packed, emit_cand, cand_cap)
             if key in cls.kernel_cache:
                 return
 
@@ -8356,14 +8357,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seed_thr_fake = None
             seed_counts_fake = None
             if emit_seed_counts:
-                seed_thr_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Float32, (cute.sym_int(), 3),
-                    stride_order=(1, 0),
-                    assumed_align=4)
-                seed_counts_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32, (cute.sym_int(), 3),
-                    stride_order=(1, 0),
-                    assumed_align=4)
+                if seed_packed:
+                    # single [rows, 8] fp32 packed seed row: lines at
+                    # cols 0..2 (kernel reads (row, j<=2) unchanged),
+                    # counts accumulate as fp32 at cols 3..5; the same
+                    # tensor is bound to both params.
+                    seed_thr_fake = cute.runtime.make_fake_compact_tensor(
+                        cutlass.Float32, (cute.sym_int(), 8),
+                        stride_order=(1, 0),
+                        assumed_align=4)
+                    seed_counts_fake = cute.runtime.make_fake_compact_tensor(
+                        cutlass.Float32, (cute.sym_int(), 8),
+                        stride_order=(1, 0),
+                        assumed_align=4)
+                else:
+                    seed_thr_fake = cute.runtime.make_fake_compact_tensor(
+                        cutlass.Float32, (cute.sym_int(), 3),
+                        stride_order=(1, 0),
+                        assumed_align=4)
+                    seed_counts_fake = cute.runtime.make_fake_compact_tensor(
+                        cutlass.Int32, (cute.sym_int(), 3),
+                        stride_order=(1, 0),
+                        assumed_align=4)
 
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
@@ -8382,6 +8397,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 emit_block_meta=emit_block_meta,
                 emit_hit_stats=emit_hit_stats,
                 emit_seed_counts=emit_seed_counts,
+                seed_packed=seed_packed,
                 emit_cand=emit_cand,
                 cand_cap=cand_cap,
             )
@@ -8549,28 +8565,44 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert (block_max_out.shape == (B * next_n, nrec)
                         and block_max_out.is_contiguous())
 
+            seed_packed = False
             if emit_seed_counts:
                 assert emit_block_meta, (
                     "emit_seed_counts requires emit_block_meta")
-                # Per-row seed-count emission: 3 thresholds per row (fp32,
-                # post-conversion value domain), counts accumulated with
-                # red.global.add.s32 — the caller must zero seed_counts_out
-                # each step.
-                assert (
-                    seed_thr is not None and seed_thr.dtype == torch.float32
-                    and seed_thr.is_cuda and seed_thr.is_contiguous()
-                    and seed_thr.shape == (B * next_n, 3)
-                ), (f"emit_seed_counts requires seed_thr fp32 "
-                    f"[{B * next_n}, 3]; got "
-                    f"{None if seed_thr is None else (seed_thr.dtype, tuple(seed_thr.shape))}"
-                    )
-                assert (seed_counts_out is not None
-                        and seed_counts_out.dtype == torch.int32
-                        and seed_counts_out.is_cuda
-                        and seed_counts_out.is_contiguous()
-                        and seed_counts_out.shape == (B * next_n, 3)), (
-                            "emit_seed_counts requires a caller-zeroed "
-                            "seed_counts_out int32 [B*next_n, 3]")
+                if seed_counts_out is None:
+                    # Packed contract: seed_thr IS the [rows, 8] fp32 seed
+                    # row (top-k pre-packed layout). Lines at cols 0..2;
+                    # counts accumulate as fp32 at cols 3..5 - the caller
+                    # zeroes cols 3..7 and writes lines each step. The
+                    # same buffer then feeds the top-k launch directly.
+                    seed_packed = True
+                    assert (
+                        seed_thr is not None and seed_thr.dtype == torch.float32
+                        and seed_thr.is_cuda and seed_thr.is_contiguous()
+                        and seed_thr.shape == (B * next_n, 8)
+                    ), (f"packed emit_seed_counts requires seed_thr fp32 "
+                        f"[{B * next_n}, 8]; got "
+                        f"{None if seed_thr is None else (seed_thr.dtype, tuple(seed_thr.shape))}"
+                        )
+                    seed_counts_out = seed_thr
+                else:
+                    # Legacy split contract: 3 thresholds per row (fp32),
+                    # counts accumulated with red.global.add.s32 into a
+                    # caller-zeroed int32 [rows, 3].
+                    assert (
+                        seed_thr is not None and seed_thr.dtype == torch.float32
+                        and seed_thr.is_cuda and seed_thr.is_contiguous()
+                        and seed_thr.shape == (B * next_n, 3)
+                    ), (f"emit_seed_counts requires seed_thr fp32 "
+                        f"[{B * next_n}, 3]; got "
+                        f"{None if seed_thr is None else (seed_thr.dtype, tuple(seed_thr.shape))}"
+                        )
+                    assert (seed_counts_out.dtype == torch.int32
+                            and seed_counts_out.is_cuda
+                            and seed_counts_out.is_contiguous()
+                            and seed_counts_out.shape == (B * next_n, 3)), (
+                                "emit_seed_counts requires a caller-zeroed "
+                                "seed_counts_out int32 [B*next_n, 3]")
             else:
                 seed_thr = None
                 seed_counts_out = None
@@ -8604,7 +8636,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
-                   emit_seed_counts, emit_cand, cand_cap)
+                   emit_seed_counts, seed_packed, emit_cand, cand_cap)
             if key not in cls.kernel_cache:
                 cls._compile(
                     compute_block_kv,
@@ -8620,6 +8652,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     emit_block_meta=emit_block_meta,
                     emit_hit_stats=emit_hit_stats,
                     emit_seed_counts=emit_seed_counts,
+                    seed_packed=seed_packed,
                     emit_cand=emit_cand,
                     cand_cap=cand_cap)
             compiled = cls.kernel_cache[key]

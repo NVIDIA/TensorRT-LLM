@@ -469,6 +469,7 @@ class FP4MQALogitsKernel:
         emit_block_meta: bool = False,
         emit_hit_stats: bool = True,
         emit_seed_counts: bool = False,
+        seed_packed: bool = False,
         emit_cand: bool = False,
         cand_cap: int = 5120,
     ):
@@ -559,6 +560,14 @@ class FP4MQALogitsKernel:
         if emit_seed_counts and not emit_block_meta:
             raise ValueError("emit_seed_counts requires emit_block_meta")
         self.emit_seed_counts = emit_seed_counts
+        # seed_packed: single [num_rows, 8] fp32 seed row per the top-k
+        # pre-packed contract - lines at cols 0..2, counts ACCUMULATED AS
+        # FLOATS at cols 3..5 (exact to 2^24; red.global.add.f32). The
+        # caller zeroes cols 3..7 and writes the lines each step; the
+        # same buffer feeds the top-k launch with no host repack.
+        if seed_packed and not emit_seed_counts:
+            raise ValueError("seed_packed requires emit_seed_counts")
+        self.seed_packed = seed_packed
         # emit_cand (L2 of the epilogue suite): unordered pre-collect of all
         # (value, index) pairs >= the t_0 seed threshold via warp ballot +
         # lane0 batch atomic claim. claimed >= K certifies the candidate
@@ -1068,8 +1077,11 @@ class FP4MQALogitsKernel:
     @cute.jit
     def _flush_seed_counts(self, mSeedCounts, q_idx, scnt, meta_lane):
         """Warp-redux the lane-local seed counters and fire one lane-0
-        red.global.add.s32 per (t, threshold). Caller zero-initializes
-        mSeedCounts each step; cross-CTA totals accumulate atomically."""
+        red.global.add per (t, threshold). Caller zero-initializes the
+        count slots each step; cross-CTA totals accumulate atomically.
+
+        seed_packed: mSeedCounts IS the [num_rows, 8] packed seed row -
+        counts land as fp32 at cols 3..5 (exact to 2^24)."""
         next_n = cutlass.const_expr(self.next_n)
         base_addr = mSeedCounts.iterator.toint()
         for t in cutlass.range_constexpr(next_n):
@@ -1077,10 +1089,16 @@ class FP4MQALogitsKernel:
                 w_cnt = cute.arch.warp_redux_sync(scnt[t * 3 + j], "add")
                 if meta_lane == cutlass.Int32(0):
                     row = q_idx * cutlass.Int32(next_n) + cutlass.Int32(t)
-                    addr = base_addr + (
-                        cutlass.Int64(row) * cutlass.Int64(3) + cutlass.Int64(j)
-                    ) * cutlass.Int64(4)
-                    _red_global_add_s32(addr, w_cnt)
+                    if cutlass.const_expr(self.seed_packed):
+                        addr = base_addr + (
+                            cutlass.Int64(row) * cutlass.Int64(8) + cutlass.Int64(3 + j)
+                        ) * cutlass.Int64(4)
+                        _red_global_add_f32(addr, cutlass.Float32(w_cnt))
+                    else:
+                        addr = base_addr + (
+                            cutlass.Int64(row) * cutlass.Int64(3) + cutlass.Int64(j)
+                        ) * cutlass.Int64(4)
+                        _red_global_add_s32(addr, w_cnt)
                 scnt[t * 3 + j] = cutlass.Int32(0)
 
     @cute.jit
@@ -2216,14 +2234,18 @@ class FP4MQALogitsKernel:
                             if cutlass.const_expr(self.emit_seed_counts):
                                 if q_idx_old < batch_size:
                                     self._flush_seed_counts(mSeedCounts, q_idx_old, scnt, meta_lane)
+                                # (re)load this q's thresholds - gated on
+                                # emit_seed_counts, NOT emit_cand: counts-
+                                # only mode needs them too (a stale
+                                # FLT_MAX default zeroes every counter)
+                                for _t in cutlass.range_constexpr(next_n):
+                                    for _j in cutlass.range_constexpr(3):
+                                        sthr[_t * 3 + _j] = mSeedThr[(q_idx * next_n + _t, _j)]
                             if cutlass.const_expr(self.emit_cand):
                                 if q_idx_old < batch_size:
                                     self._flush_cand_window(
                                         mCand, q_idx_old, cwbase, cwleft, meta_lane
                                     )
-                                for _t in cutlass.range_constexpr(next_n):
-                                    for _j in cutlass.range_constexpr(3):
-                                        sthr[_t * 3 + _j] = mSeedThr[(q_idx * next_n + _t, _j)]
                             ctx_cur = mContextLens[q_idx]
 
                     # Process KV block for group 0 (kv_idx + 0)
@@ -2760,14 +2782,17 @@ class FP4MQALogitsKernel:
                             if cutlass.const_expr(self.emit_seed_counts):
                                 if q_idx_old < batch_size:
                                     self._flush_seed_counts(mSeedCounts, q_idx_old, scnt, meta_lane)
+                                # (re)load this q's thresholds - gated on
+                                # emit_seed_counts, NOT emit_cand (see the
+                                # WG0 twin above)
+                                for _t in cutlass.range_constexpr(next_n):
+                                    for _j in cutlass.range_constexpr(3):
+                                        sthr[_t * 3 + _j] = mSeedThr[(q_idx * next_n + _t, _j)]
                             if cutlass.const_expr(self.emit_cand):
                                 if q_idx_old < batch_size:
                                     self._flush_cand_window(
                                         mCand, q_idx_old, cwbase, cwleft, meta_lane
                                     )
-                                for _t in cutlass.range_constexpr(next_n):
-                                    for _j in cutlass.range_constexpr(3):
-                                        sthr[_t * 3 + _j] = mSeedThr[(q_idx * next_n + _t, _j)]
                             ctx_cur = mContextLens[q_idx]
 
                     # Process KV block for group 1 (kv_idx + 1)

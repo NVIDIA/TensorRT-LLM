@@ -766,12 +766,14 @@ def test_cute_dsl_fp4_paged_mqa_logits_block_meta(
 @pytest.mark.parametrize("avg_ctx", [4096, 4224])
 @pytest.mark.parametrize("phys_block_kv", [64, 128])
 @pytest.mark.parametrize("fix_length", [True, False])
+@pytest.mark.parametrize("packed", [False, True])
 def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
     batch_size,
     next_n,
     avg_ctx,
     phys_block_kv,
     fix_length,
+    packed,
 ):
     """emit_seed_counts exactness: per-row counts of logits >= threshold
     recomputed from the KERNEL'S OWN logits output (the count contract is
@@ -867,7 +869,15 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         seed_thr[row, 1] = torch.quantile(vals, 0.90)
         seed_thr[row, 2] = torch.quantile(vals, 0.998)
 
-    seed_counts = torch.zeros((num_rows, 3), dtype=torch.int32, device=device)
+    if packed:
+        # Packed contract: one [rows, 8] fp32 seed row, lines at cols
+        # 0..2, counts accumulate as fp32 at cols 3..5 (caller zeroes).
+        seed_row = torch.zeros((num_rows, 8), dtype=torch.float32, device=device)
+        seed_row[:, 0:3] = seed_thr
+        thr_arg, counts_arg = seed_row, None
+    else:
+        seed_counts = torch.zeros((num_rows, 3), dtype=torch.int32, device=device)
+        thr_arg, counts_arg = seed_thr, seed_counts
     block_max.fill_(nan)
     logits, _, _ = CuteDSLFP4PagedMQALogitsRunner.forward(
         q_fp4,
@@ -882,14 +892,22 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         emit_hit_stats=False,
         block_max_out=block_max,
         emit_seed_counts=True,
-        seed_thr=seed_thr,
-        seed_counts_out=seed_counts,
+        seed_thr=thr_arg,
+        seed_counts_out=counts_arg,
         **common,
     )
     torch.cuda.synchronize()
 
     lf = logits.float()
-    torch.testing.assert_close(lf, lf0, atol=0.0, rtol=0.0)
+    # compare valid prefixes only: past ctx the buffer is unwritten
+    # allocator garbage and differs run-to-run
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        torch.testing.assert_close(lf[row, :ctx], lf0[row, :ctx], atol=0.0, rtol=0.0)
+    if packed:
+        assert torch.equal(seed_row[:, 0:3], seed_thr), "lines clobbered"
+        assert (seed_row[:, 6:8] == 0).all(), "stray write past counts"
+        seed_counts = seed_row[:, 3:6].to(torch.int32)
     for row in range(num_rows):
         ctx = int(context_lens[row // next_n].item())
         tag = f"row={row} ctx={ctx} next_n={next_n} pbk={phys_block_kv}"
