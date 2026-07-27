@@ -5404,6 +5404,9 @@ class GvrTopKKernel:
         # CTA-uniform and the dynamic branches below stay convergent.
         ck0 = cutlass.Int64(0)
         ck1 = cutlass.Int64(0)
+        ckE = cutlass.Int64(0)
+        if cutlass.const_expr(_P4_TAIL_DBG):
+            ckE = cute.arch.clock64()  # row-phase entry (device-residency ref)
         ext_row = cutlass.Int32(0)
         if cutlass.const_expr(self.use_ext_counts):
             # line validity mirrors ext_rungs: ALL THREE lines finite and
@@ -6794,6 +6797,11 @@ class GvrTopKKernel:
                         xstate_row[2] = anch_pub
                         if cutlass.const_expr(_P4_TAIL_DBG):
                             ck3 = cute.arch.clock64()
+                            # [1] device total (entry->publish), [2] true
+                            # in-kernel prologue (entry->walk start): wall
+                            # minus [1] = host/launch, NOT kernel work
+                            xstate_row[1] = cutlass.Float32(cutlass.Int32(ck3 - ckE))
+                            xstate_row[2] = cutlass.Float32(cutlass.Int32(ck0 - ckE))
                             xstate_row[4] = cutlass.Float32(cutlass.Int32(ck1 - ck0))  # walk+flags
                             xstate_row[5] = cutlass.Float32(cutlass.Int32(ck2 - ck1))  # P2/P3 gap
                             xstate_row[6] = cutlass.Float32(cutlass.Int32(ck3 - ck2))  # Phase 4
