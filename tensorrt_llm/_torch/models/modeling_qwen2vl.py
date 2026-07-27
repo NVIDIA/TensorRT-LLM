@@ -305,6 +305,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         divided by ``spatial_merge_unit`` (the post-merger placeholder count)."""
         if isinstance(image, torch.Tensor):
             image_h, image_w = int(image.shape[-2]), int(image.shape[-1])
+        elif isinstance(image, np.ndarray):
+            # HWC uint8 from ImageMediaIO's "np" format.
+            image_h, image_w = int(image.shape[0]), int(image.shape[1])
         else:
             image_h, image_w = image.height, image.width
         encoder_tokens = self._num_vision_tokens(width=image_w,
@@ -320,6 +323,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         if isinstance(first_frame, torch.Tensor):
             frame_h = int(first_frame.shape[-2])
             frame_w = int(first_frame.shape[-1])
+        elif isinstance(first_frame, np.ndarray):
+            # HWC uint8 from VideoMediaIO's "np" format.
+            frame_h = int(first_frame.shape[0])
+            frame_w = int(first_frame.shape[1])
         else:
             frame_h, frame_w = first_frame.height, first_frame.width
         encoder_tokens = self._num_vision_tokens(width=frame_w,
