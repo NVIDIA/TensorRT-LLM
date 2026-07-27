@@ -265,6 +265,24 @@ def _flashinfer_gdn_decode(
     HV = v.shape[2]
     V = v.shape[3]
 
+    # The FlashInfer CuTe-DSL kernel requires every input tensor's data pointer
+    # to be 32-byte aligned (enforced in build_memref_desc). ``a`` and ``b`` are
+    # per-head-scalar slices of the fused ``in_proj_ba`` output: ``b`` starts at
+    # offset 0 (aligned) but ``a`` starts ``num_v_heads_per_tp`` bf16 elements in,
+    # so when ``num_v_heads_per_tp`` is not a multiple of 16 (e.g. Qwen3.6-35B-A3B
+    # TEP4: 32 v-heads / 4 = 8 -> 16-byte offset) the slice base is not 32-byte
+    # aligned and the kernel aborts. ``.contiguous()`` is NOT enough: at decode
+    # the token dim is 1, so the strided/offset slice already reports as
+    # contiguous (size-1 dims are ignored by is_contiguous) and ``.contiguous()``
+    # is a no-op that keeps the misaligned pointer. Clone into fresh (allocator-
+    # aligned) storage instead, and only when misaligned so the common aligned
+    # case (e.g. Qwen3.5-397B TEP4: 64 / 4 = 16 -> 32-byte offset) stays zero-copy.
+    # q/k/v are sliced on 128-element head boundaries (>=256 B), always aligned.
+    if a.data_ptr() % 32 != 0:
+        a = a.clone(memory_format=torch.contiguous_format)
+    if b.data_ptr() % 32 != 0:
+        b = b.clone(memory_format=torch.contiguous_format)
+
     # Reshape from packed varlen [1, N*T, ...] to batched [N, T, ...].
     q_bat = q.view(N, T_per_seq, q.shape[2], q.shape[3])
     k_bat = k.view(N, T_per_seq, k.shape[2], k.shape[3])

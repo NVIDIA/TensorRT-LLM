@@ -88,6 +88,16 @@
       "path": "attention_dp_config.kv_cache_routing_max_sessions"
     },
     {
+      "allowed_values": [
+        "round_robin",
+        "least_queued"
+      ],
+      "annotation": "Literal['round_robin', 'least_queued']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "attention_dp_config.kv_cache_routing_new_conv_placement"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",

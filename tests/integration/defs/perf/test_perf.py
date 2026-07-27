@@ -65,6 +65,8 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "nemotron_3_super_120b_nvfp4_mtp",
     "nemotron_3_ultra_550b_nvfp4",
     "glm_5_fp8",
+    "minimax_m3_mxfp8",
+    "qwen3.6_35b_a3b_fp4",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
     "nemotron_nano_12b_v2",
