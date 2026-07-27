@@ -97,6 +97,8 @@ class PyStartTracker:
         # The child writes its own data file and rediscovers what it runs.
         self._new_suffix()
         self._data = {}
+        self._outcomes = {}
+        self._expected = {}
         if self._active:
             try:
                 _MON.restart_events()

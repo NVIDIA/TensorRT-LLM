@@ -127,9 +127,10 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     if _is_nested_pytest:
         # Inner pytest: apply the mpi_session env-whitelist patch synchronously instead of via the watcher thread.
         try:
-            from cbts_plugin import install_mpi_pool_patch
+            from cbts_plugin import install_expected_workers_patch, install_mpi_pool_patch
 
             install_mpi_pool_patch(raise_on_refactor=False)
+            install_expected_workers_patch()
         except Exception as _exc:
             print(
                 f"[cbts] nested-pytest mpi patch skipped in pid {os.getpid()}: {_exc!r}",
@@ -162,9 +163,13 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
                     and "mpi4py.futures" in sys.modules
                 ):
                     try:
-                        from cbts_plugin import install_mpi_pool_patch
+                        from cbts_plugin import (
+                            install_expected_workers_patch,
+                            install_mpi_pool_patch,
+                        )
 
                         install_mpi_pool_patch(raise_on_refactor=False)
+                        install_expected_workers_patch()
                     except Exception as exc:
                         print(
                             f"[cbts] mpi_session patch in pid {os.getpid()} failed: {exc!r}",

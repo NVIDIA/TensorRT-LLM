@@ -86,9 +86,9 @@ def install_expected_workers_patch():
         try:
             max_workers = kwargs.get("max_workers", args[0] if args else None)
             n = int(max_workers) if max_workers else 1
-            _sitecustomize_call("note_expected_workers", os.environ.get("CBTS_TEST_ID", ""), n)
-        except Exception:
-            pass
+        except (ValueError, TypeError):
+            n = 1
+        _sitecustomize_call("note_expected_workers", os.environ.get("CBTS_TEST_ID", ""), n)
         return init(self, *args, **kwargs)
 
     setattr(_patched_init, _POOL_PATCHED_MARKER, True)
@@ -144,6 +144,9 @@ if "pytest" in sys.modules:
         del call
         outcome = yield
         report = outcome.get_result()
-        # The call phase is the test body; a non-passing setup is the test's effective outcome.
-        if report.when == "call" or (report.when == "setup" and report.outcome != "passed"):
+        # The call phase is the test body; a non-passing setup or teardown is the test's
+        # effective outcome (a failing teardown downgrades an already-recorded pass).
+        if report.when == "call" or (
+            report.when in ("setup", "teardown") and report.outcome != "passed"
+        ):
             _sitecustomize_call("record_test_outcome", item.nodeid, report.outcome)
