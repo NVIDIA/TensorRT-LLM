@@ -166,7 +166,7 @@ class MultimodalEncoderRequestState:
                 "output shape, dtype, and device")
         self.outputs[item_idx] = output.detach().clone()
 
-    def resident_output_bytes(self, embedding_row_bytes: int) -> int:
+    def resident_output_bytes(self, bytes_per_encoder_embedding: int) -> int:
         """Bytes of recorded, not-yet-consumed outputs held by this request.
 
         The scheduler sums this over live states every tick to derive the
@@ -176,7 +176,7 @@ class MultimodalEncoderRequestState:
         return sum(
             length
             for length, output in zip(self.embedding_lengths, self.outputs)
-            if output is not None) * embedding_row_bytes
+            if output is not None) * bytes_per_encoder_embedding
 
     def finalize_into(self, multimodal_data: Dict[str, Any]) -> bool:
         """Publish the item outputs once every slot is recorded.
@@ -1316,17 +1316,15 @@ def initialize_multimodal_encoder_request(
         max_num_tokens: int,
         *,
         max_output_bytes: Optional[int] = None,
-        embedding_row_bytes: int = 0) -> None:
+        bytes_per_encoder_embedding: int = 0) -> None:
     """Initialize immutable request kind and mutable per-item encoder state.
 
-    Raises `ValueError` (failing only this request) when the request can
-    never execute under the startup guarantees: an atomic item larger than
-    the effective encoder token budget, or — when the encoder-output
-    budget is supplied — a total embedding footprint that could never fit
-    the encoder output budget (one prefill iteration's embeddings). The
-    latter is ordinarily unreachable because prompts are bounded by
-    `max_num_tokens`, but LLM chunked prefill admits longer prompts whose
-    full embedding must stay resident across chunks.
+    Raises `ValueError` (failing only this request) when raw encoder inputs
+    have missing or empty item metadata, an atomic item is larger than the
+    effective encoder token budget, or — when the encoder-output budget is
+    supplied — the request's complete embedding footprint could never fit.
+    Prefill currently waits for every item, so the complete footprint must
+    remain resident until the request becomes LLM-eligible.
     """
     mm_data = request.py_multimodal_data
     has_raw_payload = isinstance(mm_data, dict) and any(
@@ -1334,8 +1332,17 @@ def initialize_multimodal_encoder_request(
         for modality in ("image", "video", "audio"))
     has_full_embedding = (isinstance(mm_data, dict)
                           and mm_data.get("multimodal_embedding") is not None)
-    token_lengths = get_multimodal_encoder_token_lengths(
-        request) if has_raw_payload and not has_full_embedding else None
+    needs_item_encoding = has_raw_payload and not has_full_embedding
+    token_lengths = (get_multimodal_encoder_token_lengths(request)
+                     if needs_item_encoding else None)
+    if needs_item_encoding and token_lengths is None:
+        raise ValueError(
+            "Raw multimodal payload requires multimodal_encoder_item_metadata "
+            "when item-level encoder scheduling is enabled")
+    if needs_item_encoding and not token_lengths:
+        raise ValueError(
+            "Raw multimodal payload must declare at least one encoder item "
+            "when item-level encoder scheduling is enabled")
     if token_lengths is not None:
         largest = max(token_lengths, default=0)
         if largest > max_num_tokens:
@@ -1349,15 +1356,14 @@ def initialize_multimodal_encoder_request(
         if embedding_lengths is None:
             raise ValueError("Multimodal item scheduling requires "
                              "multimodal_embedding_lengths")
-        if max_output_bytes is not None and embedding_row_bytes > 0:
-            total_bytes = sum(embedding_lengths) * embedding_row_bytes
+        if (max_output_bytes is not None and bytes_per_encoder_embedding > 0):
+            total_bytes = (sum(embedding_lengths) * bytes_per_encoder_embedding)
             if total_bytes > max_output_bytes:
                 raise ValueError(
                     f"Multimodal request needs {total_bytes} bytes of "
                     "resident encoder output but the encoder output budget "
-                    f"is only {max_output_bytes} bytes (one prefill "
-                    "iteration); raise max_num_tokens to serve inputs of "
-                    "this size")
+                    f"is only {max_output_bytes} bytes; raise "
+                    "encoder_max_num_tokens to serve inputs of this size")
         request.py_mm_encoder_state = (
             MultimodalEncoderRequestState.from_embedding_lengths(
                 embedding_lengths))

@@ -567,6 +567,12 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
         edge = max((max_size // unit) * unit, unit)
         return {"image": self._vit_tokens(width=edge, height=edge, patch=patch)}
 
+    def get_max_mm_encoder_output_embeddings(
+            self, max_num_items: int, max_num_encoder_tokens: int) -> int:
+        """Bound post-merger embeddings from one Pixtral encoder iteration."""
+        _, merge, _, _ = self._vision_geometry()
+        return max_num_encoder_tokens // (merge * merge)
+
     def get_mm_encoder_attention_metadata_capacity(
             self, max_num_items: int,
             max_num_tokens: int) -> Optional[Dict[str, int]]:

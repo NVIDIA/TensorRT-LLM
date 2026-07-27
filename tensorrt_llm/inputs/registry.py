@@ -739,6 +739,20 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         """
         return {}
 
+    def get_max_mm_encoder_output_embeddings(
+            self, max_num_items: int,
+            max_num_encoder_tokens: int) -> Optional[int]:
+        """Bound encoder-output embeddings produced in one encoder iteration.
+
+        The result is the aggregate number of post-encoder embeddings across
+        every item that can be scheduled together under ``max_num_items`` and
+        ``max_num_encoder_tokens``. Models opting into MM encoder item
+        scheduling must override this method using their encoder geometry.
+
+        ``None`` keeps the contract unsupported for legacy processors.
+        """
+        return None
+
     def get_mm_encoder_attention_metadata_capacity(
             self, max_num_items: int,
             max_num_tokens: int) -> Optional[Dict[str, int]]:
