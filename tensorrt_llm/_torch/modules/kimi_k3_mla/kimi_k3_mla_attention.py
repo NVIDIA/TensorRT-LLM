@@ -406,33 +406,22 @@ class KimiK3MLAAttention(nn.Module):
         )
 
         gen_mla_backend = os.environ.get("TLLM_K3_MLA_GEN_BACKEND", "cute-dsl")
-        # FP8 KV cache is accuracy-broken on K3: GSM8K 74.45 vs 96.44 with
-        # bf16 KV on the same build, with partial scores decaying through the
-        # run — consistent with fp8 latent-cache error compounding over
-        # generation length. The decode backend is NOT the cause: bf16 +
-        # trtllm-gen decode scores 96.59, so the deficit is the fp8 cache
-        # numerics themselves. Fail fast until that is fixed.
+        # FP8 KV cache is accuracy-validated on K3 with the kv-scale
+        # plumbing fix in ``TrtllmAttention.mla_rope_generation``: GSM8K
+        # 96.89 vs 96.44 bf16 control (the pre-fix 74.45 that motivated a
+        # hard error here was the severed None kv-scale delivery, not the
+        # fp8 cache itself).
         self.has_fp8_kv_cache = bool(
             quant_config is not None
             and quant_config.layer_quant_mode.has_fp8_kv_cache())
-        if self.has_fp8_kv_cache:
-            if os.environ.get("KIMI_K3_ALLOW_INACCURATE_MLA_GEN",
-                              "0") != "1":
-                raise ValueError(
-                    "Kimi K3: FP8 KV cache (kv_cache_config.dtype='fp8') "
-                    "currently degrades accuracy severely (GSM8K 74.5 vs "
-                    "96.4 with bf16 KV). Use a non-FP8 KV cache "
-                    "(kv_cache_config.dtype 'auto'/'bfloat16'), or set "
-                    "KIMI_K3_ALLOW_INACCURATE_MLA_GEN=1 for perf-only "
-                    "experiments.")
-            if gen_mla_backend != "trtllm-gen":
-                # cute-dsl rejects fp8 KV device scales; trtllm-gen decode
-                # is accuracy-equivalent to cute-dsl on K3 (96.59 vs 96.44).
-                logger.info(
-                    "Kimi K3 MLA: FP8 KV cache requires the trtllm-gen MLA "
-                    "generation backend; overriding "
-                    f"'{gen_mla_backend}' -> 'trtllm-gen'.")
-                gen_mla_backend = "trtllm-gen"
+        if self.has_fp8_kv_cache and gen_mla_backend != "trtllm-gen":
+            # cute-dsl rejects fp8 KV device scales; trtllm-gen decode is
+            # accuracy-equivalent to cute-dsl on K3 (96.59 vs 96.44).
+            logger.info(
+                "Kimi K3 MLA: FP8 KV cache requires the trtllm-gen MLA "
+                "generation backend; overriding "
+                f"'{gen_mla_backend}' -> 'trtllm-gen'.")
+            gen_mla_backend = "trtllm-gen"
 
         # Context backend: absorbed MQA path, head_dim = kv_lora +
         # qk_rope, num_kv_heads=1. Called by ``forward_prefill`` with

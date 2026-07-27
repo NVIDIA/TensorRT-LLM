@@ -2048,8 +2048,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            None,  # kv_scale_orig_quant
-            None,  # kv_scale_quant_orig
+            # Layer fp8-KV scales (default-1.0 buffers from the ctor).
+            # Passing None here cost ~22 GSM8K points on K3 fp8-KV
+            # (74.45 -> 96.89 with the buffers passed): the
+            # kernel's scale delivery must not be severed even when the
+            # scale is the trivial 1.0.
+            self.kv_scale_orig_quant,
+            self.kv_scale_quant_orig,
             out_scale,
             metadata.block_ids_per_seq,
             helix_tensor_params,

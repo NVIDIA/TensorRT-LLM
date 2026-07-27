@@ -32,7 +32,7 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`), so prompts longer than `max_num_tokens` are scheduled across multiple steps.
 * **`kv_cache_config.tokens_per_block` must be `64`** — required by the MLA (576, 512) trtllm-gen generation kernel.
 * **Speculative decoding and disaggregated serving are supported with constraints.** Suffix-automaton speculative decoding is an opt-in for evaluation and requires CUDA graphs and the overlap scheduler disabled with `max_batch_size` ≤ 8; disaggregated serving requires matched DEP16 context and generation servers. See the "Current limitations" section of `examples/kimi_k3/README.md` and `examples/kimi_k3/disagg/README.md` for details.
-* **FP8 KV cache is not supported** due to a known accuracy issue; a fix is in progress.
+* **FP8 KV cache is supported** (`kv_cache_config.dtype: fp8`). Enabling it forces the trtllm-gen MLA generation backend, which is accuracy-equivalent to the default cute-dsl backend.
 
 ## Deployment Steps
 
