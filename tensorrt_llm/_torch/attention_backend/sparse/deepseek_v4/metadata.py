@@ -11,7 +11,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 
 from ..dsa.metadata import DSAtrtllmAttentionMetadata
 from .indexer import DeepseekV4Indexer
@@ -54,6 +54,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             f"Dual-pool sparse MLA requires window_size == 128, which equals to the"
             f"TileSizeKV of the FMHA kernel. (got {window_size})."
         )
+        # The Hopper path uses MLA's fused RoPE/cache-append helpers. Executor
+        # warmup can invoke the model before prepare(), so initialize the
+        # metadata fields those helpers read.
+        if not hasattr(self, "max_ctx_seq_len"):
+            self.max_ctx_seq_len = 0
+        if not hasattr(self, "num_ctx_cached_tokens"):
+            self.num_ctx_cached_tokens = 0
+        if not hasattr(self, "max_ctx_kv_len"):
+            self.max_ctx_kv_len = 0
         capture_graph = self.is_cuda_graph
         self.compress_ratio_set = set(self.compress_ratios)
         # Cache a sorted list for deterministic iteration order across
@@ -558,6 +567,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.cu_seq_lens_cuda[: num_requests + 1].copy_(
             self.cu_seq_lens[: num_requests + 1], non_blocking=True
         )
+
+        # Hopper uses the fused MLA RoPE/cache-append helpers for context and
+        # generation. Blackwell's FMHA plan/run path prepares this state
+        # internally.
+        if get_sm_version() < 100:
+            self.prepare_for_mla_rope_append(cached_token_lens[:num_requests], kv_lens)
 
         # For indices conversion
         self.prepare_for_indices_conversion()
