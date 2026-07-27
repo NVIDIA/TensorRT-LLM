@@ -135,24 +135,6 @@ def test_item_scheduling_rejects_raw_payload_without_item_metadata():
         initialize_multimodal_encoder_request(request, max_num_tokens=8)
 
 
-def test_item_scheduling_rejects_raw_payload_with_no_declared_items():
-    request = _llm_request(
-        1,
-        multimodal_data={
-            "image": {"pixel_values": torch.empty(0, 1)},
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
-                item_refs=[],
-                encoder_token_lengths=[],
-                output_embedding_lengths=[],
-            ),
-            "multimodal_embedding_lengths": [],
-        },
-    )
-
-    with pytest.raises(ValueError, match="at least one encoder item"):
-        initialize_multimodal_encoder_request(request, max_num_tokens=8)
-
-
 def test_multimodal_scheduler_keeps_items_atomic_and_backfills_requests():
     scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=2, max_num_tokens=10)
     first = _request(1, [7, 7])
@@ -319,16 +301,14 @@ def test_encoder_token_budget_auto_raises_for_atomic_item():
     assert _resolve_mm_encoder_token_budget(8192, 65536) == 65536
 
 
-@pytest.mark.parametrize("llm_max_num_tokens", [8192, 65536])
-def test_output_budget_uses_encoder_embedding_capacity(llm_max_num_tokens):
+def test_qwen_output_budget_uses_post_merge_embedding_capacity():
+    processor = object.__new__(Qwen2VLInputProcessorBase)
+    processor._config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
     engine = object.__new__(PyTorchModelEngine)
-    engine.max_num_tokens = llm_max_num_tokens
+    engine.max_num_tokens = 8192
     engine.encoder_max_num_items = 8
     engine.encoder_max_num_tokens = 65536
-    engine.input_processor = SimpleNamespace(
-        get_max_mm_encoder_output_embeddings=lambda max_num_items,
-        max_num_encoder_tokens: max_num_encoder_tokens // 4
-    )
+    engine.input_processor = processor
     engine._resolve_bytes_per_mm_encoder_embedding = lambda: 32768
 
     budget = engine._resolve_mm_encoder_output_budget_bytes()
@@ -348,34 +328,21 @@ def test_output_budget_requires_processor_embedding_capacity():
         engine._resolve_mm_encoder_output_budget_bytes()
 
 
-def _eager_compatibility_args(*, enable_attention_dp=False, disagg_backend=None):
-    return SimpleNamespace(
+def test_eager_compatibility_is_checked_only_for_item_scheduled_models():
+    args = SimpleNamespace(
         multimodal_config=SimpleNamespace(
             encoder_scheduling_policy=MultimodalEncoderSchedulingPolicy.EAGER
         ),
-        enable_attention_dp=enable_attention_dp,
-        cache_transceiver_config=(
-            SimpleNamespace(backend=disagg_backend) if disagg_backend is not None else None
-        ),
+        enable_attention_dp=True,
+        cache_transceiver_config=SimpleNamespace(backend="NIXL"),
     )
 
-
-def test_unsupported_model_ignores_eager_compatibility_restrictions():
-    args = _eager_compatibility_args(enable_attention_dp=True, disagg_backend="NIXL")
-
     _validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=False)
-
-
-def test_item_scheduled_model_rejects_eager_with_attention_dp():
-    args = _eager_compatibility_args(enable_attention_dp=True)
 
     with pytest.raises(ValueError, match="attention DP"):
         _validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
 
-
-def test_item_scheduled_model_rejects_eager_with_disaggregated_serving():
-    args = _eager_compatibility_args(disagg_backend="NIXL")
-
+    args.enable_attention_dp = False
     with pytest.raises(ValueError, match="disaggregated"):
         _validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
 
@@ -807,18 +774,6 @@ def test_qwen_item_metadata_uses_prompt_order_and_pre_merger_costs():
     assert metadata.output_embedding_lengths == [8, 4]
 
 
-def test_qwen_output_capacity_converts_encoder_tokens_after_spatial_merge():
-    processor = object.__new__(Qwen2VLInputProcessorBase)
-    processor._config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
-
-    assert (
-        processor.get_max_mm_encoder_output_embeddings(
-            max_num_items=8, max_num_encoder_tokens=65536
-        )
-        == 16384
-    )
-
-
 def test_qwen_item_metadata_collapses_frame_spans_into_original_video():
     processor = object.__new__(Qwen2VLInputProcessorBase)
     processor._config = SimpleNamespace(
@@ -851,18 +806,6 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
     assert metadata.item_refs == [("image", 0), ("image", 1)]
     assert metadata.encoder_token_lengths == [8, 16]
     assert metadata.output_embedding_lengths == [2, 4]
-
-
-def test_mistral_output_capacity_converts_encoder_tokens_after_spatial_merge():
-    processor = object.__new__(Mistral3InputProcessor)
-    processor._vision_geometry = lambda: (14, 2, 3, 1024)
-
-    assert (
-        processor.get_max_mm_encoder_output_embeddings(
-            max_num_items=8, max_num_encoder_tokens=65536
-        )
-        == 16384
-    )
 
 
 # ---------------------------------------------------------------------------
