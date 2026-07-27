@@ -42,7 +42,6 @@ def test_context_first_handoff_round_trip_large_ids_and_binary() -> None:
     )
 
     session = encode_handoff(params)
-    assert session.handoff_profile == HANDOFF_ATTRIBUTE
     payload = json.loads(session.attributes_struct[HANDOFF_ATTRIBUTE])
     assert payload["ctx_request_id"] == str(2**63 - 2)
     assert payload["disagg_request_id"] == str(2**63 - 1)
@@ -109,14 +108,6 @@ def test_decode_rejects_non_decimal_identifier() -> None:
         }
     )
     with pytest.raises(ValueError, match="decimal string"):
-        decode_handoff(session)
-
-
-def test_decode_rejects_foreign_handoff_profile() -> None:
-    session = kv_pb2.KvSessionRef(handoff_profile="vllm.kv_transfer_params.v1")
-    session.attributes_struct[HANDOFF_ATTRIBUTE] = json.dumps({"schedule_style": "context_first"})
-
-    with pytest.raises(ValueError, match="Unsupported TensorRT-LLM handoff profile"):
         decode_handoff(session)
 
 
@@ -214,8 +205,6 @@ async def test_media_preserves_per_modality_order_and_merge_inputs(monkeypatch) 
         "tensorrt_llm.openengine.converters.MEDIA_IO_REGISTRY",
         {"image": _MediaIO, "video": _MediaIO, "audio": _MediaIO},
     )
-    options = generation_pb2.GenerateRequest().media_options
-    options.update({"image": {"format": "pil"}})
     config = type("Config", (), {"media_io_kwargs": {"image": {"device": "cpu"}}})()
     media = [
         generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"one"),
@@ -223,7 +212,7 @@ async def test_media_preserves_per_modality_order_and_merge_inputs(monkeypatch) 
         generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"two"),
     ]
 
-    decoded = await load_media(media, options, config)
+    decoded = await load_media(media, config)
 
     assert decoded == {"image": ["one", "two"], "video": ["video"]}
-    assert calls[0] == ({"device": "cpu"}, {"format": "pil"})
+    assert calls[0] == ({"device": "cpu"}, None)

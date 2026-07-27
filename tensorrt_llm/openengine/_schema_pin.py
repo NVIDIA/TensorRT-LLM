@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""OpenEngine source identity embedded in TensorRT-LLM distributions."""
+"""OpenEngine source identity and compatibility constants."""
 
-OPENENGINE_COMMIT = "a66ff6f73a65e262a7c3edd5ea6fd0d8701d402f"
+OPENENGINE_COMMIT = "57cd5033554cd22ab9645ae6c17f34d7fa9f5bb0"
+SCHEMA_REVISION = 1
+MINIMUM_CLIENT_REVISION = 1
 
-__all__ = ["OPENENGINE_COMMIT"]
+__all__ = ["MINIMUM_CLIENT_REVISION", "OPENENGINE_COMMIT", "SCHEMA_REVISION"]

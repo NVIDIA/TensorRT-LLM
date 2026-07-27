@@ -11,7 +11,6 @@ import re
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
-from google.protobuf.json_format import MessageToDict
 from openengine.v1 import generation_pb2, kv_pb2
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
@@ -133,31 +132,13 @@ def to_priority(priority: int | None) -> float:
     return 0.5 + 0.5 * priority / (1 + abs(priority))
 
 
-def _message_struct(struct_message: object) -> dict[str, Any]:
-    if not struct_message.fields:
-        return {}
-    return MessageToDict(struct_message, preserving_proto_field_name=True)
-
-
-def validate_media_options(options: dict[str, Any]) -> None:
-    unknown = set(options).difference(MEDIA_IO_REGISTRY)
-    if unknown:
-        raise ValueError(f"Unknown media option modalities: {sorted(unknown)}")
-    invalid = [name for name, value in options.items() if not isinstance(value, dict)]
-    if invalid:
-        raise ValueError(f"Media options must be objects for modalities: {sorted(invalid)}")
-
-
 async def load_media(
     media: list[object],
-    media_options: object,
     server_config: MultimodalServerConfig | None,
 ) -> dict[str, list[Any]] | None:
-    """Decode ordered OpenEngine media with TRT-LLM's media-I/O merge rules."""
+    """Decode ordered OpenEngine media with server-configured media-I/O options."""
     if not media:
         return None
-    request_options = _message_struct(media_options)
-    validate_media_options(request_options)
     server_options = (server_config.media_io_kwargs if server_config is not None else None) or {}
     output: dict[str, list[Any]] = {}
     pending: list[tuple[str, asyncio.Future[Any] | asyncio.Task[Any] | Any]] = []
@@ -165,9 +146,7 @@ async def load_media(
         modality = _MODALITY_NAMES.get(item.modality)
         if modality is None:
             raise ValueError(f"Unsupported media modality {item.modality}")
-        media_io = MEDIA_IO_REGISTRY[modality].create(
-            server_options.get(modality), request_options.get(modality)
-        )
+        media_io = MEDIA_IO_REGISTRY[modality].create(server_options.get(modality), None)
         source = item.WhichOneof("source")
         if source in ("url", "data_uri"):
             pending.append((modality, media_io.async_load(getattr(item, source))))
@@ -268,15 +247,12 @@ def encode_handoff(
         session_id=str(params.disagg_request_id or params.ctx_request_id or ""),
         transfer_backend="tensorrt_llm",
         dp_rank=params.ctx_dp_rank or 0,
-        handoff_profile=HANDOFF_ATTRIBUTE,
     )
     session.attributes_struct[HANDOFF_ATTRIBUTE] = canonical
     return session
 
 
 def _decode_handoff_payload(session: kv_pb2.KvSessionRef) -> dict[str, Any]:
-    if session.handoff_profile and session.handoff_profile != HANDOFF_ATTRIBUTE:
-        raise ValueError(f"Unsupported TensorRT-LLM handoff profile {session.handoff_profile!r}")
     if HANDOFF_ATTRIBUTE not in session.attributes_struct:
         raise ValueError(f"KV session is missing {HANDOFF_ATTRIBUTE!r}")
     encoded = session.attributes_struct[HANDOFF_ATTRIBUTE]

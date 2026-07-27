@@ -427,9 +427,9 @@ def launch_server(
                 if error.name and error.name.startswith("openengine"):
                     llm.shutdown()
                     raise click.ClickException(
-                        "OpenEngine support requires openengine-proto 0.3.0. "
+                        "OpenEngine support requires generated Python bindings. "
                         "Run scripts/install_openengine.py against the pinned "
-                        "local OpenEngine sibling checkout.") from error
+                        "OpenEngine schema source.") from error
                 raise
             from tensorrt_llm.serve.kv_event_fanout import KvEventFanout
             from tensorrt_llm.serve.request_tracker import (RequestTracker,

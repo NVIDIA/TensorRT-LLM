@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 import grpc
-from openengine import MINIMUM_CLIENT_REVISION, SCHEMA_RELEASE, SCHEMA_REVISION
 from openengine.v1 import (
     error_pb2,
     generation_pb2,
@@ -42,8 +41,8 @@ from tensorrt_llm.serve.kv_event_fanout import KvEventFanout, KvEventSubscriberO
 from tensorrt_llm.serve.request_tracker import RequestTracker
 from tensorrt_llm.serve.stats_fanout import StatsFanout
 
+from ._schema_pin import MINIMUM_CLIENT_REVISION, OPENENGINE_COMMIT, SCHEMA_REVISION
 from .converters import (
-    HANDOFF_ATTRIBUTE,
     decode_handoff,
     encode_handoff,
     handoff_requires_decode_media,
@@ -58,7 +57,7 @@ from .lora_registry import LoraRegistry
 
 def schema_release() -> str:
     """Return the immutable OpenEngine source identity configured at startup."""
-    return os.getenv("OPENENGINE_SCHEMA_RELEASE", SCHEMA_RELEASE)
+    return os.getenv("OPENENGINE_SCHEMA_RELEASE", OPENENGINE_COMMIT)
 
 
 def _arg(llm: object, name: str, default: Any = None) -> Any:
@@ -145,14 +144,11 @@ class OpenEngineServicer(
         event_host: str = "127.0.0.1",
         event_port: int = 0,
         kv_session_ttl_seconds: float = 300.0,
-        post_abort_cleanup_timeout_seconds: float = 1.0,
     ) -> None:
         self.llm = llm
         self.model = model
         model_id = _arg(llm, "model", model)
         self.model_id = str(model_id) if model_id else model
-        tokenizer_source = _arg(llm, "tokenizer", None)
-        self.tokenizer_source = str(tokenizer_source) if tokenizer_source else self.model_id
         tokenizer_mode = _arg(llm, "tokenizer_mode", "auto")
         self.tokenizer_mode = str(tokenizer_mode) if tokenizer_mode else "auto"
         self.model_aliases = [self.model_id] if self.model_id != self.model else []
@@ -177,9 +173,6 @@ class OpenEngineServicer(
         if kv_session_ttl_seconds <= 0:
             raise ValueError("kv_session_ttl_seconds must be positive")
         self._kv_session_ttl_seconds = kv_session_ttl_seconds
-        if post_abort_cleanup_timeout_seconds <= 0:
-            raise ValueError("post_abort_cleanup_timeout_seconds must be positive")
-        self._post_abort_cleanup_timeout_seconds = post_abort_cleanup_timeout_seconds
         self._partial_block_hashes: dict[int, set[object]] = {}
         self.instance_id = instance_id or str(uuid.uuid4())
         self.event_host = event_host
@@ -206,7 +199,6 @@ class OpenEngineServicer(
             "role": server_pb2.EngineRole.Name(self.role),
             "request_id": request.request_id,
             "session_id": session.session_id,
-            "handoff_profile": session.handoff_profile,
             "dp_rank": session.dp_rank,
         }
         try:
@@ -346,7 +338,7 @@ class OpenEngineServicer(
             self._validate_generate(request, target_dp_rank)
             params = to_sampling_params(request)
             media_items = list(request.media)
-            media = await load_media(media_items, request.media_options, self.media_config)
+            media = await load_media(media_items, self.media_config)
             input_kind = request.WhichOneof("input")
             inputs: dict[str, Any]
             if input_kind == "prompt":
@@ -541,9 +533,7 @@ class OpenEngineServicer(
                     reaper = self.tracker.reap(request.request_id, result)
                     if consumed_session_id is not None:
                         reaper.add_done_callback(
-                            lambda _task,
-                            session_id=consumed_session_id,
-                            owner=consumed_session_owner: (
+                            lambda _task, session_id=consumed_session_id, owner=consumed_session_owner: (
                                 self._release_kv_session(session_id, owner)
                             )
                         )
@@ -672,8 +662,6 @@ class OpenEngineServicer(
         if self.role == server_pb2.ENGINE_ROLE_DECODE:
             if not request.kv.HasField("session"):
                 raise ValueError("Decode requests require a prefill KV session")
-            if request.kv.session.HasField("bootstrap"):
-                raise ValueError("TensorRT-LLM does not support client-created KV bootstrap")
             requires_media = handoff_requires_decode_media(request.kv.session)
             if requires_media and not request.media:
                 raise ValueError("Decode request must resend the ordered context-phase media")
@@ -903,12 +891,6 @@ class OpenEngineServicer(
             raise ValueError(f"Unknown model {request.model!r}")
         input_processor = getattr(self.llm, "input_processor", None)
         aggregate = self._available_modalities(input_processor)
-        prefill_decode = self._available_modalities(input_processor, prefill_decode=True)
-        modality_enum = {
-            "image": generation_pb2.MODALITY_IMAGE,
-            "video": generation_pb2.MODALITY_VIDEO,
-            "audio": generation_pb2.MODALITY_AUDIO,
-        }
         args = getattr(self.llm, "args", None)
         guided_backend = getattr(args, "guided_decoding_backend", None)
         guided_modes = []
@@ -928,10 +910,6 @@ class OpenEngineServicer(
             served_model_name=self.model,
             served_model_aliases=self.model_aliases,
             tokenizer_modes=[self.tokenizer_mode],
-            tokenizer=model_pb2.TokenizerInfo(
-                source=self.tokenizer_source,
-                mode=self.tokenizer_mode,
-            ),
             supports_text_input=True,
             supports_token_ids_input=True,
             supports_lora=self._supports_lora(),
@@ -959,24 +937,7 @@ class OpenEngineServicer(
                 supports_cache_salt=True,
                 supports_prefix_cache_bypass=False,
             ),
-            multimodal_capabilities=model_pb2.MultimodalCapabilities(
-                aggregate_modalities=[modality_enum[name] for name in aggregate],
-                prefill_decode_modalities=[modality_enum[name] for name in prefill_decode],
-                source_types=[
-                    generation_pb2.MEDIA_SOURCE_TYPE_URL,
-                    generation_pb2.MEDIA_SOURCE_TYPE_DATA_URI,
-                    generation_pb2.MEDIA_SOURCE_TYPE_RAW_BYTES,
-                ],
-                supports_per_request_media_options=True,
-            ),
         )
-        routing_token_getter = getattr(
-            input_processor, "get_openengine_routing_image_token_id", None
-        )
-        if "image" in aggregate and callable(routing_token_getter):
-            routing_image_token_id = routing_token_getter()
-            if routing_image_token_id is not None:
-                info.multimodal_capabilities.routing_image_token_id = routing_image_token_id
         if max_context is not None:
             info.max_context_length = max_context
         return info
@@ -1103,10 +1064,8 @@ class OpenEngineServicer(
             raise NotImplementedError("Role-safe inference probes are not implemented")
         healthy, message = await self.tracker.health()
         state = (
-            lifecycle_pb2.HEALTH_STATE_DRAINING
-            if self.tracker.draining
-            else lifecycle_pb2.HEALTH_STATE_READY
-            if healthy
+            lifecycle_pb2.HEALTH_STATE_READY
+            if healthy and not self.tracker.draining
             else lifecycle_pb2.HEALTH_STATE_NOT_READY
         )
         checks = [lifecycle_pb2.HealthCheck(name="scheduler", state=state, message=message)]
@@ -1146,42 +1105,6 @@ class OpenEngineServicer(
                 if released_session
                 else f"Request {request_id} is not active"
             ),
-        )
-
-    async def Drain(
-        self, request: lifecycle_pb2.DrainRequest, context: grpc.aio.ServicerContext
-    ) -> AsyncGenerator[lifecycle_pb2.DrainResponse, None]:
-        del context
-        if request.stop_accepting_new_requests:
-            await self.tracker.start_drain()
-        yield lifecycle_pb2.DrainResponse(
-            state=lifecycle_pb2.DRAIN_STATE_STARTED,
-            in_flight_requests=self.tracker.active_count,
-            open_kv_sessions=len(self._kv_session_requests),
-            message="Process-wide drain started",
-        )
-        timeout = request.deadline_ms / 1000.0 if request.HasField("deadline_ms") else None
-        empty = await self.tracker.wait_empty(timeout)
-        if not empty and request.abort_after_deadline:
-            await self.tracker.abort_all()
-            empty = await self.tracker.wait_empty(self._post_abort_cleanup_timeout_seconds)
-        if not empty:
-            yield lifecycle_pb2.DrainResponse(
-                error=error_pb2.EngineError(
-                    code=error_pb2.ERROR_CODE_INTERNAL,
-                    message="Drain deadline expired with active requests",
-                    retryable=False,
-                ),
-                in_flight_requests=self.tracker.active_count,
-                open_kv_sessions=len(self._kv_session_requests),
-            )
-            return
-        self._release_all_kv_sessions()
-        yield lifecycle_pb2.DrainResponse(
-            state=lifecycle_pb2.DRAIN_STATE_COMPLETE,
-            in_flight_requests=0,
-            open_kv_sessions=0,
-            message="Drain complete",
         )
 
     async def LoadLora(
@@ -1250,10 +1173,7 @@ class OpenEngineServicer(
             supports_remote_prefill=enabled,
             supports_decode_pull=enabled,
             supports_abort_cleanup=enabled,
-            supports_drain=enabled,
             schema_version=1,
-            handoff_profile=HANDOFF_ATTRIBUTE,
-            supports_client_bootstrap=False,
         )
 
     def _kv_events_enabled(self) -> bool:

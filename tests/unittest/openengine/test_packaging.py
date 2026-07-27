@@ -15,7 +15,17 @@ def _requirement(path: Path, name: str) -> str:
 def test_openengine_video_dependency_excludes_numpy_incompatible_opencv() -> None:
     root = Path(__file__).resolve().parents[3]
     numpy = _requirement(root / "requirements.txt", "numpy")
+    openengine_numpy = _requirement(root / "requirements-openengine.txt", "numpy")
     opencv = _requirement(root / "requirements-openengine.txt", "opencv-python-headless")
 
     assert numpy == "numpy>=2.0.0,<2.4"
+    assert openengine_numpy == numpy
     assert opencv == "opencv-python-headless==4.11.0.86"
+
+
+def test_openengine_binding_generation_dependencies_are_declared() -> None:
+    requirements = Path(__file__).resolve().parents[3] / "requirements-openengine.txt"
+
+    assert _requirement(requirements, "grpcio") == "grpcio>=1.67"
+    assert _requirement(requirements, "grpcio-tools") == "grpcio-tools>=1.67"
+    assert _requirement(requirements, "protobuf") == "protobuf>=5.27"

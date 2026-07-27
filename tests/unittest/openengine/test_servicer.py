@@ -329,7 +329,6 @@ async def test_model_info_suppresses_modalities_when_required_lora_is_unavailabl
     info = await service.GetModelInfo(model_pb2.GetModelInfoRequest(), _Context())
 
     assert not info.supports_multimodal
-    assert list(info.multimodal_capabilities.aggregate_modalities) == []
 
 
 @pytest.mark.asyncio
@@ -414,9 +413,6 @@ async def test_context_then_generation_round_trips_handoff(monkeypatch) -> None:
     }
     assert {record["session_id"] for record in completed} == {
         context_responses[0].prefill_ready.kv_session.session_id
-    }
-    assert {record["handoff_profile"] for record in completed} == {
-        "tensorrt_llm.disaggregated_params.v1"
     }
     assert {record["tensorrt_llm"]["disagg_request_id"] for record in completed} == {"101"}
 
@@ -759,9 +755,6 @@ async def test_discovery_and_load_use_config_and_shared_stats(monkeypatch) -> No
         def get_openengine_prefill_decode_modalities(self) -> tuple[str, ...]:
             return ("image",)
 
-        def get_openengine_routing_image_token_id(self) -> int:
-            return 151655
-
         def get_required_lora_spec(self, modalities: tuple[str, ...]) -> None:
             del modalities
             return None
@@ -806,13 +799,10 @@ async def test_discovery_and_load_use_config_and_shared_stats(monkeypatch) -> No
     )
 
     server_info = await service.GetServerInfo(server_pb2.GetServerInfoRequest(), _Context())
-    assert server_info.schema_revision == 3
+    assert server_info.schema_revision == 1
     assert server_info.minimum_client_revision == 1
     assert server_info.capacity.kv_block_size == 64
     assert server_info.capacity.total_kv_blocks == 100
-    assert server_info.kv_connector.handoff_profile == "tensorrt_llm.disaggregated_params.v1"
-    assert server_info.kv_connector.HasField("supports_client_bootstrap")
-    assert not server_info.kv_connector.supports_client_bootstrap
     model_info = await service.GetModelInfo(
         model_pb2.GetModelInfoRequest(model="Qwen/Qwen3-VL-2B-Instruct"),
         _Context(),
@@ -820,9 +810,8 @@ async def test_discovery_and_load_use_config_and_shared_stats(monkeypatch) -> No
     assert model_info.model_id == "Qwen/Qwen3-VL-2B-Instruct"
     assert model_info.served_model_name == "qwen3-vl"
     assert list(model_info.served_model_aliases) == ["Qwen/Qwen3-VL-2B-Instruct"]
-    assert model_info.tokenizer.source == "Qwen/Qwen3-VL-2B-Instruct"
-    assert model_info.tokenizer.mode == "slow"
-    assert model_info.multimodal_capabilities.routing_image_token_id == 151655
+    assert list(model_info.tokenizer_modes) == ["slow"]
+    assert model_info.supports_multimodal
     assert not model_info.generation.guided_decoding.supported
     assert not model_info.supports_lora
 
@@ -958,32 +947,6 @@ async def test_direct_kv_subscription_rejects_unknown_rank() -> None:
 
     with pytest.raises(AssertionError, match="INVALID_ARGUMENT"):
         await _collect_async(service.SubscribeKvEvents(request, _Context()))
-
-
-@pytest.mark.asyncio
-async def test_drain_deadline_does_not_wait_forever_for_external_http() -> None:
-    llm = _Llm()
-    tracker = RequestTracker(llm)
-    tracker.begin_external()
-    service = OpenEngineServicer(
-        llm,
-        "model",
-        server_pb2.ENGINE_ROLE_AGGREGATED,
-        tracker,
-        post_abort_cleanup_timeout_seconds=0.01,
-    )
-    request = lifecycle_pb2.DrainRequest(
-        stop_accepting_new_requests=True,
-        deadline_ms=1,
-        abort_after_deadline=True,
-    )
-
-    responses = await asyncio.wait_for(
-        _collect_async(service.Drain(request, _Context())), timeout=0.1
-    )
-
-    assert responses[-1].WhichOneof("event") == "error"
-    await tracker.finish_external()
 
 
 @pytest.mark.asyncio
