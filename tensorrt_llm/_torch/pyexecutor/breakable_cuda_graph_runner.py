@@ -14,7 +14,6 @@ from .breakable_cuda_graph import (
     BreakableCUDAGraphCapture,
     enable_breakable_cuda_graph,
 )
-from .trace_log_utils import log_mem_snapshot
 
 
 class BreakableCUDAGraphRunnerState(Enum):
@@ -78,7 +77,6 @@ class BreakableCUDAGraphRunner:
         self._capture_stream.wait_stream(current_stream)
         graph = None
         created_memory_pool = False
-        log_mem_snapshot(f"bcg/before_capture_{num_tokens}")
         try:
             with torch.cuda.stream(self._capture_stream):
                 self.warmup(engine_forward)
@@ -105,13 +103,11 @@ class BreakableCUDAGraphRunner:
             assert graph is not None
             self._graphs[num_tokens] = graph
             self._outputs[num_tokens] = make_weak_ref(output)
-            log_mem_snapshot(f"bcg/after_capture_{num_tokens}")
         except Exception:
             if graph is not None:
                 graph.reset()
             if created_memory_pool and not self._graphs:
                 self._memory_pool = None
-            log_mem_snapshot(f"bcg/capture_failed_{num_tokens}")
             raise
         finally:
             self._active_graph = None
