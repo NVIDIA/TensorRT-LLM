@@ -1,0 +1,5 @@
+# HunyuanVideo 1.5 text-to-video (single GPU).
+# Sequence/CFG parallelism and caching are not yet supported for this model.
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
