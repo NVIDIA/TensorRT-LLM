@@ -873,8 +873,8 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                 param.multimodal_data["multimodal_embedding"], expected_embedding.unsqueeze(0)
             )
 
-    def test_single_request_with_multiple_modalities_is_allowed(self):
-        """The request-order fix does not reject an existing mixed request."""
+    def test_single_request_with_multiple_modalities_raises(self):
+        """Mixed-modality requests are rejected until prompt-order handling is supported."""
         model = self._make_model()
         multimodal_param = MultimodalParams(
             multimodal_data={
@@ -883,14 +883,11 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             }
         )
 
-        with unittest.mock.patch.object(
-            model,
-            "_get_image_features",
-            side_effect=lambda pixel_values, **_: pixel_values[:, 0],
+        with self.assertRaisesRegex(
+            ValueError,
+            "requests containing multiple multimodal input types are not supported",
         ):
-            embeddings = model.encode_multimodal_inputs([multimodal_param])
-
-        torch.testing.assert_close(embeddings, torch.tensor([[1.0], [2.0]]))
+            model.encode_multimodal_inputs([multimodal_param])
 
     def test_instantiation_without_vision(self):
         """VLM wrapper works text-only when vision_config is None."""

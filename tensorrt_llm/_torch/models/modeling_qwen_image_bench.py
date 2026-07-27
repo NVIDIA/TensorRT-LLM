@@ -98,6 +98,8 @@ class _QwenImageBenchModelMixin:
 class QwenImageBenchModel(_QwenImageBenchModelMixin, Qwen3VLModelBase):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         if model_config.multimodal_config is not None:
+            # dataclasses.replace() resets init=False fields, so preserve runtime metadata.
+            extra_attrs = model_config.extra_attrs
             model_config = replace(
                 model_config,
                 multimodal_config=MultimodalConfig(
@@ -107,6 +109,7 @@ class QwenImageBenchModel(_QwenImageBenchModelMixin, Qwen3VLModelBase):
                     encoder_cache_max_bytes=0,
                 ),
             )
+            model_config.extra_attrs = extra_attrs
         kwargs["vision_model_class"] = Qwen3VisionModel
         kwargs["disable_fuse_rope"] = kwargs.get("disable_fuse_rope", False)
         super().__init__(model_config, *args, **kwargs)

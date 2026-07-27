@@ -353,7 +353,7 @@ class MultimodalModelMixin:
         by multimodal embeddings. Return `None` to use the out-of-vocabulary
         sentinel behavior in `fuse_input_embeds`.
         """
-        raise NotImplementedError
+        return None
 
     @property
     def text_embedding_layer(self):

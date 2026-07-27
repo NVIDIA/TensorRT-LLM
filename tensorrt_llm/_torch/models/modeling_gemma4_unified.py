@@ -226,6 +226,10 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
 
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config
+        if config.image_token_id is None:
+            raise ValueError(
+                "Gemma4UnifiedForConditionalGeneration requires config.image_token_id."
+            )
         super().__init__(config)
 
         # ModelConfig always has `mapping`, and Mapping always has `local_rank`.
@@ -233,11 +237,9 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
         self._device = f"cuda:{local_rank}"
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
         self._top_config = config
-        # HF always defines these token ids (each may be None if that modality is absent).
-        self.image_token_ids = (
-            torch.tensor([config.image_token_id], dtype=torch.int32, device=self._device)
-            if config.image_token_id is not None
-            else None
+        # Image tokens are required; audio and video may be absent.
+        self.image_token_ids = torch.tensor(
+            [config.image_token_id], dtype=torch.int32, device=self._device
         )
         self.audio_token_ids = (
             torch.tensor([config.audio_token_id], dtype=torch.int32, device=self._device)

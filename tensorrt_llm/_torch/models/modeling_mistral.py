@@ -859,12 +859,14 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         mm_inputs: PreparedLlmInputs,
         spec_metadata: SpecMetadata | None,
         resource_manager: Any | None = None,
+        lora_params: Any | None = None,
         **forward_kwargs: Any,
     ) -> dict[str, Any]:
         del raw_input_ids, position_ids, mm_inputs, forward_kwargs
         return {
             "spec_metadata": spec_metadata,
             "resource_manager": resource_manager,
+            "lora_params": lora_params,
         }
 
     @staticmethod

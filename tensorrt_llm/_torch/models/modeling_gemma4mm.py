@@ -592,6 +592,11 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             for multimodal_param in multimodal_params
         ]
 
+        if any(len(modalities) > 1 for modalities in param_modalities):
+            raise ValueError(
+                "Gemma4 requests containing multiple multimodal input types are not supported."
+            )
+
         # The cache helper splits this tensor by request. Preserve that order while still batching
         # consecutive requests with the same modality.
         if (
