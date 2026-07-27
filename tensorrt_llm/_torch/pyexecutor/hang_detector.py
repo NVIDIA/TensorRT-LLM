@@ -122,23 +122,22 @@ class HangDetector:
     async def _detect_hang(self) -> None:
         await asyncio.sleep(self.timeout)
         with self.lock:
-            self._detected = True
             status_providers = tuple(self._status_providers)
 
         _best_effort_log_error(f"Hang detected after {self.timeout} seconds.")
-        try:
-            for provider in status_providers:
-                try:
-                    status = provider()
-                    if status:
-                        _best_effort_log_error(status)
-                except Exception as error:  # noqa: BLE001 - isolate diagnostic providers
-                    _best_effort_log_error(
-                        f"HangDetector: status provider failed with {type(error).__name__}: {error}"
-                    )
-            print_all_stacks()
-        finally:
-            self.on_detected()
+        for provider in status_providers:
+            try:
+                status = provider()
+                if status:
+                    _best_effort_log_error(status)
+            except Exception as error:  # noqa: BLE001 - isolate diagnostic providers
+                _best_effort_log_error(
+                    f"HangDetector: status provider failed with {type(error).__name__}: {error}"
+                )
+        print_all_stacks()
+        with self.lock:
+            self._detected = True
+        self.on_detected()
 
     def detected(self):
         """Return True if hang is detected."""
