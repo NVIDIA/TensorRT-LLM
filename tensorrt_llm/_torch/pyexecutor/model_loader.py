@@ -440,6 +440,12 @@ class ModelLoader:
             # init=False runtime fields such as num_nextn_predict_layers.
             update_spec_config_from_model_config(llm_args.speculative_config,
                                                  config.pretrained_config)
+            spec_config = llm_args.speculative_config
+            spec_config._use_shared_kv_cache = bool(
+                getattr(model_cls, 'external_draft_shares_target_kv_cache',
+                        False)
+                and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                and spec_config.speculative_model is not None)
 
         # The transceiver preference follows the checkpoint's original
         # architecture: _resolve_class may rewrite it to an execution class
@@ -555,9 +561,8 @@ class ModelLoader:
 
             loads_draft_weights = (
                 self.spec_config is not None
-                and (self.spec_config.spec_dec_mode.need_load_draft_weights() or
-                     (self.spec_config.spec_dec_mode.is_mtp_eagle_one_model()
-                      and self.spec_config.speculative_model is not None)))
+                and (self.spec_config.spec_dec_mode.need_load_draft_weights()
+                     or self.spec_config._use_shared_kv_cache))
             speculative_mode = self._speculative_mode_name(self.spec_config)
             post_transform_qualification = self._qualify_post_transform_profile(
                 model,

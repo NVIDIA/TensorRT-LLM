@@ -36,7 +36,6 @@ from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
-from ..speculative.interface import uses_external_shared_kv_mtp
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
@@ -451,17 +450,6 @@ def create_py_executor(
                 f"Disable overlap scheduler for speculation mode {spec_config.spec_dec_mode.name}"
             )
             llm_args.disable_overlap_scheduler = True
-
-        # Other one-engine modes may require a separate draft KV cache, which
-        # FlashInfer attention metadata does not yet support.
-        if (llm_args.attn_backend == "FLASHINFER"
-                and spec_config.spec_dec_mode.use_one_engine()
-                and not uses_external_shared_kv_mtp(spec_config)):
-            raise ValueError(
-                f"FLASHINFER attention backend is not supported with one-engine speculative "
-                f"decoding mode '{spec_config.spec_dec_mode.name}' because its draft KV-cache "
-                f"path is not supported. Please use 'TRTLLM' attention "
-                f"backend instead by setting attn_backend='TRTLLM'.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True

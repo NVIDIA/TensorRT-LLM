@@ -107,11 +107,10 @@ _FORCE_ACCEPT_RNG_COUNTER_STRIDE = 6007
 _FORCE_ACCEPT_RNG_SLOT_STRIDE = 1009
 
 
-def uses_external_shared_kv_mtp(spec_config) -> bool:
-    """Whether one-engine MTP uses an external assistant over target KV."""
+def uses_shared_kv_cache(spec_config) -> bool:
+    """Whether the draft model attends directly over the target KV cache."""
     return bool(spec_config is not None
-                and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
-                and spec_config.speculative_model is not None)
+                and getattr(spec_config, "_use_shared_kv_cache", False))
 
 
 def should_use_separate_draft_kv_cache(spec_config) -> bool:
@@ -122,7 +121,7 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if not spec_config.spec_dec_mode.use_one_engine():
         return False
-    if uses_external_shared_kv_mtp(spec_config):
+    if uses_shared_kv_cache(spec_config):
         return False
     # DSpark owns a dedicated rolling-window cache in DSparkWorker. Its draft
     # model does not read the paged draft KV cache managed by attention metadata.

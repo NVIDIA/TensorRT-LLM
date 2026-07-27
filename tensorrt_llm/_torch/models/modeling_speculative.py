@@ -32,7 +32,7 @@ except ImportError:
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
-from ..speculative.interface import uses_external_shared_kv_mtp
+from ..speculative.interface import uses_shared_kv_cache
 from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
@@ -1890,7 +1890,7 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
             )
 
-    elif (uses_external_shared_kv_mtp(model_config.spec_config)
+    elif (uses_shared_kv_cache(model_config.spec_config)
           and draft_config is not None):
         return AutoModelForCausalLM.from_config(draft_config)
     elif spec_dec_mode.is_mtp_one_model():
@@ -1996,7 +1996,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
-                elif uses_external_shared_kv_mtp(spec_config):
+                elif uses_shared_kv_cache(spec_config):
                     self.draft_config = ModelConfig.from_pretrained(
                         spec_config.speculative_model,
                         trust_remote_code=True,

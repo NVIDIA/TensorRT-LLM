@@ -9,8 +9,15 @@ import torch
 from tensorrt_llm._torch.models import modeling_speculative
 from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
 from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker
-from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
-from tensorrt_llm._torch.speculative.utils import get_num_extra_kv_tokens, get_num_spec_layers
+from tensorrt_llm._torch.speculative.interface import (
+    should_use_separate_draft_kv_cache,
+    uses_shared_kv_cache,
+)
+from tensorrt_llm._torch.speculative.utils import (
+    get_num_extra_kv_tokens,
+    get_num_spec_layers,
+    update_spec_config_from_loaded_model,
+)
 from tensorrt_llm.llmapi import MTPDecodingConfig
 
 
@@ -21,12 +28,44 @@ def _shared_kv_spec_config(**kwargs) -> MTPDecodingConfig:
         mtp_eagle_one_model=True,
         **kwargs,
     )
+    spec_config._use_shared_kv_cache = True
     return spec_config
+
+
+def test_external_checkpoint_does_not_imply_shared_kv_cache():
+    spec_config = MTPDecodingConfig(
+        max_draft_len=3,
+        speculative_model="/tmp/assistant",
+        mtp_eagle_one_model=True,
+    )
+
+    assert not uses_shared_kv_cache(spec_config)
+    assert get_num_spec_layers(spec_config) == 1
+    assert get_num_extra_kv_tokens(spec_config) == 2
+    assert should_use_separate_draft_kv_cache(spec_config)
+
+
+def test_loaded_draft_capability_updates_runtime_spec_config():
+    spec_config = MTPDecodingConfig(
+        max_draft_len=3,
+        speculative_model="/tmp/gemma4-assistant",
+        mtp_eagle_one_model=True,
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(num_nextn_predict_layers=1),
+        draft_config=None,
+        draft_model=SimpleNamespace(shares_target_kv_cache=True),
+    )
+
+    update_spec_config_from_loaded_model(spec_config, model)
+
+    assert uses_shared_kv_cache(spec_config)
 
 
 def test_external_shared_kv_uses_no_draft_kv_cache():
     spec_config = _shared_kv_spec_config()
 
+    assert uses_shared_kv_cache(spec_config)
     assert get_num_spec_layers(spec_config) == 0
     assert get_num_extra_kv_tokens(spec_config) == 0
     assert not should_use_separate_draft_kv_cache(spec_config)

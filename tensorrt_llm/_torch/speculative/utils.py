@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
-from ..speculative.interface import SpecMetadata, uses_external_shared_kv_mtp
+from ..speculative.interface import SpecMetadata, uses_shared_kv_cache
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSampler,
                            DraftTargetOneModelSpecMetadata,
@@ -443,7 +443,7 @@ def get_spec_drafter(model_engine,
 
 
 def get_num_spec_layers(spec_config):
-    if uses_external_shared_kv_mtp(spec_config):
+    if uses_shared_kv_cache(spec_config):
         return 0
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         return 1
@@ -521,7 +521,7 @@ def get_num_extra_kv_tokens(spec_config):
     """
     if spec_config is None:
         return 0
-    if uses_external_shared_kv_mtp(spec_config):
+    if uses_shared_kv_cache(spec_config):
         return 0
     if spec_config.spec_dec_mode.use_one_engine():
         return spec_config.max_draft_len - 1
@@ -586,6 +586,10 @@ def update_spec_config_from_model_config(spec_config, model_config):
 def update_spec_config_from_loaded_model(spec_config, model) -> None:
     """Populate spec config fields from loaded target and draft model configs."""
     update_spec_config_from_model_config(spec_config, model.config)
+    draft_model = getattr(model, 'draft_model', None)
+    spec_config._use_shared_kv_cache = bool(
+        draft_model is not None
+        and getattr(draft_model, 'shares_target_kv_cache', False))
     draft_config = getattr(model, 'draft_config', None)
     if draft_config is not None:
         update_spec_config_from_draft_model_config(
