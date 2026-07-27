@@ -34,6 +34,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .base import Communication
 
 _NVFP4_FUSED_OUTPUT_SCALE_ENV = "TRTLLM_DEEP_EP_NVFP4_FUSED_OUTPUT_SCALE"
+_NVFP4_FUSED_BF16_DISPATCH_ENV = "TRTLLM_DEEP_EP_NVFP4_FUSED_BF16_DISPATCH"
 
 
 class DeepEPLowLatency(Communication):
@@ -97,6 +98,13 @@ class DeepEPLowLatency(Communication):
                 f"{_NVFP4_FUSED_OUTPUT_SCALE_ENV} must be 0 or 1, got {fused_output_scale_value!r}"
             )
         self._fuse_nvfp4_output_scale = fused_output_scale_value == "1"
+        fused_bf16_dispatch_value = os.environ.get(_NVFP4_FUSED_BF16_DISPATCH_ENV)
+        if fused_bf16_dispatch_value not in (None, "0", "1"):
+            raise ValueError(
+                f"{_NVFP4_FUSED_BF16_DISPATCH_ENV} must be 0 or 1, "
+                f"got {fused_bf16_dispatch_value!r}"
+            )
+        self._fuse_nvfp4_bf16_dispatch = fused_bf16_dispatch_value == "1"
         if self._fuse_nvfp4_output_scale and (
             not self.use_low_precision_combine or not self._has_nvfp4()
         ):
@@ -171,6 +179,26 @@ class DeepEPLowLatency(Communication):
             return (self.hidden_size // 2) in self.SUPPORTED_HIDDEN_SIZES
         return False
 
+    def should_fuse_bf16_nvfp4_dispatch(
+        self, hidden_states: torch.Tensor, global_scale: Optional[torch.Tensor]
+    ) -> bool:
+        """Return whether dispatch can absorb this call's NVFP4 quantization."""
+        return (
+            getattr(self, "_fuse_nvfp4_bf16_dispatch", False)
+            and self._has_nvfp4()
+            and self.supports_post_quant_dispatch()
+            and isinstance(hidden_states, torch.Tensor)
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.dim() == 2
+            and hidden_states.is_contiguous()
+            and hidden_states.shape[1] == self.hidden_size
+            and isinstance(global_scale, torch.Tensor)
+            and global_scale.dtype == torch.float32
+            and global_scale.numel() == 1
+            and global_scale.is_contiguous()
+            and global_scale.device == hidden_states.device
+        )
+
     def supports_low_precision_combine(self) -> bool:
         """
         DeepEP Low Latency supports low-precision combine for: fp8_qdq, nvfp4, w4afp8
@@ -207,6 +235,8 @@ class DeepEPLowLatency(Communication):
         all_rank_num_tokens: List[int],
         use_dp_padding: Optional[bool] = None,
         pre_quant_scale: Optional[torch.Tensor] = None,
+        fuse_bf16_nvfp4_quantization: bool = False,
+        nvfp4_input_scale: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -258,39 +288,55 @@ class DeepEPLowLatency(Communication):
                 hidden_states = hidden_states.view(torch.float8_e4m3fn)
 
             elif self._has_nvfp4():
-                token_num = hidden_states.shape[0]
-                # For nvfp4, hidden_states.shape[1] is the quantized dimension (hidden_size // 2)
-                # We need to calculate the original hidden_size
-                # note: we use uint8 to store 2 fp4 values
-                hidden_size = hidden_states.shape[1] * 2
-
-                # Pre-dispatch assertions
-                assert (
-                    hidden_states.dtype == torch.uint8
-                    and hidden_states_sf is not None
-                    and hidden_states_sf.dtype == torch.uint8
-                )
-                assert hidden_size % 32 == 0, (
-                    "HiddenSize should be divisible by 32 in nvfp4 postquant alltoall"
-                )
-                assert (
-                    hidden_states_sf.shape[0] == token_num
-                    and hidden_states_sf.shape[1] == hidden_size // 16
-                )
-                assert (
-                    hidden_states.shape[0] == token_num
-                    and hidden_states.shape[1] == hidden_size // 2
-                )
-
-                hidden_states, hidden_states_sf, recv_expert_count, deep_ep_handle = (
-                    self.deep_ep_buffer.low_latency_dispatch_fp4(
-                        hidden_states,
-                        hidden_states_sf,
-                        deep_ep_topk_idx,
-                        all_rank_max_num_tokens,
-                        self.num_slots,
+                if fuse_bf16_nvfp4_quantization:
+                    if nvfp4_input_scale is None or not self.should_fuse_bf16_nvfp4_dispatch(
+                        hidden_states, nvfp4_input_scale
+                    ):
+                        raise ValueError(
+                            "Fused BF16-to-NVFP4 dispatch requires contiguous BF16 input, "
+                            "one FP32 input scale, and supported NVFP4 post-quant DeepEP"
+                        )
+                    hidden_size = hidden_states.shape[1]
+                    assert hidden_states_sf is None
+                    hidden_states, hidden_states_sf, recv_expert_count, deep_ep_handle = (
+                        self.deep_ep_buffer.low_latency_dispatch_bf16_to_fp4(
+                            hidden_states,
+                            nvfp4_input_scale,
+                            deep_ep_topk_idx,
+                            all_rank_max_num_tokens,
+                            self.num_slots,
+                        )
                     )
-                )
+                else:
+                    token_num = hidden_states.shape[0]
+                    # uint8 stores two FP4 values, so recover the original width.
+                    hidden_size = hidden_states.shape[1] * 2
+                    assert (
+                        hidden_states.dtype == torch.uint8
+                        and hidden_states_sf is not None
+                        and hidden_states_sf.dtype == torch.uint8
+                    )
+                    assert hidden_size % 32 == 0, (
+                        "HiddenSize should be divisible by 32 in nvfp4 postquant alltoall"
+                    )
+                    assert (
+                        hidden_states_sf.shape[0] == token_num
+                        and hidden_states_sf.shape[1] == hidden_size // 16
+                    )
+                    assert (
+                        hidden_states.shape[0] == token_num
+                        and hidden_states.shape[1] == hidden_size // 2
+                    )
+
+                    hidden_states, hidden_states_sf, recv_expert_count, deep_ep_handle = (
+                        self.deep_ep_buffer.low_latency_dispatch_fp4(
+                            hidden_states,
+                            hidden_states_sf,
+                            deep_ep_topk_idx,
+                            all_rank_max_num_tokens,
+                            self.num_slots,
+                        )
+                    )
 
                 # Post-dispatch assertions
                 assert hidden_states.dtype == torch.uint8 and hidden_states_sf.dtype == torch.uint8
