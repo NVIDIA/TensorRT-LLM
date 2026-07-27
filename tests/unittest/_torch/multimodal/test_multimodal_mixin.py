@@ -146,10 +146,13 @@ def make_keyed_multimodal_param(
     n_items = len(embedding_lengths)
 
     # Pattern-A image data so the mixin's default `build_multimodal_encoder_input` can
-    # slice this param (dim-0 `pixel_values` parallel to a per-item `image_sizes` list).
+    # slice this param (dim-0 `pixel_values [B, C, H, W]` parallel to a per-item
+    # `image_sizes` list).
     mm_data = {
         "image": {
-            "pixel_values": torch.arange(n_items * 3, dtype=torch.float32).reshape(n_items, 3),
+            "pixel_values": torch.arange(n_items * 3 * 2 * 2, dtype=torch.float32).reshape(
+                n_items, 3, 2, 2
+            ),
             "image_sizes": [[2, 2]] * n_items,
         },
         "multimodal_embedding_lengths": embedding_lengths,
@@ -596,6 +599,38 @@ def test_build_multimodal_encoder_input_slices_packed_grid_thw():
     torch.testing.assert_close(residual_image["second_per_grid_ts"], per_item_meta[[2, 0]])
     assert residual_image["per_item_list"] == ["c", "a"]
     torch.testing.assert_close(residual_image["per_request_scalar"], torch.tensor(42.0))
+
+
+def test_build_multimodal_encoder_input_stacked_crops_padding_to_miss_max_size():
+    # `pixel_values` is padded to request-wide 5x5 but item 0's true size is (3, 4)
+    # and item 1's is (5, 5). Slicing to just item 0 must crop `pixel_values` down to
+    # (3, 4) so Mistral 3's `batch_pixel_values` (which re-pads to
+    # `max(image_sizes)`) doesn't apply a negative pad amount.
+    pixels = torch.arange(2 * 3 * 5 * 5, dtype=torch.float32).reshape(2, 3, 5, 5)
+    param = MultimodalParams(
+        multimodal_input=MultimodalInput(
+            multimodal_hashes=[[i] * 8 for i in range(2)],
+            multimodal_positions=[0, 0],
+            multimodal_lengths=[1, 1],
+        ),
+        multimodal_data={
+            "image": {
+                "pixel_values": pixels,
+                "image_sizes": [[3, 4], [5, 5]],
+            },
+            "multimodal_embedding_lengths": [1, 1],
+            "mm_processor_kwargs_hash": "kw",
+        },
+    )
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([0]))
+
+    residual = model.build_multimodal_encoder_input(param, [0])
+
+    residual_image = residual.multimodal_data["image"]
+    assert residual_image["image_sizes"] == [[3, 4]]
+    assert residual_image["pixel_values"].shape == (1, 3, 3, 4)
+    # Cropped tensor preserves item 0's top-left (H=0..3, W=0..4) window.
+    torch.testing.assert_close(residual_image["pixel_values"], pixels[0:1, :, :3, :4])
 
 
 @pytest.mark.parametrize(
