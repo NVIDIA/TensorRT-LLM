@@ -3005,7 +3005,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
     )
     def test_cuda_graph_speculative_verification_hybrid_headdim(self):
-        """Speculative graph refreshes paged-prefill state after request turnover."""
+        """Speculative multi-query decode survives graph request turnover."""
         config = Gemma4TextConfig(**deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG))
         kv_cache_manager = self._get_kv_cache_manager(
             config, num_blocks=32, tokens_per_block=32, batch_size=2
@@ -3075,7 +3075,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         ):
             return FlashInferAttentionMetadata(
                 seq_lens=torch.tensor([verification_tokens], dtype=torch.int),
-                num_contexts=1,
+                num_contexts=0,
                 is_cuda_graph=is_cuda_graph,
                 kv_cache_params=KVCacheParams(
                     use_cache=True, num_cached_tokens_per_seq=cached_tokens

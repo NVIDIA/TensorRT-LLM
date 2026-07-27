@@ -121,16 +121,6 @@ def needs_external_draft_weights(spec_config) -> bool:
     return spec_config.spec_dec_mode.need_load_draft_weights()
 
 
-def should_extend_context(spec_config,
-                          attention_backend: Type[AttentionBackend]) -> bool:
-    """Whether generation verification uses the backend's context kernel."""
-    if is_gemma4_mtp_assistant(spec_config):
-        from ..attention_backend.flashinfer import FlashInferAttention
-        if issubclass(attention_backend, FlashInferAttention):
-            return True
-    return spec_config.spec_dec_mode.extend_ctx(attention_backend)
-
-
 def should_use_separate_draft_kv_cache(spec_config) -> bool:
     """
     Check if separate draft KV cache should be used for one-engine speculative decoding.

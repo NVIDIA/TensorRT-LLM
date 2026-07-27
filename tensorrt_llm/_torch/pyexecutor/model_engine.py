@@ -66,7 +66,6 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
                            prepare_attn_metadata_for_draft_replay,
                            restore_attn_metadata_after_draft_replay,
-                           should_extend_context,
                            update_spec_config_from_loaded_model)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
@@ -3392,9 +3391,8 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.beam_width = 1
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = num_extend_ctx_requests if (
-            enable_spec_decode
-            and should_extend_context(spec_config, self.attn_backend)
-            and spec_config.is_linear_tree) else 0
+            enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
+                self.attn_backend) and spec_config.is_linear_tree) else 0
         attn_metadata.num_chunked_ctx_requests = attn_metadata.num_contexts
 
         # Create KV cache params and prepare metadata
@@ -3673,8 +3671,9 @@ class PyTorchModelEngine(ModelEngine):
         num_extend_dummy_requests = 0
         num_previous_batch = 0
 
-        use_extend_ctx = (self.enable_spec_decode and should_extend_context(
-            spec_config, self.attn_backend) and spec_config.is_linear_tree)
+        use_extend_ctx = (self.enable_spec_decode
+                          and spec_config.spec_dec_mode.extend_ctx(
+                              self.attn_backend) and spec_config.is_linear_tree)
 
         for idx, request in enumerate(extend_requests):
             request_accepted_path[request.py_request_id] = \
@@ -3747,8 +3746,8 @@ class PyTorchModelEngine(ModelEngine):
 
         # Determine if we're using extend_ctx mode for linear tree decoding
         num_extend_ctx_requests = 0
-        if self.enable_spec_decode and should_extend_context(
-                spec_config, self.attn_backend) and spec_config.is_linear_tree:
+        if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
+                self.attn_backend) and spec_config.is_linear_tree:
             num_extend_ctx_requests = num_extend_requests
 
         virtual_num_tokens = num_generation_tokens
@@ -4331,8 +4330,7 @@ class PyTorchModelEngine(ModelEngine):
                                        if is_promoted_context else
                                        request.max_beam_num_tokens - 1)
                 draft_lens.append(num_draft_tokens)
-                if self.enable_spec_decode and should_extend_context(
-                        spec_config,
+                if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     # We're treating the prompt lengths as context requests here, so
                     # the the prompt lens should not include the cached tokens.
@@ -4384,8 +4382,7 @@ class PyTorchModelEngine(ModelEngine):
                     request.py_num_compressed_tokens)
                 request.cached_tokens = (past_seen_token_num +
                                          runtime_tokens_per_gen_step)
-                if self.enable_spec_decode and should_extend_context(
-                        spec_config,
+                if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     prompt_lengths.append(runtime_tokens_per_gen_step)
                 else:
@@ -4983,8 +4980,8 @@ class PyTorchModelEngine(ModelEngine):
         # Use num_chunked_ctx_requests to record the number of extend context requests,
         # so that we can update the kv_lens_cuda correctly in _preprocess_inputs.
         attn_metadata.num_chunked_ctx_requests = 0
-        if self.enable_spec_decode and should_extend_context(
-                spec_config, self.attn_backend) and spec_config.is_linear_tree:
+        if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
+                self.attn_backend) and spec_config.is_linear_tree:
             # For the tree decoding, we want to use XQA to process the draft tokens for the target model.
             # Therefore, we do not treat them as the chunked context requests.
             attn_metadata.num_contexts += len(extend_requests)
@@ -5629,8 +5626,8 @@ class PyTorchModelEngine(ModelEngine):
             tokens_per_seq = 1
             if (self.enable_spec_decode and self.runtime_draft_len > 0
                     and self.spec_config.is_linear_tree
-                    and not should_extend_context(self.spec_config,
-                                                  self.attn_backend)):
+                    and not self.spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend)):
                 tokens_per_seq = self.runtime_draft_len + 1
             return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
                 scheduled_requests, attn_metadata, peft_cache_manager,
@@ -5749,9 +5746,8 @@ class PyTorchModelEngine(ModelEngine):
             # count so the kernel correctly expands LoRA weights for all tokens.
             if (self.enable_spec_decode and self.runtime_draft_len > 0
                     and self.spec_config.is_linear_tree
-                    and not should_extend_context(self.spec_config,
-                                                  self.attn_backend)
-                    and num_generations > 0):
+                    and not self.spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend) and num_generations > 0):
                 tokens_per_req = self.runtime_draft_len + 1
                 host_request_types = host_request_types.clone()
                 host_request_types[num_contexts:num_seqs].fill_(0)  # kCONTEXT

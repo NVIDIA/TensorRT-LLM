@@ -451,9 +451,8 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-        # External MTP assistants with shared target KV use a dedicated
-        # FlashInfer decode metadata view. Other one-engine modes still rely
-        # on the one-query-per-sequence decode contract.
+        # Gemma4 MTP assistants provide the shared-KV metadata required by the
+        # FlashInfer decode path. Other one-engine modes remain unsupported.
         supports_shared_kv_flashinfer = getattr(spec_config,
                                                 "_is_gemma4_mtp_assistant",
                                                 False)
@@ -461,9 +460,7 @@ def create_py_executor(
                 and not supports_shared_kv_flashinfer):
             raise ValueError(
                 f"FLASHINFER attention backend is not supported with one-engine speculative "
-                f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
-                f"decode path expects exactly 1 token per sequence, but one-engine speculative "
-                f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
+                f"decoding mode '{spec_config.spec_dec_mode.name}'. Please use 'TRTLLM' attention "
                 f"backend instead by setting attn_backend='TRTLLM'.")
 
     if mm_encoder_only:

@@ -7,7 +7,6 @@ from .interface import (SpecMetadata, SpecWorkerBase,
                         needs_external_draft_weights,
                         prepare_attn_metadata_for_draft_replay,
                         restore_attn_metadata_after_draft_replay,
-                        should_extend_context,
                         should_use_separate_draft_kv_cache)
 from .mtp import MTPSampler, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
@@ -64,7 +63,6 @@ __all__ = [
     "prepare_attn_metadata_for_draft_replay",
     "needs_external_draft_weights",
     "restore_attn_metadata_after_draft_replay",
-    "should_extend_context",
     "should_use_separate_draft_kv_cache",
     "update_spec_config_from_draft_model_config",
     "update_spec_config_from_loaded_model",
