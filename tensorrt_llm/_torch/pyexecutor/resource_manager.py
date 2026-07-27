@@ -47,6 +47,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_to_str_dtype, mpi_rank, nvtx_range
 from ...logger import logger
 from ...mapping import CpType, Mapping
+from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
@@ -444,8 +445,7 @@ class KVCacheManager(BaseResourceManager):
         # Determine if this is VSWA (Variable Sliding Window Attention).
         # The `w > 0` check excludes LinearCacheType.RECURRENT_STATES sentinel
         # values (negative) used by hybrid linear attention models.
-        self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(
-            w > 0 for w in self.max_attention_window_vec)
+        self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
         self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size

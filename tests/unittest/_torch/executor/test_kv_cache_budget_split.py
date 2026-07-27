@@ -14,11 +14,13 @@
 # limitations under the License.
 """Tests for KV cache budget splitting between target and draft managers."""
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
+from tensorrt_llm._torch.pyexecutor.config_utils import uses_vswa_kv_cache_layout
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 GB = 1 << 30
@@ -65,6 +67,70 @@ def _make_creator(
 
 
 class TestSplitGpuBudgetForDraft:
+    def test_v1_mixed_draft_build_uses_original_max_seq_len(self, mocker):
+        c = _make_creator(max_gpu_total_bytes=10 * GB)
+        original_max_seq_len = 16384
+        c._max_seq_len = original_max_seq_len
+        c._skip_est = False
+        c._is_kv_cache_manager_v2 = False
+        c._is_encoder_decoder = Mock(return_value=False)
+        c._draft_model_engine = None
+        c._kv_connector_manager = None
+        c._is_disagg = False
+        c._max_num_tokens = 8192
+        c._max_beam_width = 1
+        c._execution_stream = None
+        c._enable_kv_cache_stats = Mock(return_value=False)
+        c._should_create_separate_draft_kv_cache = Mock(return_value=True)
+        c._speculative_config = Mock()
+        c._speculative_config.spec_dec_mode.is_external_drafter.return_value = True
+
+        draft_pretrained_config = SimpleNamespace(
+            num_hidden_layers=2,
+            sliding_window=4096,
+            layer_types=["sliding_attention", "full_attention"],
+            torch_dtype=None,
+        )
+        effective_draft_config = SimpleNamespace(
+            pretrained_config=draft_pretrained_config,
+            sparse_attention_config=None,
+        )
+        c._get_effective_draft_config = Mock(return_value=effective_draft_config)
+        c._get_num_draft_layers = Mock(return_value=2)
+        c._model_engine.model.model_config.pretrained_config.num_hidden_layers = 40
+        c._fallback_if_unsupported_kv_cache_manager_v2 = Mock(
+            side_effect=lambda manager_cls, *_: manager_cls
+        )
+
+        target_manager = Mock()
+
+        def create_target_manager(*_args, **_kwargs):
+            c._max_seq_len = 4096
+            return target_manager
+
+        c._create_kv_cache_manager = Mock(side_effect=create_target_manager)
+        mocker.patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls", return_value=Mock()
+        )
+        create_manager = mocker.patch(
+            "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager", return_value=Mock()
+        )
+
+        resources = {}
+        c.build_managers(resources)
+
+        draft_kwargs = create_manager.call_args.kwargs
+        assert draft_kwargs["max_seq_len"] == original_max_seq_len
+        assert draft_kwargs["kv_cache_config"].max_attention_window == [4096, 16384]
+        assert uses_vswa_kv_cache_layout(draft_kwargs["kv_cache_config"].max_attention_window)
+
+    @pytest.mark.parametrize(
+        ("windows", "expected"),
+        [([4096, 16384], True), ([-2147483647, 16384], False)],
+    )
+    def test_vswa_detection_excludes_recurrent_state_windows(self, windows, expected):
+        assert uses_vswa_kv_cache_layout(windows) is expected
+
     def test_gpu_budget_split_proportionally(self):
         total_gpu = 10 * GB
         c = _make_creator(
