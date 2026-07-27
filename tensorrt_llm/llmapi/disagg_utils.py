@@ -311,6 +311,11 @@ def extract_router_config(server_cfg: dict) -> RouterConfig:
     args = server_cfg.pop("router", {})
     router_type = args.pop("type", "round_robin")
 
+    if router_type == "kv_cache_aware" and "model_path" not in args:
+        model_path = server_cfg.get("model")
+        if model_path is not None:
+            args["model_path"] = model_path
+
     # add fields that are not specific to router
     extract_keys = ["max_batch_size", "max_num_tokens"]
     for key in extract_keys:
