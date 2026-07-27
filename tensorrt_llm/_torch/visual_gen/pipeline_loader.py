@@ -303,6 +303,15 @@ class PipelineLoader:
         else:
             logger.info("torch.compile disabled by config")
 
+        # Cache acceleration (TeaCache / Cache-DiT) is enabled AFTER torch.compile
+        # on purpose: Cache-DiT captures references to the transformer block
+        # modules at enable time, while torch_compile() replaces the block lists
+        # with compiled copies. If Cache-DiT were enabled first, it would keep
+        # running the stale eager blocks and torch.compile would contribute
+        # nothing.
+        if getattr(pipeline, "transformer", None) is not None:
+            pipeline._setup_cache_acceleration()
+
         if not skip_warmup:
             if config.torch_compile.enable_autotune:
                 with autotune(
