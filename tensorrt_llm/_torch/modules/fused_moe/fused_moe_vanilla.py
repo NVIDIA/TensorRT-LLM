@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from dataclasses import replace
 from typing import Dict, List, Optional
@@ -18,6 +21,11 @@ from .routing import BaseMoeRoutingMethod
 
 
 class VanillaMoE(nn.ModuleList):
+
+    @property
+    def supports_partial_weight_loading(self) -> bool:
+        """Vanilla expert modules currently require one complete load."""
+        return False
 
     def __init__(
         self,

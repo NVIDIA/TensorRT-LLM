@@ -234,6 +234,9 @@ class FusedMoEMethodBase(ABC):
     weight_alignment: int = 1
     """int: Required byte alignment for MoE weight tensors."""
 
+    supports_partial_weight_loading: bool = False
+    """Whether the method supports deferred finalization after partial loads."""
+
     eplb_support_status: EplbSupportStatus = EplbSupportStatus.NOT_SUPPORTED
     """EplbSupportStatus: Online EPLB support status for this quantization method.
 
@@ -431,15 +434,9 @@ class FusedMoEMethodBase(ABC):
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
-        if allow_partial_loading:
-            if not isinstance(self,
-                              (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
-                               DeepSeekFP8BlockScalesFusedMoEMethod,
-                               DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
-                               NVFP4FusedMoEMethod)):
-                raise NotImplementedError(
-                    f"Partial loading is not supported for {type(self).__name__}"
-                )
+        if allow_partial_loading and not self.supports_partial_weight_loading:
+            raise NotImplementedError(
+                f"Partial loading is not supported for {type(self).__name__}")
         additional_kargs = {}
         if "allow_partial_loading" in inspect.getfullargspec(
                 self.load_expert_weights_to_dst).args:
@@ -697,6 +694,7 @@ class FusedMoEMethodBase(ABC):
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
+    supports_partial_weight_loading = True
     eplb_support_status = EplbSupportStatus.SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
@@ -887,6 +885,7 @@ def requantize_expert_w3_w1_weight_fp8_qdq(module: torch.nn.Module,
 
 
 class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
+    supports_partial_weight_loading = True
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
@@ -1064,6 +1063,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
 
 
 class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
+    supports_partial_weight_loading = True
     eplb_support_status = EplbSupportStatus.NOT_VERIFIED
     FP8_QUANT_BLOCK_SIZE = 128
 
@@ -2092,6 +2092,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     """
     Base class for NVFP4 fused MoE methods for all backends.
     """
+    supports_partial_weight_loading = True
     eplb_support_status = EplbSupportStatus.SUPPORTED
 
     def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,

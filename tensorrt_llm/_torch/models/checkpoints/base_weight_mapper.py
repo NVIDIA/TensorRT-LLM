@@ -1,13 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Sequence
 from typing import Callable, List, Union
 
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    WeightGroup
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 
 
 class BaseWeightMapper(ABC):
+
+    # A mapper must opt in explicitly when every source tensor can be loaded
+    # independently. Most model families fuse or jointly transform checkpoint
+    # tensors, so the conservative default requires an atomic group manifest.
+    single_tensor_groups_safe = False
+
+    @property
+    def borrowed_source_tensors_safe(self) -> bool:
+        """Whether incremental loading may borrow transport-owned tensors.
+
+        The conservative default requires rank-local staging. Opting in means
+        mapper callbacks and model loading neither mutate source tensors nor
+        retain their storage after ``load_weights`` returns. The orchestrator
+        must still wait for asynchronous H2D reads before releasing the source
+        batch.
+        """
+        return False
 
     def __init__(self):
         self._callbacks: list[Callable] = []
@@ -15,6 +38,8 @@ class BaseWeightMapper(ABC):
         self._skip_modules = []
         self._model: Union[nn.Module, DecoderModelForCausalLM] | None = None
         self._config: ModelConfig | None = None
+        self._incremental_expected_group_ids: tuple[str, ...] | None = None
+        self._incremental_loaded_group_ids: set[str] = set()
 
     def init_model_and_config(self, model: Union[nn.Module,
                                                  DecoderModelForCausalLM],
@@ -35,6 +60,97 @@ class BaseWeightMapper(ABC):
     def cleanup(self) -> None:
         self._model = None
         self._config = None
+        self._incremental_expected_group_ids = None
+        self._incremental_loaded_group_ids.clear()
+
+    def get_weight_groups(self,
+                          keys: Iterable[str]) -> list[WeightGroup] | None:
+        """Return source tensors that must be materialized atomically.
+
+        The returned groups must partition ``keys`` exactly once. The default
+        is intentionally unsupported because a generic mapper cannot prove
+        that tensors are independent across model-specific fusion,
+        quantization, or alias transformations.
+
+        This hook is evaluated after :meth:`init_model_and_config`, allowing a
+        mapper to account for the model configuration and rank mapping.
+        """
+        del keys
+        return None
+
+    def get_incremental_load_roots(
+            self, keys: Iterable[str]) -> tuple[str, ...] | None:
+        """Return model subtrees that can consume an incremental source group.
+
+        Returning ``None`` selects the conservative full-model traversal. A
+        mapper should override this only when it can map every source tensor
+        name to a destination subtree without omitting model-specific fusion,
+        quantization, or callback handling. The returned roots may overlap;
+        the loader de-duplicates their module traversal.
+
+        Args:
+            keys: Tensor names after mapper preprocessing and optional
+                ``params_map`` renaming.
+
+        Returns:
+            Destination module roots, or ``None`` when a full traversal is
+            required.
+        """
+        del keys
+        return None
+
+    def begin_incremental_load(self, groups: Sequence[WeightGroup]) -> None:
+        """Start source-manifest validation for an incremental load.
+
+        This lifecycle validates that every declared source group is presented
+        exactly once. It deliberately does not prove destination-parameter
+        completeness; each model-family opt-in remains responsible for
+        choosing groups that preserve its loading invariants.
+        """
+        if self._incremental_expected_group_ids is not None:
+            raise RuntimeError("An incremental weight load is already active")
+
+        group_ids = tuple(group.group_id for group in groups)
+        if len(set(group_ids)) != len(group_ids):
+            raise ValueError("Incremental weight group IDs must be unique")
+        self._incremental_expected_group_ids = group_ids
+        self._incremental_loaded_group_ids.clear()
+
+    def record_incremental_group_loaded(self, group_id: str) -> None:
+        """Record one successfully materialized source dependency group."""
+        if self._incremental_expected_group_ids is None:
+            raise RuntimeError("No incremental weight load is active")
+        if group_id not in self._incremental_expected_group_ids:
+            raise ValueError(f"Unknown incremental weight group {group_id!r}")
+        if group_id in self._incremental_loaded_group_ids:
+            raise ValueError(
+                f"Incremental weight group {group_id!r} was loaded twice")
+        self._incremental_loaded_group_ids.add(group_id)
+
+    def finalize_incremental_load(self) -> None:
+        """Validate complete source-group coverage and close the lifecycle."""
+        if self._incremental_expected_group_ids is None:
+            raise RuntimeError("No incremental weight load is active")
+
+        missing = [
+            group_id for group_id in self._incremental_expected_group_ids
+            if group_id not in self._incremental_loaded_group_ids
+        ]
+        if missing:
+            missing_sample = ", ".join(missing[:8])
+            if len(missing) > 8:
+                missing_sample += ", ..."
+            raise RuntimeError(
+                "Incremental weight load did not materialize "
+                f"{len(missing)} source groups: {missing_sample}")
+
+        self._incremental_expected_group_ids = None
+        self._incremental_loaded_group_ids.clear()
+
+    def abort_incremental_load(self) -> None:
+        """Reset incremental validation without masking the primary error."""
+        self._incremental_expected_group_ids = None
+        self._incremental_loaded_group_ids.clear()
 
     @abstractmethod
     def map_weights(self) -> None:

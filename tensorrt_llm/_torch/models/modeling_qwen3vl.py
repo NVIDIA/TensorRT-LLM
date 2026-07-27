@@ -1009,6 +1009,12 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
 
 class Qwen3VisionModelBase(nn.Module):
+    _VISION_PARAMS_MAP = {
+        r"(.*?)attn.proj.(.*)": r"\1attn.o_proj.\2",
+        r"(.*?)mlp.linear_fc1.(.*)": r"\1mlp.up_proj.\2",
+        r"(.*?)mlp.linear_fc2.(.*)": r"\1mlp.down_proj.\2",
+    }
+
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -1026,13 +1032,18 @@ class Qwen3VisionModelBase(nn.Module):
         self.visual = MultimodalModelMixin._cast_multimodal_encoder_dtype(
             model_class(self.model_config), self.model_dtype
         )
+        self._vision_weights_loaded = False
 
         self.post_config()
 
     def post_config(self):
         self.config = self.model_config.pretrained_config.vision_config
 
-    def load_weights(self, weights: Dict[str, torch.Tensor]):
+    @classmethod
+    def _prepare_visual_weights(
+        cls, weights: Dict[str, torch.Tensor]
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Extract vision tensors and canonicalize fused QKV source names."""
         visual_weights = filter_weights("model.visual", weights)
         converted_weights = {}
 
@@ -1051,13 +1062,75 @@ class Qwen3VisionModelBase(nn.Module):
                 converted_weights[v_name] = visual_weights[name][2 * dim_shape :]
             else:
                 converted_weights[name] = visual_weights[name]
-        pattern_mapping = {
-            r"(.*?)attn.proj.(.*)": r"\1attn.o_proj.\2",
-            r"(.*?)mlp.linear_fc1.(.*)": r"\1mlp.up_proj.\2",
-            r"(.*?)mlp.linear_fc2.(.*)": r"\1mlp.down_proj.\2",
-        }
+
+        canonical_weights = {}
+        for name, tensor in converted_weights.items():
+            canonical_name = name
+            for pattern, replacement in cls._VISION_PARAMS_MAP.items():
+                if re.match(pattern, name):
+                    canonical_name = re.sub(pattern, replacement, name)
+                    break
+            canonical_weights[canonical_name] = tensor
+        return converted_weights, canonical_weights
+
+    def _required_visual_weight_names(self) -> set[str]:
+        """Return source names required by the unquantized vision loader."""
+        required_names = set()
+        for module_name, module in self.visual.named_modules(remove_duplicate=False):
+            parameter_names = [name for name, _ in module.named_parameters(recurse=False)]
+            if not parameter_names:
+                continue
+
+            names = module_name.split(".")
+            if names[-1] == "qkv_proj":
+                prefix = ".".join(names[:-1])
+                for source_name in ("q_proj", "k_proj", "v_proj"):
+                    for parameter_name in parameter_names:
+                        required_names.add(
+                            ".".join(
+                                filter(
+                                    None,
+                                    (prefix, source_name, parameter_name),
+                                )
+                            )
+                        )
+            else:
+                for parameter_name in parameter_names:
+                    required_names.add(".".join(filter(None, (module_name, parameter_name))))
+        return required_names
+
+    def load_weights(
+        self,
+        weights: Dict[str, torch.Tensor],
+        allow_partial_loading: bool = False,
+    ):
+        visual_weights = filter_weights("model.visual", weights)
+        if allow_partial_loading and not visual_weights:
+            # Text dependency groups must not walk or mutate the vision tower.
+            return
+        if allow_partial_loading and getattr(self, "_vision_weights_loaded", False):
+            raise RuntimeError("Qwen3 vision weights were already loaded")
+
+        converted_weights, canonical_weights = self._prepare_visual_weights(weights)
+        if allow_partial_loading:
+            missing_names = sorted(self._required_visual_weight_names() - canonical_weights.keys())
+            if missing_names:
+                raise ValueError(
+                    "Incremental Qwen3 vision group is incomplete: missing "
+                    f"{len(missing_names)} parameters, including "
+                    f"{missing_names[:5]}"
+                )
+
         self.visual.config.num_attention_heads = self.visual.config.num_heads
-        _load_weights_impl(self.visual, converted_weights, params_map=pattern_mapping)
+        # The mapper publishes the complete vision/projector subtree as one
+        # atomic group. Use the strict loader after prevalidation so an
+        # incomplete group cannot partially mutate the already-built tower.
+        _load_weights_impl(
+            self.visual,
+            converted_weights,
+            params_map=self._VISION_PARAMS_MAP,
+        )
+        self._vision_weights_loaded = True
 
     def _parse_and_batch_multimodal_data(
         self, multimodal_params: List[MultimodalParams]

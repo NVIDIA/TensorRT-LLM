@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from .base_checkpoint_loader import BaseCheckpointLoader
 from .hf.afmoe_weight_mapper import AfmoeHfWeightMapper
 from .hf.checkpoint_loader import HfCheckpointLoader
@@ -24,6 +27,8 @@ from .mistral.config_loader import MistralConfigLoader
 from .mistral.weight_mapper import (MistralLarge3WeightMapper,
                                     MistralWeightMapper)
 from .mx.checkpoint_loader import MXCheckpointLoader
+from .weight_load_plan import (DEFAULT_WEIGHT_LOAD_PLAN, WeightLoadPlan,
+                               WeightLoadPolicy)
 
 __all__ = [
     "AfmoeHfWeightMapper", "HfConfigLoader", "HfWeightLoader", "HfWeightMapper",
@@ -35,5 +40,6 @@ __all__ = [
     "Qwen3_5MoeHfWeightMapper", "Qwen3NextHfWeightMapper",
     "Gemma4HfWeightMapper", "LlavaNextHfWeightMapper",
     "MistralLarge3CheckpointLoader", "MistralLarge3WeightMapper",
-    "MXCheckpointLoader", "Qwen3VLHfWeightMapper", "Cosmos3HfWeightMapper"
+    "MXCheckpointLoader", "Qwen3VLHfWeightMapper", "Cosmos3HfWeightMapper",
+    "DEFAULT_WEIGHT_LOAD_PLAN", "WeightLoadPlan", "WeightLoadPolicy"
 ]

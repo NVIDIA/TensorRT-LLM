@@ -1,10 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import re
 from collections import defaultdict
+from collections.abc import Iterable
 
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import WeightGroup
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_next_weight_mapper import (
     Qwen3NextHfWeightMapper,
 )
@@ -60,6 +65,98 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     _DENSE_MLP_PATTERN = re.compile(
         r"^((?:model|mtp)\.layers\.\d+\.mlp)\.(gate_proj|up_proj|down_proj|gate_up_proj)(\..+)$"
     )
+    _LAYER_MLP_PATTERN = re.compile(r"^((?:model|mtp)\.layers\.\d+\.mlp)\.")
+
+    @property
+    def borrowed_source_tensors_safe(self) -> bool:
+        """Whether this Qwen3.5 profile can release source views per group."""
+        return self._borrowed_source_tensor_config_is_safe()
+
+    def _checkpoint_num_experts(self) -> int:
+        pretrained_config = self.config.pretrained_config
+        text_config = getattr(pretrained_config, "text_config", None)
+        num_experts = getattr(pretrained_config, "num_experts", None)
+        if num_experts is None:
+            num_experts = getattr(text_config, "num_experts", 0)
+        return int(num_experts or 0)
+
+    @staticmethod
+    def _canonical_source_weight_name(key: str) -> str:
+        if key.startswith("model.language_model."):
+            return "model." + key[len("model.language_model.") :]
+        return key
+
+    def _source_weight_group_id(self, key: str) -> str:
+        """Return a conservative atomic group for one Qwen3.5 source key."""
+        if key.startswith("model.visual."):
+            # The vision tower includes the patch embedder, every transformer
+            # block, and the output/deep-stack projectors. Its legacy loader
+            # materializes the complete tower in one strict operation, so keep
+            # the source subtree atomic rather than exposing partial modules.
+            return "qwen3_5.vision_and_projector"
+
+        canonical_key = self._canonical_source_weight_name(key)
+        mlp_match = self._LAYER_MLP_PATTERN.match(canonical_key)
+        if mlp_match is not None and self._checkpoint_num_experts():
+            # Qwen MoE loading chooses FUSED vs VANILLA from the complete set
+            # of gate/up/down tensors. Splitting gate_up_proj from down_proj
+            # could switch modes between calls and corrupt the destination.
+            return f"qwen3_5.{mlp_match.group(1)}"
+
+        projection_match = self._SPLIT_PROJ_PATTERN.match(canonical_key)
+        if projection_match is not None:
+            prefix, projection_name, _ = projection_match.groups()
+            if projection_name in {"qkv", "q", "k", "v", "z"}:
+                dependency_root = f"{prefix}.in_proj_qkvz"
+            else:
+                dependency_root = f"{prefix}.in_proj_ba"
+            return f"qwen3_5.{dependency_root}"
+
+        # The generic dependency mapper keeps q/k/v, gate/up, and each ordinary
+        # tensor family in their respective atomic destination modules. MTP
+        # source names remain distinct here; preprocessing later relocates them
+        # into the appended decoder layer.
+        return f"qwen3_5.{self._source_dependency_root(canonical_key)}"
+
+    def get_weight_groups(self, keys: Iterable[str]) -> list[WeightGroup] | None:
+        """Group Qwen3.5 source tensors for incremental materialization.
+
+        Split linear-attention projections are grouped by their packed qkvz or
+        ba destination, q/k/v and gate/up families stay fused, and a routed-MoE
+        MLP remains one atomic dependency. The manifest uses original source
+        names while aliases such as
+        ``model.language_model`` share canonical destination groups.
+        """
+        grouped_keys: dict[str, list[str]] = {}
+        seen_keys = set()
+        for key in keys:
+            if key in seen_keys:
+                raise ValueError(f"Duplicate checkpoint tensor name {key!r}")
+            seen_keys.add(key)
+            group_id = self._source_weight_group_id(key)
+            grouped_keys.setdefault(group_id, []).append(key)
+
+        return [
+            WeightGroup(group_id=group_id, keys=tuple(group_keys))
+            for group_id, group_keys in grouped_keys.items()
+        ]
+
+    def get_incremental_load_roots(self, keys: Iterable[str]) -> tuple[str, ...] | None:
+        """Dispatch preprocessed groups to only their destination subtrees."""
+        roots = []
+        seen_roots = set()
+        is_moe = bool(self._checkpoint_num_experts())
+        for key in keys:
+            mlp_match = self._LAYER_MLP_PATTERN.match(key)
+            root = (
+                mlp_match.group(1)
+                if is_moe and mlp_match is not None
+                else self._source_dependency_root(key)
+            )
+            if root not in seen_roots:
+                roots.append(root)
+                seen_roots.add(root)
+        return tuple(roots)
 
     def _normalize_weight_names(self, weights: dict) -> dict:
         normalized_weights = {}
