@@ -36,47 +36,42 @@ _SPARSE_ATTN_HOOK_MODULE_PATHS = {
     "dsa": ".dsa.module",
     "deepseek_v4": ".deepseek_v4.module",
 }
-_HOOK_PARAMETER_NAMES = {
+# Each entry describes one optional function exported by an algorithm's
+# ``module.py``. A hook may have separate MLA and Attention call signatures;
+# keeping every accepted signature under the same hook name makes additional
+# module call sites explicit.
+_HOOK_SIGNATURES: dict[str, tuple[tuple[str, ...], ...]] = {
+    # Extend module construction after the dense submodules are initialized.
     "initialize_sparse_attn": (
-        "module",
-        "config",
-        "mapping",
-        "mapping_o",
-        "rms_norm_eps",
-        "quant_config",
-        "q_scaling",
-        "bias",
-        "dtype",
-        "reduce_output",
-        "aux_stream",
+        (
+            "module",
+            "config",
+            "mapping",
+            "mapping_o",
+            "rms_norm_eps",
+            "quant_config",
+            "q_scaling",
+            "bias",
+            "dtype",
+            "reduce_output",
+            "aux_stream",
+        ),
     ),
-    "create_sparse_attn_weights": ("module",),
-    "transform_sparse_attn_weights": ("module",),
-    "prepare_sparse_attn_outputs": ("module", "hidden_states", "attn_metadata"),
+    # Add or transform algorithm-specific parameters around weight loading.
+    "create_sparse_attn_weights": (("module",),),
+    "transform_sparse_attn_weights": (("module",),),
+    # Allocate any extra output buffers required by a sparse MLA forward.
+    "prepare_sparse_attn_outputs": (("module", "hidden_states", "attn_metadata"),),
+    # Replace the dense forward. The first signature is used by MLA; the
+    # second is used by Attention and keeps future backend kwargs extensible.
     "forward_sparse_attn": (
-        "module",
-        "position_ids",
-        "hidden_states",
-        "attn_metadata",
-        "attn_output",
-    ),
-    "forward_sparse_attn_custom_op": (
-        "module",
-        "hidden_states",
-        "position_ids",
-        "attn_output",
-        "latent_cache_gen",
-    ),
-    "project_sparse_attn_output": (
-        "module",
-        "attn_output",
-        "position_ids",
-        "attn_metadata",
-        "all_reduce_params",
-    ),
-}
-_ALTERNATE_HOOK_PARAMETER_NAMES = {
-    "forward_sparse_attn": (
+        (
+            "module",
+            "position_ids",
+            "hidden_states",
+            "attn_metadata",
+            "attn_output",
+        ),
         (
             "module",
             "q",
@@ -94,7 +89,26 @@ _ALTERNATE_HOOK_PARAMETER_NAMES = {
             "kwargs",
         ),
     ),
+    # Implement the sparse MLA body hidden behind its torch custom op.
+    "forward_sparse_attn_custom_op": (
+        (
+            "module",
+            "hidden_states",
+            "position_ids",
+            "attn_output",
+            "latent_cache_gen",
+        ),
+    ),
+    # Replace output projection. The signatures correspond to MLA and
+    # Attention, whose projection call sites have different inputs.
     "project_sparse_attn_output": (
+        (
+            "module",
+            "attn_output",
+            "position_ids",
+            "attn_metadata",
+            "all_reduce_params",
+        ),
         (
             "module",
             "attn_output",
@@ -104,7 +118,7 @@ _ALTERNATE_HOOK_PARAMETER_NAMES = {
         ),
     ),
 }
-_INITIALIZE_KEYWORD_ONLY_PARAMETERS = frozenset(_HOOK_PARAMETER_NAMES["initialize_sparse_attn"][1:])
+_INITIALIZE_KEYWORD_ONLY_PARAMETERS = frozenset(_HOOK_SIGNATURES["initialize_sparse_attn"][0][1:])
 
 
 def _get_hook(
@@ -127,10 +141,7 @@ def _get_hook(
         "module" if index == 0 and parameter.name in ("self", "mla") else parameter.name
         for index, parameter in enumerate(parameters)
     )
-    expected_names = (
-        _HOOK_PARAMETER_NAMES[hook_name],
-        *_ALTERNATE_HOOK_PARAMETER_NAMES.get(hook_name, ()),
-    )
+    expected_names = _HOOK_SIGNATURES[hook_name]
     if parameter_names not in expected_names:
         raise TypeError(
             f"Sparse attention hook {algorithm!r}.{hook_name} has parameters {parameter_names}; "
@@ -175,7 +186,7 @@ class SparseAttnHooks:
 
     def require(self, hook_name: str) -> SparseAttnHook:
         """Return an implemented hook required by the current module path."""
-        if hook_name not in _HOOK_PARAMETER_NAMES:
+        if hook_name not in _HOOK_SIGNATURES:
             raise ValueError(f"Unknown sparse attention hook {hook_name!r}")
         hook = getattr(self, hook_name)
         if hook is None:
