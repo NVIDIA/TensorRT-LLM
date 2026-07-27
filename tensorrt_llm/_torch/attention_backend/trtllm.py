@@ -1586,6 +1586,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert forward_args.latent_cache is not None
             from .utils import \
                 append_mla_latent_cache_generation_cuda_graph_safe
+
             # The write positions must come from device tensors: the host
             # lists (request ids, seq lens, cached-token counts) are frozen
             # into the graph at capture time and corrupt the cache on replay.

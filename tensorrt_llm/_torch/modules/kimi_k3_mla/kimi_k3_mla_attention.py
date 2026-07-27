@@ -213,9 +213,8 @@ def _supports_mla_prefill_direct_output(
     """Whether native generation preprocessing accepts this packed batch."""
     num_generations = rt.metadata.num_generations
     query_len = rt.seq_lens[0]
-    return (
-        query_len * num_generations == num_tokens
-        and all(seq_len == query_len for seq_len in rt.seq_lens)
+    return query_len * num_generations == num_tokens and all(
+        seq_len == query_len for seq_len in rt.seq_lens
     )
 
 
@@ -412,15 +411,16 @@ class KimiK3MLAAttention(nn.Module):
         # hard error here was the severed None kv-scale delivery, not the
         # fp8 cache itself).
         self.has_fp8_kv_cache = bool(
-            quant_config is not None
-            and quant_config.layer_quant_mode.has_fp8_kv_cache())
+            quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache()
+        )
         if self.has_fp8_kv_cache and gen_mla_backend != "trtllm-gen":
             # cute-dsl rejects fp8 KV device scales; trtllm-gen decode is
             # accuracy-equivalent to cute-dsl on K3 (96.59 vs 96.44).
             logger.info(
                 "Kimi K3 MLA: FP8 KV cache requires the trtllm-gen MLA "
                 "generation backend; overriding "
-                f"'{gen_mla_backend}' -> 'trtllm-gen'.")
+                f"'{gen_mla_backend}' -> 'trtllm-gen'."
+            )
             gen_mla_backend = "trtllm-gen"
 
         # Context backend: absorbed MQA path, head_dim = kv_lora +
@@ -505,8 +505,7 @@ class KimiK3MLAAttention(nn.Module):
         # refreshes it). DeepSeek's mla.py pre-materializes the same
         # tensors once for the same reason.
         cache = getattr(self, "_absorb_cache", None)
-        if (cache is not None and w.device.type != "meta"
-                and cache[0] == w.data_ptr()):
+        if cache is not None and w.device.type != "meta" and cache[0] == w.data_ptr():
             return cache[1], cache[2]
         H = self.num_heads
         n = self.qk_nope_head_dim
@@ -784,12 +783,15 @@ class KimiK3MLAAttention(nn.Module):
                 forward_args.quant_q_buffer,
             )
         else:
-            if (getattr(self._backend_ctx, "has_fp8_kv_cache", False)
-                    and rt.metadata.kv_cache_manager is not None):
+            if (
+                getattr(self._backend_ctx, "has_fp8_kv_cache", False)
+                and rt.metadata.kv_cache_manager is not None
+            ):
                 raise NotImplementedError(
                     "Kimi K3 MLA prefill fallback (ragged/mismatched batch) "
                     "does not support FP8 KV cache: the python latent-append "
-                    "helper writes unquantized BF16 rows into the FP8 pool.")
+                    "helper writes unquantized BF16 rows into the FP8 pool."
+                )
             forward_args = AttentionForwardArgs(
                 latent_cache=latent_cache,
                 attention_input_type=AttentionInputType.generation_only,
@@ -831,8 +833,10 @@ class KimiK3MLAAttention(nn.Module):
         legacy python path, whose latent-append helper handles q_len > 1.
         """
         metadata = rt.metadata
-        if (hidden_states.shape[0] == metadata.num_generations
-                and metadata.kv_cache_manager is not None):
+        if (
+            hidden_states.shape[0] == metadata.num_generations
+            and metadata.kv_cache_manager is not None
+        ):
             return self._forward_decode_fused(hidden_states, rt)
         return self._forward_decode_legacy(hidden_states, rt)
 
@@ -871,24 +875,18 @@ class KimiK3MLAAttention(nn.Module):
         q_rot_use, _ = self._maybe_rotate_qk(q_rot, None)
 
         fused_q = hidden_states.new_empty(
-            (num_tokens, self.num_heads,
-             self.kv_lora_rank + self.qk_rope_head_dim))
+            (num_tokens, self.num_heads, self.kv_lora_rank + self.qk_rope_head_dim)
+        )
         # Absorb: [H, T, m] × [H, m, kv] -> [H, T, kv] (m = qk_nope_head_dim),
         # written directly into fused_q's latent slice.
         torch.ops.trtllm.bmm_out(
-            q_nope.transpose(0, 1), k_absorb,
-            fused_q[..., :self.kv_lora_rank].transpose(0, 1))
+            q_nope.transpose(0, 1), k_absorb, fused_q[..., : self.kv_lora_rank].transpose(0, 1)
+        )
 
         num_seqs = metadata.num_seqs
-        cu_q_seqlens = torch.empty(num_seqs + 1,
-                                   dtype=torch.int32,
-                                   device=hidden_states.device)
-        cu_kv_seqlens = torch.empty(num_seqs + 1,
-                                    dtype=torch.int32,
-                                    device=hidden_states.device)
-        fmha_scheduler_counter = torch.empty(1,
-                                             dtype=torch.uint32,
-                                             device=hidden_states.device)
+        cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=hidden_states.device)
+        cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=hidden_states.device)
+        fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=hidden_states.device)
         # FP8 KV cache: the rope-generation op additionally quantizes the
         # appended latent row and fused_q, emitting the FMHA dequant scales
         # and the quantized-Q buffer (same contract as the DeepSeek MLA
@@ -897,18 +895,15 @@ class KimiK3MLAAttention(nn.Module):
         mla_bmm2_scale = None
         quant_q_buffer = None
         if getattr(self._backend_gen, "has_fp8_kv_cache", False):
-            mla_bmm1_scale = torch.empty(2,
-                                         dtype=torch.float32,
-                                         device=hidden_states.device)
-            mla_bmm2_scale = torch.empty(1,
-                                         dtype=torch.float32,
-                                         device=hidden_states.device)
+            mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=hidden_states.device)
+            mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
             quant_q_buffer = torch.empty(
                 num_tokens,
                 self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 dtype=torch.uint8,
-                device=hidden_states.device)
+                device=hidden_states.device,
+            )
         # Identity rope (NoPE): writes q_rot into fused_q's rope tail,
         # appends the latent row to the paged cache, and fills the
         # scheduler buffers — one op, CUDA-graph-safe (the DeepSeek MLA
@@ -946,16 +941,15 @@ class KimiK3MLAAttention(nn.Module):
             forward_args=forward_args,
         )
         # ``attn_absorbed`` shape: ``[num_tokens, num_heads * kv_lora_rank]``.
-        attn_absorbed = attn_absorbed.view(num_tokens, self.num_heads,
-                                           self.kv_lora_rank)
-        attn_out = hidden_states.new_empty(
-            (num_tokens, self.num_heads * self.v_head_dim))
+        attn_absorbed = attn_absorbed.view(num_tokens, self.num_heads, self.kv_lora_rank)
+        attn_out = hidden_states.new_empty((num_tokens, self.num_heads * self.v_head_dim))
         # Un-absorb: [H, T, kv] × [H, kv, v] -> [H, T, v], written directly
         # into the gate/o_proj input buffer.
         torch.ops.trtllm.bmm_out(
-            attn_absorbed.transpose(0, 1), v_absorb.transpose(1, 2),
-            attn_out.view(num_tokens, self.num_heads,
-                          self.v_head_dim).transpose(0, 1))
+            attn_absorbed.transpose(0, 1),
+            v_absorb.transpose(1, 2),
+            attn_out.view(num_tokens, self.num_heads, self.v_head_dim).transpose(0, 1),
+        )
         return self._apply_output_gate_and_o_proj(hidden_states, attn_out)
 
     def _forward_decode_legacy(
@@ -969,13 +963,16 @@ class KimiK3MLAAttention(nn.Module):
         where ``append_mla_latent_cache_generation_cuda_graph_safe`` handles
         the multi-token append.
         """
-        if (getattr(self._backend_gen, "has_fp8_kv_cache", False)
-                and rt.metadata.kv_cache_manager is not None):
+        if (
+            getattr(self._backend_gen, "has_fp8_kv_cache", False)
+            and rt.metadata.kv_cache_manager is not None
+        ):
             raise NotImplementedError(
                 "Kimi K3 MLA legacy decode (speculative-verification, "
                 "q_len > 1) does not support FP8 KV cache: the python "
                 "latent-append helper writes unquantized BF16 rows into "
-                "the FP8 pool.")
+                "the FP8 pool."
+            )
         num_tokens = hidden_states.shape[0]
         q_nope, q_rot = self._project_q_unabsorbed(hidden_states)
         normed_kv, k_pe, latent_cache = self._project_kv_and_latent(hidden_states)
@@ -1021,9 +1018,9 @@ class KimiK3MLAAttention(nn.Module):
         # Multi-token generation batches (spec-dec verify: SA, DFlash) go
         # through the trtllm-gen backend, which supports q_len_per_req > 1.
         num_gens = rt.metadata.num_generations
-        backend = (self._backend_gen
-                   if num_gens > 0 and num_tokens == num_gens
-                   else self._backend_ctx)
+        backend = (
+            self._backend_gen if num_gens > 0 and num_tokens == num_gens else self._backend_ctx
+        )
         attn_absorbed = backend.forward(
             q_fused_flat, None, None, rt.metadata, forward_args=forward_args
         )
