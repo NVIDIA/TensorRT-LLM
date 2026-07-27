@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import ast
 from pathlib import Path
 from typing import List, Tuple
 from unittest.mock import MagicMock, call, patch
@@ -8,6 +9,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 
+import tensorrt_llm._torch.visual_gen
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.profiler import (
     PROFILE_START_STOP_ENV_VAR_NAME,
@@ -315,3 +317,60 @@ def test_run_inference_skips_profiling_during_warmup(
     pipeline._is_warmup = False
     assert pipeline.run_inference(request) is request
     assert events == ["start", "stop"]
+
+
+# ----------------------------------------------------------------------
+# Structural guard: a hand-written denoise loop that forgets the hooks is
+# silently absent from every trace, which is how Qwen-Image and LTX-2
+# stage 2 were missed. Catch it at the source level instead.
+# ----------------------------------------------------------------------
+
+_VISUAL_GEN_ROOT = Path(tensorrt_llm._torch.visual_gen.__file__).parent
+
+_STEP_HOOKS = {"_open_step_window", "_close_step_window"}
+_PHASE_HOOKS = {"_close_predenoise_window", "_open_postdenoise_window"}
+
+
+def _self_calls(node: ast.AST) -> set:
+    """Names of ``self.<name>(...)`` calls anywhere under ``node``."""
+    return {
+        n.func.attr
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "self"
+    }
+
+
+def _denoise_loops() -> List[Tuple[str, str, ast.For, ast.AST]]:
+    """Every loop in visual_gen that steps a transformer, i.e. denoises."""
+    found = []
+    for path in sorted(_VISUAL_GEN_ROOT.rglob("*.py")):
+        for fn in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for loop in ast.walk(fn):
+                if not isinstance(loop, ast.For):
+                    continue
+                names = _self_calls(loop)
+                if "transformer" in names or any(n.startswith("_denoise_step") for n in names):
+                    found.append((path.name, fn.name, loop, fn))
+    return found
+
+
+def test_every_denoise_loop_is_instrumented() -> None:
+    loops = _denoise_loops()
+    # base denoise(), Qwen-Image forward(), LTX-2 stage 2 _refinement_denoise()
+    assert len(loops) == 3, [(f, n) for f, n, _, _ in loops]
+
+    for filename, fn_name, loop, fn in loops:
+        where = f"{filename}::{fn_name}"
+        assert _STEP_HOOKS <= _self_calls(loop), (
+            f"{where} steps a transformer without the per-step profiler hooks; "
+            "numeric TLLM_PROFILE_VISUAL_GEN_START_STOP ranges would skip it"
+        )
+        assert _PHASE_HOOKS <= _self_calls(fn), (
+            f"{where} is missing the denoise-loop phase hooks; "
+            "predenoise/postdenoise windows would land on the wrong boundary"
+        )

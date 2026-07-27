@@ -75,6 +75,12 @@ the complete request from text encoding through VAE decode. `predenoise`
 captures text encoding, latent preparation, and denoise-loop setup;
 `postdenoise` captures VAE decode and the remaining request work.
 
+Multi-stage pipelines (LTX-2 two-stage) run more than one denoise loop per
+request, which affects the per-loop modes: a numeric range captures the named
+steps of *every* stage, one trace file per stage, and `postdenoise` opens at
+the end of the first stage, so its window also covers the later stages'
+denoising. `all` and `predenoise` are unaffected.
+
 ### Visualize the PyTorch profiler results
 
 Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.

@@ -1629,7 +1629,13 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         )
 
         # --- Euler denoising loop (no guidance) ---
+        # Stage 2 runs its own loop rather than BasePipeline.denoise(), so it
+        # carries the profiler hooks itself. Without them a numeric range
+        # would capture stage 1 only and the trace would silently omit half
+        # the denoising.
+        self._close_predenoise_window()
         for i in range(len(sigmas) - 1):
+            self._open_step_window(i)
             with nvtx_range(f"refinement_step {i}"):
                 sigma = sigmas[i]
                 sigma_next = sigmas[i + 1]
@@ -1688,6 +1694,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     denoised_a = a_working.float() - vel_a.float() * sigma_a
                     velocity_a = (a_working.float() - denoised_a) / sigma_a
                     a_working = (a_working.float() + velocity_a * dt).to(a_working.dtype)
+            self._close_step_window(i)
+
+        self._open_postdenoise_window()
 
         # --- Unpatchify ---
         video_out = self.video_patchifier.unpatchify(v_working, video_shape)
