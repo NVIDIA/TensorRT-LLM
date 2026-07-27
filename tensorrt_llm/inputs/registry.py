@@ -686,19 +686,14 @@ class BaseMultimodalInputProcessor(ABC):
 
 
 class BaseMultimodalDummyInputsBuilder(ABC):
-    """Build deterministic dummy multimodal inputs for KV-cache profiling.
+    """Build deterministic multimodal request data for KV-cache profiling.
 
-    Modality-agnostic: a model declares the per-item token demand of each
-    modality it encodes via :meth:`get_mm_max_tokens_per_item`, and materializes
-    the worst-case dummy for a per-modality token budget via
-    :meth:`get_dummy_mm_data_for_tokens`. The profiler splits the shared
-    ``encoder_max_num_tokens`` budget across modalities in proportion to that
-    demand, so they share one encoder microbatch cap rather than each claiming
-    the whole budget. Every modality-specific decision (size inversion, item
-    count, tensor layout) lives in the concrete implementation, so vision
-    (size-based), audio (duration/frame-based), and mixed image+video+audio
-    processors all satisfy the same contract without leaking ``width``/``height``
-    into this base.
+    A model declares the per-item token demand of each modality it encodes via
+    :meth:`get_mm_max_tokens_per_item`, and materializes raw request-side media
+    via :meth:`get_dummy_mm_data`. The profiler passes this data through the
+    normal input processor and executor request path, so prompt expansion,
+    multimodal metadata, encoder output ownership, and prefill fusion match
+    runtime behavior.
 
     Token unit is **encoder attention** (pre-merger), matching
     ``encoder_max_num_tokens`` and ``AttentionMetadata.max_num_tokens``.
@@ -726,15 +721,16 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         """Per-modality encoder-attention tokens of the single worst-case item.
 
         Keyed by modality — e.g. ``{"image": 16384}`` for a vision-only model or
-        ``{"image": 16384, "audio": 1500}`` for a mixed one. The keys enumerate
-        the modalities this model runs through its encoder(s); the values weight
-        how the profiler splits the shared encoder budget across them. (Qwen-VL
-        declares only ``"image"``: image and video share one ViT, so the image
-        worst case already covers the vision encoder.)
+        ``{"image": 16384, "audio": 1500}`` for a mixed one. The engine uses
+        the largest value to ensure that the encoder budget admits every atomic
+        item. A concrete dummy builder decides how to distribute its aggregate
+        profiling budget across the declared modalities. (Qwen-VL declares
+        only ``"image"``: image and video share one ViT, so the image worst case
+        already covers the vision encoder.)
 
-        Default ``{}`` → no direct encoder profiling (text-only dummy fallback);
+        Default ``{}`` → no multimodal request profiling (text-only fallback);
         a model opts in by overriding this together with
-        :meth:`get_dummy_mm_data_for_tokens`.
+        :meth:`get_dummy_mm_data`.
         """
         return {}
 
@@ -777,26 +773,24 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         """
         return {}
 
-    def get_dummy_mm_data_for_tokens(
+    def get_dummy_mm_data(
         self,
         *,
-        max_tokens_per_modality: Dict[str, int],
-        max_items_per_modality: Optional[Dict[str, int]] = None,
-        dtype: Optional[torch.dtype] = None,
+        max_num_encoder_tokens: int,
+        max_num_items: int,
     ) -> Dict[str, Any]:
-        """Build the worst-case dummy ``multimodal_data`` per modality budget.
+        """Build raw request-side ``multi_modal_data`` for memory profiling.
 
-        The modality-agnostic entry the KV-cache encoder profiler calls, sizing
-        each modality to saturate its share of the token budget. When
-        ``max_items_per_modality`` is provided, concrete builders should spread
-        that budget across up to the requested number of equal-sized items;
-        this lets profiling cover the many-item boundary in addition to the
-        longest-item boundary.
+        Args:
+            max_num_encoder_tokens: Aggregate encoder-attention token budget.
+            max_num_items: Maximum number of atomic multimodal items.
 
-        Returns the ``multimodal_data`` dict the model's encoder consumes (e.g.
-        ``{"image": {"pixel_values": ..., "image_grid_thw": ...}}`` for Qwen-VL).
-        Default raises ``NotImplementedError``; the profiler treats that as "no
-        direct profiling for this model" and falls back to a text-only dummy.
+        Returns:
+            Raw image, video, or audio items accepted by the normal input
+            processor.
+
+        The default raises ``NotImplementedError``. The profiler then falls
+        back to text-only memory estimation.
         """
         raise NotImplementedError
 
