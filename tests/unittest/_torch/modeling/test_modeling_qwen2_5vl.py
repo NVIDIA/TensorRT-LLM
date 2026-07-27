@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import os
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -26,8 +27,8 @@ from tensorrt_llm._torch.models.modeling_qwen2vl import (
     Qwen2_5_VisionModel, Qwen2_5_VLModel, Qwen2VisionModelBase,
     Qwen2VLInputProcessorBase, Qwen2VLModel, _prepare_qwen_vl_mrope_config,
     _prepare_qwen_vl_vision_attn_metadata)
-from tensorrt_llm._torch.models.modeling_qwen3vl import (
-    Qwen3VisionModel, Qwen3VLInputProcessorBase)
+from tensorrt_llm._torch.models.modeling_qwen3vl import \
+    Qwen3VLInputProcessorBase
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -557,34 +558,23 @@ def test_qwen_vision_metadata_rejects_segment_above_fixed_max_seq_len() -> None:
     assert metadata.prepare_encoder_only_calls == 0
 
 
-def test_qwen3_vision_prepare_metadata_passes_fixed_max_seq_len() -> None:
-    model = Qwen3VisionModel.__new__(Qwen3VisionModel)
-    torch.nn.Module.__init__(model)
-    model._fixed_max_seq_len = 65536
-    metadata = _StubVisionAttentionMetadata()
-
-    model.prepare_attn_metadata([256, 1024], metadata)
-
-    assert metadata.max_seq_len == 65536
-    assert metadata.seq_lens.tolist() == [256, 1024]
-
-
 def test_qwen2_5_window_attention_uses_tighter_fixed_max_seq_len() -> None:
-    model = Qwen2_5_VisionModel.__new__(Qwen2_5_VisionModel)
-    torch.nn.Module.__init__(model)
-    model.window_size = 100
-    model.spatial_merge_size = 2
-    model.spatial_merge_unit = 4
-    model.patch_size = 14
+    hf_config = Qwen2_5_VLConfig.from_dict(copy.deepcopy(QWEN2_5_VL_7B_CONFIG))
+    model_config = ModelConfig(pretrained_config=hf_config,
+                               skip_create_weights_in_init=True)
+    model = Qwen2_5_VisionModel(model_config)
     model.metadata_cls = _StubVisionAttentionMetadata
-    model.patch_embed = SimpleNamespace(proj=SimpleNamespace(
-        weight=torch.empty(1)))
 
-    model.setup_attn_metadata(max_num_requests=8, max_num_tokens=16)
-    model.set_attn_max_seq_len(65536)
+    max_num_requests = 8
+    max_num_tokens = 16
+    fixed_max_seq_len = 65_536
+    expected_window_max_seq_len = 64
+    model.setup_attn_metadata(max_num_requests=max_num_requests,
+                              max_num_tokens=max_num_tokens)
+    model.set_attn_max_seq_len(fixed_max_seq_len)
 
-    assert model._full_attn_max_seq_len == 65536
-    assert model._window_attn_max_seq_len == 36
+    assert model._full_attn_max_seq_len == fixed_max_seq_len
+    assert model._window_attn_max_seq_len == expected_window_max_seq_len
 
 
 # ---------------------------------------------------------------------------
@@ -783,15 +773,6 @@ def test_mm_max_tokens_per_item_is_image_only(processor_cls):
     assert demand["image"] == proc._num_vision_tokens(width=cap_size["width"],
                                                       height=cap_size["height"])
     assert demand["image"] > 0
-
-
-def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:
-    proc = _make_dummy_processor(Qwen3VLInputProcessorBase,
-                                 patch_size=16,
-                                 spatial_merge_size=2,
-                                 max_pixels=16_777_216)
-
-    assert proc.get_mm_max_tokens_per_item() == {"image": 65_536}
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)

@@ -68,7 +68,7 @@ class MultimodalEncoderMixin:
         """Set an optional stable per-segment attention capacity.
 
         Specialized encoders may override this hook. Keeping it separate from
-        ``setup_attn_metadata`` preserves that method's existing override
+        `setup_attn_metadata` preserves that method's existing override
         contract for external encoders.
         """
 

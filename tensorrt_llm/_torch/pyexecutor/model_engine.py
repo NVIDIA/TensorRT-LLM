@@ -2636,7 +2636,7 @@ class PyTorchModelEngine(ModelEngine):
         Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
         by inheriting `MultimodalEncoderMixin`, and the engine drives the construction
         so the sizes match ``llm_args.get_encoder_runtime_sizes()`` rather
-        than being hardcoded inside each encoder's ``__init__``. The optional
+        than being hardcoded inside each encoder's `__init__`. The optional
         per-segment capacity combines the encoder token budget with the input
         processor's largest supported item.
         """
