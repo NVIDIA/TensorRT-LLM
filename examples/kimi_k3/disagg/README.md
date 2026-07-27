@@ -1,9 +1,10 @@
 # Kimi K3 disaggregated serving (ctx/gen split)
 
 Configuration pair + deployment wiring for running Kimi K3 with separate
-context (prefill) and generation (decode) servers. Status: **drafted and
-schema-validated, not yet run end-to-end on hardware** — see the caveats
-section.
+context (prefill) and generation (decode) servers. Status: **validated
+end-to-end on hardware** (GB300 NVL72, 1 ctx + 1 gen, DEP16 both sides,
+GSM8K accuracy parity with aggregated serving) — see the caveats section
+for constraints.
 
 ## Files
 
@@ -125,10 +126,12 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
    setup MPI collectives. Not an MPI/pmix or V2 code bug; with
    `UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc` V2 NIXL passes multi-node
    with no code change.
-2. **SA off first.** Run `gen_config_no_sa.yaml` until MLA+KDA transfer
-   is parity-validated, then switch to `gen_config.yaml`.
-   The SA disagg gen-side init fix is included on this branch,
-   but K3-scale SA-in-disagg is unvalidated.
+2. **SA runs eager.** SA speculative decoding in disagg is validated for
+   accuracy (GSM8K parity with aggregated serving) with CUDA graphs
+   disabled, as configured in `gen_config.yaml`. Do not enable CUDA
+   graphs together with SA: it currently degrades output quality.
+   Start with `gen_config_no_sa.yaml` for the first
+   bring-up on a new cluster, then switch to `gen_config.yaml`.
 3. **Matched-DP only.** Keep ctx and gen at identical DEP16 with
    attention-DP on both sides; heterogeneous parallelism with
    attention-DP off is rejected (see constraints above).
@@ -146,3 +149,23 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
    Within an NVL72 domain this is ~0.9 ms/request (measured; not a
    bottleneck), but off-fabric paths would pay 11–23 ms — keep ctx and
    gen inside one NVL72 domain.
+6. **Bounce-buffer sizing cliff (silent).** Size `kv_cache_bounce_size_mb`
+   to the largest single request's full KV payload (fixed KDA state plus
+   the per-token MLA latent; ≥1024 MB for 8k ISL). An undersized region
+   does not error — every transfer silently falls back to a much slower
+   host-staged TCP path.
+7. **SA caps gen-side batch size.** SA requires `max_batch_size` ≤ 8 on
+   the generation server, which bounds per-instance concurrency at
+   `8 × dp_size` (128 with DEP16). Plan instance counts accordingly.
+8. **Prefill capacity and TTFT under burst.** Without chunked prefill,
+   context-server throughput is limited and queued prefills grow TTFT
+   roughly linearly under closed-loop bursts. Rate-match the ctx:gen
+   instance ratio to the expected traffic instead of oversubscribing a
+   single context server.
+9. **Startup time.** Weight loading takes tens of minutes per 16-GPU
+   instance before the first token; set health-check, idle-reaper, and
+   job time limits accordingly. The disaggregated proxy does not serve
+   `/v1/models` (404) — point readiness probes at a different endpoint.
+10. **`max_num_tokens` coupling.** The generation side must cover
+    `max_batch_size × (1 + max_draft_len)`; the context side needs
+    `max_tokens_in_buffer` ≥ max ISL (see constraints above).

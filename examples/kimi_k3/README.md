@@ -187,9 +187,30 @@ decoding requires the default cache manager, which cannot reuse blocks.
 
 ## Current limitations
 
-Pipeline parallelism is not supported. Disaggregated serving is supported;
-see `examples/kimi_k3/disagg/README.md` for configs and launch instructions.
-
-Suffix-automaton (SA) speculative decoding is supported as an opt-in for
-evaluation (see `eval_extra_llm_options_sa.yaml`). SA runs keep CUDA graphs
-and the overlap scheduler off, need `max_batch_size` ≤ 8.
+- Pipeline parallelism is not supported.
+- FP8 KV cache has a known accuracy issue and is rejected at engine setup;
+  a fix is in progress. Setting `KIMI_K3_ALLOW_INACCURATE_MLA_GEN=1`
+  bypasses the check for performance experiments only.
+- Speculative decoding:
+  - Suffix-automaton (SA) speculative decoding is supported as an opt-in
+    for evaluation (see `eval_extra_llm_options_sa.yaml`). SA requires CUDA
+    graphs disabled (`cuda_graph_config: null`), the overlap scheduler off,
+    and `max_batch_size` ≤ 8. Enabling CUDA graphs together with SA
+    currently degrades output quality. SA speedup is workload-dependent —
+    proportional to n-gram repetition in the generated output.
+  - MTP and DFlash speculative decoding are scaffolding only and not yet
+    functional; support depends on compatible draft weights.
+- Disaggregated serving works end-to-end within the constraints below; see
+  `examples/kimi_k3/disagg/README.md` for configs, launch instructions,
+  and the full caveat list.
+  - Context and generation servers must both run `tp=ep=16` with
+    attention-DP enabled (matched DEP16); heterogeneous ctx/gen
+    parallelism is not supported.
+  - No chunked prefill and no KV-cache block reuse; `tokens_per_block`
+    is fixed at 64.
+  - Only the Python cache transceiver with the NIXL backend is tested
+    (`cache_transceiver_config`: `backend: NIXL`,
+    `transceiver_runtime: PYTHON` — required for this model). Keep both
+    servers within a single NVLink domain: cross-domain deployments are
+    untested, and rack-spanning 16-GPU allocations on GB300 currently hit
+    an unresolved out-of-memory failure.
