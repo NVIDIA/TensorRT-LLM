@@ -223,13 +223,25 @@ class VisualGenProfiler:
         """Close the open capture window, exporting its trace."""
         if not self._active:
             return
-        # End the window on an idle device. A collector may stop collecting —
-        # or end the process, as nsys --capture-range-end=stop-shutdown does —
-        # the moment the range closes, so no async work may still be in
-        # flight. Mirrors PyExecutor's profile_step().
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
         torch_profiler = self._torch_profiler
+        try:
+            # End the window on an idle device. A collector may stop
+            # collecting — or end the process, as nsys
+            # --capture-range-end=stop-shutdown does — the moment the range
+            # closes, so no async work may still be in flight. Mirrors
+            # PyExecutor's profile_step().
+            #
+            # This is also where a sticky CUDA error from an earlier kernel
+            # surfaces, which is exactly when the collectors below must still
+            # come down: a half-closed window leaves the Nsight capture range
+            # open and this profiler wedged for the rest of the process.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        finally:
+            self._shutdown_collectors(torch_profiler)
+
+    def _shutdown_collectors(self, torch_profiler: Any) -> None:
+        """Stop both collectors and clear window state, whatever else failed."""
         try:
             if torch_profiler is not None:
                 torch_profiler.stop()

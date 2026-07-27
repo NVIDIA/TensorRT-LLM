@@ -132,6 +132,42 @@ def test_close_window_syncs_before_ending_capture(
     ]
 
 
+def test_close_window_stops_collectors_when_sync_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A sticky CUDA error surfacing at the sync must not wedge the profiler.
+
+    Leaving the window open would keep the Nsight capture range open, keep
+    Kineto recording, and block every later window behind ``_active``.
+    """
+    profiler, torch_profiler = _profiler_with_torch_trace(monkeypatch, tmp_path, "all")
+    cudart = MagicMock()
+
+    with (
+        patch("tensorrt_llm._torch.visual_gen.profiler.torch.cuda.cudart", return_value=cudart),
+        patch.object(torch.cuda, "is_available", return_value=True),
+        patch.object(torch.cuda, "synchronize"),
+        patch("tensorrt_llm._torch.visual_gen.profiler.logger.info"),
+    ):
+        profiler.open_window()
+
+    with (
+        patch("tensorrt_llm._torch.visual_gen.profiler.torch.cuda.cudart", return_value=cudart),
+        patch.object(torch.cuda, "is_available", return_value=True),
+        patch.object(
+            torch.cuda, "synchronize", side_effect=RuntimeError("CUDA error: launch failure")
+        ),
+        patch("tensorrt_llm._torch.visual_gen.profiler.logger.info"),
+        pytest.raises(RuntimeError, match="launch failure"),
+    ):
+        profiler.close_window()
+
+    cudart.cudaProfilerStop.assert_called_once_with()
+    torch_profiler.stop.assert_called_once_with()
+    assert not profiler.active
+    assert profiler._torch_profiler is None
+
+
 def test_close_window_is_a_noop_when_never_opened(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
