@@ -533,6 +533,32 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
             edge -= unit
         return {"width": edge, "height": edge, "num_frames": 1}
 
+    def _dummy_mm_data_for_size(
+        self,
+        *,
+        width: int,
+        height: int,
+        num_images: int = 1,
+        dtype: torch.dtype | None = None,
+    ) -> Dict[str, Any]:
+        """Build processed Pixtral vision tensors of the requested geometry.
+
+        Image-only: Pixtral has no temporal axis, so there is no frame count
+        to take here (contrast the Qwen helper, which grids over frames).
+        """
+        _, _, channels, _ = self._vision_geometry()
+        num_images = max(num_images, 1)
+        pixel_values = torch.zeros(
+            (num_images, channels, height, width),
+            dtype=dtype or self.dtype,
+        )
+        return {
+            "image": {
+                "pixel_values": pixel_values,
+                "image_sizes": [[height, width]] * num_images,
+            }
+        }
+
     def get_mm_max_tokens_per_item(self) -> Dict[str, int]:
         """Largest single image's ViT patch count (the ``max_image_size``-capped
         square), used to weight the shared-budget split. Image only -- image and
@@ -564,8 +590,9 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
         *,
         max_num_encoder_tokens: int,
         max_num_items: int,
+        dtype: torch.dtype | None = None,
     ) -> Dict[str, Any]:
-        """Build raw images for a runtime-valid profiling request."""
+        """Build a processed full-budget encoder profiling batch."""
         if max_num_encoder_tokens <= 0:
             raise ValueError("max_num_encoder_tokens must be positive")
         if max_num_items <= 0:
@@ -583,8 +610,12 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
             return {}
         num_images = min(max_num_items,
                          max_num_encoder_tokens // tokens_per_image)
-        image = Image.new("RGB", (size["width"], size["height"]))
-        return {"image": [image.copy() for _ in range(num_images)]}
+        return self._dummy_mm_data_for_size(
+            width=size["width"],
+            height=size["height"],
+            num_images=num_images,
+            dtype=dtype,
+        )
 
     def get_vocab_size(self) -> int:
         """Return the vocab size of the model."""

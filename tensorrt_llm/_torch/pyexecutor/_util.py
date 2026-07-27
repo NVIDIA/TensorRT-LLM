@@ -15,21 +15,17 @@
 import copy
 import dataclasses
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 is_sm_100f,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 is_sm_100f, prefer_pinned, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.inputs import (MultimodalDataTracker,
-                                 add_multimodal_placeholders)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
-from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
@@ -516,6 +512,7 @@ class KvCacheCreator:
         self._max_batch_size = max_batch_size
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
+        self._dummy_encoder_inputs: List[MultimodalParams] = []
         self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
         self._cache_transceiver_config = llm_args.cache_transceiver_config
@@ -745,6 +742,8 @@ class KvCacheCreator:
 
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
+        # Keep the LLM dummy text-only so it can always fill max_num_tokens.
+        # The MM encoder is profiled independently at its own token budget.
         requests = []
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
         max_num_tokens = self._max_num_tokens
@@ -752,12 +751,6 @@ class KvCacheCreator:
 
         input_seq_len = min(max_num_tokens, input_seq_len)
         remaining_tokens = max_num_tokens
-        if isinstance(self._model_engine.model, MultimodalModelMixin):
-            multimodal_request = self._create_dummy_multimodal_request()
-            if multimodal_request is not None:
-                requests.append(multimodal_request)
-                remaining_tokens -= len(multimodal_request.input_token_ids)
-
         while remaining_tokens > 0:
             input_seq_len = min(input_seq_len, remaining_tokens)
             input_tokens = torch.randint(low=0,
@@ -786,146 +779,80 @@ class KvCacheCreator:
             requests = requests * self._mapping.tp_size
         return requests
 
-    def _create_dummy_multimodal_request(self) -> Optional[trtllm.Request]:
-        """Build one maximal-item request through normal MM preprocessing."""
+    def _create_dummy_encoder_inputs(self) -> List[MultimodalParams]:
+        """Build one processed MM encoder batch at its scheduling limits."""
+        if not isinstance(self._model_engine.model, MultimodalModelMixin):
+            return []
         if isinstance(
                 self._profiling_stage_data,
                 dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
-            return None
+            return []
         # No local multimodal encoder (disable_mm_encoder or MM E/P disagg):
         # nothing to profile.
         if (hasattr(self._model_engine.model, "mm_encoder")
                 and self._model_engine.model.mm_encoder is None):
-            return None
+            return []
 
         input_processor = self._model_engine.input_processor
         encoder_max_num_tokens = self._model_engine.encoder_max_num_tokens
         max_tokens_per_item = input_processor.get_mm_max_tokens_per_item()
         if not max_tokens_per_item:
-            return None
+            return []
         largest_item_tokens = max(max_tokens_per_item.values())
+        max_num_items = min(
+            self._model_engine.encoder_max_num_items,
+            max(1, encoder_max_num_tokens // largest_item_tokens),
+        )
 
-        while True:
-            max_num_items = min(
-                self._model_engine.encoder_max_num_items,
-                max(1, encoder_max_num_tokens // largest_item_tokens),
+        try:
+            mm_data = input_processor.get_dummy_mm_data(
+                max_num_encoder_tokens=encoder_max_num_tokens,
+                max_num_items=max_num_items,
+                dtype=self._model_engine.model.dtype,
             )
-            try:
-                mm_data = input_processor.get_dummy_mm_data(
-                    max_num_encoder_tokens=encoder_max_num_tokens,
-                    max_num_items=max_num_items,
-                )
-            except NotImplementedError:
-                logger.info(
-                    "Multimodal memory profiling skipped: %s does not "
-                    "implement get_dummy_mm_data().",
-                    type(input_processor).__name__)
-                return None
-            if not mm_data:
-                return None
+        except NotImplementedError:
+            logger.info(
+                "Multimodal memory profiling skipped: %s does not implement "
+                "get_dummy_mm_data().",
+                type(input_processor).__name__)
+            return []
+        if not mm_data:
+            return []
+        return [MultimodalParams(multimodal_data=mm_data)]
 
-            prompt_token_ids, multimodal_params = (
-                self._preprocess_dummy_mm_data(mm_data))
-            if len(prompt_token_ids) <= self._max_num_tokens:
-                break
+    def _encode_dummy_inputs(self) -> Optional[torch.Tensor]:
+        """Run the full-budget MM encoder and retain request-owned output storage."""
+        if not self._dummy_encoder_inputs:
+            return None
 
-            next_encoder_tokens = max(
-                1,
-                encoder_max_num_tokens * self._max_num_tokens //
-                len(prompt_token_ids),
-            )
-            if next_encoder_tokens >= encoder_max_num_tokens:
-                next_encoder_tokens = encoder_max_num_tokens - 1
-            if next_encoder_tokens <= 0:
-                raise ValueError(
-                    "The smallest multimodal profiling request exceeds "
-                    f"max_num_tokens={self._max_num_tokens}")
-            encoder_max_num_tokens = next_encoder_tokens
+        encoder_inputs = self._dummy_encoder_inputs
+        try:
+            with torch.inference_mode():
+                for encoder_input in encoder_inputs:
+                    encoder_input.to_device(
+                        "multimodal_data",
+                        "cuda",
+                        pin_memory=prefer_pinned(),
+                        target_keywords=getattr(
+                            self._model_engine.model,
+                            "multimodal_data_device_paths",
+                            None,
+                        ),
+                    )
+                output = self._model_engine.model.encode_multimodal_inputs(
+                    encoder_inputs)
+                # Runtime item state owns detached copies rather than views of
+                # an encoder batch. Reproduce that allocation boundary here.
+                return output.detach().clone()
+        finally:
+            self._dummy_encoder_inputs = []
 
-        multimodal_input = None
-        if multimodal_params.multimodal_input is not None:
-            multimodal_input = multimodal_params.multimodal_input.to_binding(
-                trtllm)
-        request = trtllm.Request(
-            prompt_token_ids,
-            max_tokens=1,
-            streaming=False,
-            sampling_config=trtllm.SamplingConfig(
-                beam_width=self._max_beam_width),
-            output_config=trtllm.OutputConfig(),
-            end_id=-1,
-            multimodal_input=multimodal_input,
-        )
-        request.py_multimodal_data = multimodal_params.multimodal_data
-        if multimodal_params.mm_item_order:
-            request.py_mm_item_order = multimodal_params.mm_item_order
-        request.py_conversation_params = None
-        return request
-
-    def _preprocess_dummy_mm_data(
-        self,
-        mm_data: Dict[str, object],
-    ) -> Tuple[List[int], MultimodalParams]:
-        """Convert raw profiling media through the normal input processor."""
-        input_processor = self._model_engine.input_processor
-        tracker = MultimodalDataTracker(input_processor.config.model_type)
-        for modality, value in mm_data.items():
-            items = value if isinstance(value, list) else [value]
-            for item in items:
-                tracker.add_data(modality, item)
-
-        tracked_mm_data, _ = tracker.retrieve_all_sync()
-        if not tracked_mm_data:
-            raise RuntimeError("Multimodal profiling input contains no media")
-        item_order = tracker.item_order()
-        mm_uuids = {}
-        for modality, items in tracked_mm_data.items():
-            mm_uuids[modality] = [
-                f"trtllm-mm-profile-{modality}-{item_idx}"
-                for item_idx in range(len(items))
-            ]
-
-        prompt = add_multimodal_placeholders(
-            input_processor.config.model_type,
-            "",
-            tracker.placeholder_counts(),
-            item_order=item_order,
-        )
-        inputs = {
-            "prompt": prompt,
-            "multi_modal_data": tracked_mm_data,
-            "multi_modal_uuids": mm_uuids,
-            "mm_item_order": item_order,
-        }
-        prompt_token_ids, extra_processed_inputs = (
-            self._model_engine.input_processor_with_hash(
-                inputs, SamplingParams(max_tokens=1)))
-        if extra_processed_inputs is None:
-            raise RuntimeError(
-                "Multimodal profiling input produced no processed data")
-
-        return prompt_token_ids, MultimodalParams(
-            multimodal_input=extra_processed_inputs.get("multimodal_input"),
-            multimodal_data=extra_processed_inputs.get("multimodal_data"),
-            mm_item_order=item_order,
-        )
-
-    def _get_multimodal_encoder_memory_reserve(self) -> int:
-        """Return MM encoder output and cache capacity absent from the dummy peak."""
+    def _get_multimodal_encoder_memory_reserve(self,
+                                               profiled_output_bytes: int = 0
+                                               ) -> int:
+        """Return output and cache capacity absent from the measured peak."""
         output_budget = getattr(self._model_engine,
                                 "mm_encoder_output_budget_bytes", None)
-        profiled_output_bytes = 0
-        bytes_per_embedding = getattr(self._model_engine,
-                                      "bytes_per_mm_encoder_embedding", None)
-        if bytes_per_embedding is not None:
-            for request in self._dummy_reqs or []:
-                metadata = get_multimodal_encoder_item_metadata(
-                    getattr(request, "py_multimodal_data", None))
-                if metadata is not None:
-                    profiled_output_bytes = (
-                        sum(metadata.output_embedding_lengths) *
-                        bytes_per_embedding)
-                    break
         unprofiled_output_bytes = max(0, (output_budget or 0) -
                                       profiled_output_bytes)
 
@@ -958,6 +885,7 @@ class KvCacheCreator:
         if self._dummy_reqs is None:
             self._dummy_reqs = self._create_dummy_context_requests(
                 max(1, self._net_max_seq_len - 1))
+            self._dummy_encoder_inputs = self._create_dummy_encoder_inputs()
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
@@ -1114,16 +1042,19 @@ class KvCacheCreator:
             f"Memory used after loading model weights (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
         )
 
-        # Read metadata before execution because requests release multimodal
-        # payloads after prefill.
-        multimodal_encoder_memory_reserve = (
-            self._get_multimodal_encoder_memory_reserve())
+        profiled_output_bytes = 0
 
         if py_executor is not None and not self._skip_est:
+            # Run the MM encoder at its independent token budget, then keep the
+            # resulting request-owned embeddings resident while the text-only
+            # LLM dummy fills max_num_tokens.
+            encoder_profile_output = self._encode_dummy_inputs()
+            if encoder_profile_output is not None:
+                profiled_output_bytes = (encoder_profile_output.numel() *
+                                         encoder_profile_output.element_size())
             py_executor.set_gather_responses(True)
             origin_iter_stats = py_executor.enable_iter_perf_stats
             py_executor.enable_iter_perf_stats = False
-            encoder_cache = self._model_engine.mm_encoder_cache
             req_ids = []
             if py_executor.dist.mapping.rank == 0:
                 req_ids = py_executor.enqueue_requests(self._dummy_reqs)
@@ -1143,8 +1074,9 @@ class KvCacheCreator:
                 torch_peak_memory = torch.cuda.memory_stats(
                 )["allocated_bytes.all.peak"]
 
-                if encoder_cache is not None:
-                    encoder_cache.clear()
+                # Release before measuring current usage so the retained
+                # embeddings count toward the peak but not the steady state.
+                encoder_profile_output = None
 
                 # Clear the caching allocator before measuring the current memory usage
                 torch.cuda.empty_cache()
@@ -1152,6 +1084,10 @@ class KvCacheCreator:
                 torch_used_bytes = torch.cuda.memory_stats(
                 )["allocated_bytes.all.current"]
             finally:
+                # Redundant on the success path, but a failed dummy run would
+                # otherwise keep the profiling embeddings alive through
+                # teardown -- exactly when memory is already scarce.
+                encoder_profile_output = None
                 # get kv cache stats for both model and draft model
                 kv_stats = py_executor.resource_manager.resource_managers.get(
                     ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
@@ -1170,8 +1106,6 @@ class KvCacheCreator:
                 py_executor.shutdown()
                 py_executor.enable_iter_perf_stats = origin_iter_stats
                 py_executor.set_gather_responses(False)
-                if encoder_cache is not None:
-                    encoder_cache.clear()
 
             total_used_bytes = total_gpu_memory - end
             activation_bytes = torch_peak_memory - model_bytes
@@ -1189,12 +1123,15 @@ class KvCacheCreator:
             allocated_bytes = 0
             activation_bytes = 0
 
+        multimodal_encoder_memory_reserve = (
+            self._get_multimodal_encoder_memory_reserve(
+                profiled_output_bytes=profiled_output_bytes))
         peak_memory += multimodal_encoder_memory_reserve
         if multimodal_encoder_memory_reserve > 0:
             mem_gb = multimodal_encoder_memory_reserve / GB
             logger.info(
                 f"Reserving {mem_gb:.2f} GiB for multimodal encoder memory "
-                "not materialized by the profiling request.")
+                "not materialized by the profiling run.")
 
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,

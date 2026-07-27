@@ -706,9 +706,16 @@ def test_dummy_get_size_rejects_non_positive_budget():
 @pytest.mark.parametrize("budget", [4096, 8192])
 def test_dummy_get_dummy_mm_data_saturates_budget(budget):
     proc = _make_dummy_processor()
-    images = proc.get_dummy_mm_data(max_num_encoder_tokens=budget, max_num_items=1)["image"]
-    assert len(images) == 1
-    width, height = images[0].size
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=budget,
+        max_num_items=1,
+        dtype=torch.float16,
+    )["image"]
+    pixel_values = image["pixel_values"]
+    num_images, channels, height, width = pixel_values.shape
+    assert num_images == 1
+    assert channels == 3
+    assert image["image_sizes"] == [[height, width]]
     per_image = (height // 14) * (width // 14)
     assert per_image <= budget
     assert 2 * per_image > budget
@@ -716,9 +723,43 @@ def test_dummy_get_dummy_mm_data_saturates_budget(budget):
 
 def test_dummy_get_dummy_mm_data_covers_many_item_boundary():
     proc = _make_dummy_processor()
-    images = proc.get_dummy_mm_data(max_num_encoder_tokens=8192, max_num_items=8)["image"]
-    width, height = images[0].size
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        max_num_items=8,
+        dtype=torch.float16,
+    )["image"]
+    pixel_values = image["pixel_values"]
+    num_images, _, height, width = pixel_values.shape
     tokens_per_image = (height // 14) * (width // 14)
-    assert len(images) == 8
+    assert num_images == 8
     assert tokens_per_image == 1024
-    assert len(images) * tokens_per_image == 8192
+    assert num_images * tokens_per_image == 8192
+
+
+def test_dummy_mm_data_satisfies_the_encoder_input_contract():
+    """KV-cache profiling feeds `get_dummy_mm_data()` straight to the encoder.
+
+    Nothing rebuilds these tensors through the input processor any more, so the
+    processor now restates the encoder's input layout on its own. A drift
+    between the two would surface only as a crash during startup memory
+    estimation. Drive the encoder's real batching step instead of restating its
+    expectations here, so a change on either side fails this test.
+    """
+    proc = _make_dummy_processor()
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        max_num_items=4,
+        dtype=torch.float16,
+    )["image"]
+
+    # `_vision_forward` collects one entry per request and converts the sizes to
+    # tensors before batching; mirror that, then run the real batching step.
+    batched_pixel_values, batched_sizes = modeling_mistral.Mistral3VLM.batch_pixel_values(
+        pixel_values=[image["pixel_values"]],
+        image_sizes=[torch.tensor(image["image_sizes"])],
+    )
+
+    num_images = image["pixel_values"].shape[0]
+    assert batched_pixel_values.shape[0] == num_images
+    assert batched_sizes.shape == (num_images, 2)
+    assert batched_pixel_values.dtype == torch.float16
