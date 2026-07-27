@@ -159,14 +159,14 @@ class QwenImagePipeline(BasePipeline):
         """
         vgm = self.pipeline_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
-        warmup_true_cfg_scale = 4.0 if cfg_size > 1 else 1.0
+        warmup_cfg_scale = 4.0 if cfg_size > 1 else 1.0
         with torch.no_grad():
             self.forward(
                 prompt="warmup",
                 height=height,
                 width=width,
                 num_inference_steps=max(steps, 2),
-                true_cfg_scale=warmup_true_cfg_scale,
+                negative_prompt_cfg_scale=warmup_cfg_scale,
                 seed=42,
                 max_sequence_length=64,
             )
@@ -409,30 +409,30 @@ class QwenImagePipeline(BasePipeline):
         return neg_prompt_embeds, neg_prompt_embeds_mask
 
     @staticmethod
-    def _combine_true_cfg(
-        noise_pred: torch.Tensor, neg_noise_pred: torch.Tensor, true_cfg_scale: float
+    def _combine_negative_prompt_cfg(
+        noise_pred: torch.Tensor, neg_noise_pred: torch.Tensor, cfg_scale: float
     ) -> torch.Tensor:
-        comb = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+        comb = neg_noise_pred + cfg_scale * (noise_pred - neg_noise_pred)
         cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
         noise_norm = torch.norm(comb, dim=-1, keepdim=True)
         return comb * (cond_norm / noise_norm)
 
     def _cfg_parallel_state(
-        self, do_true_cfg: bool
+        self, use_negative_prompt_cfg: bool
     ) -> Tuple[bool, int, int, Optional[ProcessGroup]]:
         vgm = self.pipeline_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
         cfg_rank = vgm.cfg_rank if vgm else 0
         cfg_pg = vgm.cfg_group if vgm else None
-        do_cfg_parallel = do_true_cfg and cfg_size > 1
+        do_cfg_parallel = use_negative_prompt_cfg and cfg_size > 1
         if (
             cfg_size > 1
-            and not do_true_cfg
+            and not use_negative_prompt_cfg
             and cfg_rank == 0
             and not getattr(self, "_logged_cfg_disabled_parallel_warning", False)
         ):
             logger.warning(
-                "Qwen-Image configured with cfg_size=%d but true CFG is disabled; "
+                "Qwen-Image configured with cfg_size=%d but negative-prompt CFG is disabled; "
                 "CFG-parallel ranks will redundantly compute the same request path.",
                 cfg_size,
             )
@@ -475,7 +475,7 @@ class QwenImagePipeline(BasePipeline):
             height=params.height,
             width=params.width,
             num_inference_steps=params.num_inference_steps,
-            true_cfg_scale=params.guidance_scale,
+            negative_prompt_cfg_scale=params.guidance_scale,
             seed=params.seed,
             max_sequence_length=params.max_sequence_length,
         )
@@ -488,7 +488,7 @@ class QwenImagePipeline(BasePipeline):
         height: int = 1328,
         width: int = 1328,
         num_inference_steps: int = 50,
-        true_cfg_scale: float = 4.0,
+        negative_prompt_cfg_scale: float = 4.0,
         seed: int = 42,
         max_sequence_length: int = 1024,
         sigmas: Optional[list] = None,
@@ -496,7 +496,7 @@ class QwenImagePipeline(BasePipeline):
         """Text-to-image generation.
 
         Implementation mirrors ``diffusers.QwenImagePipeline.__call__``
-        with the FlowMatchEuler sampler and real CFG (``true_cfg_scale``).
+        with the FlowMatchEuler sampler and negative-prompt CFG.
         """
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -506,8 +506,10 @@ class QwenImagePipeline(BasePipeline):
             prompt = [prompt]
         batch_size = len(prompt)
 
-        do_true_cfg = true_cfg_scale > 1.0
-        do_cfg_parallel, cfg_size, cfg_rank, cfg_pg = self._cfg_parallel_state(do_true_cfg)
+        use_negative_prompt_cfg = negative_prompt_cfg_scale > 1.0
+        do_cfg_parallel, cfg_size, cfg_rank, cfg_pg = self._cfg_parallel_state(
+            use_negative_prompt_cfg
+        )
 
         device = self.device
         generator = torch.Generator(device=device).manual_seed(seed)
@@ -516,7 +518,7 @@ class QwenImagePipeline(BasePipeline):
         logger.info("Encoding prompt...")
         prompt_embeds, prompt_embeds_mask = self._encode_prompt(prompt, device, max_sequence_length)
         neg_prompt_embeds = neg_prompt_embeds_mask = None
-        if do_true_cfg:
+        if use_negative_prompt_cfg:
             negative_prompt = self._normalize_negative_prompt(negative_prompt, batch_size)
             neg_prompt_embeds, neg_prompt_embeds_mask = self._encode_prompt(
                 negative_prompt, device, max_sequence_length
@@ -586,7 +588,9 @@ class QwenImagePipeline(BasePipeline):
                 )[0].contiguous()
                 gather_list = [torch.empty_like(noise_pred_local) for _ in range(cfg_size)]
                 dist.all_gather(gather_list, noise_pred_local, group=cfg_pg)
-                noise_pred = self._combine_true_cfg(gather_list[0], gather_list[1], true_cfg_scale)
+                noise_pred = self._combine_negative_prompt_cfg(
+                    gather_list[0], gather_list[1], negative_prompt_cfg_scale
+                )
             else:
                 noise_pred = self.transformer(
                     hidden_states=latents,
@@ -597,7 +601,7 @@ class QwenImagePipeline(BasePipeline):
                     return_dict=False,
                 )[0]
 
-            if do_true_cfg and not do_cfg_parallel:
+            if use_negative_prompt_cfg and not do_cfg_parallel:
                 if cuda_graph_enabled:
                     # CUDA graph outputs are graph-owned buffers; the negative CFG
                     # replay may reuse the same pool before guidance consumes this one.
@@ -611,7 +615,9 @@ class QwenImagePipeline(BasePipeline):
                     img_shapes=img_shapes,
                     return_dict=False,
                 )[0]
-                noise_pred = self._combine_true_cfg(noise_pred, neg_noise_pred, true_cfg_scale)
+                noise_pred = self._combine_negative_prompt_cfg(
+                    noise_pred, neg_noise_pred, negative_prompt_cfg_scale
+                )
 
             latents_dtype = latents.dtype
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]

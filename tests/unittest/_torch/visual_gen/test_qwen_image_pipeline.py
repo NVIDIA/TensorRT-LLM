@@ -132,7 +132,7 @@ def _expanded_noise(values, *, batch_size, seq_len, dtype=torch.float32):
     return pattern.view(1, 1, -1).expand(batch_size, seq_len, -1)
 
 
-def test_forward_runs_without_true_cfg():
+def test_forward_runs_without_negative_prompt_cfg():
     pipe, captured = _pipeline_with_test_doubles()
 
     output = pipe.forward(
@@ -141,7 +141,7 @@ def test_forward_runs_without_true_cfg():
         height=32,
         width=48,
         num_inference_steps=3,
-        true_cfg_scale=1.0,
+        negative_prompt_cfg_scale=1.0,
         seed=123,
         max_sequence_length=16,
         sigmas=[1.0, 0.5, 0.25],
@@ -163,7 +163,7 @@ def test_forward_runs_without_true_cfg():
     )
 
 
-def test_forward_defaults_missing_negative_prompt_to_empty_string_for_true_cfg():
+def test_forward_defaults_missing_negative_prompt_to_empty_string_for_cfg():
     pipe, captured = _pipeline_with_test_doubles()
 
     output = pipe.forward(
@@ -172,7 +172,7 @@ def test_forward_defaults_missing_negative_prompt_to_empty_string_for_true_cfg()
         height=32,
         width=48,
         num_inference_steps=2,
-        true_cfg_scale=4.0,
+        negative_prompt_cfg_scale=4.0,
         seed=123,
         max_sequence_length=16,
         sigmas=[1.0, 0.5],
@@ -193,7 +193,7 @@ def test_forward_defaults_missing_negative_prompt_to_empty_string_for_true_cfg()
     )
 
 
-def test_forward_runs_true_cfg_pipeline():
+def test_forward_runs_negative_prompt_cfg_pipeline():
     pipe, captured = _pipeline_with_test_doubles()
 
     output = pipe.forward(
@@ -202,7 +202,7 @@ def test_forward_runs_true_cfg_pipeline():
         height=32,
         width=48,
         num_inference_steps=2,
-        true_cfg_scale=3.0,
+        negative_prompt_cfg_scale=3.0,
         seed=123,
         max_sequence_length=16,
         sigmas=[1.0, 0.5],

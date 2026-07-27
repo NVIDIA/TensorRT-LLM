@@ -185,10 +185,10 @@ def test_qwen_image_selects_cfg_inputs_by_rank():
     assert selected[1] is negative_mask
 
 
-def test_qwen_image_true_cfg_combination_keeps_reference_formula():
+def test_qwen_image_negative_prompt_cfg_combination_keeps_reference_formula():
     noise_pred = torch.tensor([[[2.0, 0.0]]])
     neg_noise_pred = torch.tensor([[[1.0, 0.0]]])
-    combined = QwenImagePipeline._combine_true_cfg(noise_pred, neg_noise_pred, 4.0)
+    combined = QwenImagePipeline._combine_negative_prompt_cfg(noise_pred, neg_noise_pred, 4.0)
     assert combined.shape == noise_pred.shape
     assert torch.allclose(combined, torch.tensor([[[2.0, 0.0]]]))
 
