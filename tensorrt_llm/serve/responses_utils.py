@@ -888,7 +888,8 @@ async def request_preprocess(
     prev_response_id = request.previous_response_id
 
     # TODO: better way to enable metrics
-    if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+    if (len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0
+            or len(os.getenv("TRTLLM_PERF_TIME_EVENTS_PATH", "")) > 0):
         sampling_params.return_perf_metrics = True
 
     prev_msgs = []

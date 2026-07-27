@@ -317,6 +317,10 @@ class OpenAIServer(_VideoRoutesMixin):
         self.metrics_collector = None
         self.perf_metrics = None
         self.perf_metrics_lock = None
+        # Effective maxlen for the /perf_metrics deque. Normally
+        # perf_metrics_max_requests, but TRTLLM_PERF_TIME_EVENTS_PATH can
+        # auto-enable the endpoint with a default cap even when that arg is 0.
+        self.perf_metrics_maxlen = 0
         self._iteration_stats_collector_task = None
         self._iteration_stats_wakeup_event = asyncio.Event()
         # Bounded snapshot of iteration stats for the GET /metrics handler.
@@ -583,7 +587,19 @@ class OpenAIServer(_VideoRoutesMixin):
             self._log_config_info_metrics()
             max_perf_metrics = self.generator.args.perf_metrics_max_requests
             if max_perf_metrics > 0:
+                self.perf_metrics_maxlen = max_perf_metrics
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
+                self.perf_metrics_lock = asyncio.Lock()
+            # TRTLLM_PERF_TIME_EVENTS_PATH also makes the HTTP /perf_metrics
+            # endpoint usable for single-server (aggregated) runs, even when
+            # return_perf_metrics / perf_metrics_max_requests were not set. The
+            # per-rank live files remain the primary artifact; this is
+            # convenience.
+            if (self.perf_metrics is None
+                    and len(os.getenv("TRTLLM_PERF_TIME_EVENTS_PATH", "")) > 0):
+                self.perf_metrics_maxlen = (
+                    self.generator.args.perf_metrics_max_requests or 65536)
+                self.perf_metrics = deque(maxlen=self.perf_metrics_maxlen)
                 self.perf_metrics_lock = asyncio.Lock()
 
     @staticmethod
@@ -1276,7 +1292,8 @@ class OpenAIServer(_VideoRoutesMixin):
         async with self.perf_metrics_lock:
             perf_metrics = self.perf_metrics
             self.perf_metrics = deque(
-                maxlen=self.generator.args.perf_metrics_max_requests)
+                maxlen=self.perf_metrics_maxlen
+                or self.generator.args.perf_metrics_max_requests)
         for metrics_dict in perf_metrics:
             metrics = metrics_dict["perf_metrics"]
             timing_metrics = metrics.timing_metrics
@@ -1369,7 +1386,7 @@ class OpenAIServer(_VideoRoutesMixin):
             # Wake up the stats collector to drain iteration stats
             if getattr(self.generator.args, "enable_iter_perf_stats", True):
                 self._iteration_stats_wakeup_event.set()
-        if self.generator.args.return_perf_metrics:
+        if self.generator.args.return_perf_metrics or self.perf_metrics is not None:
             output = res.outputs[0]
             item = {
                 "request_id": res.request_id,
@@ -1936,7 +1953,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 tokenizer=self.tokenizer,
             )
             # TODO: better way to enable metrics
-            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+            if (len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0
+                    or len(os.getenv("TRTLLM_PERF_TIME_EVENTS_PATH", "")) > 0):
                 sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
@@ -2095,7 +2113,8 @@ class OpenAIServer(_VideoRoutesMixin):
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
             # Enable per-request perf metrics when the env var is set.
             # Otherwise the /perf_metrics deque stays empty on this path.
-            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+            if (len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0
+                    or len(os.getenv("TRTLLM_PERF_TIME_EVENTS_PATH", "")) > 0):
                 sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)

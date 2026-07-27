@@ -72,6 +72,10 @@ class PerfTimingInfo:
     ctx_gpu_sample_time: Optional[float] = None
     # Flag: set after the last ctx chunk is saved (py_decoding_iter == 1)
     ctx_chunks_complete: bool = False
+    # Per-iteration batch context captured for extended perf time events
+    # (populated only when TRTLLM_PERF_TIME_EVENTS_PATH / capture_extended is on).
+    # Merged into each per-iteration metric dict by append_step_metrics.
+    iter_batch_context: Optional[Dict] = None
 
 
 class LogitsStorage:

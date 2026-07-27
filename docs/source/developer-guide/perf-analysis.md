@@ -22,6 +22,69 @@ Toggling the CUDA profiler runtime API on and off:
   * Help users to analyze the performance breakdown in the model.
   * Results in smaller files to post-process (for metric extraction or similar).
 
+### Perf Time Events (per-rank live capture)
+
+For scheduling / gen-bubble debugging on the PyTorch workflow, TensorRT LLM can
+capture a per-request timeline directly from inside the executor and write it
+**live, one file per rank** — no HTTP `/perf_metrics` scrape and no server
+teardown race. This is driven by a single environment variable that also
+enriches the timeline with per-iteration batch context:
+
+```bash
+# Set on every worker (both ctx and gen servers for a disaggregated run).
+export TRTLLM_PERF_TIME_EVENTS_PATH=/tmp/perf_events
+# Optional but recommended for disaggregated serving — the KV-transfer CSVs
+# written by the native transceiver perf logger:
+export TRTLLM_KVCACHE_TIME_OUTPUT_PATH=/tmp/kv_csv
+```
+
+Setting `TRTLLM_PERF_TIME_EVENTS_PATH` (to an output **directory**, symmetric
+with `TRTLLM_KVCACHE_TIME_OUTPUT_PATH`) does three things:
+
+* **Force-enables capture** regardless of `return_perf_metrics` / `LLM` args, so
+  you do not have to thread the flag through the benchmark client.
+* Records **extended per-iteration batch context** on each per-iteration metric
+  entry: `iter_counter`, `iter_batch_size`, `num_ctx_requests`,
+  `num_gen_requests`, `context_token_number`, `generation_token_number`, the
+  per-request `req_context_token_number` / `req_generation_token_number`, and the
+  per-iteration starvation counters `num_capacity_fitting` / `num_scheduled`.
+* Starts a **daemon writer thread per rank** that drains an in-process queue and
+  appends to `time_events_rank{N}_pid{P}.jsonl`. The executor loop only builds a
+  dict and does a non-blocking `queue.put_nowait`, so capture stays off the
+  critical path (no file I/O on the loop thread).
+
+Each JSONL record is `{request_id, rank, ctx_request_id, time_breakdown_metrics}`
+— the same `time_breakdown_metrics` shape the `time_breakdown` tool consumes.
+
+**Known limitations (Python-only capture):**
+
+* **Starvation is a per-iteration count**, not per-request attribution — the
+  Python scheduler exposes only `num_fitting_reqs`.
+* **Pipeline parallelism**: the PP executor loop does not record the extended
+  fields, so batch-context keys are absent under PP.
+* **ctx ⇄ gen correlation** across the two disaggregated servers relies on the
+  request's disaggregated `ctx_request_id` when exposed; otherwise the ctx-side
+  and gen-side records live in separate per-rank files.
+
+**Optional offline aggregator.** To stitch the per-rank files (and the KV CSVs)
+into one combined JSON — and, optionally, the interactive HTML timeline — run:
+
+```bash
+python -m tensorrt_llm.serve.scripts.perf_time_events \
+    --event-dir /tmp/perf_events \
+    --kv-csv-dir /tmp/kv_csv \
+    -o /tmp/perf_events/combined.json \
+    --html /tmp/perf_events/timeline.html
+```
+
+The aggregator joins KV-transfer rows by request id (`unique_rid` for the native
+transceiver; `RequestID` for C++), reports any unmatched rows under
+`unjoined_kv_events` with a match-rate warning, and computes derived
+`inter_step_gaps` / `inter_chunk_gaps` and per-iteration `starved` counts. It is
+a convenience over the per-rank files, not the load-bearing capture path; only
+the `--html` path pulls in `plotly`. See [Introduction to KV Cache
+Transmission](./kv-transfer.md) for the KV cache transfer CSVs it consumes.
+
 
 ## Coordinating with NVIDIA Nsight Systems Launch
 
