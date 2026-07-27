@@ -141,16 +141,17 @@ public:
     //                       Stats-only: no effect on allocation, reuse, or correctness.
     // textOnly:             per-sequence override of the text-only (digest-free) guarantee;
     //                       nullopt inherits the manager config default.
-    std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, std::vector<TokenIdExt> const& inputTokens = {},
+    // inputTokens is a non-owning view; the caller must keep the underlying buffer alive for the
+    // duration of the call (matching reads it but never stores it).
+    std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, TokenSpan inputTokens = {},
         std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
         std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt);
 
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
     // Defaults false (safe: the scanning path is taken).
     BlockRadixTree::ReuseMatch matchReuse(
-        ReuseScope const& reuseScope, std::vector<TokenIdExt> const& inputTokens, bool knownNoDigest = false) const;
-    int probeReuse(
-        ReuseScope reuseScope = {}, std::vector<TokenIdExt> const& inputTokens = {}, bool knownNoDigest = false) const;
+        ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest = false) const;
+    int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
 
     // ---- Memory pool queries -----------------------------------------------
 

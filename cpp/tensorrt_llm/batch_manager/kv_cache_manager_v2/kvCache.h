@@ -114,47 +114,6 @@ struct SeqBlock
 };
 
 // ---------------------------------------------------------------------------
-// Span<T> — non-owning view into a contiguous buffer.
-// Supports operator[] for uniform access with std::vector<int>.
-// ---------------------------------------------------------------------------
-template <typename T>
-struct Span
-{
-    T* ptr;
-    int32_t len;
-
-    T& operator[](int idx)
-    {
-        return ptr[idx];
-    }
-
-    T operator[](int idx) const
-    {
-        return ptr[idx];
-    }
-
-    int size() const noexcept
-    {
-        return len;
-    }
-
-    T* data() const noexcept
-    {
-        return ptr;
-    }
-
-    T* begin() const noexcept
-    {
-        return ptr;
-    }
-
-    T* end() const noexcept
-    {
-        return ptr + len;
-    }
-};
-
-// ---------------------------------------------------------------------------
 // PlannedDropHandle — tracks committed pages planned for dropping without
 // owning them. Mirrors Python's PlannedDropHandle in _core/_kv_cache.py.
 //
@@ -258,7 +217,7 @@ public:
     // This is a terminal-memory contract: callers must not perform later writes
     // to this KvCache's memory. The final live pages may be moved into the radix
     // tree instead of copied (SSM state and the last partial block).
-    void commit(std::vector<TokenIdExt> const& tokens, bool isEnd = false);
+    void commit(TokenSpan tokens, bool isEnd = false);
 
     // Stop committing (called by close() automatically).
     void stopCommitting();

@@ -1717,12 +1717,12 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
 // commit
 // ---------------------------------------------------------------------------
 
-void KvCache::commit(std::vector<TokenIdExt> const& tokens, bool isEnd)
+void KvCache::commit(TokenSpan tokens, bool isEnd)
 {
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     if (mBeamWidth != BeamIndex{1})
         throw LogicError("Not implemented yet for beam search");
-    if (tokens.empty())
+    if (tokens.size() == 0)
     {
         if (isEnd)
             stopCommitting();
@@ -1906,7 +1906,7 @@ std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
     if (numCommittedTokens() == 0)
         return nullptr;
 
-    auto const match = mManager->matchReuse(mReuseScope, mCommittedTokens);
+    auto const match = mManager->matchReuse(mReuseScope, toSpan(mCommittedTokens));
     if (match.numTokens != numCommittedTokens() || match.blocks.empty())
         return nullptr;
 

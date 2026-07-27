@@ -793,6 +793,61 @@ class TestNoBatching(TestKVCacheManagerV2):
                 kv_cache.close()
         stream_holder.take_finish_event().synchronize()
 
+    def test_int32_ndarray_ingest_matches_list(self) -> None:
+        """Zero-copy int32-ndarray ingest must hash identically to the list path.
+
+        The int32-ndarray path must agree with the per-element list path across
+        create_kv_cache / commit / probe_reuse.
+
+        A digest-free int32 token is bit-identical to a normal 4-byte TokenIdExt,
+        so the C++ binding reinterprets a contiguous int32 buffer to TokenIdExt*
+        with no copy. If that reinterpret disagreed with the list path by even one
+        bit, blocks committed via the ndarray path would not be found by a list
+        probe (and vice versa), so the equalities below would fail.
+        """
+        # The int32-ndarray ingest fast path lives in the C++ binding; the pure-Python
+        # backend consumes plain lists (the dispatcher hands it get_tokens, not a view).
+        if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() == "python":
+            self.skipTest("int32-ndarray ingest is a C++-backend fast path")
+
+        import numpy as np
+
+        tokens_per_block = 8
+        self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=tokens_per_block)
+        # Pure-int prompt (no randbytes/digest tokens) so the int32 fast path applies.
+        prompt = [TokenId(i) for i in range(tokens_per_block * 3)]
+        prompt_np = np.asarray(prompt, dtype=np.int32)
+        assert prompt_np.dtype == np.int32 and prompt_np.flags["C_CONTIGUOUS"]
+
+        def commit_prompt(tokens) -> None:
+            kv_cache = self.manager.create_kv_cache(None, tokens)
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(kv_cache.resume(stream))
+                self.assertTrue(kv_cache.resize(len(prompt)))
+                committed = kv_cache.num_committed_tokens
+                if committed < len(prompt):
+                    kv_cache.commit(tokens[committed:])
+                kv_cache.stop_committing()
+            _ = stream_holder.take_finish_event()
+            kv_cache.close()
+
+        # Commit via the int32-ndarray fast path (both create_kv_cache and commit).
+        commit_prompt(prompt_np)
+
+        # Probing with a list and with an int32 ndarray must both fully match —
+        # proving the ndarray commit hashes like the list path, and the ndarray
+        # probe hashes like the list probe.
+        self.assertEqual(self.manager.probe_reuse(None, prompt), len(prompt))
+        self.assertEqual(self.manager.probe_reuse(None, prompt_np), len(prompt))
+
+        # Reverse direction: commit via the list path in a fresh tree, probe via
+        # the int32-ndarray path → full match.
+        self.manager.clear_reusable_blocks()
+        self.assertEqual(self.manager.probe_reuse(None, prompt_np), 0)
+        commit_prompt(prompt)
+        self.assertEqual(self.manager.probe_reuse(None, prompt_np), len(prompt))
+
     def test_reuse_scope_isolates_reuse(self) -> None:
         self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=8)
         tokens = [TokenId(i) for i in range(64)]

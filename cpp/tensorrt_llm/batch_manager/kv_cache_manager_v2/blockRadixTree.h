@@ -372,7 +372,9 @@ public:
     };
 
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
-    ReuseMatch match(ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool knownNoDigest = false,
+    // Takes a non-owning TokenSpan so a zero-copy int32 token buffer can be matched without
+    // allocating/copying (the hot path). Callers holding a std::vector pass toSpan(vec).
+    ReuseMatch match(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest = false,
         bool enablePartialMatch = false) const;
 
     // Clear all cached pages. ~Block() handles excludeFromEviction for DROPPABLE pages.
@@ -410,8 +412,8 @@ public:
 
 private:
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
-    std::vector<MatchResult> matchTokenPath(ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens,
-        bool knownNoDigest, bool enablePartialMatch) const;
+    std::vector<MatchResult> matchTokenPath(
+        ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const;
     std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched) const;
 
     // Erase any pending empty root blocks from mRoots.
