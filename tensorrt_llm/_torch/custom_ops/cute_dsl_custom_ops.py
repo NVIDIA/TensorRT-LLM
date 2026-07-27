@@ -6716,12 +6716,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_output_values: bool,
             cluster_size: int,
             seqlen_sorted: bool,
+            enable_block_skip: bool = False,
+            use_ext_counts: bool = False,
+            emit_xstate: bool = False,
+            use_ext_cand: bool = False,
+            ext_rungs: bool = False,
+            cand_cap: int = 5120,
+            accept_cap: Optional[int] = None,
+            kc_override: Optional[int] = None,
         ) -> tuple:
             key = (dtype, top_k, next_n, enable_unroll_4, enable_phase3_unroll,
                    use_constant_hint, min_blocks_per_mp, use_256bit_load,
                    num_threads_per_block, enable_warp_parallel_reduce,
                    compress_ratio, return_output_values, cluster_size,
-                   seqlen_sorted)
+                   seqlen_sorted, enable_block_skip, use_ext_counts,
+                   emit_xstate, use_ext_cand, ext_rungs, cand_cap, accept_cap,
+                   kc_override)
             if key in cls.kernel_cache:
                 return key
             n_rows = cute.sym_int()
@@ -6754,6 +6764,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
             order_row_fake = (cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
                 (n_batch, ), stride_order=(0, )) if seqlen_sorted else None)
+            # emission-assisted tiers (list/counts/rungs, see
+            # gvr_routing): fake shapes mirror the harness wrapper
+            block_max_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32, (n_rows, cute.sym_int()),
+                stride_order=(1, 0),
+                assumed_align=16) if enable_block_skip else None)
+            seed_thr_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32, (n_rows, 8 if use_ext_counts else 3),
+                stride_order=(1, 0),
+                assumed_align=4) if (use_ext_counts or ext_rungs) else None)
+            xstate_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32, (n_rows, 8),
+                stride_order=(1, 0),
+                assumed_align=4) if emit_xstate else None)
+            cand_vals_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32, (n_rows, cand_cap),
+                stride_order=(1, 0),
+                assumed_align=4) if use_ext_cand else None)
+            cand_idx_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n_rows, cand_cap),
+                stride_order=(1, 0),
+                assumed_align=4) if use_ext_cand else None)
+            cand_ctl_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n_rows, 4),
+                stride_order=(1, 0),
+                assumed_align=8) if use_ext_cand else None)
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
@@ -6772,6 +6808,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return_output_values=return_output_values,
                 cluster_size=cluster_size,
                 seqlen_sorted=seqlen_sorted,
+                enable_block_skip=enable_block_skip,
+                use_ext_counts=use_ext_counts,
+                emit_xstate=emit_xstate,
+                use_ext_cand=use_ext_cand,
+                ext_rungs=ext_rungs,
+                cand_cap=cand_cap,
+                accept_cap=accept_cap,
+                kc_override=kc_override,
+                # ext modes need 3 rung slots (M_thr == 3); the qfrac
+                # VALUES are irrelevant (P1b skipped), only slot count
+                r0_qfracs=((0.85, 0.35) if
+                           (use_ext_counts or ext_rungs) else None),
             )
             cls.kernel_cache[key] = cute.compile(
                 kernel,
@@ -6782,6 +6830,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 out_indices_fake,
                 order_row_fake,
                 stream=fake_stream,
+                block_max=block_max_fake,
+                seed_thr=seed_thr_fake,
+                seed_counts=None,
+                xstate=xstate_fake,
+                cand_vals=cand_vals_fake,
+                cand_idx=cand_idx_fake,
+                cand_ctl=cand_ctl_fake,
                 options="--enable-tvm-ffi",
             )
             logger.debug(f"[compile cute_dsl gvr_topk_decode] {key}")
@@ -6891,6 +6946,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             order_row: Optional[torch.Tensor] = None,
             counters: Optional[torch.Tensor] = None,
             max_batch_size: Optional[int] = None,
+            seed_thr: Optional[torch.Tensor] = None,
+            xstate: Optional[torch.Tensor] = None,
+            cand_vals: Optional[torch.Tensor] = None,
+            cand_idx: Optional[torch.Tensor] = None,
+            cand_ctl: Optional[torch.Tensor] = None,
+            block_max: Optional[torch.Tensor] = None,
+            num_threads: Optional[int] = None,
+            accept_cap: Optional[int] = None,
+            kc_override: Optional[int] = None,
         ) -> None:
             """Three paths, picked by ``(counters, order_row)``:
 
@@ -7013,6 +7077,31 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ), ("order_row must be int32, CUDA, shape == seq_lens.shape "
                     f"(={tuple(seq_lens.shape)}); got dtype={order_row.dtype} "
                     f"shape={tuple(order_row.shape)}")
+            # emission-assisted tiers: mode from which ext tensors the
+            # caller handed in (see gvr_routing.plan_emission)
+            use_ext_counts = seed_thr is not None and seed_thr.shape[1] >= 6
+            ext_rungs = seed_thr is not None and seed_thr.shape[1] == 3
+            use_ext_cand = cand_vals is not None
+            enable_block_skip = block_max is not None
+            emit_xstate = xstate is not None
+            if use_ext_cand:
+                assert use_ext_counts, (
+                    "candidate list requires the packed seed row "
+                    "([rows, 8]: lines + counts)")
+                assert (cand_idx is not None and cand_ctl is not None
+                        and cand_vals.shape == cand_idx.shape
+                        and cand_ctl.shape == (num_rows, 4)), (
+                            "list tier needs cand_vals/cand_idx same shape "
+                            "+ cand_ctl [rows, 4]")
+            if (use_ext_counts or ext_rungs or use_ext_cand
+                    or enable_block_skip):
+                assert not lb_mode and order_row is None, (
+                    "ext tiers are single-CTA/sort-path only")
+            if num_threads is not None:
+                tuning = dict(tuning, num_threads_per_block=num_threads)
+            elif use_ext_cand and top_k <= 512:
+                # small-K list rule: hit rows do O(list) work
+                tuning = dict(tuning, num_threads_per_block=512)
             key = cls._compile(
                 cute_dtype,
                 top_k,
@@ -7021,10 +7110,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return_output_values=return_output_values,
                 cluster_size=cluster_size,
                 seqlen_sorted=seqlen_sorted,
+                enable_block_skip=enable_block_skip,
+                use_ext_counts=use_ext_counts,
+                emit_xstate=emit_xstate,
+                use_ext_cand=use_ext_cand,
+                ext_rungs=ext_rungs,
+                cand_cap=(cand_vals.shape[1] if use_ext_cand else 5120),
+                accept_cap=accept_cap,
+                kc_override=kc_override,
                 **tuning,
             )
             cls.kernel_cache[key](logits, pre_idx, seq_lens, None,
-                                  output_indices, order_row)
+                                  output_indices, order_row, block_max,
+                                  seed_thr, None, xstate, cand_vals, cand_idx,
+                                  cand_ctl)
 
     # TODO(dsa.py): wire ``order_row = argsort(seq_lens, descending=True)``
     # (device-side, graph-safe) into the LJF row-reorder branch when
@@ -7033,7 +7132,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # swap. Below that threshold the win is noise / can regress a few
     # percent (B200 N∈{8K,16K,32K} sweep 2026-06-23).
     @torch.library.custom_op("trtllm::cute_dsl_gvr_topk_decode",
-                             mutates_args=("output_indices", ),
+                             mutates_args=("output_indices", "xstate"),
                              device_types="cuda")
     def cute_dsl_gvr_topk_decode(
         logits: torch.Tensor,
@@ -7048,6 +7147,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         order_row: Optional[torch.Tensor] = None,
         counters: Optional[torch.Tensor] = None,
         max_batch_size: Optional[int] = None,
+        seed_thr: Optional[torch.Tensor] = None,
+        xstate: Optional[torch.Tensor] = None,
+        cand_vals: Optional[torch.Tensor] = None,
+        cand_idx: Optional[torch.Tensor] = None,
+        cand_ctl: Optional[torch.Tensor] = None,
+        block_max: Optional[torch.Tensor] = None,
+        num_threads: Optional[int] = None,
+        accept_cap: Optional[int] = None,
+        kc_override: Optional[int] = None,
     ) -> None:
         """CuTe DSL GVR (Guess-Verify-Refine) Top-K decode for Blackwell.
 
@@ -7118,6 +7226,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             order_row=order_row,
             counters=counters,
             max_batch_size=max_batch_size,
+            seed_thr=seed_thr,
+            xstate=xstate,
+            cand_vals=cand_vals,
+            cand_idx=cand_idx,
+            cand_ctl=cand_ctl,
+            block_max=block_max,
+            num_threads=num_threads,
+            accept_cap=accept_cap,
+            kc_override=kc_override,
         )
 
     @torch.library.register_fake("trtllm::cute_dsl_gvr_topk_decode")
@@ -7134,6 +7251,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         order_row: Optional[torch.Tensor] = None,
         counters: Optional[torch.Tensor] = None,
         max_batch_size: Optional[int] = None,
+        seed_thr: Optional[torch.Tensor] = None,
+        xstate: Optional[torch.Tensor] = None,
+        cand_vals: Optional[torch.Tensor] = None,
+        cand_idx: Optional[torch.Tensor] = None,
+        cand_ctl: Optional[torch.Tensor] = None,
+        block_max: Optional[torch.Tensor] = None,
+        num_threads: Optional[int] = None,
+        accept_cap: Optional[int] = None,
+        kc_override: Optional[int] = None,
     ) -> None:
         return None
 
