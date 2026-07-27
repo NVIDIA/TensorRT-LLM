@@ -20,7 +20,7 @@ from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, SpecWorkerBase, is_gemma4_mtp_assistant
+from .interface import SpecMetadata, SpecWorkerBase, uses_external_shared_kv_mtp
 from .mtp import MTPSampler, _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
@@ -1291,34 +1291,43 @@ class MTPEagleWorker(Eagle3OneModelWorker):
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
         # Preserved for callers/tests that still expect this attribute.
         self.is_thop = False
-        self._uses_external_shared_target_kv = is_gemma4_mtp_assistant(
-            spec_config)
+        self._uses_external_shared_target_kv = False
 
     def set_draft_model(self, draft_model) -> None:
         super().set_draft_model(draft_model)
+        expects_external_shared_target_kv = uses_external_shared_kv_mtp(
+            self.spec_config)
+        supports_shared_target_kv = bool(
+            getattr(draft_model, "shares_target_kv_cache", False))
+        if expects_external_shared_target_kv and not supports_shared_target_kv:
+            raise ValueError(
+                "External shared-target-KV MTP requires a draft model that "
+                "declares shares_target_kv_cache=True.")
+        self._uses_external_shared_target_kv = (
+            expects_external_shared_target_kv and supports_shared_target_kv)
         if not self._uses_external_shared_target_kv:
             return
         if self.use_dynamic_tree:
             raise ValueError(
-                "Gemma4 shared-target-KV MTP supports only the linear draft "
+                "External shared-target-KV MTP supports only the linear draft "
                 "path.")
         if self.spec_config.draft_len_schedule is not None:
             raise ValueError(
-                "Gemma4 shared-target-KV MTP does not support a draft length "
-                "schedule.")
+                "External shared-target-KV MTP does not support a draft "
+                "length schedule.")
         if self.sa_enhancer is not None:
             raise ValueError(
-                "Gemma4 shared-target-KV MTP does not support the suffix "
+                "External shared-target-KV MTP does not support the suffix "
                 "automaton enhancer.")
         if self.spec_config.use_rejection_sampling:
             raise ValueError(
-                "Gemma4 shared-target-KV MTP does not support rejection "
+                "External shared-target-KV MTP does not support rejection "
                 "sampling.")
 
     def set_guided_decoder(self, guided_decoder) -> bool:
         if self._uses_external_shared_target_kv:
             raise ValueError(
-                "Gemma4 shared-target-KV MTP does not support guided "
+                "External shared-target-KV MTP does not support guided "
                 "decoding.")
         return super().set_guided_decoder(guided_decoder)
 
@@ -1351,10 +1360,10 @@ class MTPEagleWorker(Eagle3OneModelWorker):
         spec_metadata,
         draft_model,
     ):
-        """Draft with a Gemma4 Q-only assistant over accepted target KV."""
+        """Draft with an external Q-only assistant over accepted target KV."""
         if not isinstance(attn_metadata, FlashInferAttentionMetadata):
             raise TypeError(
-                "Gemma4 shared-target-KV MTP requires FlashInfer attention "
+                "External shared-target-KV MTP requires FlashInfer attention "
                 "metadata.")
 
         batch_size = attn_metadata.num_seqs

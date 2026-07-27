@@ -41,7 +41,6 @@ from ..models.modeling_utils import (MODEL_CLASS_MAPPING,
                                      timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
-from ..speculative import needs_external_draft_weights
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
@@ -437,8 +436,8 @@ class ModelLoader:
             from tensorrt_llm._torch.speculative import \
                 update_spec_config_from_model_config
 
-            # Model defaults reconstruct nested Pydantic configs. Populate
-            # runtime-only speculative state after that reconstruction.
+            # Model defaults reconstruct nested Pydantic configs and drop
+            # init=False runtime fields such as num_nextn_predict_layers.
             update_spec_config_from_model_config(llm_args.speculative_config,
                                                  config.pretrained_config)
 
@@ -554,7 +553,11 @@ class ModelLoader:
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
 
-            loads_draft_weights = needs_external_draft_weights(self.spec_config)
+            loads_draft_weights = (
+                self.spec_config is not None
+                and (self.spec_config.spec_dec_mode.need_load_draft_weights() or
+                     (self.spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                      and self.spec_config.speculative_model is not None)))
             speculative_mode = self._speculative_mode_name(self.spec_config)
             post_transform_qualification = self._qualify_post_transform_profile(
                 model,
@@ -705,7 +708,7 @@ class ModelLoader:
                     self._call_load_weights(model.load_weights, weights,
                                             self.weight_mapper)
 
-                if needs_external_draft_weights(self.spec_config):
+                if loads_draft_weights:
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model,
                         mapping=self.mapping)
@@ -840,7 +843,7 @@ class ModelLoader:
                                     "commit an unpopulated model to the GMS "
                                     "pool.")
 
-                            if needs_external_draft_weights(self.spec_config):
+                            if loads_draft_weights:
                                 draft_weights = checkpoint_loader.load_weights(
                                     self.spec_config.speculative_model,
                                     mapping=self.mapping)
@@ -967,7 +970,7 @@ class ModelLoader:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
                 initialize_dummy_weights(model)
-                if needs_external_draft_weights(self.spec_config):
+                if loads_draft_weights:
                     model.draft_model.load_weights_from_target_model(model)
 
             elif load_format == LoadFormat.VISION_ONLY:

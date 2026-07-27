@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
-from ..speculative.interface import SpecMetadata, is_gemma4_mtp_assistant
+from ..speculative.interface import SpecMetadata, uses_external_shared_kv_mtp
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSampler,
                            DraftTargetOneModelSpecMetadata,
@@ -443,7 +443,7 @@ def get_spec_drafter(model_engine,
 
 
 def get_num_spec_layers(spec_config):
-    if is_gemma4_mtp_assistant(spec_config):
+    if uses_external_shared_kv_mtp(spec_config):
         return 0
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         return 1
@@ -521,7 +521,7 @@ def get_num_extra_kv_tokens(spec_config):
     """
     if spec_config is None:
         return 0
-    if is_gemma4_mtp_assistant(spec_config):
+    if uses_external_shared_kv_mtp(spec_config):
         return 0
     if spec_config.spec_dec_mode.use_one_engine():
         return spec_config.max_draft_len - 1
@@ -581,14 +581,6 @@ def update_spec_config_from_model_config(spec_config, model_config):
 
     if not spec_config.use_dynamic_tree:
         spec_config.max_total_draft_tokens = spec_config.max_draft_len
-
-    model_type = getattr(model_config, "model_type", None)
-    spec_config._is_gemma4_mtp_assistant = bool(
-        model_type in ("gemma4", "gemma4_text")
-        and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
-        and spec_config.speculative_model is not None)
-    if spec_config._is_gemma4_mtp_assistant:
-        spec_config._allow_separate_draft_kv_cache = False
 
 
 def update_spec_config_from_loaded_model(spec_config, model) -> None:

@@ -2550,8 +2550,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     # Internal max batch size for dynamic-tree worker buffers.
     _max_batch_size: Optional[int] = PrivateAttr(default=None)
-    # Runtime-only marker populated from the target model config.
-    _is_gemma4_mtp_assistant: bool = PrivateAttr(default=False)
 
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,

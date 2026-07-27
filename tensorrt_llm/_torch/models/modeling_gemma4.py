@@ -1224,20 +1224,6 @@ class Gemma4TextModel(DecoderModel):
         return hidden_states
 
 
-# ---------------------------------------------------------------------------
-# Gemma4 For Causal LM
-# ---------------------------------------------------------------------------
-def _configure_gemma4_mtp_assistant(model_config: ModelConfig) -> None:
-    spec_config = model_config.spec_config
-    if (
-        spec_config is not None
-        and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
-        and spec_config.speculative_model is not None
-    ):
-        spec_config._is_gemma4_mtp_assistant = True
-        spec_config._allow_separate_draft_kv_cache = False
-
-
 @register_auto_model("Gemma4ForCausalLM")
 class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
     def __init__(
@@ -1259,7 +1245,6 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
                 "moe_ep_size>1 requires a Gemma4 MoE variant (only 26B-A4B-it today)."
             )
 
-        _configure_gemma4_mtp_assistant(model_config)
         super().__init__(Gemma4TextModel(model_config), model_config)
 
     @classmethod
@@ -1563,6 +1548,8 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
 @register_auto_model("Gemma4AssistantForCausalLM")
 class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
     """Gemma4 MTP assistant that attends directly to the target model KV cache."""
+
+    shares_target_kv_cache = True
 
     def __init__(self, model_config: ModelConfig):
         assistant_config = model_config.pretrained_config

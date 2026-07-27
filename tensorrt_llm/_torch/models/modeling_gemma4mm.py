@@ -49,7 +49,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear
-from .modeling_gemma4 import Gemma4ForCausalLM, _configure_gemma4_mtp_assistant
+from .modeling_gemma4 import Gemma4ForCausalLM
 from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
 from .modeling_multimodal_mixin import MultimodalModelMixin, PreparedLlmInputs
@@ -853,7 +853,6 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
             )
 
         config = model_config.pretrained_config
-        _configure_gemma4_mtp_assistant(model_config)
         super().__init__(config)
 
         # Pin multimodal tensors to the local rank so each rank of a multi-GPU

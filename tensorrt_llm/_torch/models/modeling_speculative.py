@@ -32,7 +32,7 @@ except ImportError:
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
-from ..speculative.interface import is_gemma4_mtp_assistant
+from ..speculative.interface import uses_external_shared_kv_mtp
 from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
@@ -1890,8 +1890,8 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
             )
 
-    elif (spec_dec_mode.is_mtp_eagle_one_model() and draft_config is not None
-          and is_gemma4_mtp_assistant(model_config.spec_config)):
+    elif (uses_external_shared_kv_mtp(model_config.spec_config)
+          and draft_config is not None):
         return AutoModelForCausalLM.from_config(draft_config)
     elif spec_dec_mode.is_mtp_one_model():
         return MTPForCausalLM(model_config,
@@ -1996,10 +1996,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
-                elif (spec_config.spec_dec_mode.is_mtp_eagle_one_model()
-                      and spec_config.speculative_model is not None
-                      and model_config.pretrained_config.model_type
-                      in ("gemma4", "gemma4_text")):
+                elif uses_external_shared_kv_mtp(spec_config):
                     self.draft_config = ModelConfig.from_pretrained(
                         spec_config.speculative_model,
                         trust_remote_code=True,
@@ -2012,14 +2009,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                         model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
-                    draft_pretrained_config = (
-                        self.draft_config.pretrained_config)
-                    draft_architectures = getattr(draft_pretrained_config,
-                                                  "architectures", None) or []
-                    if "Gemma4AssistantForCausalLM" not in draft_architectures:
-                        raise ValueError(
-                            "Gemma4 MTP requires a "
-                            "Gemma4AssistantForCausalLM checkpoint.")
 
                 elif spec_config.spec_dec_mode.is_external_drafter():
                     self.draft_config = ModelConfig.from_pretrained(

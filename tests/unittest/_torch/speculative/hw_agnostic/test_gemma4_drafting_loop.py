@@ -6,12 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.models import modeling_speculative
 from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
 from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker
-from tensorrt_llm._torch.speculative.interface import (
-    needs_external_draft_weights,
-    should_use_separate_draft_kv_cache,
-)
+from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.speculative.utils import get_num_extra_kv_tokens, get_num_spec_layers
 from tensorrt_llm.llmapi import MTPDecodingConfig
 
@@ -23,18 +21,43 @@ def _shared_kv_spec_config(**kwargs) -> MTPDecodingConfig:
         mtp_eagle_one_model=True,
         **kwargs,
     )
-    spec_config._is_gemma4_mtp_assistant = True
-    spec_config._allow_separate_draft_kv_cache = False
     return spec_config
 
 
 def test_external_shared_kv_uses_no_draft_kv_cache():
     spec_config = _shared_kv_spec_config()
 
-    assert needs_external_draft_weights(spec_config)
     assert get_num_spec_layers(spec_config) == 0
     assert get_num_extra_kv_tokens(spec_config) == 0
     assert not should_use_separate_draft_kv_cache(spec_config)
+
+
+def test_external_shared_kv_builds_draft_from_external_config(monkeypatch):
+    draft_config = object()
+    expected_model = object()
+    monkeypatch.setattr(
+        modeling_speculative.AutoModelForCausalLM,
+        "from_config",
+        lambda config: expected_model,
+    )
+
+    model_config = SimpleNamespace(spec_config=_shared_kv_spec_config())
+    assert (
+        modeling_speculative.get_draft_model(
+            model_config,
+            draft_config,
+            lm_head=None,
+            model=None,
+        )
+        is expected_model
+    )
+
+
+def test_external_shared_kv_worker_requires_draft_model_capability():
+    worker = MTPEagleWorker(_shared_kv_spec_config())
+
+    with pytest.raises(ValueError, match="shares_target_kv_cache=True"):
+        worker.set_draft_model(SimpleNamespace(model=SimpleNamespace()))
 
 
 def test_external_shared_kv_worker_rejects_unverified_modes():
@@ -45,7 +68,12 @@ def test_external_shared_kv_worker_rejects_unverified_modes():
     worker = MTPEagleWorker(spec_config)
 
     with pytest.raises(ValueError, match="linear draft path"):
-        worker.set_draft_model(SimpleNamespace(model=SimpleNamespace()))
+        worker.set_draft_model(
+            SimpleNamespace(
+                model=SimpleNamespace(),
+                shares_target_kv_cache=True,
+            )
+        )
 
 
 @pytest.mark.parametrize(

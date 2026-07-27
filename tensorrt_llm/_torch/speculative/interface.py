@@ -107,18 +107,11 @@ _FORCE_ACCEPT_RNG_COUNTER_STRIDE = 6007
 _FORCE_ACCEPT_RNG_SLOT_STRIDE = 1009
 
 
-def is_gemma4_mtp_assistant(spec_config) -> bool:
+def uses_external_shared_kv_mtp(spec_config) -> bool:
+    """Whether one-engine MTP uses an external assistant over target KV."""
     return bool(spec_config is not None
-                and getattr(spec_config, "_is_gemma4_mtp_assistant", False))
-
-
-def needs_external_draft_weights(spec_config) -> bool:
-    """Whether a one-engine mode loads a separate draft checkpoint."""
-    if spec_config is None:
-        return False
-    if is_gemma4_mtp_assistant(spec_config):
-        return True
-    return spec_config.spec_dec_mode.need_load_draft_weights()
+                and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                and spec_config.speculative_model is not None)
 
 
 def should_use_separate_draft_kv_cache(spec_config) -> bool:
@@ -128,6 +121,8 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
     if spec_config is None:
         return False
     if not spec_config.spec_dec_mode.use_one_engine():
+        return False
+    if uses_external_shared_kv_mtp(spec_config):
         return False
     # DSpark owns a dedicated rolling-window cache in DSparkWorker. Its draft
     # model does not read the paged draft KV cache managed by attention metadata.
