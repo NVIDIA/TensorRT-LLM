@@ -84,21 +84,25 @@ def create_trtoai_worker(model_name, async_client):
 @pytest.mark.asyncio(loop_scope="module")
 def test_trtoai_worker_generation(default_prompt, model_name, server):
     worker = create_trtoai_worker(model_name, server.get_async_client())
-    task = GenerationTask.create_from_prompt(default_prompt)
-    task.max_tokens = 100
-    status = asyncio.run(worker.run_task(task))
-    assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTOpenaiWorker"
-    worker.shutdown()
+    try:
+        task = GenerationTask.create_from_prompt(default_prompt)
+        task.max_tokens = 100
+        status = asyncio.run(worker.run_task(task))
+        assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTOpenaiWorker"
+    finally:
+        worker.shutdown()
 
 
 @pytest.mark.asyncio(loop_scope="module")
 def test_trtoai_worker_chat(default_prompt, model_name, server):
     worker = create_trtoai_worker(model_name, server.get_async_client())
-    task = ChatTask.create_from_messages([UserMessage(default_prompt)])
-    task.max_tokens = 100
-    status = asyncio.run(worker.run_task(task))
-    assert status == TaskStatus.SUCCESS, "Chat Task is not successful with TRTOpenaiWorker"
-    worker.shutdown()
+    try:
+        task = ChatTask.create_from_messages([UserMessage(default_prompt)])
+        task.max_tokens = 100
+        status = asyncio.run(worker.run_task(task))
+        assert status == TaskStatus.SUCCESS, "Chat Task is not successful with TRTOpenaiWorker"
+    finally:
+        worker.shutdown()
 
 
 def create_trtllm_worker(model_path):
