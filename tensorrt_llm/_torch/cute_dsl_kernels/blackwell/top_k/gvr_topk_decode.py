@@ -3403,6 +3403,8 @@ class GvrTopKKernel:
         tidx,
         warp_id,
         lane,
+        ext_range_flag=None,  # list rows: walk pre-staged range + hist zero
+        ext_min=None,  # list rows: cut line == exact candidate minimum
     ):
         kK = cutlass.const_expr(self.top_k)
         kBins = cutlass.const_expr(self.kNumBins)
@@ -3427,43 +3429,61 @@ class GvrTopKKernel:
             sc6 = cutlass.Int64(0)
             if cutlass.const_expr(_P4_SUB_DBG):
                 sc0 = cute.arch.clock64()
-            # ---- block min/max over candidates ----
-            local_cmin = cutlass.Float32(self.FLT_MAX)
-            local_cmax = cutlass.Float32(self.NEG_FLT_MAX)
-            i5 = tidx
-            while i5 < cand_count:
-                v = smem_keys[i5]
-                local_cmin = _fmin_f32_inline(local_cmin, v)
-                local_cmax = cute.arch.fmax(local_cmax, v)
-                i5 = i5 + cutlass.Int32(num_threads)
-            cmin = self.warp_reduce_min_f32(local_cmin)
-            cmax = self.warp_reduce_max_f32(local_cmax)
-            if lane == cutlass.Int32(0):
-                smem_wcnt[warp_id] = float_as_uint32(cmin)
-                smem_hist[warp_id] = float_as_uint32(cmax)
-            cute.arch.barrier()
             bmin_r = cutlass.Float32(self.FLT_MAX)
             bmax_r = cutlass.Float32(self.NEG_FLT_MAX)
-            for w in cutlass.range_constexpr(self.num_warps):
-                vmin = cutlass.Float32(
-                    llvm.bitcast(cutlass.Float32.mlir_type, smem_wcnt[w].ir_value())
-                )
-                vmax = cutlass.Float32(
-                    llvm.bitcast(cutlass.Float32.mlir_type, smem_hist[w].ir_value())
-                )
-                bmin_r = _fmin_f32_inline(bmin_r, vmin)
-                bmax_r = cute.arch.fmax(bmax_r, vmax)
-            if bmax_r <= bmin_r:
-                bmax_r = bmin_r + cutlass.Float32(1e-6)
-            cute.arch.barrier()
-            if cutlass.const_expr(_P4_SUB_DBG):
-                sc1 = cute.arch.clock64()
-            # ---- zero + build histogram ----
-            i6 = tidx
-            while i6 < cutlass.Int32(kBins):
-                smem_hist[i6] = cutlass.Int32(0)
-                i6 = i6 + cutlass.Int32(num_threads)
-            cute.arch.barrier()
+            use_ext_r = cutlass.Int32(0)
+            if cutlass.const_expr(ext_range_flag is not None):
+                use_ext_r = ext_range_flag
+            if use_ext_r == cutlass.Int32(1):
+                # list rows: the take walk pre-zeroed the hist and staged
+                # per-warp maxima in smem_wcnt (its end barrier orders
+                # them); min := cut line by construction. The minmax
+                # scan, the zero pass and their three barriers vanish.
+                if cutlass.const_expr(ext_min is not None):
+                    bmin_r = ext_min
+                for w in cutlass.range_constexpr(self.num_warps):
+                    vmax = cutlass.Float32(
+                        llvm.bitcast(cutlass.Float32.mlir_type, smem_wcnt[w].ir_value())
+                    )
+                    bmax_r = cute.arch.fmax(bmax_r, vmax)
+                if bmax_r <= bmin_r:
+                    bmax_r = bmin_r + cutlass.Float32(1e-6)
+            if use_ext_r == cutlass.Int32(0):
+                # ---- block min/max over candidates ----
+                local_cmin = cutlass.Float32(self.FLT_MAX)
+                local_cmax = cutlass.Float32(self.NEG_FLT_MAX)
+                i5 = tidx
+                while i5 < cand_count:
+                    v = smem_keys[i5]
+                    local_cmin = _fmin_f32_inline(local_cmin, v)
+                    local_cmax = cute.arch.fmax(local_cmax, v)
+                    i5 = i5 + cutlass.Int32(num_threads)
+                cmin = self.warp_reduce_min_f32(local_cmin)
+                cmax = self.warp_reduce_max_f32(local_cmax)
+                if lane == cutlass.Int32(0):
+                    smem_wcnt[warp_id] = float_as_uint32(cmin)
+                    smem_hist[warp_id] = float_as_uint32(cmax)
+                cute.arch.barrier()
+                for w in cutlass.range_constexpr(self.num_warps):
+                    vmin = cutlass.Float32(
+                        llvm.bitcast(cutlass.Float32.mlir_type, smem_wcnt[w].ir_value())
+                    )
+                    vmax = cutlass.Float32(
+                        llvm.bitcast(cutlass.Float32.mlir_type, smem_hist[w].ir_value())
+                    )
+                    bmin_r = _fmin_f32_inline(bmin_r, vmin)
+                    bmax_r = cute.arch.fmax(bmax_r, vmax)
+                if bmax_r <= bmin_r:
+                    bmax_r = bmin_r + cutlass.Float32(1e-6)
+                cute.arch.barrier()
+                if cutlass.const_expr(_P4_SUB_DBG):
+                    sc1 = cute.arch.clock64()
+                # ---- zero + build histogram ----
+                i6 = tidx
+                while i6 < cutlass.Int32(kBins):
+                    smem_hist[i6] = cutlass.Int32(0)
+                    i6 = i6 + cutlass.Int32(num_threads)
+                cute.arch.barrier()
             range1 = bmax_r - bmin_r
             inv1 = (cutlass.Float32(kBins - 1) + cutlass.Float32(0.99)) / range1
             i7 = tidx
@@ -5901,6 +5921,17 @@ class GvrTopKKernel:
                         s_iscalars[1] = cutlass.Int32(1)  # done
                     cute.arch.barrier()
                     lane_c = tidx & cutlass.Int32(self.WARP_SIZE - 1)
+                    # fused P4 prologue: zero the coarse hist here and
+                    # accumulate the candidate max INSIDE the cut walk
+                    # (per-fragment fmax is free ILP; min := cut line by
+                    # construction). P4's minmax scan + zero pass and
+                    # their three barriers disappear for list rows - the
+                    # staging rides this walk's own end barrier.
+                    izh_c = tidx
+                    while izh_c < cutlass.Int32(self.kNumBins):
+                        smem_hist[izh_c] = cutlass.Int32(0)
+                        izh_c = izh_c + cutlass.Int32(num_threads)
+                    wmax_acc = cutlass.Float32(self.NEG_FLT_MAX)
                     if line_cut == cutlass.Int32(1):
                         # ---- LINE cut: dense mapped-prefix COPY of
                         # exactly cut_n entries. No filter, no ballots,
@@ -5923,9 +5954,9 @@ class GvrTopKKernel:
                                         cute.AddressSpace.gmem,
                                         assumed_align=4,
                                     )
-                                    smem_keys[j_c] = cute.make_tensor(vp_c, cute.make_layout((1,)))[
-                                        0
-                                    ]
+                                    pv_c = cute.make_tensor(vp_c, cute.make_layout((1,)))[0]
+                                    smem_keys[j_c] = pv_c
+                                    wmax_acc = cute.arch.fmax(wmax_acc, pv_c)
                                     # eager position fetch: the idx column
                                     # rides the same ILP batch as the value
                                     # read, so vals hold TRUE positions and
@@ -5940,6 +5971,9 @@ class GvrTopKKernel:
                                         0
                                     ]
                             i_c = i_c + cutlass.Int32(4 * num_threads)
+                        wmax_w = self.warp_reduce_max_f32(wmax_acc)
+                        if lane_c == cutlass.Int32(0):
+                            smem_wcnt[tidx // cutlass.Int32(32)] = float_as_uint32(wmax_w)
                         cute.arch.barrier()
                     if line_cut == cutlass.Int32(0):
                         # ---- histogram-edge cut: value-filtered mapped
@@ -5980,6 +6014,7 @@ class GvrTopKKernel:
                                     pidx = cute.make_tensor(ip_c, cute.make_layout((1,)))[0]
                                     if pval >= cut_t:
                                         keep = cutlass.Int32(1)
+                                wmax_acc = cute.arch.fmax(wmax_acc, pval)
                                 pvals.append(pval)
                                 pidxs.append(pidx)
                                 keeps.append(keep)
@@ -6019,6 +6054,9 @@ class GvrTopKKernel:
                                             smem_vals[wpos] = pidxs[_ju]
                                     off = off + cutlass.Int32(cute.arch.popc(mj))
                             i_c = i_c + cutlass.Int32(4 * num_threads)
+                        wmax_w2 = self.warp_reduce_max_f32(wmax_acc)
+                        if lane_c == cutlass.Int32(0):
+                            smem_wcnt[tidx // cutlass.Int32(32)] = float_as_uint32(wmax_w2)
                         cute.arch.barrier()
                         cnt_l = s_iscalars[0]
                         if cnt_l < cutlass.Int32(self.top_k) or cnt_l > cutlass.Int32(self.kC):
@@ -6712,20 +6750,43 @@ class GvrTopKKernel:
                 # cs=1: the single CTA per row IS the leader.
                 cand_count_p4 = min(s_iscalars[0], cutlass.Int32(self.kC))
                 if cutlass.const_expr(self.enable_p4_rank_scatter):
-                    self.phase4_rank_scatter(
-                        smem_keys,
-                        smem_vals,
-                        smem_hist,
-                        smem_wcnt,
-                        s_thr,
-                        s_iscalars,
-                        output_values_row,
-                        output_indices_row,
-                        cand_count_p4,
-                        tidx,
-                        warp_id,
-                        lane,
-                    )
+                    if cutlass.const_expr(
+                        self.use_ext_cand and self.use_ext_counts and self.dtype == cutlass.Float32
+                    ):
+                        # list rows carry a walk-staged range + pre-zeroed
+                        # hist (flag = list_used; fallback rows take the
+                        # stock minmax path inside)
+                        self.phase4_rank_scatter(
+                            smem_keys,
+                            smem_vals,
+                            smem_hist,
+                            smem_wcnt,
+                            s_thr,
+                            s_iscalars,
+                            output_values_row,
+                            output_indices_row,
+                            cand_count_p4,
+                            tidx,
+                            warp_id,
+                            lane,
+                            ext_range_flag=list_used,
+                            ext_min=cut_t,
+                        )
+                    else:
+                        self.phase4_rank_scatter(
+                            smem_keys,
+                            smem_vals,
+                            smem_hist,
+                            smem_wcnt,
+                            s_thr,
+                            s_iscalars,
+                            output_values_row,
+                            output_indices_row,
+                            cand_count_p4,
+                            tidx,
+                            warp_id,
+                            lane,
+                        )
                 else:
                     self.phase4_histogram_snap(
                         smem_keys,
