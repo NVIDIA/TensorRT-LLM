@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -73,6 +74,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
         Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
         Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner)
+
+_DIRECT_DEEP_EP_METADATA_ENV = "TRTLLM_CUTEDSL_DEEP_EP_DIRECT_METADATA"
+_REMOVE_DEEP_EP_ADAPTER_ENV = "TRTLLM_CUTEDSL_DEEP_EP_REMOVE_ADAPTER"
 
 
 def _unwrap_locality_domain_runner(runner: TunableRunner) -> TunableRunner:
@@ -308,6 +312,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  enable_alltoall: bool = False,
                  output_dtype: torch.dtype = torch.bfloat16,
                  scaling_vector_size: int = 16,
+                 use_direct_expert_metadata: bool = False,
+                 deep_ep_expert_capacity: Optional[int] = None,
                  workload_identity: Optional[Tuple] = None):
         super().__init__()
         self.forward_impl = forward_impl
@@ -317,6 +323,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.local_expert_offset = local_expert_offset
         self.enable_finalize_fusion = enable_finalize_fusion
         self.enable_alltoall = enable_alltoall
+        self.use_direct_expert_metadata = use_direct_expert_metadata
+        self.deep_ep_expert_capacity = deep_ep_expert_capacity
 
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
@@ -336,6 +344,11 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         )
         if self.workload_identity is not None:
             identity += (self.workload_identity, )
+        if self.use_direct_expert_metadata:
+            identity += (
+                "direct_expert_metadata",
+                self.deep_ep_expert_capacity,
+            )
         return identity
 
     def get_valid_tactics(
@@ -356,25 +369,28 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
     def get_tuning_config(self) -> TuningConfig:
         key = self.unique_id()
         if key not in self.__class__.tuning_config_cache:
-            helper = CuteDslFusedMoENvfp4InputsHelper(self.num_experts,
-                                                      self.top_k,
-                                                      self.num_local_experts,
-                                                      self.local_expert_offset)
-            self.__class__.tuning_config_cache[key] = TuningConfig(
-                dynamic_tensor_specs=(DynamicTensorSpec(
-                    0, 0, get_last_power_of_2_num_tokens_buckets,
-                    last_positive_power_of_2), ),
-                constraint_specs=(ConstraintSpec(1, 0,
-                                                 helper.infer_shape_num_tokens),
-                                  ConstraintSpec(2, 0,
-                                                 helper.infer_shape_num_tokens),
-                                  ConstraintSpec(3, 0,
-                                                 helper.infer_shape_num_tokens),
-                                  ConstraintSpec(
-                                      4, 0, helper.infer_shape_num_tokens)),
-                inputs_pre_hook=helper.inputs_pre_hook,
-                use_cold_l2_cache=True,
-            )
+            if self.use_direct_expert_metadata:
+                tuning_config = TuningConfig(use_cold_l2_cache=True)
+            else:
+                helper = CuteDslFusedMoENvfp4InputsHelper(
+                    self.num_experts, self.top_k, self.num_local_experts,
+                    self.local_expert_offset)
+                tuning_config = TuningConfig(
+                    dynamic_tensor_specs=(DynamicTensorSpec(
+                        0, 0, get_last_power_of_2_num_tokens_buckets,
+                        last_positive_power_of_2), ),
+                    constraint_specs=(ConstraintSpec(
+                        1, 0, helper.infer_shape_num_tokens),
+                                      ConstraintSpec(
+                                          2, 0, helper.infer_shape_num_tokens),
+                                      ConstraintSpec(
+                                          3, 0, helper.infer_shape_num_tokens),
+                                      ConstraintSpec(
+                                          4, 0, helper.infer_shape_num_tokens)),
+                    inputs_pre_hook=helper.inputs_pre_hook,
+                    use_cold_l2_cache=True,
+                )
+            self.__class__.tuning_config_cache[key] = tuning_config
         return self.__class__.tuning_config_cache[key]
 
     def forward(self,
@@ -399,9 +415,17 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             tile_size = tactic
         else:
             tile_size = 128
-        return self.forward_impl(*inputs,
-                                 enable_alltoall=self.enable_alltoall,
-                                 tile_size=tile_size)
+        recv_expert_count = None
+        forward_inputs = inputs
+        if self.use_direct_expert_metadata:
+            recv_expert_count = inputs[-1]
+            forward_inputs = inputs[:-1]
+        return self.forward_impl(
+            *forward_inputs,
+            enable_alltoall=self.enable_alltoall,
+            tile_size=tile_size,
+            recv_expert_count=recv_expert_count,
+            deep_ep_expert_capacity=self.deep_ep_expert_capacity)
 
     @AutoTuner.TacticsCapture.register_runner_tactic_comb_checker
     @staticmethod
@@ -788,6 +812,13 @@ class CuteDslFusedMoE(MoEImplBase):
             init_load_balancer=init_load_balancer,
         )
         self.apply_router_weight_on_input = apply_router_weight_on_input
+        self.enable_deep_ep_direct_metadata = os.environ.get(
+            _DIRECT_DEEP_EP_METADATA_ENV, "0") == "1"
+        self.enable_deep_ep_remove_adapter = os.environ.get(
+            _REMOVE_DEEP_EP_ADAPTER_ENV, "0") == "1"
+        if self.enable_deep_ep_remove_adapter and not self.enable_deep_ep_direct_metadata:
+            raise ValueError(f"{_REMOVE_DEEP_EP_ADAPTER_ENV}=1 requires "
+                             f"{_DIRECT_DEEP_EP_METADATA_ENV}=1")
 
         # Read by run_moe_nvfp4* to pick the fused-finalize epilogue, which
         # leaves no seam for a LoRA GEMM.
@@ -941,6 +972,8 @@ class CuteDslFusedMoE(MoEImplBase):
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
         weight_view: Optional[NvFp4WeightView] = None,
+        recv_expert_count: Optional[torch.Tensor] = None,
+        deep_ep_expert_capacity: Optional[int] = None,
     ) -> torch.Tensor:
         """NVFP4 MoE computation.
 
@@ -985,6 +1018,14 @@ class CuteDslFusedMoE(MoEImplBase):
             return moe_output
 
         effective_top_k = token_selected_experts.size(-1)
+        if (recv_expert_count is None) != (deep_ep_expert_capacity is None):
+            raise ValueError(
+                "recv_expert_count and deep_ep_expert_capacity must be provided together"
+            )
+        use_direct_expert_metadata = (
+            self.enable_deep_ep_direct_metadata
+            and recv_expert_count is not None
+            and not use_locality_domain)
 
         if use_locality_domain:
             forward_impl = self._run_moe_nvfp4_locality_domain
@@ -1021,8 +1062,13 @@ class CuteDslFusedMoE(MoEImplBase):
             enable_finalize_fusion=self.use_fused_finalize,
             enable_alltoall=enable_alltoall,
             workload_identity=workload_identity,
+            use_direct_expert_metadata=use_direct_expert_metadata,
+            deep_ep_expert_capacity=(deep_ep_expert_capacity
+                                     if use_direct_expert_metadata else None),
         )
 
+        if use_direct_expert_metadata:
+            inputs.append(recv_expert_count)
         _, best_tactic = tuner.choose_one(
             tuner_key,
             [runner],
@@ -1041,6 +1087,8 @@ class CuteDslFusedMoE(MoEImplBase):
         weight_view: NvFp4WeightView,
         enable_alltoall: bool = False,
         tile_size: int = 128,
+        recv_expert_count: Optional[torch.Tensor] = None,
+        deep_ep_expert_capacity: Optional[int] = None,
     ) -> torch.Tensor:
         """Non-DWDP NVFP4 MoE implementation using single-tensor ops."""
         output_dtype = torch.bfloat16
@@ -1051,15 +1099,27 @@ class CuteDslFusedMoE(MoEImplBase):
         esp = weight_view.expert_size_per_partition
         slot_start = weight_view.slot_start
 
-        tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            num_experts=self.num_slots,
-            top_k=effective_top_k,
-            local_expert_offset=slot_start,
-            local_num_experts=esp,
-            tile_tokens_dim=tile_size,
-        )
+        if recv_expert_count is not None:
+            assert deep_ep_expert_capacity is not None
+            assert effective_top_k == 1
+            assert recv_expert_count.dim() == 1
+            assert recv_expert_count.numel() == esp
+            assert x.size(0) == esp * deep_ep_expert_capacity
+            tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_metadata_from_expert_counts(
+                expert_counts=recv_expert_count,
+                capacity=deep_ep_expert_capacity,
+                tile_size=tile_size,
+            )
+        else:
+            tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                num_experts=self.num_slots,
+                top_k=effective_top_k,
+                local_expert_offset=slot_start,
+                local_num_experts=esp,
+                tile_tokens_dim=tile_size,
+            )
 
         has_aux_streams = self._has_moe_output_memset_aux_stream()
         if self.use_fused_finalize and has_aux_streams:
@@ -1775,6 +1835,8 @@ class CuteDslFusedMoE(MoEImplBase):
                 moe_output=moe_output,
                 enable_alltoall=enable_alltoall,
                 weight_view=weight_view,
+                recv_expert_count=plan.recv_expert_count,
+                deep_ep_expert_capacity=plan.deep_ep_expert_capacity,
             )
         elif self.has_deepseek_fp8_block_scales:
             result = self.run_moe_fp8_block_scales(

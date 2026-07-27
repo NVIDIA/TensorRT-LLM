@@ -195,6 +195,109 @@ def test_moe_sort(num_tokens: int, top_k: int, ep_size: int, tile_size: int):
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("slot_start", [0, 13])
+@pytest.mark.parametrize("all_zero", [False, True])
+def test_moe_metadata_from_expert_counts_matches_sort_and_permute_output(
+    tile_size: int, slot_start: int, all_zero: bool
+):
+    """Direct expert-major metadata must match sorting the DeepEP adapter tensors."""
+    capacity = tile_size + 1
+    counts_host = [0, tile_size - 1, tile_size, capacity]
+    if all_zero:
+        counts_host = [0] * len(counts_host)
+    counts = torch.tensor(counts_host, dtype=torch.int32, device="cuda")
+    num_local_experts = counts.numel()
+    num_experts = slot_start + num_local_experts + 7
+
+    row_in_expert = torch.arange(capacity, dtype=torch.int32, device="cuda")
+    mask = row_in_expert.unsqueeze(0) < counts.unsqueeze(1)
+    local_slots = torch.arange(
+        slot_start,
+        slot_start + num_local_experts,
+        dtype=torch.int32,
+        device="cuda",
+    ).unsqueeze(1)
+    token_selected_slots = torch.where(mask, local_slots, num_experts).reshape(-1, 1)
+    token_final_scales = torch.ones_like(token_selected_slots, dtype=torch.float32)
+
+    old_metadata = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_slots,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=1,
+        local_expert_offset=slot_start,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+    direct_metadata = torch.ops.trtllm.moe_metadata_from_expert_counts(
+        expert_counts=counts,
+        capacity=capacity,
+        tile_size=tile_size,
+    )
+
+    for old_tensor, direct_tensor in zip(old_metadata, direct_metadata):
+        assert direct_tensor.shape == old_tensor.shape
+        assert direct_tensor.dtype == old_tensor.dtype
+
+    num_valid_tiles = direct_metadata[-1].item()
+    num_valid_permuted_tokens = direct_metadata[-2].item()
+    torch.testing.assert_close(
+        direct_metadata[0][:num_valid_tiles], old_metadata[0][:num_valid_tiles]
+    )
+    torch.testing.assert_close(
+        direct_metadata[1][:num_valid_tiles], old_metadata[1][:num_valid_tiles]
+    )
+    torch.testing.assert_close(direct_metadata[2], old_metadata[2])
+    valid_permuted = direct_metadata[3][:num_valid_permuted_tokens] >= 0
+    torch.testing.assert_close(
+        direct_metadata[3][:num_valid_permuted_tokens][valid_permuted],
+        old_metadata[3][:num_valid_permuted_tokens][valid_permuted],
+    )
+    torch.testing.assert_close(direct_metadata[4], old_metadata[4])
+    torch.testing.assert_close(direct_metadata[5], old_metadata[5])
+
+    assert (direct_metadata[0][num_valid_tiles:] == -1).all()
+    assert (direct_metadata[1][num_valid_tiles:] == 0).all()
+    assert (direct_metadata[3][num_valid_permuted_tokens:] == -1).all()
+
+    hidden_size = 64
+    x = torch.randn(
+        num_local_experts * capacity,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    old_permuted, _ = torch.ops.trtllm.moe_permute(
+        x, None, old_metadata[1], old_metadata[3], old_metadata[5], tile_size, 1
+    )
+    direct_permuted, _ = torch.ops.trtllm.moe_permute(
+        x, None, direct_metadata[1], direct_metadata[3], direct_metadata[5], tile_size, 1
+    )
+    live_sources = direct_metadata[2].flatten() >= 0
+    live_destinations = direct_metadata[2].flatten()[live_sources]
+    torch.testing.assert_close(direct_permuted[live_destinations], old_permuted[live_destinations])
+    torch.testing.assert_close(direct_permuted[live_destinations], x[live_sources])
+
+    old_output = torch.ops.trtllm.moe_unpermute(old_permuted, old_metadata[2], token_final_scales)
+    direct_output = torch.ops.trtllm.moe_unpermute(
+        direct_permuted, direct_metadata[2], token_final_scales
+    )
+    torch.testing.assert_close(direct_output, old_output)
+
+
+def test_moe_metadata_from_expert_counts_rejects_int32_padded_size_overflow():
+    int32_max = torch.iinfo(torch.int32).max
+    counts = torch.zeros(2, dtype=torch.int32, device="cuda")
+
+    with pytest.raises(RuntimeError, match="maximum permuted token count exceeds int32 range"):
+        torch.ops.trtllm.moe_metadata_from_expert_counts(
+            expert_counts=counts,
+            capacity=int32_max // 2,
+            tile_size=int32_max,
+        )
+
+
+@pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float8", "float4"])

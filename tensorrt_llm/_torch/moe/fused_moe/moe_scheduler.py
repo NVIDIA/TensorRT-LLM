@@ -518,6 +518,18 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # through **kwargs, so the request does not need a comm-side test.
             if moe.backend.input_requirement.requires_sanitized_expert_ids:
                 dispatch_kwargs["enable_sanitize_expert_ids"] = True
+            if isinstance(moe.comm, DeepEPLowLatency) and moe.backend.__class__ == CuteDslFusedMoE:
+                remove_adapter = moe.backend.enable_deep_ep_remove_adapter
+                if remove_adapter and not moe.backend.has_nvfp4:
+                    raise ValueError("The adapter-free DeepEP CuteDSL path supports only NVFP4")
+                if remove_adapter and not supports_post_quant:
+                    raise ValueError(
+                        "The adapter-free DeepEP CuteDSL path requires post-quant dispatch"
+                    )
+                dispatch_kwargs["use_direct_expert_metadata"] = (
+                    moe.backend.enable_deep_ep_direct_metadata
+                )
+                dispatch_kwargs["remove_adapter"] = remove_adapter
 
             if supports_post_quant:
                 # Quantize -> Dispatch
@@ -851,11 +863,19 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # combine() still reads the flag off the strategy; the plan stays
             # the single place that decides its value.
             moe.comm.payload_in_workspace = payload_in_workspace
+        recv_expert_count = None
+        deep_ep_expert_capacity = None
+        if isinstance(moe.comm, DeepEPLowLatency) and moe.backend.__class__ == CuteDslFusedMoE:
+            recv_expert_count, deep_ep_expert_capacity = (
+                moe.comm.get_expert_major_dispatch_metadata()
+            )
         return MoECommPlan(
             input_sf_swizzled=not supports_post_quant,
             enable_alltoall=moe.enable_alltoall,
             moe_output=moe_output,
             payload_in_workspace=payload_in_workspace,
+            recv_expert_count=recv_expert_count,
+            deep_ep_expert_capacity=deep_ep_expert_capacity,
         )
 
 
