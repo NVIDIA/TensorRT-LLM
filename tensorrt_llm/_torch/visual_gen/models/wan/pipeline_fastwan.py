@@ -80,27 +80,32 @@ class WanDMDPipeline(WanPipeline):
 
         CFG-free: one transformer forward pass per step, no negative prompt support.
         Unsupported parameters (num_inference_steps, guidance_scale, guidance_scale_2,
-        boundary_ratio) are accepted for base-class compatibility but logged as warnings
-        and ignored.
+        boundary_ratio) are accepted for base-class compatibility but rejected with a
+        ValueError if set to anything other than FastWan's fixed values.
         """
         if image is not None:
             raise NotImplementedError(
                 "FastWan currently supports text-to-video only (no image conditioning)."
             )
-        if num_inference_steps not in (None, len(self.DMD_TIMESTEPS)):
-            logger.warning(
-                f"FastWan always uses {len(self.DMD_TIMESTEPS)} DMD steps; "
-                f"ignoring num_inference_steps={num_inference_steps}."
+        num_expected_inference_steps = len(self.DMD_TIMESTEPS)
+        if num_inference_steps is not None and num_inference_steps != num_expected_inference_steps:
+            raise ValueError(
+                f"FastWan's DMD model always uses {num_expected_inference_steps} inference steps. "
+                f"Do not set num_inference_steps or set it to {num_expected_inference_steps}. "
+                f"Got num_inference_steps={num_inference_steps}."
             )
         if guidance_scale not in (None, 1.0):
-            logger.warning(f"FastWan is CFG-free; ignoring guidance_scale={guidance_scale}.")
+            raise ValueError(
+                f"FastWan is CFG-free and only supports guidance_scale=1.0. "
+                f"Got guidance_scale={guidance_scale}."
+            )
         if guidance_scale_2 is not None:
-            logger.warning(
-                f"FastWan does not support guidance_scale_2; ignoring guidance_scale_2={guidance_scale_2}."
+            raise ValueError(
+                f"FastWan does not support guidance_scale_2. Got guidance_scale_2={guidance_scale_2}."
             )
         if boundary_ratio is not None:
-            logger.warning(
-                f"FastWan does not support boundary_ratio; ignoring boundary_ratio={boundary_ratio}."
+            raise ValueError(
+                f"FastWan does not support boundary_ratio. Got boundary_ratio={boundary_ratio}."
             )
 
         pipeline_start = time.time()
