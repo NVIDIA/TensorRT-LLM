@@ -63,6 +63,8 @@ release semantics, so peer CTAs could observe stale DSMEM: see
 ``cluster_arrive_relaxed`` DSMEM-race history in the GVR campaign notes).
 """
 
+import math
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.math as cmath
@@ -76,6 +78,30 @@ from cutlass.utils.smem_allocator import SmemAllocator
 RUNGS = 8
 MAXPASS = 8
 SS = 32  # P2a sample stride (float4s)
+
+# pr6 DATA-ADAPTIVE admission (op43-pr6 campaign, shipped head).
+# This is the pr4 admission machinery
+# BYTE-PARITY on every streaming pass, the fused R=2 count-collect, the
+# reuse rule, the P4 select and the P2c driver (iter1's dedicated window
+# rungs and iter2's R=4 window both taxed the whole kernel 4-15%
+# globally — even trivial-branch cells — via register pressure/extra
+# compares/P4 prefilter, and iter1 additionally carried an adversarial
+# under-emit bug). The adaptivity is a PICK-ONLY delta:
+#   * stage 0c LEAN-PIVOT OVERRIDE: when the stage-0 CI admission FAILED
+#     (the pick in hand is a band/2-sigma/overshoot fallback: fat or
+#     undershoot-prone), npad <= 262144, and a strictly LEANER ladder
+#     rung's sampled count lands in [K, kC] by its clustering-aware
+#     1.5-sigma CI on both sides, that rung becomes the pivot (the
+#     rescue is recomputed from it by the standard next-fatter rule).
+#     A fat band pick (est ~3-4x K, the P3-push/P4-radix fatness the
+#     op43-pr6 D2 probe identified as the whole residual-band gap) is
+#     replaced by a lean CI-backed pivot; an undershoot costs ONE rescue
+#     re-stream — pr4's own economics.
+#   * kC pinned to the pr4 flat budget 8192 (K>=2048) / 6144 — the pr6
+#     iron rule (the K-scaled diet was falsified as pure harm).
+#   * ladder quantiles pinned WIDE (pr4): abl3 showed the re-placed
+#     spread under this admission is a net residual harm.
+#   * the C4 occupancy CS cut keeps the fix-head default (neutral).
 FLT_MAX = 3.4028234663852886e38
 INF = float("inf")
 
@@ -213,6 +239,24 @@ def _fmin_f32(a, b, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _lg2_f32(a, *, loc=None, ip=None):
+    """lg2.approx.f32 — thread-0 serial pick section only (lean interp)."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            cutlass.Float32.mlir_type,
+            [a.ir_value(loc=loc, ip=ip)],
+            "lg2.approx.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 @cute.jit
 def _f2u_bits(u):
     """Order-preserving fp32-bits -> Uint32 key: u ^ (sign ? 0xFFFFFFFF : 0x80000000)."""
@@ -293,6 +337,10 @@ class GvrTpKernel:
         assert num_threads % 32 == 0
         assert ar in (6, 8)
         assert cluster_size in (1, 2, 4, 8)
+        # pr6 D2a-lean2 interpolation target (per-K: K512 rows carry
+        # 5-20x sparser P2a samples, so 2.0K keeps interpolation-error
+        # margin; K>=1024 takes the measured-win 1.5K).
+        self.lean_tgt = (2 * top_k) if top_k < 1024 else (3 * top_k) // 2
         self.top_k = top_k
         self.kC = kC
         self.cluster_size = cluster_size
@@ -371,17 +419,34 @@ class GvrTpKernel:
         frags = [
             cute.make_fragment((4,), cutlass.Float32) for _ in range(U)
         ]  # Python-unrolled register batch
+        # Mask hoist: float4s below vmain = min(v1, n_eff >> 2) are fully
+        # valid (4i+3 < n_eff), so the main loop runs mask-free (the
+        # per-element gi compare + select was ~10% of whole-kernel
+        # instructions); only [vmain, v1) — the n_eff boundary float4 and
+        # the pad tail — takes the masked epilogue. Bit-exact: the mask
+        # only changes values at gi >= n_eff, all of which live in
+        # [vmain, v1).
+        vmain = v1
+        vfull = n_eff >> cutlass.Int32(2)
+        if vmain > vfull:
+            vmain = vfull
         i = v0 + tidx
-        while i + cutlass.Int32((U - 1) * TB) < v1:
+        while i + cutlass.Int32((U - 1) * TB) < vmain:
             for u in cutlass.range_constexpr(U):
                 self._ld_float4(copy_atom, row_addr, i + cutlass.Int32(u * TB), frags[u])
             for u in cutlass.range_constexpr(U):
-                gi = (i + cutlass.Int32(u * TB)) << cutlass.Int32(2)
                 for q in cutlass.range_constexpr(4):
-                    v = _mask_tail(frags[u][q], gi + cutlass.Int32(q), n_eff)
+                    v = frags[u][q]
                     for r in cutlass.range_constexpr(R):
                         cnt[r] = cnt[r] + cutlass.Int32(v >= tr[r])
             i = i + cutlass.Int32(U * TB)
+        while i < vmain:
+            self._ld_float4(copy_atom, row_addr, i, frags[0])
+            for q in cutlass.range_constexpr(4):
+                v = frags[0][q]
+                for r in cutlass.range_constexpr(R):
+                    cnt[r] = cnt[r] + cutlass.Int32(v >= tr[r])
+            i = i + cutlass.Int32(TB)
         while i < v1:
             self._ld_float4(copy_atom, row_addr, i, frags[0])
             gi = i << cutlass.Int32(2)
@@ -495,17 +560,27 @@ class GvrTpKernel:
         m = cutlass.Float32(-FLT_MAX)
         # op43 S-E: explicit U=4 batched loads (CUDA `float4 a[4]` idiom).
         frags = [cute.make_fragment((4,), cutlass.Float32) for _ in range(4)]
+        vmain = v1
+        vfull = n_eff >> cutlass.Int32(2)
+        if vmain > vfull:
+            vmain = vfull
         i = v0 + tidx
-        while i + cutlass.Int32(3 * TB) < v1:
+        while i + cutlass.Int32(3 * TB) < vmain:
             for u in cutlass.range_constexpr(4):
                 self._ld_float4(copy_atom, row_addr, i + cutlass.Int32(u * TB), frags[u])
             for u in cutlass.range_constexpr(4):
-                gi = (i + cutlass.Int32(u * TB)) << cutlass.Int32(2)
                 for q in cutlass.range_constexpr(4):
-                    v = _mask_tail(frags[u][q], gi + cutlass.Int32(q), n_eff)
+                    v = frags[u][q]
                     if v < t_hi_bound:
                         m = cute.arch.fmax(m, v)
             i = i + cutlass.Int32(4 * TB)
+        while i < vmain:
+            self._ld_float4(copy_atom, row_addr, i, frags[0])
+            for q in cutlass.range_constexpr(4):
+                v = frags[0][q]
+                if v < t_hi_bound:
+                    m = cute.arch.fmax(m, v)
+            i = i + cutlass.Int32(TB)
         while i < v1:
             self._ld_float4(copy_atom, row_addr, i, frags[0])
             gi = i << cutlass.Int32(2)
@@ -672,8 +747,16 @@ class GvrTpKernel:
                         x = _shfl_up_add(x, tidx, o)
                     A = x - Ssum
                     binw2 = (hmax - tlow) * cutlass.Float32(1.0 / 64.0)
+                    # pr6 D1: WIDE (pr4) quantile spread, pinned — the
+                    # P2A path must stay pr4-parity (abl3: the re-placed
+                    # spread under this admission is a net residual harm).
                     if cutlass.const_expr(AR == 6):
-                        qt = ((K * 15) // 100, (K * 40) // 100, (K * 70) // 100, (K * 92) // 100)
+                        qt = (
+                            (K * 15) // 100,
+                            (K * 40) // 100,
+                            (K * 70) // 100,
+                            (K * 92) // 100,
+                        )
                     else:
                         qt = (
                             (K * 10) // 100,
@@ -786,23 +869,53 @@ class GvrTpKernel:
             a_cnt = _mapa_shared_cluster(s_isc.iterator + cutlass.Int32(5), cutlass.Int32(0))
             a_st = _mapa_shared_cluster(s_cand.iterator, cutlass.Int32(0))
         # Explicit U-batched loads (CUDA `float4 a[U]` idiom), main +
-        # vec-tail while-loops (same op43 S-E fix as count_pass).
+        # vec-tail while-loops (same op43 S-E fix as count_pass). Mask
+        # hoist as in count_pass: [v0, vmain) mask-free (gi computed only
+        # inside the rare push branch), [vmain, v1) masked epilogue.
         frags = [cute.make_fragment((4,), cutlass.Float32) for _ in range(U)]
+        vmain = v1
+        vfull = n_eff >> cutlass.Int32(2)
+        if vmain > vfull:
+            vmain = vfull
         i = v0 + tidx
-        while i + cutlass.Int32((U - 1) * TB) < v1:
+        while i + cutlass.Int32((U - 1) * TB) < vmain:
             for u in cutlass.range_constexpr(U):
                 self._ld_float4(copy_atom, row_addr, i + cutlass.Int32(u * TB), frags[u])
             for u in cutlass.range_constexpr(U):
-                gi = (i + cutlass.Int32(u * TB)) << cutlass.Int32(2)
                 for q in cutlass.range_constexpr(4):
-                    v = _mask_tail(frags[u][q], gi + cutlass.Int32(q), n_eff)
+                    v = frags[u][q]
                     for r in cutlass.range_constexpr(R):
                         cnt[r] = cnt[r] + cutlass.Int32(v >= tr[r])
                     if v >= tpush:
                         self._push_cand(
-                            a_cnt, a_st, s_cand, s_isc, kcap, True, v, gi + cutlass.Int32(q)
+                            a_cnt,
+                            a_st,
+                            s_cand,
+                            s_isc,
+                            kcap,
+                            True,
+                            v,
+                            ((i + cutlass.Int32(u * TB)) << cutlass.Int32(2)) + cutlass.Int32(q),
                         )
             i = i + cutlass.Int32(U * TB)
+        while i < vmain:
+            self._ld_float4(copy_atom, row_addr, i, frags[0])
+            for q in cutlass.range_constexpr(4):
+                v = frags[0][q]
+                for r in cutlass.range_constexpr(R):
+                    cnt[r] = cnt[r] + cutlass.Int32(v >= tr[r])
+                if v >= tpush:
+                    self._push_cand(
+                        a_cnt,
+                        a_st,
+                        s_cand,
+                        s_isc,
+                        kcap,
+                        True,
+                        v,
+                        (i << cutlass.Int32(2)) + cutlass.Int32(q),
+                    )
+            i = i + cutlass.Int32(TB)
         while i < v1:
             self._ld_float4(copy_atom, row_addr, i, frags[0])
             gi = i << cutlass.Int32(2)
@@ -838,19 +951,45 @@ class GvrTpKernel:
         # 1-deep loop was the dominant stall site (36% of all warp-stall
         # samples) on cells whose reuse check fails at big npad x big BS.
         frags = [cute.make_fragment((4,), cutlass.Float32) for _ in range(4)]
+        vmain = v1
+        vfull = n_eff >> cutlass.Int32(2)
+        if vmain > vfull:
+            vmain = vfull
         i = v0 + tidx
-        while i + cutlass.Int32(3 * TB) < v1:
+        while i + cutlass.Int32(3 * TB) < vmain:
             for u in cutlass.range_constexpr(4):
                 self._ld_float4(copy_atom, row_addr, i + cutlass.Int32(u * TB), frags[u])
             for u in cutlass.range_constexpr(4):
-                gi = (i + cutlass.Int32(u * TB)) << cutlass.Int32(2)
                 for q in cutlass.range_constexpr(4):
-                    v = _mask_tail(frags[u][q], gi + cutlass.Int32(q), n_eff)
+                    v = frags[u][q]
                     if v >= thr:
                         self._push_cand(
-                            a_cnt, a_st, s_cand, s_isc, kcap, False, v, gi + cutlass.Int32(q)
+                            a_cnt,
+                            a_st,
+                            s_cand,
+                            s_isc,
+                            kcap,
+                            False,
+                            v,
+                            ((i + cutlass.Int32(u * TB)) << cutlass.Int32(2)) + cutlass.Int32(q),
                         )
             i = i + cutlass.Int32(4 * TB)
+        while i < vmain:
+            self._ld_float4(copy_atom, row_addr, i, frags[0])
+            for q in cutlass.range_constexpr(4):
+                v = frags[0][q]
+                if v >= thr:
+                    self._push_cand(
+                        a_cnt,
+                        a_st,
+                        s_cand,
+                        s_isc,
+                        kcap,
+                        False,
+                        v,
+                        (i << cutlass.Int32(2)) + cutlass.Int32(q),
+                    )
+            i = i + cutlass.Int32(TB)
         while i < v1:
             self._ld_float4(copy_atom, row_addr, i, frags[0])
             gi = i << cutlass.Int32(2)
@@ -1128,6 +1267,13 @@ class GvrTpKernel:
                                                 bestd = cutlass.Int32(0)
                                                 best = cutlass.Int32(j)
                                                 adm_est = cnt_j * cutlass.Int32(SS)
+                    # pr6 D1: record the stage-0 CI-admission outcome
+                    # BEFORE stages 0b/1/2 mutate bestd; a stage-0 admit
+                    # is the "confident P2A" signal — those rows never
+                    # take the stage-0c override.
+                    s0_ok = cutlass.Int32(0)
+                    if bestd == cutlass.Int32(0):
+                        s0_ok = cutlass.Int32(1)
                     # Stage 0b — legacy band pick (min |est - tgt| in
                     # [1.5K, 0.6kC], EXACTLY the pr1 stage-1 rule), then
                     # combine: with no admission it is taken as-is (pr1
@@ -1195,6 +1341,64 @@ class GvrTpKernel:
                                     if dd < bestd:
                                         bestd = dd
                                         best = cutlass.Int32(j)
+                    # ---- pr6 D1 stage 0c: lean-pivot override ----
+                    # When the stage-0 CI admission FAILED, npad <=
+                    # 262144, and some ladder rung is (i) strictly LEANER
+                    # than the pick in hand and (ii) lands in [K, kC] by
+                    # its own clustering-aware 1.5-sigma CI on BOTH sides
+                    # (a looser window than stage 0's [K, 0.6kC] at
+                    # 1.85/2.0-sigma — rows passing THAT never get here),
+                    # make IT the pivot. Rungs are descending in j: scan
+                    # ascending and keep the FIRST (tightest) qualifier.
+                    # Hint-unrepresentative rows (the 44f0a208a9 harm
+                    # band) have no CI-qualifying rung and keep the pr4
+                    # pick. Same sqrt/div-free margin algebra as stage 0;
+                    # everything downstream (fused R=2, rescue, reuse,
+                    # P4, secant) is byte-parity pr4.
+                    # npad floor 16384: below it the stride-32 sample sees
+                    # <= ~128 float4s, the occ-aware CI fires on noise and
+                    # misfire rescues cost 3-5% (v32_8k probe, pr6d1d);
+                    # the absolute win-room there is small anyway.
+                    gate_ok = cutlass.Int32(0)
+                    if npad >= cutlass.Int32(16384):
+                        if npad <= cutlass.Int32(262144):
+                            gate_ok = cutlass.Int32(1)
+                    if gate_ok != cutlass.Int32(0):
+                        if s0_ok == cutlass.Int32(0):
+                            est_pick = cutlass.Int32(0x7FFFFFFF)
+                            if bestd != cutlass.Int32(0x7FFFFFFF):
+                                est_pick = (s_rcnt[best] & cutlass.Int32(0xFFFF)) * cutlass.Int32(
+                                    SS
+                                )
+                            jw = cutlass.Int32(AR)
+                            for w_ in cutlass.range_constexpr(AR):
+                                if jw == cutlass.Int32(AR):
+                                    cnt_w = s_rcnt[w_] & cutlass.Int32(0xFFFF)
+                                    if cnt_w > cutlass.Int32(0):
+                                        estw = cnt_w * cutlass.Int32(SS)
+                                        if estw < est_pick:
+                                            occ_w = s_rcnt[w_] >> cutlass.Int32(16)
+                                            if occ_w < cutlass.Int32(1):
+                                                occ_w = cutlass.Int32(1)
+                                            foccw = cutlass.Float32(occ_w)
+                                            festw = cutlass.Float32(estw)
+                                            few2 = festw * festw
+                                            a_low = festw - cutlass.Float32(float(K))
+                                            bhiw = cutlass.Float32(float(kC)) - festw
+                                            if a_low >= cutlass.Float32(0.0):
+                                                if (
+                                                    a_low * a_low * foccw
+                                                    >= cutlass.Float32(2.25) * few2
+                                                ):
+                                                    if bhiw >= cutlass.Float32(0.0):
+                                                        if (
+                                                            cutlass.Float32(2.25) * few2
+                                                            <= bhiw * bhiw * foccw
+                                                        ):
+                                                            jw = cutlass.Int32(w_)
+                            if jw < cutlass.Int32(AR):
+                                best = jw
+                                bestd = cutlass.Int32(0)
                     tp_ = s_rungs[best]
                     # Rescue rung: the next FATTER ladder rung below the
                     # pivot. If the pivot's exact count lands under K
@@ -1205,6 +1409,43 @@ class GvrTpKernel:
                     resc_ = hmin_floor
                     if best < cutlass.Int32(AR - 1):
                         resc_ = s_rungs[best + cutlass.Int32(1)]
+                    # ---- pr6 D2a lean pivot (ported from pr6d2 lean2,
+                    # composed AFTER stage 0c): the pick in hand — band,
+                    # 2-sigma, overshoot fallback, or a stage-0c lean rung
+                    # that is still fat — is structurally FAT on the
+                    # 32k-128k residual band (exact Cp 2.4-4.7x K; P3
+                    # pushes + P4 radix pay for it). When the picked
+                    # rung's sampled est >= 1.8K, interpolate tpush
+                    # between the pick and the next tighter rung with
+                    # est < lean_tgt, targeting count ~= lean_tgt
+                    # (log2-count interpolation: tails are ~exponential,
+                    # the linear form undershoots). Rescue = the ORIGINAL
+                    # pick, whose exact count the fused pass computes
+                    # anyway: an undershoot costs one collect re-stream,
+                    # cheap under the npad <= 98304 gate; the 256k-1024k
+                    # guard band keeps the stock pick bit-for-bit.
+                    if npad <= cutlass.Int32(98304):
+                        estp = (s_rcnt[best] & cutlass.Int32(0xFFFF)) * cutlass.Int32(SS)
+                        if estp >= cutlass.Int32((9 * K) // 5):
+                            jm = cutlass.Int32(-1)
+                            estm = cutlass.Int32(1)
+                            for j in cutlass.range_constexpr(AR):
+                                if cutlass.Int32(j) < best:
+                                    cj = (s_rcnt[j] & cutlass.Int32(0xFFFF)) * cutlass.Int32(SS)
+                                    if cj < cutlass.Int32(self.lean_tgt):
+                                        jm = cutlass.Int32(j)
+                                        estm = cj
+                            if jm >= cutlass.Int32(0):
+                                if estm < cutlass.Int32(1):
+                                    estm = cutlass.Int32(1)
+                                fp = _lg2_f32(cutlass.Float32(estp))
+                                fm = _lg2_f32(cutlass.Float32(estm))
+                                den = fp - fm
+                                if den < cutlass.Float32(1e-6):
+                                    den = cutlass.Float32(1e-6)
+                                frac = (fp - cutlass.Float32(math.log2(self.lean_tgt))) / den
+                                resc_ = tp_
+                                tp_ = tp_ + (s_rungs[jm] - tp_) * frac
                     s_rungs[0] = tp_
                     s_rungs[1] = resc_
                 cute.arch.barrier()
@@ -1594,6 +1835,8 @@ def _get_compiled(K: int, CS: int, AR: int, UF: int, TB: int, next_n: int = 1, c
     key = (K, CS, AR, UF, TB, next_n, cr)
     compiled = _LAUNCH_CACHE.get(key)
     if compiled is None:
+        # pr6 iron rule: pr4 flat candidate budget, never the K-scaled
+        # diet (falsified as pure harm).
         kC = 8192 if K >= 2048 else 6144
         kern = GvrTpKernel(
             top_k=K,
@@ -1638,7 +1881,11 @@ _FAST = {}  # (K, bs, npad) -> compiled variant (hot-path single dict hit)
 
 
 def tp_cluster_size(bs: int, npad: int) -> int:
-    """CS selection of launch_tp<512>: co-residency + slice floor."""
+    """CS selection of launch_tp<512>: co-residency + slice floor.
+    Occupancy cut for mid-N large-BS (measured neutral-to-positive)."""
+    # C4 occupancy cut kept at fix-head default (ablation: neutral).
+    if npad < 65536 and bs >= 64:
+        return 1
     cs = 1
     if bs < 128:
         cs = _p2floor(296 // bs) if bs <= 296 else 1
