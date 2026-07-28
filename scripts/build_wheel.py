@@ -28,7 +28,8 @@ from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
-from subprocess import DEVNULL, CalledProcessError, check_output, run
+from subprocess import (DEVNULL, PIPE, STDOUT, CalledProcessError, check_output,
+                        run)
 from typing import Optional, Sequence
 
 try:
@@ -87,6 +88,12 @@ def apply_msa_patch(project_dir: Path) -> None:
     tree so every consumer sees the patched fmha_sm100 sources: the runtime
     importer, editable installs, and wheel packaging. Re-running is a no-op, so
     it is safe to call on every build.
+
+    Patching goes through patch(1), as 3rdparty/CMakeLists.txt does for its
+    dependencies, so only a working tree is required. A tree copied without the
+    superproject's .git, as Dockerfile.multi does, keeps a gitlink to a gitdir
+    that is not there, and every git command fails in it. That rules out
+    git apply.
     """
     msa_source_dir = project_dir / "3rdparty" / "MSA"
     msa_package_dir = msa_source_dir / "python" / "fmha_sm100"
@@ -96,36 +103,39 @@ def apply_msa_patch(project_dir: Path) -> None:
             f"MSA sources are missing at {msa_package_dir}; initialize 3rdparty/MSA"
         )
 
-    git_env = os.environ.copy()
-    git_env["GIT_CEILING_DIRECTORIES"] = str(msa_source_dir.parent.resolve())
+    def patch_cmd(*flags: str):
+        # --no-backup-if-mismatch keeps the .orig copy of a hunk applied at an
+        # offset out of the packaged submodule.
+        return [
+            "patch", "-p1", "--batch", "--no-backup-if-mismatch", *flags, "-i",
+            str(msa_patch)
+        ]
 
-    # A clean reverse-apply means the patch is already present, so a forward
-    # apply would fail. Skip in that case.
-    already_applied = run(
-        ["git", "apply", "--reverse", "--check",
-         str(msa_patch)],
+    forward_check = run(
+        patch_cmd("--dry-run", "--forward"),
         cwd=msa_source_dir,
-        env=git_env,
-        stdout=DEVNULL,
-        stderr=DEVNULL,
-    ).returncode == 0
-    if already_applied:
+        stdout=PIPE,
+        stderr=STDOUT,
+        text=True,
+    )
+    if forward_check.returncode != 0:
+        # --forward also refuses an already applied patch, so only a clean
+        # reverse tells that no-op apart from a real conflict. Conflicts must
+        # fail loudly: the runtime asserts on the patched symbols.
+        reverse_applies = run(
+            patch_cmd("--dry-run", "--reverse"),
+            cwd=msa_source_dir,
+            stdout=DEVNULL,
+            stderr=DEVNULL,
+        ).returncode == 0
+        if not reverse_applies:
+            raise RuntimeError(
+                f"Cannot apply {msa_patch} to {msa_source_dir}:\n"
+                f"{forward_check.stdout.strip()}")
         print(f"-- MSA patch already applied at {msa_package_dir}; skipping.")
         return
 
-    # Verify a clean forward apply before mutating the working tree.
-    run(
-        ["git", "apply", "--check", str(msa_patch)],
-        cwd=msa_source_dir,
-        env=git_env,
-        check=True,
-    )
-    run(
-        ["git", "apply", str(msa_patch)],
-        cwd=msa_source_dir,
-        env=git_env,
-        check=True,
-    )
+    run(patch_cmd("--forward"), cwd=msa_source_dir, check=True)
     print(f"-- Applied MSA patch to {msa_package_dir}.")
 
 

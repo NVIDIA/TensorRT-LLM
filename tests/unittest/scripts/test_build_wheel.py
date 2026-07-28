@@ -64,6 +64,30 @@ def test_apply_msa_patch_is_idempotent_in_place(tmp_path):
     assert "def _prepare_paged_hnd_input" in patched_interface.read_text()
 
 
+def test_apply_msa_patch_with_dangling_submodule_gitlink(tmp_path):
+    """Patching must work in a copied tree whose gitlink points nowhere."""
+    project_dir = _stage_project(tmp_path)
+    patched_interface = project_dir / "3rdparty" / "MSA" / MSA_INTERFACE
+    (project_dir / "3rdparty" / "MSA" / ".git").write_text(
+        "gitdir: ../../.git/modules/3rdparty/MSA\n"
+    )
+
+    apply_msa_patch(project_dir)
+    assert "def _prepare_paged_hnd_input" in patched_interface.read_text()
+
+    apply_msa_patch(project_dir)
+    assert "def _prepare_paged_hnd_input" in patched_interface.read_text()
+
+
+def test_apply_msa_patch_reports_conflict(tmp_path):
+    """A patch that does not apply must fail, not pass as an applied one."""
+    project_dir = _stage_project(tmp_path)
+    (project_dir / "3rdparty" / "MSA" / MSA_INTERFACE).write_text("unrelated\n")
+
+    with pytest.raises(RuntimeError, match="Cannot apply"):
+        apply_msa_patch(project_dir)
+
+
 def test_apply_msa_patch_requires_initialized_submodule(tmp_path):
     project_dir = tmp_path / "project"
     project_dir.mkdir()
