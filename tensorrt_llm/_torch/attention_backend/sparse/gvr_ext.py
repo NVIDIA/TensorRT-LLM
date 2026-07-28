@@ -83,7 +83,9 @@ class GvrExtState:
 
     def ensure_block_max(self, max_seq_len: int) -> torch.Tensor:
         nb4 = ((max_seq_len + 255) // 256 * 256) // 128 * 4
-        if self.block_max is None or self.block_max.shape[1] < nb4:
+        # exact width: the runner asserts shape == (rows, nrec), so a
+        # wider reused buffer would trip it
+        if self.block_max is None or self.block_max.shape[1] != nb4:
             self.block_max = torch.zeros(
                 (self.max_rows, nb4), dtype=torch.float32, device=self.seed_row.device
             )
@@ -124,10 +126,9 @@ class GvrExtState:
         planned emission tier (caller merges into its call)."""
         kw: dict = {}
         if emit_tier in ("counts", "list"):
-            kw.update(emit_seed_counts=True, seed_thr=self.seed_row[:num_rows])
+            kw["seed_thr"] = self.seed_row[:num_rows]
         if emit_tier == "list":
             kw.update(
-                emit_cand_bucketed=True,
                 accept_cap=LIST_SEG_A,
                 cand_out=self.cand_vals[:num_rows],
                 cand_idx_out=self.cand_idx[:num_rows],

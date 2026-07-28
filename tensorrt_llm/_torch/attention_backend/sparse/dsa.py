@@ -2799,8 +2799,7 @@ class Indexer(nn.Module):
                                 "counts", "list"):
                             gvr_emit_kwargs["block_max_out"] = (
                                 st.ensure_block_max(
-                                    indexer_max_seq_len //
-                                    max(self.compress_ratio, 1))[:batch_size])
+                                    indexer_max_seq_len)[:batch_size])
                     logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
                         dsl_q, decode_q_scale, k_cache, weights_decode,
                         dsl_context_lens, dsl_block_table, dsl_schedule_meta,
@@ -2881,8 +2880,18 @@ class Indexer(nn.Module):
                     st = self._gvr_ext
                     out_slice = topk_indices_buffer[
                         num_ctx_tokens:num_ctx_tokens + num_gen_tokens, :]
-                    seq_1d = (context_lens if self.compress_ratio > 1 else
-                              gen_kv_lens_cuda).reshape(-1)[:num_gen_tokens]
+                    # the GVR op takes RAW-domain seq_lens (its kernel
+                    # ceil-divides by compress_ratio internally). On the
+                    # DSL indexer path the live compressed lengths are in
+                    # gen_indexer_kv_lens_cuda_runtime (kv_lens_cuda_2d
+                    # stays zero there - same trap as the indexer call).
+                    if self.compress_ratio > 1:
+                        gvr_lens = metadata.gen_indexer_kv_lens_cuda_runtime
+                        assert gvr_lens is not None
+                        seq_1d = (gvr_lens.reshape(-1)[:num_gen_tokens] *
+                                  self.compress_ratio)
+                    else:
+                        seq_1d = gen_kv_lens_cuda.reshape(-1)[:num_gen_tokens]
                     ext_kw = st.topk_ext_kwargs(
                         self._gvr_route, num_gen_tokens,
                         st.block_max[:num_gen_tokens]
@@ -2897,6 +2906,27 @@ class Indexer(nn.Module):
                         self.compress_ratio,
                         max_seq_len=indexer_max_seq_len,
                         **ext_kw)
+                    # diagnostic dump (NO_GRAPH runs only): capture the
+                    # inputs AND the in-run selection so an offline pass
+                    # can check score-multiset equality vs torch.topk on
+                    # the exact production path. prev_topk still holds
+                    # the pre-op value here (copy-back is below). The
+                    # min-seq guard skips warmup/dummy rows (n < K).
+                    if (os.environ.get("TRTLLM_GVR_DUMP")
+                            and getattr(self, "_gvr_dumped", 0) < 6
+                            and int(seq_1d.min())
+                            >= self.index_topk * self.compress_ratio):
+                        self._gvr_dumped = getattr(self, "_gvr_dumped", 0) + 1
+                        torch.save(
+                            {
+                                "logits": logits_decode.clone().cpu(),
+                                "seq_raw": seq_1d.clone().cpu(),
+                                "pre":
+                                st.prev_topk[:num_gen_tokens].clone().cpu(),
+                                "sel": out_slice.clone().cpu(),
+                                "layer": self.layer_idx,
+                            }, f"/tmp/siyid_e2e/dump_l{self.layer_idx}_"
+                            f"{self._gvr_dumped}.pt")
                     st.prev_topk[:num_gen_tokens].copy_(out_slice)
                 elif self.use_cute_dsl_topk and self._enable_heuristic_topk:
                     # GVR DSL: supports all compress_ratio and next_n values.
@@ -2917,9 +2947,20 @@ class Indexer(nn.Module):
                 # significant, so we cap it at 256 and fall back to C++.
                 elif (self.use_cute_dsl_topk and num_gen_tokens <= 256
                       and (self.compress_ratio == 1 or next_n == 1)):
+                    # request-level seq_lens must be 1-D; on the DSL
+                    # indexer path the live compressed lengths are in
+                    # gen_indexer_kv_lens_cuda_runtime (kv_lens_cuda_2d
+                    # stays zero there)
+                    if self.compress_ratio > 1:
+                        radix_lens = (metadata.gen_indexer_kv_lens_cuda_runtime
+                                      if self.use_cute_dsl_paged_mqa_logits and
+                                      metadata.gen_indexer_kv_lens_cuda_runtime
+                                      is not None else context_lens)
+                        radix_lens = radix_lens.reshape(-1)
+                    else:
+                        radix_lens = gen_kv_lens_cuda
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-                        logits_decode, context_lens
-                        if self.compress_ratio > 1 else gen_kv_lens_cuda,
+                        logits_decode, radix_lens,
                         topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                             num_gen_tokens, :], self.index_topk,
                         next_n)
