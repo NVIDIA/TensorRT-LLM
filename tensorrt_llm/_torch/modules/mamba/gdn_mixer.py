@@ -175,7 +175,7 @@ def gdn_custom_op_inplace(
     )
 
 
-breakable_gdn_custom_op_inplace = eager_on_graph(True)(gdn_custom_op_inplace)
+breakable_gdn_custom_op_inplace = eager_on_graph(gdn_custom_op_inplace)
 
 
 def ensure_divisibility(numerator, denominator):

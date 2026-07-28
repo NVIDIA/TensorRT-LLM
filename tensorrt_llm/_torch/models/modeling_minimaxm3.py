@@ -661,9 +661,7 @@ def minimax_m3_attn_custom_op_inplace(
     )
 
 
-maybe_bcg_minimax_m3_attn_custom_op_inplace = eager_on_graph(True)(
-    minimax_m3_attn_custom_op_inplace
-)
+maybe_bcg_minimax_m3_attn_custom_op_inplace = eager_on_graph(minimax_m3_attn_custom_op_inplace)
 
 
 class MiniMaxM3Attention(Attention):
@@ -1244,9 +1242,7 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         output = q.new_empty((q.shape[0], self.num_heads * self.head_dim))
-        if self.register_to_config and (
-            is_torch_compiling() or is_in_breakable_cuda_graph()
-        ):
+        if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
             maybe_bcg_minimax_m3_attn_custom_op_inplace(
                 q,
                 k,

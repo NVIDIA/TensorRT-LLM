@@ -84,7 +84,7 @@ def test_duplicate_layer_ids_preserve_all_mla_registrations() -> None:
     assert registry["0_1"]() is next_mla
 
 
-def test_dsv4_epilogue_fusion_returns_only_final_output_inside_breakable_graph() -> None:
+def test_dsv4_epilogue_fusion_returns_final_output_inside_breakable_graph() -> None:
     metadata = SimpleNamespace(num_contexts=1, num_generations=1, num_tokens=5)
     mla_layer = Mock(spec=MLA)
     mla_layer._should_use_dsv4_epilogue_fusion.return_value = True
@@ -101,15 +101,20 @@ def test_dsv4_epilogue_fusion_returns_only_final_output_inside_breakable_graph()
             return_value=True,
         ),
     ):
-        outputs = create_mla_outputs_impl(hidden_states, "0")
+        output = create_mla_outputs_impl(hidden_states, "0")
 
-    assert outputs == [mla_layer.create_output.return_value]
+    assert output is mla_layer.create_output.return_value
     mla_layer.create_output.assert_called_once_with(
         hidden_states,
         1,
         enable_dsv4_epilogue_fusion=True,
     )
     mla_layer._create_dsv4_epilogue_buffers.assert_not_called()
+
+
+def test_create_mla_outputs_custom_op_returns_tensor() -> None:
+    schema = torch.ops.trtllm.create_mla_outputs.default._schema
+    assert [str(return_value.type) for return_value in schema.returns] == ["Tensor"]
 
 
 def test_mla_custom_op_marks_only_final_output_mutable() -> None:
@@ -177,7 +182,11 @@ def test_dsv4_fusion_o_proj_only_flattens_lora_output() -> None:
     )
     lora_o = torch.randn(7, 4, 3)
 
-    output = MLA._deepseek_v4_o_proj(mla_layer, lora_o)
+    output = MLA._deepseek_v4_o_proj(
+        mla_layer,
+        lora_o,
+        enable_dsv4_epilogue_fusion=True,
+    )
 
     assert output is projected
     mla_layer.o_b_proj.assert_called_once()
@@ -214,9 +223,6 @@ def test_dsv4_epilogue_bmm_writes_only_phase_ranges(
         o_a_proj=torch.empty(0),
         o_a_proj_scale=torch.empty(0),
     )
-    mla_layer._run_dsv4_epilogue_bmm = lambda epilogue, phase_output: (
-        MLA._run_dsv4_epilogue_bmm(mla_layer, epilogue, phase_output)
-    )
 
     def fake_bmm(_attn_fp8, _weight, attn_scale, _weight_scale, phase_output):
         phase_output.fill_(attn_scale.item())
@@ -238,7 +244,7 @@ def test_dsv4_epilogue_bmm_writes_only_phase_ranges(
                 torch.empty(groups, num_generation_tokens, 4),
                 torch.tensor(22.0),
             )
-        MLA._run_dsv4_epilogue_bmms(
+        MLA._run_dsv4_o_lora_bmms(
             mla_layer,
             output,
             num_context_tokens,
