@@ -953,15 +953,15 @@ def test_mm_encoder_state_charges_the_whole_request_from_its_first_item():
     assert state.resident_output_bytes(4) == (2 + 3) * 4
 
 
-def test_mm_encoder_state_finalize_into_is_a_conditional_no_op():
+def test_mm_encoder_state_finalize_is_a_conditional_no_op():
     state = MultimodalEncoderRequestState.from_embedding_lengths([2])
     multimodal_data = {"image": {"pixel_values": torch.empty(2, 1)}}
 
-    assert state.finalize_into(multimodal_data) is False
+    assert state.finalize(multimodal_data) is False
     assert "multimodal_embedding" not in multimodal_data
 
     state.record(0, torch.ones(2, 2))
-    assert state.finalize_into(multimodal_data) is True
+    assert state.finalize(multimodal_data) is True
     assert multimodal_data["multimodal_embedding"] is state.embeddings
     assert "image" not in multimodal_data
 
@@ -980,7 +980,7 @@ def test_mm_encoder_state_publishes_the_buffer_without_copying():
     state.record(1, torch.ones(3, 2))
     buffer_ptr = state.embeddings.untyped_storage().data_ptr()
 
-    assert state.finalize_into(multimodal_data) is True
+    assert state.finalize(multimodal_data) is True
 
     published = multimodal_data["multimodal_embedding"]
     assert published is state.embeddings
