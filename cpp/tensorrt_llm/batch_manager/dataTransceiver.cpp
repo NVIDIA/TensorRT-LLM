@@ -31,18 +31,178 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 
 namespace tensorrt_llm::batch_manager
 {
 
 using BlockRange = tensorrt_llm::batch_manager::kv_cache_manager::BlockRange;
+
+namespace
+{
+
+bool isDisaggTransferDiagnosticsEnabled()
+{
+    static bool const enabled = []
+    {
+        auto const* value = std::getenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+
+double getSteadyClockTimeSeconds()
+{
+    using Seconds = std::chrono::duration<double>;
+    return Seconds(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::mutex& getDisaggDiagnosticsLogMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+LlmRequest::RequestIdType getDiagnosticContextRequestId(
+    LlmRequest const* request, LlmRequest::RequestIdType fallback) noexcept
+{
+    if (!isDisaggTransferDiagnosticsEnabled() || request == nullptr)
+    {
+        return fallback;
+    }
+    try
+    {
+        auto const& contextPhaseParams = request->getContextPhaseParams();
+        if (contextPhaseParams.has_value())
+        {
+            return contextPhaseParams->getReqId();
+        }
+    }
+    catch (...)
+    {
+        // Diagnostics must not alter transfer semantics.
+    }
+    return fallback;
+}
+
+void logTransferDiagnostic(char const* category, char const* action, LlmRequest::RequestIdType requestId,
+    LlmRequest::RequestIdType contextRequestId, char const* phase, double timestamp = 0.0) noexcept
+{
+    if (!isDisaggTransferDiagnosticsEnabled())
+    {
+        return;
+    }
+    try
+    {
+        auto const eventTime = timestamp > 0.0 ? timestamp : getSteadyClockTimeSeconds();
+        std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+        TLLM_LOG_INFO("[DISAGG_DIAG][%s-transfer] t=%.9f rank=%d action=%s request=%zu context_request=%zu phase=%s",
+            category, eventTime, mpi::MpiComm::world().getRank(), action, requestId, contextRequestId, phase);
+    }
+    catch (...)
+    {
+        // Diagnostics must not alter transfer semantics.
+    }
+}
+
+void logSenderRequestInfoCompleteDiagnostic(LlmRequest::RequestIdType requestId,
+    LlmRequest::RequestIdType contextRequestId, size_t counterparts, bool ready) noexcept
+{
+    if (!isDisaggTransferDiagnosticsEnabled())
+    {
+        return;
+    }
+    try
+    {
+        std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+        TLLM_LOG_INFO(
+            "[DISAGG_DIAG][sender-transfer] t=%.9f rank=%d action=request-info-complete request=%zu "
+            "context_request=%zu phase=receiver-credit counterparts=%zu ready=%d",
+            getSteadyClockTimeSeconds(), mpi::MpiComm::world().getRank(), requestId, contextRequestId, counterparts,
+            static_cast<int>(ready));
+    }
+    catch (...)
+    {
+        // Diagnostics must not alter transfer semantics.
+    }
+}
+
+void logSenderServiceStartDiagnostic(LlmRequest::RequestIdType requestId, LlmRequest::RequestIdType contextRequestId,
+    char const* source, double timestamp = 0.0) noexcept
+{
+    if (!isDisaggTransferDiagnosticsEnabled())
+    {
+        return;
+    }
+    try
+    {
+        auto const eventTime = timestamp > 0.0 ? timestamp : getSteadyClockTimeSeconds();
+        std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+        TLLM_LOG_INFO(
+            "[DISAGG_DIAG][sender-transfer] t=%.9f rank=%d action=service-start request=%zu context_request=%zu "
+            "phase=format source=%s",
+            eventTime, mpi::MpiComm::world().getRank(), requestId, contextRequestId, source);
+    }
+    catch (...)
+    {
+        // Diagnostics must not alter transfer semantics.
+    }
+}
+
+void logReceiverRequestInfoSubmittedDiagnostic(
+    LlmRequest::RequestIdType requestId, LlmRequest::RequestIdType contextRequestId, size_t counterparts) noexcept
+{
+    if (!isDisaggTransferDiagnosticsEnabled())
+    {
+        return;
+    }
+    try
+    {
+        std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+        TLLM_LOG_INFO(
+            "[DISAGG_DIAG][receiver-transfer] t=%.9f rank=%d action=request-info-submitted request=%zu "
+            "context_request=%zu phase=request-info counterparts=%zu",
+            getSteadyClockTimeSeconds(), mpi::MpiComm::world().getRank(), requestId, contextRequestId, counterparts);
+    }
+    catch (...)
+    {
+        // Diagnostics must not alter transfer semantics.
+    }
+}
+
+void logReceiverReadyDiagnostic(LlmRequest::RequestIdType requestId, LlmRequest::RequestIdType contextRequestId,
+    char const* result, double timestamp = 0.0) noexcept
+{
+    if (!isDisaggTransferDiagnosticsEnabled())
+    {
+        return;
+    }
+    try
+    {
+        auto const eventTime = timestamp > 0.0 ? timestamp : getSteadyClockTimeSeconds();
+        std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+        TLLM_LOG_INFO(
+            "[DISAGG_DIAG][receiver-transfer] t=%.9f rank=%d action=ready request=%zu context_request=%zu "
+            "phase=ready-signal result=%s",
+            eventTime, mpi::MpiComm::world().getRank(), requestId, contextRequestId, result);
+    }
+    catch (...)
+    {
+        // Diagnostics must not alter transfer semantics.
+    }
+}
+
+} // namespace
 
 std::vector<Connection const*> const& TransferSession::getConnections() const
 {
@@ -160,16 +320,68 @@ bool TransferSession::releaseReservedRecvBuffer(BaseTransBufferManager const& ma
     {
         return false;
     }
+    auto const diagnosticsEnabled = isDisaggTransferDiagnosticsEnabled();
+    auto const wasHeld = diagnosticsEnabled && holderIt->held();
+    auto const bufferIndex = diagnosticsEnabled ? holderIt->index() : std::nullopt;
+    // Sample before release so a waiter awakened by release() cannot appear
+    // to acquire the slot before this event. This is a conservative upper
+    // bound on the true release-to-refill interval by the release call cost.
+    auto const releaseTime = wasHeld ? getSteadyClockTimeSeconds() : 0.0;
     holderIt->release();
+    if (diagnosticsEnabled && mRequest != nullptr && wasHeld)
+    {
+        try
+        {
+            auto const contextRequestId = mRequest->getContextPhaseParams().has_value()
+                ? mRequest->getContextPhaseParams().value().getReqId()
+                : 0;
+            std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+            TLLM_LOG_INFO(
+                "[DISAGG_DIAG][receiver-slot] t=%.9f rank=%d action=released request=%zu context_request=%zu "
+                "manager=%p buffer=%d release_reason=formatter",
+                releaseTime, mpi::MpiComm::world().getRank(), mRequest->mRequestId, contextRequestId,
+                static_cast<void const*>(&manager), bufferIndex.value_or(-1));
+        }
+        catch (...)
+        {
+            // This method is noexcept; diagnostics must not alter release semantics.
+        }
+    }
     mReservedRecvBuffers.erase(holderIt);
     return true;
 }
 
 void TransferSession::releaseReservedRecvBuffers() noexcept
 {
+    auto const diagnosticsEnabled = isDisaggTransferDiagnosticsEnabled();
     for (auto& holder : mReservedRecvBuffers)
     {
+        auto const wasHeld = diagnosticsEnabled && holder.held();
+        auto const bufferIndex = diagnosticsEnabled ? holder.index() : std::nullopt;
+        auto const* manager = diagnosticsEnabled ? holder.manager() : nullptr;
+        // See releaseReservedRecvBuffer(): preserve causal ordering with a
+        // waiter that may acquire the slot as soon as release() notifies it.
+        auto const releaseTime = wasHeld ? getSteadyClockTimeSeconds() : 0.0;
         holder.release();
+        if (diagnosticsEnabled && mRequest != nullptr && wasHeld)
+        {
+            try
+            {
+                auto const contextRequestId = mRequest->getContextPhaseParams().has_value()
+                    ? mRequest->getContextPhaseParams().value().getReqId()
+                    : 0;
+                std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+                TLLM_LOG_INFO(
+                    "[DISAGG_DIAG][receiver-slot] t=%.9f rank=%d action=released request=%zu "
+                    "context_request=%zu manager=%p buffer=%d release_reason=session",
+                    releaseTime, mpi::MpiComm::world().getRank(), mRequest->mRequestId, contextRequestId,
+                    static_cast<void const*>(manager), bufferIndex.value_or(-1));
+            }
+            catch (...)
+            {
+                // This method is noexcept; diagnostics must not alter release semantics.
+            }
+        }
     }
     mReservedRecvBuffers.clear();
 }
@@ -375,6 +587,7 @@ public:
         {
             (void) getOrCreateInFlightCancelFlag(llmRequest->mRequestId);
         }
+        double queuedTime = 0.0;
         {
             std::scoped_lock lock(mSenderMutex);
             TLLM_CHECK_WITH_INFO(
@@ -383,8 +596,11 @@ public:
                 = mReadyResponses.emplace(llmRequest->mRequestId, Response{llmRequest, std::move(promise)});
             TLLM_CHECK_WITH_INFO(
                 result.second, "Request %zu is already queued for KV cache transfer", llmRequest->mRequestId);
+            queuedTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
         }
         mSenderCv.notify_all();
+        logTransferDiagnostic("sender", "queued", llmRequest->mRequestId,
+            getDiagnosticContextRequestId(llmRequest.get(), llmRequest->mRequestId), "wait-request-info", queuedTime);
         return future;
     }
 
@@ -417,6 +633,42 @@ public:
         auto it = mRequestToSession.find(requestId);
         TLLM_CHECK(it != mRequestToSession.end());
         return it->second.getConnections().size();
+    }
+
+    void logRequestInfoCompleteDiagnostic(
+        RequestIdType sessionId, RequestIdType requestId, RequestIdType contextRequestId, bool ready) noexcept
+    {
+        if (!isDisaggTransferDiagnosticsEnabled())
+        {
+            return;
+        }
+        try
+        {
+            logSenderRequestInfoCompleteDiagnostic(requestId, contextRequestId, getCounterpartsCount(sessionId), ready);
+        }
+        catch (...)
+        {
+            // Diagnostics must not alter transfer semantics.
+        }
+    }
+
+    [[nodiscard]] bool isDiagnosticCancellationRequested(RequestIdType requestId) noexcept
+    {
+        if (!isDisaggTransferDiagnosticsEnabled() || !common::getEnvDisaggEnableInflightCancel())
+        {
+            return false;
+        }
+        try
+        {
+            std::lock_guard<std::mutex> lock(mInFlightCancelMutex);
+            auto const it = mInFlightCancelFlags.find(requestId);
+            return it != mInFlightCancelFlags.end() && it->second->load(std::memory_order_relaxed);
+        }
+        catch (...)
+        {
+            // Diagnostics must not alter transfer semantics.
+            return false;
+        }
     }
 
     void release(LlmRequest::RequestIdType requestId)
@@ -545,7 +797,7 @@ public:
         return info;
     }
 
-    void sendSync(LlmRequest const& llmRequest)
+    std::pair<double, double> sendSync(LlmRequest const& llmRequest, bool emitServiceDiagnostic = true)
     {
         TransferSession* session = nullptr;
         {
@@ -556,9 +808,26 @@ public:
         }
         session->setLlmRequest(llmRequest);
         TLLM_LOG_DEBUG("KV cache transfer request %zu phase=transfer-submit begin.", llmRequest.mRequestId);
-        mCacheTransferLayer.format(*session);
+        auto const serviceStartTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
+        try
+        {
+            mCacheTransferLayer.format(*session);
+        }
+        catch (...)
+        {
+            logSenderServiceStartDiagnostic(llmRequest.mRequestId,
+                getDiagnosticContextRequestId(&llmRequest, llmRequest.mRequestId), "request", serviceStartTime);
+            throw;
+        }
+        auto const completedTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
+        if (emitServiceDiagnostic)
+        {
+            logSenderServiceStartDiagnostic(llmRequest.mRequestId,
+                getDiagnosticContextRequestId(&llmRequest, llmRequest.mRequestId), "request", serviceStartTime);
+        }
         TLLM_LOG_DEBUG("KV cache transfer request %zu phase=transfer-complete end.", llmRequest.mRequestId);
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+        return {serviceStartTime, completedTime};
     }
 
     bool cancelRequest(LlmRequest const& llmRequest)
@@ -566,6 +835,8 @@ public:
         bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
         bool isCancelled = false;
         bool isCurrentRequest = false;
+        bool cancelledBeforeReceiverReady = false;
+        double cancellationTime = 0.0;
         {
             std::scoped_lock lock(mSenderMutex);
             auto it = mReadyResponses.find(llmRequest.mRequestId);
@@ -582,12 +853,14 @@ public:
                     {
                         // Keep only the request ID as a tombstone so a late peer
                         // receives ready=false without retaining the request.
+                        cancellationTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
                         failResponse(it->second,
                             std::make_exception_ptr(
                                 TLLM_REQUEST_EXCEPTION(llmRequest.mRequestId, common::RequestErrorCode::kNETWORK_ERROR,
                                     "Context KV cache request cancelled before a peer was ready for request %zu",
                                     llmRequest.mRequestId)));
                         mReadyResponses.erase(it);
+                        cancelledBeforeReceiverReady = true;
                     }
                 }
             }
@@ -609,6 +882,12 @@ public:
         else
         {
             mSenderCv.notify_all();
+        }
+        if (cancelledBeforeReceiverReady)
+        {
+            logTransferDiagnostic("sender", "cancelled", llmRequest.mRequestId,
+                getDiagnosticContextRequestId(&llmRequest, llmRequest.mRequestId), "wait-request-info",
+                cancellationTime);
         }
         return isCancelled;
     }
@@ -723,41 +1002,57 @@ private:
 
     void sendAndRemoveResponse(RequestIdType id, Response resp) noexcept
     {
+        auto const* llmRequest = resp.getRequest();
+        auto const requestId = llmRequest != nullptr ? llmRequest->mRequestId : id;
+        auto const contextRequestId = getDiagnosticContextRequestId(llmRequest, id);
         try
         {
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-            if (auto* llmRequest = resp.getRequest(); llmRequest != nullptr)
+            std::pair<double, double> transferTimes;
+            if (llmRequest != nullptr)
             {
-                sendSync(*llmRequest);
+                transferTimes = sendSync(*llmRequest, false);
             }
             else
             {
                 // Reuse tree path — no LlmRequest
-                sendSyncFromReuseTree(id);
+                transferTimes = sendSyncFromReuseTree(id);
             }
             release(id);
             resp.mPromise.set_value();
+            logSenderServiceStartDiagnostic(
+                requestId, contextRequestId, llmRequest != nullptr ? "request" : "reuse-tree", transferTimes.first);
+            logTransferDiagnostic("sender", "completed", requestId, contextRequestId, "format", transferTimes.second);
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
         {
+            auto const terminalTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
+            auto const* action = isDiagnosticCancellationRequested(id) ? "cancelled" : "failed";
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
             discardTransferState(id);
             auto new_exception = TLLM_REQUEST_EXCEPTION(id, e.getErrorCode(), "%s", e.what());
             failResponse(resp, std::make_exception_ptr(new_exception));
+            logTransferDiagnostic("sender", action, requestId, contextRequestId, "format", terminalTime);
         }
         catch (std::exception const& e)
         {
+            auto const terminalTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
+            auto const* action = isDiagnosticCancellationRequested(id) ? "cancelled" : "failed";
             auto const exception = std::current_exception();
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s request id: %ld", e.what(), id);
             discardTransferState(id);
             failResponse(resp, exception);
+            logTransferDiagnostic("sender", action, requestId, contextRequestId, "format", terminalTime);
         }
         catch (...)
         {
+            auto const terminalTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
+            auto const* action = isDiagnosticCancellationRequested(id) ? "cancelled" : "failed";
             auto const exception = std::current_exception();
             TLLM_LOG_ERROR("Unknown exception in sendAndRemoveResponse for request id: %ld", id);
             discardTransferState(id);
             failResponse(resp, exception);
+            logTransferDiagnostic("sender", action, requestId, contextRequestId, "format", terminalTime);
         }
         releasePinnedBlocks(resp);
     }
@@ -772,15 +1067,19 @@ private:
         }
         catch (std::exception const& err)
         {
+            auto const terminalTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
             TLLM_LOG_ERROR("Failed to queue asynchronous KV cache send for request %zu: %s", id, err.what());
             discardTransferState(id);
             failResponse(resp, std::current_exception());
+            logTransferDiagnostic("sender", "failed", id, id, "async-queue", terminalTime);
         }
         catch (...)
         {
+            auto const terminalTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
             TLLM_LOG_ERROR("Unknown error while queueing asynchronous KV cache send for request %zu", id);
             discardTransferState(id);
             failResponse(resp, std::current_exception());
+            logTransferDiagnostic("sender", "failed", id, id, "async-queue", terminalTime);
         }
     }
 
@@ -789,12 +1088,20 @@ private:
         bool isReady = true;
         bool allCounterpartsReady = false;
         std::optional<Response> cancelledResponse;
+        RequestIdType requestId = reqId;
+        RequestIdType contextRequestId = reqId;
         {
             std::scoped_lock lock(mSenderMutex);
             TLLM_CHECK(mCurrentRequest.has_value() && mCurrentRequest.value() == reqId);
             auto responseIt = mReadyResponses.find(reqId);
             bool const isCancelled = mCancelledRequests.find(reqId) != mCancelledRequests.end();
             TLLM_CHECK(responseIt != mReadyResponses.end() || isCancelled);
+            if (responseIt != mReadyResponses.end())
+            {
+                auto const* request = responseIt->second.getRequest();
+                requestId = request != nullptr ? request->mRequestId : reqId;
+                contextRequestId = getDiagnosticContextRequestId(request, reqId);
+            }
             auto countIt = mRemainSendCount.find(reqId);
             TLLM_CHECK(countIt != mRemainSendCount.end());
             auto const count = --countIt->second;
@@ -818,14 +1125,19 @@ private:
 
         if (cancelledResponse.has_value())
         {
+            auto const cancellationTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
             failResponse(*cancelledResponse,
                 std::make_exception_ptr(TLLM_REQUEST_EXCEPTION(reqId, common::RequestErrorCode::kNETWORK_ERROR,
                     "KV cache transfer for request %zu was cancelled", reqId)));
+            logTransferDiagnostic(
+                "sender", "cancelled", requestId, contextRequestId, "wait-request-info", cancellationTime);
         }
         if (!allCounterpartsReady)
         {
             return;
         }
+
+        logRequestInfoCompleteDiagnostic(reqId, requestId, contextRequestId, isReady);
 
         // Keep mCurrentRequest set while notifying the peer so cancellation cannot change the decision after it has
         // been made. The network operation must not run under mSenderMutex.
@@ -866,7 +1178,7 @@ private:
         }
     }
 
-    void sendSyncFromReuseTree(RequestIdType requestId)
+    std::pair<double, double> sendSyncFromReuseTree(RequestIdType requestId)
     {
         TransferSession* session = nullptr;
         {
@@ -876,7 +1188,18 @@ private:
             session = std::addressof(it->second);
         }
         // READY was already sent by response(); the receiver consumes exactly one per transfer.
-        mCacheTransferLayer.format(*session);
+        auto const serviceStartTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
+        try
+        {
+            mCacheTransferLayer.format(*session);
+        }
+        catch (...)
+        {
+            logSenderServiceStartDiagnostic(requestId, requestId, "reuse-tree", serviceStartTime);
+            throw;
+        }
+        auto const completedTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
+        return {serviceStartTime, completedTime};
     }
 
     // Pin the requested chain in the reuse tree; an empty result means no full match.
@@ -941,15 +1264,18 @@ private:
                         auto pinnedIds = pinReuseTreeBlocks(reqId);
                         if (pinnedIds.empty())
                         {
+                            logRequestInfoCompleteDiagnostic(reqId, reqId, reqId, false);
                             TLLM_LOG_ERROR(
                                 "Requested blocks do not exist in the source's reuse tree (request id: %lu). Notifying "
                                 "receiver.",
                                 reqId);
                             sendReadySignal(reqId, false);
                             discardTransferState(reqId);
+                            logTransferDiagnostic("sender", "failed", reqId, reqId, "reuse-tree");
                         }
                         else
                         {
+                            logRequestInfoCompleteDiagnostic(reqId, reqId, reqId, true);
                             sendReadySignal(reqId, true);
                             std::promise<void> promise;
                             // Id-only response: the reuse-tree path has no LlmRequest.
@@ -1052,7 +1378,12 @@ private:
             = std::make_exception_ptr(std::runtime_error("CacheSender terminated before asynchronous send completed"));
         for (auto& response : pendingAsyncResponses)
         {
+            auto const* request = response.getRequest();
+            auto const requestId = response.getRequestId();
+            auto const contextRequestId = getDiagnosticContextRequestId(request, requestId);
+            auto const terminalTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
             failResponse(response, exception);
+            logTransferDiagnostic("sender", "failed", requestId, contextRequestId, "shutdown", terminalTime);
         }
     }
 
@@ -1081,7 +1412,11 @@ private:
         }
         for (auto& entry : pendingResponses)
         {
+            auto const* request = entry.second.getRequest();
+            auto const contextRequestId = getDiagnosticContextRequestId(request, entry.first);
+            auto const terminalTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
             failResponse(entry.second, exception);
+            logTransferDiagnostic("sender", "failed", entry.first, contextRequestId, "shutdown", terminalTime);
         }
     }
 
@@ -1268,10 +1603,37 @@ public:
             auto const& managers = agentConnectionManager->getCacheTransBufferManagers();
             recvHolders.reserve(managers.size());
             cacheBufferIds.reserve(managers.size());
-            for (auto& cacheTransBufferManager : managers)
+            auto const diagnosticsEnabled = isDisaggTransferDiagnosticsEnabled();
+            for (size_t managerIdx = 0; managerIdx < managers.size(); ++managerIdx)
             {
+                auto* cacheTransBufferManager = managers[managerIdx];
+                auto const waitStart
+                    = diagnosticsEnabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 auto rawIdx = cacheTransBufferManager->assignBufferIndexForRecv(bufferCancel);
                 recvHolders.emplace_back(*cacheTransBufferManager, rawIdx, /*isRecv=*/true);
+                if (diagnosticsEnabled)
+                {
+                    try
+                    {
+                        using Milliseconds = std::chrono::duration<double, std::milli>;
+                        using Seconds = std::chrono::duration<double>;
+                        auto const acquiredTime = std::chrono::steady_clock::now();
+                        auto const waitMs = Milliseconds(acquiredTime - waitStart).count();
+                        auto const* action = rawIdx.has_value() ? "acquired" : "not-acquired";
+                        std::lock_guard<std::mutex> lock(getDisaggDiagnosticsLogMutex());
+                        TLLM_LOG_INFO(
+                            "[DISAGG_DIAG][receiver-slot] t=%.9f wait_start_t=%.9f rank=%d action=%s "
+                            "request=%zu context_request=%zu manager_index=%zu manager=%p buffer=%d wait_ms=%.3f",
+                            Seconds(acquiredTime.time_since_epoch()).count(),
+                            Seconds(waitStart.time_since_epoch()).count(), mpi::MpiComm::world().getRank(), action,
+                            llmRequest.mRequestId, requestId, managerIdx,
+                            static_cast<void const*>(cacheTransBufferManager), rawIdx.value_or(-1), waitMs);
+                    }
+                    catch (...)
+                    {
+                        // Diagnostics must not alter transfer semantics.
+                    }
+                }
                 if (rawIdx.has_value())
                 {
                     cacheBufferIds.push_back(static_cast<size_t>(rawIdx.value()));
@@ -1376,6 +1738,8 @@ public:
                     sendRequestInfo(connection, requestInfo);
                 }
             }
+
+            logReceiverRequestInfoSubmittedDiagnostic(llmRequest.mRequestId, requestId, allCounterparts.size());
 
             auto const& resource = getReceiveCacheResource(llmRequest);
             TransferSession session = perRequestCancel != nullptr
@@ -1497,6 +1861,11 @@ public:
             std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
             mInFlightCancelFlags.erase(*queuedCancelledReqId);
         }
+        if (queuedCancelledReqId.has_value())
+        {
+            logTransferDiagnostic("receiver", "cancelled", llmRequest.mRequestId,
+                getDiagnosticContextRequestId(&llmRequest, llmRequest.mRequestId), "receive-queue");
+        }
         if (!isCancelled && common::getEnvDisaggEnableInflightCancel())
         {
             std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
@@ -1521,6 +1890,18 @@ public:
         kMixed,
         kCancelled,
     };
+
+    static char const* readySignalResultName(ReadySignalResult result) noexcept
+    {
+        switch (result)
+        {
+        case ReadySignalResult::kReady: return "ready";
+        case ReadySignalResult::kNotReady: return "not-ready";
+        case ReadySignalResult::kMixed: return "mixed";
+        case ReadySignalResult::kCancelled: return "cancelled";
+        }
+        return "unknown";
+    }
 
     ReadySignalResult receiveReadySignalDetailed(TransferSession& session, std::atomic<bool> const& perRequestCancel)
     {
@@ -1616,6 +1997,9 @@ private:
         auto const requestId = llmRequest.mRequestId;
         auto const contextRequestId = llmRequest.getContextPhaseParams().value().getReqId();
         char const* phase = "request-info";
+        bool cancellationObserved = false;
+        bool readyDiagnosticPending = false;
+        double readyTime = 0.0;
         TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu started.", requestId, contextRequestId);
         if (llmRequest.getKvCacheTransferStart() == LlmRequest::TimePoint{})
         {
@@ -1627,6 +2011,7 @@ private:
         {
             if (perRequestCancel.load(std::memory_order_relaxed) || mTerminate.load(std::memory_order_relaxed))
             {
+                cancellationObserved = true;
                 TLLM_THROW("KV cache receive request %zu cancelled before request-info", requestId);
             }
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
@@ -1644,8 +2029,12 @@ private:
             auto readyResult = receiveReadySignalDetailed(*session, perRequestCancel);
             TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s end: result=%d.", requestId,
                 contextRequestId, phase, static_cast<int>(readyResult));
+            readyTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
+            readyDiagnosticPending = readyResult == ReadySignalResult::kReady;
             if (readyResult == ReadySignalResult::kCancelled)
             {
+                logReceiverReadyDiagnostic(requestId, contextRequestId, readySignalResultName(readyResult), readyTime);
+                cancellationObserved = true;
                 if (common::getEnvDisaggEnableInflightCancel())
                 {
                     session->poisonReservedRecvBuffers();
@@ -1654,11 +2043,13 @@ private:
             }
             if (readyResult == ReadySignalResult::kNotReady)
             {
+                logReceiverReadyDiagnostic(requestId, contextRequestId, readySignalResultName(readyResult), readyTime);
                 session->releaseReservedRecvBuffers();
                 TLLM_THROW("KV cache receive request %zu was rejected by the context peer", requestId);
             }
             if (readyResult == ReadySignalResult::kMixed)
             {
+                logReceiverReadyDiagnostic(requestId, contextRequestId, readySignalResultName(readyResult), readyTime);
                 if (common::getEnvDisaggEnableInflightCancel())
                 {
                     session->poisonReservedRecvBuffers();
@@ -1677,26 +2068,48 @@ private:
             receiveSync(*session);
             TLLM_LOG_DEBUG(
                 "KV cache receive request %zu, context request %zu phase=%s end.", requestId, contextRequestId, phase);
+            auto const completedTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
             llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+            logReceiverReadyDiagnostic(requestId, contextRequestId, "ready", readyTime);
+            readyDiagnosticPending = false;
+            logTransferDiagnostic("receiver", "completed", requestId, contextRequestId, phase, completedTime);
         }
         catch (std::exception const& err)
         {
+            auto const terminalTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
+            if (readyDiagnosticPending)
+            {
+                logReceiverReadyDiagnostic(requestId, contextRequestId, "ready", readyTime);
+                readyDiagnosticPending = false;
+            }
             if (common::getEnvDisaggEnableInflightCancel() && session.has_value())
             {
                 session->poisonReservedRecvBuffers();
             }
             llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+            auto const* action
+                = cancellationObserved || perRequestCancel.load(std::memory_order_relaxed) ? "cancelled" : "failed";
+            logTransferDiagnostic("receiver", action, requestId, contextRequestId, phase, terminalTime);
             TLLM_LOG_ERROR("KV cache receive request %zu, context request %zu failed in phase=%s: %s", requestId,
                 contextRequestId, phase, err.what());
             throw;
         }
         catch (...)
         {
+            auto const terminalTime = isDisaggTransferDiagnosticsEnabled() ? getSteadyClockTimeSeconds() : 0.0;
+            if (readyDiagnosticPending)
+            {
+                logReceiverReadyDiagnostic(requestId, contextRequestId, "ready", readyTime);
+                readyDiagnosticPending = false;
+            }
             if (common::getEnvDisaggEnableInflightCancel() && session.has_value())
             {
                 session->poisonReservedRecvBuffers();
             }
             llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+            auto const* action
+                = cancellationObserved || perRequestCancel.load(std::memory_order_relaxed) ? "cancelled" : "failed";
+            logTransferDiagnostic("receiver", action, requestId, contextRequestId, phase, terminalTime);
             TLLM_LOG_ERROR(
                 "KV cache receive request %zu, context request %zu failed in phase=%s with an unknown "
                 "exception",

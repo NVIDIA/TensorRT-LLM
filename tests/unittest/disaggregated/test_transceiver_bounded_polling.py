@@ -16,14 +16,23 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Optional
 from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
-from tensorrt_llm._torch.disaggregation.native.transfer import TaskStatus, TxSession
+from tensorrt_llm._torch.disaggregation.native import transfer as native_transfer_module
+from tensorrt_llm._torch.disaggregation.native.transfer import (
+    KVRecvTask,
+    RxSession,
+    TaskStatus,
+    TxSession,
+)
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm.bindings import LlmRequestState
 
@@ -31,6 +40,7 @@ from tensorrt_llm.bindings import LlmRequestState
 @dataclass
 class _FakeRequest:
     state: Optional[LlmRequestState] = None
+    py_request_id: Optional[int] = None
 
 
 class _FakeTransferWorker:
@@ -50,12 +60,20 @@ class _FakeSession:
         status: SessionStatus = SessionStatus.READY,
         is_completed: bool = False,
         has_failed: bool = False,
+        kv_transfer_start_time_s: Optional[float] = None,
+        request_info_sent_time_s: Optional[float] = None,
+        kv_ready_time_s: Optional[float] = None,
     ) -> None:
         self._rid = rid
         self._wait_result = wait_result
         self._status = status
         self._is_completed = is_completed
         self._has_failed = has_failed
+        self.kv_transfer_start_time_s = kv_transfer_start_time_s
+        self.request_info_sent_time_s = request_info_sent_time_s
+        self.kv_ready_time_s = kv_ready_time_s
+        self.transfer_end_time = None
+        self.kv_cache_size_bytes = 0
         self.blocking_calls: list[bool] = []
         self.closed = False
 
@@ -98,7 +116,7 @@ def _make_transceiver(
 ) -> KvCacheTransceiverV2:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._send_sessions = sessions
-    transceiver._send_reqs = reqs or {rid: _FakeRequest() for rid in sessions}
+    transceiver._send_reqs = reqs or {rid: _FakeRequest(py_request_id=rid) for rid in sessions}
     transceiver._sender_future_timeout_ms = 123
     # Attributes read by check_context_transfer_status before it processes sessions.
     transceiver._ever_had_send_session = True
@@ -150,6 +168,32 @@ def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued() -
     assert 11 in transceiver._send_sessions
     assert 11 in transceiver._send_reqs
     assert transceiver._transfer_worker.sweep_count == 1
+
+
+def test_context_wait_timeout_is_nonterminal_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transceiver_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    session = _FakeSession(rid=14, wait_result=WaitResult.TIMEOUT)
+    transceiver = _make_transceiver({14: session})
+    transceiver._log_python_transfer_diagnostic = Mock()
+    transceiver._log_transfer_terminal = Mock()
+
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=1)
+
+    assert completed == []
+    assert failed == []
+    assert not session.closed
+    assert 14 in transceiver._send_sessions
+    transceiver._log_transfer_terminal.assert_not_called()
+    transceiver._log_python_transfer_diagnostic.assert_called_once_with(
+        role="ctx",
+        action="wait-timeout",
+        request=14,
+        local_request=14,
+        status=SessionStatus.READY.value,
+        timeout_ms=123,
+    )
 
 
 def test_context_transfer_status_block_all_uses_blocking_wait() -> None:
@@ -247,6 +291,164 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._gen_consensus.assert_called_once_with([])
 
 
+def test_gen_transfer_status_stamps_first_local_ready_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+    monkeypatch.setattr(transceiver_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(transceiver_module, "_diagnostic_now_s", lambda: 12.6)
+    log_info = Mock()
+    monkeypatch.setattr(transceiver_module.logger, "info", log_info)
+    session = _FakeSession(
+        rid=21,
+        wait_result=WaitResult.COMPLETED,
+        is_completed=True,
+        kv_transfer_start_time_s=10.25,
+        request_info_sent_time_s=10.25,
+        kv_ready_time_s=12.5,
+    )
+    request = Mock(
+        py_request_id=21,
+        py_kv_cache_xfer_bytes=8192,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = True
+    transceiver._mapping = Mock(enable_attention_dp=False, world_size=4)
+    transceiver._recv_sessions = {21: session}
+    transceiver._recv_reqs = {21: request}
+    transceiver._diagnostic_ready_rids = set()
+    transceiver._dist = Mock(rank=2)
+    transceiver._collect_done = Mock(return_value=([21], []))
+    transceiver._gen_consensus = Mock(return_value=[21])
+    transceiver._build_to_process = Mock(return_value=[21])
+    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [21]))
+    transceiver._need_aux_transfer = Mock(return_value=False)
+    transceiver._assert_disagg_history_declared = Mock()
+    transceiver._close_failed_sessions = Mock()
+
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
+
+    assert completed == [21]
+    assert failed == []
+    assert cancelled == []
+    assert request.py_kv_transfer_service_start_time_s == 10.25
+    assert request.py_kv_request_info_sent_time_s == 10.25
+    assert request.py_kv_transfer_ready_time_s == 12.5
+    assert request.py_kv_transfer_global_ready_time_s == 12.6
+    message = next(
+        call.args[0] for call in log_info.call_args_list if "action=local-ready" in call.args[0]
+    )
+    assert "[DISAGG_DIAG][python-transfer]" in message
+    assert "rank=2" in message
+    assert "request=21" in message
+    assert "bytes=8192" in message
+    assert "request_info_sent_t=10.250000000" in message
+    assert "receive_ms=2250.000" in message
+    global_ready_message = next(
+        call.args[0] for call in log_info.call_args_list if "action=global-ready" in call.args[0]
+    )
+    assert "t=12.600000000" in global_ready_message
+    assert "completion_scope=global-consensus" in global_ready_message
+    assert "expected_participants=4" in global_ready_message
+    assert "local_ready_t=12.500000000" in global_ready_message
+
+
+def test_gen_global_ready_uses_one_consensus_boundary_for_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transceiver_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    diagnostic_clock = Mock(side_effect=(12.6, 12.7, 12.8))
+    monkeypatch.setattr(transceiver_module, "_diagnostic_now_s", diagnostic_clock)
+    wall_clock = Mock(side_effect=(100.1, 100.2, 100.3, 100.4, 100.5))
+    monkeypatch.setattr(transceiver_module.time, "time", wall_clock)
+    log_info = Mock()
+    monkeypatch.setattr(transceiver_module.logger, "info", log_info)
+    sessions = {
+        rid: _FakeSession(
+            rid=rid,
+            wait_result=WaitResult.COMPLETED,
+            is_completed=True,
+            request_info_sent_time_s=10.0,
+            kv_ready_time_s=12.5,
+        )
+        for rid in (21, 22)
+    }
+    requests = {
+        rid: Mock(
+            py_request_id=rid,
+            py_kv_cache_xfer_bytes=8192,
+            state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        )
+        for rid in sessions
+    }
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = True
+    transceiver._mapping = Mock(enable_attention_dp=False, world_size=4)
+    transceiver._recv_sessions = sessions
+    transceiver._recv_reqs = requests
+    transceiver._diagnostic_ready_rids = set(sessions)
+    transceiver._dist = Mock(rank=2)
+    transceiver._collect_done = Mock(return_value=(list(sessions), []))
+    transceiver._gen_consensus = Mock(return_value=list(sessions))
+    transceiver._build_to_process = Mock(return_value=list(sessions))
+    transceiver._gen_consensus_outcome = Mock(return_value=([], [], list(sessions)))
+    transceiver._need_aux_transfer = Mock(return_value=False)
+    transceiver._assert_disagg_history_declared = Mock()
+    transceiver._close_failed_sessions = Mock()
+
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
+
+    assert completed == [21, 22]
+    assert failed == []
+    assert cancelled == []
+    assert {request.py_kv_transfer_global_ready_time_s for request in requests.values()} == {12.6}
+    assert diagnostic_clock.call_count == 3
+    global_ready_messages = [
+        call.args[0] for call in log_info.call_args_list if "action=global-ready" in call.args[0]
+    ]
+    assert len(global_ready_messages) == 2
+    assert all("wall_t=100.100000000" in message for message in global_ready_messages)
+    assert all("wall_semantics=boundary-sampled" in message for message in global_ready_messages)
+
+
+def test_kv_recv_task_records_native_transfer_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
+    monkeypatch.setattr(native_transfer_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    timestamps = iter((timedelta(seconds=3.25), timedelta(seconds=4.75)))
+    monkeypatch.setattr(
+        native_transfer_module.tensorrt_llm.bindings,
+        "steady_clock_now",
+        lambda: next(timestamps),
+    )
+    task = KVRecvTask(17, Mock(), 0, Mock(), None)
+
+    task.mark_transferring()
+    task.mark_transferring()
+    task.complete()
+
+    assert task.transfer_start_time_s == 3.25
+    assert task.completion_time_s == 4.75
+    assert task.status == TaskStatus.TRANSFERRED
+
+
+def test_rx_session_aggregates_native_task_timestamps() -> None:
+    session = object.__new__(RxSession)
+    first_task = Mock(transfer_start_time_s=2.5, completion_time_s=7.0)
+    second_task = Mock(transfer_start_time_s=3.0, completion_time_s=8.25)
+    session._kv_tasks = [first_task, second_task]
+
+    assert session.kv_transfer_start_time_s == 2.5
+    assert session.kv_ready_time_s == 8.25
+
+    second_task.completion_time_s = None
+    assert session.kv_ready_time_s is None
+
+
 def test_consensus_outcome_uses_single_batched_allgather() -> None:
     # The cancelled/failed/completed id lists are exchanged with ONE allgather
     # (packed as a list-of-lists) instead of three; verify a single call and that
@@ -319,6 +521,68 @@ def test_tx_session_wait_complete_defaults_to_blocking() -> None:
 
     assert session.wait_complete() == WaitResult.TIMEOUT
     assert task.wait_calls == [0.25]
+
+
+def test_native_session_boundaries_are_recorded_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(native_transfer_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    tx_session = object.__new__(TxSession)
+    tx_session.lock = threading.Lock()
+    tx_session._first_write_submit_time_s = None
+    tx_session._kv_physical_complete_time_s = None
+    rx_session = object.__new__(RxSession)
+    rx_session.lock = threading.Lock()
+    rx_session._request_info_sent_time_s = None
+
+    assert tx_session.mark_first_write_submitted(3.0)
+    assert not tx_session.mark_first_write_submitted(4.0)
+    assert tx_session.first_write_submit_time_s == 3.0
+    assert tx_session.mark_kv_physical_complete(4.0)
+    assert not tx_session.mark_kv_physical_complete(5.0)
+    assert tx_session.kv_physical_complete_time_s == 4.0
+    assert rx_session.mark_request_info_sent(5.0)
+    assert not rx_session.mark_request_info_sent(6.0)
+    assert rx_session.request_info_sent_time_s == 5.0
+
+
+@pytest.mark.parametrize("has_transferring_tasks", [False, True])
+def test_cancel_request_separates_request_from_terminal_diagnostic(
+    has_transferring_tasks: bool,
+) -> None:
+    request = Mock(
+        request_id=7,
+        py_request_id=7,
+        py_disaggregated_params=None,
+    )
+    session = Mock(status=SessionStatus.CANCELLED)
+    session.has_transferring_tasks.return_value = has_transferring_tasks
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._wait_reqs = {}
+    transceiver._send_sessions = {7: session}
+    transceiver._send_reqs = {7: request}
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._log_transfer_terminal = Mock()
+
+    result = transceiver.cancel_request(request)
+
+    session.cancel.assert_called_once()
+    if has_transferring_tasks:
+        assert not result
+        assert 7 in transceiver._send_sessions
+        transceiver._log_transfer_terminal.assert_not_called()
+    else:
+        assert result
+        assert 7 not in transceiver._send_sessions
+        transceiver._log_transfer_terminal.assert_called_once_with(
+            role="ctx",
+            action="cancelled",
+            rid=7,
+            session=session,
+            req=request,
+        )
+        session.close.assert_called_once()
 
 
 def test_tx_session_wait_complete_nonblocking_returns_none_without_waiting() -> None:

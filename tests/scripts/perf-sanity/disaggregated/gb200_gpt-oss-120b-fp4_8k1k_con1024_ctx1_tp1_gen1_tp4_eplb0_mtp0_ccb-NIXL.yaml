@@ -42,7 +42,7 @@ environment:
   # existing gpt-oss perf-sanity configs; PDL / no-parallel-weight-load /
   # disabled NCCL graph register / disabled UCC collective are preserved so
   # the same load & runtime paths are exercised).
-  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes OVERRIDE_QUANT_ALGO=W4A8_MXFP4_MXFP8 TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True NCCL_GRAPH_REGISTER=0 OMPI_MCA_coll_ucc_enable=0"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes OVERRIDE_QUANT_ALGO=W4A8_MXFP4_MXFP8 TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True NCCL_GRAPH_REGISTER=0 OMPI_MCA_coll_ucc_enable=0 TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS=1"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 profiling:
   nsys_on: false

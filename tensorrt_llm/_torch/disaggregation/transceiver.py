@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import time
 import uuid
@@ -19,6 +22,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     WaitResult,
     get_unique_rid,
 )
+from tensorrt_llm._torch.disaggregation.diagnostics import get_diagnostic_host_identity
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
 )
@@ -41,6 +45,16 @@ from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
+
+_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED = os.getenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS") == "1"
+
+
+def _is_disagg_transfer_diagnostics_enabled() -> bool:
+    return _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+
+
+def _diagnostic_now_s() -> float:
+    return tensorrt_llm.bindings.steady_clock_now().total_seconds()
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
@@ -102,6 +116,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_sessions: Dict[int, RxSessionBase] = {}
         self._send_reqs = {}
         self._recv_reqs = {}
+        self._diagnostic_ready_rids = set() if _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED else None
+        self._diagnostic_terminal_events = set() if _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED else None
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
         # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
@@ -112,6 +128,91 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
+
+    def _log_python_transfer_diagnostic(
+        self,
+        *,
+        role: str,
+        action: str,
+        request: int,
+        timestamp_s: Optional[float] = None,
+        wall_timestamp_s: Optional[float] = None,
+        wall_semantics: str = "emission",
+        **fields: object,
+    ) -> None:
+        if not _is_disagg_transfer_diagnostics_enabled():
+            return
+        if timestamp_s is None:
+            timestamp_s = _diagnostic_now_s()
+        if wall_timestamp_s is None:
+            wall_timestamp_s = time.time()
+        rank = getattr(getattr(self, "_dist", None), "rank", -1)
+        host, host_source = get_diagnostic_host_identity()
+        instance = getattr(self, "_instance_name", "-")
+        encoded_fields = " ".join(f"{key}={value}" for key, value in fields.items())
+        logger.info(
+            "[DISAGG_DIAG][python-transfer] "
+            f"t={timestamp_s:.9f} clock=local_steady "
+            f"wall_t={wall_timestamp_s:.9f} wall_clock=unix "
+            f"wall_semantics={wall_semantics} runtime=Python "
+            f"host={host} host_source={host_source} "
+            f"instance={instance} rank={rank} role={role} "
+            f"source=transceiver action={action} request={request} "
+            f"{encoded_fields}"
+        )
+
+    def _log_transfer_terminal(
+        self,
+        *,
+        role: str,
+        action: str,
+        rid: int,
+        session,
+        req,
+    ) -> None:
+        if not _is_disagg_transfer_diagnostics_enabled():
+            return
+        terminal_events = getattr(self, "_diagnostic_terminal_events", None)
+        if terminal_events is None:
+            terminal_events = set()
+            self._diagnostic_terminal_events = terminal_events
+        event_key = (role, action, rid)
+        if event_key in terminal_events:
+            return
+        terminal_events.add(event_key)
+
+        timestamp_s = _diagnostic_now_s()
+        fields: dict[str, object] = {
+            "local_request": getattr(req, "py_request_id", rid),
+            "status": getattr(getattr(session, "status", None), "value", "unknown"),
+        }
+        if role == "ctx":
+            first_write_time_s = getattr(session, "first_write_submit_time_s", None)
+            kv_physical_complete_time_s = getattr(session, "kv_physical_complete_time_s", None)
+            if first_write_time_s is not None:
+                fields["first_write_t"] = f"{first_write_time_s:.9f}"
+                fields["elapsed_from_first_write_ms"] = (
+                    f"{(timestamp_s - first_write_time_s) * 1000:.6f}"
+                )
+            if kv_physical_complete_time_s is not None:
+                fields["kv_physical_complete_t"] = f"{kv_physical_complete_time_s:.9f}"
+                fields["kv_physical_complete_to_terminal_ms"] = (
+                    f"{(timestamp_s - kv_physical_complete_time_s) * 1000:.6f}"
+                )
+        else:
+            request_info_sent_time_s = getattr(session, "request_info_sent_time_s", None)
+            ready_time_s = getattr(session, "kv_ready_time_s", None)
+            if request_info_sent_time_s is not None:
+                fields["request_info_sent_t"] = f"{request_info_sent_time_s:.9f}"
+            if ready_time_s is not None:
+                fields["ready_t"] = f"{ready_time_s:.9f}"
+        self._log_python_transfer_diagnostic(
+            role=role,
+            action=action,
+            request=rid,
+            timestamp_s=timestamp_s,
+            **fields,
+        )
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
@@ -567,10 +668,32 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+                self._log_transfer_terminal(
+                    role="gen",
+                    action="completed",
+                    rid=rid,
+                    session=session,
+                    req=req,
+                )
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                self._log_transfer_terminal(
+                    role="gen",
+                    action="failed",
+                    rid=rid,
+                    session=session,
+                    req=req,
+                )
         except Exception:
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            if session is not None:
+                self._log_transfer_terminal(
+                    role="gen",
+                    action="failed",
+                    rid=rid,
+                    session=session,
+                    req=req,
+                )
             raise
         finally:
             if session is not None:
@@ -642,6 +765,32 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             to_process, cancelled, failed, completed, timed_out
         )
 
+        if _is_disagg_transfer_diagnostics_enabled():
+            for action, rids in (
+                ("cancelled", cancelled),
+                ("failed", failed),
+                ("completed", completed),
+            ):
+                for rid in rids:
+                    self._log_transfer_terminal(
+                        role="ctx",
+                        action=action,
+                        rid=rid,
+                        session=self._send_sessions[rid],
+                        req=self._send_reqs[rid],
+                    )
+            for rid in timed_out:
+                session = self._send_sessions[rid]
+                req = self._send_reqs[rid]
+                self._log_python_transfer_diagnostic(
+                    role="ctx",
+                    action="wait-timeout",
+                    request=rid,
+                    local_request=req.py_request_id,
+                    status=getattr(session.status, "value", "unknown"),
+                    timeout_ms=self._sender_future_timeout_ms,
+                )
+
         for rid in cancelled:
             self._send_sessions[rid].close()
             del self._send_reqs[rid]
@@ -671,6 +820,49 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._poll_gen_sessions_for_poll_interval(wait_num)
 
         local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+        diagnostic_ready_rids = getattr(self, "_diagnostic_ready_rids", None)
+        if _is_disagg_transfer_diagnostics_enabled():
+            assert diagnostic_ready_rids is not None
+            for rid in local_completed:
+                if rid in diagnostic_ready_rids:
+                    continue
+                session = self._recv_sessions[rid]
+                request_info_sent_time = getattr(session, "request_info_sent_time_s", None)
+                ready_time = getattr(session, "kv_ready_time_s", None)
+                if ready_time is None:
+                    diagnostic_ready_rids.add(rid)
+                    req = self._recv_reqs[rid]
+                    self._log_python_transfer_diagnostic(
+                        role="gen",
+                        action="missing-native-timestamp",
+                        request=rid,
+                        local_request=req.py_request_id,
+                    )
+                    continue
+                req = self._recv_reqs[rid]
+                if request_info_sent_time is not None:
+                    req.py_kv_transfer_service_start_time_s = request_info_sent_time
+                    req.py_kv_request_info_sent_time_s = request_info_sent_time
+                req.py_kv_transfer_ready_time_s = ready_time
+                diagnostic_ready_rids.add(rid)
+                receive_ms = (
+                    (ready_time - request_info_sent_time) * 1000
+                    if request_info_sent_time is not None
+                    else -1.0
+                )
+                diagnostic_request_info_sent_time = (
+                    request_info_sent_time if request_info_sent_time is not None else -1.0
+                )
+                self._log_python_transfer_diagnostic(
+                    role="gen",
+                    action="local-ready",
+                    request=rid,
+                    timestamp_s=ready_time,
+                    local_request=req.py_request_id,
+                    bytes=getattr(req, "py_kv_cache_xfer_bytes", 0),
+                    request_info_sent_t=f"{diagnostic_request_info_sent_time:.9f}",
+                    receive_ms=f"{receive_ms:.3f}",
+                )
         to_process = self._build_to_process(
             self._recv_sessions,
             self._gen_consensus(local_completed + local_failed),
@@ -704,12 +896,61 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             to_process, cancelled, failed, completed
         )
 
+        if _is_disagg_transfer_diagnostics_enabled():
+            global_ready_time = _diagnostic_now_s() if completed else None
+            global_ready_wall_time = time.time() if completed else None
+            expected_participants = 1
+            if self._gen_need_sync:
+                expected_participants = (
+                    self._mapping.pp_size
+                    if self._mapping.enable_attention_dp
+                    else self._mapping.world_size
+                )
+            for rid in completed:
+                assert global_ready_time is not None
+                assert global_ready_wall_time is not None
+                session = self._recv_sessions[rid]
+                req = self._recv_reqs[rid]
+                req.py_kv_transfer_global_ready_time_s = global_ready_time
+                local_ready_time = getattr(session, "kv_ready_time_s", None)
+                self._log_python_transfer_diagnostic(
+                    role="gen",
+                    action="global-ready",
+                    request=rid,
+                    timestamp_s=global_ready_time,
+                    wall_timestamp_s=global_ready_wall_time,
+                    wall_semantics="boundary-sampled",
+                    local_request=req.py_request_id,
+                    completion_scope=("global-consensus" if self._gen_need_sync else "rank-local"),
+                    expected_participants=expected_participants,
+                    local_ready_t=(
+                        f"{local_ready_time:.9f}"
+                        if isinstance(local_ready_time, (int, float))
+                        else "-1"
+                    ),
+                )
+            for action, rids in (
+                ("cancelled", cancelled),
+                ("failed", failed),
+                ("completed", completed),
+            ):
+                for rid in rids:
+                    self._log_transfer_terminal(
+                        role="gen",
+                        action=action,
+                        rid=rid,
+                        session=self._recv_sessions[rid],
+                        req=self._recv_reqs[rid],
+                    )
+
         cancelled_reqs = []
         for rid in cancelled:
             cancelled_reqs.append(self._recv_reqs[rid])
             self._recv_sessions[rid].close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+            if diagnostic_ready_rids is not None:
+                diagnostic_ready_rids.discard(rid)
 
         # Log gen-side transfer summary after consensus.
         if completed and os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH"):
@@ -737,12 +978,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session.close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+            if diagnostic_ready_rids is not None:
+                diagnostic_ready_rids.discard(rid)
         if failed:
             logger.warning(
                 f"Disagg gen transfer FAILED rank={self._dist.rank} "
                 f"rids={failed} gen_need_sync={self._gen_need_sync}"
             )
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
+        if diagnostic_ready_rids is not None:
+            for rid in failed:
+                diagnostic_ready_rids.discard(rid)
 
         return completed, failed, cancelled_reqs
 
@@ -811,20 +1057,38 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         has_transferring = False
 
         if rid in self._send_sessions:
-            self._send_sessions[rid].cancel()
-            if self._send_sessions[rid].has_transferring_tasks():
+            session = self._send_sessions[rid]
+            req = self._send_reqs[rid]
+            session.cancel()
+            if session.has_transferring_tasks():
                 has_transferring = True
             else:
-                self._send_sessions[rid].close()
+                self._log_transfer_terminal(
+                    role="ctx",
+                    action="cancelled",
+                    rid=rid,
+                    session=session,
+                    req=req,
+                )
+                session.close()
                 del self._send_reqs[rid]
                 del self._send_sessions[rid]
 
         if rid in self._recv_sessions:
-            self._recv_sessions[rid].cancel()
-            if self._recv_sessions[rid].has_transferring_tasks():
+            session = self._recv_sessions[rid]
+            req = self._recv_reqs[rid]
+            session.cancel()
+            if session.has_transferring_tasks():
                 has_transferring = True
             else:
-                self._recv_sessions[rid].close()
+                self._log_transfer_terminal(
+                    role="gen",
+                    action="cancelled",
+                    rid=rid,
+                    session=session,
+                    req=req,
+                )
+                session.close()
                 del self._recv_reqs[rid]
                 del self._recv_sessions[rid]
 
