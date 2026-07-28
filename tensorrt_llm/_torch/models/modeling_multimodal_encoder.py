@@ -55,8 +55,16 @@ class MultimodalEncoderMixin:
 
     def get_encoder_attention_metadata_capacity(
             self, max_num_items: int, max_num_tokens: int) -> dict[str, int]:
-        """Map item/token budgets to model-internal attention sequences."""
-        del max_num_tokens
+        """Map item/token budgets to model-internal attention sequences.
+
+        Keys name this encoder's attention metadata objects, so they are
+        model-specific: this default declares a single `attention` object,
+        while a windowed encoder such as Qwen2.5-VL declares `full_attention`
+        and `window_attention`. There is no fixed superset to enumerate.
+
+        The default sizes from the item budget alone; encoders that split one
+        item across several sequences override this and use `max_num_tokens`.
+        """
         return {
             "attention": max(max_num_items, _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
         }
