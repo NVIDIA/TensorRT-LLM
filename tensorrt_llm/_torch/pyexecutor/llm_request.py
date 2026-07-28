@@ -115,7 +115,7 @@ class MultimodalEncoderRequestState:
     embeddings: Optional[torch.Tensor] = None
     """Contiguous ``[sum(embedding_lengths), ...]`` storage for every item of
     this request, allocated by the first `record()`. Published by reference at
-    `finalize_into()` and released when the request is stripped, so its
+    `finalize()` and released when the request is stripped, so its
     presence is exactly what the byte budget charges."""
 
     @classmethod
@@ -207,13 +207,13 @@ class MultimodalEncoderRequestState:
         The buffer covers every item from the first `record()` onward, so a
         partially encoded request already charges its full footprint — which
         is what it actually occupies — and keeps charging it after
-        `finalize_into()` until the request is stripped post-prefill.
+        `finalize()` until the request is stripped post-prefill.
         """
         if self.embeddings is None:
             return 0
         return sum(self.embedding_lengths) * bytes_per_encoder_embedding
 
-    def finalize_into(self, multimodal_data: Dict[str, Any]) -> bool:
+    def finalize(self, multimodal_data: Dict[str, Any]) -> bool:
         """Publish the request's embedding once every item is recorded.
 
         Attaches the buffer as ``multimodal_embedding`` and drops the raw

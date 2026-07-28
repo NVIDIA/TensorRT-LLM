@@ -3352,8 +3352,7 @@ class PyTorchModelEngine(ModelEngine):
                     encoder_cache.put(key, output)
 
         for request in touched_requests.values():
-            request.py_mm_encoder_state.finalize_into(
-                request.py_multimodal_data)
+            request.py_mm_encoder_state.finalize(request.py_multimodal_data)
 
     def _resolve_mm_encoder_output_budget_bytes(self) -> int:
         """Resolve the byte budget for resident MM encoder outputs.
