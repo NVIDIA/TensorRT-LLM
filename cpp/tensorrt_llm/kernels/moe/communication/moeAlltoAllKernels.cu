@@ -1416,13 +1416,19 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
 
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 {
-    (void) params;
-    TLLM_CHECK_WITH_INFO(false,
-        "moe_a2a_prepare_dispatch_launch requires a registered MoeA2AExecutionControl so dispatch can fail closed");
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask,
+        "moe_a2a_prepare_dispatch_launch requires a registered MoeA2AExecutionControl in rank-mask mode");
+    launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", moeA2APrepareDispatchKernel, 1, params.ep_size, 0,
+        params.stream, params.send_counters, params.local_token_counter, params.ep_size, params.flag_val);
 }
 
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params, MoeA2AExecutionControl const& executionControl)
 {
+    if (!params.enable_rank_mask)
+    {
+        moe_a2a_prepare_dispatch_launch(params);
+        return;
+    }
     validateExecutionControl(executionControl);
     // NOTE: LE counters are NOT zeroed between iterations. They grow monotonically.
     // Cumulative baselines in regular device memory track the expected value.
@@ -1436,18 +1442,9 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params, MoeA2AE
 // Launch Functions
 // ============================================================================
 
-void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
+static void moe_a2a_dispatch_launch_impl(
+    MoeA2ADispatchParams const& params, MoeA2AExecutionControl const& executionControl)
 {
-    (void) params;
-    TLLM_CHECK_WITH_INFO(false,
-        "moe_a2a_dispatch_launch requires a registered MoeA2AExecutionControl so an aborted epoch cannot return "
-        "unobserved partial output");
-}
-
-void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params, MoeA2AExecutionControl const& executionControl)
-{
-    validateExecutionControl(executionControl);
-
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
@@ -1589,6 +1586,24 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params, MoeA2AExecution
                     params.num_experts, params.eplb_stats_num_experts);
             }))})
     }
+}
+
+void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
+{
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask,
+        "moe_a2a_dispatch_launch requires a registered MoeA2AExecutionControl in rank-mask mode");
+    moe_a2a_dispatch_launch_impl(params, MoeA2AExecutionControl{});
+}
+
+void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params, MoeA2AExecutionControl const& executionControl)
+{
+    if (!params.enable_rank_mask)
+    {
+        moe_a2a_dispatch_launch(params);
+        return;
+    }
+    validateExecutionControl(executionControl);
+    moe_a2a_dispatch_launch_impl(params, executionControl);
 }
 
 // ============================================================================
@@ -1981,11 +1996,11 @@ __device__ void vectorized_quant(DstT* dst, SrcT const* src, int num_elements)
 
 // LOW_PRECISION=false: vectorized byte-copy (SrcT = payload dtype).
 // LOW_PRECISION=true:  vectorized SrcT→FP8 quantization via vectorized_quant<SrcT, fp8_e4m3>.
-template <bool LOW_PRECISION, typename SrcT>
+template <bool LOW_PRECISION, typename SrcT, bool ENABLE_RANK_MASK>
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void const* source_payload,
     int elements_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, int const* recv_counters,
     int source_stride_per_token, int workspace_stride_per_token, int prepare_first_token, int prepare_num_tokens,
-    uint8_t* region_c_base, int ep_rank, uint64_t* execution_admission)
+    uint8_t* region_c_base, int ep_rank, [[maybe_unused]] uint64_t* execution_admission)
 {
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
@@ -1997,7 +2012,10 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
     if (blockIdx.x == 0 && threadIdx.x == 0)
     {
         *flag_val_ptr = *flag_val_ptr + 1;
-        *execution_admission = 0;
+        if constexpr (ENABLE_RANK_MASK)
+        {
+            *execution_admission = 0;
+        }
     }
     // NOTE: LE counters are NOT zeroed. They grow monotonically with cumulative baselines.
 
@@ -2479,19 +2497,11 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
     });
 }
 
-void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
-{
-    (void) params;
-    TLLM_CHECK_WITH_INFO(false,
-        "moe_a2a_prepare_combine_launch requires a registered MoeA2AExecutionControl so combine admission can "
-        "fail closed");
-}
-
-void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl)
+static void moe_a2a_prepare_combine_launch_impl(
+    MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl)
 {
     constexpr int kBlockSize = 256;
     TLLM_CHECK(params.max_tokens_per_rank > 0);
-    validateExecutionControl(executionControl);
 
     uint8_t* recv_buffer_bytes = static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank]));
     // CFT combine stages local contributions compactly into its dedicated receive region.
@@ -2504,34 +2514,45 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params, MoeA2AExe
     // Zeroing them here (after dispatch's fabric puts) corrupts subsequent counter increments
     // because cudaDeviceSynchronize does NOT wait for fabric engine completion.
 
+    SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
     SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
         SWITCH_DTYPE(params.dtype, SrcT, {
-            auto kernel_fn = moeA2APrepareCombineKernel<LOW_PRECISION, SrcT>;
+            auto kernel_fn = moeA2APrepareCombineKernel<LOW_PRECISION, SrcT, ENABLE_RANK_MASK>;
             launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
                 recv_buffer_bytes, params.source_payload, params.elements_per_token, params.ep_size,
                 params.max_tokens_per_rank, params.flag_val, params.recv_counters, params.source_stride_per_token,
                 params.workspace_stride_per_token, params.prepare_first_token, params.prepare_num_tokens, region_c_base,
                 params.ep_rank, executionControl.device_admission);
+            });
         });
     });
+}
+
+void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
+{
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask,
+        "moe_a2a_prepare_combine_launch requires a registered MoeA2AExecutionControl in rank-mask mode");
+    moe_a2a_prepare_combine_launch_impl(params, MoeA2AExecutionControl{});
+}
+
+void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl)
+{
+    if (!params.enable_rank_mask)
+    {
+        moe_a2a_prepare_combine_launch(params);
+        return;
+    }
+    validateExecutionControl(executionControl);
+    moe_a2a_prepare_combine_launch_impl(params, executionControl);
 }
 
 // ============================================================================
 // Combine Launch Function
 // ============================================================================
 
-void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
+static void moe_a2a_combine_launch_impl(
+    MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl)
 {
-    (void) params;
-    TLLM_CHECK_WITH_INFO(false,
-        "moe_a2a_combine_launch requires a registered MoeA2AExecutionControl so an aborted epoch cannot return "
-        "unobserved partial output");
-}
-
-void moe_a2a_combine_launch(MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl)
-{
-    validateExecutionControl(executionControl);
-
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
@@ -2664,6 +2685,24 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params, MoeA2AExecutionCo
             });
         });
     });
+}
+
+void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
+{
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask,
+        "moe_a2a_combine_launch requires a registered MoeA2AExecutionControl in rank-mask mode");
+    moe_a2a_combine_launch_impl(params, MoeA2AExecutionControl{});
+}
+
+void moe_a2a_combine_launch(MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl)
+{
+    if (!params.enable_rank_mask)
+    {
+        moe_a2a_combine_launch(params);
+        return;
+    }
+    validateExecutionControl(executionControl);
+    moe_a2a_combine_launch_impl(params, executionControl);
 }
 
 // Kernel to sanitize expert ids for invalid tokens

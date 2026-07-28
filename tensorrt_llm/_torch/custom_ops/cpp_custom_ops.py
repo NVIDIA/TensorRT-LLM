@@ -728,7 +728,7 @@ def _register_fake():
         execution_control: Optional[torch.Tensor] = None,
         expected_execution_epoch: int = 0,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
-        if execution_control is None:
+        if enable_rank_mask and execution_control is None:
             raise RuntimeError("execution_control is required")
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
@@ -764,7 +764,7 @@ def _register_fake():
         execution_control: Optional[torch.Tensor] = None,
         expected_execution_epoch: int = 0,
     ) -> torch.Tensor:
-        if execution_control is None:
+        if enable_rank_mask and execution_control is None:
             raise RuntimeError("execution_control is required")
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 
