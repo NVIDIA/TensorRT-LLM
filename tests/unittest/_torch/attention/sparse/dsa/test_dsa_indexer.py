@@ -504,6 +504,14 @@ def _create_mock_metadata(
             self.max_draft_tokens = max_draft_tokens
             self.num_sparse_topk = index_topk
             self.enable_indexer_skip = enable_indexer_skip
+            # Defaults mirroring DSAMetadataParams / create_buffers_for_indexer()
+            # for the tests that drive on_update_kv_lens() directly. Without
+            # in_mtp_draft_loop the shared-topk reset at the top of
+            # on_update_kv_lens() raises AttributeError; the draft-loop tests
+            # that need it True set it on the instance.
+            self.enable_heuristic_topk = False
+            self.use_cute_dsl_topk = False
+            self.in_mtp_draft_loop = False
             self.indexer_head_dim = indexer_head_dim
             self.indexer_quant_block_size = 128
             self.compress_ratios = [compress_ratio]
@@ -826,6 +834,138 @@ def test_recompute_slot_mappings_matches_prepare_with_cached_tokens():
     metadata.slot_mapping_scale.zero_()
     Indexer.recompute_slot_mappings(metadata)
 
+    torch.testing.assert_close(metadata.slot_mapping_fp8[:num_tokens], expected_fp8)
+    torch.testing.assert_close(metadata.slot_mapping_scale[:num_tokens], expected_scale)
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
+def test_on_update_kv_lens_rebuilds_req_idx_in_draft_loop():
+    """The token->request map must follow the one-token-per-request draft layout.
+
+    prepare_for_indices_conversion() builds req_idx_per_token once per engine step
+    from the target forward's seq_lens, which are (max_draft_len + 1) tokens per
+    request. The one-model draft loop rewrites the layout to one token per request
+    before calling update_for_spec_dec(); if the map is not rebuilt, token j
+    resolves to request j // (max_draft_len + 1) and every request but the first
+    reads another request's block table.
+    """
+    head_dim = 128
+    block_size = 64
+    batch_size = 4
+    next_n = 8  # max_draft_len + 1
+    request_ids = list(range(batch_size))
+    cached_tokens = [128] * batch_size
+    seq_lens = torch.tensor([next_n] * batch_size, dtype=torch.int32)
+    kv_lens = torch.tensor([128 + next_n] * batch_size, dtype=torch.int32)
+    num_tokens = int(seq_lens.sum().item())
+
+    cache_manager, _ = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=512,
+        num_layers=1,
+    )
+    cache_manager.add_dummy_requests(
+        request_ids, kv_lens.tolist(), is_gen=False, prepare_resource=True
+    )
+    metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=0,
+        num_generations=batch_size,
+        seq_lens=seq_lens,
+        kv_lens=kv_lens,
+        num_cached_tokens=cached_tokens,
+        cache_manager=cache_manager,
+        num_ctx_tokens=0,
+        num_tokens=num_tokens,
+        indexer_head_dim=head_dim,
+    )
+    metadata.prepare_for_indices_conversion()
+
+    # The target-step map: next_n consecutive tokens per request.
+    expected_target = torch.repeat_interleave(
+        torch.arange(batch_size, dtype=metadata.req_idx_per_token.dtype),
+        seq_lens.to(torch.int64),
+    ).to(metadata.req_idx_per_token.device)
+    torch.testing.assert_close(metadata.req_idx_per_token[:num_tokens], expected_target)
+
+    # Now mutate the layout exactly as the one-model draft loop does.
+    metadata._seq_lens[:batch_size].fill_(1)
+    metadata._seq_lens_cuda[:batch_size].fill_(1)
+    metadata.on_update()
+    metadata.num_contexts = 0
+    assert metadata.num_tokens == batch_size
+
+    metadata.on_update_kv_lens()
+
+    # Each row is now its own request. Pre-fix this was [0, 0, 0, 0].
+    expected_draft = torch.arange(
+        batch_size,
+        dtype=metadata.req_idx_per_token.dtype,
+        device=metadata.req_idx_per_token.device,
+    )
+    torch.testing.assert_close(metadata.req_idx_per_token[:batch_size], expected_draft)
+
+    # And the derived slot mappings must address batch_size distinct requests.
+    assert metadata.slot_mapping_fp8[:batch_size].unique().numel() == batch_size
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
+def test_on_update_kv_lens_matches_prepare_on_target_forward():
+    """On an unmutated layout the rebuild is a no-op, including padded rows.
+
+    The safety argument for rebuilding in on_update_kv_lens() rests on the
+    searchsorted form being exactly equivalent to the repeat_interleave in
+    prepare_for_indices_conversion(). Pin that for a mixed context+generation
+    batch that also carries a zero-length (CUDA-graph padded) row.
+    """
+    head_dim = 128
+    block_size = 64
+    request_ids = [0, 1, 2]
+    cached_tokens = [64, 128, 128]
+    # ctx row, gen row, and a zero-length padded row.
+    seq_lens = torch.tensor([32, 1, 0], dtype=torch.int32)
+    kv_lens = torch.tensor([96, 129, 128], dtype=torch.int32)
+    num_ctx_tokens = int(seq_lens[0].item())
+    num_tokens = int(seq_lens.sum().item())
+
+    cache_manager, _ = create_dsa_cache_manager(
+        batch_size=len(request_ids),
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=256,
+        num_layers=1,
+    )
+    cache_manager.add_dummy_requests(
+        request_ids, kv_lens.tolist(), is_gen=False, prepare_resource=True
+    )
+    metadata = _create_mock_metadata(
+        request_ids,
+        len(request_ids),
+        num_contexts=1,
+        num_generations=2,
+        seq_lens=seq_lens,
+        kv_lens=kv_lens,
+        num_cached_tokens=cached_tokens,
+        cache_manager=cache_manager,
+        num_ctx_tokens=num_ctx_tokens,
+        num_tokens=num_tokens,
+        indexer_head_dim=head_dim,
+    )
+    metadata.prepare_for_indices_conversion()
+    expected = metadata.req_idx_per_token[:num_tokens].clone()
+
+    Indexer.prepare(metadata)
+    expected_fp8 = metadata.slot_mapping_fp8[:num_tokens].clone()
+    expected_scale = metadata.slot_mapping_scale[:num_tokens].clone()
+
+    metadata.on_update_kv_lens()
+
+    torch.testing.assert_close(metadata.req_idx_per_token[:num_tokens], expected)
     torch.testing.assert_close(metadata.slot_mapping_fp8[:num_tokens], expected_fp8)
     torch.testing.assert_close(metadata.slot_mapping_scale[:num_tokens], expected_scale)
 
