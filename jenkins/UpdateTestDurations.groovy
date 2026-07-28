@@ -147,6 +147,7 @@ pipeline {
                         echo "Generated file size: \$(wc -l < new_test_durations.json) lines"
                         echo "Sample output (first 5 lines):"
                         head -5 new_test_durations.json
+
                     """
 
                     // Always archive the freshly generated file so the user can download

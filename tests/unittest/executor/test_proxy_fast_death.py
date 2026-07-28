@@ -53,6 +53,7 @@ def _bare_proxy():
     proxy._results = {}
     # Set so the __del__ -> shutdown() path is a clean no-op at GC time.
     proxy.workers_started = False
+    proxy._multi_frontend_ipc_dir = None
     return proxy
 
 

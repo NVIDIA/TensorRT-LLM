@@ -1343,24 +1343,33 @@ def generate_multi_gpu_test_params(
     return params
 
 
-def _generate_megamoe_multi_gpu_test_params(
+def _generate_focused_multi_gpu_test_params(
     *,
     backend_type,
     quant_algo,
-    should_skip_fn,
+    parallel_modes,
+    comm_methods,
+    should_skip_fn=None,
 ) -> List:
-    """Generate focused MegaMoE module multi-GPU coverage for one backend.
+    """Generate focused module multi-GPU coverage for one backend.
 
-    Both MegaMoE backends share the same multi-GPU matrix shape; only the
-    backend/quant enum and capability skip hook differ between DeepGemm
-    (W4A8_MXFP4_MXFP8) and CuteDsl (NVFP4). The comm method is hardcoded to
-    the ``IGNORE`` sentinel because the fused kernel owns dispatch/combine
-    (the worker pops ``TRTLLM_FORCE_COMM_METHOD`` and takes the fused path).
+    Shared by the backends that opt out of the full ``COMM_METHODS`` matrix:
+
+    - MegaMoE (DeepGemm / CuteDsl): the fused kernel owns dispatch/combine,
+      so the comm method is the ``IGNORE`` sentinel (the worker pops
+      ``TRTLLM_FORCE_COMM_METHOD`` and takes the fused path) and each backend
+      passes its capability skip hook via ``should_skip_fn``.
+    - Marlin: an EXTERNAL_COMM backend whose ``run_moe`` can route internally,
+      but under attention-DP the scheduler precomputes routing and dispatches
+      plain BF16 activations (W4A16 — no activation scales). Coverage is
+      pinned to ALLGATHER, which is available on every SM90 box; the NVLink
+      a2a strategies in ``COMM_METHODS`` require MNNVL fabric that Hopper CI
+      nodes lack.
     """
     params: List = []
     seq_lens = [8] if IS_CI_MODE else SEQ_LENS
 
-    for parallel_mode, comm_method in product(MEGAMOE_PARALLEL_MODES, [MEGAMOE_IGNORE_COMM_METHOD]):
+    for parallel_mode, comm_method in product(parallel_modes, comm_methods):
         for (
             swiglu_alpha,
             swiglu_beta,
@@ -1382,7 +1391,7 @@ def _generate_megamoe_multi_gpu_test_params(
             [quant_algo],
             MULTI_GPU_ROUTING_METHODS,
         ):
-            if not skip_reason:
+            if not skip_reason and should_skip_fn is not None:
                 skip_reason = should_skip_fn(
                     parallel_mode,
                     comm_method,
@@ -1676,19 +1685,34 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     seq_lens=[8] if IS_CI_MODE else SEQ_LENS,
     dtypes=DTYPES,
     backend_types=[
-        b for b in BACKEND_TYPES if b != MoeBackendType.MARLIN
-    ],  # Marlin doesn't support fused routing
+        # Marlin gets focused ALLGATHER coverage below; the NVLink a2a
+        # strategies in COMM_METHODS require MNNVL fabric unavailable on
+        # the Hopper (SM90) nodes Marlin runs on.
+        b
+        for b in BACKEND_TYPES
+        if b != MoeBackendType.MARLIN
+    ],
     quant_algos=QUANT_ALGOS,
     routing_methods=MULTI_GPU_ROUTING_METHODS,
 )
-MULTI_GPU_TEST_PARAMS += _generate_megamoe_multi_gpu_test_params(
+MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
+    backend_type=MoeBackendType.MARLIN,
+    quant_algo=QuantAlgo.NVFP4,
+    parallel_modes=["DEP"] if IS_CI_MODE else ["DEP", "TEP"],
+    comm_methods=["ALLGATHER"],
+)
+MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     backend_type=MoeBackendType.MEGAMOE_DEEPGEMM,
     quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
+    parallel_modes=MEGAMOE_PARALLEL_MODES,
+    comm_methods=[MEGAMOE_IGNORE_COMM_METHOD],
     should_skip_fn=should_skip_MegaMoEDeepGemm,
 )
-MULTI_GPU_TEST_PARAMS += _generate_megamoe_multi_gpu_test_params(
+MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     backend_type=MoeBackendType.MEGAMOE_CUTEDSL,
     quant_algo=QuantAlgo.NVFP4,
+    parallel_modes=MEGAMOE_PARALLEL_MODES,
+    comm_methods=[MEGAMOE_IGNORE_COMM_METHOD],
     should_skip_fn=should_skip_MegaMoECuteDsl,
 )
 

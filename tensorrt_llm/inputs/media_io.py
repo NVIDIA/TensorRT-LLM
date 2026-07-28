@@ -74,8 +74,9 @@ def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
 MediaModality = Literal["image", "video", "audio"]
 
 # Output representations supported by `ImageMediaIO`:
-# `"pt"` -> `torch.Tensor`, `"pil"` -> `PIL.Image.Image`.
-_SUPPORTED_IMAGE_FORMATS = ("pt", "pil")
+# `"pt"` -> `torch.Tensor`, `"np"` -> uint8 HWC `numpy.ndarray`,
+# `"pil"` -> `PIL.Image.Image`.
+_SUPPORTED_IMAGE_FORMATS = ("pt", "np", "pil")
 
 # Output representations supported by `VideoMediaIO`. See
 # `_load_video_by_cv2` for the per-format contract.
@@ -691,7 +692,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         return await loop.run_in_executor(BaseMediaIO._executor, fn, *args)
 
 
-class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor]]):
+class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
     """I/O for the image modality."""
 
     def __init__(self, format: str = "pt", device: str = "cpu") -> None:
@@ -700,20 +701,25 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor]]):
         self._format = format
         self._device = device
 
-    def _postprocess(self, image: Image.Image) -> Union[Image.Image, torch.Tensor]:
+    def _postprocess(self, image: Image.Image) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         if self._format == "pt":
             from torchvision.transforms import ToTensor
 
             return ToTensor()(image).to(device=self._device)
+        if self._format == "np":
+            # uint8 HWC array; the downstream HF processor rescales/permutes.
+            return np.asarray(image)
         return image
 
-    def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor]:
+    def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         return self._postprocess(_load_and_convert_image(BytesIO(data)))
 
-    def load_base64(self, media_type: str, data: str) -> Union[Image.Image, torch.Tensor]:
+    def load_base64(
+        self, media_type: str, data: str
+    ) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         return self._postprocess(_load_and_convert_image(BytesIO(base64.b64decode(data))))
 
-    def load_file(self, url: str) -> Union[Image.Image, torch.Tensor]:
+    def load_file(self, url: str) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         return self._postprocess(_load_and_convert_image(Path(_normalize_file_uri(url))))
 
 
