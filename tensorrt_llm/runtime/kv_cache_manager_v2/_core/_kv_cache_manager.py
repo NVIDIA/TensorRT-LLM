@@ -215,6 +215,8 @@ class KVCacheManager:
         "_iteration_peak_num_blocks_by_cache_level",
         "_dirty_stats_kv_cache_ids",
         "_stats_excluded_kv_cache_ids",
+        "_iter_suspended_requests",
+        "_iter_resumed_requests",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
@@ -246,6 +248,8 @@ class KVCacheManager:
     ]
     _dirty_stats_kv_cache_ids: set[int]
     _stats_excluded_kv_cache_ids: set[int]
+    _iter_suspended_requests: int
+    _iter_resumed_requests: int
 
     def __init__(
         self,
@@ -287,6 +291,8 @@ class KVCacheManager:
         self._reset_iteration_peak_num_blocks()
         self._dirty_stats_kv_cache_ids = set()
         self._stats_excluded_kv_cache_ids = set()
+        self._iter_suspended_requests = 0
+        self._iter_resumed_requests = 0
 
     def __del__(self) -> None:
         self.shutdown()
@@ -538,6 +544,30 @@ class KVCacheManager:
         }
         self._iteration_stats_by_life_cycle.clear()
         return stats
+
+    def record_suspended_request(self) -> None:
+        """Count one ACTIVE->SUSPENDED transition for the current iteration window."""
+        if not self._stats_enabled:
+            return
+        self._iter_suspended_requests += 1
+
+    def record_resumed_request(self) -> None:
+        """Count one successful SUSPENDED->ACTIVE transition for the current iteration window."""
+        if not self._stats_enabled:
+            return
+        self._iter_resumed_requests += 1
+
+    def get_and_reset_iteration_suspend_resume_stats(self) -> tuple[int, int]:
+        """Return (suspended, resumed) request counts since the last drain and reset them.
+
+        Suspend/resume is a per-request, manager-level event (not per-pool-group), so it
+        is drained alongside get_and_reset_iteration_stats once per iteration-stats fetch.
+        """
+        suspended = self._iter_suspended_requests
+        resumed = self._iter_resumed_requests
+        self._iter_suspended_requests = 0
+        self._iter_resumed_requests = 0
+        return suspended, resumed
 
     def get_and_reset_iteration_peak_block_stats(
         self, cache_level: CacheLevel

@@ -426,6 +426,42 @@ class TestStatsSerializer:
         assert life_cycle["iterMissedBlocks"] == 3
         assert "iterGenAllocBlocks" not in life_cycle
 
+    def test_serializer_emits_v2_suspend_resume_counters(self) -> None:
+        """V2 suspend/resume (preemption) counts surface as top-level iteration keys.
+
+        Suspend/resume is a per-request, manager-level event, so the counters must
+        appear at the top level of the stats dict, not nested inside the per-pool-group
+        breakdown. This is the black-box signal a test uses to confirm the V2
+        ACTIVE<->SUSPENDED state machine fired (offload/onboard bytes stay 0 on
+        suspend, so they are the wrong proxy).
+        """
+        iter_stats = _make_mock_iteration_stats()
+        by_window = _make_mock_kv_iter_stats(window_size=16)
+        pool_group_stats = _make_mock_kv_iter_stats(window_size=16)[16]
+        kv_iter = KVCacheV2IterationStatsReport(
+            by_window,
+            {
+                0: KVCacheV2PoolGroupIterationStats(
+                    pool_group_id=0,
+                    slot_size=(2 << 20,),
+                    window_sizes=(16,),
+                    stats=pool_group_stats,
+                )
+            },
+            suspended_requests=2,
+            resumed_requests=1,
+        )
+
+        result = BaseWorker._stats_serializer((iter_stats, None, kv_iter))
+        d = json.loads(result)
+
+        assert d["iterSuspendedRequests"] == 2
+        assert d["iterResumedRequests"] == 1
+        # Manager-level, not nested inside the per-pool-group breakdown.
+        pool_group = d["kvCacheIterationStatsByPoolGroup"]["0"]
+        assert "iterSuspendedRequests" not in pool_group
+        assert "iterResumedRequests" not in pool_group
+
     def test_v2_peak_block_stats_reset_tracks_interval_peak(self):
         """Peak block stats should cover the interval since the previous reset."""
         from tensorrt_llm.runtime.kv_cache_manager_v2._common import GPU_LEVEL, CacheLevel
