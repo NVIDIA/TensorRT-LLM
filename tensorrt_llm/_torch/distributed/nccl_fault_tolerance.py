@@ -107,18 +107,6 @@ def resolve_nccl_group(group: Iterable[int]) -> List[int]:
     return list(_active_groups.get(root, root))
 
 
-def resolve_nccl_group_and_rank(group: Iterable[int], world_rank: int) -> tuple[List[int], int]:
-    """Resolve a raw NCCL group and the caller's compact communicator rank."""
-    active_group = resolve_nccl_group(group)
-    try:
-        compact_rank = active_group.index(int(world_rank))
-    except ValueError as error:
-        raise RuntimeError(
-            f"NCCL error: world rank {world_rank} is not in active communicator {active_group}"
-        ) from error
-    return active_group, compact_rank
-
-
 def is_nccl_group_reconfigured(group: Iterable[int]) -> bool:
     """Cheap hot-path membership-change check for a trusted rank group."""
     if not NCCL_FAULT_TOLERANCE_ENABLED:
@@ -162,49 +150,6 @@ def assert_nccl_group_not_reconfigured(group: Iterable[int], operation: str) -> 
             f"for statically sharded group {list(original_group)}; redistribute the "
             "missing rank's state and rebuild the mapping before resuming"
         )
-
-
-def publish_nccl_group_reconfiguration(
-    original_group: Iterable[int],
-    current_group: Iterable[int],
-    active_group: Iterable[int],
-) -> None:
-    """Publish a successful native raw-NCCL communicator replacement.
-
-    ``current_group`` makes stale or racing reconfiguration attempts fail
-    before they can overwrite newer membership.  Publishing happens only
-    after the coordinated native rebuild succeeds.
-    """
-    original = _canonical_group(original_group, "original_group")
-    current = _canonical_group(current_group, "current_group")
-    active = _canonical_group(active_group, "active_group")
-
-    if not set(active).issubset(current):
-        raise ValueError("active_group must be a subset of current_group")
-
-    with _registry_lock:
-        root = _reconfiguration_lineages.get(original, original)
-        registered = _active_groups.get(root, root)
-        if registered == active:
-            _unavailable_reconfiguration_lineages.pop(root, None)
-            return
-        if registered != current:
-            raise RuntimeError(
-                "NCCL error: stale communicator membership update: "
-                f"expected {list(registered)}, got {list(current)}"
-            )
-
-        # Preserve aliases for the model's original mapping and for any
-        # survivor-only mapping views already handed to communication helpers.
-        aliases = {
-            key for key, lineage_root in _reconfiguration_lineages.items() if lineage_root == root
-        }
-        aliases.update(key for key, value in _active_groups.items() if value == current)
-        aliases.update((root, original, current, active))
-        for alias in aliases:
-            _reconfiguration_lineages[alias] = root
-            _active_groups[alias] = active
-        _unavailable_reconfiguration_lineages.pop(root, None)
 
 
 def reconfigure_nccl_group(
