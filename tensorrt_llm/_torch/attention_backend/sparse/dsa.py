@@ -834,8 +834,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # Runtime cached lengths after overlap/spec-dec correction.
             start_positions = self.kv_lens_cuda[:self.num_seqs] - seq_lens
 
-            # Reuse request-per-token mapping prepared in metadata.prepare().
-            # This avoids repeat_interleave in graph-capture mode.
+            # Rebuild the token->request map from the current seq_lens: the map
+            # built in prepare() describes the target forward's layout, but the
+            # draft loop rewrites seq_lens to one token per request. Equivalent to
+            # prepare()'s repeat_interleave whenever seq_lens is unchanged.
+            cu_seq_lens = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
+            token_idx = torch.arange(self.num_tokens,
+                                     device=seq_lens.device,
+                                     dtype=torch.int32)
+            self.req_idx_per_token[:self.num_tokens] = torch.searchsorted(
+                cu_seq_lens, token_idx,
+                right=True).to(self.req_idx_per_token.dtype)
             req_indices = self.req_idx_per_token[:self.num_tokens].to(
                 dtype=torch.int64)
             seq_starts = torch.cumsum(
