@@ -24,6 +24,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
     KVCacheV2PoolGroupIterationStats,
+    KVCacheV2SsmLifeCycleIterationStats,
+    KVCacheV2SsmSnapshotIterationStats,
 )
 from tensorrt_llm.executor.base_worker import BaseWorker
 
@@ -387,7 +389,20 @@ class TestStatsSerializer:
                     window_size=16,
                     kind="attention",
                     stats=life_cycle_stats,
-                )
+                ),
+                4: KVCacheV2SsmLifeCycleIterationStats(
+                    life_cycle_id=4,
+                    pool_group_id=8,
+                    snapshot_stats=KVCacheV2SsmSnapshotIterationStats(
+                        iter_snapshot_lookups=4,
+                        iter_snapshot_hits=3,
+                        iter_snapshot_misses=1,
+                        iter_reused_tokens=96,
+                        iter_unreused_tokens=32,
+                        iter_aligned_snapshot_hits=2,
+                        iter_unaligned_snapshot_hits=1,
+                    ),
+                ),
             },
         )
 
@@ -425,6 +440,23 @@ class TestStatsSerializer:
         assert life_cycle["iterReusedBlocks"] == 5
         assert life_cycle["iterMissedBlocks"] == 3
         assert "iterGenAllocBlocks" not in life_cycle
+        ssm_life_cycle = d["kvCacheIterationStatsByLifecycle"]["4"]
+        assert ssm_life_cycle == {
+            "lifeCycleId": 4,
+            "poolGroupId": 8,
+            "windowSize": None,
+            "kind": "ssm",
+            "snapshotStats": {
+                "iterSnapshotLookups": 4,
+                "iterSnapshotHits": 3,
+                "iterSnapshotMisses": 1,
+                "iterSnapshotHitRate": 0.75,
+                "iterReusedTokens": 96,
+                "iterUnreusedTokens": 32,
+                "iterAlignedSnapshotHits": 2,
+                "iterUnalignedSnapshotHits": 1,
+            },
+        }
 
     def test_v2_peak_block_stats_reset_tracks_interval_peak(self):
         """Peak block stats should cover the interval since the previous reset."""
