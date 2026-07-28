@@ -668,6 +668,7 @@ def test_ft_disables_fused_nvfp4_gemm_allreduce(monkeypatch):
             return True
 
     class QuantConfig:
+        quant_algo = None
         layer_quant_mode = QuantMode()
 
     monkeypatch.setattr(linear_module, "mpi_disabled", lambda: False)
