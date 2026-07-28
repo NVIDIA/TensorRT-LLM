@@ -74,10 +74,6 @@ def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
     [
         ("callsite_dflash", "one-model MTP or EAGLE3"),
         ("union_only_per_head", "union"),
-        ("dynamic_tree", "linear speculative"),
-        ("dynamic_draft_length", "fixed speculative draft length"),
-        ("missing_draft", "separate draft"),
-        ("sliding_draft", "full-attention draft"),
     ],
 )
 def test_speculative_admission_gates_raise(gate, match):
@@ -86,32 +82,17 @@ def test_speculative_admission_gates_raise(gate, match):
 
     if gate == "callsite_dflash":
         spec_config = DFlashDecodingConfig(max_draft_len=3)
-    elif gate == "dynamic_tree":
-        spec_config = MTPDecodingConfig(
-            max_draft_len=2,
-            use_dynamic_tree=True,
-            dynamic_tree_max_topK=2,
-        )
-    elif gate == "dynamic_draft_length":
-        spec_config = MTPDecodingConfig(
-            max_draft_len=1,
-            draft_len_schedule={1: 1, 8: 0},
-        )
     else:
         spec_config = MTPDecodingConfig(max_draft_len=1)
     config = _make_tri_config(
         budget=8,
         eviction_mode="per_head" if gate == "union_only_per_head" else "union",
     )
-    draft_manager = None if gate == "missing_draft" else _make_fake_v2(is_draft=True)
-    if gate == "sliding_draft":
-        draft_manager.max_attention_window_vec = [128]
 
     with pytest.raises(ValueError, match=match):
         validate_kv_cache_compression_with_spec(
             config,
             spec_config,
-            draft_manager,
         )
 
 
@@ -181,6 +162,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
 
 def test_request_admission_reserves_score_high_watermark():
     manager = _make_triattention(budget=128, beta=64)
+    assert manager._selection_width_capacity == 193
     manager._phase = mock.Mock()
     manager._selection_width_capacity = 260
     manager._score_token_capacity = 0
@@ -192,7 +174,7 @@ def test_request_admission_reserves_score_high_watermark():
         manager._score_token_capacity = score_token_capacity
         manager._launch_score = object()
 
-    manager._build_eviction_capacity = mock.Mock(side_effect=publish_score_state)
+    manager._build_score_runtime = mock.Mock(side_effect=publish_score_state)
     requests = [
         _make_request(1, py_prompt_len=100, py_max_new_tokens=10000),
         _make_request(2, py_prompt_len=700, py_max_new_tokens=10),
@@ -200,9 +182,9 @@ def test_request_admission_reserves_score_high_watermark():
     ]
 
     for request in requests:
-        manager._reserve_eviction_capacity(request)
+        manager.on_request_init(request)
 
-    assert manager._build_eviction_capacity.call_args_list == [
+    assert manager._build_score_runtime.call_args_list == [
         mock.call(score_token_capacity=1024),
         mock.call(score_token_capacity=2048),
     ]
@@ -221,11 +203,11 @@ def test_request_admission_aligns_clamped_score_bucket_to_tile():
     manager._launch_score = None
     manager._compaction_done_event = mock.Mock()
     manager.kv_cache_manager = SimpleNamespace(max_seq_len=1050, tokens_per_block=128)
-    manager._build_eviction_capacity = mock.Mock()
+    manager._build_score_runtime = mock.Mock()
 
-    manager._reserve_eviction_capacity(_make_request(1, py_prompt_len=1025, py_max_new_tokens=192))
+    manager.on_request_init(_make_request(1, py_prompt_len=850, py_max_new_tokens=200))
 
-    manager._build_eviction_capacity.assert_called_once_with(score_token_capacity=1280)
+    manager._build_score_runtime.assert_called_once_with(score_token_capacity=1152)
     manager._compaction_done_event.synchronize.assert_not_called()
 
 

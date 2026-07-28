@@ -639,12 +639,9 @@ class Attention(nn.Module):
         if (config.kv_cache_compression_config is not None
                 and config.kv_cache_compression_config.
                 kv_cache_compression_mode.is_eviction_method()):
-            # Fused RoPE derives positions from the KV length, which eviction shortens; stay unfused.
             logger.warning_once(
-                "disable rope_fusion for KV-cache compression "
-                f"({config.kv_cache_compression_config.algorithm}): "
-                "rotary positions must come from logical position_ids, "
-                "not the compression-shortened KV length.",
+                "KV-cache eviction changes the physical cache length; "
+                "setting rope_fusion=False.",
                 key="disable_rope_fusion_for_kv_cache_compression")
             self.rope_fusion = False
 

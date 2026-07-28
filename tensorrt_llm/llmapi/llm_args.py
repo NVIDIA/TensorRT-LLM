@@ -58,9 +58,7 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  CapacitySchedulerPolicy as _CapacitySchedulerPolicy,
                                  ContextChunkingPolicy as _ContextChunkingPolicy,
                                  DecodingConfig,
-                                 DecodingMode,
                                  DynamicBatchConfig as _DynamicBatchConfig,
-                                 EagleConfig as _EagleConfig,
                                  ExecutorConfig as _ExecutorConfig,
                                  ExtendedRuntimePerfKnobConfig as _ExtendedRuntimePerfKnobConfig,
                                  KvCacheConfig as _KvCacheConfig,
@@ -3592,6 +3590,12 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "load.")
 
 
+KvCacheCompressionConfigType: TypeAlias = Annotated[
+    Union[TriAttentionKvCacheCompressionConfig],
+    Field(discriminator="algorithm"),
+]
+
+
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
 class AgentTreeConfig(StrictBaseModel, PybindMirror):
     """Configuration for agent tree scheduling.
@@ -4341,15 +4345,11 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype")
 
     # KV cache compression config (separate from sparse attention: changes which
-    # KV is stored, not the attention computation). Dispatch is by the
-    # ``algorithm`` tag; grow this into a discriminated union when a second
-    # algorithm lands.
-    kv_cache_compression_config: Optional[
-        TriAttentionKvCacheCompressionConfig] = Field(
-            default=None,
-            description=
-            "KV-cache compression config; None disables compression.",
-            status="prototype")
+    # KV is stored, not the attention computation).
+    kv_cache_compression_config: Optional[KvCacheCompressionConfigType] = Field(
+        default=None,
+        description="KV-cache compression config; None disables compression.",
+        status="prototype")
 
     # Speculative decoding parameters
     speculative_config: Optional[SpeculativeConfig] = Field(

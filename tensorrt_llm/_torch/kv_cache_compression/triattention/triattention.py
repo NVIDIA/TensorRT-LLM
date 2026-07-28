@@ -35,7 +35,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheCompressionManager
 from tensorrt_llm._torch.utils import next_positive_power_of_2
-from tensorrt_llm._utils import nvtx_range, nvtx_range_debug, prefer_pinned
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     copy_batch_block_offsets_to_device,
 )
@@ -79,11 +79,7 @@ def _allocate_block_offset_staging(
     request_capacity: int,
     token_capacity: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Allocate a host snapshot and persistent device table.
-
-    Both use the native V2 ``[pool, request, K/V, block]`` layout and grow only
-    when a newly admitted request raises the high-water mark.
-    """
+    """Allocate a V2 page-table snapshot for the scorer/compactor token span."""
     tokens_per_block = int(anchor_pool.shape[3])
     page_count = (token_capacity + tokens_per_block - 1) // tokens_per_block
     max_source_blocks = int(manager.host_kv_cache_block_offsets.shape[-1])
@@ -176,12 +172,13 @@ class TriAttention(KVCacheCompressionManager):
         # The next-step reservation size is fixed; overlap only changes which
         # requests have it.
         self._overlap_tail_length = 1 + int(kv_cache_manager._kv_reserve_draft_tokens)
-        # Fixed by the manager/config; only absolute source length can grow
-        # when later requests arrive with longer prompts.
+        # Fixed buffer geometry. These are TriAttention scratch dimensions,
+        # not KV capacities owned by KVCacheManagerV2.
         self._request_capacity = int(kv_cache_manager.max_batch_size)
-        self._selection_width_capacity = (
-            self.budget + 2 * self.beta + int(kv_cache_manager.max_total_draft_tokens)
-        )
+        max_draft_tokens = int(kv_cache_manager.max_total_draft_tokens)
+        # Crossing a cadence can overshoot by D accepted draft tokens; one
+        # suspended due round may resume with another 1 + D confirmed tokens.
+        self._selection_width_capacity = self.budget + self.beta + 2 * max_draft_tokens + 1
         max_tail_capacity = max(
             self._protected_tail_capacity,
             self._draft_protected_tail_capacity,
@@ -350,12 +347,35 @@ class TriAttention(KVCacheCompressionManager):
     # ---- framework hooks (call order) ----
 
     def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
-        """Validate and reserve request-dependent eviction capacity."""
-        self._validate_request_capacity(request)
-        self._reserve_eviction_capacity(request)
+        """Cover this request's largest possible scorer span."""
+        manager = self.kv_cache_manager
+        prompt_length = int(request.py_prompt_len)
+        max_decode_tokens = min(
+            int(request.py_max_new_tokens),
+            max(int(manager.max_seq_len) - prompt_length, 0),
+        )
+        first_evict_step = (self.budget // self.beta + 1) * self.beta
+        if max_decode_tokens < first_evict_step:
+            return
+        self._phase.reserve(prompt_length + max_decode_tokens + 1)
+        required_source_tokens = prompt_length + min(
+            max_decode_tokens, self._selection_width_capacity
+        )
+        if required_source_tokens <= self._score_token_capacity:
+            return
+
+        # CuTe launches capture score buffers; retire an older, smaller span first.
+        if self._launch_score is not None:
+            self._compaction_done_event.synchronize()
+
+        score_token_capacity = next_positive_power_of_2(max(required_source_tokens, 1024))
+        score_token_capacity = min(score_token_capacity, int(manager.max_seq_len))
+        score_tile_tokens = max(64, int(manager.tokens_per_block))
+        score_token_capacity = -(-score_token_capacity // score_tile_tokens) * score_tile_tokens
+        self._build_score_runtime(score_token_capacity=score_token_capacity)
 
     def on_generation_step_begin(self, scheduled_batch: "ScheduledRequests", **kwargs) -> None:
-        """Remember the batch whose next-step KV capacity is already reserved."""
+        """Remember the next batch: overlap prepares it before updating the previous batch."""
         self._prepared_generation_batch = scheduled_batch
 
     def on_generation_step_end(self, scheduled_batch: "ScheduledRequests", **kwargs) -> None:
@@ -363,40 +383,7 @@ class TriAttention(KVCacheCompressionManager):
 
         KVCacheManagerV2 must run first so capacity includes the written token and any rewind.
         """
-        with nvtx_range_debug("triattention.generation_step_end", color="blue"):
-            self._evict_due_requests(scheduled_batch)
-
-    # ---- request capacity ----
-
-    def _validate_request_capacity(self, request: "LlmRequest") -> None:
-        """Reject requests whose maximum pre-eviction peak cannot fit."""
-        speculative_overshoot = int(self.kv_cache_manager.max_draft_len)
-        decode_capacity = min(
-            int(request.py_max_new_tokens),
-            self.budget + self.beta + speculative_overshoot,
-        )
-        confirmed_capacity = int(request.py_prompt_len) + decode_capacity
-        checked = [(self.kv_cache_manager, self._protected_tail_capacity, "target")]
-        if self.draft_kv_cache_manager is not None:
-            checked.append(
-                (self.draft_kv_cache_manager, self._draft_protected_tail_capacity, "draft")
-            )
-        for manager, protected_tail, label in checked:
-            required_capacity = confirmed_capacity + protected_tail
-            pool_capacity = manager.get_num_available_tokens(
-                token_num_upper_bound=confirmed_capacity,
-                max_num_draft_tokens=int(manager._kv_reserve_draft_tokens) + 1,
-            )
-            table_capacity = manager.max_blocks_per_seq * manager.tokens_per_block
-            if confirmed_capacity > pool_capacity or required_capacity > table_capacity:
-                raise ValueError(
-                    f"TriAttention {label} KV capacity is too small for eviction: "
-                    f"request requires {required_capacity} tokens "
-                    f"(prompt={request.py_prompt_len}, budget={self.budget}, "
-                    f"beta={self.beta}, protected tail={protected_tail}), but the "
-                    f"V2 pool covers {pool_capacity + protected_tail} tokens and "
-                    f"its page table covers {table_capacity} tokens"
-                )
+        self._evict_due_requests(scheduled_batch)
 
     # ---- eviction round ----
 
@@ -415,67 +402,66 @@ class TriAttention(KVCacheCompressionManager):
             if prepared_batch is not None and prepared_batch is not scheduled_batch
             else set()
         )
-        with nvtx_range("triattention.metadata", color="cyan"):
-            for request in scheduled_batch.generation_requests:
-                if request.is_dummy or request.state in (
-                    LlmRequestState.GENERATION_COMPLETE,
-                    LlmRequestState.CONTEXT_INIT,
-                ):
+        for request in scheduled_batch.generation_requests:
+            if request.is_dummy or request.state in (
+                LlmRequestState.GENERATION_COMPLETE,
+                LlmRequestState.CONTEXT_INIT,
+            ):
+                continue
+            request_id = request.py_request_id
+            target_cache = manager.kv_cache_map.get(request_id)
+            if target_cache is None or not target_cache.is_active:
+                # Overlap scheduling may suspend a cache mid-flight; defer
+                # this request (pre-launch) instead of failing the batch.
+                continue
+            draft_cache = None
+            if self.draft_kv_cache_manager is not None:
+                # A missing draft cache is a wiring bug: keep the precise KeyError.
+                draft_cache = self.draft_kv_cache_manager.kv_cache_map[request_id]
+                if not draft_cache.is_active:
                     continue
-                request_id = request.py_request_id
-                target_cache = manager.kv_cache_map.get(request_id)
-                if target_cache is None or not target_cache.is_active:
-                    # Overlap scheduling may suspend a cache mid-flight; defer
-                    # this request (pre-launch) instead of failing the batch.
-                    continue
-                draft_cache = None
-                if self.draft_kv_cache_manager is not None:
-                    # A missing draft cache is a wiring bug: keep the precise KeyError.
-                    draft_cache = self.draft_kv_cache_manager.kv_cache_map[request_id]
-                    if not draft_cache.is_active:
-                        continue
-                target_tail_length = self._num_extra_kv_tokens + (
-                    self._overlap_tail_length if request_id in overlap_request_ids else 0
+            target_tail_length = self._num_extra_kv_tokens + (
+                self._overlap_tail_length if request_id in overlap_request_ids else 0
+            )
+            source_length = int(target_cache.capacity) - target_tail_length
+            if source_length < target_cache.history_length:
+                raise RuntimeError(
+                    f"Request {request_id} KV length {source_length} is below "
+                    f"finalized history {target_cache.history_length}"
                 )
-                source_length = int(target_cache.capacity) - target_tail_length
-                if source_length < target_cache.history_length:
-                    raise RuntimeError(
-                        f"Request {request_id} KV length {source_length} is below "
-                        f"finalized history {target_cache.history_length}"
-                    )
-                prompt_length = int(request.py_prompt_len)
-                # Restore the logical length from the physical cache and the
-                # eviction count already published to the model runtime.
-                compressed_tokens = int(request.py_num_compressed_tokens)
-                logical_source_length = source_length + compressed_tokens
-                confirmed_tokens = logical_source_length - prompt_length
-                # The last compact ended at budget + compressed_tokens. This
-                # watermark catches a beta boundary deferred by cache suspension.
-                if (self.budget + compressed_tokens) // self.beta >= (
-                    confirmed_tokens // self.beta
-                ):
-                    continue
-                if source_length <= prompt_length + self.budget:
-                    # Selection would be an identity: nothing to evict yet.
-                    continue
-                eviction_requests.append(
-                    _EvictionRequest(
-                        request=request,
-                        target_cache=target_cache,
-                        draft_cache=draft_cache,
-                        source_length=source_length,
-                        target_tail_length=target_tail_length,
-                    )
+            prompt_length = int(request.py_prompt_len)
+            # Restore the logical length from the physical cache and the
+            # eviction count already published to the model runtime.
+            compressed_tokens = int(request.py_num_compressed_tokens)
+            logical_source_length = source_length + compressed_tokens
+            confirmed_tokens = logical_source_length - prompt_length
+            # The last compact ended at budget + compressed_tokens. This
+            # watermark catches a beta boundary deferred by cache suspension.
+            if (self.budget + compressed_tokens) // self.beta >= (confirmed_tokens // self.beta):
+                continue
+            if source_length <= prompt_length + self.budget:
+                # Selection would be an identity: nothing to evict yet.
+                continue
+            decode_width = source_length - prompt_length
+            if decode_width > self._selection_width_capacity:
+                raise RuntimeError(
+                    f"Request {request_id} TriAttention selection width "
+                    f"{decode_width} exceeds compiled capacity "
+                    f"{self._selection_width_capacity}"
                 )
+            eviction_requests.append(
+                _EvictionRequest(
+                    request=request,
+                    target_cache=target_cache,
+                    draft_cache=draft_cache,
+                    source_length=source_length,
+                    target_tail_length=target_tail_length,
+                )
+            )
         if not eviction_requests:
             return
 
-        # Ungated NVTX: the due count in the message shows each round's size.
-        with nvtx_range(
-            f"triattention.evict_request_group reqs={len(eviction_requests)}",
-            color="purple",
-        ):
-            self._execute_eviction_round(eviction_requests)
+        self._execute_eviction_round(eviction_requests)
         for item in eviction_requests:
             evicted = item.source_length - int(item.request.py_prompt_len) - self.budget
             # The manager's only channel to the runtime (feeds num_cached_tokens_per_seq).
@@ -493,113 +479,107 @@ class TriAttention(KVCacheCompressionManager):
         # PyExecutor already joins its execution stream before the final
         # compression resource update, so the round can use caller current.
         try:
-            with nvtx_range_debug("triattention.page_table_stage", color="orange"):
-                request_ids = [item.request.py_request_id for item in eviction_requests]
-                logical_source_lengths = [
-                    item.source_length + int(item.request.py_num_compressed_tokens)
-                    for item in eviction_requests
-                ]
-                prompt_lengths = [int(item.request.py_prompt_len) for item in eviction_requests]
-                source_lengths = [item.source_length for item in eviction_requests]
-                dense_move_offsets, swa_move_offsets, draft_move_offsets = (
-                    self._compute_compaction_move_offsets(eviction_requests)
+            request_ids = [item.request.py_request_id for item in eviction_requests]
+            logical_source_lengths = [
+                item.source_length + int(item.request.py_num_compressed_tokens)
+                for item in eviction_requests
+            ]
+            prompt_lengths = [int(item.request.py_prompt_len) for item in eviction_requests]
+            source_lengths = [item.source_length for item in eviction_requests]
+            dense_move_offsets, swa_move_offsets, draft_move_offsets = (
+                self._compute_compaction_move_offsets(eviction_requests)
+            )
+            metadata_rows = (
+                logical_source_lengths,
+                source_lengths,
+                prompt_lengths,
+                dense_move_offsets,
+                swa_move_offsets,
+                draft_move_offsets,
+            )
+            # CPU may rewrite pinned staging only after its prior H2D completes.
+            self._staging_reuse_event.synchronize()
+            host_table = self._request_metadata_host_np
+            for row, values in enumerate(metadata_rows):
+                if values is not None:
+                    host_table[row, : len(values)] = values
+            # Native compaction keeps fixed-capacity metadata views; make
+            # their unused request rows explicit no-ops.
+            host_table[:3, len(eviction_requests) :] = 0
+            try:
+                self._stage_block_offsets(
+                    manager,
+                    request_ids,
+                    self._block_offsets_host,
+                    self._block_offsets_device,
                 )
-                metadata_rows = (
-                    logical_source_lengths,
-                    source_lengths,
-                    prompt_lengths,
-                    dense_move_offsets,
-                    swa_move_offsets,
-                    draft_move_offsets,
-                )
-                # CPU may rewrite pinned staging only after its prior H2D completes.
-                self._staging_reuse_event.synchronize()
-                host_table = self._request_metadata_host_np
-                for row, values in enumerate(metadata_rows):
-                    if values is not None:
-                        host_table[row, : len(values)] = values
-                # Native compaction keeps fixed-capacity metadata views; make
-                # their unused request rows explicit no-ops.
-                host_table[:3, len(eviction_requests) :] = 0
-                try:
+                if draft_manager is not None:
                     self._stage_block_offsets(
-                        manager,
+                        draft_manager,
                         request_ids,
-                        self._block_offsets_host,
-                        self._block_offsets_device,
+                        self._draft_block_offsets_host,
+                        self._draft_block_offsets_device,
                     )
-                    if draft_manager is not None:
-                        self._stage_block_offsets(
-                            draft_manager,
-                            request_ids,
-                            self._draft_block_offsets_host,
-                            self._draft_block_offsets_device,
-                        )
-                    self._request_metadata_device.copy_(
-                        self._request_metadata_host, non_blocking=True
-                    )
-                finally:
-                    self._staging_reuse_event.record(stream)
+                self._request_metadata_device.copy_(self._request_metadata_host, non_blocking=True)
+            finally:
+                self._staging_reuse_event.record(stream)
 
             request_count = len(eviction_requests)
             union = self.eviction_mode == "union"
-            with nvtx_range("triattention.score", color="blue"):
-                # In-place refresh: the compiled score launches captured these pointers.
-                _gather_mean_phase_kernel[(request_count,)](
-                    self._logical_source_lengths_device,
-                    self._phase.cos,
-                    self._phase.sin,
-                    self._source_lengths_device,
-                    self._prompt_lengths_device,
-                    self._mean_cos,
-                    self._mean_sin,
-                    self._decode_lengths_device,
-                    self._swa_destination_bases,
-                    self._swa_rebase_delta,
-                    NUM_FREQS=self._phase.num_freqs,
-                    F_BLOCK=self._phase.frequency_block,
-                    HAS_SWA=self._swa_destination_bases is not None,
-                    num_warps=1,
+            # In-place refresh: the compiled score launches captured these pointers.
+            _gather_mean_phase_kernel[(request_count,)](
+                self._logical_source_lengths_device,
+                self._phase.cos,
+                self._phase.sin,
+                self._source_lengths_device,
+                self._prompt_lengths_device,
+                self._mean_cos,
+                self._mean_sin,
+                self._decode_lengths_device,
+                self._swa_destination_bases,
+                self._swa_rebase_delta,
+                NUM_FREQS=self._phase.num_freqs,
+                F_BLOCK=self._phase.frequency_block,
+                HAS_SWA=self._swa_destination_bases is not None,
+                num_warps=1,
+            )
+            self._launch_score(request_count)
+            if union and self._union_tp_mapping is not None:
+                # Max is order-free, so every TP rank keeps the same ordinals.
+                gathered = allgather(
+                    self._selection_scores_rows[:request_count],
+                    self._union_tp_mapping,
+                    dim=0,
                 )
-                self._launch_score(request_count)
-                if union and self._union_tp_mapping is not None:
-                    # Max is order-free, so every TP rank keeps the same ordinals.
-                    gathered = allgather(
-                        self._selection_scores_rows[:request_count],
-                        self._union_tp_mapping,
-                        dim=0,
-                    )
-                    _fold_union_ranks_kernel[
-                        (
-                            request_count,
-                            triton.cdiv(self._selection_width_capacity, 1024),
-                        )
-                    ](
-                        gathered,
-                        self._selection_scores_rows,
+                _fold_union_ranks_kernel[
+                    (
                         request_count,
-                        TP_SIZE=int(self._union_tp_mapping.tp_size),
-                        WIDTH=self._selection_width_capacity,
+                        triton.cdiv(self._selection_width_capacity, 1024),
                     )
-            with nvtx_range("triattention.select", color="yellow"):
-                if not union:
-                    reduce_per_head_scores(
-                        self._score_scratch,
-                        self._decode_lengths_device,
-                        self._prompt_lengths_device,
-                        self._row_mean,
-                        self._row_inv_std,
-                        self._selection_scores_rows,
-                        self._selection_row_lengths,
-                        request_count=request_count,
-                        padded_head_columns=PADDED_HEAD_COLUMNS,
-                        score_token_capacity=self._score_token_capacity,
-                        per_layer=self.eviction_mode == "per_layer_perhead",
-                        normalize_scores=self.normalize_scores,
-                    )
-                self._select_top_tokens(request_count)
-            with nvtx_range("triattention.compact", color="purple"):
-                compact(self._compaction_params, request_count)
+                ](
+                    gathered,
+                    self._selection_scores_rows,
+                    request_count,
+                    TP_SIZE=int(self._union_tp_mapping.tp_size),
+                    WIDTH=self._selection_width_capacity,
+                )
+            if not union:
+                reduce_per_head_scores(
+                    self._score_scratch,
+                    self._decode_lengths_device,
+                    self._prompt_lengths_device,
+                    self._row_mean,
+                    self._row_inv_std,
+                    self._selection_scores_rows,
+                    self._selection_row_lengths,
+                    request_count=request_count,
+                    padded_head_columns=PADDED_HEAD_COLUMNS,
+                    score_token_capacity=self._score_token_capacity,
+                    per_layer=self.eviction_mode == "per_layer_perhead",
+                    normalize_scores=self.normalize_scores,
+                )
+            self._select_top_tokens(request_count)
+            compact(self._compaction_params, request_count)
         finally:
             # Target and draft V2 managers share this execution stream.
             self._compaction_done_event.record(stream)
@@ -677,34 +657,31 @@ class TriAttention(KVCacheCompressionManager):
         )
 
     def _resize_compacted_caches(self, eviction_requests: Sequence[_EvictionRequest]) -> None:
-        with nvtx_range("triattention.resize", color="red"):
-            for item in eviction_requests:
-                resized_capacity = (
-                    int(item.request.py_prompt_len) + self.budget + item.target_tail_length
+        for item in eviction_requests:
+            resized_capacity = (
+                int(item.request.py_prompt_len) + self.budget + item.target_tail_length
+            )
+            if not item.target_cache.resize(resized_capacity, None):
+                raise RuntimeError(
+                    "Failed to resize compacted target KV cache for "
+                    f"request {item.request.py_request_id} to "
+                    f"{resized_capacity} tokens"
                 )
-                if not item.target_cache.resize(resized_capacity, None):
-                    raise RuntimeError(
-                        "Failed to resize compacted target KV cache for "
-                        f"request {item.request.py_request_id} to "
-                        f"{resized_capacity} tokens"
-                    )
-            if self.draft_kv_cache_manager is None:
-                return
-            # Target and draft retain the same selected tokens.
-            for item in eviction_requests:
-                resized_capacity = (
-                    int(item.request.py_prompt_len)
-                    + self.budget
-                    + self._draft_protected_tail_capacity
+        if self.draft_kv_cache_manager is None:
+            return
+        # Target and draft retain the same selected tokens.
+        for item in eviction_requests:
+            resized_capacity = (
+                int(item.request.py_prompt_len) + self.budget + self._draft_protected_tail_capacity
+            )
+            if not item.draft_cache.resize(resized_capacity, None):
+                raise RuntimeError(
+                    "Failed to resize compacted draft KV cache for "
+                    f"request {item.request.py_request_id} to "
+                    f"{resized_capacity} tokens"
                 )
-                if not item.draft_cache.resize(resized_capacity, None):
-                    raise RuntimeError(
-                        "Failed to resize compacted draft KV cache for "
-                        f"request {item.request.py_request_id} to "
-                        f"{resized_capacity} tokens"
-                    )
 
-    # ---- persistent state + request capacity ----
+    # ---- persistent state + score runtime ----
 
     def _initialize_eviction_state(self) -> None:
         """Create manager-lifetime state once."""
@@ -778,7 +755,7 @@ class TriAttention(KVCacheCompressionManager):
         *,
         num_freqs: int,
     ) -> None:
-        """Allocate manager-lifetime host staging and device metadata."""
+        """Allocate fixed manager-lifetime host staging and device metadata."""
         row_count = 6
         request_capacity = self._request_capacity
         self._request_metadata_host = torch.empty(
@@ -816,18 +793,18 @@ class TriAttention(KVCacheCompressionManager):
         self._mean_sin = torch.empty_like(self._mean_cos)
 
     def _allocate_selection_buffers(self, device: torch.device, *, tp_size: int) -> None:
-        """Allocate fixed TopK inputs and outputs for the configured mode."""
+        """Allocate fixed manager-lifetime TopK inputs and outputs."""
         request_capacity = self._request_capacity
         selection_width = self._selection_width_capacity
         union = self.eviction_mode == "union"
-        if union:
-            self._selection_rows_per_request = 1
-        elif self.eviction_mode == "per_head":
-            self._selection_rows_per_request = self._num_kv_heads
-        else:
-            self._selection_rows_per_request = self._num_layers * self._num_kv_heads
+        self._selection_rows_per_request = (
+            1
+            if union
+            else self._num_kv_heads
+            * (self._num_layers if self.eviction_mode == "per_layer_perhead" else 1)
+        )
         selection_rows = request_capacity * self._selection_rows_per_request
-        selection_rect = selection_rows * max(selection_width, self.budget)
+        selection_rect = selection_rows * selection_width
         if union:
             selection_rect = max(
                 selection_rect,
@@ -872,44 +849,12 @@ class TriAttention(KVCacheCompressionManager):
         )
         self._kept_ordinal_rows = torch.empty_like(self._provisional_rows)
 
-    def _reserve_eviction_capacity(self, request: "LlmRequest") -> None:
-        """Reserve all request-dependent runtime capacity at admission."""
-        first_evict_step = (self.budget // self.beta + 1) * self.beta
-        if int(request.py_max_new_tokens) < first_evict_step:
-            return
-        self._phase.reserve(int(request.py_prompt_len) + int(request.py_max_new_tokens) + 1)
-        decode_tokens = min(int(request.py_max_new_tokens), self._selection_width_capacity)
-        required_source_tokens = int(request.py_prompt_len) + decode_tokens
-        if required_source_tokens <= self._score_token_capacity:
-            return
-
-        # A newly admitted request may require larger score state while work
-        # from an older request is still in flight.
-        if self._launch_score is not None:
-            self._compaction_done_event.synchronize()
-
-        manager = self.kv_cache_manager
-        # Bucket the largest admitted source rather than eagerly reserving
-        # max_seq_len; score scratch is the dominant allocation.
-        score_token_capacity = next_positive_power_of_2(max(required_source_tokens, 1024))
-        score_token_capacity = min(
-            score_token_capacity, max(int(manager.max_seq_len), required_source_tokens)
-        )
-        # The bucket capacity must be tile-aligned (mis-tiling stripes the
-        # score scratch silently); the ceiling division constructs that fact.
-        score_tile_tokens = max(64, int(manager.tokens_per_block))
-        score_token_capacity = -(-score_token_capacity // score_tile_tokens) * score_tile_tokens
-
-        self._build_eviction_capacity(
-            score_token_capacity=score_token_capacity,
-        )
-
-    def _build_eviction_capacity(
+    def _build_score_runtime(
         self,
         *,
         score_token_capacity: int,
     ) -> None:
-        """Build and publish all state bound to one score-token capacity."""
+        """Build one scorer span and refresh its page-table bindings."""
         dense_layer = self._target_layout["dense_layers"][0]
         anchor_pool = self._target_layout["layer_pools"][dense_layer]
         request_capacity = self._request_capacity
@@ -985,18 +930,10 @@ class TriAttention(KVCacheCompressionManager):
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         global_layers = self._global_layers
-        num_layers = len(global_layers)
         if global_layers and max(global_layers) >= self._calibration_q_real.shape[0]:
             raise ValueError(
                 f"TriAttention calibration has {self._calibration_q_real.shape[0]} layers, "
                 f"but this PP rank references global layer {max(global_layers)}"
-            )
-        if global_layers == list(range(global_layers[0], global_layers[0] + num_layers)):
-            layer_slice = slice(global_layers[0], global_layers[0] + num_layers)
-            return (
-                self._calibration_q_real[layer_slice],
-                self._calibration_q_imag[layer_slice],
-                self._calibration_mlr_coef[layer_slice],
             )
         layer_ids = torch.as_tensor(
             global_layers,

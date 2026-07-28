@@ -2113,7 +2113,6 @@ def _create_kv_cache_manager(
 def validate_kv_cache_compression_with_spec(
     config: KvCacheCompressionConfig,
     spec_config: Optional[SpeculativeConfig],
-    draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
 ) -> None:
     """Reject speculative setups the compression method cannot run with."""
     if spec_config is None:
@@ -2129,19 +2128,6 @@ def validate_kv_cache_compression_with_spec(
         raise ValueError(
             f"KV-cache compression does not support speculative decoding "
             f"mode {mode.name}; use one-model MTP or EAGLE3")
-    if not spec_config.is_linear_tree:
-        raise ValueError(
-            "KV-cache compression requires linear speculative decoding")
-    if spec_config.draft_len_schedule is not None:
-        raise ValueError(
-            "KV-cache compression requires a fixed speculative draft length")
-    if draft_kv_cache_manager is None:
-        raise ValueError(
-            "KV-cache compression requires a separate draft KV cache")
-    if any(window is not None
-           for window in draft_kv_cache_manager.max_attention_window_vec):
-        raise ValueError(
-            "KV-cache compression requires full-attention draft KV")
 
 
 def create_kv_cache_compression_manager(
@@ -2158,6 +2144,7 @@ def create_kv_cache_compression_manager(
     ``validate_kv_cache_compression_with_spec``.
     """
     if config.algorithm == "triattention":
+        # TriAttention imports CuTe/CUTLASS; keep normal executor startup lazy.
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import \
             TriAttention
 
@@ -2422,8 +2409,7 @@ def create_py_executor_instance(
         draft_kv_cache_manager = resources.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         validate_kv_cache_compression_with_spec(kv_cache_compression_config,
-                                                spec_config,
-                                                draft_kv_cache_manager)
+                                                spec_config)
         compression_manager = create_kv_cache_compression_manager(
             kv_cache_compression_config,
             kv_cache_manager,

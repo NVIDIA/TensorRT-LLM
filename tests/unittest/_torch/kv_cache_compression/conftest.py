@@ -544,7 +544,7 @@ def make_cute_buffers(
     manager._staging_reuse_event.record(torch.cuda.current_stream(layer_pools[0].device))
     manager._compaction_done_event = torch.cuda.Event()
     manager._compaction_done_event.record(torch.cuda.current_stream(layer_pools[0].device))
-    manager._build_eviction_capacity(score_token_capacity=seq_len)
+    manager._build_score_runtime(score_token_capacity=seq_len)
     return manager
 
 

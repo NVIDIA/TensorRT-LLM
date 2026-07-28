@@ -79,40 +79,6 @@ class TestConfigAndFactory:
 
 
 class TestTriAttentionClass:
-    def test_request_init_validates_and_reserves_capacity(self):
-        manager = _make_fake_v2()
-        manager.num_extra_kv_tokens = 4
-        manager._kv_reserve_draft_tokens = 4
-        with mock.patch.object(TriAttention, "_initialize_eviction_state"):
-            triattention = TriAttention(_make_tri_config(budget=8), manager)
-        with (
-            mock.patch.object(triattention, "_validate_request_capacity") as validate,
-            mock.patch.object(triattention, "_reserve_eviction_capacity") as reserve,
-        ):
-            request_11 = _make_request(11)
-            request_12 = _make_request(12)
-            triattention.on_request_init(request_11)
-            triattention.on_request_init(request_12)
-
-        assert triattention.adjusts_generation_kv_length is True
-        assert manager.kv_compression_manages_history
-        assert validate.call_args_list == [mock.call(request_11), mock.call(request_12)]
-        assert reserve.call_args_list == [mock.call(request_11), mock.call(request_12)]
-
-    def test_capacity_guard_uses_maximum_steady_eviction_peak(self):
-        manager = _make_triattention(budget=10, beta=8)
-        manager.kv_cache_manager.get_num_available_tokens = mock.Mock(return_value=17)
-
-        with pytest.raises(ValueError, match="requires 19 tokens"):
-            manager._validate_request_capacity(
-                _make_request(7, py_prompt_len=0, py_max_new_tokens=100)
-            )
-
-        manager.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
-            token_num_upper_bound=18,
-            max_num_draft_tokens=1,
-        )
-
     def test_resolve_accepts_flat_pt(self, flat_calibration_pt):
         mgr = _make_triattention()
         mgr.calibration_path = flat_calibration_pt
@@ -287,6 +253,7 @@ class TestEvictionLifecycle:
         )
         mgr.beta = 128
         mgr.budget = 4096
+        mgr._selection_width_capacity = mgr.budget + mgr.beta + 1
         return mgr, request, batch
 
     def test_suspended_cache_defers_that_request_pre_launch(self):
@@ -312,12 +279,23 @@ class TestEvictionLifecycle:
             assert second_request.py_num_compressed_tokens == 0
 
             second_cache.is_active = True
+            # Resumption executes one more token before the next final update.
+            second_cache.capacity += 1
             manager._evict_due_requests(SimpleNamespace(generation_requests=[second_request]))
 
         resumed = internals.execute.call_args.args[0]
         assert [item.request.py_request_id for item in resumed] == [8]
-        assert second_request.py_num_compressed_tokens == 128
+        assert second_request.py_num_compressed_tokens == 129
         second_cache.resize.assert_called_once_with(1024 + 4096, None)
+
+    def test_deferred_eviction_checks_the_compiled_selection_width(self):
+        manager, request, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 128 + 2)
+
+        with _mocked_eviction_internals(manager) as internals:
+            with pytest.raises(RuntimeError, match="selection width"):
+                manager._evict_due_requests(batch)
+
+        internals.execute.assert_not_called()
 
     # Accepted draft tokens may cross the same cadence boundary; they do not
     # change the fixed overlap reservation.
@@ -364,8 +342,10 @@ class TestEvictionLifecycle:
     def test_confirmed_length_comes_from_capacity_ledger_not_logical_length(self):
         # The due-branch source length must come from the physical capacity
         # ledger (capacity minus the protected tail), never the logical length.
-        physical_confirmed = 6172
         manager = _make_triattention(beta=128)
+        compressed_tokens = manager.beta - manager.budget
+        # Reachable second cadence boundary, within the compiled selection span.
+        physical_confirmed = 1024 + manager.budget + manager.beta
         cache = SimpleNamespace(
             capacity=physical_confirmed,
             history_length=1024,
@@ -377,8 +357,8 @@ class TestEvictionLifecycle:
         request = _make_request(
             7,
             py_prompt_len=1024,
-            py_num_compressed_tokens=100,
-            max_beam_num_tokens=999999,
+            py_num_compressed_tokens=compressed_tokens,
+            max_beam_num_tokens=physical_confirmed + compressed_tokens + 1,
             py_draft_tokens=[1, 2, 3, 4],
         )
 
@@ -388,7 +368,7 @@ class TestEvictionLifecycle:
         eviction_requests = internals.execute.call_args.args[0]
         assert eviction_requests[0].source_length == physical_confirmed
         assert request.py_num_compressed_tokens == (
-            100 + physical_confirmed - 1024 - manager.budget
+            compressed_tokens + physical_confirmed - 1024 - manager.budget
         )
         cache.resize.assert_called_once_with(1024 + manager.budget, None)
 
@@ -418,7 +398,6 @@ class TestEvictionLifecycle:
         validate_kv_cache_compression_with_spec(
             _make_tri_config(budget=8),
             spec_config,
-            draft_manager,
         )
 
 
