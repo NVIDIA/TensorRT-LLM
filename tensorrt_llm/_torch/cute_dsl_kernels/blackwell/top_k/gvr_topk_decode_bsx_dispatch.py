@@ -82,6 +82,38 @@ def _thresholds(npad):
     return tpb, dnb
 
 
+# Measured fallback band table (op43-pr6 full-grid verdict, 2026-07-28):
+# (npad, bs) buckets where the in-tree kernel is faster than every bsx
+# tier by >1.10x on at least one production layer (865 real decode cells
+# x 11 BS, same-rep cold-L2 nsys pairs; data
+# op43_bsx_cutedsl/results/pr6_band_table.json, recalibration recipe in
+# the campaign notes). These are the L2-resident mid-N shapes where the
+# in-tree exact-count ladder admits a leaner candidate set and its
+# row-slice cluster split keeps every CTA busy through P4. Routing them
+# to the in-tree kernel caps the worst case at 1.10x while keeping the
+# bsx win elsewhere (full-grid gm 1.40 vs the in-tree head).
+# Keys are the nearest power-of-two of npad; values are inclusive bs
+# ranges. TRTLLM_BSX_FALLBACK_BANDS=0 disables the table (bsx serves
+# every guarded shape).
+_FALLBACK_BANDS = {
+    8192: (256, 1 << 30),
+    16384: (256, 1 << 30),
+    32768: (16, 1 << 30),
+    65536: (16, 1 << 30),
+    131072: (16, 255),
+    262144: (16, 127),
+}
+
+
+def _in_fallback_band(bs: int, npad: int) -> bool:
+    if _env_threshold("TRTLLM_BSX_FALLBACK_BANDS") == _BIG:  # "0" -> off
+        return False
+    up = 1 << max(npad - 1, 1).bit_length()  # pow2 >= npad
+    np2 = up if 4 * npad >= 3 * up else up >> 1  # arithmetic-midpoint nearest
+    band = _FALLBACK_BANDS.get(np2)
+    return band is not None and band[0] <= bs <= band[1]
+
+
 # tier name -> (kind, params). reg params = (cs, tb, maxv, ar).
 def route(bs: int, npad: int, K: int) -> str:
     """Tier the CUDA gvr_topk_launch_batched would take. Returns
@@ -204,6 +236,8 @@ def is_bsx_supported(
         return False
     n_req = bs // next_n
     if npad > 262144 or npad % 64 != 0:
+        return False
+    if _in_fallback_band(bs, npad):
         return False
     if not (
         logits.is_contiguous()

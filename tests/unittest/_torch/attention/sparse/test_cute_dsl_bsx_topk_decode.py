@@ -49,6 +49,92 @@ CR = 4  # default axis of the legacy (pre-MTP) cases: compress_ratio == 4 (DSv4)
 NEXT_N = 1  # default axis of the legacy (pre-MTP) cases: next_n == 1
 
 
+@pytest.fixture(autouse=True)
+def _bsx_bands_off(monkeypatch):
+    """Kernel-contract tests must reach the bsx tiers: disable the measured
+    fallback band table (it legitimately routes several tested (npad, bs)
+    shapes to the in-tree kernel in production). The table itself is covered
+    by ``test_bsx_fallback_band_table``."""
+    monkeypatch.setenv("TRTLLM_BSX_FALLBACK_BANDS", "0")
+    bsx_dispatch._reset_env_cache()
+    yield
+    monkeypatch.delenv("TRTLLM_BSX_FALLBACK_BANDS", raising=False)
+    bsx_dispatch._reset_env_cache()
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("bands", ["on", "off"])
+def test_bsx_cuda_graph_capture_replay(monkeypatch, bands):
+    """The op must be CUDA-graph capturable and replay-consistent on both
+    sides of the fallback band table. Shape (npad=32768, bs=64) sits inside
+    a fallback bucket: bands=on captures the in-tree branch, bands=off the
+    bsx tp branch — the dispatch decision is host-side per shape, so it
+    bakes into the graph at capture time and must hold across replays,
+    including replays over in-place rewritten inputs."""
+    if bands == "on":
+        # the autouse fixture pinned the table off; restore the default
+        monkeypatch.delenv("TRTLLM_BSX_FALLBACK_BANDS", raising=False)
+    bsx_dispatch._reset_env_cache()
+    bs, npad, top_k = 64, 32768, 2048
+    logits, pre_idx, seq_lens = _make_bsx_inputs(bs, npad, top_k, seed=1234)
+    out = torch.empty(bs, top_k, dtype=torch.int32, device="cuda")
+
+    def call():
+        torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+            logits, pre_idx, seq_lens, out, top_k=top_k, next_n=NEXT_N, compress_ratio=CR
+        )
+
+    # warmup outside capture: JIT compile + any lazy init, on a side stream
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            call()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+    g.replay()
+    torch.cuda.synchronize()
+    _tie_aware_check(out, logits, seq_lens, top_k)
+
+    # replay over in-place rewritten inputs (fresh logits + fresh hints)
+    logits2, pre_idx2, seq_lens2 = _make_bsx_inputs(bs, npad, top_k, seed=4321)
+    logits.copy_(logits2)
+    pre_idx.copy_(pre_idx2)
+    seq_lens.copy_(seq_lens2)
+    g.replay()
+    torch.cuda.synchronize()
+    _tie_aware_check(out, logits, seq_lens, top_k)
+
+
+def test_bsx_fallback_band_table(monkeypatch):
+    """The measured (npad, bs) fallback buckets route to the in-tree kernel
+    by default; the kill-switch restores bsx service; neighbours are not
+    over-routed. Bands: op43-pr6 full-grid verdict (2026-07-28)."""
+    monkeypatch.delenv("TRTLLM_BSX_FALLBACK_BANDS", raising=False)
+    bsx_dispatch._reset_env_cache()
+    inb = bsx_dispatch._in_fallback_band
+    # routed buckets (bucket floor <0.909 vs the in-tree head)
+    assert inb(256, 8192) and inb(1024, 8192)
+    assert inb(16, 32768) and inb(1024, 65536)
+    assert inb(128, 131072) and inb(64, 262144)
+    assert inb(48, 40960)  # off-grid npad resolves to the nearest pow2
+    # neighbours stay on bsx
+    assert not inb(128, 8192)  # direct/tp win band
+    assert not inb(8, 32768)  # latency reg band
+    assert not inb(256, 131072) and not inb(128, 262144)  # large-N tp win
+    assert not inb(1024, 4096)  # small-npad tp win
+    # kill-switch
+    monkeypatch.setenv("TRTLLM_BSX_FALLBACK_BANDS", "0")
+    bsx_dispatch._reset_env_cache()
+    assert not inb(64, 32768)
+    monkeypatch.delenv("TRTLLM_BSX_FALLBACK_BANDS", raising=False)
+    bsx_dispatch._reset_env_cache()
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers. ``_tie_aware_check`` is a local copy of the one in
 # test_cute_dsl_gvr_topk_decode.py (same directory): the sibling test module
