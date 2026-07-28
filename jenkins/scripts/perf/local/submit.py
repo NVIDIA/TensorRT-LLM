@@ -342,25 +342,6 @@ def get_benchmark_config(config, benchmark_mode):
     }
 
 
-def get_benchmark_request_queue_size(config, concurrency):
-    """Cap the gen-only fill target to the GEN executor's active capacity."""
-    gen_config = (config.get("worker_config", {}) or {}).get("gen", {}) or {}
-    concurrency = int(concurrency)
-    max_batch_size = int(gen_config.get("max_batch_size", concurrency))
-    enable_attention_dp = gen_config.get("enable_attention_dp", False)
-    tp_size = int(gen_config.get("tensor_parallel_size", 1))
-    max_capacity = max_batch_size * tp_size if enable_attention_dp else max_batch_size
-    queue_size = min(max_capacity, concurrency)
-    if queue_size < concurrency:
-        print(
-            "[WARNING] TLLM_BENCHMARK_REQ_QUEUES_SIZE capped to "
-            f"{queue_size} (max_batch_size={max_batch_size}, tp_size={tp_size}, "
-            f"attention_dp={enable_attention_dp}) instead of concurrency={concurrency}. "
-            "The fill loop cannot reach a target above the GEN executor capacity."
-        )
-    return queue_size
-
-
 def partition_has_gpu_gres(partition):
     """Return True if the Slurm partition reports GPU GRES (e.g. 'gpu:4'), False if null/absent."""
     try:
@@ -905,13 +886,12 @@ def main():
             srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
         elif "gen_only" in bm_config.get("mode", ""):
             concurrency = bm_config.get("concurrency", 1)
-            queue_size = get_benchmark_request_queue_size(config, concurrency)
             ctx_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 {ctx_worker_env_vars}"
             )
             gen_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
-                f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_size} {gen_worker_env_vars}"
+                f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
         ucx_tls_cmd = get_ucx_tls_cmd(cluster_name, gpu_type)
