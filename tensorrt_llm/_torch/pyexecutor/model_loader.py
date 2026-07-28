@@ -21,7 +21,7 @@ from tensorrt_llm._torch.weight_sharing import (
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
-                                          ModelExpressConfig, MTPDecodingConfig,
+                                          ModelExpressConfig,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
@@ -52,10 +52,6 @@ _KV_CACHE_MAP = {
     "auto": "auto"
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
-_GEMMA4_TARGET_ARCHITECTURES = (
-    "Gemma4ForCausalLM",
-    "Gemma4ForConditionalGeneration",
-)
 
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
@@ -444,14 +440,6 @@ class ModelLoader:
             # init=False runtime fields such as num_nextn_predict_layers.
             update_spec_config_from_model_config(llm_args.speculative_config,
                                                  config.pretrained_config)
-            architectures = getattr(config.pretrained_config, "architectures",
-                                    None) or ()
-            if (isinstance(llm_args.speculative_config, MTPDecodingConfig)
-                    and architectures
-                    and architectures[0] in _GEMMA4_TARGET_ARCHITECTURES):
-                llm_args.speculative_config._use_shared_kv_cache = (
-                    llm_args.speculative_config.spec_dec_mode.
-                    is_mtp_eagle_one_model())
 
         # The transceiver preference follows the checkpoint's original
         # architecture: _resolve_class may rewrite it to an execution class
