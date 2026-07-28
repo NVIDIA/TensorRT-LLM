@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """Shared harness for the KV-cache compaction tests."""
 
@@ -97,7 +85,8 @@ def make_ramp_pools(
     base=0,
     device=None,
 ):
-    """Build bf16 ramp pools whose moved regions have distinct byte patterns."""
+    """bf16 pools with a shifted ``arange % 251`` ramp: every wrong move
+    lands on a different byte pattern (supported geometry defaults)."""
     return [
         (
             (
@@ -118,7 +107,11 @@ def make_ramp_pools(
 
 
 def build_compaction(**overrides):
-    """Build opaque compaction parameters and caller-owned test inputs."""
+    """``build_compaction_params`` with the suite's 2-layer defaults:
+    allocates the caller-owned move-offset rows (capacity cumsum) and SWA
+    destination bases, and hands the test's pre-settled
+    ``kept_token_ordinals`` in as the decision rows. Returns the opaque
+    ``params`` plus a test-side mirror of the caller-owned inputs."""
     from tensorrt_llm._torch.kv_cache_compression.compaction import build_compaction_params
 
     args = dict(
@@ -209,7 +202,9 @@ def build_compaction(**overrides):
 
 
 def run_compaction(compaction):
-    """Run SWA rebasing and opaque compaction in production order."""
+    """Replica of the round's move stage in production order: SWA
+    destination rebase, then ``compact`` loops the opaque params (each packs
+    its decision rows into move sources and fires its native moves)."""
     from tensorrt_llm._torch.kv_cache_compression.compaction import compact
 
     if compaction["swa_destination_bases"] is not None:

@@ -467,10 +467,13 @@ class KVCacheManager(BaseResourceManager):
                 pp_size = self.mapping.pp_size if self.mapping is not None else 1
                 live_state_slots = self.max_batch_size * pp_size
                 max_snapshots = live_state_slots
-                if kv_cache_config.enable_block_reuse:
-                    max_snapshots += (
-                        kv_cache_config.max_tokens //
-                        linear_attention_metadata.states_snapshot_interval)
+                snapshot_interval = (
+                    linear_attention_metadata.states_snapshot_interval)
+                if (kv_cache_config.enable_block_reuse
+                        and snapshot_interval is not None
+                        and snapshot_interval > 0):
+                    max_snapshots += (kv_cache_config.max_tokens //
+                                      snapshot_interval)
 
                 blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
                     int(max_snapshots), 0)
@@ -1932,12 +1935,23 @@ class KVCacheManager(BaseResourceManager):
         pp_size = self.mapping.pp_size if self.mapping is not None else 1
         intercept = self.max_batch_size * pp_size * state_bytes_local
 
-        max_tokens = max((primary_budget - intercept) // slope, 0)
+        if slope > 0:
+            max_tokens = max((primary_budget - intercept) // slope, 0)
+        elif primary_budget >= intercept:
+            # With snapshots disabled, a rank containing only recurrent-state
+            # layers has no per-token cache cost after its live slots are
+            # allocated. Bound the otherwise-unlimited token count by the
+            # configured capacity or by all resident sequences at max length.
+            max_tokens = (kv_cache_config.max_tokens
+                          if kv_cache_config.max_tokens is not None else
+                          self.max_seq_len * self.max_batch_size * pp_size)
+        else:
+            max_tokens = 0
         if kv_cache_config.max_tokens is not None:
             max_tokens = min(kv_cache_config.max_tokens, max_tokens)
             if max_tokens < kv_cache_config.max_tokens:
                 logger.warning(
-                    f'The memory budget for Mamba + KV cache cannot fit the user-specified max_tokens of {kv_cache_config.max_tokens}. The calculated max_tokens based on the memory budget is {max_tokens}. Please consider adjusting max_batch_size/max_tokens/mamba_state_cache_interval.'
+                    f'The memory budget for Mamba + KV cache cannot fit the user-specified max_tokens of {kv_cache_config.max_tokens}. The calculated max_tokens based on the memory budget is {max_tokens}. Please consider adjusting max_batch_size/max_tokens/mamba_state_config.periodic_snapshot_interval.'
                 )
 
         kv_blocks_in_primary_pool = int(max_tokens // self.tokens_per_block)
