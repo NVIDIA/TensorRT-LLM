@@ -70,7 +70,8 @@ class TestPrepareDatasetLora:
         tokenizer_dir = model_cache / _TOKENIZER_SUBPATH
         cmd.extend(["--model", str(tokenizer_dir)])
 
-        # Always add --stdout flag since we parse stdout output
+        # Write to a file via --output rather than --stdout: trtllm-bench prints
+        # an import-time banner on stdout that would corrupt the parsed output.
         cmd.extend(["prepare-dataset", "--output", f"{output_path}"])
 
         return cmd

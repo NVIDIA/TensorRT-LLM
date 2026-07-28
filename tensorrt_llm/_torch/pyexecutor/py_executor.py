@@ -2028,6 +2028,9 @@ class PyExecutor:
 
             # Aggregate stats from all generation requests
             for req in scheduled_batch.generation_requests:
+                # exclude attention dp dummy / CUDA Graph padding requests from AL calculation
+                if getattr(req, 'is_dummy', False):
+                    continue
                 draft_len = getattr(req, 'num_draft_tokens', 0)
                 py_draft_tokens = getattr(req, 'py_draft_tokens', None)
                 py_num_accepted = getattr(req, 'py_num_accepted_draft_tokens',
