@@ -22,6 +22,8 @@ import groovy.transform.Field
 // Docker image registry
 IMAGE_NAME = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging"
 NGC_IMAGE_NAME = "${IMAGE_NAME}/ngc"
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -218,6 +220,8 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
             spec:
                 qosClass: Guaranteed
                 ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   ${containerConfig}
                   - name: jnlp
