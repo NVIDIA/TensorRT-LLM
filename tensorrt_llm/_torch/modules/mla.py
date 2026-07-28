@@ -1040,6 +1040,29 @@ class MLA(nn.Module):
             return False
         return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
 
+    def _is_fused_kv_norm_enabled(self, num_generations: int = 0) -> bool:
+        # Mirrors `_is_fused_q_fp8_quant_enabled`. Context-only: the fused kernel
+        # lives in `applyMLARopeAndAssignQKVKernelOptContext`, whose KV region can
+        # give one warp a whole latent row. The generation kernel instead splits a
+        # row across blockIdx.y regions, so no block there can compute the RMS
+        # denominator.
+        # `TRTLLM_DISABLE_FUSED_KV_NORM=1` opts back into the standalone
+        # kv_a_layernorm + concat pair as a kill switch.
+        if os.environ.get("TRTLLM_DISABLE_FUSED_KV_NORM", "0") == "1":
+            return False
+        if not self.is_deepseek_v4:
+            return False
+        # The kernel describes the latent row with its K_DIM/ROPE_DIM template
+        # constants, so these must be the 448/64 instantiation.
+        if self.kv_lora_rank != 448 or self.qk_rope_head_dim != 64:
+            return False
+        if num_generations > 0:
+            return False
+        # V4 normalizes the whole 512-wide latent; the weight must span it.
+        if self.kv_a_layernorm.weight.shape[0] != self.kv_lora_rank + self.qk_rope_head_dim:
+            return False
+        return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
+
     def _deepseek_v4_q_b_layernorm_fused_fp8(self, q_proj: torch.Tensor):
         # Returns (placeholder_q, quant_q_buffer, q_pe, quant_scale_qkv).
         # `placeholder_q` keeps the [num_tokens, num_heads*head_dim] bf16 layout
@@ -1814,16 +1837,38 @@ class MLA(nn.Module):
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1
         )
 
-        q, kv = maybe_execute_in_parallel(
-            lambda: self.q_a_layernorm(q),
-            lambda: self.kv_a_layernorm(kv),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        # Fused kv-norm: the context RoPE kernel applies kv_a_layernorm itself, so
+        # skip both the standalone RMSNorm launch and the concat that would only
+        # re-materialize its output, and hand the kernel the RAW latent.
+        self._fused_kv_norm_active = self._is_fused_kv_norm_enabled(num_generations=num_generations)
+
+        if self._fused_kv_norm_active:
+            q = self.q_a_layernorm(q)
+        else:
+            q, kv = maybe_execute_in_parallel(
+                lambda: self.q_a_layernorm(q),
+                lambda: self.kv_a_layernorm(kv),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
         compressed_kv, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
         qr = q
-        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+        if self._fused_kv_norm_active:
+            # `kv` is already the [compressed_kv | k_pe] row layout the kernel
+            # expects; it takes it as `T const* fuse_buf` and only ever reads it.
+            # The `compressed_kv`/`k_pe` views above are dead on the V4 branch.
+            #
+            # NOTE: `kv` is a last-dim slice of the kv_a_proj output, so its row
+            # stride is q_lora_rank + 512, NOT 512 -- it is a view, not a
+            # contiguous tensor. The kernel reads the row stride from
+            # latent_cache.stride(0) rather than assuming it; calling
+            # .contiguous() here would just reintroduce the copy the fusion
+            # exists to remove. Only the innermost dim must be unit-stride.
+            assert kv.stride(-1) == 1, "fused kv-norm needs a unit-stride latent row"
+            latent_cache = kv
+        else:
+            latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
         # CuTe DSL path for q_b_proj (hardware-default cluster count).
         # Restricted to DSv4 CSA layers with compress_ratio=4 so the kernel
@@ -2854,10 +2899,19 @@ class MLA(nn.Module):
             topk_indices=topk_indices,  # used by DSA attention
             dsv4_inv_rope_cos_sin_cache=dsv4_cos_sin_cache,
             enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
+            # fused kv-norm path only: `latent_cache` above is the RAW kv_a_proj
+            # output, so the kernel must apply the norm before RoPE/quant/write.
+            kv_norm_weight=(
+                self.kv_a_layernorm.weight
+                if getattr(self, "_fused_kv_norm_active", False)
+                else None
+            ),
+            kv_norm_eps=float(self.kv_a_layernorm.variance_epsilon),
         )
         fused_q = None
         self._fused_quant_q_buffer = None
         self._fused_q_pe = None
+        self._fused_kv_norm_active = False
 
         if enable_dsv4_epilogue_fusion:
             return attn_out_latent

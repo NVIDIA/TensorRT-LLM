@@ -383,7 +383,8 @@ public:
         std::optional<torch::Tensor> relative_attention_bias,
         std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
         std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt,
-        bool enable_dsv4_epilogue_fusion = false) const
+        bool enable_dsv4_epilogue_fusion = false, std::optional<torch::Tensor> kv_norm_weight = std::nullopt,
+        double kv_norm_eps = 1e-6) const
         = 0;
 };
 
@@ -453,7 +454,8 @@ public:
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
         std::optional<torch::Tensor> relative_attention_bias, std::optional<torch::Tensor> quant_scale_qkv,
-        std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion) const override
+        std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
+        std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -520,6 +522,31 @@ public:
                     ? reinterpret_cast<float const*>(quant_scale_qkv.value().data_ptr())
                     : nullptr;
                 mla_params.fuse_q_fp8_in_rope = (quant_q_buffer.has_value() && quant_scale_qkv.has_value());
+
+                // Fused kv_a_layernorm: when the caller supplies the norm weight it
+                // has also passed the RAW kv_a_proj output as `latent_cache` and
+                // skipped both its own RMSNorm launch and the
+                // concat([compressed_kv, k_pe]). Context-only, like the Q fusion.
+                if (kv_norm_weight.has_value())
+                {
+                    TORCH_CHECK(kv_norm_weight->is_cuda(), "kv_norm_weight must be a CUDA tensor");
+                    TORCH_CHECK(kv_norm_weight->is_contiguous(), "kv_norm_weight must be contiguous");
+                    TORCH_CHECK(kv_norm_weight->scalar_type() == qkv_or_q.scalar_type(),
+                        "kv_norm_weight dtype must match the activation dtype");
+                    TORCH_CHECK(latent_cache.has_value(),
+                        "fused kv-norm needs latent_cache (the raw kv_a_proj output) to be provided");
+                    // latent_cache is a last-dim slice of the kv_a_proj output, so
+                    // its rows are strided by q_lora_rank + kv_lora_rank +
+                    // qk_rope_head_dim. Forward the real stride; only the innermost
+                    // dim has to be unit-stride for the kernel's 16B vector loads.
+                    TORCH_CHECK(latent_cache->dim() == 2, "latent_cache must be 2D for fused kv-norm, got ",
+                        latent_cache->dim(), "D");
+                    TORCH_CHECK(latent_cache->stride(1) == 1, "latent_cache must be unit-stride in its last dim");
+                    mla_params.latent_row_stride = static_cast<int>(latent_cache->stride(0));
+                    mla_params.kv_norm_weight = static_cast<void const*>(kv_norm_weight->data_ptr());
+                    mla_params.kv_norm_eps = static_cast<float>(kv_norm_eps);
+                    mla_params.fuse_kv_norm_in_rope = true;
+                }
             }
             else if (is_context)
             {
@@ -1114,7 +1141,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
     std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-    bool const force_prepare_spec_dec_tree_mask)
+    bool const force_prepare_spec_dec_tree_mask, std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1400,7 +1427,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias,
-            quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion);
+            quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion, kv_norm_weight, kv_norm_eps);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1423,7 +1450,10 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias,
-            quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion);
+            quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion,
+            // the attention op's kv-norm fusion is context-only; generation gets it from
+            // the standalone mla_rope_generation op instead.
+            /*kv_norm_weight=*/std::nullopt, kv_norm_eps);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);

@@ -190,14 +190,23 @@ inline __device__ void dequantCopy(
 // of `quant_q_buf`, so the standalone quantizeCopyInputToFp8Kernel can be
 // dropped. `quant_q_buf`/`quant_scale_qkv`/bmm_scale outputs are unused when
 // `kOutputFp8Q == false`.
-template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer, bool kOutputFp8Q = false>
+// `kFuseKvNorm`: when true, `fuse_buf` holds the RAW kv_a_proj output instead of
+// the normalized latent. The KV region below then owns a whole
+// `K_DIM + ROPE_DIM` row per warp, so the RMSNorm reduction is warp-local, and
+// it applies norm -> weight -> RoPE -> quant -> paged write in one pass. The Q
+// region must not touch `fuse_buf` in that mode (its copy would be
+// un-normalized), so the redundant per-head k load/rotate is compiled out
+// entirely -- only `head_idx == 0` ever wrote it anyway.
+template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer, bool kOutputFp8Q = false,
+    bool kFuseKvNorm = false>
 __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k_ptr, T const* fuse_buf,
     KVCacheBuffer kv_cache, int q_pe_ld, int q_pe_stride, float2 const* cos_sin_cache, size_t head_num, int head_size,
     int c_k, int* cu_q_seqlens, int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
     float const* quant_scale_kv, int32_t const* helix_position_offsets, bool absorption_mode,
     __nv_fp8_e4m3* quant_q_buf = nullptr, float const* quant_scale_qkv = nullptr, float* bmm1_scale_out = nullptr,
     float* bmm2_scale_out = nullptr, float const* dequant_scale_q = nullptr, float const* dequant_scale_kv = nullptr,
-    float const* quant_scale_o = nullptr, float host_bmm1_scale = 1.0f)
+    float const* quant_scale_o = nullptr, float host_bmm1_scale = 1.0f, T const* kv_norm_weight = nullptr,
+    float kv_norm_eps = 1e-6f, int latent_row_stride = 0)
 {
     // bmm scales — single thread emits them when we skip quantizeCopyInputToFp8Kernel.
     if constexpr (kOutputFp8Q)
@@ -282,7 +291,6 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
                 = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
             VecT q, k;
-            auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
             auto src_q_global_offset = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
                 + (head_size + ROPE_DIM) * head_idx + head_size;
             // In the absorption mode, we load pe from q_pe instead of q_ptr.
@@ -294,35 +302,56 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
             }
 
             q = *reinterpret_cast<VecT const*>(&q_pe_input[src_q_global_offset + head_dim_idx]);
-            k = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
 
-            // Pack two elements into one for gptj rotary embedding.
-#pragma unroll
-            for (int elt_id = 0; elt_id < ELTS_PER_VEC / 2; elt_id++)
+            if constexpr (kFuseKvNorm)
             {
-                GPTJEltT& q_ = reinterpret_cast<GPTJEltT*>(&q)[elt_id];
-                GPTJEltT& k_ = reinterpret_cast<GPTJEltT*>(&k)[elt_id];
+                // `fuse_buf` is un-normalized here; the KV region owns k_pe entirely.
+                // Rotating q alone is bit-identical to the two-operand helper, which
+                // is just two independent rotary_embedding_transform calls.
+#pragma unroll
+                for (int elt_id = 0; elt_id < ELTS_PER_VEC / 2; elt_id++)
+                {
+                    GPTJEltT& q_ = reinterpret_cast<GPTJEltT*>(&q)[elt_id];
+                    q_ = mmha::rotary_embedding_transform(q_, rotary_coef_cache_buffer[elt_id]);
+                }
+            }
+            else
+            {
+                auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
+                k = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
 
-                float2 rotary_coef_cache = rotary_coef_cache_buffer[elt_id];
-                mmha::apply_rotary_embedding_gptj(q_, k_, rotary_coef_cache);
+                // Pack two elements into one for gptj rotary embedding.
+#pragma unroll
+                for (int elt_id = 0; elt_id < ELTS_PER_VEC / 2; elt_id++)
+                {
+                    GPTJEltT& q_ = reinterpret_cast<GPTJEltT*>(&q)[elt_id];
+                    GPTJEltT& k_ = reinterpret_cast<GPTJEltT*>(&k)[elt_id];
+
+                    float2 rotary_coef_cache = rotary_coef_cache_buffer[elt_id];
+                    mmha::apply_rotary_embedding_gptj(q_, k_, rotary_coef_cache);
+                }
             }
             // do sync
             __syncwarp();
             if (valid_token)
             {
-                if (head_idx == 0)
+                if constexpr (!kFuseKvNorm)
                 {
-                    auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
-                    auto inBlockIdx = kv_cache.getKVLocalIdx(
-                        token_idx_in_kv_cache, 0, TOTAL_VECS_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
-                    if (cache_type == KvCacheDataType::FP8)
+                    if (head_idx == 0)
                     {
+                        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
+                        auto inBlockIdx = kv_cache.getKVLocalIdx(
+                            token_idx_in_kv_cache, 0, TOTAL_VECS_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
+                        if (cache_type == KvCacheDataType::FP8)
+                        {
 
-                        quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
-                            reinterpret_cast<T const*>(&k), quant_scale_kv_val);
+                            quantCopy<T, ELTS_PER_VEC>(
+                                reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
+                                reinterpret_cast<T const*>(&k), quant_scale_kv_val);
+                        }
+                        else
+                            reinterpret_cast<VecT*>(kDst)[inBlockIdx] = k;
                     }
-                    else
-                        reinterpret_cast<VecT*>(kDst)[inBlockIdx] = k;
                 }
                 auto const dst_q_idx = static_cast<size_t>(global_token_idx) * head_num * (nope_head_size_q + ROPE_DIM)
                     + head_idx * (nope_head_size_q + ROPE_DIM) + nope_head_size_q + head_dim_idx;
@@ -338,9 +367,132 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
                     reinterpret_cast<VecT*>(q_ptr)[dst_q_idx / ELTS_PER_VEC] = q;
                 }
                 // Only write to k_pe to k_buf in the non-absorption mode.
-                if (!absorption_mode)
+                // kFuseKvNorm implies absorption mode, so `k` is never loaded there.
+                if constexpr (!kFuseKvNorm)
                 {
-                    reinterpret_cast<VecT*>(k_ptr)[dst_k_idx / ELTS_PER_VEC] = k;
+                    if (!absorption_mode)
+                    {
+                        reinterpret_cast<VecT*>(k_ptr)[dst_k_idx / ELTS_PER_VEC] = k;
+                    }
+                }
+            }
+        }
+    }
+    else if constexpr (kFuseKvNorm)
+    {
+        // Fused kv_a_layernorm + RoPE + quant + paged write.
+        //
+        // One WARP owns one whole `K_DIM + ROPE_DIM` latent row, so the
+        // sum-of-squares is a plain warp shuffle -- the same shape that makes
+        // `deepseekV4QNormFusedKernel` work on the Q side. The un-fused path below
+        // instead splits a row across this region (dims 0..K_DIM) and the Q region
+        // (dims K_DIM..K_DIM+ROPE_DIM), which is what makes the reduction
+        // impossible there.
+        constexpr int kWarpSize = 32;
+        constexpr int kRowElts = K_HEAD_SIZE + HEAD_SIZE;
+        constexpr int kRowVecs = TOTAL_VECS_PER_HEAD;
+        constexpr int kVecsPerLane = kRowVecs / kWarpSize;
+        constexpr int kTokensPerBlock = BLOCK_SIZE / kWarpSize;
+        static_assert(kRowVecs % kWarpSize == 0,
+            "Fused kv-norm needs the latent row to split evenly across a warp's 16B vectors.");
+        static_assert(kVecsPerLane >= 1, "Latent row is too narrow for one warp.");
+
+        int const lane = threadIdx.x % kWarpSize;
+        int const warp_id = threadIdx.x / kWarpSize;
+        int const block_dim = gridDim.z - head_num;
+        int const block_id = head_idx - head_num;
+        float const quant_scale_kv_val = quant_scale_kv ? quant_scale_kv[0] : 1.f;
+
+        // Mainloop. Every lane of a warp shares `local_token_idx`, so the
+        // early-continue below keeps the shuffles convergent.
+        for (int local_token_idx = warp_id + gridDim.x * kTokensPerBlock * block_id + blockIdx.x * kTokensPerBlock;
+             local_token_idx < static_cast<int>(max_input_seq_len);
+             local_token_idx += block_dim * kTokensPerBlock * gridDim.x)
+        {
+            int const global_token_offset = cu_q_seqlens[batch_idx];
+            int const cache_seq_len = kv_cache_lengths[batch_idx];
+            int const current_seq_len = cu_q_seqlens[batch_idx + 1] - global_token_offset;
+            int const cached_offset = cache_seq_len - current_seq_len;
+            int const token_idx_in_kv_cache = local_token_idx + cached_offset;
+
+            if (token_idx_in_kv_cache >= cache_seq_len || local_token_idx >= current_seq_len)
+            {
+                continue;
+            }
+            int const global_token_idx = local_token_idx + global_token_offset;
+            auto const position_id
+                = helix_position_offsets ? helix_position_offsets[global_token_idx] : token_idx_in_kv_cache;
+
+            // `fuse_buf` is the caller's raw kv_a_proj slice, whose row stride is
+            // NOT kRowElts -- it is a last-dim view of a wider [q_lora | kv] buffer.
+            // Only the innermost dim is unit-stride, which is what the 16B vector
+            // loads below require.
+            size_t const row_stride = latent_row_stride > 0 ? static_cast<size_t>(latent_row_stride) : kRowElts;
+            T const* row = fuse_buf + static_cast<size_t>(global_token_idx) * row_stride;
+
+            // Pass 1: load the whole row into registers and reduce.
+            VecT vals[kVecsPerLane];
+            float sum_squares = 0.f;
+#pragma unroll
+            for (int i = 0; i < kVecsPerLane; ++i)
+            {
+                int const vec_idx = i * kWarpSize + lane;
+                vals[i] = *reinterpret_cast<VecT const*>(row + vec_idx * ELTS_PER_VEC);
+                auto const* elts = reinterpret_cast<T const*>(&vals[i]);
+#pragma unroll
+                for (int j = 0; j < ELTS_PER_VEC; ++j)
+                {
+                    float const v = static_cast<float>(elts[j]);
+                    sum_squares += v * v;
+                }
+            }
+#pragma unroll
+            for (int mask = kWarpSize / 2; mask > 0; mask >>= 1)
+            {
+                sum_squares += __shfl_xor_sync(0xFFFFFFFFu, sum_squares, mask);
+            }
+            float const norm_scale = rsqrtf(sum_squares / static_cast<float>(kRowElts) + kv_norm_eps);
+
+            // Pass 2: scale by weight, rotate the rope tail, quantize, scatter.
+            // Values never leave registers between the two passes.
+            auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
+#pragma unroll
+            for (int i = 0; i < kVecsPerLane; ++i)
+            {
+                int const vec_idx = i * kWarpSize + lane;
+                int const dim_idx = vec_idx * ELTS_PER_VEC;
+
+                auto* elts = reinterpret_cast<T*>(&vals[i]);
+#pragma unroll
+                for (int j = 0; j < ELTS_PER_VEC; ++j)
+                {
+                    elts[j] = static_cast<T>(
+                        static_cast<float>(elts[j]) * norm_scale * static_cast<float>(kv_norm_weight[dim_idx + j]));
+                }
+
+                // The rope tail occupies dims [K_HEAD_SIZE, K_HEAD_SIZE + ROPE_DIM).
+                // ELTS_PER_VEC divides both segments, so a vector never straddles them.
+                if (vec_idx >= K_VECS_PER_HEAD)
+                {
+                    float2 const* rope_coef
+                        = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + ((dim_idx - K_HEAD_SIZE) / 2);
+#pragma unroll
+                    for (int elt_id = 0; elt_id < ELTS_PER_VEC / 2; ++elt_id)
+                    {
+                        GPTJEltT& d = reinterpret_cast<GPTJEltT*>(&vals[i])[elt_id];
+                        d = mmha::rotary_embedding_transform(d, rope_coef[elt_id]);
+                    }
+                }
+
+                auto const inBlockIdx = kv_cache.getKVLocalIdx(token_idx_in_kv_cache, 0, TOTAL_VECS_PER_HEAD, vec_idx);
+                if (cache_type == KvCacheDataType::FP8)
+                {
+                    quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
+                        reinterpret_cast<T const*>(&vals[i]), quant_scale_kv_val);
+                }
+                else
+                {
+                    reinterpret_cast<VecT*>(kDst)[inBlockIdx] = vals[i];
                 }
             }
         }
@@ -1039,7 +1191,39 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
     }
     else
     {
-        if (useFusedFp8Q)
+        // DSv4 layout (rope_append == false). The kv_a_layernorm fusion is only
+        // wired on this instantiation: the kernel describes the latent row with its
+        // K_DIM/ROPE_DIM template constants, so kv_lora_rank must actually match.
+        bool const useFusedKvNorm = params.fuse_kv_norm_in_rope && params.absorption_mode
+            && params.kv_norm_weight != nullptr && params.meta.kv_lora_rank == 448;
+        TLLM_CHECK_WITH_INFO(params.fuse_kv_norm_in_rope == useFusedKvNorm,
+            "MLA Context: fused kv-norm requested but preconditions not met "
+            "(absorption_mode=%d, kv_norm_weight=%p, kv_lora_rank=%d, expected 448)",
+            static_cast<int>(params.absorption_mode), params.kv_norm_weight, params.meta.kv_lora_rank);
+        auto const* kv_norm_w = static_cast<T const*>(params.kv_norm_weight);
+
+        if (useFusedFp8Q && useFusedKvNorm)
+        {
+            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 448, 64, KVCacheBuffer, true, true>
+                <<<grid, 256, 0, stream>>>(params.q_buf, params.q_pe, params.k_buf, params.latent_cache,
+                    kv_cache_buffer, params.q_pe_ld, params.q_pe_stride, params.cos_sin_cache, params.head_num,
+                    head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens,
+                    params.max_input_seq_len, params.cache_type, params.quant_scale_kv, params.helix_position_offsets,
+                    params.absorption_mode, quant_q_fp8, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+                    params.dequant_scale_q, params.dequant_scale_kv, params.quant_scale_o, params.host_bmm1_scale,
+                    kv_norm_w, params.kv_norm_eps, params.latent_row_stride);
+        }
+        else if (useFusedKvNorm)
+        {
+            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 448, 64, KVCacheBuffer, false, true>
+                <<<grid, 256, 0, stream>>>(params.q_buf, params.q_pe, params.k_buf, params.latent_cache,
+                    kv_cache_buffer, params.q_pe_ld, params.q_pe_stride, params.cos_sin_cache, params.head_num,
+                    head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens,
+                    params.max_input_seq_len, params.cache_type, params.quant_scale_kv, params.helix_position_offsets,
+                    params.absorption_mode, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1.0f,
+                    kv_norm_w, params.kv_norm_eps, params.latent_row_stride);
+        }
+        else if (useFusedFp8Q)
         {
             applyMLARopeAndAssignQKVKernelOptContext<T, 256, 448, 64, KVCacheBuffer, true>
                 <<<grid, 256, 0, stream>>>(params.q_buf, params.q_pe, params.k_buf, params.latent_cache,

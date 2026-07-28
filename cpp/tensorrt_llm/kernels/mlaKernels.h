@@ -126,6 +126,22 @@ struct MlaParams
     // skipped. Nope segment must be pre-filled (see deepseek_v4_q_norm_fused_fp8).
     bool fuse_q_fp8_in_rope = false;
 
+    // Fused kv_a_layernorm in the absorption-mode context RoPE kernel. When set,
+    // `latent_cache` holds the RAW (un-normalized) kv_a_proj output and the kernel
+    // applies RMSNorm over kv_lora_rank + qk_rope_head_dim with `kv_norm_weight`
+    // before RoPE + quant + paged write. Lets the caller drop both the standalone
+    // kv_a_layernorm launch and the concat([compressed_kv, k_pe]) that only
+    // re-materializes its output. Requires absorption mode and
+    // meta.kv_lora_rank == the kernel's K_DIM template argument.
+    bool fuse_kv_norm_in_rope = false;
+    void const* kv_norm_weight = nullptr;
+    float kv_norm_eps = 1e-6f;
+    // Row stride of `latent_cache`, in elements. On the fused path the caller
+    // passes a last-dim slice of the kv_a_proj output, whose row stride is
+    // q_lora_rank + kv_lora_rank + qk_rope_head_dim rather than the packed
+    // kv_lora_rank + qk_rope_head_dim. 0 means "packed".
+    int latent_row_stride = 0;
+
     // DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
     Dsv4EpilogueFusionParams dsv4_epilogue_fusion;
 
