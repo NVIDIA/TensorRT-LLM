@@ -858,7 +858,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             draft_input_ids,
             recurrent_hidden_states,
             draft_position_ids,
-        ) = self._prepare_external_shared_target_kv_draft_inputs(
+        ) = self._prepare_shared_kv_draft_inputs(
             accepted_tokens=accepted_tokens,
             num_accepted_tokens=num_accepted_tokens,
             hidden_states=hidden_states,
@@ -1112,11 +1112,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     attn_metadata.on_update()
                     has_kv_cache = inputs[
                         "attn_metadata"].kv_cache_manager is not None
+                    if has_kv_cache and hasattr(attn_metadata,
+                                                "host_request_types"):
+                        attn_metadata.host_request_types[:attn_metadata.
+                                                         num_contexts].fill_(1)
                     if has_kv_cache:
-                        if hasattr(attn_metadata, "host_request_types"):
-                            attn_metadata.host_request_types[:attn_metadata.
-                                                             num_contexts].fill_(
-                                                                 1)
                         attn_metadata.num_contexts = 0
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
@@ -1374,8 +1374,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             "spec_metadata": spec_metadata,
         }
 
-    @staticmethod
-    def _prepare_external_shared_target_kv_draft_inputs(
+    def _prepare_shared_kv_draft_inputs(
+        self,
         *,
         accepted_tokens: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
