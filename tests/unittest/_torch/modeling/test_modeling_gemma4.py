@@ -2631,7 +2631,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         }
 
         accepted_tokens = torch.tensor([1, 3], dtype=torch.int, device="cuda")
-        draft_metadata = metadata.get_shared_kv_draft_metadata()
+        draft_metadata = metadata.get_draft_metadata()
         draft_metadata.update_shared_kv_draft_lengths(
             metadata,
             accepted_tokens,
@@ -2645,7 +2645,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         self.assertIs(draft_metadata.kv_cache_manager, metadata.kv_cache_manager)
         self.assertIsNot(draft_metadata, metadata)
         torch.testing.assert_close(
-            draft_metadata._shared_kv_runtime_lens[:2],
+            draft_metadata._draft_kv_runtime_lens[:2],
             expected_kv_lens,
             atol=0,
             rtol=0,

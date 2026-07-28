@@ -269,12 +269,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     _multi_item_params: Optional[FlashInferMultiItemParams] = field(
         init=False, default=None)
-    _shared_kv_draft_metadata: Optional["FlashInferAttentionMetadata"] = field(
+    _draft_metadata: Optional["FlashInferAttentionMetadata"] = field(
         init=False, default=None, repr=False)
-    _shared_kv_runtime_lens: torch.Tensor = field(init=False, repr=False)
+    _draft_kv_runtime_lens: torch.Tensor = field(init=False, repr=False)
     _is_shared_kv_draft_view: bool = field(init=False,
                                            default=False,
                                            repr=False)
+    _is_separate_kv_draft_view: bool = field(init=False,
+                                             default=False,
+                                             repr=False)
+    _uses_full_draft_page_table: bool = field(init=False,
+                                              default=False,
+                                              repr=False)
 
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
@@ -296,14 +302,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     ) -> flashinfer.BatchDecodeWithPagedKVCacheWrapper:
         assert plan_params in self._plan_params_to_wrappers, "Plan params not found, make sure to call plan()"
         result = self._plan_params_to_wrappers[plan_params].decode_wrapper
-        if self._is_shared_kv_draft_view:
+        if self._is_shared_kv_draft_view or self._is_separate_kv_draft_view:
             if result._backend != "trtllm-gen":
                 raise ValueError(
-                    "The shared-target-KV draft metadata view requires the "
-                    "FlashInfer trtllm-gen decode backend.")
+                    "FlashInfer draft metadata views require the trtllm-gen "
+                    "decode backend.")
             num_seqs = self.num_seqs
             result._kv_lens_buffer[:num_seqs].copy_(
-                self._shared_kv_runtime_lens[:num_seqs])
+                self._draft_kv_runtime_lens[:num_seqs])
         return result
 
     def get_ragged_prefill_wrapper(
@@ -594,42 +600,82 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     def positions(self) -> torch.Tensor:
         return self._positions[:self.num_tokens]
 
-    def get_shared_kv_draft_metadata(self) -> "FlashInferAttentionMetadata":
-        """Return a one-query decode view over this metadata's target KV."""
-        if self._shared_kv_draft_metadata is None:
+    def get_draft_metadata(
+        self,
+        draft_kv_cache_manager: Optional[Any] = None,
+    ) -> "FlashInferAttentionMetadata":
+        """Return a planned draft view over shared or separate KV cache."""
+        uses_shared_kv_cache = draft_kv_cache_manager is None
+        if self._draft_metadata is None:
             draft_metadata = copy.copy(self)
-            draft_metadata._is_shared_kv_draft_view = True
-            draft_metadata._shared_kv_draft_metadata = None
+            draft_metadata._is_shared_kv_draft_view = uses_shared_kv_cache
+            draft_metadata._is_separate_kv_draft_view = (
+                not uses_shared_kv_cache)
+            draft_metadata._draft_metadata = None
             draft_metadata.workspace_buffer = self.workspace_buffer
             draft_metadata.cuda_graph_buffers = None
             draft_metadata.cross = None
-            draft_metadata.max_num_tokens = self.max_num_requests
+            if uses_shared_kv_cache:
+                draft_metadata.max_num_tokens = self.max_num_requests
+            else:
+                draft_metadata.kv_cache_manager = draft_kv_cache_manager
             draft_metadata._seq_lens = None
             draft_metadata._seq_lens_cuda = None
             draft_metadata._seq_lens_kv = None
             draft_metadata._seq_lens_kv_cuda = None
             draft_metadata._saved_tensors = {}
-            draft_metadata.seq_lens = torch.ones((self.max_num_requests, ),
-                                                 dtype=torch.int)
+            if uses_shared_kv_cache:
+                draft_metadata.seq_lens = torch.ones((self.max_num_requests, ),
+                                                     dtype=torch.int)
+                draft_metadata.num_contexts = 0
+            else:
+                draft_metadata.seq_lens = self.seq_lens
+                draft_metadata.num_contexts = self.num_contexts
             draft_metadata.seq_lens_kv = None
-            draft_metadata.num_contexts = 0
             draft_metadata.__post_init__()
-            self._shared_kv_draft_metadata = draft_metadata
-            draft_metadata._sync_shared_kv_draft_view(self)
-        return self._shared_kv_draft_metadata
+            if not uses_shared_kv_cache:
+                # Keep the existing speculative worker's backend-neutral
+                # kv_lens_cuda protocol scoped to the separate-KV draft view.
+                draft_metadata.kv_lens_cuda = (
+                    draft_metadata._draft_kv_runtime_lens)
+            self._draft_metadata = draft_metadata
+            draft_metadata._sync_draft_view(self)
+        elif (self._draft_metadata._is_shared_kv_draft_view
+              != uses_shared_kv_cache):
+            raise RuntimeError(
+                "FlashInfer metadata cannot mix shared and separate draft KV "
+                "views.")
+        return self._draft_metadata
 
-    def _sync_shared_kv_draft_view(
-            self, target: "FlashInferAttentionMetadata") -> None:
-        """Refresh host-planned page tables before target graph replay."""
-        if not self._is_shared_kv_draft_view:
-            raise RuntimeError("Only a shared-KV draft metadata view can sync")
+    def _sync_draft_view(self, target: "FlashInferAttentionMetadata") -> None:
+        """Refresh a shared- or separate-KV draft metadata view."""
+        if not (self._is_shared_kv_draft_view
+                or self._is_separate_kv_draft_view):
+            raise RuntimeError("Only a draft metadata view can be synchronized")
 
         num_seqs = target.num_seqs
         self.request_ids = target.request_ids
         self.prompt_lens = target.prompt_lens
         self.kv_cache_params = target.kv_cache_params
-        self.kv_cache_manager = target.kv_cache_manager
         self.all_rank_num_tokens = target.all_rank_num_tokens
+
+        if self._is_separate_kv_draft_view:
+            self.padded_num_tokens = target.padded_num_tokens
+            self.seq_lens = target.seq_lens
+            self.seq_lens_kv = None
+            self.num_contexts = target.num_contexts
+            self._uses_full_draft_page_table = False
+            self.prepare()
+            torch.add(
+                target._cached_token_lens[:num_seqs],
+                target.seq_lens_kv_cuda[:num_seqs],
+                out=self._draft_kv_runtime_lens[:num_seqs],
+            )
+            if self.num_contexts == 0:
+                self._prepare_full_draft_page_table()
+            return
+
+        self.kv_cache_manager = target.kv_cache_manager
         self.seq_lens = torch.ones((num_seqs, ), dtype=torch.int)
         self.seq_lens_kv = None
         self.num_contexts = 0
@@ -685,7 +731,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._qo_indptr[:num_seqs + 1].copy_(host_qo_indptr, non_blocking=True)
         full_kv_lens = (target._cached_token_lens[:num_seqs] +
                         target.seq_lens_kv_cuda[:num_seqs])
-        self._shared_kv_runtime_lens[:num_seqs].copy_(full_kv_lens)
+        self._draft_kv_runtime_lens[:num_seqs].copy_(full_kv_lens)
 
         if self.is_cuda_graph:
             # Graph replay keeps the captured trtllm-gen plan. Refresh only
@@ -708,7 +754,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 "Draft KV lengths can only be set on the shared-KV view")
         num_seqs = target.num_seqs
         cached_lens = target._cached_token_lens[:num_seqs]
-        runtime_lens = self._shared_kv_runtime_lens[:num_seqs]
+        runtime_lens = self._draft_kv_runtime_lens[:num_seqs]
         if num_contexts > 0:
             runtime_lens[:num_contexts].copy_(
                 cached_lens[:num_contexts] +
@@ -716,11 +762,72 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         runtime_lens[num_contexts:num_seqs].copy_(
             cached_lens[num_contexts:num_seqs] +
             num_accepted_tokens[num_contexts:num_seqs])
+        self._update_draft_kv_lengths()
+
+    def _prepare_full_draft_page_table(self) -> None:
+        """Expose every allocated draft page and use device KV lengths."""
+        if self._uses_full_draft_page_table:
+            return
+        assert self.request_ids is not None
+        block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
+            self.request_ids)
+        self.num_blocks = [len(block_ids) for block_ids in block_ids_per_seq]
+        self.num_context_blocks = 0
+        self.num_generation_blocks = sum(self.num_blocks)
+        paged_kv_indices = self.kv_cache_manager.get_batch_cache_indices_flat(
+            self.request_ids, self.num_blocks)
+        self._paged_kv_indices[:paged_kv_indices.numel()].copy_(
+            paged_kv_indices, non_blocking=True)
+        self._host_paged_kv_indices = paged_kv_indices
+
+        host_indptr = maybe_pin_memory(
+            torch.from_numpy(
+                np.concatenate([[0], np.cumsum(self.num_blocks)
+                                ]).astype(np.int32, copy=False)))
+        num_seqs = self.num_seqs
+        self.paged_kv_indptr_decode[:num_seqs + 1].copy_(host_indptr,
+                                                         non_blocking=True)
+        self._host_paged_kv_indptr_decode = host_indptr
+        self.paged_kv_indptr = self.paged_kv_indptr_decode[:num_seqs + 1]
+        self._uses_full_draft_page_table = True
+        self._update_draft_kv_lengths()
+
+        if self.is_cuda_graph:
+            for plan_params, wrappers in self._plan_params_to_wrappers.items():
+                self._build_decode_block_tables(plan_params, wrappers)
+        elif not torch.cuda.is_current_stream_capturing():
+            self._clean_cached_plans(defer_plan=False)
+
+    def _update_draft_kv_lengths(self) -> None:
+        """Publish runtime KV lengths to a shared or separate draft view."""
+        num_seqs = self.num_seqs
+        runtime_lens = self._draft_kv_runtime_lens[:num_seqs]
         self._cached_token_lens[:num_seqs].copy_(runtime_lens)
-        torch.remainder(runtime_lens - 1,
+        self._paged_kv_last_page_len[:num_seqs].copy_(runtime_lens)
+        self._paged_kv_last_page_len[:num_seqs].sub_(1)
+        torch.remainder(self._paged_kv_last_page_len[:num_seqs],
                         self.page_size,
                         out=self._paged_kv_last_page_len[:num_seqs])
         self._paged_kv_last_page_len[:num_seqs].add_(1)
+        if self._is_shared_kv_draft_view:
+            return
+
+        self._cached_token_lens[:num_seqs].sub_(1)
+        self._positions[:num_seqs].copy_(self._cached_token_lens[:num_seqs])
+        torch.arange(num_seqs + 1,
+                     dtype=torch.int32,
+                     device=self._qo_indptr.device,
+                     out=self._qo_indptr[:num_seqs + 1])
+        torch.arange(num_seqs,
+                     dtype=torch.int32,
+                     device=self._batch_indices.device,
+                     out=self._batch_indices[:num_seqs])
+
+    def update_for_spec_dec(self) -> None:
+        if not self._is_separate_kv_draft_view:
+            return
+        self._prepare_full_draft_page_table()
+        self._update_draft_kv_lengths()
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -776,9 +883,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._cached_token_lens = torch.empty((self.max_num_requests, ),
                                               dtype=torch.int,
                                               device='cuda')
-        self._shared_kv_runtime_lens = torch.empty((self.max_num_requests, ),
-                                                   dtype=torch.int,
-                                                   device='cuda')
+        self._draft_kv_runtime_lens = self.get_empty(
+            buffers,
+            (self.max_num_requests, ),
+            dtype=torch.int,
+            cache_name="_draft_kv_runtime_lens",
+            capture_graph=capture_graph,
+        )
         self._batch_indices = torch.empty((self.max_num_tokens, ),
                                           dtype=torch.int,
                                           device='cuda')
@@ -905,7 +1016,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         metadata.max_num_tokens = max_batch_size * (1 + max_draft_tokens)
         # The graph owns distinct assistant wrappers and stable metadata
         # buffers; never inherit the eager view through the shallow copy.
-        metadata._shared_kv_draft_metadata = None
+        metadata._draft_metadata = None
         # Post init again to make sure all tensors are allocated
         metadata.__post_init__()
         return metadata
@@ -1417,7 +1528,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             if pp.attention_mask_data is None
         ]
         defer_plan = len(active_wrappers) > 1
-        self._clean_cached_plans(defer_plan=defer_plan)
+        if not (self._is_separate_kv_draft_view and self.is_cuda_graph):
+            self._clean_cached_plans(defer_plan=defer_plan)
 
         # Re-plan MLA wrappers outside of forward/capture using the params
         # cached by prior warmup forwards. Forward still handles first-use or
@@ -1549,8 +1661,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     if self.num_generations < batch_size:
                         kv_lens_buf[self.num_generations:batch_size].zero_()
         if (not self._is_shared_kv_draft_view
-                and self._shared_kv_draft_metadata is not None):
-            self._shared_kv_draft_metadata._sync_shared_kv_draft_view(self)
+                and not self._is_separate_kv_draft_view
+                and self._draft_metadata is not None):
+            self._draft_metadata._sync_draft_view(self)
 
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()

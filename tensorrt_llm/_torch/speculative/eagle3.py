@@ -850,7 +850,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             # Accepted counts let the indexer stash each gen's last-accepted row.
             attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
 
-        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+        with self.draft_kv_cache_context(
+                attn_metadata, draft_kv_cache_manager) as draft_attn_metadata:
+            attn_metadata = draft_attn_metadata
+            inputs["attn_metadata"] = draft_attn_metadata
             for i in range(runtime_draft_len):
                 if reuse_mtp_topk:
                     attn_metadata.set_skip_topk(i > 0)
@@ -1013,8 +1016,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     has_kv_cache = inputs[
                         "attn_metadata"].kv_cache_manager is not None
                     if has_kv_cache:
-                        attn_metadata.host_request_types[:attn_metadata.
-                                                         num_contexts].fill_(1)
+                        if hasattr(attn_metadata, "host_request_types"):
+                            attn_metadata.host_request_types[:attn_metadata.
+                                                             num_contexts].fill_(
+                                                                 1)
                         attn_metadata.num_contexts = 0
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
@@ -1409,7 +1414,7 @@ class MTPEagleWorker(Eagle3OneModelWorker):
             batch_indices=spec_metadata.batch_indices_cuda[:batch_size],
         )
 
-        draft_metadata = attn_metadata.get_shared_kv_draft_metadata()
+        draft_metadata = attn_metadata.get_draft_metadata()
         draft_metadata.update_shared_kv_draft_lengths(attn_metadata,
                                                       num_accepted_tokens,
                                                       num_contexts)

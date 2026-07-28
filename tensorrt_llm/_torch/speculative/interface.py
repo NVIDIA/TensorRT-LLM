@@ -2137,20 +2137,25 @@ class SpecWorkerBase(nn.Module, ABC):
     @contextmanager
     def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
         """
-        Context manager to temporarily switch to draft KV cache manager in one-engine speculative decoding.
+        Select draft attention metadata for one-engine speculative decoding.
 
-        This swaps both the kv_cache_manager reference AND the block offset tensors,
-        since the target and draft KV caches have different block layouts.
+        TRTLLM metadata temporarily swaps its manager and block offsets.
+        FlashInfer uses an independently planned metadata view because its page
+        tables and kernel wrappers are manager-specific.
         """
 
         # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
         if draft_kv_cache_manager is None:
-            yield
+            yield attn_metadata
             return
 
-        # Only TrtllmAttentionMetadata supports separate draft KV cache layouts
+        from ..attention_backend.flashinfer import FlashInferAttentionMetadata
+        if isinstance(attn_metadata, FlashInferAttentionMetadata):
+            yield attn_metadata.get_draft_metadata(draft_kv_cache_manager)
+            return
+
         if not isinstance(attn_metadata, TrtllmAttentionMetadata):
-            yield
+            yield attn_metadata
             return
 
         # Check if draft KV cache block offsets are allocated
@@ -2158,7 +2163,7 @@ class SpecWorkerBase(nn.Module, ABC):
                                       'draft_kv_cache_block_offsets', None)
         if draft_block_offsets is None:
             # Draft KV cache block offsets not allocated, skip switching
-            yield
+            yield attn_metadata
             return
 
         # Save main KV cache manager and block offsets
@@ -2174,7 +2179,7 @@ class SpecWorkerBase(nn.Module, ABC):
             attn_metadata.prepare_flash_mla()
 
         try:
-            yield
+            yield attn_metadata
         finally:
             # Restore main KV cache manager and block offsets
             attn_metadata.kv_cache_manager = target_kv_cache_manager

@@ -451,13 +451,6 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-    if (spec_config is not None and llm_args.attn_backend == "FLASHINFER"
-            and spec_config.spec_dec_mode.use_one_engine()
-            and not spec_config._use_shared_kv_cache):
-        raise ValueError(
-            "FLASHINFER attention backend supports one-engine speculative "
-            "decoding only when the draft model shares the target KV cache.")
-
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
         llm_args.disable_overlap_scheduler = True
