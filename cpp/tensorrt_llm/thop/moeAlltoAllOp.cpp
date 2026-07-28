@@ -594,8 +594,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     torch::Tensor const& tokenSelectedExperts, std::vector<torch::Tensor> const& inputPayloads,
     torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
     int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats,
-    bool enableRankMask, torch::optional<torch::Tensor> activeRankMask,
-    torch::optional<torch::Tensor> executionControl, int64_t expectedExecutionEpoch)
+    bool enableRankMask, torch::optional<torch::Tensor> activeRankMask, torch::optional<torch::Tensor> executionControl,
+    int64_t expectedExecutionEpoch)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -793,16 +793,23 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     {
         TORCH_CHECK(!hasActiveRankMask(activeRankMask), "active_rank_mask requires enable_rank_mask=True");
     }
-    auto const resolvedExecutionControl
-        = resolveExecutionControl(executionControl, expectedExecutionEpoch, workspace, epRank);
 
     params.stream = at::cuda::getCurrentCUDAStream(workspaceDevice);
 
-    // Prepare for dispatch (zero counters/indices and increment flag_val)
-    moe_a2a_prepare_dispatch_launch(params, resolvedExecutionControl);
-
-    // Launch the dispatch kernel
-    moe_a2a_dispatch_launch(params, resolvedExecutionControl);
+    if (params.enable_rank_mask)
+    {
+        auto const resolvedExecutionControl
+            = resolveExecutionControl(executionControl, expectedExecutionEpoch, workspace, epRank);
+        // Prepare for dispatch (zero counters/indices and increment flag_val)
+        moe_a2a_prepare_dispatch_launch(params, resolvedExecutionControl);
+        moe_a2a_dispatch_launch(params, resolvedExecutionControl);
+    }
+    else
+    {
+        // Preserve the legacy no-mask ABI and fail-stop timeout behavior.
+        moe_a2a_prepare_dispatch_launch(params);
+        moe_a2a_dispatch_launch(params);
+    }
     cudaError_t result = cudaGetLastError();
     TORCH_CHECK(result == cudaSuccess, "moe_a2a_dispatch kernel launch failed: ", cudaGetErrorString(result));
 
@@ -975,15 +982,22 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     {
         TORCH_CHECK(!hasActiveRankMask(activeRankMask), "active_rank_mask requires enable_rank_mask=True");
     }
-    auto const resolvedExecutionControl
-        = resolveExecutionControl(executionControl, expectedExecutionEpoch, workspace, epRank);
 
     params.stream = at::cuda::getCurrentCUDAStream(workspaceDevice);
 
-    moe_a2a_prepare_combine_launch(params, resolvedExecutionControl);
-
-    // Launch the combine kernel
-    moe_a2a_combine_launch(params, resolvedExecutionControl);
+    if (params.enable_rank_mask)
+    {
+        auto const resolvedExecutionControl
+            = resolveExecutionControl(executionControl, expectedExecutionEpoch, workspace, epRank);
+        moe_a2a_prepare_combine_launch(params, resolvedExecutionControl);
+        moe_a2a_combine_launch(params, resolvedExecutionControl);
+    }
+    else
+    {
+        // Preserve the legacy no-mask ABI and fail-stop timeout behavior.
+        moe_a2a_prepare_combine_launch(params);
+        moe_a2a_combine_launch(params);
+    }
     cudaError_t result = cudaGetLastError();
     TORCH_CHECK(result == cudaSuccess, "moe_a2a_combine kernel launch failed: ", cudaGetErrorString(result));
 

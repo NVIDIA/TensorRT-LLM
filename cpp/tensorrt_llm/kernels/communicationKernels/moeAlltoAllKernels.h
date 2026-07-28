@@ -195,8 +195,9 @@ struct MoeA2ADispatchParams
 };
 
 // Dispatch kernels
-// Legacy one-argument ABI is retained but fails closed; asynchronous launches
-// must provide a host-visible execution control through the two-argument form.
+// The legacy one-argument ABI remains valid when rank-mask mode is disabled.
+// Rank-mask launches must provide host-visible execution control through the
+// two-argument form.
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params, MoeA2AExecutionControl const& executionControl);
 // Prepare for dispatch: zero send_counters, local_token_counter and increment flag_val
@@ -255,7 +256,7 @@ struct MoeA2ACombineParams
 };
 
 // Combine kernels
-// Legacy one-argument ABI is retained but fails closed; see dispatch above.
+// The legacy one-argument ABI remains valid outside rank-mask mode; see dispatch above.
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params);
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl);
 

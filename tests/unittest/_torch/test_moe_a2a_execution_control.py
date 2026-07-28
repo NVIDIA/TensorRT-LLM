@@ -598,11 +598,50 @@ def test_native_control_rejects_different_workspace_on_same_device() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_native_dispatch_rejects_missing_execution_control() -> None:
+def test_native_no_mask_ops_keep_legacy_arity() -> None:
+    workspace = torch.zeros((1, 4096), dtype=torch.uint8, device="cuda")
+    metainfo = torch.ops.trtllm.moe_a2a_initialize(workspace, 0, 1, 1)
+    token_selected_experts = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    payload = torch.arange(16, dtype=torch.float32, device="cuda").to(torch.bfloat16).view(1, 16)
+
+    recv_tensors, combine_payload_offset, _ = torch.ops.trtllm.moe_a2a_dispatch(
+        token_selected_experts,
+        [payload],
+        workspace,
+        metainfo,
+        1,
+        0,
+        1,
+        1,
+        1,
+    )
+    output = torch.ops.trtllm.moe_a2a_combine(
+        recv_tensors[0],
+        1,
+        workspace,
+        metainfo,
+        1,
+        0,
+        1,
+        1,
+        combine_payload_offset,
+        False,
+    )
+    torch.cuda.synchronize(workspace.device)
+
+    assert recv_tensors[0].shape == (1, 1, 16)
+    assert output.shape == payload.shape
+    torch.testing.assert_close(output, payload)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_native_rank_mask_ops_reject_missing_execution_control() -> None:
     workspace = torch.zeros((1, 4096), dtype=torch.uint8, device="cuda")
     metainfo = torch.ops.trtllm.moe_a2a_initialize(workspace, 0, 1, 1)
     token_selected_experts = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
     payload = torch.zeros((1, 16), dtype=torch.bfloat16, device="cuda")
+    combine_payload = payload.view(1, 1, 16)
+    active_rank_mask = torch.tensor([1, 0], dtype=torch.uint64)
 
     with pytest.raises(RuntimeError, match="execution_control is required"):
         torch.ops.trtllm.moe_a2a_dispatch(
@@ -615,4 +654,91 @@ def test_native_dispatch_rejects_missing_execution_control() -> None:
             1,
             1,
             1,
+            None,
+            True,
+            active_rank_mask,
+        )
+    with pytest.raises(RuntimeError, match="execution_control is required"):
+        torch.ops.trtllm.moe_a2a_combine(
+            combine_payload,
+            1,
+            workspace,
+            metainfo,
+            1,
+            0,
+            1,
+            1,
+            0,
+            False,
+            False,
+            True,
+            active_rank_mask,
+        )
+
+
+def test_fake_ops_match_rank_mask_execution_control_contract() -> None:
+    workspace = torch.empty((1, 4096), dtype=torch.uint8, device="meta")
+    metainfo = torch.empty((10,), dtype=torch.int64, device="meta")
+    token_selected_experts = torch.empty((1, 1), dtype=torch.int32, device="meta")
+    payload = torch.empty((1, 16), dtype=torch.bfloat16, device="meta")
+    combine_payload = payload.view(1, 1, 16)
+    active_rank_mask = torch.tensor([1, 0], dtype=torch.uint64)
+
+    recv_tensors, combine_payload_offset, _ = torch.ops.trtllm.moe_a2a_dispatch(
+        token_selected_experts,
+        [payload],
+        workspace,
+        metainfo,
+        1,
+        0,
+        1,
+        1,
+        1,
+    )
+    output = torch.ops.trtllm.moe_a2a_combine(
+        combine_payload,
+        1,
+        workspace,
+        metainfo,
+        1,
+        0,
+        1,
+        1,
+        combine_payload_offset,
+        False,
+    )
+
+    assert recv_tensors[0].shape == (1, 1, 16)
+    assert output.shape == (1, 16)
+
+    with pytest.raises(RuntimeError, match="execution_control is required"):
+        torch.ops.trtllm.moe_a2a_dispatch(
+            token_selected_experts,
+            [payload],
+            workspace,
+            metainfo,
+            1,
+            0,
+            1,
+            1,
+            1,
+            None,
+            True,
+            active_rank_mask,
+        )
+    with pytest.raises(RuntimeError, match="execution_control is required"):
+        torch.ops.trtllm.moe_a2a_combine(
+            combine_payload,
+            1,
+            workspace,
+            metainfo,
+            1,
+            0,
+            1,
+            1,
+            0,
+            False,
+            False,
+            True,
+            active_rank_mask,
         )

@@ -42,12 +42,12 @@ void expectEmptyExecutionControlRejected(LaunchParams const& params, LaunchFunct
 }
 
 template <typename LaunchParams, typename LaunchFunction>
-void expectLegacyPrepareRejected(LaunchParams const& params, LaunchFunction launch)
+void expectRankMaskWithoutControlRejected(LaunchParams const& params, LaunchFunction launch)
 {
     try
     {
         launch(params);
-        FAIL() << "legacy prepare without execution control must fail before mutation";
+        FAIL() << "rank-mask launch without execution control must fail before mutation";
     }
     catch (TllmException const& error)
     {
@@ -63,12 +63,15 @@ TEST(MoeAlltoAllKernelTest, RejectsEmptyExecutionControl)
     dispatchParams.ep_rank = 0;
     dispatchParams.num_experts = 1;
     dispatchParams.num_payloads = 1;
+    dispatchParams.enable_rank_mask = true;
     expectEmptyExecutionControlRejected(dispatchParams,
         static_cast<void (*)(MoeA2ADispatchParams const&, MoeA2AExecutionControl const&)>(moe_a2a_dispatch_launch));
     expectEmptyExecutionControlRejected(dispatchParams,
         static_cast<void (*)(MoeA2ADispatchParams const&, MoeA2AExecutionControl const&)>(
             moe_a2a_prepare_dispatch_launch));
-    expectLegacyPrepareRejected(
+    expectRankMaskWithoutControlRejected(
+        dispatchParams, static_cast<void (*)(MoeA2ADispatchParams const&)>(moe_a2a_dispatch_launch));
+    expectRankMaskWithoutControlRejected(
         dispatchParams, static_cast<void (*)(MoeA2ADispatchParams const&)>(moe_a2a_prepare_dispatch_launch));
 
     MoeA2ACombineParams combineParams{};
@@ -76,12 +79,15 @@ TEST(MoeAlltoAllKernelTest, RejectsEmptyExecutionControl)
     combineParams.ep_size = 1;
     combineParams.ep_rank = 0;
     combineParams.elements_per_token = 1;
+    combineParams.enable_rank_mask = true;
     expectEmptyExecutionControlRejected(combineParams,
         static_cast<void (*)(MoeA2ACombineParams const&, MoeA2AExecutionControl const&)>(moe_a2a_combine_launch));
     expectEmptyExecutionControlRejected(combineParams,
         static_cast<void (*)(MoeA2ACombineParams const&, MoeA2AExecutionControl const&)>(
             moe_a2a_prepare_combine_launch));
-    expectLegacyPrepareRejected(
+    expectRankMaskWithoutControlRejected(
+        combineParams, static_cast<void (*)(MoeA2ACombineParams const&)>(moe_a2a_combine_launch));
+    expectRankMaskWithoutControlRejected(
         combineParams, static_cast<void (*)(MoeA2ACombineParams const&)>(moe_a2a_prepare_combine_launch));
 }
 
