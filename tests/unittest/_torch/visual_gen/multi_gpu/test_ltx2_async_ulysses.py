@@ -298,10 +298,10 @@ def _build_av_model(
 ):
     """Build LTXModel (AudioVideo) with deterministic weights via shared seed.
 
-    ``configure_audio_ulysses(audio_seq_len)`` gates audio_attn1's Ulysses
-    activity by divisibility: not divisible → ``set_ulysses_active(False)``
-    swaps the audio backend to plain (no ``forward_async``), forcing async
-    self-attn to fall through the ``hasattr`` guard in ``LTX2Attention.forward``.
+    audio_attn1's attention TYPE is fixed at construction from the AudioShardMode
+    env constant: CONDITIONAL (default) builds a plain backend (no
+    ``forward_async``), so async self-attn falls through the ``hasattr`` guard in
+    ``LTX2Attention.forward``; legacy FULL builds the Ulysses wrapper.
     """
     from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel, LTXModelType
 
