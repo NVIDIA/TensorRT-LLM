@@ -16,6 +16,7 @@
 import asyncio
 import concurrent.futures
 import ctypes
+import math
 import os
 import re
 import sys
@@ -298,6 +299,65 @@ def is_llm_response(instance):
     # Avoid testing for "result", because an error bindings.executor.Response
     # throws when accessing its result property.
     return hasattr(instance, "has_error")
+
+
+# --- Executor worker startup (initialization) stall reporting ---------------
+#
+# Both the proxy and every worker rank read this.  It is an environment
+# variable rather than an LlmArgs field on purpose: the ``TRTLLM``-prefixed
+# environment is forwarded verbatim to spawned MPI ranks
+# (``MpiPoolSession._start_mpi_pool``), so a single ``export`` sets the
+# proxy-side report and the per-rank stack dumps together, and CI can set it
+# without touching the protected LLM API surface.  It sits next to the existing
+# ``TRTLLM_WORKER_PRINT_STACKS_PERIOD`` / ``TRTLLM_WORKER_DISABLE_GC`` worker
+# knobs.
+
+#: Seconds of silence before the proxy logs a startup-stall report and every
+#: worker rank dumps its own thread stacks.  Diagnostics only -- nothing is
+#: killed and no deadline is imposed -- so this is safe to enable by default
+#: even for a startup that is slow but healthy (e.g. a 671B checkpoint loading
+#: from a cold NFS mount).  Set <= 0 to silence; anything that is not a finite
+#: number is a hard error rather than a silent fallback (see
+#: :func:`float_from_env`).
+WORKER_INIT_STALL_WARN_ENV = "TRTLLM_WORKER_INIT_STALL_WARN_SEC"
+WORKER_INIT_STALL_WARN_DEFAULT_SEC = 600.0
+
+
+def float_from_env(name: str, default: float) -> float:
+    """Read a float-valued environment variable, rejecting anything unusable.
+
+    Unset or blank takes ``default``.  Anything else that is not a finite
+    number raises ``ValueError`` rather than falling back, because this knob
+    configures the reporting that a wedged startup depends on: silently
+    substituting the default would hide the misconfiguration behind exactly
+    the silence this reporting exists to remove, and the variable is only ever
+    set deliberately, so there is no legitimate value to preserve.
+
+    ``nan`` in particular must not survive.  Every comparison against it is
+    False, so it slips past the ``period <= 0`` disable check, and
+    ``threading.Event.wait(nan)`` then returns False immediately (measured:
+    ~10us, no exception) instead of sleeping -- turning the watchdog into a
+    hot loop that dumps every thread's stack on every rank.  ``inf`` is no
+    better: ``Event.wait(inf)`` raises ``OverflowError`` from inside the
+    watchdog thread, killing the reporting silently.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError as e:
+        raise ValueError(f"Invalid {name}={raw!r}: expected a number of "
+                         f"seconds (default {default}).") from e
+    if not math.isfinite(value):
+        raise ValueError(f"Invalid {name}={raw!r}: expected a *finite* number "
+                         f"of seconds (default {default}).")
+    return value
+
+
+def worker_init_stall_warn_sec() -> float:
+    return float_from_env(WORKER_INIT_STALL_WARN_ENV,
+                          WORKER_INIT_STALL_WARN_DEFAULT_SEC)
 
 
 def print_alive_threads():
