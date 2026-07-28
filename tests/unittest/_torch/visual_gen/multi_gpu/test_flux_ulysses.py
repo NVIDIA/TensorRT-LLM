@@ -444,8 +444,8 @@ def _logic_flux1_async_vs_sync_parity(rank, world_size, backend):
     torch.testing.assert_close(
         async_output["sample"],
         sync_output["sample"],
-        rtol=1e-2,
-        atol=1e-2,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"Rank {rank}: FLUX.1 async-Ulysses output differs from sync Ulysses",
     )
 
