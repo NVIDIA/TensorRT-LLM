@@ -59,7 +59,7 @@ else
     }
 fi
 rm -f "${WORKSPACE}/${PROGRESS_TAR}.upload_ok" 2>/dev/null || true
-if curl -fsSL --retry 2 -u "$ART_USER:$ART_PASS" \
+if curl -fsSL --retry 2 -o /dev/null -u "$ART_USER:$ART_PASS" \
         -T "${WORKSPACE}/${PROGRESS_TAR}" "$PROGRESS_URL"; then
     [ -n "$HASH_FILE" ] && echo "$current_hash" > "$HASH_FILE"
     touch "${WORKSPACE}/${PROGRESS_TAR}.upload_ok" 2>/dev/null || true
