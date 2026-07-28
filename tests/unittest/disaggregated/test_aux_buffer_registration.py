@@ -22,6 +22,7 @@ NIXL fails the whole registration on the LIBFABRIC backend.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import List, Sequence, Tuple
 from unittest.mock import Mock
 
 import numpy as np
@@ -30,7 +31,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
 
 
-def _fake_worker(ptrs, sizes):
+def _fake_worker(ptrs: Sequence[int], sizes: Sequence[int]) -> SimpleNamespace:
     """Minimal stand-in exposing only what _register_aux_buffer touches."""
     meta = AuxBufferMeta(ptrs=np.array(ptrs, dtype=np.int64), size=np.array(sizes, dtype=np.int64))
     return SimpleNamespace(
@@ -38,24 +39,27 @@ def _fake_worker(ptrs, sizes):
     )
 
 
-def _registered_descs(worker):
+def _registered_descs(worker: SimpleNamespace) -> List[Tuple[int, int, int, str]]:
     worker._agent.register_memory.assert_called_once()
     return worker._agent.register_memory.call_args[0][0].descs
 
 
-def test_null_pointer_aux_buffer_is_skipped():
-    # Index 1 mirrors the draft-token buffer with max_draft_len == 0.
-    worker = _fake_worker([0x1000, 0, 0x3000, 0x4000], [512, 0, 128, 128])
+def test_null_pointer_aux_buffer_is_skipped() -> None:
+    # Index 1 mirrors the draft-token buffer with max_draft_len == 0. Its size is
+    # deliberately non-zero so this fails if only zero-sized buffers are filtered.
+    worker = _fake_worker([0x1000, 0, 0x3000, 0x4000], [512, 256, 128, 128])
 
     TransferWorker._register_aux_buffer(worker)
 
     descs = _registered_descs(worker)
     assert [d[0] for d in descs] == [0x1000, 0x3000, 0x4000]
-    assert all(d[1] > 0 for d in descs)
+    # Names keep their original index, so the list is sparse rather than renumbered.
+    assert [d[3] for d in descs] == ["aux_buffer_ptr_0", "aux_buffer_ptr_2", "aux_buffer_ptr_3"]
     assert len(worker._registered_mem) == 1
 
 
-def test_zero_size_aux_buffer_is_skipped():
+def test_zero_size_aux_buffer_is_skipped() -> None:
+    # Mirror image of the case above: a valid pointer with nothing behind it.
     worker = _fake_worker([0x1000, 0x2000], [512, 0])
 
     TransferWorker._register_aux_buffer(worker)
@@ -63,7 +67,7 @@ def test_zero_size_aux_buffer_is_skipped():
     assert [d[0] for d in _registered_descs(worker)] == [0x1000]
 
 
-def test_all_buffers_registered_when_none_are_empty():
+def test_all_buffers_registered_when_none_are_empty() -> None:
     ptrs = [0x1000, 0x2000, 0x3000, 0x4000]
     worker = _fake_worker(ptrs, [512, 256, 128, 128])
 
@@ -75,7 +79,7 @@ def test_all_buffers_registered_when_none_are_empty():
     assert [d[3] for d in descs] == [f"aux_buffer_ptr_{i}" for i in range(4)]
 
 
-def test_nothing_registered_when_every_buffer_is_empty():
+def test_nothing_registered_when_every_buffer_is_empty() -> None:
     worker = _fake_worker([0, 0], [0, 0])
 
     TransferWorker._register_aux_buffer(worker)
