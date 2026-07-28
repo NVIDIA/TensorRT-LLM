@@ -25,7 +25,7 @@ from torch.cuda import device_count
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
-from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
@@ -1822,6 +1822,7 @@ def disaggregated(
     """Running server in disaggregated mode"""
 
     logger.set_level(log_level)
+    set_prometheus_multiproc_dir()
 
     if metrics_log_interval != 0:
         logger.warning(

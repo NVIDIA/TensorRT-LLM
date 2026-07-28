@@ -1265,3 +1265,59 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
         f"CuteDSL heuristic kernel ({heuristic_us:.2f} us) is "
         f">{cublas_tolerance:.2f}x slower than cuBLAS NVFP4 "
         f"({cublas_us:.2f} us) for M={m}, N={n}, K={k}")
+
+
+@pytest.mark.parametrize("distribution", ["random", "balanced"])
+def test_trtllm_gen_moe_dummy_topk_local_experts_less_than_topk(
+        distribution, monkeypatch):
+    """NVBugs 6457853: autotuner warmup must not fail on EP shards where
+    local_num_experts < top_k (e.g. gpt-oss-120b: 128 experts, top_k=4,
+    EP64 -> 2 local experts per rank, attention-DP => use_dp=True).
+    Dummy rows keep the production shape: top_k distinct ids per row, all
+    local experts present, remaining slots padded with out-of-shard ids."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import \
+        prepare_dummy_topk_and_hook
+
+    monkeypatch.setenv("TRTLLM_GEN_MOE_AUTOTUNE_DUMMY_DISTRIBUTION",
+                       distribution)
+    num_tokens, top_k = 8, 4
+    num_experts, local_num_experts, local_expert_offset = 128, 2, 6
+    hidden_states = torch.randn(num_tokens,
+                                64,
+                                dtype=torch.bfloat16,
+                                device="cuda")
+    topk_ids = torch.randint(0,
+                             num_experts, (num_tokens, top_k),
+                             dtype=torch.int32,
+                             device="cuda")
+    topk_weights = torch.ones(num_tokens,
+                              top_k,
+                              dtype=torch.bfloat16,
+                              device="cuda")
+
+    with autotune():
+        _, dummy_weights, dummy_ids, _ = prepare_dummy_topk_and_hook(
+            topk_weights,
+            topk_ids,
+            hidden_states,
+            None,
+            1,
+            TuningConfig(),
+            top_k,
+            num_experts,
+            local_num_experts,
+            None,
+            None,
+            None,
+            local_expert_offset=local_expert_offset,
+            use_dp=True)
+
+    assert dummy_ids.shape == (num_tokens, top_k)
+    assert dummy_ids.dtype == torch.int32
+    assert dummy_weights.shape == (num_tokens, top_k)
+    shard = range(local_expert_offset, local_expert_offset + local_num_experts)
+    for row in dummy_ids.tolist():
+        assert len(set(row)) == top_k, f"duplicate ids in row {row}"
+        assert sum(x in shard for x in row) == local_num_experts, (
+            f"expected all {local_num_experts} local experts in row {row}")
+        assert all(0 <= x < num_experts for x in row), row

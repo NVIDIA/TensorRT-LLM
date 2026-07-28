@@ -707,6 +707,8 @@ def _generate_ltx2_cuda_graph_trtllm_backend_video(output_path):
         _save_lpips_video_mp4(output.video, output_path, frame_rate=LTX2_T2V_FRAME_RATE)
     finally:
         visual_gen.shutdown()
+        del visual_gen
+        _cleanup_cuda()
 
     assert os.path.isfile(output_path), f"LTX-2 TRTLLM backend did not produce {output_path}"
 

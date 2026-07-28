@@ -56,6 +56,7 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
@@ -100,8 +101,7 @@ from tensorrt_llm.version import __version__ as VERSION
 from tensorrt_llm.visual_gen import VisualGen
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
-from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
-                              maybe_transform_reasoning_effort)
+from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 
 # yapf: enable
 
@@ -492,13 +492,21 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.tokenizer.tokenizer, "name_or_path", None) or getattr(
                     self.tokenizer, "name_or_path", None)
         trust_remote_code = self.generator.args.trust_remote_code
-        try:
-            self.processor = AutoProcessor.from_pretrained(
-                hf_tokenizer_path, trust_remote_code=trust_remote_code)
-        except Exception:
-            logger.debug("Failed to load AutoProcessor or AutoConfig for %s",
-                         hf_tokenizer_path)
+        checkpoint_format = getattr(self.generator.args, "checkpoint_format",
+                                    None)
+        if checkpoint_format in ("mistral", "mistral_large_3"):
+            # Do not load HF processor for mistral native checkpoints
+            # even if it is available
             self.processor = None
+        else:
+            try:
+                self.processor = AutoProcessor.from_pretrained(
+                    hf_tokenizer_path, trust_remote_code=trust_remote_code)
+            except Exception:
+                logger.debug(
+                    "Failed to load AutoProcessor or AutoConfig for %s",
+                    hf_tokenizer_path)
+                self.processor = None
 
         # load model config
         try:
@@ -1547,7 +1555,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
@@ -1556,7 +1565,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                )
 
             # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
             if request.prompt_token_ids is None and request.prompt_token_ids_b64:
@@ -1735,7 +1745,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
@@ -1744,7 +1755,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                )
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
@@ -2053,34 +2065,18 @@ class OpenAIServer(_VideoRoutesMixin):
             # NOTE: WAR for Disagg failure, may affect perf if no warmup
             if not self.harmony_adapter:
                 self.harmony_adapter = get_harmony_adapter()
-            # Convert Pydantic models to dictionaries for JSON serialization (standard pattern)
-            tools_dict = None
-            if request.tools:
-                tools_dict = [tool.model_dump() for tool in request.tools]
-
-            # Reasoning effort precedence: request.reasoning_effort > system message parsing > serving default
-            reasoning_effort = maybe_transform_reasoning_effort(
-                request.reasoning_effort)
-            # Get tool_choice from request
-            tool_choice = getattr(request, 'tool_choice', None)
 
             # Reuse pre-tokenized harmony tokens when forwarded by an upstream
             # context worker (disaggregated serving). Otherwise, run the
             # Harmony adapter on the request messages.
-            if request.prompt_token_ids is not None:
-                harmony_tokens = request.prompt_token_ids
-            else:
-                try:
-                    harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
-                        request.messages,
-                        tools_dict,
-                        reasoning_effort=reasoning_effort,
-                        tool_choice=tool_choice)
-                except Exception:
-                    logger.error(f"messages_dict: {request.messages}")
-                    logger.error(f"tools_dict: {tools_dict}")
-                    logger.error(f"request: {request}")
-                    raise
+            try:
+                harmony_tokens = tokenize_harmony_chat_request(
+                    request, harmony_adapter=self.harmony_adapter)
+            except Exception:
+                logger.error("messages_dict: %s", request.messages)
+                logger.error("tools: %s", request.tools)
+                logger.error("request: %s", request)
+                raise
 
             # Get harmony stop tokens
             harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
