@@ -1283,11 +1283,40 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
     def transform_weights(self, module: Linear) -> None:
         super().transform_weights(module)
-        if (is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
-                                 or module.disable_deep_gemm)) or \
-           get_sm_version() == 120:
+        use_deep_gemm_layout = (
+            is_sm_100f()
+            and not (module.use_cute_dsl_blockscaling_mm
+                     or module.disable_deep_gemm)) or get_sm_version() == 120
+        use_indexer_q_cutedsl_layout = (use_deep_gemm_layout and getattr(
+            module, "use_indexer_q_cutedsl_fusion", False))
+        if use_deep_gemm_layout or use_indexer_q_cutedsl_layout:
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
+
+            if use_indexer_q_cutedsl_layout:
+                # Native SM100 MXF8 MMA consumes one scale per 32 K values.
+                # The checkpoint/production quantization contract remains
+                # 128x128: expand each row block and repeat each K scale four
+                # times, then materialize CUTLASS/CuTe's 128x4 swizzle once at
+                # weight-load time.
+                n = weight.shape[0]
+                scale_cutedsl = weight_scale.repeat_interleave(128, dim=0)[:n]
+                scale_cutedsl = scale_cutedsl.repeat_interleave(4, dim=1)
+                scale_cutedsl = torch.ops.trtllm.block_scale_interleave(
+                    scale_cutedsl.to(torch.float8_e8m0fnu).view(torch.uint8))
+                module.register_buffer(
+                    "indexer_q_weight_scale_cutedsl",
+                    scale_cutedsl,
+                    persistent=False,
+                )
+                module.register_buffer(
+                    "indexer_q_alpha_cutedsl",
+                    torch.ones((1, ), dtype=torch.float32,
+                               device=weight.device),
+                    persistent=False,
+                )
+
+        if use_deep_gemm_layout:
             transformed_scale = transform_sf_into_required_layout(
                 weight_scale,
                 mn=weight.shape[0],
@@ -3285,14 +3314,17 @@ class Linear(nn.Module):
                 raise ValueError(
                     f"Uneven TP is not supported with QuantAlgo {_quant_algo}")
             self.tp_sharding = override_tp_sharding
+            self._tp_sharding_is_auto = False
         elif self.tp_size > 1 and self.tp_mode is not None \
                 and self.weights_loading_config.weight_mode == WeightMode.VANILLA \
                 and _quant_algo not in _uneven_tp_unsupported \
                 and not skip_create_weights_in_init:
             features = in_features if self.tp_mode == TensorParallelMode.ROW else out_features
             self.tp_sharding = self._auto_tp_sharding(features, quant_config)
+            self._tp_sharding_is_auto = True
         else:
             self.tp_sharding = None
+            self._tp_sharding_is_auto = False
             if self.tp_size > 1 and self.tp_mode is not None:
                 features = in_features if self.tp_mode == TensorParallelMode.ROW else out_features
                 assert features % self.tp_size == 0, (
@@ -3304,6 +3336,31 @@ class Linear(nn.Module):
 
         self.in_features = self.calculate_local_in_features(in_features)
         self.out_features = self.calculate_local_out_features(out_features)
+
+        # allgather with sizes=None requires every rank to hold the same shape, so an
+        # unevenly sharded COLUMN output has to declare the per-rank widths explicitly.
+        self.gather_output_sizes = None
+        if self.gather_output and self.tp_size > 1 \
+                and self.tp_mode == TensorParallelMode.COLUMN:
+            if self._tp_sharding_is_auto:
+                sizes = [
+                    end - start for start, end in (
+                        self._auto_tp_sharding(out_features, quant_config, rank)
+                        for rank in range(self.tp_size))
+                ]
+                if len(set(sizes)) > 1:
+                    self.gather_output_sizes = sizes
+            elif self.tp_sharding is not None:
+                # allgather concatenates in rank order, so gather_output assumes rank i
+                # holds the i-th ascending, contiguous slice. _auto_tp_sharding
+                # guarantees that; an arbitrary override guarantees neither the widths
+                # nor the ordering, and `sizes` carries widths only — it cannot express
+                # a permuted or non-contiguous layout even when the widths are equal.
+                raise ValueError(
+                    f"gather_output=True is not supported together with "
+                    f"override_tp_sharding ({self.tp_sharding}); gather_output "
+                    f"requires the rank-ordered contiguous layout that only "
+                    f"automatic TP sharding provides.")
 
         if self.tp_mode == TensorParallelMode.COLUMN:
             reduce_output = False if self.mapping.enable_attention_dp else reduce_output
@@ -3344,9 +3401,8 @@ class Linear(nn.Module):
         if torch.cuda.is_available():
             capability = torch.cuda.get_device_capability(
                 torch.device('cuda:0'))
-            # enable cuda core for sm89 and sm120
-            self.enable_cuda_core = (capability[0] == 8 and capability[1] == 9) \
-                or (capability[0] == 12 and capability[1] == 0)
+            # enable cuda core for sm89, sm120, and sm121
+            self.enable_cuda_core = capability in ((8, 9), (12, 0), (12, 1))
 
         if not skip_create_weights_in_init:
             self.create_weights()
@@ -3358,34 +3414,36 @@ class Linear(nn.Module):
     def _calc_shard(total, tp_size, rank):
         return (total // tp_size) * rank + min(total % tp_size, rank)
 
-    def _auto_tp_sharding(self, features, quant_config):
+    def _auto_tp_sharding(self, features, quant_config, rank=None):
         """Auto-generate tp_sharding tuple based on quant alignment requirements.
 
         VANILLA mode only. Fused modes (FUSED_QKV, FUSED_GATE_UP) require explicit
         override_tp_sharding because individual sub-weight sizes (Q vs K vs V; gate
         vs up) are not knowable here — they aren't always equal (e.g. GQA), and
         cross-rank consistency must be decided by the caller.
+
+        `rank` defaults to this module's own TP rank; pass an explicit rank to query
+        another rank's range (e.g. to build the per-rank sizes an allgather needs).
         """
         assert self.weights_loading_config.weight_mode == WeightMode.VANILLA, (
             f"_auto_tp_sharding only supports VANILLA mode, got "
             f"{self.weights_loading_config.weight_mode}. Fused modes require "
             f"explicit override_tp_sharding.")
+        rank = self.tp_rank if rank is None else rank
         alignment = get_quant_method(quant_config).get_tp_alignment(
             self.tp_mode, quant_config)
         if alignment <= 1:
             # No alignment constraint — use standard element-level distribution
-            start = self._calc_shard(features, self.tp_size, self.tp_rank)
-            end = self._calc_shard(features, self.tp_size, self.tp_rank + 1)
+            start = self._calc_shard(features, self.tp_size, rank)
+            end = self._calc_shard(features, self.tp_size, rank + 1)
         else:
             # Distribute whole alignment-sized blocks across ranks
             assert features % alignment == 0, (
                 f"Feature dim ({features}) must be divisible by quant alignment "
                 f"({alignment}) for TP sharding")
             num_blocks = features // alignment
-            block_start = self._calc_shard(num_blocks, self.tp_size,
-                                           self.tp_rank)
-            block_end = self._calc_shard(num_blocks, self.tp_size,
-                                         self.tp_rank + 1)
+            block_start = self._calc_shard(num_blocks, self.tp_size, rank)
+            block_end = self._calc_shard(num_blocks, self.tp_size, rank + 1)
             start = block_start * alignment
             end = block_end * alignment
         return (start, end)
@@ -3674,7 +3732,9 @@ class Linear(nn.Module):
             output = self.apply_linear(input, self.bias, lora_params, layer_idx)
             if self.gather_output:
                 from ..distributed import allgather
-                output = allgather(output, self.mapping)
+                output = allgather(output,
+                                   self.mapping,
+                                   sizes=self.gather_output_sizes)
         else:
             output = self.apply_linear(input, self.bias, lora_params, layer_idx)
 

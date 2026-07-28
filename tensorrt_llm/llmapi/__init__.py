@@ -90,5 +90,4 @@ __all__ = [
     'PrometheusMetricsConfig',
     'ThinkingBudgetLogitsProcessor',
     'add_thinking_budget_logits_processor',
-    'DeepSeekV4SparseAttentionConfig',
 ]
