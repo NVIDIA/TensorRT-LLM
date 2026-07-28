@@ -312,29 +312,6 @@ def safely_apply_temperature_inplace(
 class Fusions:
     @staticmethod
     @torch.compile(dynamic=None, fullgraph=True)
-    def _gather_scatter_impl(
-        dst_cuda: torch.Tensor,
-        dst_index_cuda: torch.Tensor,
-        src_cuda: torch.Tensor,
-        src_index_cuda: torch.Tensor,
-    ) -> None:
-        dst_cuda[dst_index_cuda] = src_cuda[src_index_cuda]
-
-    @staticmethod
-    def gather_scatter(
-        dst_cuda: torch.Tensor,
-        dst_index_cuda: torch.Tensor,
-        src_cuda: torch.Tensor,
-        src_index_cuda: torch.Tensor,
-    ) -> None:
-        torch._dynamo.mark_dynamic(dst_cuda, 0)
-        torch._dynamo.mark_dynamic(dst_index_cuda, 0)
-        torch._dynamo.mark_dynamic(src_cuda, 0)
-        torch._dynamo.mark_dynamic(src_index_cuda, 0)
-        Fusions._gather_scatter_impl(dst_cuda, dst_index_cuda, src_cuda, src_index_cuda)
-
-    @staticmethod
-    @torch.compile(dynamic=None, fullgraph=True)
     def _determine_sampled_rank_impl(
         group_logprobs_cuda: torch.Tensor, sampled_logprobs_cuda: torch.Tensor
     ) -> torch.Tensor:
@@ -361,18 +338,25 @@ class Fusions:
         ),
     )
     def _gather_log_softmax_impl(
-        inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor
-    ) -> torch.Tensor:
-        return torch.nn.functional.log_softmax(
+        inputs_cuda: torch.Tensor,
+        indices_cuda: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        # NB: helper function for TorchSampler._process_logprobs, torch.compile is expected to avoid
+        #     materializing the index select and output the results directly into the destination tensor.
+        out[...] = torch.nn.functional.log_softmax(
             inputs_cuda[indices_cuda],
             dim=-1,
         )
 
     @staticmethod
-    def gather_log_softmax(inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor) -> torch.Tensor:
+    def gather_log_softmax_with_output(
+        inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor, out: torch.Tensor
+    ) -> None:
         torch._dynamo.mark_dynamic(inputs_cuda, 0)
         torch._dynamo.mark_dynamic(indices_cuda, 0)
-        return Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda)
+        torch._dynamo.mark_dynamic(out, 0)
+        Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda, out)
 
     # --- Top-P Decay ops ---------------------------------------------------
     # Host-launch-bound per-step ops (a few dozen elements per row), fused with
