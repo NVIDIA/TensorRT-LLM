@@ -756,12 +756,41 @@ def test_qwen2_5_attention_metadata_capacity_uses_processor_geometry():
         max_num_items=8, max_num_tokens=160)
 
     # One full-attention frame has at least 4 merged cells * 4 physical
-    # patches. For 4x4 windows, the maximum window/area ratio is 2/5 (a
-    # 1x5 merged grid), or one window segment per 10 physical patches.
+    # patches. For 4x4 windows the worst window/area ratio is a 1x4 merged
+    # grid: the encoder pads an exactly-divisible dimension by a whole window
+    # (see `_windows_along`), so it emits 2 windows for 16 physical patches.
+    # A 160-token batch therefore holds 10 such frames and 20 contexts.
     assert capacities == {
         "full_attention": 10,
-        "window_attention": 16,
+        "window_attention": 20,
     }
+
+
+@pytest.mark.parametrize(
+    "merged_h,merged_w,expected_windows",
+    [
+        (1, 4, 2),  # width exactly divisible -> one all-padding window
+        (4, 4, 4),  # both exactly divisible -> ceil() would say 1
+        (2, 8, 3),
+        (8, 8, 9),
+        (3, 5, 2),  # neither divisible -> ceil() already agreed
+        (1, 3, 1),
+    ],
+)
+def test_window_count_matches_encoder_padding(merged_h, merged_w,
+                                              expected_windows):
+    """Capacity sizing must count windows the way the encoder emits them.
+
+    `get_window_index_by_thw` pads by `window - dim % window`, which is a
+    whole extra window when `dim` is an exact multiple. Those windows carry
+    only padding, so their sequence length is zero, but they still reach
+    `window_seq_lens` and still count as contexts -- so sizing the metadata
+    with `ceil()` under-allocates exactly on the divisible cases.
+    """
+    window_side = 4
+    windows = (Qwen2VLInputProcessorBase._windows_along(merged_h, window_side) *
+               Qwen2VLInputProcessorBase._windows_along(merged_w, window_side))
+    assert windows == expected_windows
 
 
 def test_qwen2_5_rejects_runtime_grid_below_startup_geometry():

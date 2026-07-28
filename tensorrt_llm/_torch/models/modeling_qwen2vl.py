@@ -632,6 +632,21 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         return min_area, max_area
 
     @staticmethod
+    def _windows_along(dimension: int, window_side: int) -> int:
+        """Windows the encoder produces along one merged-grid dimension.
+
+        This mirrors `Qwen2_5_VisionModel.get_window_index_by_thw` rather than
+        rounding up, because that padding is `window - dim % window`, which is
+        a whole extra window when `dim` is an exact multiple instead of none.
+        The extra window holds only padding, so its sequence length is zero --
+        but it is still emitted in `window_seq_lens` and still counted as a
+        context, so metadata sized with `ceil()` would come up short (a 4x4
+        merged grid produces 4 windows, not 1).
+        """
+        return (dimension + window_side -
+                dimension % window_side) // window_side
+
+    @staticmethod
     @lru_cache(maxsize=32)
     def _max_window_ratio(min_area: int, max_area: int,
                           window_side: int) -> Tuple[int, int]:
@@ -644,13 +659,14 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         """
         best_windows = 1
         best_area = min_area
+        windows_along = Qwen2VLInputProcessorBase._windows_along
         for grid_h in range(1, max_area + 1):
             min_grid_w = max(1, math.ceil(min_area / grid_h))
             max_grid_w = max_area // grid_h
             for grid_w in range(min_grid_w, max_grid_w + 1):
                 area = grid_h * grid_w
-                windows = (math.ceil(grid_h / window_side) *
-                           math.ceil(grid_w / window_side))
+                windows = (windows_along(grid_h, window_side) *
+                           windows_along(grid_w, window_side))
                 if windows * best_area > best_windows * area:
                     best_windows = windows
                     best_area = area
@@ -676,8 +692,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 merged_h = grid_h // merge_size
                 merged_w = grid_w // merge_size
                 area = merged_h * merged_w
-                windows = (math.ceil(merged_h / window_side) *
-                           math.ceil(merged_w / window_side))
+                windows = (self._windows_along(merged_h, window_side) *
+                           self._windows_along(merged_w, window_side))
                 if (area < min_area
                         or windows * ratio_area > max_windows * area):
                     raise ValueError(
