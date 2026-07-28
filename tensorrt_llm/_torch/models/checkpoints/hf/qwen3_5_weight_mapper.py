@@ -85,7 +85,8 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 preview += f", ... ({len(pending)} tensors total)"
             raise RuntimeError(
                 "Cannot finalize Qwen3.5 weight update with incomplete "
-                f"linear-attention projection groups: {preview}")
+                f"linear-attention projection groups: {preview}"
+            )
         self._update_weights_active = False
 
     def abort_update_weights(self) -> None:
@@ -98,8 +99,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         self.abort_update_weights()
         super().cleanup()
 
-    def _stage_partial_split_projections(self, weights: dict,
-                                         quant_algo: QuantAlgo | None) -> dict:
+    def _stage_partial_split_projections(self, weights: dict, quant_algo: QuantAlgo | None) -> dict:
         """Emit complete QKVZ and BA groups from incremental input.
 
         Packed broadcast boundaries are byte based and may split projections
@@ -118,8 +118,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 ready_weights[name] = tensor
                 continue
             if name in self._partial_split_weights:
-                raise RuntimeError(
-                    f"Duplicate Qwen3.5 partial weight received: {name}")
+                raise RuntimeError(f"Duplicate Qwen3.5 partial weight received: {name}")
             self._partial_split_weights[name] = tensor
 
         grouped_names = defaultdict(dict)
@@ -131,8 +130,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
 
         consumed_names = set()
         for (prefix, suffix), names in grouped_names.items():
-            if (quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-                    and suffix == "weight_scale_inv"):
+            if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and suffix == "weight_scale_inv":
                 # DeepSeek-format block scales must be emitted with the FP8
                 # weights that consume them below.
                 continue
@@ -150,15 +148,15 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                     quant_algo == QuantAlgo.FP8_BLOCK_SCALES
                     and suffix == "weight"
                     and any(
-                        self._partial_split_weights[name].dtype
-                        == torch.float8_e4m3fn for name in required_names))
+                        self._partial_split_weights[name].dtype == torch.float8_e4m3fn
+                        for name in required_names
+                    )
+                )
                 if requires_block_scales:
-                    scale_names = grouped_names.get(
-                        (prefix, "weight_scale_inv"), {})
+                    scale_names = grouped_names.get((prefix, "weight_scale_inv"), {})
                     if required.issubset(scale_names):
                         consumed_names.update(required_names)
-                        consumed_names.update(
-                            scale_names[key] for key in required)
+                        consumed_names.update(scale_names[key] for key in required)
                 else:
                     consumed_names.update(required_names)
 
@@ -236,14 +234,12 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             # stacked weights get misrouted into the fused path and crash the
             # quantized loader.
             per_expert_pattern = re.compile(r"^\d+\.(?:gate_proj|up_proj|down_proj)\.")
-            has_per_expert_tensors = any(
-                per_expert_pattern.match(name) for name in module_weights)
+            has_per_expert_tensors = any(per_expert_pattern.match(name) for name in module_weights)
             has_stacked_expert_tensors = any(
-                name in ("gate_up_proj", "down_proj")
-                and getattr(value, "ndim", None) == 3
-                for name, value in module_weights.items())
-            uses_fused_expert_tensors = (
-                has_stacked_expert_tensors and not has_per_expert_tensors)
+                name in ("gate_up_proj", "down_proj") and getattr(value, "ndim", None) == 3
+                for name, value in module_weights.items()
+            )
+            uses_fused_expert_tensors = has_stacked_expert_tensors and not has_per_expert_tensors
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():
                 if has_per_expert_tensors and weight_name in ("gate_up_proj", "down_proj"):
@@ -677,7 +673,8 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         normalized_weights = self._normalize_weight_names(weights)
         if allow_partial_loading:
             normalized_weights = self._stage_partial_split_projections(
-                normalized_weights, quant_algo)
+                normalized_weights, quant_algo
+            )
         normalized_weights, is_modelopt_pb_wo = self._normalize_scale_names(
             normalized_weights, quant_algo
         )

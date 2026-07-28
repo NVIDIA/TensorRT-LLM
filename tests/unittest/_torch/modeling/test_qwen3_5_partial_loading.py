@@ -30,14 +30,11 @@ def test_qwen35_vl_propagates_partial_loading_to_vision_encoder():
         allow_partial_loading=True,
     )
 
-    model.mm_encoder.load_weights.assert_called_once_with(
-        {}, allow_partial_loading=True
-    )
+    model.mm_encoder.load_weights.assert_called_once_with({}, allow_partial_loading=True)
     assert model.llm.load_weights.call_args.kwargs["allow_partial_loading"] is True
 
 
 class _VisualStub(nn.Module):
-
     def __init__(self):
         super().__init__()
         self.config = SimpleNamespace(num_heads=2)
@@ -73,9 +70,11 @@ def test_qwen35_partial_block_fp8_qkvz_waits_for_weights_and_scales():
 
     mapper.begin_update_weights()
     assert not mapper._stage_partial_split_projections(
-        {f"{prefix}qkv.weight": qkv_weight}, QuantAlgo.FP8_BLOCK_SCALES)
+        {f"{prefix}qkv.weight": qkv_weight}, QuantAlgo.FP8_BLOCK_SCALES
+    )
     assert not mapper._stage_partial_split_projections(
-        {f"{prefix}z.weight": z_weight}, QuantAlgo.FP8_BLOCK_SCALES)
+        {f"{prefix}z.weight": z_weight}, QuantAlgo.FP8_BLOCK_SCALES
+    )
     assert not mapper._stage_partial_split_projections(
         {f"{prefix}qkv.weight_scale_inv": qkv_scale},
         QuantAlgo.FP8_BLOCK_SCALES,
@@ -102,9 +101,11 @@ def test_qwen35_partial_bf16_qkvz_does_not_wait_for_scales():
 
     mapper.begin_update_weights()
     assert not mapper._stage_partial_split_projections(
-        {f"{prefix}qkv.weight": qkv_weight}, QuantAlgo.FP8_BLOCK_SCALES)
+        {f"{prefix}qkv.weight": qkv_weight}, QuantAlgo.FP8_BLOCK_SCALES
+    )
     ready = mapper._stage_partial_split_projections(
-        {f"{prefix}z.weight": z_weight}, QuantAlgo.FP8_BLOCK_SCALES)
+        {f"{prefix}z.weight": z_weight}, QuantAlgo.FP8_BLOCK_SCALES
+    )
 
     assert ready == {
         f"{prefix}qkv.weight": qkv_weight,

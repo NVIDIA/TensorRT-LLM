@@ -703,9 +703,7 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     ):
         # None under MM E/P disagg or disable_mm_encoder.
         if self.mm_encoder is not None:
-            self.mm_encoder.load_weights(
-                weights, allow_partial_loading=allow_partial_loading
-            )
+            self.mm_encoder.load_weights(weights, allow_partial_loading=allow_partial_loading)
 
         # Hand the persistent mapper the inner LM's model_config, not the VLM wrapper's:
         # only the inner config went through the Qwen3.5 quant-dict
@@ -717,11 +715,10 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
         # weight_scale=1.0 and quantizes activations dynamically every step.
         if not isinstance(weight_mapper, Qwen3_5MoeHfWeightMapper):
             raise TypeError(
-                "Qwen3.5 VLM requires Qwen3_5MoeHfWeightMapper, got "
-                f"{type(weight_mapper).__name__}")
+                f"Qwen3.5 VLM requires Qwen3_5MoeHfWeightMapper, got {type(weight_mapper).__name__}"
+            )
         if weight_mapper.model is not self.llm:
-            weight_mapper.init_model_and_config(self.llm,
-                                                self.llm.model_config)
+            weight_mapper.init_model_and_config(self.llm, self.llm.model_config)
         filtered_weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
         params_map = {
             r"^model\.language_model\.(.*)$": r"model.\1",
