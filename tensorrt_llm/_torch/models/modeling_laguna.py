@@ -304,6 +304,7 @@ class LagunaAttention(QKNormRoPEAttention):
             rp.beta_fast = float(rp_dict.get("beta_fast", 32.0))
             rp.beta_slow = float(rp_dict.get("beta_slow", 1.0))
             attention_factor = rp_dict.get("attention_factor")
+            print(f"attention_factor read from config: {attention_factor}")
             if attention_factor is not None:
                 attention_factor = float(attention_factor)
                 # attention_factor is the FINAL YaRN scaling (HF semantics).
