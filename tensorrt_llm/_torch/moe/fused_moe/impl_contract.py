@@ -504,6 +504,7 @@ class MoECommPlan:
     # every other communication strategy.
     recv_expert_count: Optional[torch.Tensor] = None
     deep_ep_expert_capacity: Optional[int] = None
+    use_deep_ep_direct_metadata: bool = False
 
 
 @dataclass(frozen=True)

@@ -210,58 +210,21 @@ def test_cutedsl_direct_metadata_tuning_is_static_and_legacy_remains_dynamic():
 
 
 @pytest.mark.parametrize(
-    "enable_direct_metadata,remove_adapter,expect_error",
+    "disable_value,expected_disabled",
     [
-        (False, False, False),
-        (True, False, False),
-        (False, True, True),
-        (True, True, False),
+        (None, False),
+        ("0", False),
+        ("1", True),
     ],
 )
-def test_cutedsl_deep_ep_direct_metadata_env_gating(
-    monkeypatch, enable_direct_metadata: bool, remove_adapter: bool, expect_error: bool
+def test_cutedsl_deep_ep_direct_metadata_disable_env(
+    monkeypatch, disable_value: Optional[str], expected_disabled: bool
 ):
-    monkeypatch.delenv("TRTLLM_CUTEDSL_DEEP_EP_DIRECT_METADATA", raising=False)
-    monkeypatch.delenv("TRTLLM_CUTEDSL_DEEP_EP_COUNT_NATIVE_METADATA", raising=False)
-    monkeypatch.delenv("TRTLLM_CUTEDSL_DEEP_EP_REMOVE_ADAPTER", raising=False)
-    if enable_direct_metadata:
-        monkeypatch.setenv("TRTLLM_CUTEDSL_DEEP_EP_DIRECT_METADATA", "1")
-    if remove_adapter:
-        monkeypatch.setenv("TRTLLM_CUTEDSL_DEEP_EP_REMOVE_ADAPTER", "1")
-
-    def mock_base_init(self, **kwargs):
-        self.aux_stream_dict = {}
-        self.event_dict = {}
-
-    monkeypatch.setattr(CutlassFusedMoE, "__init__", mock_base_init)
-    monkeypatch.setattr(torch.cuda, "Stream", MagicMock(return_value=object()))
-    monkeypatch.setattr(torch.cuda, "Event", MagicMock(return_value=object()))
-
-    constructor_kwargs = {
-        "routing_method": MagicMock(),
-        "num_experts": 8,
-        "hidden_size": 64,
-        "intermediate_size": 128,
-    }
-    if expect_error:
-        with pytest.raises(ValueError, match="REMOVE_ADAPTER=1 requires"):
-            CuteDslFusedMoE(**constructor_kwargs)
-        return
-
-    backend = CuteDslFusedMoE(**constructor_kwargs)
-    assert backend.enable_deep_ep_direct_metadata is enable_direct_metadata
-    assert backend.enable_deep_ep_count_native_metadata is False
-    assert backend.enable_deep_ep_remove_adapter is remove_adapter
-
-
-@pytest.mark.parametrize("remove_adapter,expect_error", [(False, True), (True, False)])
-def test_cutedsl_count_native_metadata_env_gating(monkeypatch, remove_adapter, expect_error):
-    monkeypatch.setenv("TRTLLM_CUTEDSL_DEEP_EP_DIRECT_METADATA", "1")
-    monkeypatch.setenv("TRTLLM_CUTEDSL_DEEP_EP_COUNT_NATIVE_METADATA", "1")
-    if remove_adapter:
-        monkeypatch.setenv("TRTLLM_CUTEDSL_DEEP_EP_REMOVE_ADAPTER", "1")
+    env_name = "TRTLLM_DISABLE_CUTEDSL_DEEP_EP_DIRECT_METADATA"
+    if disable_value is None:
+        monkeypatch.delenv(env_name, raising=False)
     else:
-        monkeypatch.delenv("TRTLLM_CUTEDSL_DEEP_EP_REMOVE_ADAPTER", raising=False)
+        monkeypatch.setenv(env_name, disable_value)
 
     def mock_base_init(self, **kwargs):
         self.aux_stream_dict = {}
@@ -270,19 +233,16 @@ def test_cutedsl_count_native_metadata_env_gating(monkeypatch, remove_adapter, e
     monkeypatch.setattr(CutlassFusedMoE, "__init__", mock_base_init)
     monkeypatch.setattr(torch.cuda, "Stream", MagicMock(return_value=object()))
     monkeypatch.setattr(torch.cuda, "Event", MagicMock(return_value=object()))
+
     constructor_kwargs = {
         "routing_method": MagicMock(),
         "num_experts": 8,
         "hidden_size": 64,
         "intermediate_size": 128,
     }
-    if expect_error:
-        with pytest.raises(ValueError, match="COUNT_NATIVE_METADATA=1 requires"):
-            CuteDslFusedMoE(**constructor_kwargs)
-        return
 
     backend = CuteDslFusedMoE(**constructor_kwargs)
-    assert backend.enable_deep_ep_count_native_metadata is True
+    assert backend.disable_deep_ep_direct_metadata is expected_disabled
 
 
 def test_deep_ep_adapter_free_output_matches_schema_and_reuses_cache(monkeypatch):
@@ -354,7 +314,50 @@ def test_deep_ep_adapter_free_cache_miss_rejected_during_capture(monkeypatch):
     assert comm._adapter_free_placeholder_cache == {}
 
 
-def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl():
+@pytest.mark.parametrize(
+    "disabled,has_nvfp4,supports_post_quant,expected",
+    [
+        (False, True, True, True),
+        (True, True, True, False),
+        (False, False, True, False),
+        (False, True, False, False),
+    ],
+)
+def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
+    disabled: bool, has_nvfp4: bool, supports_post_quant: bool, expected: bool
+):
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend.disable_deep_ep_direct_metadata = disabled
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=MagicMock(return_value=has_nvfp4),
+        ),
+    )
+    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler.moe = SimpleNamespace(backend=backend, comm=comm)
+
+    assert scheduler._use_cutedsl_deep_ep_direct_metadata(supports_post_quant) is expected
+
+
+def test_scheduler_rejects_direct_metadata_for_other_backend_or_communication():
+    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler.moe = SimpleNamespace(
+        backend=CuteDslFusedMoE.__new__(CuteDslFusedMoE),
+        comm=object(),
+    )
+    assert scheduler._use_cutedsl_deep_ep_direct_metadata(True) is False
+
+    scheduler.moe = SimpleNamespace(
+        backend=CutlassFusedMoE.__new__(CutlassFusedMoE),
+        comm=DeepEPLowLatency.__new__(DeepEPLowLatency),
+    )
+    assert scheduler._use_cutedsl_deep_ep_direct_metadata(True) is False
+
+
+@pytest.mark.parametrize("disabled,expected", [(False, True), (True, False)])
+def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(disabled: bool, expected: bool):
     recv_expert_count = torch.tensor([3, 0, 5], dtype=torch.int32)
     expert_capacity = 8
     comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
@@ -363,6 +366,13 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl():
         "expert_capacity": expert_capacity,
     }
     backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend.disable_deep_ep_direct_metadata = disabled
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=MagicMock(return_value=True),
+        ),
+    )
     scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
     scheduler.moe = SimpleNamespace(
         backend=backend,
@@ -373,10 +383,12 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl():
     plan = scheduler._build_comm_plan(
         all_rank_num_tokens=None,
         output_dtype=torch.bfloat16,
+        use_deep_ep_direct_metadata=expected,
     )
 
     assert plan.recv_expert_count is recv_expert_count
     assert plan.deep_ep_expert_capacity == expert_capacity
+    assert plan.use_deep_ep_direct_metadata is expected
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
