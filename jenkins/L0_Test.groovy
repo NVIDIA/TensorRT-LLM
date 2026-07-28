@@ -48,6 +48,8 @@ UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifac
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 ENABLE_UPLOAD_TEST_RESULTS = params.enableUploadTestResults != null ? params.enableUploadTestResults : true
 ENABLE_S3_ECHO_STDOUT = params.enableS3EchoStdout != null ? params.enableS3EchoStdout : false
+// Kill switch for the scoped post-merge multi-GPU echo (shouldEchoTestOutputToConsole).
+DISABLE_POST_MERGE_STDOUT_ECHO = params.disableStdoutEchoOnPostMerge != null ? params.disableStdoutEchoOnPostMerge : false
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -1272,12 +1274,22 @@ def getPytestBaseCommandLine(
 // results-<stage>.tar.gz), but recovering it means knowing to download and
 // unpack an artifact, which is not how a stage failure gets triaged.
 //
+// What echoing recovers, precisely: everything written up to roughly a quarter
+// second before the process dies, which covers a HangDetector report. It does
+// not recover pytest-timeout's own stack dump, which is written immediately
+// before os._exit -- that still only reaches the spool, as it does today.
+//
 // Echoing costs log volume, so it is limited to where the evidence is worth
 // most: post-merge multi-GPU stages. Those are the stages whose timeouts burn
 // the most GPU-hours per occurrence, and the wedges there are the ones that
 // leave nothing behind today. PerfSanity stages are excluded so that timing
-// runs keep their current, quieter console.
+// runs keep their current, quieter console. Set the disableStdoutEchoOnPostMerge
+// build parameter to turn this off without a code change; the plugin also caps
+// the echoed bytes per session.
 def shouldEchoTestOutputToConsole(String stageName) {
+    if (DISABLE_POST_MERGE_STDOUT_ECHO) {
+        return false
+    }
     if (!stageName.contains("Post-Merge") || stageName.contains("PerfSanity")) {
         return false
     }

@@ -79,8 +79,18 @@ def test_data_availability(stage_query):
     print(f"Max samples configured: {MAX_SAMPLES}")
 
 
-def test_s3_stdout_echo_requires_explicit_opt_in():
-    """Keep Jenkins pytest progress readable unless live log echo is requested."""
+def test_s3_stdout_echo_is_opt_in_or_scoped_to_post_merge_multi_gpu():
+    """Keep Jenkins pytest progress readable: echo only where it is justified.
+
+    Live echo used to be reachable only through the ``enableS3EchoStdout``
+    build parameter. It is now also enabled for post-merge multi-GPU stages,
+    because a test that wedges there is hard-killed before the S3 capture
+    plugin publishes its output, leaving the stage log with no trace of the
+    wedge. That is a deliberate widening, so this test no longer requires the
+    parameter guard -- but every ``--s3-echo-stdout`` path must still be
+    guarded by one of exactly two things, so echo cannot spread to pre-merge
+    stages unnoticed.
+    """
     with open(GROOVY, 'r') as f:
         lines = f.readlines()
 
@@ -93,9 +103,30 @@ def test_s3_stdout_echo_requires_explicit_opt_in():
     ]
     assert echo_lines, 'Expected at least one opt-in --s3-echo-stdout path'
 
+    allowed_guards = ('ENABLE_S3_ECHO_STDOUT',
+                      'shouldEchoTestOutputToConsole(stageName)')
     for idx in echo_lines:
         context = lines[max(0, idx - 3):idx]
-        assert any('if (ENABLE_S3_ECHO_STDOUT)' in line for line in context)
+        assert any(guard in line for guard in allowed_guards
+                   for line in context), (
+                       f'{GROOVY}:{idx + 1} enables --s3-echo-stdout without '
+                       'the enableS3EchoStdout parameter or the '
+                       'shouldEchoTestOutputToConsole() stage gate')
+
+    # The stage gate itself must stay narrow: post-merge only, multi-GPU only,
+    # not perf stages, and disableable without a code change.
+    groovy = ''.join(lines)
+    gate = groovy.split('def shouldEchoTestOutputToConsole(')[1]
+    gate = gate.split('\ndef ')[0]
+    for required in ('DISABLE_POST_MERGE_STDOUT_ECHO', '"Post-Merge"',
+                     '"PerfSanity"', 'system_gpu_count'):
+        assert required in gate, (
+            f'shouldEchoTestOutputToConsole() no longer checks {required}; '
+            'console echo must stay scoped to post-merge multi-GPU stages')
+    assert any(
+        'DISABLE_POST_MERGE_STDOUT_ECHO = params.disableStdoutEchoOnPostMerge'
+        in line for line in lines), (
+            'the post-merge echo needs a build-parameter kill switch')
 
     progress_lines = [
         idx for idx, line in enumerate(lines)

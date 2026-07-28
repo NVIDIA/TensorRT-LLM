@@ -166,31 +166,62 @@ class SessionFDSpool:
             self._saved_fd = None
 
 
+@dataclass
+class _SpoolReader:
+    path: str
+    stream: io.RawIOBase
+    console_fd: int
+
+
 class SessionSpoolEchoer:
     """Mirror the session spool files onto the real console as they grow.
 
     Session capture points fd 1 and 2 at append-only spool files, so nothing a
     test -- or any MPI worker rank that inherited those fds -- writes reaches
     the console; it is published only once the test finishes and its slice is
-    uploaded. A wedged test never finishes: pytest's ``--timeout`` kills the
-    process with ``os._exit``, so the spooled bytes, including any HangDetector
-    dump, are never published anywhere the stage log can see.
+    uploaded. A test that wedges never finishes, so its output is never
+    published and the stage log holds no trace of it.
 
-    Tailing the spool puts that output on the console while it is produced, at
-    a cost of at most one poll interval of lag, and without changing how
-    capture, per-test slicing, or uploading work. Only the console copy is
-    best-effort: the spool file itself is still written synchronously by the
-    producer, so an abrupt kill cannot lose more than the last poll interval.
+    Tailing the spool puts that output on the console while it is produced,
+    without changing how capture, per-test slicing, or uploading work.
+
+    What this does and does not recover, precisely: everything written more
+    than one poll interval before the process dies reaches the console, which
+    covers a HangDetector report (the detector logs, dumps stacks, and only
+    then hard-kills). It does *not* recover output written in the last instants
+    before an abrupt exit -- notably pytest-timeout's own stack dump, which it
+    writes and then immediately calls ``os._exit``. That dump still reaches the
+    spool file, and so the ``results-<stage>.tar.gz`` artifact, exactly as it
+    does today; it is simply not on the console.
+
+    The console copy is strictly best effort. The spool is written
+    synchronously by the producer and is never affected by anything here: a
+    reader that cannot be read or written is dropped, and echoing stops after
+    ``max_bytes`` so a pathological test cannot flood the console.
     """
 
     POLL_INTERVAL_SECONDS = 0.25
+    # Console output is bounded so one runaway test cannot flood the Jenkins
+    # log. A post-merge multi-GPU stage captures single-digit MB in total, so
+    # this only trips on pathological output, and says where the rest lives.
+    DEFAULT_MAX_BYTES = 128 * 1024 * 1024
     _READ_CHUNK_BYTES = 1 << 20
+    # A write of at most PIPE_BUF bytes is atomic on a pipe, so lines never
+    # interleave with pytest's own progress output or with another writer.
+    _WRITE_CHUNK_BYTES = 4096
+    # A graceful exit needs one poll interval plus a drain. Anything longer
+    # means the thread is stuck writing to a blocked console, and stalling
+    # session teardown on it buys nothing: the spool is already complete.
+    _JOIN_TIMEOUT_SECONDS = 2.0
 
-    def __init__(self, spools, poll_interval=POLL_INTERVAL_SECONDS):
+    def __init__(self, spools, poll_interval=POLL_INTERVAL_SECONDS, max_bytes=DEFAULT_MAX_BYTES):
         self._spools = list(spools)
         self._poll_interval = poll_interval
+        self._max_bytes = max_bytes
+        self._echoed_bytes = 0
         self._readers = []
         self._stop = threading.Event()
+        self._closed = False
         self._thread = None
 
     def start(self):
@@ -198,50 +229,110 @@ class SessionSpoolEchoer:
             if spool.console_fd is None:
                 continue
             try:
-                self._readers.append((open(spool.path, "rb", buffering=0), spool.console_fd))
+                stream = open(spool.path, "rb", buffering=0)
             except OSError as e:
                 logger.warning("Cannot tail spool %s for console echo: %s", spool.path, e)
+                continue
+            self._readers.append(_SpoolReader(spool.path, stream, spool.console_fd))
         if not self._readers:
             return
         self._thread = threading.Thread(target=self._loop, daemon=True, name="s3-spool-echo")
         self._thread.start()
 
     def _loop(self):
-        while not self._stop.is_set():
+        while not self._stop.is_set() and self._readers:
             self._drain()
             self._stop.wait(self._poll_interval)
         # Final pass so a graceful stop does not truncate the console copy.
         self._drain()
 
     def _drain(self):
-        for reader, console_fd in self._readers:
+        for reader in list(self._readers):
+            if self._closed:
+                return
             try:
                 while True:
-                    data = reader.read(self._READ_CHUNK_BYTES)
+                    data = reader.stream.read(self._READ_CHUNK_BYTES)
                     if not data:
                         break
-                    self._write_all(console_fd, data)
-            except OSError as e:
-                logger.warning("Console echo from %s stopped: %s", reader.name, e)
+                    if not self._echo(reader, data):
+                        break
+            except (OSError, ValueError) as e:
+                # ValueError: stop() closed the stream underneath us.
+                self._drop(reader, f"cannot read spool: {e}")
+
+    def _echo(self, reader, data):
+        """Write ``data`` to the console. Returns False once this reader is done."""
+        if self._max_bytes is not None:
+            remaining = self._max_bytes - self._echoed_bytes
+            if remaining <= 0:
+                self._exhaust_budget()
+                return False
+            data = data[:remaining]
+        try:
+            self._write_all(reader.console_fd, data)
+        except (OSError, ValueError) as e:
+            # A broken console (EPIPE) never heals. Drop the reader instead of
+            # retrying every poll: the warning would go to stderr, i.e. back
+            # into the spool we are reading, and feed itself.
+            self._drop(reader, f"console write failed: {e}")
+            return False
+        self._echoed_bytes += len(data)
+        if self._max_bytes is not None and self._echoed_bytes >= self._max_bytes:
+            self._exhaust_budget()
+            return False
+        return True
+
+    def _exhaust_budget(self):
+        if not self._readers:
+            return
+        logger.warning(
+            "Console echo capped after %d bytes; the full output is in the stage's "
+            "results-<stage>.tar.gz artifact",
+            self._echoed_bytes,
+        )
+        for reader in list(self._readers):
+            self._close_reader(reader)
+        self._readers = []
+
+    def _drop(self, reader, reason):
+        logger.warning("Console echo of %s stopped: %s", reader.path, reason)
+        self._close_reader(reader)
+        try:
+            self._readers.remove(reader)
+        except ValueError:
+            pass
 
     @staticmethod
-    def _write_all(fd, data):
+    def _close_reader(reader):
+        try:
+            reader.stream.close()
+        except (OSError, ValueError):
+            pass
+
+    @classmethod
+    def _write_all(cls, fd, data):
         view = memoryview(data)
         while view:
-            view = view[os.write(fd, view) :]
+            written = os.write(fd, view[: cls._WRITE_CHUNK_BYTES])
+            view = view[written:]
 
     def stop(self):
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            if self._thread.is_alive():
-                logger.warning("Spool echo thread did not exit in time")
-            self._thread = None
-        for reader, _ in self._readers:
-            try:
-                reader.close()
-            except OSError:
-                pass
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=self._JOIN_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                # Do not close the streams the thread may still be reading:
+                # that turns into a ValueError on a closed file, which escapes
+                # into threading.excepthook and prints a traceback on the real
+                # stderr -- the one place a triager is looking. The process is
+                # ending anyway, so leaking two descriptors is the cheaper bug.
+                logger.warning("Spool echo thread still running; leaving its readers open")
+                return
+        self._closed = True
+        for reader in self._readers:
+            self._close_reader(reader)
         self._readers = []
 
 
@@ -271,8 +362,18 @@ class SessionCapture:
             raise
         self._started = True
         if self._echo_to_console:
-            self._echoer = SessionSpoolEchoer(self._spools.values())
-            self._echoer.start()
+            # Console echo is a diagnostic nicety layered on top of capture. If
+            # it cannot start -- a thread limit on a many-rank stage, say --
+            # swallow it: raising here would escape pytest_load_initial_conftests
+            # before the capture cleanup is registered, leaving fd 1 and 2 pinned
+            # to the spool and pytest's own traceback inside it.
+            try:
+                echoer = SessionSpoolEchoer(self._spools.values())
+                echoer.start()
+                self._echoer = echoer
+            except Exception as e:  # noqa: BLE001 - echo must never fail the session
+                logger.warning("Console echo disabled: %s", e)
+                self._echoer = None
 
     def snapshot(self):
         return {filename: spool.snapshot() for filename, spool in self._spools.items()}

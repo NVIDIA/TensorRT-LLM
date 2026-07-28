@@ -22,7 +22,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from test_common import s3_output_hooks
+from test_common import s3_output, s3_output_hooks
 from test_common.s3_output import (
     FDRedirector,
     FileSlice,
@@ -534,6 +534,104 @@ def test_session_capture_does_not_echo_to_console_by_default(tmp_path):
 
     assert b"spooled only" not in leaked
     capture.remove_files()
+
+
+def test_session_echo_drops_a_reader_whose_console_is_gone(tmp_path):
+    """A broken console must not be retried every poll.
+
+    The warning would go to stderr, into the spool being read, and feed itself.
+    """
+    console_read, console_write = os.pipe()
+    saved_stdout = os.dup(1)
+    capture = SessionCapture(str(tmp_path), echo_to_console=True)
+    try:
+        os.dup2(console_write, 1)
+        capture.start()
+        echoer = capture._echoer
+        os.close(console_read)  # reader gone -> EPIPE on the next write
+        os.write(1, b"first\n")
+        deadline = time.monotonic() + 10.0
+        while echoer._readers and time.monotonic() < deadline:
+            time.sleep(0.05)
+        for _ in range(5):
+            os.write(1, b"more\n")
+            time.sleep(0.1)
+    finally:
+        capture.stop()
+        os.dup2(saved_stdout, 1)
+        os.close(saved_stdout)
+        os.close(console_write)
+
+    # Both readers dropped, so the loop exits instead of warning every poll.
+    assert echoer._readers == []
+    assert not echoer._thread
+    capture.remove_files()
+
+
+def test_session_echo_stops_after_the_byte_budget(tmp_path):
+    console_read, console_write = os.pipe()
+    saved_stdout = os.dup(1)
+    spool = s3_output.SessionFDSpool(1, str(tmp_path / "stdout.log"))
+    payload = b"x" * 512
+    try:
+        os.dup2(console_write, 1)
+        spool.start()
+        echoer = s3_output.SessionSpoolEchoer([spool], poll_interval=0.02, max_bytes=1024)
+        echoer.start()
+        for _ in range(20):
+            os.write(1, payload)
+        deadline = time.monotonic() + 10.0
+        while echoer._readers and time.monotonic() < deadline:
+            time.sleep(0.02)
+        echoer.stop()
+        spool.stop()
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.close(saved_stdout)
+        os.close(console_write)
+
+    seen = _drain_console_pipe(console_read, b"\0", timeout=0.5)
+    os.close(console_read)
+    assert echoer._echoed_bytes <= 1024
+    assert len(seen) <= 1024
+    # The spool itself is untouched by the cap.
+    assert (tmp_path / "stdout.log").stat().st_size == 20 * len(payload)
+
+
+def test_session_capture_survives_an_echo_thread_that_cannot_start(tmp_path, monkeypatch):
+    """Echo is best effort; failing to start it must not abort the session."""
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(s3_output.SessionSpoolEchoer, "start", boom)
+    capture = SessionCapture(str(tmp_path), echo_to_console=True)
+    capture.start()
+    try:
+        assert capture._started
+        assert capture._echoer is None
+        os.write(1, b"still spooled\n")
+    finally:
+        capture.stop()
+    assert "still spooled" in (open(capture._spools["stdout.log"].path, errors="replace").read())
+    capture.remove_files()
+
+
+def test_session_echo_writes_are_atomic_sized(tmp_path):
+    """Writes over PIPE_BUF are not atomic on a pipe and splice other writers."""
+    assert s3_output.SessionSpoolEchoer._WRITE_CHUNK_BYTES <= 4096
+
+    written = []
+    fake_fd = object()
+    monkey = lambda fd, buf: (written.append(len(buf)), len(buf))[1]  # noqa: E731
+    real_write = os.write
+    os.write = monkey
+    try:
+        s3_output.SessionSpoolEchoer._write_all(fake_fd, b"y" * 10000)
+    finally:
+        os.write = real_write
+    assert max(written) <= 4096
+    assert sum(written) == 10000
 
 
 def test_fd_redirector_echoes_a_partial_chunk_without_waiting_for_more(tmp_path):
