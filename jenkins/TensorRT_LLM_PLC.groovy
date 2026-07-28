@@ -200,8 +200,7 @@ def generateLockFiles(llmRepo, ref)
             echo "Running against a fork repo, skipping lock file push to branch"
         } else {
             sh "git status"
-            sh "git add -u security_scanning/"
-            sh "git add \$(find . -type f \\( -name 'poetry.lock' -o -name 'pyproject.toml' -o -name 'metadata.json' \\))"
+            sh "git add security_scanning/"
             sh "git commit -s -m \"[None][infra] Check in most recent lock file from nightly pipeline\""
             withCredentials([
                 string(credentialsId: 'svc_tensorrt_gitlab_api_token_no_username_as_string', variable: 'GITLAB_API_TOKEN'),
