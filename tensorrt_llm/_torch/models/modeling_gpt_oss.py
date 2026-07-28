@@ -1,4 +1,4 @@
-from typing import Any, Dict, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
 
 import torch
 from torch import nn
@@ -31,6 +31,9 @@ from ..speculative import SpecMetadata
 from ..utils import Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, filter_weights, register_auto_model
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # Use TinyGEMM when the number of tokens is not larger than this threshold
 MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
@@ -551,6 +554,25 @@ class Transformer(DecoderModel):
 
 @register_auto_model("GptOssForCausalLM")
 class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        """Select KV cache manager V2 by default.
+
+        GPT-OSS applies a sliding window to every other layer
+        (see ``AttentionBlock.__init__``), so the KV cache is VSWA: two
+        distinct attention window sizes. V2 groups layers by lifecycle and
+        coalesces buffers within each pool group, which sizes the
+        sliding-window and full-attention pools independently instead of
+        statically dividing memory between them.
+
+        Users keep full control: an explicit
+        ``kv_cache_config.use_kv_cache_manager_v2`` always wins over this
+        default. Two-model Eagle3 is a known exception -- V2 does not split
+        the KV cache budget between the target and draft managers -- so that
+        combination should be run with the flag set to False explicitly.
+        """
+        return {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
 
     @classmethod
     def get_preferred_transceiver_runtime(

@@ -74,6 +74,31 @@ scheduler_config:
   enable_prefix_aware_scheduling: false
 ```
 
+### Selecting the KV Cache Manager
+
+TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
+selects between them and defaults to `auto`, which adopts the model's own
+preference and falls back to the V1 C++ manager for models that do not declare
+one. Set it to `true` or `false` to override the model default.
+
+Models that select the V2 manager by default:
+
+| Model | Reason |
+| --- | --- |
+| Hybrid Mamba (NemotronH, Qwen3-Next) | Attention KV and Mamba state pools must be sized together |
+| DeepSeek-V4 | Sparse attention attaches auxiliary per-layer buffers |
+| GPT-OSS | Sliding window on every other layer (VSWA), so the sliding-window and full-attention pools are sized independently |
+
+Separately, Gemma4 hybrid attention and sparse-attention models are routed to
+V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's
+unified pool, so `use_kv_cache_manager_v2` does not apply to them.
+
+Two-model speculative decoding (for example Eagle3 with
+`eagle3_one_model=False`) is not supported by V2, which does not split the KV
+cache budget between the target and draft managers. Under `auto`, a model
+default of V2 falls back to V1 for that combination; setting
+`use_kv_cache_manager_v2: true` explicitly is not supported there.
+
 ### Mamba Snapshot Boundaries
 
 Hybrid Mamba models must retain the recurrent Mamba state together with the
@@ -111,8 +136,9 @@ If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
 Mamba models warn and fall back to half of `max_seq_len`, which can produce a
 suboptimal pool split. Exact explicit boundaries currently require
 `MambaHybridCacheManagerV2`, `max_beam_width=1`, and no KV connector. Hybrid
-Mamba models select V2 by default when
-`use_kv_cache_manager_v2: auto`; set it to `false` to select the V1 C++
+Mamba models select V2 by default (see
+[Selecting the KV Cache Manager](#selecting-the-kv-cache-manager)); set
+`use_kv_cache_manager_v2` to `false` to select the V1 C++
 compatibility manager. In disaggregated serving, V2 Mamba requires the Python
 NIXL transceiver (`transceiver_runtime: PYTHON`); V1 routes support periodic
 snapshots only.
