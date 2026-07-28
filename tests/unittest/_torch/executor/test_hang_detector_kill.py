@@ -151,6 +151,18 @@ def test_rank_crash_kill_fires_for_multi_rank(monkeypatch):
     assert kills == [1]
 
 
+def _assert_slept_then_killed(order, grace):
+    """Assert the grace was slept out before the kill.
+
+    Patching time.sleep is process-wide, so an unrelated background thread can
+    append its own ("sleep", x) while this runs. Assert on the entries this
+    test is about rather than on exact list equality, which would flake.
+    """
+    assert ("sleep", grace) in order, order
+    assert "kill" in order, order
+    assert order.index(("sleep", grace)) < order.index("kill"), order
+
+
 def test_rank_crash_kill_sleeps_grace_before_kill(monkeypatch):
     """The grace must elapse BEFORE the kill so cleaner error paths win the race."""
     order = []
@@ -158,7 +170,7 @@ def test_rank_crash_kill_sleeps_grace_before_kill(monkeypatch):
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "2.5")
     assert hard_kill_on_rank_crash(world_size=2) is True
-    assert order == [("sleep", 2.5), "kill"]
+    _assert_slept_then_killed(order, 2.5)
 
 
 def test_rank_crash_kill_disabled_by_negative_grace(monkeypatch):
@@ -176,7 +188,7 @@ def test_rank_crash_kill_invalid_grace_uses_default(monkeypatch):
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "bogus")
     assert hard_kill_on_rank_crash(world_size=2) is True
-    assert order == [("sleep", 10.0), "kill"]
+    _assert_slept_then_killed(order, 10.0)
 
 
 def test_rank_crash_kill_never_raises(monkeypatch):
