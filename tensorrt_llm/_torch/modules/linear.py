@@ -3826,7 +3826,7 @@ class Linear(nn.Module):
         if self.lora is not None and bool(lora_params):
             output = LoraLayer.forward_with_base(
                 lambda: self.quant_method.apply(self, input, bias),
-                (self.lora,),
+                (self.lora, ),
                 input,
                 lora_params,
                 layer_idx,
