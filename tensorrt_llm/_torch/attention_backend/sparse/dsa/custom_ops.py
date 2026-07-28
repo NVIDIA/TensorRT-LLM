@@ -149,4 +149,4 @@ def _mla_dsa_attn_inplace_fake(
     """Model the in-place output mutation during fake-tensor propagation."""
 
 
-maybe_bcg_mla_dsa_attn_inplace = eager_on_graph(True)(mla_dsa_attn_inplace)
+maybe_bcg_mla_dsa_attn_inplace = eager_on_graph(mla_dsa_attn_inplace)

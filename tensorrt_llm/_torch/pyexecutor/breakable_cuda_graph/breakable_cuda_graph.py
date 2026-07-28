@@ -143,46 +143,36 @@ def _copy_output(destination: Any, source: Any) -> Any:
     return source
 
 
-def eager_on_graph(enable: bool) -> Callable[[Callable], Callable]:
+def eager_on_graph(inner: Callable) -> Callable:
     """Run a callable eagerly between captured CUDA graph segments."""
 
-    def decorator(inner: Callable) -> Callable:
-        if not enable:
-            return inner
+    @functools.wraps(inner)
+    def wrapper(*args, **kwargs):
+        capture = _current_capture.get()
+        if capture is None:
+            return inner(*args, **kwargs)
 
-        @functools.wraps(inner)
-        def wrapper(*args, **kwargs):
-            capture = _current_capture.get()
-            if capture is None:
-                return inner(*args, **kwargs)
+        logger.debug(
+            "Break CUDA graph for function %s", getattr(inner, "__name__", type(inner).__name__)
+        )
+        capture._end_current_segment()
+        output = inner(*args, **kwargs)
 
-            logger.debug(
-                "Break CUDA graph for function %s", getattr(inner, "__name__", type(inner).__name__)
-            )
-            capture._end_current_segment()
-            output = inner(*args, **kwargs)
+        captured_args = tuple(make_weak_ref(arg, preserve_unsupported=True) for arg in args)
+        captured_kwargs = {
+            key: make_weak_ref(value, preserve_unsupported=True) for key, value in kwargs.items()
+        }
+        captured_output = make_weak_ref(output, preserve_unsupported=True)
 
-            # 看下attn的参数
-            def make_weak_ref_with_str_none(x):
-                if isinstance(x, (str, type(None))):
-                    return x
-                return make_weak_ref(x)
+        def replay_fn() -> Any:
+            new_output = inner(*captured_args, **captured_kwargs)
+            return _copy_output(captured_output, new_output)
 
-            captured_args = tuple(make_weak_ref_with_str_none(arg) for arg in args)
-            captured_kwargs = {key: make_weak_ref_with_str_none(value) for key, value in kwargs.items()}
-            captured_output = make_weak_ref_with_str_none(output)
+        capture.cuda_graph._break_functions.append(replay_fn)
+        capture._begin_new_segment()
+        return output
 
-            def replay_fn() -> Any:
-                new_output = inner(*captured_args, **captured_kwargs)
-                return _copy_output(captured_output, new_output)
-
-            capture.cuda_graph._break_functions.append(replay_fn)
-            capture._begin_new_segment()
-            return output
-
-        return wrapper
-
-    return decorator
+    return wrapper
 
 
 class BreakableCUDAGraph:
@@ -286,7 +276,7 @@ class BreakableCUDAGraphCapture:
         self.cuda_graph._segments[-1].capture_end()
 
 
-@eager_on_graph(True)
+@eager_on_graph
 def break_graph() -> None:
     """Insert an empty eager break between CUDA graph segments."""
     return None

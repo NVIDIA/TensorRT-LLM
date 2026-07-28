@@ -187,40 +187,36 @@ def _create_dsv4_epilogue_buffers(
     return fp8_o, output_sf
 
 
-def _run_dsv4_epilogue_bmm(
+def _run_dsv4_o_lora_bmms(
     self,
-    epilogue_output: tuple[torch.Tensor, torch.Tensor],
-    output: torch.Tensor,
-) -> None:
-    attn_fp8, attn_scale = epilogue_output
-    torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
-        attn_fp8,
-        self.o_a_proj,
-        attn_scale,
-        self.o_a_proj_scale,
-        output.transpose(0, 1),
-    )
-
-
-def _run_dsv4_epilogue_bmms(
-    self,
-    output: torch.Tensor,
+    o_lora_output: torch.Tensor,
     num_context_tokens: int,
     num_tokens: int,
-    context_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]],
-    generation_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]],
+    context_o_lora_bmm_input: Optional[tuple[torch.Tensor, torch.Tensor]],
+    generation_o_lora_bmm_input: Optional[tuple[torch.Tensor, torch.Tensor]],
 ) -> None:
-    if context_epilogue_output is not None:
-        _run_dsv4_epilogue_bmm(
-            self,
-            context_epilogue_output,
-            output[:num_context_tokens],
+    def run_o_lora_bmm(
+        o_lora_bmm_input: tuple[torch.Tensor, torch.Tensor],
+        phase_o_lora_output: torch.Tensor,
+    ) -> None:
+        attn_fp8, attn_scale = o_lora_bmm_input
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+            attn_fp8,
+            self.o_a_proj,
+            attn_scale,
+            self.o_a_proj_scale,
+            phase_o_lora_output.transpose(0, 1),
         )
-    if generation_epilogue_output is not None:
-        _run_dsv4_epilogue_bmm(
-            self,
-            generation_epilogue_output,
-            output[num_context_tokens:num_tokens],
+
+    if context_o_lora_bmm_input is not None:
+        run_o_lora_bmm(
+            context_o_lora_bmm_input,
+            o_lora_output[:num_context_tokens],
+        )
+    if generation_o_lora_bmm_input is not None:
+        run_o_lora_bmm(
+            generation_o_lora_bmm_input,
+            o_lora_output[num_context_tokens:num_tokens],
         )
 
 
@@ -410,11 +406,13 @@ def forward_generation_sparse_attn(
         quant_q_buffer,
     )
 
-    attention_output = output
-    output_sf = None
+    dsv4_output = output
+    o_lora_bmm_input_scale = None
     inverse_rope_cos_sin = None
     if enable_dsv4_epilogue_fusion:
-        attention_output, output_sf = _create_dsv4_epilogue_buffers(self, q, num_tokens)
+        dsv4_output, o_lora_bmm_input_scale = _create_dsv4_epilogue_buffers(
+            self, q, num_tokens
+        )
         inverse_rope_cos_sin = self.inverse_rotary_emb.rotary_cos_sin
 
     attn_out_latent = self._attn_forward_gen(
@@ -426,8 +424,8 @@ def forward_generation_sparse_attn(
         attn_metadata,
         attention_input_type=AttentionInputType.generation_only,
         out_scale=self.out_scale,
-        output=attention_output,
-        output_sf=output_sf,
+        output=dsv4_output,
+        output_sf=o_lora_bmm_input_scale,
         latent_cache=latent_cache,
         q_pe=q_pe,
         sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk_indices),
@@ -441,8 +439,8 @@ def forward_generation_sparse_attn(
         enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
     )
     if enable_dsv4_epilogue_fusion:
-        assert attention_output is not None and output_sf is not None
-        return attention_output, output_sf
+        assert dsv4_output is not None and o_lora_bmm_input_scale is not None
+        return dsv4_output, o_lora_bmm_input_scale
 
     assert output is not None
     if self.mapping.has_cp_helix():
@@ -492,11 +490,13 @@ def forward_context_sparse_attn(
         quant_q_buffer = None
         quant_scale_qkv = None
 
-    attention_output = output
-    output_sf = None
+    dsv4_output = output
+    o_lora_bmm_input_scale = None
     inverse_rope_cos_sin = None
     if enable_dsv4_epilogue_fusion:
-        attention_output, output_sf = _create_dsv4_epilogue_buffers(self, q, num_tokens)
+        dsv4_output, o_lora_bmm_input_scale = _create_dsv4_epilogue_buffers(
+            self, q, num_tokens
+        )
         inverse_rope_cos_sin = self.inverse_rotary_emb.rotary_cos_sin
 
     attn_out_latent = self._attn_forward_gen(
@@ -508,8 +508,8 @@ def forward_context_sparse_attn(
         attn_metadata,
         attention_input_type=AttentionInputType.context_only,
         out_scale=self.out_scale,
-        output=attention_output,
-        output_sf=output_sf,
+        output=dsv4_output,
+        output_sf=o_lora_bmm_input_scale,
         latent_cache=latent_cache,
         q_pe=q_pe,
         quant_q_buffer=quant_q_buffer,
@@ -522,8 +522,8 @@ def forward_context_sparse_attn(
     self._fused_q_pe = None
 
     if enable_dsv4_epilogue_fusion:
-        assert attention_output is not None and output_sf is not None
-        return attention_output, output_sf
+        assert dsv4_output is not None and o_lora_bmm_input_scale is not None
+        return dsv4_output, o_lora_bmm_input_scale
 
     assert output is not None
     if self.mapping.has_cp_helix():
@@ -826,7 +826,9 @@ def forward_sparse_attn(
         assert generation_o_lora_bmm_input is None or isinstance(
             generation_o_lora_bmm_input, tuple
         )
-        _run_dsv4_epilogue_bmms(
+        # The fused kernel output is group-first, which BCG cannot slice on
+        # dim 0. Write O-LoRA as token-first so replay can slice the bucket.
+        _run_dsv4_o_lora_bmms(
             self,
             output,
             num_ctx_tokens,

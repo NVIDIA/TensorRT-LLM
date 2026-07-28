@@ -119,7 +119,7 @@ def attn_custom_op_inplace(
     )
 
 
-maybe_bcg_attn_custom_op_inplace = eager_on_graph(True)(attn_custom_op_inplace)
+maybe_bcg_attn_custom_op_inplace = eager_on_graph(attn_custom_op_inplace)
 
 
 def _helix_zero_kv_mask(

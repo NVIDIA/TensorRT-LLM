@@ -112,18 +112,21 @@ def _extract_mla_extra_attrs(layer_idx: str):
     return metadata, mla_layer
 
 
-def create_mla_outputs_impl(hidden_states: torch.Tensor, layer_idx: str) -> list[torch.Tensor]:
+def create_mla_outputs_impl(hidden_states: torch.Tensor, layer_idx: str) -> torch.Tensor:
     metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
-    return mla_layer._create_outputs(hidden_states, metadata)
+    outputs = mla_layer._create_outputs(hidden_states, metadata)
+    if len(outputs) != 1:
+        raise RuntimeError("MLA custom ops require exactly one output tensor.")
+    return outputs[0]
 
 
 @torch.library.custom_op("trtllm::create_mla_outputs", mutates_args=())
-def create_mla_outputs(hidden_states: torch.Tensor, layer_idx: str) -> list[torch.Tensor]:
+def create_mla_outputs(hidden_states: torch.Tensor, layer_idx: str) -> torch.Tensor:
     return create_mla_outputs_impl(hidden_states, layer_idx)
 
 
 @create_mla_outputs.register_fake
-def _create_mla_outputs_fake(hidden_states, layer_idx):
+def _create_mla_outputs_fake(hidden_states: torch.Tensor, layer_idx: str) -> torch.Tensor:
     return create_mla_outputs_impl(hidden_states, layer_idx)
 
 
@@ -159,7 +162,7 @@ def mla_custom_op_inplace(
     )
 
 
-maybe_bcg_mla_custom_op_inplace = eager_on_graph(True)(mla_custom_op_inplace)
+maybe_bcg_mla_custom_op_inplace = eager_on_graph(mla_custom_op_inplace)
 
 
 def fp8_block_scaling_bmm_out(
@@ -1801,9 +1804,9 @@ class MLA(nn.Module):
                     "unquantized_hidden_states view"
                 )
                 output_hidden_states = hidden_states.unquantized_hidden_states
-            attn_output = torch.ops.trtllm.create_mla_outputs(
-                output_hidden_states, self.layer_idx_str
-            )
+            attn_output = [
+                torch.ops.trtllm.create_mla_outputs(output_hidden_states, self.layer_idx_str)
+            ]
             self._forward_custom_op(
                 hidden_states,
                 position_ids,

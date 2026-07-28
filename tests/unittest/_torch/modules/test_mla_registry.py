@@ -23,7 +23,7 @@ from torch import nn
 from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
     _create_dsv4_epilogue_buffers,
-    _run_dsv4_epilogue_bmms,
+    _run_dsv4_o_lora_bmms,
     prepare_sparse_attn_outputs,
     project_sparse_attn_output,
 )
@@ -126,6 +126,11 @@ def test_mla_custom_op_marks_only_final_output_mutable() -> None:
     assert mutated_args == ["output"]
 
 
+def test_create_mla_outputs_custom_op_returns_tensor() -> None:
+    schema = torch.ops.trtllm.create_mla_outputs.default._schema
+    assert [str(return_value.type) for return_value in schema.returns] == ["Tensor"]
+
+
 def test_dsv4_epilogue_fusion_supports_mixed_batch() -> None:
     mla_layer = _make_dsv4_epilogue_layer()
     metadata = SimpleNamespace(num_contexts=1, num_generations=1)
@@ -225,7 +230,7 @@ def test_dsv4_epilogue_bmm_writes_only_phase_ranges(
                 torch.empty(groups, num_generation_tokens, 4),
                 torch.tensor(22.0),
             )
-        _run_dsv4_epilogue_bmms(
+        _run_dsv4_o_lora_bmms(
             mla_layer,
             output,
             num_context_tokens,

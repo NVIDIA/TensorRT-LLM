@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import gc
-import weakref
 
 import pytest
 import torch
@@ -20,6 +18,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import (
     BreakableCUDAGraphRunner,
     BreakableCUDAGraphRunnerState,
 )
+from tensorrt_llm._torch.utils import make_weak_ref
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
@@ -46,11 +45,11 @@ def test_no_break_capture_and_repeated_replay():
 
 
 def test_single_and_multiple_breakpoints():
-    @eager_on_graph(True)
+    @eager_on_graph
     def add_one(value):
         return value + 1
 
-    @eager_on_graph(True)
+    @eager_on_graph
     def double(value):
         return value * 2
 
@@ -72,18 +71,26 @@ def test_single_and_multiple_breakpoints():
     torch.testing.assert_close(output, torch.full_like(output, 16))
 
 
-def test_disabled_and_outside_capture():
-    @eager_on_graph(False)
-    def disabled(value):
-        return value + 1
-
-    @eager_on_graph(True)
+def test_outside_capture():
+    @eager_on_graph
     def outside(value):
         return value + 2
 
     value = torch.tensor([1.0, 2.0], device="cuda")
-    torch.testing.assert_close(disabled(value), value + 1)
     torch.testing.assert_close(outside(value), value + 2)
+
+
+def test_make_weak_ref_option_preserves_unsupported_values():
+    unsupported = object()
+    with pytest.raises(TypeError, match="Invalid type"):
+        make_weak_ref(unsupported)
+
+    captured = make_weak_ref(
+        {"nested": (unsupported, [None, "value"])},
+        preserve_unsupported=True,
+    )
+    assert captured == {"nested": (unsupported, [None, "value"])}
+    assert captured["nested"][0] is unsupported
 
 
 def test_break_graph_inserts_empty_breakpoint():
@@ -204,11 +211,11 @@ def test_runner_warmup_capture_execute_and_shared_output():
 
 def test_runner_first_bucket_segments_share_one_memory_pool():
     class BreakableBody(nn.Module):
-        @eager_on_graph(True)
+        @eager_on_graph
         def eager_add_one(self, value):
             return value + 1
 
-        @eager_on_graph(True)
+        @eager_on_graph
         def eager_double(self, value):
             return value * 2
 

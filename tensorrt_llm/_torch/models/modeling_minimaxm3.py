@@ -662,9 +662,7 @@ def minimax_m3_attn_custom_op_inplace(
     )
 
 
-maybe_bcg_minimax_m3_attn_custom_op_inplace = eager_on_graph(True)(
-    minimax_m3_attn_custom_op_inplace
-)
+maybe_bcg_minimax_m3_attn_custom_op_inplace = eager_on_graph(minimax_m3_attn_custom_op_inplace)
 
 
 class MiniMaxM3Attention(Attention):
