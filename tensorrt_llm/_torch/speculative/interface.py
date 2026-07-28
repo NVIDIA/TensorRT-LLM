@@ -42,10 +42,10 @@ if TYPE_CHECKING:
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
-from ..pyexecutor.sampler.sampling_utils import (
-    compute_probs_from_logits, greedy_search_sampling_batch,
-    sampling_batch_spec_dec_one_model,
+from ..pyexecutor.sampler.ops.spec_decode import (
+    compute_probs_from_logits, sampling_batch_spec_dec_one_model,
     sampling_batch_spec_dec_one_model_for_rejection)
+from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 
 
 def rejection_sampling_one_model(
@@ -717,7 +717,7 @@ class SpecMetadata:
         before the CUDA graph key is built.
         """
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-        from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import \
+        from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
             GREEDY_TEMPERATURE_THRESHOLD
         from tensorrt_llm.sampling_params import SamplingParams
 
