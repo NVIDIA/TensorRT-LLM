@@ -12,8 +12,8 @@ class KvCacheCompressionMode(IntEnum):
     ``is_*`` predicates instead of comparing strings.
     """
 
-    TRIATTENTION = auto()
     NONE = auto()
+    TRIATTENTION = auto()
 
     def is_eviction_method(self) -> bool:
         """Return whether this mode physically evicts cached tokens."""

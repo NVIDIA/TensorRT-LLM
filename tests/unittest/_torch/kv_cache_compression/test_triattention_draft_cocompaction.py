@@ -55,7 +55,7 @@ def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
         mock.patch.object(
             torch.cuda, "current_stream", return_value=compute_stream
         ) as current_stream,
-        mock.patch.object(tri, "_stage_block_offsets") as stage,
+        mock.patch.object(tri, "_stage_block_offset_snapshot") as stage,
     ):
         with pytest.raises(Boom):
             tri._execute_eviction_round(eviction_requests)
@@ -211,26 +211,26 @@ def test_request_admission_aligns_clamped_score_bucket_to_tile():
     manager._compaction_done_event.synchronize.assert_not_called()
 
 
-def test_staged_block_width_clamps_to_manager_source_width():
-    """Clamp staged block width to the live V2 source-table width."""
+def test_block_offset_snapshot_width_is_aligned_and_capped():
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        _allocate_block_offset_staging,
+        _allocate_block_offset_snapshot,
     )
 
     anchor_pool = torch.empty(1, 2, 1, 32, 4)
     manager = SimpleNamespace(
         num_pools=1,
-        host_kv_cache_block_offsets=torch.empty(1, 2, 2, 4, dtype=torch.int32),
+        tokens_per_block=32,
+        max_blocks_per_seq=4,
     )
-    host, device_table = _allocate_block_offset_staging(
+    host, device_table = _allocate_block_offset_snapshot(
         manager,
         anchor_pool,
         request_capacity=2,
         token_capacity=129,
     )
     assert host.shape[-1] == 4 and device_table.shape[-1] == 4
-    manager.host_kv_cache_block_offsets = torch.empty(1, 2, 2, 64, dtype=torch.int32)
-    host, device_table = _allocate_block_offset_staging(
+    manager.max_blocks_per_seq = 64
+    host, device_table = _allocate_block_offset_snapshot(
         manager,
         anchor_pool,
         request_capacity=2,

@@ -2268,15 +2268,19 @@ def validate_kv_cache_compression_with_spec(
         return
     if not config.kv_cache_compression_mode.is_eviction_method():
         return
-    if config.eviction_mode != "union":
+    if config.algorithm != "triattention":
         raise ValueError(
-            "KV-cache compression with speculative decoding requires "
-            "eviction_mode='union'")
+            f"KV-cache compression algorithm {config.algorithm!r} has no "
+            "speculative-decoding compatibility contract")
     mode = spec_config.spec_dec_mode
     if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
         raise ValueError(
             f"KV-cache compression does not support speculative decoding "
             f"mode {mode.name}; use one-model MTP or EAGLE3")
+    if getattr(config, "eviction_mode", None) != "union":
+        raise ValueError(
+            "KV-cache compression with speculative decoding requires "
+            "eviction_mode='union'")
 
 
 def create_kv_cache_compression_manager(
@@ -2294,8 +2298,7 @@ def create_kv_cache_compression_manager(
     """
     if config.algorithm == "triattention":
         # TriAttention imports CuTe/CUTLASS; keep normal executor startup lazy.
-        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import \
-            TriAttention
+        from ..kv_cache_compression.triattention.triattention import TriAttention
 
         return TriAttention(
             config,

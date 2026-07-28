@@ -79,15 +79,19 @@ class TestConfigAndFactory:
 
 
 class TestTriAttentionClass:
-    def test_resolve_accepts_flat_pt(self, flat_calibration_pt):
+    def test_loads_flat_pt(self, flat_calibration_pt):
         mgr = _make_triattention()
         mgr.calibration_path = flat_calibration_pt
         mgr.model_path = None
-        loaded = mgr._resolve_calibration()
-        for key in ("E_q", "E_q_norm", "omega", "freq_scale_sq"):
-            assert key in loaded
+        mgr._load_calibration()
 
-    def test_resolve_converts_official_layout(self, tmp_path):
+        assert torch.equal(mgr._omega, torch.arange(4, dtype=torch.float32))
+        assert torch.equal(mgr._freq_scale_sq, torch.ones(4))
+        assert torch.equal(mgr._calibration_q_real, torch.zeros(2, 2, 4))
+        assert torch.equal(mgr._calibration_q_imag, torch.zeros(2, 2, 4))
+        assert torch.equal(mgr._calibration_mlr_coef, torch.ones(2, 2, 4))
+
+    def test_loads_official_layout(self, tmp_path):
         # PRODUCT CONTRACT: the official R-KV {metadata, stats} layout is
         # converted to the flat runtime schema at load; rope tables derive
         # from the model config.
@@ -109,23 +113,24 @@ class TestTriAttentionClass:
         config = _make_hf_config(rope_parameters={"rope_type": "default", "rope_theta": 10000.0})
 
         with mock.patch("transformers.AutoConfig.from_pretrained", return_value=config):
-            converted = mgr._resolve_calibration()
+            mgr._load_calibration()
 
-        assert set(converted) == {"E_q", "E_q_norm", "omega", "freq_scale_sq"}
-        assert converted["E_q"].shape == (num_layers, num_heads, freq_count)
+        assert mgr._calibration_q_real.shape == (num_layers, num_heads, freq_count)
         torch.testing.assert_close(
-            converted["E_q"][1, 0].cpu(),
-            torch.complex(torch.full((freq_count,), 10.0), torch.full((freq_count,), 1.0)),
+            mgr._calibration_q_real[1, 0].cpu(), torch.full((freq_count,), 10.0)
         )
         torch.testing.assert_close(
-            converted["E_q_norm"][1, 1].cpu(), torch.full((freq_count,), 3.0)
+            mgr._calibration_q_imag[1, 0].cpu(), torch.full((freq_count,), 1.0)
         )
-        assert converted["omega"].numel() == freq_count
+        torch.testing.assert_close(
+            mgr._calibration_mlr_coef[1, 1].cpu(), torch.full((freq_count,), -8.0)
+        )
+        assert mgr._omega.numel() == freq_count
         idx = torch.arange(0, 2 * freq_count, 2, dtype=torch.float32)
         torch.testing.assert_close(
-            converted["omega"].cpu(), 1.0 / (10000.0 ** (idx / (2 * freq_count)))
+            mgr._omega.cpu(), 1.0 / (10000.0 ** (idx / (2 * freq_count)))
         )
-        assert torch.equal(converted["freq_scale_sq"].cpu(), torch.ones(freq_count))
+        assert torch.equal(mgr._freq_scale_sq.cpu(), torch.ones(freq_count))
 
     def test_rope_tables_resolve_theta_and_attention_factor(self, tmp_path):
         # transformers>=5.5 folds rope_theta into ``rope_parameters`` and drops
@@ -167,15 +172,34 @@ class TestTriAttentionClass:
         )
         mgr = _make_triattention()
         freq_count = 32
+        calibration_path = tmp_path / "official.pt"
+        torch.save(
+            {
+                "metadata": {"sampled_heads": [(0, 0)]},
+                "stats": {
+                    "layer00_head00": {
+                        "q_mean_real": torch.zeros(freq_count),
+                        "q_mean_imag": torch.zeros(freq_count),
+                        "q_abs_mean": torch.ones(freq_count),
+                    }
+                },
+            },
+            calibration_path,
+        )
+        mgr.calibration_path = str(calibration_path)
 
         mgr.model_path = plain
-        omega, freq_scale_sq = mgr._rope_tables(freq_count)
+        mgr._load_calibration()
+        omega = mgr._omega
+        freq_scale_sq = mgr._freq_scale_sq
         idx = torch.arange(0, 64, 2, dtype=torch.float32)
         torch.testing.assert_close(omega, (1.0 / (1000000.0 ** (idx / 64)))[:freq_count])
         assert torch.equal(freq_scale_sq, torch.ones(freq_count))
 
         mgr.model_path = yarn
-        omega_yarn, freq_scale_sq_yarn = mgr._rope_tables(freq_count)
+        mgr._load_calibration()
+        omega_yarn = mgr._omega
+        freq_scale_sq_yarn = mgr._freq_scale_sq
         # Routed through transformers' yarn init: the explicit attention
         # factor lands squared, and the ladder leaves the plain-theta curve.
         torch.testing.assert_close(freq_scale_sq_yarn, torch.full((freq_count,), 1.25**2))
@@ -437,7 +461,7 @@ class TestFixedScoreMetadata:
         def stage_once():
             # Raises on any staging failure; success returns None.
             with torch.cuda.stream(current_stream):
-                staging._stage_block_offsets(
+                staging._stage_block_offset_snapshot(
                     manager,
                     [7],
                     staging._block_offsets_host,

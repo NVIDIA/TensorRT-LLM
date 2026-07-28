@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared harness for the KV-cache compaction tests."""
+"""Shared harness for KV-cache compression tests."""
 
 import json
 import os
@@ -242,7 +242,7 @@ def make_bare_staging(device, *, max_requests, staged_blocks_per_seq):
 
 
 def make_staging_manager(host_table, gather, manager_stream, *, num_slots=1):
-    """The manager surface ``_stage_block_offsets`` consumes."""
+    """The manager surface ``_stage_block_offset_snapshot`` consumes."""
     return SimpleNamespace(
         host_kv_cache_block_offsets=host_table,
         kv_factor=2,

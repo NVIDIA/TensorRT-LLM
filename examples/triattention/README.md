@@ -1,6 +1,6 @@
 # TriAttention KV-Cache Compression
 
-This document describes enabling TriAttention KV-cache compression in TensorRT LLM.
+This document describes enabling TriAttention KV-cache compression in TensorRT-LLM.
 
 TriAttention is a training-free, decode-time KV-cache eviction method for long-context LLM inference. During generation it periodically scores the cached tokens by a trigonometric importance measure derived from offline per-head query statistics (calibration), keeps the most important `budget` tokens, and physically compacts the cache — reducing KV-cache memory so more sequences fit on a GPU at once.
 
@@ -10,23 +10,23 @@ For technical details see the paper [TriAttention](https://arxiv.org/abs/2604.04
 
 TriAttention runs entirely in the generation phase and reuses the standard dense attention kernel over the compacted cache:
 
-1. **Calibration (offline, one-time per model).** The importance score needs each attention head's mean and magnitude of the pre-RoPE query, gathered over a small calibration corpus. **TensorRT LLM does not compute calibration** — you produce it once with the official tool and pass the resulting `.pt` file. TensorRT LLM loads it and converts it to its runtime schema at the first request.
-2. **Periodic eviction (Stage during generation).** Every `beta` confirmed generation tokens, once a sequence is over budget, TriAttention scores the whole cache, selects `budget` tokens to keep (the prompt tokens are preserved on top of the budget), and physically compacts the KV cache down to the kept set. A speculative iteration may confirm multiple tokens; crossing multiple periods in one update is coalesced into one eviction.
+1. **Calibration (offline, one-time per model).** The importance score needs each attention head's mean and magnitude of the pre-RoPE query, gathered over a small calibration corpus. **TensorRT-LLM does not compute calibration** — you produce it once with the official tool and pass the resulting `.pt` file. TensorRT-LLM loads and converts it when the compression manager is created.
+2. **Periodic eviction (during generation).** Every `beta` confirmed generation tokens, once a sequence is over budget, TriAttention scores the evictable decode region, selects `budget` decode tokens to keep, preserves the prompt, and physically compacts the KV cache down to that set. A speculative iteration may confirm multiple tokens; crossing multiple periods in one update is coalesced into one eviction.
 
-TriAttention is integrated into TensorRT LLM as a KV-cache compression manager on top of the `KVCacheManagerV2`. Scoring runs on CuTe DSL (SM100) and Triton kernels; compaction is a native CUDA kernel.
+TriAttention is integrated into TensorRT-LLM as a KV-cache compression manager on top of the `KVCacheManagerV2`. Scoring runs on CuTe DSL (SM100) and Triton kernels; compaction is a native CUDA kernel.
 
 ## Support Matrix
 
-* GPU Compute Capability >= 10.0 (Blackwell or newer)
+* NVIDIA B200 (SM100; the current validated target)
 * Paged KV Cache (`KVCacheManagerV2`)
-* Tensor Parallel
 * PyTorch backend
 
 **Notes:**
 1. TriAttention requires `enable_block_reuse=False` in the KV-cache configuration — the eviction physically rewrites stored keys, which is incompatible with block reuse. The construction step rejects a cache manager that has block reuse enabled.
 2. TriAttention requires the V2 KV-cache manager (`use_kv_cache_manager_v2=True`).
 3. TriAttention does not compute calibration. Bring the official tool's calibration `.pt`; see [Calibration](#calibration).
-4. Requires full-attention KVCacheManagerV2 lifecycles; attention-DP, disaggregated serving, native SWA/VSWA/SSM pools, and MLA caches are unsupported.
+4. The current SWA path covers models such as GPT-OSS whose V2 pools remain full length and whose attention kernel applies the window. Native sliding-eviction layouts such as Gemma 4, SSM/hybrid pools, and MLA caches are not supported.
+5. Speculative decoding is supported for one-model MTP and EAGLE3 with `eviction_mode="union"`. Tensor parallelism beyond TP1, attention DP, and disaggregated serving have not yet been validated end to end.
 
 ## Calibration
 
@@ -50,7 +50,7 @@ python3 scripts/calibrate.py \
     --device cuda
 ```
 
-TensorRT LLM accepts that file directly: it reads the official `{metadata, stats}` layout and derives the model's RoPE tables from the model config, then converts everything to its runtime schema at load. (An already-converted flat `.pt` is also accepted.)
+TensorRT-LLM accepts that file directly: it reads the official `{metadata, stats}` layout and derives the model's RoPE tables from the model config, then converts everything to its runtime schema at load. (An already-converted flat `.pt` is also accepted.)
 
 ## Usage
 
@@ -82,7 +82,7 @@ llm = LLM(
     kv_cache_config=kv_config,
 )
 
-# 4. Generate
+# 3. Generate
 prompts = ["To be or not to be, that is the question."]
 sampling_params = SamplingParams(max_tokens=128)
 outputs = llm.generate(prompts, sampling_params)
@@ -121,5 +121,5 @@ trtllm-eval --model <path_to_model> --config config.yaml longbench_v2 --max_outp
     * `per_head`: each KV head keeps its own set, shared across layers (mean of per-layer maxima).
     * `per_layer_perhead`: each head keeps its own set, fully independent per layer.
 * **`normalize_scores`** (bool, default=True): Z-normalize each head's scores over the decode region before selection (upstream default). `union` eviction always z-normalizes: `False` is overridden to `True` with a warning.
-* **`calibration_path`** (str): Path to the calibration `.pt` from the official tool. Required — TensorRT LLM does not compute calibration.
+* **`calibration_path`** (str): Path to the calibration `.pt` from the official tool. Required — TensorRT-LLM does not compute calibration.
 * **`model_path`** (str): Checkpoint path, used to derive the model's RoPE tables when converting the official calibration file and to classify kernel-masked sliding-window (SWA) layers from the model config.

@@ -75,7 +75,7 @@ def _select_per_head(tri, scores, *, normalize_scores):
         per_layer=tri.eviction_mode == "per_layer_perhead",
         normalize_scores=normalize_scores,
     )
-    tri._select_top_tokens(tri._request_capacity)
+    tri._select_kept_ordinals(tri._request_capacity)
 
 
 def _stable_topk(row: torch.Tensor, width: int, keep_count: int) -> torch.Tensor:
@@ -201,7 +201,7 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         torch.tensor([prompt_len] * request_count, dtype=torch.int32, device=device)
     )
     tri._selection_scores_rows.copy_(scores.amax(dim=1))
-    tri._select_top_tokens(tri._request_capacity)
+    tri._select_kept_ordinals(tri._request_capacity)
     actual = tri._kept_ordinal_rows.cpu()
 
     combined = scores.amax(dim=1).cpu()
