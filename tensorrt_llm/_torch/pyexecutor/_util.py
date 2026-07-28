@@ -2639,17 +2639,9 @@ def compute_max_num_sequences(mapping: Mapping,
     return max_batch_size * num_micro_batches
 
 
-# Model types whose disaggregated attention-DP path has been measured against
-# the ADP dummy fixes. The gate stays an explicit list rather than a capability
-# check (``enable_attention_dp and kv_cache_transceiver is not None``) so that
-# each entry is added only after its disagg ADP behavior has been exercised.
-_ADP_DUMMY_FIX_MODEL_TYPES = ("deepseek_v4", "qwen3_5_moe")
-
-
-def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
-                                       mapping: Mapping) -> bool:
-    """Gate the ADP dummy fixes while PP remains follow-up scope."""
-    return model_type in _ADP_DUMMY_FIX_MODEL_TYPES and not mapping.has_pp()
+def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
+    """Enable transactional ADP dummy handling while PP remains follow-up."""
+    return not mapping.has_pp()
 
 
 def should_enable_disagg_adp_overlap_headroom(

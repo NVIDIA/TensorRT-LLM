@@ -391,12 +391,13 @@ class PyTorchModelEngine(ModelEngine):
         # Disaggregated attention-DP can backfill a batch before the overlap
         # scheduler releases the previous batch's terminal sequence slots.
         from ._util import (compute_max_num_sequences,
-                            should_enable_disagg_adp_overlap_headroom,
-                            should_enable_dsv4_adp_dummy_fixes)
+                            should_enable_adp_dummy_fixes,
+                            should_enable_disagg_adp_overlap_headroom)
         self._enable_disagg_adp_overlap_headroom = (
             should_enable_disagg_adp_overlap_headroom(
                 mapping, llm_args.cache_transceiver_config,
                 llm_args.disable_overlap_scheduler))
+        self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
         self.max_num_seq_slots = compute_max_num_sequences(
             mapping,
             self.batch_size,
@@ -484,10 +485,6 @@ class PyTorchModelEngine(ModelEngine):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
             self.model = model
-        pretrained_config = self.model.model_config.pretrained_config
-        model_type = getattr(pretrained_config, "model_type", None)
-        self._enable_dsv4_adp_dummy_fixes = should_enable_dsv4_adp_dummy_fixes(
-            model_type, mapping)
         if drafting_loop_wrapper is not None:
             self.model = drafting_loop_wrapper(self.model)
             self.model_is_wrapped = True

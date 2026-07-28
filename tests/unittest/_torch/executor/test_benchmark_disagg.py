@@ -588,7 +588,7 @@ class MockPadDummyExecutor:
         self.max_total_draft_tokens = 0
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
-        self._enable_dsv4_adp_dummy_fixes = True
+        self._enable_adp_dummy_fixes = True
         self.max_num_tokens = None
 
         self.dist = Mock()
