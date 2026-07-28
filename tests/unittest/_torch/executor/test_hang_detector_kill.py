@@ -628,13 +628,27 @@ def _executor_loop_ast_nodes():
 
 
 def _outer_while(fn):
-    """The `while True:` that IS the event loop (the function's own outermost)."""
+    """The `while True:` that IS the event loop.
+
+    Selected by its `True` test, not by walk order: _executor_loop_pp contains
+    three other `while`s, one of them (the Stage-5 drain) a SIBLING of the
+    event loop, so relying on ast.walk ordering would silently point the guard
+    at the wrong loop if the body were ever reordered.
+    """
     import ast
 
-    for node in ast.walk(fn):
-        if isinstance(node, ast.While):
-            return node
-    return None
+    candidates = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.While)
+        and isinstance(node.test, ast.Constant)
+        and node.test.value is True
+    ]
+    assert len(candidates) == 1, (
+        f"{fn.name}: expected exactly one `while True:` (the event loop), "
+        f"found {len(candidates)} at lines {[c.lineno for c in candidates]}"
+    )
+    return candidates[0]
 
 
 def _loop_terminating_breaks(loop):
