@@ -35,6 +35,11 @@ if TYPE_CHECKING:
 
 HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
 
+# Capability consumed by external orchestrators that optionally select the
+# initial DP rank. Builds without this marker may honor an explicit first-turn
+# rank without recording it as the conversation's persistent affinity binding.
+SUPPORTS_EXPLICIT_DP_RANK_CONVERSATION_BINDING = True
+
 
 def _num_input_tokens(request) -> int:
     """Token count via the cheap num_input_tokens accessor (avoids materializing
