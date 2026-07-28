@@ -1896,9 +1896,15 @@ class _KVCache:
                         assert holder is None
                         continue
                     start, end = stale_ranges[lc]
+                    lc_obj = self.manager._life_cycles[lc]
                     if start <= ordinal < end:
                         if is_committed or self._commit_state != self.CommitState.ALLOWED:
                             assert holder is None
+                        elif ordinal in self._get_scratch_range(lc_obj, 0):
+                            # It is uncertain whether this block should hold a page: it may
+                            # have been scratch-allocated by an earlier chunk, but the prior
+                            # history length and capacity are not retained.
+                            pass
                         else:
                             # For the decoder-side disagg case, for the first step, we will skip the
                             # out-of-window blocks.
@@ -1908,7 +1914,6 @@ class _KVCache:
                             )
                     else:
                         # Scratch blocks have None pages but valid base_page_indices
-                        lc_obj = self.manager._life_cycles[lc]
                         sr = self._get_scratch_range(lc_obj)
                         is_scratch = ordinal in sr
                         if is_scratch:
