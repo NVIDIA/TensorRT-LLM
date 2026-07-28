@@ -1952,6 +1952,10 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
         lora_a = getattr(module, "svdquant_lora_a", None)
         lora_b = getattr(module, "svdquant_lora_b", None)
         pqs = getattr(module, "pre_quant_scale", None)
+        device = module.weight.device
+        fused_kernel_is_supported = (
+            device.type == "cuda"
+            and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3)))
 
         def set_derived_buffer(name: str,
                                value: Optional[torch.Tensor]) -> None:
@@ -1989,7 +1993,7 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
                           torch.bfloat16).contiguous())
         set_derived_buffer("_svdquant_l2t_smoothed", l2t_smoothed)
         set_derived_buffer("_svdquant_l1_scaled", l1_scaled)
-        module._svdquant_use_fused = True
+        module._svdquant_use_fused = fused_kernel_is_supported
 
     def apply(self, module, input, bias):
         a = getattr(module, "svdquant_lora_a", None)
@@ -2007,7 +2011,7 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
 
     def _apply_svdquant_reference(self, module, input, bias, pqs, lora_a,
                                   lora_b):
-        """Capture-safe unfused control with the same quantize and rank-down frontend."""
+        """Capture-safe control with the byte-equivalent stock NVFP4 frontend."""
         orig_shape, x2d, xq, x_sf = self._prepare_svdquant_input(
             module, input, pqs)
         l2t_smoothed = getattr(module, "_svdquant_l2t_smoothed", None)
@@ -2045,7 +2049,12 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
     def _prepare_svdquant_input(self, module, input, pqs):
         orig_shape = input.shape
         x2d = input.reshape(-1, orig_shape[-1]).to(torch.bfloat16).contiguous()
-        xq, x_sf = self._quantize_svdquant_input(module, x2d, pqs)
+        if getattr(module, "_svdquant_use_fused", False):
+            xq, x_sf = self._quantize_svdquant_input(module, x2d, pqs)
+        else:
+            # FlashInfer's fused smooth-quantizer is SM100-family-only. Keep the
+            # reference path portable by using the stock two-pass NVFP4 frontend.
+            xq, x_sf, _ = super()._input_prepare(module, x2d)
         return orig_shape, x2d, xq, x_sf
 
     @staticmethod

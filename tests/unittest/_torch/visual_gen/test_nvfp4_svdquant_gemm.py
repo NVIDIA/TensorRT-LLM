@@ -17,6 +17,8 @@
 - nvfp4_quantize_smooth : NVFP4-quantize(x * pre_quant_scale) byte-identical to fp4_quantize(x*s)
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -30,6 +32,83 @@ skip_sm100 = pytest.mark.skipif(
 _RANK = 32  # base SVDQuant low-rank r (== the kernel's rank granularity)
 # The fused kernel supports any rank that is a positive multiple of 32; ranks 32-128
 # are exercised here (see test_nvfp4_svdquant_gemm_ranks for the wide-rank coverage).
+
+
+@pytest.mark.parametrize(
+    "device_type, capability, expected",
+    [
+        ("cpu", None, False),
+        ("meta", None, False),
+        ("cuda", (9, 0), False),
+        ("cuda", (10, 0), True),
+        ("cuda", (10, 3), True),
+        ("cuda", (12, 0), False),
+    ],
+)
+def test_nvfp4_svdquant_flashinfer_arch_gate(monkeypatch, device_type, capability, expected):
+    from tensorrt_llm._torch.modules.linear import (
+        NVFP4LinearMethod,
+        NVFP4SVDLinearMethod,
+    )
+
+    queried_devices = []
+
+    def fake_get_device_capability(device):
+        queried_devices.append(device)
+        return capability
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", fake_get_device_capability)
+    module = torch.nn.Module()
+    module.weight = SimpleNamespace(device=torch.device(device_type), shape=(64, 8))
+    module.svdquant_lora_a = torch.ones((32, 16), dtype=torch.bfloat16)
+    module.svdquant_lora_b = torch.ones((64, 32), dtype=torch.bfloat16)
+    module.pre_quant_scale = torch.ones((16,), dtype=torch.bfloat16)
+    module.alpha = torch.ones((1,), dtype=torch.float32)
+    method = NVFP4SVDLinearMethod()
+    monkeypatch.setattr(NVFP4LinearMethod, "transform_weights", lambda self, module: None)
+
+    method.transform_weights(module)
+
+    assert module._svdquant_use_fused is expected
+    assert bool(queried_devices) is (device_type == "cuda")
+
+
+@pytest.mark.parametrize("use_flashinfer", [False, True])
+def test_nvfp4_svdquant_reference_frontend_selection(monkeypatch, use_flashinfer):
+    from tensorrt_llm._torch.modules.linear import (
+        NVFP4LinearMethod,
+        NVFP4SVDLinearMethod,
+    )
+
+    calls = []
+
+    def stock_frontend(self, module, x):
+        calls.append("stock")
+        return "stock_xq", "stock_sf", None
+
+    def flashinfer_frontend(module, x, pqs):
+        calls.append("flashinfer")
+        return "flashinfer_xq", "flashinfer_sf"
+
+    monkeypatch.setattr(NVFP4LinearMethod, "_input_prepare", stock_frontend)
+    monkeypatch.setattr(
+        NVFP4SVDLinearMethod,
+        "_quantize_svdquant_input",
+        staticmethod(flashinfer_frontend),
+    )
+    module = SimpleNamespace(
+        _svdquant_use_fused=use_flashinfer,
+    )
+    x = torch.zeros((2, 16), dtype=torch.bfloat16)
+    pqs = torch.ones((16,), dtype=torch.bfloat16)
+
+    _, _, xq, x_sf = NVFP4SVDLinearMethod()._prepare_svdquant_input(module, x, pqs)
+
+    expected_frontend = "flashinfer" if use_flashinfer else "stock"
+    assert calls == [expected_frontend]
+    assert xq == f"{expected_frontend}_xq"
+    assert x_sf == f"{expected_frontend}_sf"
+
 
 _GEMM_CASES = [
     (m, n, k, use_bias, tactic)
