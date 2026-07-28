@@ -14,10 +14,10 @@
 # limitations under the License.
 """Logical WideEP failure-injection worker using a real MPI transport.
 
-The smoke keeps every process alive so ``COMM_WORLD`` can coordinate portable
+The smoke keeps every process alive so `COMM_WORLD` can coordinate portable
 results. Actual peer death and MPI runtime error classification are outside its
 scope because common launchers terminate the whole job when a worker exits
-without ``MPI_Finalize``.
+without `MPI_Finalize`.
 """
 
 import atexit
@@ -48,10 +48,10 @@ _TERMINAL_DONE_MARKER = "WIDEEP_MPI_TERMINAL_DONE"
 _TERMINAL_EXITING_MARKER = "WIDEEP_MPI_TERMINAL_EXITING"
 _TERMINAL_ERROR_MARKER = "WIDEEP_MPI_TERMINAL_ERROR"
 _TERMINAL_ATEXIT_MARKER = "WIDEEP_MPI_TERMINAL_ATEXIT_RAN"
-_PROPAGATION_TARGET_SEC = 0.1
 _CONVERGENCE_TIMEOUT_SEC = 2.0
 _ALLOW_SKIP_ENV = "TLLM_ALLOW_MPI_FT_SMOKE_SKIP"
 _HEALTHY_MODE = "healthy"
+_PROPAGATION_MODE = "propagation"
 _TERMINAL_MODE = "terminal"
 _WORKER_SKIPPED = False
 
@@ -121,7 +121,7 @@ def _synchronize_phase_error(
 
 
 def _run_invalid_topology_smoke(world: MPI.Intracomm) -> str | None:
-    """Prove a rank-local topology error is reconciled before ``Split``."""
+    """Prove a rank-local topology error is reconciled before `Split`."""
     rank = world.Get_rank()
     world_size = world.Get_size()
     ep_group = tuple(range(world_size))
@@ -198,6 +198,27 @@ def _run_healthy_lifecycle_smoke(world: MPI.Intracomm) -> str | None:
                 "Production-construction progress failed during healthy shutdown: "
                 f"{broadcaster.last_error}"
             )
+        second_error: str | None = None
+        try:
+            MpiFtSubcomm(
+                mapping,
+                FailureEvidenceState(world_size),
+                config,
+            )
+        except RuntimeError as creation_error:
+            second_error = str(creation_error)
+        second_errors = world.allgather(second_error)
+        expected_fragment = "at most one process-lifetime communicator per process"
+        if (
+            any(message is None for message in second_errors)
+            or len(set(second_errors)) != 1
+            or expected_fragment not in second_errors[0]
+        ):
+            raise AssertionError(
+                "second FT communicator construction was not rejected "
+                f"collectively: {second_errors}"
+            )
+        world.Barrier()
     except Exception:
         error = traceback.format_exc()
     finally:
@@ -302,7 +323,7 @@ def _run_failure_propagation_smoke(world: MPI.Intracomm) -> str | None:
                 failure_evidence.has_failure(failure_rank)
                 and broadcaster.failure_detection_is_reconciled(failure_rank)
                 and broadcaster.failure_evidence_is_reconciled()
-                and broadcaster.world_is_poisoned()
+                and broadcaster.communicator_epoch_is_failed()
             )
         except Exception:
             observation_error = traceback.format_exc()
@@ -331,18 +352,15 @@ def _run_failure_propagation_smoke(world: MPI.Intracomm) -> str | None:
             )
         if rank == detector_rank and detector_elapsed_sec is not None:
             elapsed_ms = detector_elapsed_sec * 1000.0
-            target_ms = _PROPAGATION_TARGET_SEC * 1000.0
             print(
-                f"{_PROPAGATION_MARKER} world_size={world_size} "
-                f"elapsed_ms={elapsed_ms!r} target_ms={target_ms!r} "
-                f"target_met={elapsed_ms < target_ms}",
+                f"{_PROPAGATION_MARKER} world_size={world_size} elapsed_ms={elapsed_ms!r}",
                 flush=True,
             )
 
     stop_succeeded = False
     if broadcaster is not None:
         # Deliberately do not reactivate failure_rank. Survivors must take the
-        # poisoned shutdown path and retain their unmatched receive requests.
+        # failed-epoch shutdown path and retain their unmatched receive requests.
         try:
             broadcaster.stop(timeout=5.0)
             if broadcaster.last_error is not None:
@@ -356,15 +374,15 @@ def _run_failure_propagation_smoke(world: MPI.Intracomm) -> str | None:
     if propagation_converged and stop_succeeded:
         try:
             if rank == failure_rank:
-                if broadcaster.world_is_poisoned():
-                    raise AssertionError("logical victim unexpectedly entered poisoned state")
+                if broadcaster.communicator_epoch_is_failed():
+                    raise AssertionError("logical victim unexpectedly entered a failed epoch")
                 if broadcaster._retained_requests:
                     raise AssertionError("logical victim retained healthy MPI requests")
             else:
-                if not broadcaster.world_is_poisoned():
-                    raise AssertionError("survivor lost sticky poisoned state during stop")
+                if not broadcaster.communicator_epoch_is_failed():
+                    raise AssertionError("survivor lost sticky failed-epoch state during stop")
                 if not broadcaster._retained_requests:
-                    raise AssertionError("survivor did not retain poisoned MPI requests")
+                    raise AssertionError("survivor did not retain failed-epoch MPI requests")
         except Exception:
             sticky_error = traceback.format_exc()
             error = f"{error or ''}\nsticky-poison failure:\n{sticky_error}"
@@ -394,7 +412,7 @@ def _terminal_atexit_sentinel() -> None:
 
 
 def _run_terminal_abort_smoke(world: MPI.Intracomm) -> str | None:
-    """Exercise terminal ABORT relay while keeping ``COMM_WORLD`` healthy."""
+    """Exercise terminal ABORT relay while keeping `COMM_WORLD` healthy."""
     rank = world.Get_rank()
     world_size = world.Get_size()
     mapping = _mapping(world_size, rank)
@@ -404,8 +422,9 @@ def _run_terminal_abort_smoke(world: MPI.Intracomm) -> str | None:
 
     setup_error: str | None = None
     try:
-        # Construct a fresh production communicator, then hide ULFM so this
-        # scenario specifically validates the bounded ABORT echo fallback.
+        # Construct this process's one production communicator, then hide ULFM
+        # so this scenario specifically validates the bounded ABORT echo
+        # fallback.
         owner = MpiFtSubcomm(
             mapping,
             FailureEvidenceState(world_size),
@@ -463,7 +482,7 @@ def _run_terminal_abort_smoke(world: MPI.Intracomm) -> str | None:
             local_converged = (
                 broadcaster._progress_failed.is_set()
                 and broadcaster.last_error is not None
-                and broadcaster.world_is_poisoned()
+                and broadcaster.communicator_epoch_is_failed()
                 and wrapped_comm.abort_calls == 0
             )
         except Exception:
@@ -486,8 +505,8 @@ def _run_terminal_abort_smoke(world: MPI.Intracomm) -> str | None:
     if broadcaster is not None:
         try:
             broadcaster.stop(timeout=5.0)
-            if not broadcaster.world_is_poisoned():
-                raise AssertionError("terminal FT state lost its poisoned-world latch")
+            if not broadcaster.communicator_epoch_is_failed():
+                raise AssertionError("terminal FT state lost its failed-epoch latch")
         except Exception:
             cleanup_error = traceback.format_exc()
             error = f"{error or ''}\nterminal cleanup failure:\n{cleanup_error}"
@@ -539,11 +558,10 @@ def main() -> int:
             ("invalid-topology", _run_invalid_topology_smoke),
             ("healthy-lifecycle", _run_healthy_lifecycle_smoke),
         )
+    elif mode == _PROPAGATION_MODE:
+        scenarios = (("failure-broadcast", _run_failure_propagation_smoke),)
     elif mode == _TERMINAL_MODE:
-        scenarios = (
-            ("failure-broadcast", _run_failure_propagation_smoke),
-            ("terminal-abort", _run_terminal_abort_smoke),
-        )
+        scenarios = (("terminal-abort", _run_terminal_abort_smoke),)
     else:
         if rank == 0:
             print(f"unknown WideEP MPI smoke mode: {mode!r}", file=sys.stderr)
@@ -558,16 +576,16 @@ def main() -> int:
 
 if __name__ == "__main__":
     worker_mode = sys.argv[2] if len(sys.argv) > 2 else ""
-    if worker_mode == _TERMINAL_MODE:
+    if worker_mode in (_PROPAGATION_MODE, _TERMINAL_MODE):
         # A normal interpreter shutdown would run mpi4py's Finalize hook. The
         # launcher rejects this sentinel, so the smoke independently proves that
         # the terminal path below bypassed Python atexit via os._exit().
         atexit.register(_terminal_atexit_sentinel)
     exit_code = main()
-    if worker_mode == _TERMINAL_MODE and not _WORKER_SKIPPED:
-        # This mode deliberately leaves the FT control plane terminal and
+    if worker_mode in (_PROPAGATION_MODE, _TERMINAL_MODE) and not _WORKER_SKIPPED:
+        # This mode deliberately leaves the FT detection plane terminal and
         # retains its requests. Skip mpi4py's collective MPI_Finalize just as
-        # the production poisoned-world shutdown hook will do.
+        # the production failed-epoch shutdown hook will do.
         sys.stdout.flush()
         sys.stderr.flush()
         if exit_code == 0:

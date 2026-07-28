@@ -22,7 +22,7 @@ point-to-point requests on an independent CPU thread.
 
 The component propagates one rank-failure detection and updates only the
 process-local :class:`FailureEvidenceState`. It never receives or updates the
-committed ``EPGroupHealth`` execution mask. Multi-rank suspect/confirm
+committed `EPGroupHealth` execution mask. Multi-rank suspect/confirm
 consensus, commit authorization, and communicator reconstruction are
 intentionally left to later WideEP FT phases.
 
@@ -32,11 +32,11 @@ reconciliation does **not** authorize request resume, EPLB changes, NCCL
 reconfiguration or use, or committed-mask mutation. The future 1c.4b recovery
 coordinator consumes the detection callback and owns that authorization.
 
-ULFM revoke is reserved for terminal control-plane aborts because MPI does not
+ULFM revoke is reserved for terminal detection-plane aborts because MPI does not
 carry enough information to distinguish a successful commit revoke from an
 emergency abort at remote ranks. Without ULFM, terminal state is echoed to every
 survivor; failure to confirm that echo within a bounded interval uses
-``MPI_Abort`` on the world-spanning FT communicator as a fail-stop fallback.
+`MPI_Abort` on the world-spanning FT communicator as a fail-stop fallback.
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ class _MpiComm(Protocol):
 
 
 class _MpiModule(Protocol):
-    """Subset of the mpi4py ``MPI`` module used by this component."""
+    """Subset of the mpi4py `MPI` module used by this component."""
 
     ERRORS_RETURN: object
     ERR_PROC_FAILED: int
@@ -147,7 +147,7 @@ class FailureEvidenceSnapshot:
 class FailureEvidenceState:
     """Thread-safe, process-local rank-failure evidence.
 
-    This state is deliberately distinct from ``EPGroupHealth``. It is evidence
+    This state is deliberately distinct from `EPGroupHealth`. It is evidence
     exclusively mutated by :class:`MpiFtSubcomm`, not a committed execution
     mask, and it is monotonic for one FT communicator epoch. Callers may retain
     and inspect the state, but must not mutate it.
@@ -156,8 +156,8 @@ class FailureEvidenceState:
         ep_size: Number of EP-local ranks represented by this state.
 
     Raises:
-        TypeError: If ``ep_size`` is not an integer.
-        ValueError: If ``ep_size`` is not positive.
+        TypeError: If `ep_size` is not an integer.
+        ValueError: If `ep_size` is not positive.
     """
 
     def __init__(self, ep_size: int) -> None:
@@ -185,7 +185,7 @@ class FailureEvidenceState:
             return True
 
     def has_failure(self, rank: int) -> bool:
-        """Return whether failure evidence has been recorded for ``rank``."""
+        """Return whether failure evidence has been recorded for `rank`."""
         rank = self._validate_rank(rank)
         with self._lock:
             return rank in self._failed_ranks
@@ -215,21 +215,22 @@ class MpiFtSubcommConfig:
     """Runtime-independent tuning for the FT progress thread.
 
     Args:
-        poll_interval_sec: Maximum delay between MPI progress passes. The
-            default leaves margin below the 100 ms agreement budget.
+        poll_interval_sec: Maximum delay between MPI progress passes.
         startup_timeout_sec: Maximum time to wait for receive requests to be
             posted when :meth:`MpiFtSubcomm.start` is called.
         stop_timeout_sec: Default bounded join timeout used by
-            :meth:`MpiFtSubcomm.stop`.
+            :meth:`MpiFtSubcomm.stop`, maximum time for Revoke to complete, and
+            maximum time for the progress thread to exit after a terminal
+            relay reconciles.
         reconcile_timeout_sec: Maximum time for every candidate survivor to
-            announce the same failure before the control plane fails closed.
+            announce the same failure before the detection plane fails closed.
         unattributed_error_timeout_sec: Maximum time to wait for the host
             watchdog to identify a rank after non-ULFM MPI reports a generic
-            transport error. The default leaves margin for the design's
-            five-second watchdog bound while keeping terminal escalation
-            inside the ten-second recovery budget.
+            transport error. This fail-closed bound is independent of the
+            watchdog's configurable detection policy, which later physical
+            tests must measure.
         abort_timeout_sec: Maximum time to reconcile a relayed terminal ABORT
-            before falling back to communicator-wide ``MPI_Abort`` when ULFM
+            before falling back to communicator-wide `MPI_Abort` when ULFM
             is unavailable.
     """
 
@@ -285,7 +286,7 @@ class _Lifecycle(Enum):
 
 
 class MpiFtSubcomm:
-    """Broadcast EP-rank failure detections on a dedicated MPI control plane.
+    """Broadcast EP-rank failure detections over a dedicated MPI communicator.
 
     Construction creates the FT communicator collectively on the caller's
     thread. Call :meth:`start` only after every rank has constructed the
@@ -293,33 +294,33 @@ class MpiFtSubcomm:
     this communicator; :meth:`report_detected_failure` updates only local
     failure evidence and enqueues a report, so it never waits for a peer or MPI
     progress. The watchdog must call this method instead of pre-recording evidence.
-    Because ``MPI.THREAD_MULTIPLE`` is required, a caller whose start/stop
+    Because `MPI.THREAD_MULTIPLE` is required, a caller whose start/stop
     deadline proves that thread is wedged may issue the terminal Revoke/Abort
     fallback.
 
     Args:
-        mapping: Distributed mapping whose ``moe_ep_group`` defines the FT
-            communicator and whose ``moe_ep_rank`` defines the local rank.
+        mapping: Distributed mapping whose `moe_ep_group` defines the FT
+            communicator and whose `moe_ep_rank` defines the local rank.
         failure_evidence: Process-local EP detection evidence updated by sent and
-            received failure reports. ``EPGroupHealth`` is rejected because it
+            received failure reports. `EPGroupHealth` is rejected because it
             is the committed execution-mask state owned by the recovery
             coordinator.
         config: Progress-loop timing configuration.
         on_failure_detected: Optional callback invoked as
-            ``(failed_rank, source_rank, monotonic_time)`` when a local or
+            `(failed_rank, source_rank, monotonic_time)` when a local or
             received report first changes failure evidence. This is the handoff
             to the future 1c.4b recovery coordinator; it is detection evidence,
             not commit authorization. Delivery runs on a dedicated daemon
             thread so callback latency cannot block MPI progress.
         comm: Pre-created FT communicator. Intended for tests; production
-            callers should let the component create it from ``mapping``.
-        mpi_module: MPI module paired with ``comm``. Intended for tests.
+            callers should let the component create it from `mapping`.
+        mpi_module: MPI module paired with `comm`. Intended for tests.
 
     Raises:
         RuntimeError: If MPI support or thread support is insufficient, or if
-            the communicator does not match ``mapping``.
-        TypeError: If ``failure_evidence`` is not a :class:`FailureEvidenceState`.
-        ValueError: If ``failure_evidence`` and ``mapping`` describe different
+            the communicator does not match `mapping`.
+        TypeError: If `failure_evidence` is not a :class:`FailureEvidenceState`.
+        ValueError: If `failure_evidence` and `mapping` describe different
             EP groups.
     """
 
@@ -374,7 +375,8 @@ class MpiFtSubcomm:
         else:
             if self._mpi.Query_thread() < self._mpi.THREAD_MULTIPLE:
                 raise RuntimeError(
-                    "WideEP FT requires MPI.THREAD_MULTIPLE because its control-plane "
+                    "WideEP FT requires MPI.THREAD_MULTIPLE because its "
+                    "failure-notification "
                     "thread overlaps other MPI traffic"
                 )
 
@@ -447,7 +449,7 @@ class MpiFtSubcomm:
         self._retained_requests: list[_PendingSend | _PendingReceive] = []
         self._process_lifetime_retained = comm_created_collectively
         if comm_created_collectively:
-            # The FT communicator is a process-lifetime control-plane
+            # The FT communicator is a process-lifetime failure-notification
             # resource. Letting mpi4py destroy it when one broadcaster is
             # garbage-collected would call a collective Free at rank-local
             # and nondeterministic times.
@@ -458,6 +460,8 @@ class MpiFtSubcomm:
         self._callback_thread: threading.Thread | None = None
         self._terminal_action_lock = threading.Lock()
         self._revoke_attempted = False
+        self._revoke_completed = False
+        self._revoke_deadline: float | None = None
         self._world_abort_attempted = False
         self._ulfm_available = (
             collective_setup.ulfm_available if collective_setup is not None else self._probe_ulfm()
@@ -471,7 +475,7 @@ class MpiFtSubcomm:
 
     @property
     def last_error(self) -> BaseException | None:
-        """First terminal control-plane error, if any."""
+        """First terminal failure-notification error, if any."""
         with self._error_lock:
             return self._last_error
 
@@ -479,7 +483,7 @@ class MpiFtSubcomm:
         """Start the dedicated MPI progress thread.
 
         This method is not restartable. A second call, including one after
-        :meth:`stop`, raises ``RuntimeError``.
+        :meth:`stop`, raises `RuntimeError`.
         """
         thread_start_error: BaseException | None = None
         with self._lifecycle_lock:
@@ -528,7 +532,7 @@ class MpiFtSubcomm:
             # There is no progress thread to relay ABORT, so fail closed on the
             # caller thread. This is the only thread that can own the FT comm
             # after progress-thread creation itself failed.
-            self._fail_closed_immediately(thread_start_error)
+            self._fail_closed_immediately(thread_start_error, try_revoke=False)
             callback_thread = self._callback_thread
             if callback_thread is not None and callback_thread.is_alive():
                 callback_thread.join(self._config.stop_timeout_sec)
@@ -536,7 +540,7 @@ class MpiFtSubcomm:
             if deadline_monitor_thread is not None and deadline_monitor_thread.is_alive():
                 deadline_monitor_thread.join(self._config.stop_timeout_sec)
             raise RuntimeError(
-                "WideEP FT control-plane thread failed to start"
+                "WideEP FT failure-notification thread failed to start"
             ) from thread_start_error
 
         startup_deadline = time.monotonic() + self._config.startup_timeout_sec
@@ -546,7 +550,7 @@ class MpiFtSubcomm:
         )
         if not progress_ready or not deadline_monitor_ready:
             timeout_error = TimeoutError(
-                "WideEP FT control-plane threads did not start before the timeout"
+                "WideEP FT failure-notification threads did not start before the timeout"
             )
             with self._lifecycle_lock:
                 self._lifecycle = _Lifecycle.FAILED
@@ -559,9 +563,9 @@ class MpiFtSubcomm:
             # startup deadline just expired, so it cannot execute the terminal
             # action itself. MPI.THREAD_MULTIPLE is a construction invariant;
             # use the caller thread to issue the terminal communicator action.
-            self._fail_closed_immediately(timeout_error)
+            self._fail_closed_immediately(timeout_error, try_revoke=False)
             # The progress thread may be stuck inside the first MPI Irecv and
-            # therefore unable to reach its ``finally`` block. Do not leave the
+            # therefore unable to reach its `finally` block. Do not leave the
             # independent callback worker alive after start() has failed.
             callback_thread = self._callback_thread
             if callback_thread is not None and callback_thread is not threading.current_thread():
@@ -584,6 +588,16 @@ class MpiFtSubcomm:
                     f"(state={lifecycle.name.lower()})"
                 )
         if startup_error is not None:
+            # Progress may be blocked in its terminal MPI action and unable to
+            # reach `finally`, so stop the independent callback worker before
+            # issuing an action that does not return in production.
+            self._request_callback_stop()
+            revoke_completed, _, _ = self._revoke_state()
+            if not self._progress_failed.is_set() and not revoke_completed:
+                # The error is published before Revoke or the non-ULFM relay
+                # completes. Do not retire the only deadline monitor while the
+                # progress thread may still be blocked in its terminal action.
+                self._fail_closed_immediately(startup_error, try_revoke=False)
             self._request_deadline_monitor_stop()
             deadline_monitor_thread = self._deadline_monitor_thread
             if (
@@ -591,6 +605,9 @@ class MpiFtSubcomm:
                 and deadline_monitor_thread is not threading.current_thread()
             ):
                 deadline_monitor_thread.join(self._config.stop_timeout_sec)
+            callback_thread = self._callback_thread
+            if callback_thread is not None and callback_thread is not threading.current_thread():
+                callback_thread.join(self._config.stop_timeout_sec)
             raise RuntimeError("WideEP FT progress thread failed during startup") from startup_error
 
     def stop(self, timeout: float | None = None) -> None:
@@ -610,7 +627,7 @@ class MpiFtSubcomm:
                 :attr:`MpiFtSubcommConfig.stop_timeout_sec`.
 
         Raises:
-            ValueError: If ``timeout`` is not finite and positive.
+            ValueError: If `timeout` is not finite and positive.
             TimeoutError: If the progress thread does not exit in time.
         """
         timeout = self._config.stop_timeout_sec if timeout is None else timeout
@@ -652,7 +669,7 @@ class MpiFtSubcomm:
                 # Do not enqueue fail-stop work onto the thread that this
                 # timeout proves is not making MPI progress.
                 self._request_deadline_monitor_stop()
-                self._fail_closed_immediately(timeout_error)
+                self._fail_closed_immediately(timeout_error, try_revoke=False)
                 raise timeout_error
 
         self._request_deadline_monitor_stop()
@@ -665,7 +682,7 @@ class MpiFtSubcomm:
                 timeout_error = TimeoutError(
                     "WideEP FT deadline monitor did not stop before the timeout"
                 )
-                self._fail_closed_immediately(timeout_error)
+                self._fail_closed_immediately(timeout_error, try_revoke=False)
                 raise timeout_error
 
         if callback_thread is not None and callback_thread is not threading.current_thread():
@@ -676,7 +693,7 @@ class MpiFtSubcomm:
                 )
                 # The detection handoff does not own MPI state. A stuck future
                 # coordinator callback may make this stop call time out, but it
-                # must not make one rank take the poisoned-world process-exit
+                # must not make one rank take the failed-epoch process-exit
                 # path.
                 raise timeout_error
 
@@ -694,10 +711,10 @@ class MpiFtSubcomm:
         same rank are coalesced after the first local announcement.
 
         Args:
-            failed_rank: EP-local rank in ``[0, ep_size)``.
+            failed_rank: EP-local rank in `[0, ep_size)`.
 
         Returns:
-            ``True`` if this call changed local failure evidence, else ``False``.
+            `True` if this call changed local failure evidence, else `False`.
         """
         failed_rank = self._validate_rank(failed_rank)
         with self._lifecycle_lock:
@@ -723,7 +740,7 @@ class MpiFtSubcomm:
             self._invoke_detection_callback(failed_rank, self._local_rank, detected_time)
         return changed
 
-    def world_is_poisoned(self) -> bool:
+    def communicator_epoch_is_failed(self) -> bool:
         """Return whether this communicator epoch has ever observed failure."""
         return (
             self._transport_poisoned.is_set()
@@ -734,7 +751,7 @@ class MpiFtSubcomm:
     def failure_detection_is_reconciled(self, failed_rank: int) -> bool:
         """Return whether every candidate survivor announced the same detection.
 
-        This is detection-plane evidence only. A ``True`` result does not
+        This is detection-plane evidence only. A `True` result does not
         authorize request resume, EPLB changes, NCCL reconfiguration or use, or
         committed-mask mutation. The future 1c.4b recovery coordinator owns
         those decisions. This method performs no MPI calls, and a terminal
@@ -762,7 +779,7 @@ class MpiFtSubcomm:
     def failure_evidence_is_reconciled(self) -> bool:
         """Return whether survivors propagated every local failure detection.
 
-        This is not a commit gate. A ``True`` result does not authorize request
+        This is not a commit gate. A `True` result does not authorize request
         resume, EPLB changes, NCCL reconfiguration or use, or committed-mask
         mutation. The future 1c.4b recovery coordinator owns those decisions.
         """
@@ -881,7 +898,7 @@ class MpiFtSubcomm:
         The relay is best effort because it uses the same FT communicator. If
         survivor echoes do not converge before the bounded deadline, the
         progress thread escalates to ULFM revoke or communicator-wide
-        ``MPI_Abort``. This method performs no MPI calls.
+        `MPI_Abort`. This method performs no MPI calls.
         """
         self._record_error(error)
         snapshot = self._failure_evidence.snapshot()
@@ -916,7 +933,7 @@ class MpiFtSubcomm:
         required_reporters = set(self._candidate_survivor_ranks(failed_ranks))
         if not required_reporters:
             # There is no survivor that can participate in later recovery.
-            # Do not let the usual ``empty set is a subset`` rule claim
+            # Do not let the usual `empty set is a subset` rule claim
             # detection propagation completed in this terminal case.
             return False
         reporters = self._failure_reporters.get(failed_rank, set())
@@ -1263,7 +1280,7 @@ class MpiFtSubcomm:
                     callback(failed_rank, source, event_time)
             except Exception as error:
                 # A coordinator callback must never terminate either
-                # control-plane thread.
+                # failure-notification thread.
                 logger.warning(f"WideEP FT failure callback raised: {error}")
 
     def _request_callback_stop(self) -> None:
@@ -1281,10 +1298,11 @@ class MpiFtSubcomm:
 
         Normal communicator traffic remains owned by the progress thread. This
         monitor only observes protected protocol state. If a terminal relay
-        itself reaches its deadline, ``MPI.THREAD_MULTIPLE`` permits this thread
+        itself reaches its deadline, `MPI.THREAD_MULTIPLE` permits this thread
         to issue the existing one-shot Revoke/Abort fail-stop action.
         """
         self._deadline_monitor_ready_event.set()
+        reconciled_exit_deadline: float | None = None
         try:
             while True:
                 # Clear before checking stop/deadline state so a concurrent
@@ -1292,16 +1310,61 @@ class MpiFtSubcomm:
                 self._deadline_monitor_wake_event.clear()
                 if self._deadline_monitor_stop_event.is_set():
                     return
-                if self._progress_failed.is_set():
+                revoke_completed, revoke_in_flight, revoke_deadline = self._revoke_state()
+                if revoke_completed:
                     return
+                if self._progress_failed.is_set() and not revoke_in_flight:
+                    return
+                now = time.monotonic()
+                if revoke_in_flight:
+                    if revoke_deadline is not None and now >= revoke_deadline:
+                        self._fail_closed_immediately(
+                            TimeoutError(
+                                "WideEP FT communicator revoke did not complete before the timeout"
+                            ),
+                            try_revoke=False,
+                        )
+                        self._wake_event.set()
+                        return
+                    self._deadline_monitor_wake_event.wait(
+                        min(
+                            self._config.poll_interval_sec,
+                            max(0.0, revoke_deadline - now)
+                            if revoke_deadline is not None
+                            else self._config.poll_interval_sec,
+                        )
+                    )
+                    continue
 
                 self._check_accepted_failure_epoch()
                 self._check_unattributed_transport_deadlines()
                 self._check_reconciliation_deadlines()
 
-                if self._progress_failed.is_set():
+                revoke_completed, revoke_in_flight, revoke_deadline = self._revoke_state()
+                if revoke_completed:
+                    return
+                if self._progress_failed.is_set() and not revoke_in_flight:
                     return
                 now = time.monotonic()
+                if revoke_in_flight:
+                    if revoke_deadline is not None and now >= revoke_deadline:
+                        self._fail_closed_immediately(
+                            TimeoutError(
+                                "WideEP FT communicator revoke did not complete before the timeout"
+                            ),
+                            try_revoke=False,
+                        )
+                        self._wake_event.set()
+                        return
+                    self._deadline_monitor_wake_event.wait(
+                        min(
+                            self._config.poll_interval_sec,
+                            max(0.0, revoke_deadline - now)
+                            if revoke_deadline is not None
+                            else self._config.poll_interval_sec,
+                        )
+                    )
+                    continue
                 with self._protocol_lock:
                     abort_deadline = self._abort_deadline
                     abort_reconciled = (
@@ -1311,25 +1374,45 @@ class MpiFtSubcomm:
                 if self._abort_requested.is_set() and abort_deadline is not None:
                     if abort_reconciled:
                         # The relay reached every expected survivor. The progress
-                        # thread will break cleanly when it resumes. Do not mark
-                        # progress failed here: its exception path would otherwise
-                        # escalate a reconciled non-ULFM terminal relay to
-                        # MPI_Abort.
+                        # thread should break cleanly when it resumes. Keep this
+                        # independent monitor alive until that happens so a wedged
+                        # MPI call still has a bounded fail-stop fallback.
+                        if reconciled_exit_deadline is None:
+                            reconciled_exit_deadline = now + self._config.stop_timeout_sec
                         self._wake_event.set()
-                        return
-                    if now >= abort_deadline:
+                        if now >= reconciled_exit_deadline:
+                            self._fail_closed_immediately(
+                                TimeoutError(
+                                    "WideEP FT progress thread did not stop after "
+                                    "terminal relay reconciliation"
+                                ),
+                                try_revoke=False,
+                            )
+                            self._wake_event.set()
+                            return
+                    elif now >= abort_deadline:
                         self._fail_closed_immediately(
                             TimeoutError(
                                 "WideEP FT terminal relay did not complete before "
                                 "the abort deadline"
-                            )
+                            ),
+                            try_revoke=False,
                         )
                         self._wake_event.set()
                         return
 
-                self._deadline_monitor_wake_event.wait(self._config.poll_interval_sec)
+                monitor_wait = self._config.poll_interval_sec
+                revoke_completed, revoke_in_flight, revoke_deadline = self._revoke_state()
+                if revoke_completed:
+                    return
+                if revoke_in_flight and revoke_deadline is not None:
+                    monitor_wait = min(
+                        monitor_wait,
+                        max(0.0, revoke_deadline - time.monotonic()),
+                    )
+                self._deadline_monitor_wake_event.wait(monitor_wait)
         except Exception as error:
-            self._fail_closed_immediately(error)
+            self._fail_closed_immediately(error, try_revoke=False)
             self._wake_event.set()
         finally:
             # start() also uses this event to distinguish a scheduled monitor
@@ -1507,25 +1590,31 @@ class MpiFtSubcomm:
         return False, None
 
     def _progress_terminal_abort(self) -> bool:
-        """Return ``True`` after terminal state is globally safe to stop."""
+        """Return `True` after terminal state is globally safe to stop."""
         if self.ulfm_available:
             # Revoke is itself a communicator-wide terminal notification; it
             # does not depend on rendezvous Isends reaching completion.
-            self._progress_failed.set()
             with self._lifecycle_lock:
                 self._lifecycle = _Lifecycle.FAILED
             try:
-                self._try_revoke()
+                revoke_completed = self._try_revoke()
             except Exception as error:
                 logger.warning(f"WideEP FT terminal revoke failed: {error}")
+                self._progress_failed.set()
                 self._try_world_abort()
                 return True
+            if revoke_completed:
+                self._progress_failed.set()
+                return True
             if self.ulfm_available:
+                # Another caller owns an in-flight Revoke, or its earlier
+                # attempt failed without proving ULFM unsupported. Do not
+                # mistake the attempted state for a completed fail-stop action.
+                self._progress_failed.set()
+                self._try_world_abort()
                 return True
             # A runtime unsupported result disables ULFM and falls through to
-            # the relayed-ABORT protocol. Clear the flag so the next loop pass
-            # can continue progressing those requests.
-            self._progress_failed.clear()
+            # the relayed-ABORT protocol.
 
         now = time.monotonic()
         with self._protocol_lock:
@@ -1547,19 +1636,24 @@ class MpiFtSubcomm:
             self._try_world_abort()
         return True
 
-    def _fail_closed_immediately(self, error: BaseException) -> None:
+    def _fail_closed_immediately(
+        self,
+        error: BaseException,
+        *,
+        try_revoke: bool = True,
+    ) -> None:
         """Abort globally after an error makes bounded relay unsafe."""
         with self._lifecycle_lock:
             self._record_error(error)
-            self._progress_failed.set()
             self._lifecycle = _Lifecycle.FAILED
-        if self.ulfm_available:
+        if try_revoke and self.ulfm_available:
             try:
-                self._try_revoke()
-                if self.ulfm_available:
+                if self._try_revoke():
+                    self._progress_failed.set()
                     return
             except Exception as revoke_error:
                 logger.warning(f"WideEP FT could not revoke after terminal error: {revoke_error}")
+        self._progress_failed.set()
         self._try_world_abort()
 
     def _fail_closed_after_cleanup(self, error: BaseException) -> None:
@@ -1589,7 +1683,7 @@ class MpiFtSubcomm:
         if not callable(abort):
             logger.error(
                 "WideEP FT communicator has no MPI_Abort fallback; "
-                "survivors must terminate through the poisoned-world shutdown hook"
+                "survivors must terminate through the failed-epoch shutdown hook"
             )
             return
         try:
@@ -1620,7 +1714,7 @@ class MpiFtSubcomm:
         # communicator has failed. Keeping each request together with its
         # NumPy buffer is the only bounded shutdown behavior in that state;
         # the later model-engine shutdown hook skips MPI_Finalize entirely.
-        if self.last_error is not None or self.world_is_poisoned():
+        if self.last_error is not None or self.communicator_epoch_is_failed():
             self._retain_requests(requests)
             return
 
@@ -1666,21 +1760,47 @@ class MpiFtSubcomm:
             if self._last_error is None:
                 self._last_error = error
 
-    def _try_revoke(self) -> None:
+    def _revoke_state(self) -> tuple[bool, bool, float | None]:
+        """Return completed, in-flight, and deadline state for Revoke."""
+        with self._terminal_action_lock:
+            in_flight = (
+                self._revoke_attempted
+                and not self._revoke_completed
+                and self._revoke_deadline is not None
+            )
+            return self._revoke_completed, in_flight, self._revoke_deadline
+
+    def _try_revoke(self) -> bool:
         # Claim the one permitted Revoke attempt, but never hold a Python lock
         # across MPI. A caller-thread timeout and a later-resuming progress
-        # thread may enter terminal handling concurrently; the claimant owns
-        # any unsupported/error fallback.
+        # thread may enter terminal handling concurrently. Only a returned
+        # `True` proves that the communicator-wide action completed.
         with self._terminal_action_lock:
+            if self._world_abort_attempted:
+                return False
+            if self._revoke_completed:
+                return True
             if not self._ulfm_available or self._revoke_attempted:
-                return
+                return False
             self._revoke_attempted = True
+            self._revoke_deadline = time.monotonic() + self._config.stop_timeout_sec
+        self._deadline_monitor_wake_event.set()
         try:
             self._comm.Revoke()
         except Exception as error:
             if isinstance(error, NotImplementedError) or self._is_unsupported_ulfm_error(error):
                 with self._terminal_action_lock:
                     self._ulfm_available = False
+                    self._revoke_deadline = None
+                self._deadline_monitor_wake_event.set()
                 logger.warning(f"WideEP FT revoke is unavailable at runtime: {error}")
-                return
+                return False
+            with self._terminal_action_lock:
+                self._revoke_deadline = None
+            self._deadline_monitor_wake_event.set()
             raise
+        with self._terminal_action_lock:
+            self._revoke_completed = True
+            self._revoke_deadline = None
+        self._deadline_monitor_wake_event.set()
+        return True

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the WideEP MPI failure-broadcast control plane.
+"""Unit tests for the WideEP MPI failure-notification plane.
 
 The tests use in-memory MPI, communicator, and request doubles. They exercise
 the real progress thread without requiring mpi4py, GPUs, or a multi-rank
@@ -66,7 +66,7 @@ def test_config_requires_positive_finite_timeouts(value: float) -> None:
         MpiFtSubcommConfig(abort_timeout_sec=value)
 
 
-def test_default_poll_interval_leaves_margin_below_agreement_budget() -> None:
+def test_default_poll_interval_is_ten_milliseconds() -> None:
     assert MpiFtSubcommConfig().poll_interval_sec == 0.01
 
 
@@ -293,6 +293,23 @@ class _FakeComm:
     def sends(self) -> tuple[_SendRecord, ...]:
         with self._lock:
             return tuple(self._sends)
+
+
+class _BlockingRevokeComm(_FakeComm):
+    """Communicator whose Revoke call remains in flight until released."""
+
+    def __init__(self, *, size: int, rank: int = 0) -> None:
+        super().__init__(size=size, rank=rank)
+        self.revoke_entered = threading.Event()
+        self.release_revoke = threading.Event()
+        self.on_revoke_entered: Callable[[], None] | None = None
+
+    def Revoke(self) -> None:
+        self.revoke_calls += 1
+        self.revoke_entered.set()
+        if self.on_revoke_entered is not None:
+            self.on_revoke_entered()
+        self.release_revoke.wait()
 
 
 def _wait_until(
@@ -606,10 +623,11 @@ def test_reconciliation_timeout_fails_closed_while_mpi_test_is_wedged() -> None:
         lambda: isinstance(broadcaster.last_error, TimeoutError),
         description="terminal reconciliation timeout",
     )
-    _wait_until(lambda: comm.revoke_calls == 1, description="deadline-monitor revoke")
+    _wait_until(lambda: comm.abort_calls == 1, description="deadline-monitor MPI_Abort")
     assert blocking_request.release_test.is_set() is False
+    assert comm.revoke_calls == 0
     assert broadcaster.failure_evidence_is_reconciled() is False
-    assert broadcaster.world_is_poisoned() is True
+    assert broadcaster.communicator_epoch_is_failed() is True
     with pytest.raises(RuntimeError, match="not running"):
         broadcaster.report_detected_failure(1)
     blocking_request.release_test.set()
@@ -644,7 +662,7 @@ def test_reconciliation_timeout_world_aborts_when_mpi_test_is_wedged_without_ulf
     _wait_until(lambda: comm.abort_calls == 1, description="deadline-monitor MPI_Abort")
     assert blocking_request.release_test.is_set() is False
     assert isinstance(broadcaster.last_error, TimeoutError)
-    assert broadcaster.world_is_poisoned() is True
+    assert broadcaster.communicator_epoch_is_failed() is True
 
     blocking_request.release_test.set()
     broadcaster.stop()
@@ -759,26 +777,127 @@ def test_monitor_does_not_world_abort_reconciled_relay_when_mpi_test_resumes() -
     broadcaster.start()
     _wait_until(blocking_request.entered_test.is_set, description="blocked MPI progress")
     broadcaster._request_terminal_abort(RuntimeError("terminal"), -1, 0)
+    broadcaster._wake_event.clear()
     with broadcaster._protocol_lock:
         broadcaster._abort_reporters.add(1)
         broadcaster._abort_fanout_posted = True
         broadcaster._abort_fanout_complete = True
     broadcaster._deadline_monitor_wake_event.set()
 
-    _wait_until(
-        lambda: (
-            broadcaster._deadline_monitor_thread is not None
-            and not broadcaster._deadline_monitor_thread.is_alive()
-        ),
-        description="monitor-observed terminal reconciliation",
-    )
+    _wait_until(broadcaster._wake_event.is_set, description="monitor-observed reconciliation")
+    assert broadcaster._deadline_monitor_thread is not None
+    assert broadcaster._deadline_monitor_thread.is_alive()
     assert broadcaster._progress_failed.is_set() is False
     assert comm.abort_calls == 0
 
     blocking_request.release_test.set()
     _wait_until(broadcaster._progress_failed.is_set, description="clean terminal progress stop")
+    _wait_until(
+        lambda: (
+            broadcaster._deadline_monitor_thread is not None
+            and not broadcaster._deadline_monitor_thread.is_alive()
+        ),
+        description="deadline monitor shutdown",
+    )
     broadcaster.stop()
     assert comm.abort_calls == 0
+
+
+def test_monitor_world_aborts_when_reconciled_relay_progress_never_resumes() -> None:
+    config = MpiFtSubcommConfig(
+        poll_interval_sec=0.001,
+        startup_timeout_sec=0.5,
+        stop_timeout_sec=0.02,
+        reconcile_timeout_sec=0.2,
+        abort_timeout_sec=0.2,
+    )
+    blocking_request = _BlockingRequest()
+    comm = _FakeComm(
+        size=2,
+        receive_factory=lambda _source: blocking_request,
+    )
+    broadcaster = MpiFtSubcomm(
+        _FakeMapping.ep_world(2),
+        FailureEvidenceState(2),
+        config,
+        comm=comm,
+        mpi_module=_FakeMPI(),
+    )
+    broadcaster.start()
+    try:
+        _wait_until(blocking_request.entered_test.is_set, description="blocked MPI progress")
+        broadcaster._request_terminal_abort(RuntimeError("terminal"), -1, 0)
+        with broadcaster._protocol_lock:
+            broadcaster._abort_reporters.add(1)
+            broadcaster._abort_fanout_posted = True
+            broadcaster._abort_fanout_complete = True
+        broadcaster._deadline_monitor_wake_event.set()
+
+        _wait_until(lambda: comm.abort_calls == 1, description="wedged progress fallback")
+        assert broadcaster._progress_failed.is_set()
+        assert blocking_request.release_test.is_set() is False
+        assert comm.revoke_calls == 0
+    finally:
+        blocking_request.release_test.set()
+        broadcaster.stop(timeout=0.5)
+    assert comm.abort_calls == 1
+    assert comm.revoke_calls == 0
+
+
+def test_monitor_world_aborts_when_ulfm_revoke_never_completes() -> None:
+    config = MpiFtSubcommConfig(
+        poll_interval_sec=0.1,
+        startup_timeout_sec=0.5,
+        stop_timeout_sec=0.02,
+        reconcile_timeout_sec=0.2,
+        abort_timeout_sec=0.2,
+    )
+    comm = _BlockingRevokeComm(size=1)
+    broadcaster = MpiFtSubcomm(
+        _FakeMapping.ep_world(1),
+        FailureEvidenceState(1),
+        config,
+        comm=comm,
+        mpi_module=_FakeMPI(),
+    )
+    broadcaster.start()
+    try:
+        broadcaster._request_terminal_abort(RuntimeError("terminal"), -1, 0)
+        _wait_until(comm.revoke_entered.is_set, description="in-flight communicator revoke")
+        assert comm.release_revoke.is_set() is False
+
+        _wait_until(lambda: comm.abort_calls == 1, description="wedged revoke MPI_Abort fallback")
+        assert broadcaster._progress_failed.is_set()
+        assert broadcaster._revoke_completed is False
+        assert comm.release_revoke.is_set() is False
+    finally:
+        comm.release_revoke.set()
+        broadcaster.stop(timeout=0.5)
+    assert comm.revoke_calls == 1
+    assert comm.abort_calls == 1
+
+
+@pytest.mark.parametrize(
+    "revoke_error",
+    [
+        NotImplementedError("ULFM not compiled"),
+        _FakeMpiException(_FakeMPI.ERR_UNSUPPORTED_OPERATION),
+    ],
+    ids=["not-implemented", "unsupported-operation"],
+)
+def test_runtime_unsupported_revoke_falls_back_to_terminal_relay(
+    revoke_error: BaseException,
+) -> None:
+    comm = _FakeComm(size=1, revoke_error=revoke_error)
+    broadcaster, _, _, _ = _make_broadcaster(size=1, comm=comm)
+    broadcaster.start()
+    broadcaster._request_terminal_abort(RuntimeError("terminal"), -1, 0)
+
+    _wait_until(broadcaster._progress_failed.is_set, description="terminal relay completion")
+    assert broadcaster.ulfm_available is False
+    assert comm.revoke_calls == 1
+    assert comm.abort_calls == 0
+    broadcaster.stop()
 
 
 def test_terminal_abort_waits_until_its_relay_completes() -> None:
@@ -823,10 +942,10 @@ def test_received_terminal_abort_is_relayed_without_mutating_failure_evidence() 
 
     assert failure_evidence.has_failures() is False
     assert isinstance(broadcaster.last_error, RuntimeError)
-    assert broadcaster.world_is_poisoned() is True
+    assert broadcaster.communicator_epoch_is_failed() is True
     assert comm.abort_calls == 0
     broadcaster.stop()
-    assert broadcaster.world_is_poisoned() is True
+    assert broadcaster.communicator_epoch_is_failed() is True
 
 
 def test_no_ulfm_abort_timeout_uses_world_abort_before_stop_completes() -> None:
@@ -939,7 +1058,7 @@ def test_concurrent_local_and_remote_distinct_failures_accept_only_one(
     local_thread.start()
     _wait_until(local_claimed.is_set, description="local failure claim")
     comm.deliver(source=1, failed_rank=3)
-    # The remote handler must wait for the local lifecycle transaction to commit
+    # The remote handler must wait for the local lifecycle transaction to publish
     # its accepted rank and evidence epoch atomically.
     time.sleep(2 * _TEST_CONFIG.poll_interval_sec)
     assert failure_evidence.has_failures() is False
@@ -989,6 +1108,7 @@ def test_send_test_error_is_terminal_and_revokes_with_ulfm() -> None:
 
     _wait_until(lambda: broadcaster.last_error is error, description="terminal send Test error")
     _wait_until(lambda: comm.revoke_calls == 1, description="ULFM emergency revoke")
+    assert comm.abort_calls == 0
     assert broadcaster.failure_evidence_is_reconciled() is False
     assert failed_request.cancel_calls == 0
     assert broadcaster._retained_requests
@@ -1094,7 +1214,7 @@ def test_blocking_callback_does_not_block_mpi_progress_and_stop_is_bounded() -> 
         broadcaster.stop(timeout=0.02)
     assert time.monotonic() - start < 0.2
     assert broadcaster.last_error is None
-    assert broadcaster.world_is_poisoned() is True
+    assert broadcaster.communicator_epoch_is_failed() is True
 
     release_callback.set()
     broadcaster.stop(timeout=0.5)
@@ -1141,7 +1261,7 @@ def test_single_rank_group_has_no_peer_requests_or_sends() -> None:
         assert broadcaster.report_detected_failure(0) is True
         _wait_until(broadcaster._outbound_reports.empty, description="empty single-rank report")
         assert failure_evidence.snapshot().failed_ranks == frozenset({0})
-        assert broadcaster.world_is_poisoned() is True
+        assert broadcaster.communicator_epoch_is_failed() is True
         assert broadcaster.failure_detection_is_reconciled(0) is False
         assert broadcaster.failure_evidence_is_reconciled() is False
         assert comm.sends == ()
@@ -1211,7 +1331,8 @@ def test_thread_start_failure_is_terminal_and_stoppable(
         assert broadcaster.last_error is start_error
         assert broadcaster._progress_failed.is_set()
         assert broadcaster._thread is None
-        assert comm.revoke_calls == 1
+        assert comm.revoke_calls == 0
+        assert comm.abort_calls == 1
         if failing_thread_name == "wide-ep-ft-callback":
             assert broadcaster._callback_thread is None
             assert broadcaster._deadline_monitor_thread is None
@@ -1319,6 +1440,55 @@ def test_startup_failure_publishes_error_before_failed_flag(
     assert broadcaster.last_error is error
     assert broadcaster._progress_failed.is_set()
     assert comm.revoke_calls == 1
+
+
+def test_startup_failure_aborts_before_retiring_monitor_with_revoke_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = MpiFtSubcommConfig(
+        poll_interval_sec=0.1,
+        startup_timeout_sec=0.5,
+        stop_timeout_sec=0.02,
+        reconcile_timeout_sec=0.2,
+        abort_timeout_sec=0.2,
+    )
+    comm = _BlockingRevokeComm(size=1)
+    broadcaster = MpiFtSubcomm(
+        _FakeMapping.ep_world(1),
+        FailureEvidenceState(1),
+        config,
+        lambda _failed, _source, _when: None,
+        comm=comm,
+        mpi_module=_FakeMPI(),
+    )
+    startup_error = _FakeMpiException(999, "failure after thread readiness")
+    comm.on_revoke_entered = broadcaster._ready_event.set
+
+    def fail_during_startup() -> None:
+        with broadcaster._lifecycle_lock:
+            broadcaster._lifecycle = ep_failure_broadcast._Lifecycle.RUNNING
+        broadcaster._fail_closed_immediately(startup_error)
+
+    monkeypatch.setattr(broadcaster, "_progress_loop", fail_during_startup)
+    try:
+        with pytest.raises(RuntimeError, match="failed during startup") as raised:
+            broadcaster.start()
+
+        assert raised.value.__cause__ is startup_error
+        assert comm.revoke_entered.is_set()
+        assert comm.release_revoke.is_set() is False
+        assert comm.revoke_calls == 1
+        assert comm.abort_calls == 1
+        assert broadcaster._progress_failed.is_set()
+        assert broadcaster._deadline_monitor_thread is not None
+        assert broadcaster._deadline_monitor_thread.is_alive() is False
+        assert broadcaster._callback_thread is not None
+        assert broadcaster._callback_thread.is_alive() is False
+    finally:
+        comm.release_revoke.set()
+        broadcaster.stop(timeout=0.5)
+    assert comm.revoke_calls == 1
+    assert comm.abort_calls == 1
 
 
 def test_startup_timeout_fails_closed_before_progress_resumes() -> None:
@@ -1461,13 +1631,13 @@ def test_stop_is_bounded_when_mpi_test_is_stuck() -> None:
         broadcaster.stop(timeout=0.01)
     assert time.monotonic() - start < 0.2
     assert blocking_request.release_test.is_set() is False
-    assert comm.revoke_calls == 1
-    assert comm.abort_calls == 0
+    assert comm.revoke_calls == 0
+    assert comm.abort_calls == 1
 
     blocking_request.release_test.set()
     broadcaster.stop(timeout=0.5)
-    assert comm.revoke_calls == 1
-    assert comm.abort_calls == 0
+    assert comm.revoke_calls == 0
+    assert comm.abort_calls == 1
 
 
 def test_failure_report_is_rejected_after_stop_begins() -> None:
@@ -1545,7 +1715,7 @@ def test_healthy_stop_cleanup_timeout_aborts_world_and_retains_request() -> None
     assert comm.revoke_calls == 0
 
 
-def test_poisoned_stop_keeps_progressing_until_failure_detection_is_reconciled() -> None:
+def test_failed_epoch_stop_keeps_progressing_until_detection_is_reconciled() -> None:
     broadcaster, failure_evidence, comm, _ = _make_broadcaster(size=3)
     broadcaster.start()
     _wait_until(
@@ -1588,7 +1758,7 @@ def test_poisoned_stop_keeps_progressing_until_failure_detection_is_reconciled()
     assert broadcaster._retained_requests
 
 
-def test_poisoned_resources_outlive_broadcaster_object() -> None:
+def test_failed_epoch_resources_outlive_broadcaster_object() -> None:
     registry = ep_failure_broadcast._PROCESS_LIFETIME_REFS
     initial_registry_size = len(registry)
 
@@ -1620,7 +1790,7 @@ def test_poisoned_resources_outlive_broadcaster_object() -> None:
         broadcaster.stop()
         # The fake communicator owns test bookkeeping references that a real
         # MPI communicator does not. Drop those so only the process-lifetime
-        # registry can keep the poisoned request and buffer reachable.
+        # registry can keep the failed-epoch request and buffer reachable.
         comm._receives.clear()
         return references
 
@@ -1635,7 +1805,7 @@ def test_poisoned_resources_outlive_broadcaster_object() -> None:
         del registry[initial_registry_size:]
 
 
-def test_startup_failure_retains_poisoned_comm_without_pending_requests() -> None:
+def test_startup_failure_retains_failed_comm_without_pending_requests() -> None:
     registry = ep_failure_broadcast._PROCESS_LIFETIME_REFS
     initial_registry_size = len(registry)
 
@@ -1841,7 +2011,7 @@ def test_constructor_rejects_and_retains_already_revoked_comm() -> None:
         del registry[initial_registry_size:]
 
 
-def test_peer_failure_reconciles_without_revoking_control_plane() -> None:
+def test_peer_failure_reconciles_without_revoking_failure_notification_comm() -> None:
     callbacks: list[tuple[int, int, float]] = []
     broadcaster, failure_evidence, comm, _ = _make_broadcaster(
         size=3,
