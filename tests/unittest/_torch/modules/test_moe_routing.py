@@ -919,12 +919,7 @@ def _reset_perfect_router_comm_state() -> None:
     except ImportError:
         _NVOS = None
     if _NVOS is not None:
-        for _attr in ("_WORKSPACES", "_WORKSPACE_REFCOUNTS"):
-            _d = getattr(_NVOS, _attr, None)
-            if isinstance(_d, dict):
-                _d.clear()
-        if hasattr(_NVOS, "_WORKSPACE"):
-            _NVOS._WORKSPACE = None
+        _NVOS._clear_workspace_cache()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

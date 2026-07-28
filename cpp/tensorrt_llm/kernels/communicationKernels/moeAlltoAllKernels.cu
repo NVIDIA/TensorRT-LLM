@@ -308,15 +308,27 @@ __device__ __forceinline__ bool executionAbortRequested(
     return false;
 }
 
-__device__ __forceinline__ bool executionTimedOut(uint64_t start, MoeA2AExecutionControl const& control)
+__device__ __forceinline__ bool timeoutElapsed(uint64_t start, uint64_t timeoutCycles)
 {
 #if DISABLE_TIMEOUT
+    (void) start;
+    (void) timeoutCycles;
     return false;
 #else
-    uint64_t const timeoutCycles
-        = control.timeout_cycles == 0 ? kDefaultExecutionTimeoutCycles : control.timeout_cycles;
     return clock64() - start > timeoutCycles;
 #endif
+}
+
+__device__ __forceinline__ bool executionTimedOut(uint64_t start, MoeA2AExecutionControl const& control)
+{
+    uint64_t const timeoutCycles
+        = control.timeout_cycles == 0 ? kDefaultExecutionTimeoutCycles : control.timeout_cycles;
+    return timeoutElapsed(start, timeoutCycles);
+}
+
+__device__ __forceinline__ bool legacyExecutionTimedOut(uint64_t start)
+{
+    return timeoutElapsed(start, kDefaultExecutionTimeoutCycles);
 }
 
 __device__ __forceinline__ bool executionAbortLatched(MoeA2AExecutionControl const& control)
@@ -725,16 +737,24 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
         if (is_last_token)
         {
-            // This unthrottled admission check prevents an epoch invalidated
-            // before launch from slipping through when every peer flag is
-            // already satisfiable. Only the publishing CTA performs it.
-            bool abort_latched = lane_id == 0
-                && (executionAbortLatched(ptrs.execution_control)
-                    || executionEpochInvalidated(ptrs.execution_control, MoeA2AExecutionPhase::kDispatch));
-            abort_latched = __shfl_sync(0xffffffff, abort_latched, 0);
-            if (abort_latched)
+            if constexpr (ENABLE_RANK_MASK)
             {
-                return;
+                // Rank-mask mode is the current WideEP FT admission gate. Only
+                // this opt-in path may return recoverably: ordinary MoE retains
+                // its visible fail-stop timeout until failed-epoch disposition
+                // is integrated end to end.
+                //
+                // This unthrottled admission check prevents an epoch invalidated
+                // before launch from slipping through when every peer flag is
+                // already satisfiable. Only the publishing CTA performs it.
+                bool abort_latched = lane_id == 0
+                    && (executionAbortLatched(ptrs.execution_control)
+                        || executionEpochInvalidated(ptrs.execution_control, MoeA2AExecutionPhase::kDispatch));
+                abort_latched = __shfl_sync(0xffffffff, abort_latched, 0);
+                if (abort_latched)
+                {
+                    return;
+                }
             }
 // Store send_counters to recv_counters.
 // Skip masked target ranks: their symmetric memory may be inaccessible.
@@ -812,7 +832,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 }
                 bool flag_set = false;
                 auto s = clock64();
-                uint64_t last_host_epoch_poll = s;
+                [[maybe_unused]] uint64_t last_host_epoch_poll = s;
                 while (!flag_set)
                 {
                     uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
@@ -830,18 +850,28 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                     {
                         break;
                     }
-                    if (executionAbortRequested(
-                            ptrs.execution_control, MoeA2AExecutionPhase::kDispatch, peer_rank, last_host_epoch_poll))
+                    if constexpr (ENABLE_RANK_MASK)
                     {
-                        wait_aborted = true;
-                        break;
+                        if (executionAbortRequested(ptrs.execution_control, MoeA2AExecutionPhase::kDispatch, peer_rank,
+                                last_host_epoch_poll))
+                        {
+                            wait_aborted = true;
+                            break;
+                        }
+                        if (__builtin_expect(executionTimedOut(s, ptrs.execution_control), 0))
+                        {
+                            recordExecutionAbort(ptrs.execution_control, MoeA2AExecutionPhase::kDispatch,
+                                MoeA2AAbortReason::kTimeout, peer_rank);
+                            wait_aborted = true;
+                            break;
+                        }
                     }
-                    if (__builtin_expect(executionTimedOut(s, ptrs.execution_control), 0))
+                    else if (__builtin_expect(legacyExecutionTimedOut(s), 0))
                     {
-                        recordExecutionAbort(ptrs.execution_control, MoeA2AExecutionPhase::kDispatch,
-                            MoeA2AAbortReason::kTimeout, peer_rank);
-                        wait_aborted = true;
-                        break;
+                        printf("dispatch: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
+                            peer_rank);
+                        asm volatile("trap;");
+                        return;
                     }
                 }
                 if (wait_aborted)
@@ -849,9 +879,12 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                     break;
                 }
             }
-            if (__any_sync(0xffffffff, wait_aborted))
+            if constexpr (ENABLE_RANK_MASK)
             {
-                return;
+                if (__any_sync(0xffffffff, wait_aborted))
+                {
+                    return;
+                }
             }
 #endif
         }
@@ -1458,10 +1491,20 @@ __global__ void moeA2ACombineKernel(
         int lane_id = threadIdx.x % warpSize;
         if (lane_id == 0)
         {
-            // Exactly one CTA samples mapped host memory. The winner publishes
-            // admission through a local GPU word; every other CTA waits only
-            // on local device memory before it can produce output.
-            execution_aborted = executionAdmissionAborted(ptrs.execution_control, MoeA2AExecutionPhase::kCombine);
+            if constexpr (ENABLE_RANK_MASK)
+            {
+                // Exactly one CTA samples mapped host memory. The winner publishes
+                // admission through a local GPU word; every other CTA waits only
+                // on local device memory before it can produce output.
+                execution_aborted = executionAdmissionAborted(ptrs.execution_control, MoeA2AExecutionPhase::kCombine);
+            }
+            else
+            {
+                // Recoverable partial-output returns are valid only in the
+                // opt-in WideEP FT path. Preserve the legacy fail-stop contract
+                // for ordinary MoE launches.
+                execution_aborted = 0;
+            }
         }
         __syncwarp();
         if (!execution_aborted)
@@ -1502,7 +1545,7 @@ __global__ void moeA2ACombineKernel(
                 }
                 bool flag_set = false;
                 auto s = clock64();
-                uint64_t last_host_epoch_poll = s;
+                [[maybe_unused]] uint64_t last_host_epoch_poll = s;
                 while (!flag_set)
                 {
                     uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
@@ -1521,18 +1564,28 @@ __global__ void moeA2ACombineKernel(
                     {
                         break;
                     }
-                    if (executionAbortRequested(
-                            ptrs.execution_control, MoeA2AExecutionPhase::kCombine, peer_rank, last_host_epoch_poll))
+                    if constexpr (ENABLE_RANK_MASK)
                     {
-                        wait_aborted = true;
-                        break;
+                        if (executionAbortRequested(ptrs.execution_control, MoeA2AExecutionPhase::kCombine, peer_rank,
+                                last_host_epoch_poll))
+                        {
+                            wait_aborted = true;
+                            break;
+                        }
+                        if (__builtin_expect(executionTimedOut(s, ptrs.execution_control), 0))
+                        {
+                            recordExecutionAbort(ptrs.execution_control, MoeA2AExecutionPhase::kCombine,
+                                MoeA2AAbortReason::kTimeout, peer_rank);
+                            wait_aborted = true;
+                            break;
+                        }
                     }
-                    if (__builtin_expect(executionTimedOut(s, ptrs.execution_control), 0))
+                    else if (__builtin_expect(legacyExecutionTimedOut(s), 0))
                     {
-                        recordExecutionAbort(ptrs.execution_control, MoeA2AExecutionPhase::kCombine,
-                            MoeA2AAbortReason::kTimeout, peer_rank);
-                        wait_aborted = true;
-                        break;
+                        printf("combine: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
+                            peer_rank);
+                        asm volatile("trap;");
+                        return;
                     }
                 }
                 if (wait_aborted)
@@ -1540,9 +1593,12 @@ __global__ void moeA2ACombineKernel(
                     break;
                 }
             }
-            if (__any_sync(0xffffffff, wait_aborted) && lane_id == 0)
+            if constexpr (ENABLE_RANK_MASK)
             {
-                execution_aborted = 1;
+                if (__any_sync(0xffffffff, wait_aborted) && lane_id == 0)
+                {
+                    execution_aborted = 1;
+                }
             }
             __syncwarp();
             if (!execution_aborted)

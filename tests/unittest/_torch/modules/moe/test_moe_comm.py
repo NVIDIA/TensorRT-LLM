@@ -561,6 +561,7 @@ def create_comm_object(
     comm_type: str,
     mapping: Mapping,
     config: CommTestConfig,
+    ep_group_health: Optional[EPGroupHealth] = None,
 ):
     """Create a Communication object for the given type and config."""
     num_experts = config.num_experts
@@ -616,6 +617,7 @@ def create_comm_object(
             hidden_size=config.hidden_size,
             dtype=torch.bfloat16,
             use_low_precision_combine=config.use_low_precision_combine,
+            ep_group_health=ep_group_health,
         )
 
     elif comm_type == COMM_NVLINK_TWO_SIDED:
@@ -1725,7 +1727,15 @@ def _worker_running_dispatch_abort(
             moe_ep_size=config.ep_size,
             world_size=config.ep_size,
         )
-        comm = create_comm_object(config.comm_type, mapping, config)
+        # Recoverable early return is deliberately restricted to the opt-in
+        # rank-mask/FT specialization. Keep every rank committed active so the
+        # synthetic missing participant still blocks the running kernel.
+        comm = create_comm_object(
+            config.comm_type,
+            mapping,
+            config,
+            ep_group_health=EPGroupHealth(config.ep_size),
+        )
         if abort_source == EXECUTION_ABORT_SOURCE_TIMEOUT:
             _set_execution_timeout_for_testing(comm, EXECUTION_ABORT_TEST_TIMEOUT_CYCLES)
     except Exception:
@@ -1901,7 +1911,14 @@ def _worker_running_combine_abort(
             moe_ep_size=config.ep_size,
             world_size=config.ep_size,
         )
-        comm = create_comm_object(config.comm_type, mapping, config)
+        # See the dispatch-abort worker: exercise the production WideEP FT
+        # specialization with an all-active committed membership.
+        comm = create_comm_object(
+            config.comm_type,
+            mapping,
+            config,
+            ep_group_health=EPGroupHealth(config.ep_size),
+        )
     except Exception:
         result["error"] = traceback.format_exc()
         return result

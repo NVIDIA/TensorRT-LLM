@@ -454,6 +454,10 @@ class MoeAlltoAll:
 
     def request_execution_abort(self) -> int:
         """Let the recovery coordinator invalidate in-flight work without a CUDA stream."""
+        if not self._rank_mask_enabled:
+            raise RuntimeError(
+                "recoverable MoE A2A execution abort requires WideEP FT rank-mask mode"
+            )
         return self._execution_control.request_abort()
 
     def get_execution_abort_status(

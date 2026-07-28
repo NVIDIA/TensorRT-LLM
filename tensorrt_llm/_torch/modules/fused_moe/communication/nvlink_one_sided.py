@@ -377,6 +377,50 @@ class NVLinkOneSided(Communication):
         """
         return True
 
+    @classmethod
+    def _clear_workspace_cache(cls) -> None:
+        """Synchronize and release every cached symmetric workspace.
+
+        Reused-worker tests need fresh-process semantics between cases. The
+        execution-control registry owns each workspace until ``close()``, so
+        clearing the Python dictionaries directly would retain both the mapped
+        host allocation and the full CUDA workspace.
+        """
+        workspace_states = []
+        seen_states = set()
+        for workspace_state in cls._WORKSPACES.values():
+            state_id = id(workspace_state)
+            if state_id not in seen_states:
+                seen_states.add(state_id)
+                workspace_states.append(workspace_state)
+
+        if cls._WORKSPACE is not None and id(cls._WORKSPACE) not in seen_states:
+            workspace_states.append(cls._WORKSPACE)
+
+        for workspace_state in workspace_states:
+            for instance in tuple(workspace_state.get("instances", ())):
+                instance._alltoall_watchdog = None
+            AlltoAllWatchdogCoordinator.shutdown_shared_watchdog(workspace_state)
+
+        for workspace_state in workspace_states:
+            workspace = workspace_state.get("workspace")
+            if (
+                torch.cuda.is_available()
+                and isinstance(workspace, torch.Tensor)
+                and workspace.is_cuda
+            ):
+                torch.cuda.synchronize(workspace.device)
+
+        for workspace_state in workspace_states:
+            execution_control = workspace_state.get("execution_control")
+            if execution_control is not None:
+                execution_control.close()
+            workspace_state.clear()
+
+        cls._WORKSPACES.clear()
+        cls._WORKSPACE_REFCOUNTS.clear()
+        cls._WORKSPACE = None
+
     def destroy(self):
         """Release this instance's reference to the shared symmetric workspace."""
         if getattr(self, "_destroyed", False):
@@ -669,6 +713,10 @@ class NVLinkOneSided(Communication):
 
     def request_execution_abort(self) -> int:
         """Let the recovery coordinator invalidate in-flight work without a CUDA stream."""
+        if not self._rank_mask_enabled:
+            raise RuntimeError(
+                "recoverable MoE A2A execution abort requires WideEP FT rank-mask mode"
+            )
         return self._execution_control.request_abort()
 
     def get_execution_abort_status(self) -> Optional[MoeA2AExecutionAbortStatus]:

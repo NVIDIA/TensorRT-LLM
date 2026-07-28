@@ -19,7 +19,10 @@ from weakref import WeakSet
 import pytest
 import torch
 
-from tensorrt_llm._torch.alltoall_watchdog import ActiveRankMaskSnapshot
+from tensorrt_llm._torch.alltoall_watchdog import (
+    ActiveRankMaskSnapshot,
+    AlltoAllWatchdogCoordinator,
+)
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe_a2a_execution_control import (
@@ -253,6 +256,91 @@ def test_execution_control_lifecycle_delegates_to_host_ops(monkeypatch: pytest.M
         control.capture_epoch()
 
 
+def test_nvlink_workspace_cache_closes_each_execution_control_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeExecutionControl:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    first_control = FakeExecutionControl()
+    second_control = FakeExecutionControl()
+    first_workspace = torch.zeros((1, 32), dtype=torch.uint8)
+    first_state = {
+        "workspace": first_workspace,
+        "execution_control": first_control,
+        "instances": WeakSet(),
+    }
+    second_state = {
+        "workspace": torch.empty(0, dtype=torch.uint8),
+        "execution_control": second_control,
+    }
+    watchdog_coordinator = AlltoAllWatchdogCoordinator(
+        workspace_state=first_state,
+        workspace=first_workspace,
+        metainfo=torch.tensor([0, 4, 8], dtype=torch.int64),
+        metainfo_index={
+            "FLAG_VAL_OFFSET_INDEX": 0,
+            "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 1,
+            "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 2,
+        },
+        ep_rank=0,
+    )
+    watchdog = watchdog_coordinator.acquire_watchdog(
+        ep_size=1,
+        timeout_s=1.0,
+        poll_interval_s=0.1,
+    )
+    wrapper = object.__new__(NVLinkOneSided)
+    wrapper._alltoall_watchdog = watchdog
+    first_state["instances"].add(wrapper)
+    monkeypatch.setattr(
+        NVLinkOneSided,
+        "_WORKSPACES",
+        {
+            ("first",): first_state,
+            ("first-alias",): first_state,
+            ("second",): second_state,
+        },
+    )
+    monkeypatch.setattr(
+        NVLinkOneSided,
+        "_WORKSPACE_REFCOUNTS",
+        {("first",): 2, ("second",): 1},
+    )
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", second_state)
+
+    NVLinkOneSided._clear_workspace_cache()
+
+    assert first_control.close_calls == 1
+    assert second_control.close_calls == 1
+    assert wrapper._alltoall_watchdog is None
+    with pytest.raises(RuntimeError, match="cannot start a stopped"):
+        watchdog.start()
+    assert NVLinkOneSided._WORKSPACES == {}
+    assert NVLinkOneSided._WORKSPACE_REFCOUNTS == {}
+    assert NVLinkOneSided._WORKSPACE is None
+
+
+@pytest.mark.parametrize("wrapper_type", [MoeAlltoAll, NVLinkOneSided])
+def test_wrapper_rejects_recoverable_abort_outside_rank_mask_mode(
+    wrapper_type: type[MoeAlltoAll] | type[NVLinkOneSided],
+) -> None:
+    class FakeExecutionControl:
+        def request_abort(self) -> int:
+            raise AssertionError("non-FT wrapper must not publish an execution abort")
+
+    wrapper = object.__new__(wrapper_type)
+    wrapper._rank_mask_enabled = False
+    wrapper._execution_control = FakeExecutionControl()
+
+    with pytest.raises(RuntimeError, match="requires WideEP FT rank-mask mode"):
+        wrapper.request_execution_abort()
+
+
 def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -311,6 +399,7 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
         wrapper.num_experts = 1
         wrapper.enable_eplb = False
         wrapper.eplb_stats_num_experts = None
+        wrapper._rank_mask_enabled = False
         wrapper._execution_control = fake_control
         wrapper._watchdog_coordinator = FakeWatchdogCoordinator()
         wrapper._alltoall_watchdog = None
@@ -332,6 +421,7 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
         top_k: int,
         num_experts: int,
         eplb_local_stats: torch.Tensor | None,
+        enable_rank_mask: bool,
         active_rank_mask: torch.Tensor | None,
         execution_control: torch.Tensor,
         expected_execution_epoch: int,
@@ -348,6 +438,7 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
                 top_k,
                 num_experts,
                 eplb_local_stats,
+                enable_rank_mask,
                 active_rank_mask,
                 execution_control,
                 expected_execution_epoch,
@@ -367,6 +458,7 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
         combine_payload_offset: int,
         payload_in_workspace: bool,
         use_low_precision: bool,
+        enable_rank_mask: bool,
         active_rank_mask: torch.Tensor | None,
         execution_control: torch.Tensor,
         expected_execution_epoch: int,
@@ -384,6 +476,7 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
                 combine_payload_offset,
                 payload_in_workspace,
                 use_low_precision,
+                enable_rank_mask,
                 active_rank_mask,
                 execution_control,
                 expected_execution_epoch,
@@ -405,9 +498,11 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
     assert first._state.execution_epoch == 7
     first.combine(payload.view(1, 2, 4), 2)
     assert first._state.phase == "idle"
+    assert dispatch_calls[0][-4] is False
     assert dispatch_calls[0][-3] is None
     assert dispatch_calls[0][-2] is control_tensor
     assert dispatch_calls[0][-1] == 7
+    assert combine_calls[0][-4] is False
     assert combine_calls[0][-3] is None
     assert combine_calls[0][-2] is control_tensor
     assert combine_calls[0][-1] == 7

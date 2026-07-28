@@ -47,6 +47,8 @@ class MoeA2AExecutionControl:
     generation. ``begin_epoch`` must be called by the recovery coordinator only
     after it has stopped new launch admission and all work tagged with the old
     epoch has quiesced. This primitive does not provide the admission gate.
+    Communication wrappers expose recoverable abort only in the opt-in
+    rank-mask/FT specialization; ordinary MoE retains its fail-stop timeout.
     """
 
     def __init__(self, workspace: torch.Tensor, ep_rank: int) -> None:
