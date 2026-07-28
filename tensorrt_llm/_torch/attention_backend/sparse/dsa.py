@@ -1811,6 +1811,16 @@ class Indexer(nn.Module):
         self.use_cute_dsl_paged_mqa_logits = (
             sparse_params.use_cute_dsl_paged_mqa_logits
             and IS_CUTLASS_DSL_AVAILABLE)
+        # GVR emission-assisted decode (opt-in, experimental): the FP4
+        # indexer epilogue emits seed counts / the bucketed candidate
+        # list and the top-k consumes them (see gvr_ext / gvr_routing).
+        # Env-gated so the default path stays byte-identical.
+        self.use_gvr_ext = (os.environ.get("TRTLLM_GVR_EXT", "0") == "1"
+                            and self.use_cute_dsl_topk
+                            and self.use_cute_dsl_paged_mqa_logits
+                            and sparse_params.indexer_k_dtype == "fp4")
+        self._gvr_ext = None  # lazy GvrExtState (first decode step)
+        self._gvr_route = None
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
         self._enable_heuristic_topk = (sparse_params.enable_heuristic_topk
@@ -2766,10 +2776,35 @@ class Indexer(nn.Module):
                         dsl_schedule_meta = (
                             metadata.scheduler_metadata_buffer_expanded)
 
+                    gvr_emit_kwargs = {}
+                    if (self.use_gvr_ext and next_n == 1
+                            and not dsl_atom_split):
+                        from .gvr_ext import GvrExtState
+                        if self._gvr_ext is None:
+                            self._gvr_ext = GvrExtState(
+                                max_rows=metadata.max_num_sequences,
+                                top_k=self.index_topk,
+                                device=q_fp8.device)
+                        st = self._gvr_ext
+                        n_comp = indexer_max_seq_len // max(
+                            self.compress_ratio, 1)
+                        emit_tier, self._gvr_route = st.plan(
+                            batch_size, n_comp,
+                            torch.cuda.get_device_properties(
+                                q_fp8.device).multi_processor_count)
+                        st.update_seed_rows(batch_size)
+                        gvr_emit_kwargs = st.indexer_emit_kwargs(
+                            emit_tier, batch_size)
+                        if self._gvr_route.attach_block_max or emit_tier in (
+                                "counts", "list"):
+                            gvr_emit_kwargs["block_max_out"] = (
+                                st.ensure_block_max(
+                                    indexer_max_seq_len //
+                                    max(self.compress_ratio, 1))[:batch_size])
                     logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
                         dsl_q, decode_q_scale, k_cache, weights_decode,
                         dsl_context_lens, dsl_block_table, dsl_schedule_meta,
-                        indexer_max_seq_len)
+                        indexer_max_seq_len, **gvr_emit_kwargs)
                 else:
                     # FP8 DSL kernel natively supports next_n ∈ {1, 2, 3, 4}.
                     # Atom-split benefits small-batch / low-ntask configs by
@@ -2832,7 +2867,38 @@ class Indexer(nn.Module):
                             metadata.heuristic_scratch_values[
                                 :num_gen_tokens]
 
-                if self.use_cute_dsl_topk and self._enable_heuristic_topk:
+                # CuTE DSL top-k allocates O(num_gen_tokens * kv_len) global
+                # memory. Beyond 256 tokens the extra memory becomes significant,
+                # so we cap it at 256 for now and fall back to the CUDA C++
+                # indexer_topk_decode. This limit can be removed if GPU memory
+                # is not a bottleneck.
+                if (self.use_gvr_ext and self._gvr_ext is not None
+                        and self._gvr_route is not None and next_n == 1
+                        and num_gen_tokens <= 256):
+                    # emission-assisted GVR: consume what the indexer
+                    # epilogue emitted this step (packed seed row /
+                    # bucketed list / block_max per the picked route)
+                    st = self._gvr_ext
+                    out_slice = topk_indices_buffer[
+                        num_ctx_tokens:num_ctx_tokens + num_gen_tokens, :]
+                    seq_1d = (context_lens if self.compress_ratio > 1 else
+                              gen_kv_lens_cuda).reshape(-1)[:num_gen_tokens]
+                    ext_kw = st.topk_ext_kwargs(
+                        self._gvr_route, num_gen_tokens,
+                        st.block_max[:num_gen_tokens]
+                        if st.block_max is not None else None)
+                    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+                        logits_decode,
+                        st.prev_topk[:num_gen_tokens],
+                        seq_1d.contiguous(),
+                        out_slice,
+                        self.index_topk,
+                        next_n,
+                        self.compress_ratio,
+                        max_seq_len=indexer_max_seq_len,
+                        **ext_kw)
+                    st.prev_topk[:num_gen_tokens].copy_(out_slice)
+                elif self.use_cute_dsl_topk and self._enable_heuristic_topk:
                     # GVR DSL: supports all compress_ratio and next_n values.
                     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
                         logits_decode,

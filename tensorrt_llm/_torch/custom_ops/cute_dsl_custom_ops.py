@@ -8870,7 +8870,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return logits
 
     @torch.library.custom_op("trtllm::cute_dsl_fp4_paged_mqa_logits",
-                             mutates_args=(),
+                             mutates_args=("block_max_out", "seed_thr",
+                                           "cand_out", "cand_idx_out",
+                                           "cand_ctl_out", "cand_cur_out"),
                              device_types="cuda")
     def cute_dsl_fp4_paged_mqa_logits(
         q: torch.Tensor,
@@ -8885,6 +8887,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         epi_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
         remove_online_sf_transpose: bool = False,
+        block_max_out: Optional[torch.Tensor] = None,
+        seed_thr: Optional[torch.Tensor] = None,
+        cand_out: Optional[torch.Tensor] = None,
+        cand_idx_out: Optional[torch.Tensor] = None,
+        cand_ctl_out: Optional[torch.Tensor] = None,
+        cand_cur_out: Optional[torch.Tensor] = None,
+        accept_cap: int = 8192,
     ) -> torch.Tensor:
         if not is_sm_100f():
             raise ValueError(
@@ -8910,7 +8919,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             f"epi_dtype={epi_dtype} output_dtype={output_dtype}",
             key="cute_dsl_fp4_paged_mqa_logits_inputs",
         )
-        return CuteDSLFP4PagedMQALogitsRunner.forward(
+        ret = CuteDSLFP4PagedMQALogitsRunner.forward(
             q,
             sf_q,
             kv_fused,
@@ -8922,7 +8931,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_epi_subtiles=num_epi_subtiles,
             epi_dtype=epi_dtype,
             output_dtype=output_dtype,
-            remove_online_sf_transpose=remove_online_sf_transpose)
+            remove_online_sf_transpose=remove_online_sf_transpose,
+            emit_block_meta=block_max_out is not None,
+            emit_hit_stats=False,
+            block_max_out=block_max_out,
+            emit_seed_counts=seed_thr is not None,
+            seed_thr=seed_thr,
+            emit_cand_bucketed=cand_out is not None,
+            accept_cap=accept_cap,
+            cand_out=cand_out,
+            cand_idx_out=cand_idx_out,
+            cand_ctl_out=cand_ctl_out,
+            cand_cur_out=cand_cur_out)
+        # with emission on, the runner returns (logits, block_max,
+        # hit_stats) - the emission buffers are caller-owned mutates,
+        # the op face stays logits-only
+        return ret[0] if isinstance(ret, tuple) else ret
 
     @torch.library.register_fake("trtllm::cute_dsl_fp4_paged_mqa_logits")
     def _(
@@ -8938,6 +8962,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         epi_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
         remove_online_sf_transpose: bool = False,
+        block_max_out: Optional[torch.Tensor] = None,
+        seed_thr: Optional[torch.Tensor] = None,
+        cand_out: Optional[torch.Tensor] = None,
+        cand_idx_out: Optional[torch.Tensor] = None,
+        cand_ctl_out: Optional[torch.Tensor] = None,
+        cand_cur_out: Optional[torch.Tensor] = None,
+        accept_cap: int = 8192,
     ) -> torch.Tensor:
         B = q.shape[0]
         next_n = q.shape[1]
