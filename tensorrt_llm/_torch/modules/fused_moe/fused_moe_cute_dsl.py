@@ -45,9 +45,7 @@ from .interface import _reject
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 
-_DIRECT_DEEP_EP_METADATA_ENV = "TRTLLM_CUTEDSL_DEEP_EP_DIRECT_METADATA"
-_COUNT_NATIVE_DEEP_EP_METADATA_ENV = "TRTLLM_CUTEDSL_DEEP_EP_COUNT_NATIVE_METADATA"
-_REMOVE_DEEP_EP_ADAPTER_ENV = "TRTLLM_CUTEDSL_DEEP_EP_REMOVE_ADAPTER"
+_DISABLE_DIRECT_DEEP_EP_METADATA_ENV = "TRTLLM_DISABLE_CUTEDSL_DEEP_EP_DIRECT_METADATA"
 
 
 def _expert_count_tile_plan(
@@ -516,21 +514,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             activation_type=activation_type,
         )
         self.swiglu_limit_scalar = swiglu_limit_scalar or float("inf")
-        self.enable_deep_ep_direct_metadata = os.environ.get(
-            _DIRECT_DEEP_EP_METADATA_ENV, "0") == "1"
-        self.enable_deep_ep_count_native_metadata = os.environ.get(
-            _COUNT_NATIVE_DEEP_EP_METADATA_ENV, "0") == "1"
-        self.enable_deep_ep_remove_adapter = os.environ.get(
-            _REMOVE_DEEP_EP_ADAPTER_ENV, "0") == "1"
-        if self.enable_deep_ep_remove_adapter and not self.enable_deep_ep_direct_metadata:
-            raise ValueError(f"{_REMOVE_DEEP_EP_ADAPTER_ENV}=1 requires "
-                             f"{_DIRECT_DEEP_EP_METADATA_ENV}=1")
-        if self.enable_deep_ep_count_native_metadata and not self.enable_deep_ep_direct_metadata:
-            raise ValueError(f"{_COUNT_NATIVE_DEEP_EP_METADATA_ENV}=1 requires "
-                             f"{_DIRECT_DEEP_EP_METADATA_ENV}=1")
-        if self.enable_deep_ep_count_native_metadata and not self.enable_deep_ep_remove_adapter:
-            raise ValueError(f"{_COUNT_NATIVE_DEEP_EP_METADATA_ENV}=1 requires "
-                             f"{_REMOVE_DEEP_EP_ADAPTER_ENV}=1")
+        # The scheduler enables the full fast path only for compatible
+        # DeepEPLowLatency NVFP4 post-quant dispatch.
+        self.disable_deep_ep_direct_metadata = os.environ.get(
+            _DISABLE_DIRECT_DEEP_EP_METADATA_ENV, "0") == "1"
 
         if self.aux_stream_dict is None:
             self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}
@@ -619,6 +606,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         weight_view: Optional[NvFp4WeightView] = None,
         recv_expert_count: Optional[torch.Tensor] = None,
         deep_ep_expert_capacity: Optional[int] = None,
+        use_deep_ep_direct_metadata: bool = False,
     ) -> torch.Tensor:
         """NVFP4 MoE computation.
 
@@ -629,6 +617,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
         Args:
             weight_view: Bundled weight tensors. Must not be None.
+            use_deep_ep_direct_metadata: Use adapter-free, count-native DeepEP
+                metadata. The scheduler sets this only for the supported path.
         """
         assert self.has_nvfp4
         assert weight_view is not None
@@ -649,7 +639,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             raise ValueError(
                 "recv_expert_count and deep_ep_expert_capacity must be provided together"
             )
-        use_direct_expert_metadata = (self.enable_deep_ep_direct_metadata
+        use_direct_expert_metadata = (use_deep_ep_direct_metadata
                                       and recv_expert_count is not None)
 
         forward_impl = self.run_moe_nvfp4_impl
@@ -664,8 +654,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             enable_finalize_fusion=self.use_fused_finalize,
             enable_alltoall=enable_alltoall,
             use_direct_expert_metadata=use_direct_expert_metadata,
-            use_count_native_expert_metadata=self.
-            enable_deep_ep_count_native_metadata,
+            use_count_native_expert_metadata=use_direct_expert_metadata,
             deep_ep_expert_capacity=(deep_ep_expert_capacity
                                      if use_direct_expert_metadata else None),
         )
@@ -969,6 +958,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 weight_view=weight_view,
                 recv_expert_count=plan.recv_expert_count,
                 deep_ep_expert_capacity=plan.deep_ep_expert_capacity,
+                use_deep_ep_direct_metadata=plan.use_deep_ep_direct_metadata,
             )
         elif self.has_deepseek_fp8_block_scales:
             result = self.run_moe_fp8_block_scales(
