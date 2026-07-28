@@ -38,11 +38,7 @@ try:
     from _visual_gen_dist_utils import spawn_with_retry
 
     from tensorrt_llm.models.modeling_utils import QuantConfig
-    from tensorrt_llm.visual_gen.args import (
-        AttentionConfig,
-        ParallelConfig,
-        TorchCompileConfig,
-    )
+    from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, TorchCompileConfig
 
     MODULES_AVAILABLE = True
 except ImportError:
