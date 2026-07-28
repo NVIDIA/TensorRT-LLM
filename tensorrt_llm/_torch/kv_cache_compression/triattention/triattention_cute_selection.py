@@ -249,12 +249,17 @@ class _TriAttentionNormalizeUnionKernel:
                     cute.coalesce(union_tile),
                 )
             else:
+                union_index = request_idx * self.output_row_stride + subtile_first_token
+                union_tile = _gmem_lane_tile(
+                    union_scores.iterator,
+                    union_index,
+                    self.tokens_per_lane,
+                    4,
+                )
                 for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
                     token = subtile_first_token + token_slot
                     if cutlass.dynamic_expr(token < decode_length):
-                        union_scores[request_idx * self.output_row_stride + token] = reduced_values[
-                            token_slot
-                        ]
+                        union_tile[token_slot] = reduced_values[token_slot]
 
     @cute.kernel
     def kernel(
