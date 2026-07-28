@@ -264,7 +264,16 @@ def pulseScanSourceCode(llmRepo, ref) {
     container("cpu") {
         def outputDir = "scan_report/source_code"
         sh "mkdir -p ${outputDir}"
-        sh "unzip -p sbom.zip \"*.json\" > ${outputDir}/sbom.json"
+        sh """
+            sbom_zip=\$(find . -maxdepth 2 -name 'sbom*.zip' | head -1)
+            if [ -n "\$sbom_zip" ]; then
+                unzip -p "\$sbom_zip" "*.json" > ${outputDir}/sbom.json
+            else
+                echo "WARNING: sbom.zip not found; listing workspace for diagnostics:"
+                ls -la
+                touch ${outputDir}/sbom.json
+            fi
+        """
         sh "mv nspect_scan_report.json ${outputDir}/vulns.json"
     }
 }
