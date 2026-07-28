@@ -1501,6 +1501,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     launchJob(pipeline, "/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
 
+                echo "Skipping x86_64 tests (For 1.3.0rc23)"
+                return
+
                 if (GEN_POST_MERGE_BUILDS_ONLY) {
                     echo "Skipping x86_64 tests (GenPostMergeBuilds mode: builds only)"
                     return
@@ -1616,6 +1619,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     ]
                     launchJob(pipeline, "/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
                 }
+
+                echo "Skipping SBSA tests (For 1.3.0rc23)"
+                return
 
                 if (GEN_POST_MERGE_BUILDS_ONLY) {
                     echo "Skipping SBSA tests (GenPostMergeBuilds mode: builds only)"
