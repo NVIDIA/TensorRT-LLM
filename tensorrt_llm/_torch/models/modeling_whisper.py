@@ -14,7 +14,7 @@
 # limitations under the License.
 """PyTorch-flow Whisper encoder-decoder (ASR) model for TensorRT-LLM.
 
-Covers ``WhisperForConditionalGeneration`` (OpenAI Whisper).
+Covers `WhisperForConditionalGeneration` (OpenAI Whisper).
 
 Whisper is an audio encoder-decoder: a log-mel spectrogram is consumed by a
 convolutional + Transformer audio encoder, and a text decoder attends to the
@@ -24,18 +24,18 @@ autoregressively.
 The request carries the raw 30 s-padded waveform (not the mel): the input
 processor only pads/validates audio on the host, and the encoder computes the
 log-mel spectrogram on GPU inside the engine process (batched across the
-encoder step; see :class:`WhisperLogMelFrontend`).
+encoder step; see `WhisperLogMelFrontend`).
 
 Key differences from BART:
     - Pre-norm (LayerNorm → sub-layer → residual add) instead of post-norm.
-    - The encoder ingests a mel-feature tensor through a 2x ``Conv1d`` stem
+    - The encoder ingests a mel-feature tensor through a 2x `Conv1d` stem
       (the second conv has stride 2, halving the time axis), not token ids.
     - Encoder and decoder embeddings are NOT tied (the encoder has no vocab
-      embedding); ``lm_head`` (``proj_out``) is tied to the decoder token
+      embedding); `lm_head` (`proj_out`) is tied to the decoder token
       embedding.
     - Learned absolute positional embeddings with NO index offset (BART uses 2).
     - No embedding scale.
-    - ``k_proj`` has no bias (``q_proj``/``v_proj``/``out_proj`` do); the missing
+    - `k_proj` has no bias (`q_proj`/`v_proj`/`out_proj` do); the missing
       key bias is materialized as zeros at weight-load time.
 """
 
@@ -71,6 +71,10 @@ from .modeling_utils import PostInitCaller, register_auto_model
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
+# WhisperConfig carries no layer-norm epsilon; HF builds every Whisper LayerNorm
+# as `nn.LayerNorm(embed_dim)`, i.e. torch's default.
+_LAYER_NORM_EPS = 1e-5
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -102,9 +106,9 @@ class WhisperSelfAttention(Attention):
 
     Whisper adds learned positional embeddings to the input before the
     attention layer, so no RoPE or other in-kernel positional encoding is
-    used. Query scaling by ``head_dim**-0.5`` is applied inside the standard
-    attention path (``q_scaling=1.0``), which is numerically identical to
-    Whisper's convention of pre-scaling the query and using ``scaling=1.0``.
+    used. Query scaling by `head_dim**-0.5` is applied inside the standard
+    attention path (`q_scaling=1.0`), which is numerically identical to
+    Whisper's convention of pre-scaling the query and using `scaling=1.0`.
     """
 
     def __init__(
@@ -179,7 +183,7 @@ class WhisperEncoderLayer(nn.Module):
         )
         self.self_attn_layer_norm = LayerNorm(
             hidden_size=hidden_size,
-            eps=1e-5,
+            eps=_LAYER_NORM_EPS,
             dtype=config.torch_dtype,
             has_bias=True,
         )
@@ -194,7 +198,7 @@ class WhisperEncoderLayer(nn.Module):
         )
         self.final_layer_norm = LayerNorm(
             hidden_size=hidden_size,
-            eps=1e-5,
+            eps=_LAYER_NORM_EPS,
             dtype=config.torch_dtype,
             has_bias=True,
         )
@@ -254,7 +258,7 @@ class WhisperDecoderLayer(nn.Module):
         )
         self.self_attn_layer_norm = LayerNorm(
             hidden_size=hidden_size,
-            eps=1e-5,
+            eps=_LAYER_NORM_EPS,
             dtype=config.torch_dtype,
             has_bias=True,
         )
@@ -262,7 +266,7 @@ class WhisperDecoderLayer(nn.Module):
         self.cross_attn = WhisperCrossAttention(model_config, layer_idx=layer_idx)
         self.cross_attn_layer_norm = LayerNorm(
             hidden_size=hidden_size,
-            eps=1e-5,
+            eps=_LAYER_NORM_EPS,
             dtype=config.torch_dtype,
             has_bias=True,
         )
@@ -278,7 +282,7 @@ class WhisperDecoderLayer(nn.Module):
         )
         self.final_layer_norm = LayerNorm(
             hidden_size=hidden_size,
-            eps=1e-5,
+            eps=_LAYER_NORM_EPS,
             dtype=config.torch_dtype,
             has_bias=True,
         )
@@ -327,17 +331,17 @@ class WhisperDecoderLayer(nn.Module):
 
 
 def _load_hf_feature_extractor(config: WhisperConfig):
-    """The checkpoint's ``WhisperFeatureExtractor`` (``preprocessor_config.json``).
+    """The checkpoint's `WhisperFeatureExtractor` (`preprocessor_config.json`).
 
     STFT/mel parameters live there, not in the model config, so they are
-    re-loaded from ``config._name_or_path``. Falls back to Whisper defaults
-    with ``config.num_mel_bins`` filters when the checkpoint ships no
-    preprocessor config or its ``feature_size`` contradicts the model config.
+    re-loaded from `config.name_or_path`. Falls back to Whisper defaults
+    with `config.num_mel_bins` filters when the checkpoint ships no
+    preprocessor config or its `feature_size` contradicts the model config.
     """
     from transformers import WhisperFeatureExtractor
 
     extractor = None
-    name_or_path = getattr(config, "_name_or_path", None)
+    name_or_path = config.name_or_path
     if name_or_path:
         try:
             extractor = WhisperFeatureExtractor.from_pretrained(name_or_path)
@@ -360,21 +364,17 @@ def _load_hf_feature_extractor(config: WhisperConfig):
 
 class WhisperLogMelFrontend(nn.Module):
     """GPU log-mel spectrogram front-end, numerics-identical to the HF
-    ``WhisperFeatureExtractor`` torch path (``_torch_extract_fbank_features``).
+    `WhisperFeatureExtractor` torch path (`_torch_extract_fbank_features`).
 
     Consumes the raw zero-padded waveform batch shipped by
-    :class:`WhisperInputProcessor` and produces ``[batch, num_mel_bins, frames]``
+    `WhisperInputProcessor` and produces `[batch, num_mel_bins, frames]`
     in fp32 (STFT precision; the caller casts to the model dtype). Kept as a
     separate module so a future encoder CUDA-graph capture can choose to keep
     the STFT outside the graphed region.
 
     STFT/mel parameters and the filterbank come from the checkpoint's feature
-    extractor; the class attributes below are the Whisper-family defaults.
+    extractor.
     """
-
-    N_FFT = 400
-    HOP_LENGTH = 160
-    SAMPLING_RATE = 16000
 
     def __init__(self, config: WhisperConfig):
         super().__init__()
@@ -399,9 +399,13 @@ class WhisperLogMelFrontend(nn.Module):
             )
             self._window = torch.hann_window(self.n_fft, device=waveforms.device)
 
+        # Follow HF's fp32 reference path: the STFT and mel matmul below lose
+        # accuracy in half precision — fp16 flushes the 1e-10 log floor to zero,
+        # bf16 lacks the mantissa bits.
         waveforms = waveforms.to(torch.float32)
         if self.dither != 0.0:
-            # Out-of-place: the input tensor is the request's feature buffer.
+            # Out-of-place: `.to(torch.float32)` above is a no-op for an already-fp32
+            # request, so an in-place add would corrupt the caller's audio buffer.
             waveforms = waveforms + self.dither * torch.randn_like(waveforms)
         stft = torch.stft(
             waveforms,
@@ -412,7 +416,7 @@ class WhisperLogMelFrontend(nn.Module):
         )
         magnitudes = stft[..., :-1].abs() ** 2
         mel_spec = self._mel_filters.T @ magnitudes
-        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+        log_spec = torch.clamp(mel_spec, min=1e-10).log10_()
         # Per-sample dynamic-range floor (batched samples must not share a max).
         max_val = log_spec.max(dim=2, keepdim=True)[0].max(dim=1, keepdim=True)[0]
         log_spec = torch.maximum(log_spec, max_val - 8.0)
@@ -459,7 +463,7 @@ class WhisperEncoder(nn.Module):
         )
         self.layer_norm = LayerNorm(
             hidden_size=embed_dim,
-            eps=1e-5,
+            eps=_LAYER_NORM_EPS,
             dtype=config.torch_dtype,
             has_bias=True,
         )
@@ -517,7 +521,7 @@ class WhisperDecoder(nn.Module):
         )
         self.layer_norm = LayerNorm(
             hidden_size=config.d_model,
-            eps=1e-5,
+            eps=_LAYER_NORM_EPS,
             dtype=config.torch_dtype,
             has_bias=True,
         )
@@ -563,33 +567,26 @@ class WhisperDecoder(nn.Module):
 class WhisperInputProcessor(InputProcessor):
     """Host-side Whisper preprocessing for the LLM API.
 
-    Validates and zero-pads ``multi_modal_data["audio"]`` to the fixed 30 s
+    Validates and zero-pads `multi_modal_data["audio"]` to the fixed 30 s
     window (the log-mel spectrogram itself is computed on GPU inside the
-    engine, see :class:`WhisperLogMelFrontend`), and returns the forced
+    engine, see `WhisperLogMelFrontend`), and returns the forced
     decoder prompt as the request's token ids. An empty text prompt selects
     the checkpoint default
-    (``<|startoftranscript|>[<|en|>][<|transcribe|>]<|notimestamps|>``); a
+    (`<|startoftranscript|>[<|en|>][<|transcribe|>]<|notimestamps|>`); a
     non-empty text prompt is tokenized verbatim as the decoder prompt, which
     is how language/task are overridden, e.g.
-    ``"<|startoftranscript|><|de|><|transcribe|><|notimestamps|>"``.
-    Pre-tokenized ``prompt_token_ids`` are not consumed.
+    `"<|startoftranscript|><|de|><|transcribe|><|notimestamps|>"`.
+    Pre-tokenized `prompt_token_ids` are not consumed.
 
-    The padded waveform rides ``multimodal_data["audio"]`` under
-    ``encoder_input_features`` + ``encoder_output_len``, which
-    ``executor_request_to_llm_request`` forwards into the request's native
+    The padded waveform rides `multimodal_data["audio"]` under
+    `encoder_input_features` + `encoder_output_len`, which
+    `executor_request_to_llm_request` forwards into the request's native
     encoder fields.
     """
 
     # Marks this model as feature-driven for the encoder side: prompts
     # without audio cannot be served and are rejected at submission.
     requires_encoder_features = True
-
-    # Whisper-family defaults (30 s at 16 kHz); the effective window comes
-    # from the checkpoint's feature extractor in ``__init__``. Longer audio
-    # is rejected instead of silently truncated (long-form chunking is a
-    # separate feature).
-    MAX_AUDIO_SECONDS = 30.0
-    SAMPLING_RATE = 16000
 
     def __init__(self, model_path, config, tokenizer, trust_remote_code: bool = True, **kwargs):
         self.model_path = model_path
@@ -601,21 +598,21 @@ class WhisperInputProcessor(InputProcessor):
         self.multimodal_hashing_supported = False
         # WhisperProcessor = feature extractor (the reference log-mel
         # implementation) + tokenizer. Also consumed by accuracy evaluators
-        # via ``llm.input_processor.processor``.
+        # via `llm.input_processor.processor`.
         self.processor = AutoProcessor.from_pretrained(
             model_path, trust_remote_code=trust_remote_code
         )
         # Audio window/sampling rate from the checkpoint's feature extractor
-        # (WhisperLogMelFrontend reads the same config engine-side).
-        extractor = getattr(self.processor, "feature_extractor", None)
-        self.sampling_rate = int(getattr(extractor, "sampling_rate", None) or self.SAMPLING_RATE)
-        self.n_samples = int(
-            getattr(extractor, "n_samples", None) or self.MAX_AUDIO_SECONDS * self.sampling_rate
-        )
+        # (WhisperLogMelFrontend reads the same config engine-side). Longer
+        # audio is rejected instead of silently truncated (long-form chunking
+        # is a separate feature).
+        extractor = self.processor.feature_extractor
+        self.sampling_rate = int(extractor.sampling_rate)
+        self.n_samples = int(extractor.n_samples)
         self.max_audio_seconds = self.n_samples / float(self.sampling_rate)
         # The mel frames halved by the conv stem must fill the encoder
         # position table exactly, or every downstream cross-KV size is wrong.
-        hop_length = int(getattr(extractor, "hop_length", None) or WhisperLogMelFrontend.HOP_LENGTH)
+        hop_length = int(extractor.hop_length)
         encoder_positions = self.n_samples // hop_length // 2
         if encoder_positions != int(self.config.max_source_positions):
             raise ValueError(
@@ -640,7 +637,7 @@ class WhisperInputProcessor(InputProcessor):
         return None
 
     def _build_decoder_prompt(self) -> List[int]:
-        """``[decoder_start] + forced task tokens`` from the checkpoint."""
+        """`[decoder_start] + forced task tokens` from the checkpoint."""
         start_id = getattr(self.config, "decoder_start_token_id", None)
         if start_id is None:
             raise ValueError(
@@ -661,7 +658,7 @@ class WhisperInputProcessor(InputProcessor):
         """Checkpoint-default forced prompt, or the user's decoder prompt.
 
         A non-empty text prompt is tokenized verbatim (special tokens
-        resolve to their ids) and must start with ``<|startoftranscript|>``;
+        resolve to their ids) and must start with `<|startoftranscript|>`;
         this is the language/task override mechanism.
         """
         prompt_text = (prompt_text or "").strip()
@@ -857,8 +854,8 @@ class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
             reduce_output=False,
         )
 
-        # Whisper ties the LM head (``proj_out``) to the decoder token embedding.
-        if getattr(config, "tie_word_embeddings", True):
+        # Whisper ties the LM head (`proj_out`) to the decoder token embedding.
+        if config.tie_word_embeddings:
             self.lm_head.weight = self.model.decoder.embed_tokens.weight
 
         self.logits_processor = LogitsProcessor()
@@ -922,10 +919,7 @@ class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
         # max_target_positions (448). Decoder generation length is capped to the
         # position table separately, in WhisperInputProcessor.
         config = self.model_config.pretrained_config
-        return max(
-            getattr(config, "max_target_positions", 448),
-            getattr(config, "max_source_positions", 1500),
-        )
+        return max(config.max_target_positions, config.max_source_positions)
 
     def load_weights(self, weights: Dict, **kwargs):
         config = self.model_config.pretrained_config
@@ -965,8 +959,8 @@ def _convert_hf_whisper_weights(
 ) -> Dict:
     """Map HuggingFace Whisper state_dict keys to TRT-LLM module-tree keys.
 
-    HF Whisper weight layout (prefix ``model.``; ``proj_out`` is the LM head,
-    tied to ``model.decoder.embed_tokens``):
+    HF Whisper weight layout (prefix `model.`; `proj_out` is the LM head,
+    tied to `model.decoder.embed_tokens`):
         model.encoder.conv1.{weight,bias}
         model.encoder.conv2.{weight,bias}
         model.encoder.embed_positions.weight
@@ -986,8 +980,8 @@ def _convert_hf_whisper_weights(
         model.decoder.layer_norm.{weight,bias}
         proj_out.weight
 
-    Whisper's ``k_proj`` has no bias while ``q``/``v``/``out`` do; because the
-    TRT-LLM fused QKV / cross-attn projections carry a bias when ``bias=True``,
+    Whisper's `k_proj` has no bias while `q`/`v`/`out` do; because the
+    TRT-LLM fused QKV / cross-attn projections carry a bias when `bias=True`,
     a zero bias is materialized for the key projection (numerically identical).
     """
     out: Dict[str, list] = {}
