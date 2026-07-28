@@ -1719,6 +1719,23 @@ def test_deepseek_v4_hopper_pool_merge_ignores_empty_pool():
     torch.testing.assert_close(result, valid_output)
 
 
+@pytest.mark.parametrize(
+    ("num_heads", "expected_heads"),
+    [(8, 64), (64, 64), (65, 128), (128, 128)],
+)
+def test_deepseek_v4_hopper_decode_query_head_padding(num_heads: int, expected_heads: int):
+    query = torch.randn(2, 1, num_heads, 192)
+
+    padded_query = MLA._pad_deepseek_v4_hopper_decode_query(query)
+
+    assert padded_query.shape == (2, 1, expected_heads, 192)
+    torch.testing.assert_close(padded_query[:, :, :num_heads], query)
+    if num_heads == expected_heads:
+        assert padded_query.data_ptr() == query.data_ptr()
+    else:
+        assert torch.count_nonzero(padded_query[:, :, num_heads:]) == 0
+
+
 @skip_no_hopper
 def test_deepseek_v4_hopper_gathers_fp8_pool_before_dequantization():
     torch.manual_seed(42)
