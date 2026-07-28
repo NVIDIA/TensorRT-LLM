@@ -130,7 +130,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 )
 @optgroup.option(
     "--duration",
-    type=int,
+    type=click.IntRange(min=1),
     default=None,
     help=
     "Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration).",
