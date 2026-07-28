@@ -15,12 +15,23 @@
 import hashlib
 import hmac
 import json
+import warnings
 from typing import Any, Mapping, Optional
 
 from tensorrt_llm.serve.openai_protocol import UCompletionRequest
 
 INTERNAL_DISAGG_AUTH_HEADER = "x-trtllm-disagg-auth"
 _SIGNATURE_PREFIX = "sha256="
+_MISSING_AUTH_KEY_WARNING = (
+    "Internal disaggregated authentication key is required for protected "
+    "disaggregated request fields. In a future release the requirement to "
+    "use internal_request_auth_key will be enforced. Please update workflow "
+    "accordingly."
+)
+
+
+def _warn_missing_auth_key() -> None:
+    warnings.warn(_MISSING_AUTH_KEY_WARNING, FutureWarning, stacklevel=2)
 
 
 def request_requires_internal_disagg_auth(request: UCompletionRequest) -> bool:
@@ -59,9 +70,8 @@ def build_internal_disagg_auth_headers(
     if not request_requires_internal_disagg_auth(request):
         return {}
     if not internal_disagg_auth_key:
-        raise ValueError(
-            "Internal disaggregated authentication key is required for protected disaggregated request fields"
-        )
+        _warn_missing_auth_key()
+        return {}
     return {INTERNAL_DISAGG_AUTH_HEADER: _sign_request(internal_disagg_auth_key, request)}
 
 
@@ -73,9 +83,8 @@ def validate_internal_disagg_request(
     if not request_requires_internal_disagg_auth(request):
         return
     if not internal_disagg_auth_key:
-        raise ValueError(
-            "Protected disaggregated request fields require authenticated disaggregated request forwarding"
-        )
+        _warn_missing_auth_key()
+        return
 
     expected = _sign_request(internal_disagg_auth_key, request)
     provided = None if headers is None else headers.get(INTERNAL_DISAGG_AUTH_HEADER)

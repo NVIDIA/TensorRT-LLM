@@ -65,12 +65,17 @@ def test_unprotected_request_does_not_require_internal_auth():
         _make_request(encoded_opaque_state="b3BhcXVl", ctx_info_endpoint="tcp://10.0.0.1:5000"),
     ],
 )
-def test_protected_fields_require_internal_auth_key(completion_request):
+def test_protected_fields_allow_missing_internal_auth_key_with_warning(
+    completion_request,
+):
     assert request_requires_internal_disagg_auth(completion_request)
 
-    with pytest.raises(ValueError, match="authentication key"):
-        build_internal_disagg_auth_headers(None, completion_request)
-    with pytest.raises(ValueError, match="require authenticated"):
+    warning_message = (
+        "In a future release the requirement to use internal_request_auth_key will be enforced"
+    )
+    with pytest.warns(FutureWarning, match=warning_message):
+        assert build_internal_disagg_auth_headers(None, completion_request) == {}
+    with pytest.warns(FutureWarning, match=warning_message):
         validate_internal_disagg_request(None, completion_request, {})
 
 
