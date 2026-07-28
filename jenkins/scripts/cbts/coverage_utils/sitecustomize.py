@@ -71,7 +71,10 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
 
     _src, _data_dir, _stage = _read_config(_CONFIG)
 
-    _PERIODIC_SAVE_SECONDS = 5
+    try:
+        _PERIODIC_SAVE_SECONDS = max(0.1, float(os.environ.get("CBTS_PERIODIC_SAVE_SECONDS", "5")))
+    except ValueError:
+        _PERIODIC_SAVE_SECONDS = 5.0
     _stop_event = threading.Event()
 
     _tracker = PyStartTracker(_src, _data_dir, _stage)
@@ -115,7 +118,8 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     _orig_argv = getattr(sys, "orig_argv", sys.argv)
     _is_pytest_main = any("pytest" in a for a in _orig_argv[:4])
     _is_nested_pytest = _parent_is_pytest() and _is_pytest_main
-    # mpi4py.futures pool workers serve one test via the inherited CBTS_TEST_ID and the atexit save; no daemons.
+    # mpi4py.futures pool workers don't spawn pools (so they skip the mpi patcher) but still run the
+    # periodic saver and the marker poller so their per-test coverage is saved and attributed.
     _is_mpi_pool_worker = any("mpi4py.futures" in a for a in _orig_argv)
     _skip_daemons = _is_pytest_main or _is_mpi_pool_worker
 
@@ -152,7 +156,7 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         # Coordinator / long-lived non-pytest processes install the pool accounting/env patch before
         # they spawn a pool; pool workers and the outer pytest don't spawn pools, so they skip this.
 
-        def _watch_mpi_session():
+        def _watch_mpi_pool():
             # Wait until mpi4py.futures is imported so installing the patch triggers no racing import.
             while not _stop_event.is_set():
                 if "mpi4py.futures" in sys.modules:
@@ -169,16 +173,18 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
                 _stop_event.wait(0.1)
 
         threading.Thread(
-            target=_watch_mpi_session,
+            target=_watch_mpi_pool,
             daemon=True,
-            name="cbts-mpi-patcher",
+            name="cbts-pool-patcher",
         ).start()
 
     # Pool workers and long-lived non-pytest processes follow the per-test marker file to switch
     # context; a pool worker would otherwise record every test it serves under one inherited (often
     # empty) context. The outer pytest switches context via the plugin instead.
     if not _is_pytest_main:
-        _MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", "/tmp/cbts/current_test.txt")
+        from cbts_plugin import DEFAULT_MARKER_FILE
+
+        _MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", DEFAULT_MARKER_FILE)
 
         def _poll_marker():
             last_seen = _initial_nodeid

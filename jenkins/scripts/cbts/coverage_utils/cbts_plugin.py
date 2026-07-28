@@ -15,10 +15,14 @@
 
 import os
 import sys
+import tempfile
 
-MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", "/tmp/cbts/current_test.txt")
+# Per-user default marker path (CI overrides via CBTS_MARKER_FILE). Defined once here and imported by
+# sitecustomize so the outer pytest (writer) and its subprocesses (readers) agree on the path.
+DEFAULT_MARKER_FILE = os.path.join(tempfile.gettempdir(), f"cbts-{os.getuid()}", "current_test.txt")
+MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", DEFAULT_MARKER_FILE)
 
-_ENV_WHITELIST_PREFIXES = ("TRTLLM", "TLLM", "COVERAGE_", "CBTS_", "PYTHON")
+_ENV_WHITELIST_PREFIXES = ("TRTLLM", "TLLM", "COVERAGE_", "CBTS_", "PYTHONPATH")
 
 _POOL_PATCHED_MARKER = "_cbts_patched_pool_init"
 
@@ -92,9 +96,12 @@ if "pytest" in sys.modules:
         marker_dir = os.path.dirname(MARKER_FILE)
         if marker_dir:
             os.makedirs(marker_dir, exist_ok=True)
-        with open(MARKER_FILE, "w") as f:
+        # Write + atomic replace so a reader never sees a half-written nodeid.
+        tmp = f"{MARKER_FILE}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
             f.write(nodeid)
             f.flush()
+        os.replace(tmp, MARKER_FILE)
 
         # Propagate nodeid via env so subprocesses pick it up in sitecustomize.py.
         os.environ["CBTS_TEST_ID"] = nodeid

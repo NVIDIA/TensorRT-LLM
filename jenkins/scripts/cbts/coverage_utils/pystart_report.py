@@ -33,59 +33,45 @@ def canon(path):
     return m.group(1) if m else path
 
 
-def _iter_rows(fp):
-    """Yield (test, file, qualname) rows from one per-process data file (SQLite or legacy JSON)."""
+def _read_data_file(fp):
+    """Open one per-process file once and return (stage, touch_rows, test_meta_rows).
+
+    ``touch_rows`` are canon'd ``(test, file, qualname)`` tuples; a corrupt/unreadable input yields
+    empty lists. Legacy ``.json`` / ``.json.gz`` files carry no stage or test_meta.
+    """
     if fp.endswith(".sqlite"):
-        con = sqlite3.connect(f"file:{fp}?mode=ro", uri=True)
         try:
-            yield from con.execute("SELECT test, file, qualname FROM touch")
+            con = sqlite3.connect(f"file:{fp}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return "", [], []
+        try:
+            try:
+                row = con.execute("SELECT stage FROM proc_meta LIMIT 1").fetchone()
+                stage = row[0] if row and row[0] else ""
+            except sqlite3.Error:
+                stage = ""
+            try:
+                touch = [
+                    (test, canon(file), qual)
+                    for test, file, qual in con.execute("SELECT test, file, qualname FROM touch")
+                ]
+            except sqlite3.Error:
+                touch = []
+            try:
+                meta = list(con.execute("SELECT test, outcome, expected_workers FROM test_meta"))
+            except sqlite3.Error:
+                meta = []
+            return stage, touch, meta
         finally:
             con.close()
-    else:
+    try:
         opener = gzip.open if fp.endswith(".gz") else open
         with opener(fp, "rt") as f:
             data = json.load(f)
-        for ctx, pairs in data.items():
-            for file, qual in pairs:
-                yield ctx, file, qual
-
-
-def _safe_rows(fp):
-    """Yield canon'd (test, file, qualname) rows from one input file; stop early on a corrupt/unreadable input."""
-    try:
-        for test, file, qual in _iter_rows(fp):
-            yield test, canon(file), qual
-    except (OSError, ValueError, sqlite3.Error):
-        return
-
-
-def _read_stage(fp):
-    """Return the stage recorded inside a per-process sqlite, or '' for legacy files."""
-    if not fp.endswith(".sqlite"):
-        return ""
-    try:
-        con = sqlite3.connect(f"file:{fp}?mode=ro", uri=True)
-        try:
-            row = con.execute("SELECT stage FROM proc_meta LIMIT 1").fetchone()
-            return row[0] if row and row[0] else ""
-        finally:
-            con.close()
-    except sqlite3.Error:
-        return ""
-
-
-def _read_test_meta(fp):
-    """Yield (test, outcome, expected_workers) from a per-process sqlite; nothing for legacy files."""
-    if not fp.endswith(".sqlite"):
-        return
-    try:
-        con = sqlite3.connect(f"file:{fp}?mode=ro", uri=True)
-        try:
-            yield from con.execute("SELECT test, outcome, expected_workers FROM test_meta")
-        finally:
-            con.close()
-    except sqlite3.Error:
-        return
+        touch = [(ctx, canon(file), qual) for ctx, pairs in data.items() for file, qual in pairs]
+    except (OSError, ValueError):
+        touch = []
+    return "", touch, []
 
 
 def merge_to_sqlite(pattern, out_path):
@@ -109,11 +95,11 @@ def merge_to_sqlite(pattern, out_path):
     test_expected = defaultdict(int)
 
     for fp in files:
-        stage = _read_stage(fp)
+        # One open per file; input errors degrade to empty, destination-write errors abort the merge.
+        stage, touch_rows, meta_rows = _read_data_file(fp)
         batch = []
         seen_tests = set()
-        # Input errors are recovered in _safe_rows; destination-write errors abort the merge.
-        for test, file, qual in _safe_rows(fp):
+        for test, file, qual in touch_rows:
             seen_tests.add(test)
             batch.append((test, file, qual, stage))
             if len(batch) >= 20000:
@@ -124,7 +110,7 @@ def merge_to_sqlite(pattern, out_path):
         for test in seen_tests:
             if test:
                 test_procs[(test, stage)].add(fp)
-        for test, outcome, expected in _read_test_meta(fp):
+        for test, outcome, expected in meta_rows:
             if not test:
                 continue
             if outcome is not None:
