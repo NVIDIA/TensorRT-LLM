@@ -20,6 +20,7 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
+import os
 from typing import TYPE_CHECKING, Callable, ClassVar, Dict, Optional
 
 import torch
@@ -118,6 +119,12 @@ class UlyssesAttention(AttentionBackend):
         # side stream so V/Q/K pushes FIFO together without intermediate
         # barrier kernels.
         self._pending_barriers: int = 0
+        # Symm-mem barrier timeout (ms) passed to ulysses_a2a_async_barrier.
+        # Default 60 s covers the one-time first-touch warmup stall on large
+        # multi-node runs; override via TLLM_ULYSSES_ASYNC_BARRIER_TIMEOUT_MS.
+        self._barrier_timeout_ms = int(
+            os.environ.get("TLLM_ULYSSES_ASYNC_BARRIER_TIMEOUT_MS", "60000")
+        )
         if async_ulysses:
             device = torch.cuda.current_device()
             if device not in UlyssesAttention._side_stream_by_device:
@@ -285,7 +292,7 @@ class UlyssesAttention(AttentionBackend):
         semantics, so the default stream sees a fully-synced recv buffer."""
         with torch.cuda.stream(self._async_side_stream):
             for _ in range(self._pending_barriers):
-                torch.ops.trtllm.ulysses_a2a_async_barrier(self._pg_boxed)
+                torch.ops.trtllm.ulysses_a2a_async_barrier(self._pg_boxed, self._barrier_timeout_ms)
             ev_done = torch.cuda.Event()
             ev_done.record()
         self._pending_barriers = 0
