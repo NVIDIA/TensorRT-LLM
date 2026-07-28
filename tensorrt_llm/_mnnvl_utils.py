@@ -409,7 +409,10 @@ class MnnvlMemory:
                     pynvml.nvmlDeviceGetTopologyCommonAncestor(self_handle, peer_handle)
                     == pynvml.NVML_TOPOLOGY_SYSTEM
                 ):
-                    return True
+                    # SYSTEM is only a distance classification. Require an
+                    # actual NVLink-capable local connection before using it
+                    # to identify multiple NVLink islands.
+                    return MnnvlMemory.support_nvlink(dev_id, need_all_up=False)
         except pynvml.NVMLError:
             return False
         return False

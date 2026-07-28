@@ -45,10 +45,15 @@ def test_pcie_nvl_sku_detected_by_name(mock_get_device_name) -> None:
 @patch(
     "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetHandleByIndex", side_effect=lambda index: index
 )
+@patch.object(MnnvlMemory, "support_nvlink", return_value=True)
 def test_split_nvlink_topology_detected(
-    mock_get_handle, mock_get_count, mock_initialize, mock_get_device_name
+    mock_support_nvlink,
+    mock_get_handle,
+    mock_get_count,
+    mock_initialize,
+    mock_get_device_name,
 ) -> None:
-    def common_ancestor(_self_handle, peer_handle):
+    def common_ancestor(_self_handle: int, peer_handle: int) -> int:
         if peer_handle >= 4:
             return pynvml.NVML_TOPOLOGY_SYSTEM
         return pynvml.NVML_TOPOLOGY_NODE
@@ -58,6 +63,32 @@ def test_split_nvlink_topology_detected(
         side_effect=common_ancestor,
     ):
         assert MnnvlMemory._is_pcie_nvl_sku(0)
+
+    mock_support_nvlink.assert_called_once_with(0, need_all_up=False)
+
+
+@patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA H200")
+@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
+@patch("tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetCount", return_value=2)
+@patch(
+    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetHandleByIndex", side_effect=lambda index: index
+)
+@patch.object(MnnvlMemory, "support_nvlink", return_value=False)
+@patch(
+    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetTopologyCommonAncestor",
+    return_value=pynvml.NVML_TOPOLOGY_SYSTEM,
+)
+def test_pcie_hopper_with_system_peers_is_not_split_nvlink(
+    mock_common_ancestor,
+    mock_support_nvlink,
+    mock_get_handle,
+    mock_get_count,
+    mock_initialize,
+    mock_get_device_name,
+) -> None:
+    assert not MnnvlMemory._is_pcie_nvl_sku(0)
+    mock_support_nvlink.assert_called_once_with(0, need_all_up=False)
+    mock_common_ancestor.assert_called_once_with(0, 1)
 
 
 @patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA H200")
@@ -70,7 +101,9 @@ def test_split_nvlink_topology_detected(
     "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetTopologyCommonAncestor",
     return_value=pynvml.NVML_TOPOLOGY_NODE,
 )
+@patch.object(MnnvlMemory, "support_nvlink", return_value=True)
 def test_nvswitch_topology_remains_supported(
+    mock_support_nvlink,
     mock_common_ancestor,
     mock_get_handle,
     mock_get_count,
@@ -78,6 +111,7 @@ def test_nvswitch_topology_remains_supported(
     mock_get_device_name,
 ) -> None:
     assert not MnnvlMemory._is_pcie_nvl_sku(0)
+    mock_support_nvlink.assert_not_called()
 
 
 @patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA B200 NVL")

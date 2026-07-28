@@ -117,8 +117,9 @@ class DeepEPLowLatency(Communication):
         if get_sm_version() in (120, 121):
             return False
         # Native NVSHMEM/IBGDA bootstrap aborts instead of raising on split
-        # H100/H200 NVL systems, so reject them before setup. DeepEP low
-        # latency otherwise uses RDMA and does not require MNNVL support.
+        # H100/H200 NVL systems. Disabling P2P does not avoid the abort: this
+        # build has no IBRC fallback, and IBGDA fails before Buffer can use
+        # allow_nvlink_for_low_latency_mode=False. Reject before setup.
         dev_id = torch.cuda.current_device()
         if MnnvlMemory._is_pcie_nvl_sku(dev_id):
             return False
