@@ -452,22 +452,27 @@ class MultimodalModelMixin:
         """Return a `MultimodalParams` whose raw modality inputs contain only
         `item_indices` from `param`, in that order.
 
-        Default handles two common single-modality layouts:
+        Default handles three common single-modality layouts:
 
-        - Stacked on dim 0 (Mistral 3 / Pixtral / LLaVA-family): `pixel_values`
+        - Image, stacked on dim 0 (Mistral 3 / Pixtral / LLaVA-family): `pixel_values`
           `[B, C, H, W]` with a parallel `image_sizes` list; both sliced by item.
-        - Packed with `*_grid_thw` offsets (Qwen2-VL family): `pixel_values`
-          `[total_patches, feat]` + `image_grid_thw` `[B, 3]`; prefix-summed patch
-          counts locate each item's slice, and `image_grid_thw` is sliced in parallel.
+        - Image / video, packed with `*_grid_thw` offsets (Qwen2-VL family):
+          `pixel_values` `[total_patches, feat]` + `image_grid_thw` `[B, 3]`;
+          prefix-summed patch counts locate each item's slice, and `image_grid_thw`
+          is sliced in parallel.
+        - Audio, stacked on dim 0 (Whisper / Qwen2-Audio / Gemma4 audio):
+          `input_features` `[B, mel_bins, T]` sliced by item.
 
         Any additional sibling field in the modality dict whose first-axis length equals
         the item count is also sliced -- covers per-item metadata such as
-        `second_per_grid_ts` on Qwen2.5-VL video without model-specific code.
+        `second_per_grid_ts` (Qwen2.5-VL video) or `input_features_mask` /
+        `feature_attention_mask` (audio) without model-specific code.
 
         Models with a different layout (e.g. mixed-modality per param, custom packed
-        formats) override this method. The parallel per-item metadata
-        (`multimodal_embedding_lengths`, `multimodal_hashes`) is re-sliced by the mixin
-        after this returns, so overrides need only handle modality data.
+        formats) should override this method. The parallel per-item metadata
+        (`multimodal_embedding_lengths`, `multimodal_hashes`) is model-agnostic and is
+        re-sliced by the mixin after this returns, so overrides need only handle the
+        modality-specific raw data.
         """
         modality = self._encoder_cache_modality(param)
         if modality is None:
@@ -485,7 +490,11 @@ class MultimodalModelMixin:
         grid_key = {"image": "image_grid_thw", "video": "video_grid_thw"}.get(modality)
         pixel_key = {"image": "pixel_values", "video": "pixel_values_videos"}.get(modality)
 
-        if grid_key and pixel_key and grid_key in modality_data and pixel_key in modality_data:
+        if (
+            (grid_key and pixel_key)
+            and (grid_key in modality_data)
+            and (pixel_key in modality_data)
+        ):
             # Packed layout: prefix-sum patch counts to locate each item's slab, then
             # concat the requested subset in item-index order.
             grids = modality_data[grid_key]
@@ -518,6 +527,14 @@ class MultimodalModelMixin:
             sliced = {
                 "pixel_values": miss_pixel,
                 "image_sizes": miss_sizes,
+            }
+        elif modality == "audio" and "input_features" in modality_data:
+            # Stacked layout: `input_features [B, mel_bins, T]` sliced on dim 0.
+            # Per-item masks (`input_features_mask`, `feature_attention_mask`, ...)
+            # are handled by the sibling-slice pass below.
+            n_items = modality_data["input_features"].shape[0]
+            sliced = {
+                "input_features": modality_data["input_features"][indices],
             }
         else:
             raise NotImplementedError(
@@ -826,7 +843,8 @@ class MultimodalModelMixin:
         """Look up every item of `param` and return the per-item partition.
 
         Returns `None` when the param is not cacheable (mixed modality, missing metadata,
-        request-local embedding already attached); the caller treats that as a full miss.
+        request-local embedding already attached); the caller should treat that as a
+        full miss.
         """
         if param.multimodal_data.get("multimodal_embedding") is not None:
             logger.debug(
@@ -859,13 +877,30 @@ class MultimodalModelMixin:
         item_tensors: Dict[int, torch.Tensor],
         total_items: int,
     ) -> torch.Tensor:
-        """Concatenate per-item embedding tensors in item-index order.
+        """Copy per-item embedding tensors into a single contiguous buffer in
+        item-index order.
 
-        `item_tensors` must contain every index in `[0, total_items)`.
+        `item_tensors` must contain every index in `[0, total_items)`. Sizes the
+        buffer from the item row counts and `copy_`s each item into its row range:
+        one predictable allocation of the exact final size, with no `torch.cat`
+        temporary competing with the sources for peak memory.
         """
         if total_items == 1:
             return item_tensors[0]
-        return torch.cat([item_tensors[i] for i in range(total_items)], dim=0)
+        first = item_tensors[0]
+        total_rows = sum(item_tensors[i].shape[0] for i in range(total_items))
+        buffer = torch.empty(
+            (total_rows, *first.shape[1:]),
+            dtype=first.dtype,
+            device=first.device,
+        )
+        offset = 0
+        for i in range(total_items):
+            item = item_tensors[i]
+            rows = item.shape[0]
+            buffer[offset : offset + rows].copy_(item)
+            offset += rows
+        return buffer
 
     @staticmethod
     def _apply_metadata_slice(
@@ -893,28 +928,47 @@ class MultimodalModelMixin:
     ) -> None:
         """Encode only the miss items of each partial-hit param and stitch results.
 
-        After this returns, each param's `multimodal_embedding` has the same shape as a
-        full encoder run so downstream `get_multimodal_embeddings` treats it as fully
-        cached.
+        Miss residuals from all partial-hit params in the batch are encoded in a
+        single call and the concatenated output is split back per param, mirroring
+        how `get_multimodal_embeddings` batches full-miss params. After this returns,
+        each param's `multimodal_embedding` has the same shape as a full encoder run
+        so downstream `get_multimodal_embeddings` treats it as fully cached.
         """
-        for param, partition in partials:
-            # Cross-iter prefetch may have staged this request's raw MM tensors on the
-            # aux stream. If its own encoder call then raised, the request reaches this
-            # iteration with an `encoder_event` but no `multimodal_embedding`; slicing
-            # those tensors on the main stream before the event would race the aux-stream
-            # H2D copy. Mirror the wait `get_multimodal_embeddings` does downstream.
+        if not partials:
+            return
+
+        # Cross-iter prefetch may have staged some params' raw MM tensors on the aux
+        # stream. If a prefetch encoder call then raised, the request reaches this
+        # iteration with an `encoder_event` but no `multimodal_embedding`; slicing
+        # those tensors on the main stream before the event would race the aux-stream
+        # H2D copy. Wait per param up front, before any raw-tensor read.
+        for param, _ in partials:
             if param.encoder_event is not None:
                 torch.cuda.current_stream().wait_event(param.encoder_event)
 
+        # Build every residual, then run one batched encoder call over the whole set.
+        residuals: list[MultimodalParams] = []
+        per_param_miss_lengths: list[list[int]] = []
+        for param, partition in partials:
             residual = self.build_multimodal_encoder_input(param, partition.miss_indices)
             self._apply_metadata_slice(residual, param, partition.miss_indices)
+            residuals.append(residual)
+            per_param_miss_lengths.append(
+                [
+                    param.multimodal_data["multimodal_embedding_lengths"][i]
+                    for i in partition.miss_indices
+                ]
+            )
 
-            residual_output = self.encode_multimodal_inputs([residual])
-            miss_lengths = [
-                param.multimodal_data["multimodal_embedding_lengths"][i]
-                for i in partition.miss_indices
-            ]
-            miss_tensors = torch.split(residual_output, miss_lengths, dim=0)
+        batched_output = self.encode_multimodal_inputs(residuals)
+        per_param_slabs = torch.split(
+            batched_output, [sum(lengths) for lengths in per_param_miss_lengths], dim=0
+        )
+
+        for (param, partition), slab, miss_lengths in zip(
+            partials, per_param_slabs, per_param_miss_lengths, strict=True
+        ):
+            miss_tensors = torch.split(slab, miss_lengths, dim=0)
 
             by_item: Dict[int, torch.Tensor] = dict(partition.hits)
             for miss_idx, tensor in zip(partition.miss_indices, miss_tensors, strict=True):

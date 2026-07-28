@@ -419,6 +419,32 @@ def test_encoder_cache_partial_hit_encodes_miss_and_interleaves():
     )
 
 
+def test_encoder_cache_partial_hit_batches_encoder_across_partial_params():
+    # Two partial-hit params in the same batch must share a single encoder call so
+    # launch overhead scales with iterations, not with partial-hit count.
+    model = CountingEncoderMultimodalModel(
+        make_embedding(hidden_size=4),
+        torch.tensor([7]),
+        encoder_cache_max_bytes=4096,
+    )
+    shared = [1, 1, 1, 1, 1, 1, 1, 1]
+    seed = make_keyed_multimodal_param(item_hashes=[shared, [2] * 8], embedding_lengths=[2, 2])
+    partial_a = make_keyed_multimodal_param(item_hashes=[shared, [3] * 8], embedding_lengths=[2, 2])
+    partial_b = make_keyed_multimodal_param(
+        item_hashes=[[2] * 8, [4] * 8], embedding_lengths=[2, 2]
+    )
+
+    model._get_or_encode_multimodal_embeddings([seed])
+    encode_calls_before = model.encode_calls
+    model._get_or_encode_multimodal_embeddings([partial_a, partial_b])
+
+    # Single batched encoder call for both partial residuals.
+    assert model.encode_calls == encode_calls_before + 1
+    # Both new miss items (`[3]*8` and `[4]*8`) written to cache alongside the two
+    # already-cached seed items.
+    assert len(model._multimodal_encoder_cache) == 4
+
+
 def test_encoder_cache_logs_rejected_oversized_write():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
@@ -633,6 +659,38 @@ def test_build_multimodal_encoder_input_stacked_crops_padding_to_miss_max_size()
     torch.testing.assert_close(residual_image["pixel_values"], pixels[0:1, :, :3, :4])
 
 
+def test_build_multimodal_encoder_input_slices_audio_input_features():
+    # Whisper / Qwen2-Audio / Gemma4-audio layout: `input_features [B, mel, T]`
+    # stacked on dim 0, with an optional per-item mask that sibling-slices
+    # automatically. Two clips: item 0 and item 1 -- slice to [1, 0] to also
+    # confirm item order is preserved.
+    features = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+    mask = torch.tensor([[1, 1, 0], [1, 1, 1]])
+    param = MultimodalParams(
+        multimodal_input=MultimodalInput(
+            multimodal_hashes=[[i] * 8 for i in range(2)],
+            multimodal_positions=[0, 0],
+            multimodal_lengths=[1, 1],
+        ),
+        multimodal_data={
+            "audio": {
+                "input_features": features,
+                "input_features_mask": mask,
+            },
+            "multimodal_embedding_lengths": [1, 1],
+            "mm_processor_kwargs_hash": "kw",
+        },
+    )
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([0]))
+
+    residual = model.build_multimodal_encoder_input(param, [1, 0])
+
+    residual_audio = residual.multimodal_data["audio"]
+    torch.testing.assert_close(residual_audio["input_features"], features[[1, 0]])
+    # Per-item mask is caught by the generic sibling-slice pass.
+    torch.testing.assert_close(residual_audio["input_features_mask"], mask[[1, 0]])
+
+
 @pytest.mark.parametrize(
     "mm_data, expected_match",
     [
@@ -641,8 +699,10 @@ def test_build_multimodal_encoder_input_stacked_crops_padding_to_miss_max_size()
         # Modality present but layout is neither pattern A (image_sizes) nor pattern B
         # (grid_thw); default has nothing to dispatch on.
         ({"image": {"pixel_values": torch.zeros(2)}}, "cannot slice image layout"),
+        # Audio modality but no `input_features`; default falls through.
+        ({"audio": {"nonsense": torch.zeros(2)}}, "cannot slice audio layout"),
     ],
-    ids=["no_modality", "unhandled_layout"],
+    ids=["no_modality", "unhandled_image_layout", "unhandled_audio_layout"],
 )
 def test_build_multimodal_encoder_input_unhandled_layout_raises(mm_data, expected_match):
     param = MultimodalParams(multimodal_data=mm_data)
