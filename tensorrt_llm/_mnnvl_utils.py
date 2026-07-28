@@ -18,6 +18,7 @@ import os
 import platform
 import sys
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, List, Optional, Union
 
 import pynvml
@@ -51,6 +52,14 @@ def _check_cu_result(cu_func_ret):
         return None
 
 
+class _MnnvlAllocationState(Enum):
+    MAPPED = "mapped"
+    PREPARING = "preparing"
+    UNMAPPED = "unmapped"
+    RESTORING = "restoring"
+    BROKEN = "broken"
+
+
 @dataclass
 class _MnnvlAllocationRecord:
     comm: Any
@@ -61,7 +70,7 @@ class _MnnvlAllocationRecord:
     start_address: int
     rank_stride: int
     address_offset: int
-    mapped: bool = True
+    state: _MnnvlAllocationState = _MnnvlAllocationState.MAPPED
 
 
 class MnnvlMemory:
@@ -113,8 +122,8 @@ class MnnvlMemory:
 
     @property
     def mapped(self) -> bool:
-        """Whether physical handles are mapped into this VA reservation."""
-        return type(self).allocated_map[self.ptr].mapped
+        """Whether the allocation is mapped and ready for data-path access."""
+        return type(self).allocated_map[self.ptr].state is _MnnvlAllocationState.MAPPED
 
     def as_torch_strided_tensor(self, dtype):
         num_segments = type(self).comm.Get_size()
@@ -331,7 +340,6 @@ class MnnvlMemory:
             cls.current_rank_stride,
             cls.current_mem_offset,
         )
-        # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         ptr = cls.current_start_address + cls.current_mem_offset
         stride = cls.current_rank_stride
         cls.allocated_map[ptr] = _MnnvlAllocationRecord(
@@ -353,8 +361,18 @@ class MnnvlMemory:
 
     @classmethod
     def close_mnnvl_memory(cls, ptr: int):
-        record = cls.allocated_map.pop(ptr)
-        if record.mapped:
+        record = cls.allocated_map[ptr]
+        if record.state not in (
+            _MnnvlAllocationState.MAPPED,
+            _MnnvlAllocationState.UNMAPPED,
+        ):
+            logger.warning(
+                "Skipping cleanup of MNNVL allocation in terminal state %s",
+                record.state.value,
+            )
+            return
+        cls.allocated_map.pop(ptr)
+        if record.state is _MnnvlAllocationState.MAPPED:
             cls._unmap_and_release_handles(record)
         cls.address_refcnt[record.start_address] -= 1
 
@@ -380,21 +398,30 @@ class MnnvlMemory:
         """Collectively detach backing handles while retaining graph-visible VA."""
         cls = type(self)
         record = cls.allocated_map[self.ptr]
-        if not record.mapped:
+        if record.state is _MnnvlAllocationState.UNMAPPED:
             return
-        torch.cuda.synchronize()
-        record.comm.barrier()
-        cls._unmap_and_release_handles(record)
-        record.mem_handles = [None] * record.comm_size
-        record.mapped = False
-        record.comm.barrier()
+        if record.state is not _MnnvlAllocationState.MAPPED:
+            raise RuntimeError(f"Cannot prepare MNNVL allocation in {record.state.value} state")
+        record.state = _MnnvlAllocationState.PREPARING
+        try:
+            torch.cuda.synchronize()
+            record.comm.barrier()
+            cls._unmap_and_release_handles(record)
+            record.mem_handles = [None] * record.comm_size
+            record.comm.barrier()
+        except Exception:
+            record.state = _MnnvlAllocationState.BROKEN
+            raise
+        record.state = _MnnvlAllocationState.UNMAPPED
 
-    def checkpoint_restore(self, comm) -> None:
-        """Collectively remap fresh handles at the original virtual addresses."""
+    def checkpoint_restore(self, comm) -> bool:
+        """Remap fresh handles while keeping data-path access disabled."""
         cls = type(self)
         record = cls.allocated_map[self.ptr]
-        if record.mapped:
-            return
+        if record.state is _MnnvlAllocationState.MAPPED:
+            return False
+        if record.state is not _MnnvlAllocationState.UNMAPPED:
+            raise RuntimeError(f"Cannot restore MNNVL allocation in {record.state.value} state")
         comm_size = comm.Get_size()
         comm_rank = comm.Get_rank()
         if comm_size != record.comm_size or comm_rank != record.comm_rank:
@@ -404,17 +431,35 @@ class MnnvlMemory:
                 f"rank/size {comm_rank}/{comm_size} != "
                 f"{record.comm_rank}/{record.comm_size}"
             )
-        torch.cuda.synchronize()
-        record.mem_handles = cls._create_and_map_handles(
-            comm,
-            record.aligned_size,
-            record.start_address,
-            record.rank_stride,
-            record.address_offset,
-        )
+        record.state = _MnnvlAllocationState.RESTORING
+        try:
+            torch.cuda.synchronize()
+            record.mem_handles = cls._create_and_map_handles(
+                comm,
+                record.aligned_size,
+                record.start_address,
+                record.rank_stride,
+                record.address_offset,
+            )
+        except Exception:
+            record.state = _MnnvlAllocationState.BROKEN
+            raise
         record.comm = comm
         cls.comm = comm
-        record.mapped = True
+        return True
+
+    def _checkpoint_restore_complete(self) -> None:
+        """Publish a restored allocation after frontend protocol readiness."""
+        record = type(self).allocated_map[self.ptr]
+        if record.state is not _MnnvlAllocationState.RESTORING:
+            raise RuntimeError(f"Cannot complete MNNVL restore in {record.state.value} state")
+        record.state = _MnnvlAllocationState.MAPPED
+
+    def _checkpoint_restore_failed(self) -> None:
+        """Make a failed frontend restore terminal and fail closed."""
+        record = type(self).allocated_map[self.ptr]
+        if record.state is _MnnvlAllocationState.RESTORING:
+            record.state = _MnnvlAllocationState.BROKEN
 
     @staticmethod
     @functools.cache
@@ -564,18 +609,28 @@ class MnnvlMoe:
     def checkpoint_restore(comm) -> None:
         """Restore TRT-native two-sided MoE workspaces at their original virtual addresses."""
         workspaces = (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
-        for workspace in workspaces:
-            if workspace is not None:
-                workspace.checkpoint_restore(comm)
-        if MnnvlMoe.moe_workspace_tensor is not None:
-            assert MnnvlMoe.moe_mapping is not None
-            torch.ops.trtllm.moe_initialize_workspace(
-                MnnvlMoe.moe_workspace_tensor,
-                MnnvlMoe.moe_mapping.moe_ep_rank,
-                MnnvlMoe.moe_mapping.moe_ep_size,
-            )
-        torch.cuda.synchronize()
-        comm.barrier()
+        restored_workspaces = []
+        try:
+            for workspace in workspaces:
+                if workspace is not None and workspace.checkpoint_restore(comm):
+                    restored_workspaces.append(workspace)
+            if not restored_workspaces:
+                return
+            if MnnvlMoe.moe_workspace_tensor is not None:
+                assert MnnvlMoe.moe_mapping is not None
+                torch.ops.trtllm.moe_initialize_workspace(
+                    MnnvlMoe.moe_workspace_tensor,
+                    MnnvlMoe.moe_mapping.moe_ep_rank,
+                    MnnvlMoe.moe_mapping.moe_ep_size,
+                )
+            torch.cuda.synchronize()
+            comm.barrier()
+        except Exception:
+            for workspace in restored_workspaces:
+                workspace._checkpoint_restore_failed()
+            raise
+        for workspace in restored_workspaces:
+            workspace._checkpoint_restore_complete()
 
     @staticmethod
     def require_mapped() -> None:

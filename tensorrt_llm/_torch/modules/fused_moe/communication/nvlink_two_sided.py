@@ -23,10 +23,12 @@ NVLINK Two-Sided supports post-quant dispatch for all quantization modes.
 
 import os
 from typing import List, Optional, Tuple
+from weakref import WeakSet
 
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+from tensorrt_llm._torch.mnnvl_alltoall_workspace import _collect_active_ranks
 from tensorrt_llm.mapping import Mapping
 
 from .base import Communication
@@ -41,6 +43,8 @@ class NVLinkTwoSided(Communication):
     local buffer. This communication model is akin to NCCL's collective operations.
     The required symmetric memory size is proportional to the communication channels opened.
     """
+
+    _INSTANCES: WeakSet = WeakSet()
 
     def __init__(
         self,
@@ -76,6 +80,7 @@ class NVLinkTwoSided(Communication):
 
         # Initialize dispatch state
         self._dispatch_state = {}
+        self._INSTANCES.add(self)
 
     @staticmethod
     def is_platform_supported() -> bool:
@@ -101,14 +106,38 @@ class NVLinkTwoSided(Communication):
 
     def checkpoint_prepare(self) -> None:
         """Detach TRT-native two-sided workspaces after global quiescence."""
-        if self._dispatch_state:
-            raise RuntimeError("Cannot checkpoint during an active MoE All-to-All phase")
+        workspaces = (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
+        if all(workspace is None or not workspace.mapped for workspace in workspaces):
+            MnnvlMoe.checkpoint_prepare()
+            return
+        local_clients_idle = not any(instance._dispatch_state for instance in self._INSTANCES)
+        workspace = MnnvlMoe.moe_workspace
+        assert workspace is not None
+        comm = workspace.comm
+        if comm is None:
+            raise RuntimeError("MNNVL workspace communicator is not initialized")
+        active_ranks = _collect_active_ranks(
+            comm,
+            local_clients_idle=local_clients_idle,
+            expected_size=self.ep_size,
+        )
+        if active_ranks:
+            raise RuntimeError(
+                f"Cannot checkpoint during an active MoE All-to-All phase on ranks {active_ranks}"
+            )
         MnnvlMoe.checkpoint_prepare()
 
     def checkpoint_restore(self, comm) -> None:
         """Restore TRT-native two-sided workspaces and protocol state."""
+        restore_required = any(
+            workspace is not None and not workspace.mapped
+            for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
+        )
         MnnvlMoe.checkpoint_restore(comm)
-        self._dispatch_state = {}
+        if not restore_required:
+            return
+        for instance in self._INSTANCES:
+            instance._dispatch_state = {}
 
     def prepare_dispatch(
         self,
