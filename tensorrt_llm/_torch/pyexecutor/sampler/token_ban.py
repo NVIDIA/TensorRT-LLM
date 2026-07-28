@@ -142,11 +142,15 @@ class TokenBanHandler(ABC):
         ngram_sizes: list[int | None],
         *,
         stale_by_one: list[bool] | None = None,
+        pending_steps: list[int] | None = None,
     ) -> TokenBans:
         """Collect all enabled feature bans into a fresh :class:`TokenBans`.
 
         ``stale_by_one`` is the per-request overlap-scheduler flag; it is only
         meaningful for :class:`OverlappedTokenBanHandler` and ignored otherwise.
+        ``pending_steps`` is the per-request count of tokens sampled but not yet
+        written back to the host, used to correct the min-length count under the
+        overlap scheduler; ``None`` means no correction is needed.
         """
 
     @abstractmethod
@@ -228,13 +232,24 @@ class TokenBanHandler(ABC):
         requests: list[LlmRequest],
         num_steps: list[int],
         num_beams: list[int],
+        *,
+        pending_steps: list[int] | None = None,
     ) -> None:
         """Add bans that suppress EOS until a request reaches its min length.
 
         For a request with ``py_min_length``, the end-of-sequence token is
         banned on every step whose generated length is still below the minimum.
-        This is an unconditional ban that does not depend on the token history,
-        so it has no stale-host variant and is identical under both handlers.
+        The ban is unconditional: it depends on the generated *length*, never on
+        token values, so unlike the suffix-rule features it needs no device-side
+        comparison and is identical under both handlers.
+
+        It does, however, need the length to be correct. ``get_num_tokens()``
+        counts the host token list, which under the overlap scheduler still
+        misses the tokens sampled but not yet written back by
+        ``update_requests``. ``pending_steps`` supplies that per-request count so
+        the comparison uses the true generated length; without it the length
+        reads one short at the boundary and EOS stays banned for one extra step,
+        making the request exceed ``min_length``.
         """
         current_offset = 0
         for index, r in enumerate(requests):
@@ -251,11 +266,12 @@ class TokenBanHandler(ABC):
             if end_id is None or end_id <= -1:
                 continue
 
+            pending = pending_steps[index] if pending_steps is not None else 0
             for beam_idx in range(num_beams[index]):
                 for step in range(num_steps[index]):
-                    if (r.get_num_tokens(beam_idx) - r.py_orig_prompt_len) + step < r.py_min_length[
-                        0
-                    ]:
+                    if (
+                        r.get_num_tokens(beam_idx) - r.py_orig_prompt_len
+                    ) + pending + step < r.py_min_length[0]:
                         bans.rows.append(request_offset + num_steps[index] * beam_idx + step)
                         bans.cols.append(end_id)
                     else:
@@ -564,8 +580,12 @@ class SynchronousTokenBanHandler(TokenBanHandler):
         ngram_sizes: list[int | None],
         *,
         stale_by_one: list[bool] | None = None,
+        pending_steps: list[int] | None = None,
     ) -> TokenBans:
         assert stale_by_one is None, "synchronous handler has no stale requests"
+        # Without the overlap scheduler update_requests has already run, so the
+        # host history is complete and no length correction applies.
+        assert not pending_steps, "synchronous handler has no pending steps"
         bans = TokenBans()
         if any(getattr(r, "py_min_length", None) for r in requests):
             self._add_min_length_bans(bans, requests, num_steps, num_beams)
@@ -607,11 +627,15 @@ class OverlappedTokenBanHandler(TokenBanHandler):
         ngram_sizes: list[int | None],
         *,
         stale_by_one: list[bool] | None = None,
+        pending_steps: list[int] | None = None,
     ) -> TokenBans:
         bans = TokenBans()
         if any(getattr(r, "py_min_length", None) for r in requests):
-            # min_length has no stale variant; identical under both handlers.
-            self._add_min_length_bans(bans, requests, num_steps, num_beams)
+            # No stale *suffix* variant, but the length count must still account
+            # for tokens pending write-back; see _add_min_length_bans.
+            self._add_min_length_bans(
+                bans, requests, num_steps, num_beams, pending_steps=pending_steps
+            )
         if any(getattr(r, "py_bad_words", None) for r in requests):
             self._add_bad_words_bans(
                 bans, requests, num_steps, num_beams, stale_by_one=stale_by_one

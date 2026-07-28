@@ -4747,6 +4747,25 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             sampled_slots=sampled_slots_cuda,
         )
 
+    def _compute_pending_steps(self, requests: list[LlmRequest]) -> list[int] | None:
+        """Per-request count of tokens sampled but not yet written back, or None.
+
+        With the overlap scheduler ``sample_async`` for step ``i`` runs before
+        ``update_requests`` for step ``i - 1``, so the host token list — and
+        hence ``get_num_tokens()`` — lags the true sequence by this many tokens.
+        Length-based bans (min_length) add it back to recover the real generated
+        length. Unlike the suffix-rule staleness this needs no device-side
+        lookup, so it is not restricted to the single-step / single-beam case.
+        Returns None when the overlap scheduler is off, on a draft batch, or
+        when nothing is pending, so callers can skip the correction entirely.
+        """
+        if not self._track_pending_steps or self._is_draft_batch(requests):
+            return None
+        pending = [
+            self._pending_steps[r.py_seq_slot] if r.py_seq_slot is not None else 0 for r in requests
+        ]
+        return pending if any(pending) else None
+
     def _compute_stale_by_one(self, requests: list[LlmRequest]) -> list[bool] | None:
         """Per-request overlap-scheduler stale flags, or None when not applicable.
 
@@ -5102,12 +5121,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 if (has_bad_words or has_no_repeat_ngram)
                 else None
             )
+            # min_length compares against get_num_tokens(), which counts only
+            # the host history; add back the tokens still pending write-back so
+            # the generated length is exact under the overlap scheduler.
+            pending_steps = (
+                self._compute_pending_steps(sampling_requests) if has_min_length else None
+            )
             bans = self._token_ban_handler.generate_ban_list(
                 sampling_requests,
                 sampling_requests_metadata.req_num_steps.tolist(),
                 sampling_requests_metadata.req_num_beams.tolist(),
                 ngram_sizes,
                 stale_by_one=stale_by_one,
+                pending_steps=pending_steps,
             )
             self._token_ban_handler.apply_ban_list(
                 logits_cuda, bans, new_tokens_cuda=new_tokens_cuda

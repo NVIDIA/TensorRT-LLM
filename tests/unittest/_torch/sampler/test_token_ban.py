@@ -433,7 +433,8 @@ class TestAddMinLengthBans:
 
     EOS (the request's original end_id) is banned on every step whose generated
     length is still below py_min_length; it is an unconditional ban with no
-    stale-host variant.
+    stale-host *suffix* variant, but the length it compares against must include
+    tokens still pending write-back under the overlap scheduler.
     """
 
     VOCAB = 16
@@ -518,3 +519,51 @@ class TestAddMinLengthBans:
         assert self._banned_cols(logits[0]) == {self.END_ID}
         assert self._banned_cols(logits[1]) == {self.END_ID}
         assert self._banned_cols(logits[2]) == set()
+
+    # -- overlap scheduler: get_num_tokens() lags by the pending-step count ---
+
+    def _run_overlapped(self, requests, pending_steps, num_steps=None, num_beams=None):
+        num_steps = num_steps or [1] * len(requests)
+        num_beams = num_beams or [1] * len(requests)
+        total_rows = sum(s * b for s, b in zip(num_steps, num_beams, strict=True))
+        logits = self._distinct_logits(total_rows, self.VOCAB)
+        ngram_sizes: list[int | None] = [None] * len(requests)
+        handler = OverlappedTokenBanHandler()
+        bans = handler.generate_ban_list(
+            cast(list[LlmRequest], requests),
+            num_steps,
+            num_beams,
+            ngram_sizes,
+            pending_steps=pending_steps,
+        )
+        handler.apply_ban_list(logits, bans)
+        return logits
+
+    def test_pending_step_reaches_min_length(self):
+        # Host sees 4 generated tokens but one more was already sampled and is
+        # awaiting write-back, so the true length is 5 == min_length. Without
+        # the correction EOS would stay banned and overshoot min_length.
+        req = self.MockLlmRequest(num_tokens=4, min_length=5)
+        logits = self._run_overlapped([req], pending_steps=[1])
+        assert self._banned_cols(logits[0]) == set()
+
+    def test_pending_step_still_below_min_length(self):
+        # Host sees 3, one pending -> true length 4 < 5, so EOS stays banned.
+        req = self.MockLlmRequest(num_tokens=3, min_length=5)
+        logits = self._run_overlapped([req], pending_steps=[1])
+        assert self._banned_cols(logits[0]) == {self.END_ID}
+
+    def test_no_pending_steps_matches_synchronous(self):
+        # pending_steps=None -> no correction; same verdict as the sync handler.
+        req = self.MockLlmRequest(num_tokens=4, min_length=5)
+        logits = self._run_overlapped([req], pending_steps=None)
+        assert self._banned_cols(logits[0]) == {self.END_ID}
+
+    def test_pending_steps_are_per_request(self):
+        # Only the second request has a pending token; the correction must not
+        # leak across requests.
+        lagging = self.MockLlmRequest(num_tokens=4, min_length=5)
+        fresh = self.MockLlmRequest(num_tokens=4, min_length=5)
+        logits = self._run_overlapped([lagging, fresh], pending_steps=[0, 1])
+        assert self._banned_cols(logits[0]) == {self.END_ID}
+        assert self._banned_cols(logits[1]) == set()
