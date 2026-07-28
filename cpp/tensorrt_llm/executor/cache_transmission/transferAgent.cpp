@@ -22,12 +22,40 @@
 #include <algorithm>
 #include <cuda.h>
 #include <dlfcn.h>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <tuple>
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
+void promoteHostLibraryToGlobalScope()
+{
+    static std::once_flag once;
+    std::call_once(once,
+        []()
+        {
+            Dl_info info{};
+            if (dladdr(reinterpret_cast<void*>(&promoteHostLibraryToGlobalScope), &info) == 0
+                || info.dli_fname == nullptr)
+            {
+                TLLM_LOG_DEBUG("dladdr failed; skipping global-scope promotion");
+                return;
+            }
+            // RTLD_NOLOAD promotes the visibility of the already-loaded library without
+            // loading a second copy. It fails when this code is statically linked into an
+            // executable (e.g. unit tests) — nothing to promote there.
+            void* handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
+            if (handle == nullptr)
+            {
+                TLLM_LOG_DEBUG("global-scope promotion skipped for %s: %s", info.dli_fname, dlerror());
+                return;
+            }
+            TLLM_LOG_DEBUG("promoted %s to the global symbol scope", info.dli_fname);
+            // Keep the extra reference: the library must stay resident for the wrappers.
+        });
+}
 
 [[nodiscard]] DynLibLoader& DynLibLoader::getInstance()
 {
@@ -37,6 +65,7 @@ namespace tensorrt_llm::executor::kv_cache
 
 [[nodiscard]] void* DynLibLoader::getHandle(std::string const& name)
 {
+    promoteHostLibraryToGlobalScope();
     std::lock_guard<std::mutex> lock(mDllMutex);
     auto it = mHandlers.find(name);
     if (it != mHandlers.end())

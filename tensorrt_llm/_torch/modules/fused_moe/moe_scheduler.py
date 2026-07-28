@@ -51,7 +51,7 @@ from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
-from .communication import DeepEP, DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided
+from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE, raise_moe_lora_multichunk_unsupported
@@ -407,10 +407,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     "Current workaround for apply_router_weight_on_input does not support fp8 input"
                 )
                 x = x * token_final_scales.to(x.dtype)
-                # DeepEP variants need a non-None token_final_scales tensor
-                # (they don't tolerate None), so feed all-ones; other strategies
-                # accept None and skip the multiply.
-                if isinstance(moe.comm, (DeepEP, DeepEPLowLatency)):
+                # These strategies need non-None token_final_scales, so feed
+                # all-ones after folding the real weights into x.
+                if isinstance(moe.comm, (DeepEP, DeepEPLowLatency, NcclEP)):
                     token_final_scales = torch.ones_like(token_final_scales)
                 else:
                     token_final_scales = None
