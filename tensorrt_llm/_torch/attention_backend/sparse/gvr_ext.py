@@ -86,6 +86,16 @@ class GvrExtState:
         # exact width: the runner asserts shape == (rows, nrec), so a
         # wider reused buffer would trip it
         if self.block_max is None or self.block_max.shape[1] != nb4:
+            # max_seq_len is engine-static, so this allocates once on the
+            # first (eager warmup) step; allocating inside CUDA graph
+            # capture would bake a dangling address into the graph, so
+            # fail loudly instead of corrupting the capture.
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "GvrExtState.ensure_block_max: (re)allocation requested "
+                    "during CUDA graph capture; the block_max buffer must be "
+                    "created by a warmup step before capture"
+                )
             self.block_max = torch.zeros(
                 (self.max_rows, nb4), dtype=torch.float32, device=self.seed_row.device
             )
@@ -95,6 +105,10 @@ class GvrExtState:
         """Route this step: (tier to EMIT next, launch knobs to CONSUME
         what was emitted last step)."""
         emit_tier = plan_emission(batch, n_comp, self.top_k, have_epilogue=True)
+        if emit_tier == "list" and self.cand_vals is None:
+            # constructed with enable_list_tier=False: no candidate
+            # buffers to emit into, demote to the counts tier
+            emit_tier = "counts"
         route = pick_config(self.emitted_tier, batch, n_comp, self.top_k, num_sms)
         return emit_tier, route
 

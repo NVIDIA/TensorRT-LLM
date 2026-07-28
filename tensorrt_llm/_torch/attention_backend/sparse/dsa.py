@@ -2912,10 +2912,12 @@ class Indexer(nn.Module):
                     # the exact production path. prev_topk still holds
                     # the pre-op value here (copy-back is below). The
                     # min-seq guard skips warmup/dummy rows (n < K).
-                    if (os.environ.get("TRTLLM_GVR_DUMP")
-                            and getattr(self, "_gvr_dumped", 0) < 6
+                    # TRTLLM_GVR_DUMP holds the target directory.
+                    gvr_dump_dir = os.environ.get("TRTLLM_GVR_DUMP")
+                    if (gvr_dump_dir and getattr(self, "_gvr_dumped", 0) < 6
                             and int(seq_1d.min())
                             >= self.index_topk * self.compress_ratio):
+                        os.makedirs(gvr_dump_dir, exist_ok=True)
                         self._gvr_dumped = getattr(self, "_gvr_dumped", 0) + 1
                         torch.save(
                             {
@@ -2925,8 +2927,10 @@ class Indexer(nn.Module):
                                 st.prev_topk[:num_gen_tokens].clone().cpu(),
                                 "sel": out_slice.clone().cpu(),
                                 "layer": self.layer_idx,
-                            }, f"/tmp/siyid_e2e/dump_l{self.layer_idx}_"
-                            f"{self._gvr_dumped}.pt")
+                            },
+                            os.path.join(
+                                gvr_dump_dir, f"dump_l{self.layer_idx}_"
+                                f"{self._gvr_dumped}.pt"))
                     st.prev_topk[:num_gen_tokens].copy_(out_slice)
                 elif self.use_cute_dsl_topk and self._enable_heuristic_topk:
                     # GVR DSL: supports all compress_ratio and next_n values.

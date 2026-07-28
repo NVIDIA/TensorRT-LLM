@@ -7079,6 +7079,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"shape={tuple(order_row.shape)}")
             # emission-assisted tiers: mode from which ext tensors the
             # caller handed in (see gvr_routing.plan_emission)
+            if seed_thr is not None:
+                assert seed_thr.shape[1] == 3 or seed_thr.shape[1] >= 6, (
+                    "seed_thr width must be 3 (rungs) or >= 6 (packed "
+                    f"counts row); got {seed_thr.shape[1]} - refusing to "
+                    "silently ignore the seed")
             use_ext_counts = seed_thr is not None and seed_thr.shape[1] >= 6
             ext_rungs = seed_thr is not None and seed_thr.shape[1] == 3
             use_ext_cand = cand_vals is not None
@@ -8795,11 +8800,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # cand_idx_out = int32 positions (same width), cand_cur_out =
                 # int32 [rows, 4] cursors (caller-zeroed), cand_ctl_out =
                 # int32 [rows, 4] {n0, void, n1, n2} (caller-zeroed)
+                assert cand_out is not None, (
+                    "emit_cand_bucketed requires cand_out")
                 W = cand_out.shape[1]
                 assert (
-                    cand_out is not None and cand_out.dtype == torch.float32
-                    and cand_out.is_cuda and cand_out.is_contiguous()
-                    and cand_out.dim() == 2 and cand_out.shape[0] == B * next_n
+                    cand_out.dtype == torch.float32 and cand_out.is_cuda
+                    and cand_out.is_contiguous() and cand_out.dim() == 2
+                    and cand_out.shape[0] == B * next_n
                     and W > 2 * accept_cap), (
                         "bucketed requires cand_out fp32 [rows, 2*segA+capC]")
                 assert (cand_idx_out is not None

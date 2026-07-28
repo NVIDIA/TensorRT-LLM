@@ -1183,10 +1183,15 @@ def test_cute_dsl_gvr_topk_decode_degenerate_preidx(
         # beyond-kC flood is a known pre-existing limitation, see the
         # xfail test below)
         logits = (torch.rand(num_rows, N, device="cuda") * 0.5).to(dtype)
+        # tie class sized to 1.5*K so the case stays a genuine flood for
+        # every top_k parametrization (2*K would cover the whole row at
+        # top_k=2048/N=4096 and collapse into all_tied) while
+        # count(>= 1.0) = 1.75*K stays inside the candidate capacity
+        tie_n = top_k + top_k // 2
         for r in range(num_rows):
             perm = torch.randperm(N, device="cuda")
-            logits[r, perm[: top_k * 2]] = 1.0
-            logits[r, perm[top_k * 2 : top_k * 2 + top_k // 4]] = 2.0
+            logits[r, perm[:tie_n]] = 1.0
+            logits[r, perm[tie_n : tie_n + top_k // 4]] = 2.0
 
     if pre_mode == "zero":
         pre_idx = torch.zeros(num_rows, top_k, dtype=torch.int32, device="cuda")

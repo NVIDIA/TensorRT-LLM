@@ -42,14 +42,21 @@ from cutlass.utils.smem_allocator import SmemAllocator
 from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 from .block_scan import warp_scan
 
+
+def _env_flag(name: str) -> bool:
+    """Debug-knob parse that never raises at import time: any of
+    ""/0/false/off/no (case-insensitive) is False, everything else True."""
+    return os.environ.get(name, "0").strip().lower() not in ("", "0", "false", "off", "no")
+
+
 # Diagnostic knob: compile per-phase clock64 stamps of the list path
 # into the spare xstate slots (harness-side analysis). Off by default;
 # NEVER set in production.
-_P4_TAIL_DBG = bool(int(os.environ.get("GVR_P4_TAIL_DBG", "0")))
+_P4_TAIL_DBG = _env_flag("GVR_P4_TAIL_DBG")
 # P4 sub-phase clock64 breakdown -> xstate[1,2,4,5,6,7] (debug: clobbers
 # the closed-loop thr/anch publish; single-shot cells only, not chains)
-_P4_SUB_DBG = bool(int(os.environ.get("GVR_P4_SUB_DBG", "0")))
-_SKIP_DBG = bool(int(os.environ.get("GVR_SKIP_DBG", "0")))
+_P4_SUB_DBG = _env_flag("GVR_P4_SUB_DBG")
+_SKIP_DBG = _env_flag("GVR_SKIP_DBG")
 
 
 # ---------------------------------------------------------------------------
@@ -6960,6 +6967,16 @@ class GvrTopKKernel:
                     # tight lower bound of the true kth), [2] accepted
                     # threshold, [3] cand_count. The next step derives its
                     # seed rung group from these.
+                    if list_used == cutlass.Int32(1):
+                        # the anchor below reads output_indices_row[K-1],
+                        # written by peer threads in rank-scatter / tail
+                        # repair; not every exit of that phase ends in a
+                        # block barrier (the eager-position path dropped
+                        # the swap loop's trailing one), so publish
+                        # visibility explicitly. list_used is uniform
+                        # (admission is decided from shared control
+                        # words), so the barrier is block-safe.
+                        cute.arch.barrier()
                     if tidx == cutlass.Int32(0):
                         xstate_row[0] = cutlass.Float32(1.0)
                         thr_pub = s_thr[0]
