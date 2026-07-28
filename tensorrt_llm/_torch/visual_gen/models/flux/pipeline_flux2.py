@@ -111,7 +111,6 @@ class Flux2Pipeline(BasePipeline):
     """
 
     derive_output_size_from_reference = True
-    supports_image_edit = True
 
     # Hidden state layers per text encoder type (auto-detected at load time)
     _TEXT_ENCODER_CONFIG = {
