@@ -233,6 +233,17 @@ class ExternalCommMoEScheduler(MoEScheduler):
     def _is_using_nvlink_one_sided(self) -> bool:
         return isinstance(self.moe.comm, NVLinkOneSided)
 
+    def _use_cutedsl_deep_ep_direct_metadata(self, supports_post_quant: bool) -> bool:
+        """Whether the full adapter-free, count-native DeepEP path is supported."""
+        moe = self.moe
+        return (
+            isinstance(moe.comm, DeepEPLowLatency)
+            and moe.backend.__class__ == CuteDslFusedMoE
+            and not moe.backend.disable_deep_ep_direct_metadata
+            and moe.backend.has_nvfp4
+            and supports_post_quant
+        )
+
     # ------------------------------------------------------------------
     # DeepGemm workspace allocation
     # ------------------------------------------------------------------
@@ -478,6 +489,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 should_update_eplb_after_dispatch = True
 
         # ========== Step 5: Quantization + dispatch (pre/post-quant adaptive ordering) ==========
+        use_deep_ep_direct_metadata = False
         if moe.comm is not None:
             supports_post_quant = moe.comm.supports_post_quant_dispatch()
 
@@ -489,17 +501,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
             if isinstance(moe.comm, DeepEP) and isinstance(moe.backend, TRTLLMGenFusedMoE):
                 dispatch_kwargs["enable_sanitize_expert_ids"] = True
             if isinstance(moe.comm, DeepEPLowLatency) and moe.backend.__class__ == CuteDslFusedMoE:
-                remove_adapter = moe.backend.enable_deep_ep_remove_adapter
-                if remove_adapter and not moe.backend.has_nvfp4:
-                    raise ValueError("The adapter-free DeepEP CuteDSL path supports only NVFP4")
-                if remove_adapter and not supports_post_quant:
-                    raise ValueError(
-                        "The adapter-free DeepEP CuteDSL path requires post-quant dispatch"
-                    )
-                dispatch_kwargs["use_direct_expert_metadata"] = (
-                    moe.backend.enable_deep_ep_direct_metadata
+                use_deep_ep_direct_metadata = self._use_cutedsl_deep_ep_direct_metadata(
+                    supports_post_quant
                 )
-                dispatch_kwargs["remove_adapter"] = remove_adapter
+                dispatch_kwargs["use_direct_expert_metadata"] = use_deep_ep_direct_metadata
+                dispatch_kwargs["remove_adapter"] = use_deep_ep_direct_metadata
 
             if supports_post_quant:
                 # Quantize -> Dispatch
@@ -553,6 +559,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 x,
                 workspace,
                 lora_params=lora_params,
+                use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
             ),
         )
 
@@ -780,6 +787,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         x: Optional[torch.Tensor] = None,
         workspace: Optional[dict] = None,
         lora_params: Optional[Dict] = None,
+        use_deep_ep_direct_metadata: bool = False,
     ) -> Dict:
         """Backend-specific kwargs for ``backend.run_moe`` (external-comm only).
 
@@ -831,6 +839,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 recv_expert_count, expert_capacity = moe.comm.get_expert_major_dispatch_metadata()
                 kwargs["recv_expert_count"] = recv_expert_count
                 kwargs["deep_ep_expert_capacity"] = expert_capacity
+                kwargs["use_deep_ep_direct_metadata"] = use_deep_ep_direct_metadata
 
         elif moe.backend.__class__ == DeepGemmFusedMoE:
             if workspace is not None:
