@@ -411,10 +411,11 @@ class MultimodalModelMixin:
             raise ValueError(f"Missing multimodal item reference for index {item_idx}")
         modality, local_idx = item_refs[item_idx]
         modality_data = multimodal_data.get(modality)
-        if modality_data is None:
-            raise ValueError(f"Missing {modality} encoder data for item {item_idx}")
         if not isinstance(modality_data, dict):
-            raise TypeError(f"{modality} encoder data must be a dict")
+            raise ValueError(
+                f"Missing or malformed {modality} encoder data for item "
+                f"{item_idx}: expected a dict, got {type(modality_data).__name__}"
+            )
 
         selected_data: Dict[str, Any] = {}
         grid_key = (
@@ -462,7 +463,7 @@ class MultimodalModelMixin:
         """Build selected item encoder inputs before the caller performs H2D.
 
         Args:
-            selected_items: ``(request params, item index)`` pairs in
+            selected_items: `(request params, item index)` pairs in
                 scheduler-selected order. Each params object must contain
                 parallel item references and embedding lengths.
 
@@ -496,7 +497,7 @@ class MultimodalModelMixin:
 
         Args:
             encoder_inputs: Tuples returned by
-                :meth:`prepare_multimodal_encoder_inputs`. Consecutive inputs
+                `prepare_multimodal_encoder_inputs`. Consecutive inputs
                 with the same modality must be batch-compatible.
 
         Returns:
@@ -1144,13 +1145,8 @@ class MultimodalModelMixin:
         embedding_length: int,
         kwargs_hash: str,
     ) -> Hashable:
-        """Build the cache key of one atomic item.
-
-        The single source of the key format: the full-request path
-        (`_encoder_cache_keys`) and the item-scheduling path
-        (`build_encoder_cache_item_keys`) produce identical keys so entries
-        written by either path hit from the other.
-        """
+        # Sole definition of the key format, so entries written by the
+        # full-request path and the item-scheduling path hit from either.
         return (modality, tuple(item_hash), int(embedding_length), kwargs_hash)
 
     @classmethod
@@ -1163,18 +1159,22 @@ class MultimodalModelMixin:
     ) -> Optional[list[Hashable]]:
         """Build per-item cache keys from request-level item metadata.
 
-        Unlike `_encoder_cache_keys`, the modality comes from each item's
-        `item_refs` entry, so mixed-modality requests are keyable per item.
-        Returns `None` when the request cannot participate in the cache
-        (missing hashes or kwargs hash, or item counts that do not line up).
+        The modality comes from each item's `item_refs` entry, so
+        mixed-modality requests are keyable per item. Returns `None` when the
+        request cannot participate in the cache (missing hashes or kwargs
+        hash, or item counts that do not line up).
         """
         if multimodal_hashes is None or kwargs_hash is None:
             return None
         if not (len(multimodal_hashes) == len(item_refs) == len(embedding_lengths)):
-            logger.debug(
-                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping item keys with "
-                "mismatched multimodal_hashes, item_refs, and "
-                "multimodal_embedding_lengths counts"
+            # Malformed metadata rather than a normal miss: the request loses
+            # cache participation silently, so say so once with the counts.
+            logger.warning_once(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping item keys because "
+                f"multimodal_hashes ({len(multimodal_hashes)}), item_refs "
+                f"({len(item_refs)}) and multimodal_embedding_lengths "
+                f"({len(embedding_lengths)}) counts disagree",
+                key="mm_encoder_cache_item_key_count_mismatch",
             )
             return None
         return [
