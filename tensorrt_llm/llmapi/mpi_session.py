@@ -220,6 +220,35 @@ def _process_start_time(pid: int) -> Optional[bytes]:
         return None
 
 
+_DEFAULT_IDENTITY_TIMEOUT = 300.0
+
+
+def _identity_barrier_timeout() -> float:
+    """Deadline for the ``wait_shutdown`` worker-identity barrier, in seconds.
+
+    The barrier itself completes in milliseconds, but it is the first work ever
+    submitted to a freshly built ``MPIPoolExecutor``, and mpi4py spawns lazily
+    from its manager thread — so this deadline really bounds the whole worker
+    bootstrap: process spawn plus ``import tensorrt_llm``, measured at ~50-65s
+    on an idle node and up to ~117s on a contended one (see
+    ``tests/test_common/session_prefetcher.py``, which budgets 180s for the
+    same work). Hence a ceiling sized against bootstrap cost rather than
+    barrier latency. ``TRTLLM_MPI_IDENTITY_TIMEOUT`` overrides it.
+    """
+    raw = os.environ.get("TRTLLM_MPI_IDENTITY_TIMEOUT")
+    if not raw:
+        return _DEFAULT_IDENTITY_TIMEOUT
+    try:
+        value = float(raw)
+        if value > 0:  # also rejects NaN, which no comparison accepts
+            return value
+    except ValueError:
+        pass
+    logger.warning(f"Ignoring invalid TRTLLM_MPI_IDENTITY_TIMEOUT={raw!r}; "
+                   f"using {_DEFAULT_IDENTITY_TIMEOUT}s")
+    return _DEFAULT_IDENTITY_TIMEOUT
+
+
 def _worker_identity_barrier():
     """Runs inside a pool worker; module-level so it is picklable.
 
@@ -315,12 +344,13 @@ class MpiPoolSession(MpiSession):
         cancel the pending tasks). Instead of handing out such a pool, tear
         it down and raise; callers fall back to a fresh spawn.
         """
+        timeout = _identity_barrier_timeout()
         try:
             futures = [
                 self.mpi_pool.submit(_worker_identity_barrier)
                 for _ in range(self.n_workers)
             ]
-            done, not_done = futures_wait(futures, timeout=60.0)
+            done, not_done = futures_wait(futures, timeout=timeout)
             identities = tuple(f.result() for f in done)
         except Exception as e:
             self._teardown_unidentified_pool(())
@@ -336,7 +366,9 @@ class MpiPoolSession(MpiSession):
                 "MpiPoolSession(wait_shutdown=True): worker identity "
                 f"collection incomplete ({len(identities)}/{self.n_workers} "
                 "valid identities); pool torn down instead of handing out a "
-                "session that cannot honor the wait_shutdown contract")
+                "session that cannot honor the wait_shutdown contract. Raise "
+                "TRTLLM_MPI_IDENTITY_TIMEOUT if worker bootstrap is merely "
+                f"slow (deadline was {timeout}s)")
         return identities
 
     def _teardown_unidentified_pool(self, partial_identities: Tuple) -> None:
