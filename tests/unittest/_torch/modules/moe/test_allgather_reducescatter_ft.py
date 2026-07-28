@@ -36,6 +36,7 @@ def _enable_and_clear_nccl_survivor_membership(monkeypatch):
     monkeypatch.setattr(torch_custom_ops, "NCCL_FAULT_TOLERANCE_ENABLED", True)
     monkeypatch.setattr(allgather_rs_module, "NCCL_FAULT_TOLERANCE_ENABLED", True)
     monkeypatch.setattr(linear_module, "NCCL_FAULT_TOLERANCE_ENABLED", True)
+    monkeypatch.setattr(embedding_module, "NCCL_FAULT_TOLERANCE_ENABLED", True)
     nccl_fault_tolerance._reset_nccl_group_registry_for_tests()
     yield
     nccl_fault_tolerance._reset_nccl_group_registry_for_tests()
@@ -178,6 +179,108 @@ def test_reconfiguration_is_shared_and_idempotent_across_moe_layers(monkeypatch)
     _assert_active_mapping(second_layer._active_mapping, [4, 6, 7], 1)
 
 
+def test_completed_generation_is_idempotent_through_survivor_alias(monkeypatch):
+    calls = []
+    _patch_reinit_op(
+        monkeypatch,
+        lambda group, active_group, rendezvous_id: calls.append(
+            (list(group), list(active_group), rendezvous_id)
+        ),
+    )
+    original_layer = AllGatherReduceScatter(_FakeMapping())
+    alias_layer = AllGatherReduceScatter(
+        _FakeMapping(
+            tp_size=3,
+            tp_rank=1,
+            moe_ep_size=3,
+            moe_ep_rank=1,
+            _group=[4, 6, 7],
+        )
+    )
+
+    original_layer.abort_and_reinit([4, 6, 7], generation=7)
+    alias_layer.abort_and_reinit([4, 6, 7], generation=7)
+
+    assert calls == [([4, 5, 6, 7], [4, 6, 7], 9)]
+    _assert_active_mapping(alias_layer._active_mapping, [4, 6, 7], 1)
+
+
+def test_failed_generation_is_reserved_through_survivor_alias(monkeypatch):
+    calls = []
+
+    def fail_first_attempt(group, active_group, rendezvous_id):
+        calls.append((list(group), list(active_group), rendezvous_id))
+        if len(calls) == 1:
+            raise RuntimeError("injected asymmetric native failure")
+
+    _patch_reinit_op(monkeypatch, fail_first_attempt)
+    original_layer = AllGatherReduceScatter(_FakeMapping())
+    alias_layer = AllGatherReduceScatter(
+        _FakeMapping(
+            tp_size=3,
+            tp_rank=1,
+            moe_ep_size=3,
+            moe_ep_rank=1,
+            _group=[4, 6, 7],
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="injected asymmetric native failure"):
+        original_layer.abort_and_reinit([4, 6, 7], generation=7)
+    with pytest.raises(RuntimeError, match="already been attempted"):
+        alias_layer.abort_and_reinit([4, 6, 7], generation=7)
+    for group in ([4, 5, 6, 7], [4, 6, 7]):
+        with pytest.raises(RuntimeError, match="did not complete"):
+            nccl_fault_tolerance.resolve_nccl_group(group)
+        with pytest.raises(RuntimeError, match="did not complete"):
+            nccl_fault_tolerance.assert_nccl_group_not_reconfigured(group, "test collective")
+        assert nccl_fault_tolerance.is_nccl_group_reconfigured(group)
+
+    alias_layer.abort_and_reinit([4, 6, 7], generation=8)
+
+    assert calls == [
+        ([4, 5, 6, 7], [4, 6, 7], 9),
+        ([4, 5, 6, 7], [4, 6, 7], 10),
+    ]
+    assert nccl_fault_tolerance.resolve_nccl_group([4, 5, 6, 7]) == [4, 6, 7]
+    assert nccl_fault_tolerance.resolve_nccl_group([4, 6, 7]) == [4, 6, 7]
+    assert not nccl_fault_tolerance.is_nccl_group_reconfigured([4, 6, 7])
+
+
+def test_later_alias_reconfiguration_updates_the_whole_lineage(monkeypatch):
+    calls = []
+    _patch_reinit_op(
+        monkeypatch,
+        lambda group, active_group, rendezvous_id: calls.append(
+            (list(group), list(active_group), rendezvous_id)
+        ),
+    )
+    original_layer = AllGatherReduceScatter(_FakeMapping())
+    alias_layer = AllGatherReduceScatter(
+        _FakeMapping(
+            tp_size=3,
+            tp_rank=1,
+            moe_ep_size=3,
+            moe_ep_rank=1,
+            _group=[4, 6, 7],
+        )
+    )
+
+    original_layer.abort_and_reinit([4, 6, 7], generation=7)
+    alias_layer.abort_and_reinit([6, 7], generation=8)
+    original_layer.abort_and_reinit([6, 7], generation=7)
+    alias_layer.abort_and_reinit([6, 7], generation=7)
+
+    assert calls == [
+        ([4, 5, 6, 7], [4, 6, 7], 9),
+        ([4, 6, 7], [6, 7], 10),
+    ]
+    assert nccl_fault_tolerance.resolve_nccl_group([4, 5, 6, 7]) == [6, 7]
+    assert nccl_fault_tolerance.resolve_nccl_group([4, 6, 7]) == [6, 7]
+    _assert_active_mapping(original_layer._active_mapping, [6, 7], 0)
+    _assert_active_mapping(alias_layer._active_mapping, [6, 7], 0)
+
+
 def test_reconfiguration_transaction_serializes_same_target(monkeypatch):
     entered_native = threading.Event()
     release_native = threading.Event()
@@ -248,7 +351,7 @@ def test_same_membership_recovery_requires_shared_generation(monkeypatch):
     assert calls == []
 
 
-@pytest.mark.parametrize("generation", [-1, 1.5, (1 << 63) - 2])
+@pytest.mark.parametrize("generation", [-1, True, 1.0, 1.5, (1 << 63) - 2])
 def test_raw_recovery_generation_must_fit_reserved_torch_int_range(monkeypatch, generation):
     calls = []
     _patch_reinit_op(
@@ -260,6 +363,30 @@ def test_raw_recovery_generation_must_fit_reserved_torch_int_range(monkeypatch, 
 
     with pytest.raises(ValueError, match="generation must be a nonnegative integer"):
         AllGatherReduceScatter(_FakeMapping()).abort_and_reinit([4, 6, 7], generation=generation)
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "active_ranks",
+    [
+        pytest.param([4, True, 7], id="bool"),
+        pytest.param([4, 6.0, 7], id="integral-float"),
+        pytest.param([4, 6.5, 7], id="fractional-float"),
+        pytest.param([4, "6", 7], id="string"),
+    ],
+)
+def test_raw_recovery_rejects_non_integral_rank_values(monkeypatch, active_ranks):
+    calls = []
+    _patch_reinit_op(
+        monkeypatch,
+        lambda group, active_group, rendezvous_id: calls.append(
+            (group, active_group, rendezvous_id)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="active_ranks entries must be an integer"):
+        AllGatherReduceScatter(_FakeMapping()).abort_and_reinit(active_ranks, generation=1)
 
     assert calls == []
 
@@ -277,6 +404,40 @@ def test_generation_rejects_conflicting_raw_recovery_targets(monkeypatch):
         comm.abort_and_reinit([6, 7], generation=9)
 
     assert calls == [([4, 5, 6, 7], [4, 6, 7])]
+
+
+@pytest.mark.parametrize(
+    ("failed_generation", "retry_generation", "expected_rendezvous_ids"),
+    [
+        pytest.param(None, 0, [1, 2], id="legacy-first-attempt"),
+        pytest.param(4, 5, [6, 7], id="explicit-generation"),
+    ],
+)
+def test_failed_raw_recovery_requires_a_new_wire_generation(
+    monkeypatch,
+    failed_generation,
+    retry_generation,
+    expected_rendezvous_ids,
+):
+    calls = []
+
+    def fail_one_survivor_then_succeed(group, active_group, rendezvous_id):
+        calls.append((list(group), list(active_group), rendezvous_id))
+        if len(calls) == 1:
+            raise RuntimeError("injected asymmetric native failure")
+
+    _patch_reinit_op(monkeypatch, fail_one_survivor_then_succeed)
+    comm = AllGatherReduceScatter(_FakeMapping())
+
+    with pytest.raises(RuntimeError, match="injected asymmetric native failure"):
+        comm.abort_and_reinit([4, 6, 7], generation=failed_generation)
+    with pytest.raises(RuntimeError, match="generation.*(required|attempted)"):
+        comm.abort_and_reinit([4, 6, 7], generation=failed_generation)
+
+    comm.abort_and_reinit([4, 6, 7], generation=retry_generation)
+
+    assert [rendezvous_id for _, _, rendezvous_id in calls] == expected_rendezvous_ids
+    _assert_active_mapping(comm._active_mapping, [4, 6, 7], 1)
 
 
 def test_fault_tolerance_control_path_requires_startup_mode(monkeypatch):
@@ -484,6 +645,20 @@ def test_ft_custom_allreduce_helpers_fail_before_workspace_allocation(monkeypatc
     )
     with pytest.raises(RuntimeError, match="userbuffers allreduce"):
         distributed_ops.userbuffers_allreduce_finalize(distributed_ops.torch.ones(1))
+
+
+def test_ft_helix_mnnvl_alltoall_fails_before_workspace_initialization(monkeypatch):
+    monkeypatch.setattr(distributed_ops, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(
+        distributed_ops.MnnvlMemory,
+        "initialize",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("unsupported FT Helix path initialized MNNVL")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Helix MNNVL alltoall.*unavailable"):
+        distributed_ops.HelixAllToAllNative.get(_FakeMapping())
 
 
 def test_ft_disables_fused_nvfp4_gemm_allreduce(monkeypatch):
@@ -780,6 +955,29 @@ def test_reconfigured_column_linear_without_gather_fails_before_gemm(monkeypatch
     assert calls == []
 
 
+def test_reconfigured_row_embedding_without_gather_fails_before_lookup(monkeypatch):
+    _patch_reinit_op(monkeypatch, lambda group, active_group, rendezvous_id: None)
+    AllGatherReduceScatter(_FakeMapping()).abort_and_reinit([6, 7])
+    calls = []
+
+    monkeypatch.setattr(embedding_module, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(
+        embedding_module,
+        "pre_comm_embedding_ops",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    class FakeRowEmbedding:
+        tp_mode = TensorParallelMode.ROW
+        _tp_group_tuple = (4, 5, 6, 7)
+        tp_size = 4
+        gather_output = False
+
+    with pytest.raises(RuntimeError, match="statically sharded|redistribute"):
+        embedding_module.Embedding.forward(FakeRowEmbedding(), distributed_ops.torch.tensor([0]))
+    assert calls == []
+
+
 def test_dispatch_and_combine_filter_sizes_to_active_ranks(monkeypatch):
     _patch_reinit_op(monkeypatch, lambda group, active_group, rendezvous_id: None)
     gather_calls = []
@@ -880,8 +1078,8 @@ def test_later_reconfiguration_replaces_active_rank_filter(monkeypatch):
     monkeypatch.setattr(allgather_rs_module, "allgather", fake_allgather)
 
     comm = AllGatherReduceScatter(_FakeMapping())
-    comm.abort_and_reinit([4, 6, 7])
-    comm.abort_and_reinit([6, 7])
+    comm.abort_and_reinit([4, 6, 7], generation=1)
+    comm.abort_and_reinit([6, 7], generation=2)
     comm.dispatch("hidden", None, "slots", None, [5, 7, 11, 13])
 
     assert calls == [
@@ -930,3 +1128,5 @@ def test_failed_reinit_does_not_commit_active_rank_filter(monkeypatch):
     assert comm._active_local_ranks is old_local_ranks
     assert comm._active_global_group is old_global_group
     assert comm._active_mapping is old_mapping
+    with pytest.raises(RuntimeError, match="did not complete"):
+        comm.dispatch("hidden", None, "slots", None, [5, 7, 11, 13])

@@ -413,7 +413,7 @@ ncclComm_t NcclCommunicator::createLegacyComm(int worldSize, int rank, mpi::MpiC
         _putenv_s("NCCL_RUNTIME_CONNECT", "0");
 #else
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
-    if (getenv("NCCL_NVLS_ENABLE") == nullptr && !ipcNvlsSupported())
+    if (getenv("NCCL_NVLS_ENABLE") == nullptr && !ipcNvlsFabricUsable())
     {
         setenv("NCCL_NVLS_ENABLE", "0", 0);
     }

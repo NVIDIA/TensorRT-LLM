@@ -954,7 +954,7 @@ TEST(NcclUniqueIdRendezvousTest, PipelineCommunicatorRebuildRunsPostRecoverySend
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&deviceValue), sizeof(*deviceValue)), cudaSuccess);
     int hostValue = rank == survivorRanks.front() ? 0x1a07 : 0;
     ASSERT_EQ(cudaMemcpy(deviceValue, &hostValue, sizeof(hostValue), cudaMemcpyHostToDevice), cudaSuccess);
-    auto buffer = tensorrt_llm::runtime::IBuffer::wrap(deviceValue, nvinfer1::DataType::kINT32, 1);
+    auto buffer = tensorrt_llm::runtime::IBuffer::wrap(deviceValue, tensorrt_llm::DataType::kINT32, 1);
     tensorrt_llm::runtime::CudaStream stream;
 
     if (rank == survivorRanks.front())

@@ -442,6 +442,11 @@ class HelixAllToAllNative:
         Returns:
             Cached or newly-created HelixAllToAllNative instance
         """
+        if NCCL_FAULT_TOLERANCE_ENABLED and not mpi_disabled():
+            raise RuntimeError(
+                "NCCL error: Helix MNNVL alltoall has no peer-failure "
+                "abort or survivor-rebuild path and is unavailable while "
+                "TLLM_FAULT_TOLERANCE_MODE=1")
         if mapping not in HelixAllToAllNative._cache:
             logger.info(
                 f"Rank {mapping.cp_rank} initializing HelixCpMnnvlMemory for Helix"

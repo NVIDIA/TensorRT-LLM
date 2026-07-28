@@ -8,12 +8,15 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
 from ..distributed import AllReduce, allgather
+from ..distributed.nccl_fault_tolerance import (
+    NCCL_FAULT_TOLERANCE_ENABLED, assert_nccl_group_not_reconfigured)
 from .linear import Linear, TensorParallelMode
 
 
@@ -304,6 +307,13 @@ class Embedding(LMHead):
             self.vocab_end_index = num_embeddings
 
     def forward(self, input):
+        if (NCCL_FAULT_TOLERANCE_ENABLED and self.tp_mode
+                in (TensorParallelMode.ROW, TensorParallelMode.COLUMN)
+                and self.tp_size > 1 and not mpi_disabled()):
+            assert_nccl_group_not_reconfigured(
+                self._tp_group_tuple,
+                f"{self.tp_mode.name.lower()}-parallel embedding")
+
         if self.tp_size > 1:
             # Run the ops before all_reduce/all_gather.
             # We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.

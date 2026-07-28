@@ -28,6 +28,7 @@ import torch
 from tensorrt_llm._torch.distributed import allgather, reducescatter
 from tensorrt_llm._torch.distributed.nccl_fault_tolerance import (
     NCCL_FAULT_TOLERANCE_ENABLED,
+    _canonical_group,
     reconfigure_nccl_group,
     resolve_nccl_group,
 )
@@ -124,11 +125,8 @@ class AllGatherReduceScatter(Communication):
                 "ProcessGroup reconstruction is not implemented"
             )
 
-        if not active_ranks:
-            raise ValueError("active_ranks must not be empty")
-        if len(active_ranks) != len(set(active_ranks)):
-            raise ValueError("active_ranks must not contain duplicates")
-        requested = {int(rank) for rank in active_ranks}
+        canonical_ranks = _canonical_group(active_ranks, "active_ranks")
+        requested = set(canonical_ranks)
         if not requested.issubset(self._original_group):
             raise ValueError(
                 "active_ranks must be global ranks from the original TP group "

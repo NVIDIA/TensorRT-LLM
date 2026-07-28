@@ -23,8 +23,8 @@ except Exception:
 from tensorrt_llm._mnnvl_utils import (get_helix_cp_mnnvl_topology,
                                        init_helix_cp_comm)
 from tensorrt_llm._torch.distributed.nccl_fault_tolerance import (
-    NCCL_FAULT_TOLERANCE_ENABLED, _canonical_recovery_generation,
-    _recovery_rendezvous_id)
+    NCCL_FAULT_TOLERANCE_ENABLED, _canonical_group,
+    _canonical_recovery_generation, _recovery_rendezvous_id)
 from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
                                  mpi_comm, mpi_disabled, mpi_isend,
                                  mpi_isend_object, mpi_recv, mpi_recv_object,
@@ -1196,6 +1196,8 @@ class PPCommNCCL:
         self._reconfigure_lock = threading.Lock()
         self._reconfigure_generation = 0
         self._completed_recovery = None
+        self._latest_recovery_attempt = None
+        self._unavailable_recovery_attempt = None
         self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
             self.mapping.world_size,
             self.mapping.rank,
@@ -1234,14 +1236,26 @@ class PPCommNCCL:
 
     def rebind(self, mapping: Mapping) -> None:
         """Refresh routing for a sequential engine on the same native comm."""
-        if not self.is_native_compatible(mapping):
+        topology = self._mapping_topology(mapping)
+        if self._topology[:2] != topology[:2]:
             raise RuntimeError(
                 "NCCL error: cannot rebind a communicator to a different "
                 "world size or rank")
         self.mapping = mapping
-        self._topology = self._mapping_topology(mapping)
+        self._topology = topology
 
     def _validate_peer(self, peer: int) -> int:
+        unavailable = self._unavailable_recovery_attempt
+        if unavailable is not None:
+            generation, requested = unavailable
+            generation_description = ("legacy generation" if generation is None
+                                      else f"generation {generation}")
+            raise RuntimeError(
+                "NCCL error: PP communicator recovery "
+                f"{generation_description} to {list(requested)} did not "
+                "complete; advance the coordinator generation and "
+                "successfully rebuild the communicator before resuming "
+                "communication")
         peer = int(peer)
         if peer not in self._topology[2]:
             raise RuntimeError(
@@ -1325,11 +1339,8 @@ class PPCommNCCL:
         failure must use a newly advanced generation so stale rendezvous traffic
         cannot pair different recovery attempts.
         """
-        canonical_ranks = tuple(sorted(int(rank) for rank in active_ranks))
-        if not canonical_ranks:
-            raise ValueError("active_ranks must not be empty")
-        if len(canonical_ranks) != len(set(canonical_ranks)):
-            raise ValueError("active_ranks must not contain duplicates")
+        canonical_ranks = tuple(
+            sorted(_canonical_group(active_ranks, "active_ranks")))
         if self.mapping.rank not in canonical_ranks:
             raise ValueError(
                 f"current world rank {self.mapping.rank} is not active")
@@ -1344,7 +1355,8 @@ class PPCommNCCL:
             current_ranks = tuple(
                 int(rank) for rank in self.nccl_comm.get_active_ranks())
             self._active_ranks = current_ranks
-            if generation is not None and self._completed_recovery is not None:
+            if (generation is not None and self._completed_recovery is not None
+                    and self._unavailable_recovery_attempt is None):
                 completed_generation, completed_target = self._completed_recovery
                 if generation < completed_generation:
                     return
@@ -1365,19 +1377,49 @@ class PPCommNCCL:
                 raise ValueError(
                     "abort_and_reinit cannot reactivate a removed rank")
 
+            latest_attempt = self._latest_recovery_attempt
+            if latest_attempt is not None:
+                attempted_generation, attempted_target = latest_attempt
+                if generation is None:
+                    raise RuntimeError(
+                        "NCCL error: generation is required after a previous "
+                        "PP communicator recovery attempt; advance the "
+                        "coordinator generation before retrying")
+                if attempted_generation is not None and generation <= attempted_generation:
+                    if generation == attempted_generation and canonical_ranks != attempted_target:
+                        raise RuntimeError(
+                            "NCCL error: conflicting PP communicator recovery "
+                            f"target for generation {generation}: attempted "
+                            f"{list(attempted_target)}, requested {list(canonical_ranks)}"
+                        )
+                    raise RuntimeError(
+                        "NCCL error: PP communicator recovery generation "
+                        f"{generation} has already been attempted or is stale; "
+                        f"use a generation greater than {attempted_generation}")
+
+            # A native failure may leave only some survivors past rendezvous.
+            # Reserve the wire namespace before entering native code and never
+            # reuse it after an exception. Poison data-plane use before native
+            # entry because an asymmetric failure can leave survivors holding
+            # different, aborted, or partially rebuilt communicators.
+            self._latest_recovery_attempt = (generation, canonical_ranks)
+            self._unavailable_recovery_attempt = (generation, canonical_ranks)
             self.nccl_comm.abort_and_reinit(list(canonical_ranks),
                                             rendezvous_id)
             native_ranks = tuple(
                 int(rank) for rank in self.nccl_comm.get_active_ranks())
             self._active_ranks = native_ranks
-            self._reconfigure_generation += 1
             if native_ranks != canonical_ranks:
                 raise RuntimeError(
                     "NCCL error: rebuilt PP communicator returned unexpected "
                     f"membership {list(native_ranks)}; expected {list(canonical_ranks)}"
                 )
+            self._reconfigure_generation += 1
             if generation is not None:
                 self._completed_recovery = (generation, canonical_ranks)
+            # Publish validated membership and completion metadata before
+            # unblocking send/recv.
+            self._unavailable_recovery_attempt = None
 
     def get_async_error(self) -> str:
         """Return the C++ wrapper's latched NCCL abort/error reason, if any."""
@@ -1467,11 +1509,17 @@ def init_pp_comm(mapping):
         try:
             init_helix_cp_comm(mapping)
         except Exception:
-            if created and _pp_comm_refcount == 0:
+            if (created and _pp_comm_refcount == 0
+                    and isinstance(_pp_comm, PPCommTorch)):
                 _pp_comm = None
+            # Keep a newly-created NCCL wrapper even when this engine fails to
+            # acquire its Helix companion. Its native WORLD communicator is a
+            # process-lifetime resource: dropping the sole Python reference
+            # here could run collective ncclCommDestroy on only this rank.
+            # Refcount remains zero, so a later sequential engine can retry
+            # Helix initialization and rebind routing transactionally.
             raise
-        if (isinstance(_pp_comm, PPCommNCCL)
-                and _pp_comm_refcount == 0
+        if (isinstance(_pp_comm, PPCommNCCL) and _pp_comm_refcount == 0
                 and not _pp_comm.is_compatible(mapping)):
             # The native communicator is a process-lifetime WORLD
             # communicator and is independent of the PP/TP/EP layout. A

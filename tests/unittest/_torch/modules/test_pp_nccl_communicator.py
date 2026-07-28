@@ -106,6 +106,8 @@ def _make_pp_comm(mapping=None):
     pp_comm._reconfigure_lock = threading.Lock()
     pp_comm._reconfigure_generation = 0
     pp_comm._completed_recovery = None
+    pp_comm._latest_recovery_attempt = None
+    pp_comm._unavailable_recovery_attempt = None
     pp_comm.nccl_comm = _FakeNcclCommunicatorOp()
     return pp_comm
 
@@ -285,12 +287,30 @@ def test_same_membership_recovery_requires_shared_generation():
     assert pp_comm.nccl_comm.reinit_calls == []
 
 
-@pytest.mark.parametrize("generation", [-1, 1.5, (1 << 63) - 2])
+@pytest.mark.parametrize("generation", [-1, True, 1.0, 1.5, (1 << 63) - 2])
 def test_recovery_generation_must_fit_reserved_torch_int_range(generation):
     pp_comm = _make_pp_comm()
 
     with pytest.raises(ValueError, match="generation must be a nonnegative integer"):
         pp_comm.abort_and_reinit([0, 2, 3], generation=generation)
+
+    assert pp_comm.nccl_comm.reinit_calls == []
+
+
+@pytest.mark.parametrize(
+    "active_ranks",
+    [
+        pytest.param([0, True, 3], id="bool"),
+        pytest.param([0, 2.0, 3], id="integral-float"),
+        pytest.param([0, 2.5, 3], id="fractional-float"),
+        pytest.param([0, "2", 3], id="string"),
+    ],
+)
+def test_pp_recovery_rejects_non_integral_rank_values(active_ranks):
+    pp_comm = _make_pp_comm()
+
+    with pytest.raises(ValueError, match="active_ranks entries must be an integer"):
+        pp_comm.abort_and_reinit(active_ranks, generation=1)
 
     assert pp_comm.nccl_comm.reinit_calls == []
 
@@ -303,6 +323,126 @@ def test_generation_rejects_conflicting_pp_recovery_targets():
         pp_comm.abort_and_reinit([0, 2], generation=7)
 
     assert pp_comm.nccl_comm.reinit_calls == [[0, 2, 3]]
+
+
+@pytest.mark.parametrize(
+    ("failed_generation", "retry_generation", "expected_rendezvous_ids"),
+    [
+        pytest.param(None, 0, [1, 2], id="legacy-first-attempt"),
+        pytest.param(4, 5, [6, 7], id="explicit-generation"),
+    ],
+)
+def test_failed_pp_recovery_requires_a_new_wire_generation(
+    failed_generation,
+    retry_generation,
+    expected_rendezvous_ids,
+):
+    pp_comm = _make_pp_comm()
+    calls = []
+
+    def fail_one_survivor_then_succeed(active_ranks, rendezvous_id):
+        calls.append((list(active_ranks), rendezvous_id))
+        if len(calls) == 1:
+            raise RuntimeError("injected asymmetric native failure")
+        pp_comm.nccl_comm.active_ranks = list(active_ranks)
+
+    pp_comm.nccl_comm.abort_and_reinit = fail_one_survivor_then_succeed
+
+    with pytest.raises(RuntimeError, match="injected asymmetric native failure"):
+        pp_comm.abort_and_reinit([0, 2, 3], generation=failed_generation)
+    with pytest.raises(RuntimeError, match="generation.*(required|attempted)"):
+        pp_comm.abort_and_reinit([0, 2, 3], generation=failed_generation)
+
+    pp_comm.abort_and_reinit([0, 2, 3], generation=retry_generation)
+
+    assert [rendezvous_id for _, rendezvous_id in calls] == expected_rendezvous_ids
+    assert pp_comm.get_active_ranks() == [0, 2, 3]
+
+
+def test_completed_pp_generation_is_not_reported_successful_while_retry_is_incomplete():
+    pp_comm = _make_pp_comm()
+    pp_comm.abort_and_reinit([0, 2, 3], generation=4)
+
+    def fail_later_rebuild(_active_ranks, _rendezvous_id):
+        raise RuntimeError("injected later native failure")
+
+    pp_comm.nccl_comm.abort_and_reinit = fail_later_rebuild
+
+    with pytest.raises(RuntimeError, match="injected later native failure"):
+        pp_comm.abort_and_reinit([0, 2, 3], generation=5)
+    with pytest.raises(RuntimeError, match="already been attempted or is stale"):
+        pp_comm.abort_and_reinit([0, 2, 3], generation=4)
+
+
+@pytest.mark.parametrize(
+    ("operation", "peer_argument"),
+    [
+        pytest.param("send", {"dest": 3}, id="send"),
+        pytest.param("recv", {"src": 3}, id="recv"),
+    ],
+)
+def test_failed_pp_recovery_blocks_data_plane_until_retry_succeeds(
+    monkeypatch,
+    operation,
+    peer_argument,
+):
+    pp_comm = _make_pp_comm()
+    rebuild_calls = []
+    data_plane_calls = []
+
+    def fail_first_rebuild(active_ranks, rendezvous_id):
+        rebuild_calls.append((list(active_ranks), rendezvous_id))
+        if len(rebuild_calls) == 1:
+            raise RuntimeError("injected asymmetric native failure")
+        pp_comm.nccl_comm.active_ranks = list(active_ranks)
+
+    pp_comm.nccl_comm.abort_and_reinit = fail_first_rebuild
+    pp_comm.nccl_comm.send = lambda tensor, dest: data_plane_calls.append(("send", dest))
+    pp_comm.nccl_comm.recv = lambda tensor, src: data_plane_calls.append(("recv", src))
+    monkeypatch.setattr(
+        communicator_module.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: True,
+    )
+
+    with pytest.raises(RuntimeError, match="injected asymmetric native failure"):
+        pp_comm.abort_and_reinit([0, 2, 3], generation=4)
+
+    with pytest.raises(RuntimeError, match="did not complete"):
+        getattr(pp_comm, operation)(object(), **peer_argument)
+    assert data_plane_calls == []
+
+    pp_comm.abort_and_reinit([0, 2, 3], generation=5)
+    getattr(pp_comm, operation)(object(), **peer_argument)
+
+    assert rebuild_calls == [([0, 2, 3], 6), ([0, 2, 3], 7)]
+    assert data_plane_calls == [(operation, 3)]
+
+
+def test_unexpected_pp_rebuild_membership_keeps_data_plane_poisoned(monkeypatch):
+    pp_comm = _make_pp_comm()
+    data_plane_calls = []
+
+    def return_unexpected_membership(active_ranks, rendezvous_id):
+        # Simulate a native wrapper that returns without publishing the
+        # requested membership. The old communicator is no longer safe merely
+        # because its reported group is unchanged.
+        pp_comm.nccl_comm.active_ranks = [0, 1, 2, 3]
+
+    pp_comm.nccl_comm.abort_and_reinit = return_unexpected_membership
+    pp_comm.nccl_comm.send = lambda tensor, dest: data_plane_calls.append(dest)
+    monkeypatch.setattr(
+        communicator_module.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: True,
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected membership"):
+        pp_comm.abort_and_reinit([0, 2, 3], generation=4)
+    with pytest.raises(RuntimeError, match="did not complete"):
+        pp_comm.send(object(), dest=3)
+
+    assert data_plane_calls == []
 
 
 def test_concurrent_nested_reinit_requests_commit_newest_membership():
@@ -325,14 +465,14 @@ def test_concurrent_nested_reinit_requests_commit_newest_membership():
     pp_comm.nccl_comm.abort_and_reinit = blocking_reinit
     errors = []
 
-    def reconfigure(active_ranks):
+    def reconfigure(active_ranks, generation):
         try:
-            pp_comm.abort_and_reinit(active_ranks)
+            pp_comm.abort_and_reinit(active_ranks, generation=generation)
         except Exception as error:  # pragma: no cover - assertion reports details
             errors.append(error)
 
-    first = threading.Thread(target=reconfigure, args=([0, 2, 3],))
-    second = threading.Thread(target=reconfigure, args=([0, 2],))
+    first = threading.Thread(target=reconfigure, args=([0, 2, 3], 1))
+    second = threading.Thread(target=reconfigure, args=([0, 2], 2))
     first.start()
     assert first_entered_native.wait(timeout=5)
     second.start()
@@ -348,7 +488,7 @@ def test_concurrent_nested_reinit_requests_commit_newest_membership():
     assert not first.is_alive()
     assert not second.is_alive()
     assert errors == []
-    assert calls == [([0, 2, 3], 1), ([0, 2], 1)]
+    assert calls == [([0, 2, 3], 3), ([0, 2], 4)]
     assert pp_comm.get_active_ranks() == [0, 2]
 
 
@@ -520,8 +660,14 @@ def test_init_pp_comm_reuses_compatible_nccl_communicator(monkeypatch):
             self.topology = (mapping.world_size, mapping.rank, tuple(mapping.pp_group))
             created.append(self)
 
+        def is_native_compatible(self, mapping):
+            return self.topology[:2] == (mapping.world_size, mapping.rank)
+
         def is_compatible(self, mapping):
             return self.topology == (mapping.world_size, mapping.rank, tuple(mapping.pp_group))
+
+        def rebind(self, mapping):
+            self.topology = (mapping.world_size, mapping.rank, tuple(mapping.pp_group))
 
     monkeypatch.setattr(communicator_module, "PPCommNCCL", FakePPComm)
     monkeypatch.setattr(communicator_module, "_pp_comm", None)
@@ -568,6 +714,7 @@ def test_ft_wrapper_churn_preserves_completed_recovery_generation(monkeypatch):
 def test_init_pp_comm_rejects_incompatible_live_topology(monkeypatch):
     existing = _make_pp_comm()
     monkeypatch.setattr(communicator_module, "_pp_comm", existing)
+    monkeypatch.setattr(communicator_module, "_pp_comm_refcount", 1)
     monkeypatch.setattr(communicator_module, "mpi_disabled", lambda: False)
     monkeypatch.setattr(communicator_module, "init_helix_cp_comm", lambda mapping: None)
 
@@ -581,6 +728,7 @@ def test_init_pp_comm_rejects_incompatible_live_topology(monkeypatch):
 def test_init_pp_comm_rejects_incompatible_live_helix_topology(monkeypatch):
     existing = _make_pp_comm(_HelixMapping())
     monkeypatch.setattr(communicator_module, "_pp_comm", existing)
+    monkeypatch.setattr(communicator_module, "_pp_comm_refcount", 1)
     monkeypatch.setattr(communicator_module, "mpi_disabled", lambda: False)
 
     with pytest.raises(RuntimeError, match="Helix MNNVL CP topology"):
@@ -617,10 +765,21 @@ def test_final_release_preserves_helix_comm_topology(monkeypatch):
 
     class FakePPComm:
         def __init__(self, mapping):
+            self.mapping = mapping
             self.topology = original_pp_comm_class._mapping_topology(mapping)
+
+        def is_native_compatible(self, mapping):
+            return self.topology[:2] == (
+                int(mapping.world_size),
+                int(mapping.rank),
+            )
 
         def is_compatible(self, mapping):
             return self.topology == original_pp_comm_class._mapping_topology(mapping)
+
+        def rebind(self, mapping):
+            self.mapping = mapping
+            self.topology = original_pp_comm_class._mapping_topology(mapping)
 
     monkeypatch.setattr(mnnvl_module, "mpi_comm", lambda: FakeMpiComm())
     monkeypatch.setattr(communicator_module, "PPCommNCCL", FakePPComm)
@@ -633,27 +792,40 @@ def test_final_release_preserves_helix_comm_topology(monkeypatch):
     communicator_module.release_pp_comm()
     communicator_module.init_pp_comm(_HelixMapping())
     communicator_module.release_pp_comm()
+    pp_comm = communicator_module._pp_comm
+    old_mapping = pp_comm.mapping
+    old_topology = pp_comm.topology
 
-    # A later engine may create a fresh PP wrapper, but it cannot reinterpret
-    # the process-lifetime Helix MPI communicator with a different CP group.
+    # A later engine cannot reinterpret either process-lifetime communicator
+    # with a different CP group. A failed refresh must be transactional.
     with pytest.raises(RuntimeError, match="cannot reuse.*incompatible topology"):
         communicator_module.init_pp_comm(_OtherHelixMapping())
 
     assert split_calls == [(0, 1)]
-    assert communicator_module._pp_comm is None
+    assert communicator_module._pp_comm is pp_comm
+    assert pp_comm.mapping is old_mapping
+    assert pp_comm.topology == old_topology
     assert communicator_module._pp_comm_refcount == 0
 
 
-def test_default_off_final_release_allows_a_later_incompatible_topology(monkeypatch):
+def test_default_off_final_release_reuses_native_comm_with_new_pp_topology(monkeypatch):
     created = []
 
     class FakePPComm:
         def __init__(self, mapping):
+            self.mapping = mapping
             self.topology = (mapping.world_size, mapping.rank, tuple(mapping.pp_group))
             created.append(self.topology)
 
+        def is_native_compatible(self, mapping):
+            return self.topology[:2] == (mapping.world_size, mapping.rank)
+
         def is_compatible(self, mapping):
             return self.topology == (mapping.world_size, mapping.rank, tuple(mapping.pp_group))
+
+        def rebind(self, mapping):
+            self.mapping = mapping
+            self.topology = (mapping.world_size, mapping.rank, tuple(mapping.pp_group))
 
     class OtherMapping(_FakeMapping):
         pp_group = [0, 2]
@@ -664,12 +836,64 @@ def test_default_off_final_release_allows_a_later_incompatible_topology(monkeypa
     monkeypatch.setattr(communicator_module, "init_helix_cp_comm", lambda mapping: None)
 
     communicator_module.init_pp_comm(_FakeMapping())
+    pp_comm = communicator_module._pp_comm
     communicator_module.release_pp_comm()
-    assert communicator_module._pp_comm is None
-    communicator_module.init_pp_comm(OtherMapping())
+    assert communicator_module._pp_comm is pp_comm
+    other_mapping = OtherMapping()
+    communicator_module.init_pp_comm(other_mapping)
 
-    assert len(created) == 2
-    assert created[0] != created[1]
+    assert communicator_module._pp_comm is pp_comm
+    assert pp_comm.mapping is other_mapping
+    assert pp_comm.topology == (4, 2, (0, 2))
+    assert len(created) == 1
+
+
+def test_initial_helix_failure_preserves_process_lifetime_nccl_wrapper(monkeypatch):
+    created = []
+
+    class FakePPComm:
+        def __init__(self, mapping):
+            self.mapping = mapping
+            self.topology = (mapping.world_size, mapping.rank, tuple(mapping.pp_group))
+            created.append(self)
+
+        def is_native_compatible(self, mapping):
+            return self.topology[:2] == (mapping.world_size, mapping.rank)
+
+        def is_compatible(self, mapping):
+            return self.topology == (mapping.world_size, mapping.rank, tuple(mapping.pp_group))
+
+        def rebind(self, mapping):
+            self.mapping = mapping
+            self.topology = (mapping.world_size, mapping.rank, tuple(mapping.pp_group))
+
+    helix_attempts = 0
+
+    def fail_first_helix_attempt(mapping):
+        nonlocal helix_attempts
+        helix_attempts += 1
+        if helix_attempts == 1:
+            raise RuntimeError("injected Helix initialization failure")
+
+    monkeypatch.setattr(communicator_module, "PPCommNCCL", FakePPComm)
+    monkeypatch.setattr(communicator_module, "NCCL_FAULT_TOLERANCE_ENABLED", False)
+    monkeypatch.setattr(communicator_module, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(communicator_module, "init_helix_cp_comm", fail_first_helix_attempt)
+
+    mapping = _FakeMapping()
+    with pytest.raises(RuntimeError, match="injected Helix initialization failure"):
+        communicator_module.init_pp_comm(mapping)
+
+    pp_comm = communicator_module._pp_comm
+    assert pp_comm is created[0]
+    assert communicator_module._pp_comm_refcount == 0
+
+    communicator_module.init_pp_comm(mapping)
+
+    assert communicator_module._pp_comm is pp_comm
+    assert communicator_module._pp_comm_refcount == 1
+    assert len(created) == 1
+    assert helix_attempts == 2
 
 
 def test_model_engine_cleanup_releases_pp_before_reporting_ub_failure(monkeypatch):

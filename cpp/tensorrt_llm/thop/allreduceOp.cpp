@@ -1610,14 +1610,15 @@ bool isNCCLWindowBuffer(torch::Tensor const& input, torch::List<int64_t> const& 
         return false;
     }
 
-    if (!commPtr || *commPtr == nullptr)
+    if (!commPtr)
     {
-        TLLM_LOG_DEBUG("[isNCCLWindowBuffer] NCCL comm is null");
+        TLLM_LOG_DEBUG("[isNCCLWindowBuffer] NCCL comm holder is null");
         return false;
     }
 
+    auto commLease = acquireComm(commPtr);
     using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
-    auto const buffer = NCCLWindowAllocator::getInstance().searchBuffer(*commPtr, input.data_ptr());
+    auto const buffer = NCCLWindowAllocator::getInstance().searchBuffer(commLease.get(), input.data_ptr());
     return buffer.isValid();
 #else
     (void) input;
