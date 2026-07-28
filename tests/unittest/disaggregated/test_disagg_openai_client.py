@@ -173,10 +173,10 @@ class TestOpenAIHttpClient:
         assert headers[INTERNAL_DISAGG_AUTH_HEADER].startswith("sha256=")
 
     @pytest.mark.asyncio
-    async def test_generation_request_with_opaque_state_requires_key(
+    async def test_generation_request_with_opaque_state_without_key_warns(
         self, mock_router, mock_session
     ):
-        """The proxy refuses to forward opaque state without auth configured."""
+        """Opaque state without auth key emits a transitional warning."""
         _reset_prometheus_registry()
         client = OpenAIHttpClient(
             router=mock_router,
@@ -185,6 +185,14 @@ class TestOpenAIHttpClient:
             max_retries=0,
             session=mock_session,
         )
+        mock_response = self.dummy_response()
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 200
+        mock_http_response.headers = {"Content-Type": "application/json"}
+        mock_http_response.json = AsyncMock(return_value=mock_response.model_dump())
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = mock_http_response
         request = CompletionRequest(
             model="test-model",
             prompt="Hello, world!",
@@ -195,9 +203,12 @@ class TestOpenAIHttpClient:
             ),
         )
 
-        with pytest.raises(ValueError, match="authentication key"):
+        warning_message = "In a future release the requirement to use internal_request_auth_key"
+        with pytest.warns(FutureWarning, match=warning_message):
             await client.send_request(request)
-        mock_session.post.assert_not_called()
+
+        headers = mock_session.post.call_args.kwargs["headers"]
+        assert INTERNAL_DISAGG_AUTH_HEADER not in headers
 
     @pytest.mark.asyncio
     async def test_non_streaming_completion_request(
@@ -423,7 +434,7 @@ class TestOpenAIHttpClient:
         assert headers is not None
         assert INTERNAL_DISAGG_AUTH_HEADER in headers
 
-    def test_generation_request_with_ctx_info_endpoint_requires_key(
+    def test_generation_request_with_ctx_info_endpoint_without_key_warns(
         self, mock_router, mock_session
     ):
         _reset_prometheus_registry()
@@ -443,8 +454,11 @@ class TestOpenAIHttpClient:
             ),
         )
 
-        with pytest.raises(ValueError, match="authentication key is required"):
-            client._get_request_headers(request)
+        warning_message = "In a future release the requirement to use internal_request_auth_key"
+        with pytest.warns(FutureWarning, match=warning_message):
+            headers = client._get_request_headers(request)
+
+        assert INTERNAL_DISAGG_AUTH_HEADER not in headers
 
 
 class TestHttpErrorBodyPreservation:
