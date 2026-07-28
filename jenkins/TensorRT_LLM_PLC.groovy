@@ -235,7 +235,7 @@ def sonarScan()
         sh "mv sonar-scanner-${sonarScannerCliVer} ../sonar-scanner"
         sh "rm sonar-scanner-cli-${sonarScannerCliVer}.zip"
         withSonarQubeEnv() {
-          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.ref}"
+          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.ref} -Dsonar.exclusions=**/*.cubin"
         }
     }
 }
@@ -269,9 +269,9 @@ def pulseScanSourceCode(llmRepo, ref) {
             if [ -n "\$sbom_zip" ]; then
                 unzip -p "\$sbom_zip" "*.json" > ${outputDir}/sbom.json
             else
-                echo "WARNING: sbom.zip not found; listing workspace for diagnostics:"
+                echo "ERROR: sbom.zip not found; listing workspace for diagnostics:"
                 ls -la
-                touch ${outputDir}/sbom.json
+                exit 1
             fi
         """
         sh "mv nspect_scan_report.json ${outputDir}/vulns.json"
