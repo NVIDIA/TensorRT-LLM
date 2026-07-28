@@ -1309,19 +1309,22 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     using CacheKey = decltype(cache_key);
     static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, OpCustomHash<CacheKey>> op_cache;
     static std::shared_mutex op_cache_mutex;
-    if (auto it = (static_cast<void>(std::shared_lock<std::shared_mutex>{op_cache_mutex}), op_cache.find(cache_key));
-        it != op_cache.end())
+
+    std::shared_lock<std::shared_mutex> lock{op_cache_mutex};
+    auto iter = op_cache.find(cache_key);
+    if (iter != op_cache.end())
     {
         TLLM_LOG_TRACE("Attention op for layer %d is cached", local_layer_idx);
-        op = it->second;
+        op = iter->second;
     }
     else
     {
-        TLLM_LOG_TRACE("Preparing new attention op for layer %d with cache key: %s", local_layer_idx,
-            to_string(cache_key).c_str());
+        lock.unlock();
+        TLLM_LOG_TRACE(
+            "Attention op for layer %d is not cached, cache key: %s", local_layer_idx, to_string(cache_key).c_str());
+        std::unique_lock<std::shared_mutex> lock{op_cache_mutex};
         op->initialize();
         runner->prepare(*op);
-        std::unique_lock<std::shared_mutex> lock{op_cache_mutex};
         auto [iter, _] = op_cache.try_emplace(cache_key, op);
         op = iter->second;
     }
