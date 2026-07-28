@@ -71,6 +71,8 @@ echo "[fat_build] Installing requirements-dev.txt..."
 pip3 install --no-user --retries 10 -r TensorRT-LLM/src/requirements-dev.txt
 echo "[fat_build] Installing trtllm wheel..."
 pip3 install --no-user --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
+echo "[fat_build] Installing opencv-python-headless..."
+pip3 install --no-user --retries 10 opencv-python-headless
 echo "[fat_build] Installed TensorRT-LLM version:"
 pip3 show tensorrt-llm || true
 echo "$LLM_TARFILE_URL" > /tmp/trtllm_installed.txt
