@@ -28,6 +28,36 @@ _PERF_CSV_HEADER = (
     "transfer_size_bytes,avg_segment_size_bytes,transfer_entry_count,"
     "prepare_args_latency_ms,queue_latency_ms,transfer_latency_ms,task_latency_ms,throughput_mbs"
 )
+_KV_TRANSFER_TRACE_ENV = "TLLM_ENABLE_KV_TRANSFER_TRACE"
+
+
+def log_kv_transfer_trace(
+    event: str,
+    unique_rid: int,
+    side: str,
+    instance_name: str,
+    instance_rank: int,
+    **details: object,
+) -> None:
+    """Log an opt-in, structured KV-transfer lifecycle event.
+
+    Wall-clock timestamps correlate events across CTX and GEN nodes, while
+    monotonic timestamps measure durations within one process. Unlike the
+    performance log, lifecycle events also cover unmatched, failed, and timed
+    out transfers.
+    """
+    if os.getenv(_KV_TRANSFER_TRACE_ENV, "0") != "1":
+        return
+
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    message = (
+        f"KV_TRANSFER_TRACE event={event} unique_rid={unique_rid} side={side} "
+        f"instance_name={instance_name} instance_rank={instance_rank} "
+        f"wall_time_ns={time.time_ns()} monotonic_time_ns={time.monotonic_ns()}"
+    )
+    if detail_text:
+        message = f"{message} {detail_text}"
+    logger.info(message)
 
 
 class PerfTimer:

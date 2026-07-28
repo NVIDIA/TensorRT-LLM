@@ -182,3 +182,44 @@ class TestPerfLogManager:
             instance_rank=0,
             perf_timer=timer,
         )
+
+
+class TestKvTransferTrace:
+    @patch.dict("os.environ", {"TLLM_ENABLE_KV_TRANSFER_TRACE": "1"}, clear=False)
+    def test_logs_structured_lifecycle_event(self):
+        from tensorrt_llm._torch.disaggregation.native import perf_logger
+
+        with patch.object(perf_logger.logger, "info") as log_info:
+            perf_logger.log_kv_transfer_trace(
+                "rx_wait_end",
+                42,
+                "gen",
+                "test-instance",
+                3,
+                result="FAILED",
+                wait_elapsed_ms="60000.123",
+            )
+
+        message = log_info.call_args.args[0]
+        assert "KV_TRANSFER_TRACE event=rx_wait_end" in message
+        assert "unique_rid=42 side=gen" in message
+        assert "instance_name=test-instance instance_rank=3" in message
+        assert "wall_time_ns=" in message
+        assert "monotonic_time_ns=" in message
+        assert "result=FAILED wait_elapsed_ms=60000.123" in message
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_disabled_by_default(self):
+        from tensorrt_llm._torch.disaggregation.native import perf_logger
+
+        os.environ.pop("TLLM_ENABLE_KV_TRANSFER_TRACE", None)
+        with patch.object(perf_logger.logger, "info") as log_info:
+            perf_logger.log_kv_transfer_trace(
+                "rx_wait_begin",
+                42,
+                "gen",
+                "test-instance",
+                3,
+            )
+
+        log_info.assert_not_called()

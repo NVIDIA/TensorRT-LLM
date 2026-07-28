@@ -58,7 +58,11 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
-from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
+from tensorrt_llm._torch.disaggregation.native.perf_logger import (
+    PerfTimer,
+    log_kv_transfer_trace,
+    perf_log_manager,
+)
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
@@ -414,6 +418,17 @@ class Sender(SenderBase):
         # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
         # - Different peers can run on different threads (better load balancing)
         thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
+        ri = self._registrar.self_rank_info
+        log_kv_transfer_trace(
+            "tx_task_enqueued",
+            write_meta.unique_rid,
+            "ctx",
+            ri.instance_name,
+            ri.instance_rank,
+            peer_rank=write_meta.peer_rank,
+            slice_id=write_meta.slice_id,
+            queue_index=thread_idx,
+        )
         self._send_task_queues[thread_idx].put(write_meta)
 
     def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
@@ -515,6 +530,16 @@ class Sender(SenderBase):
         assert write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size, (
             f"WriteMeta ptr/size mismatch for unique_rid={write_meta.unique_rid}"
         )
+        ri = self._registrar.self_rank_info
+        log_kv_transfer_trace(
+            "tx_task_dequeued",
+            write_meta.unique_rid,
+            "ctx",
+            ri.instance_name,
+            ri.instance_rank,
+            peer_rank=write_meta.peer_rank,
+            slice_id=write_meta.slice_id,
+        )
 
         with self._sessions_lock:
             session = self._get_session(write_meta.unique_rid)
@@ -593,10 +618,24 @@ class Sender(SenderBase):
                 return
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
+            transfer_start_ns = time.monotonic_ns()
+            transfer_outcome = "exception"
+            log_kv_transfer_trace(
+                "tx_nixl_begin",
+                write_meta.unique_rid,
+                "ctx",
+                ri.instance_name,
+                ri.instance_rank,
+                peer_rank=write_meta.peer_rank,
+                slice_id=write_meta.slice_id,
+                transfer_size_bytes=int(write_meta.sizes.sum()),
+                transfer_entry_count=int(write_meta.sizes.size),
+            )
             try:
                 status = self._agent.submit_transfer_requests(request)
                 if not status.wait():
                     agent_result = AgentResult.FAILED
+                    transfer_outcome = "failed"
                     last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
                     agent_name = getattr(self._agent, "name", "<?>")
                     detail = (
@@ -613,7 +652,20 @@ class Sender(SenderBase):
                     )
                     logger.error(detail)
                     task.fail(RuntimeError(detail))
+                else:
+                    transfer_outcome = "success"
             finally:
+                log_kv_transfer_trace(
+                    "tx_nixl_end",
+                    write_meta.unique_rid,
+                    "ctx",
+                    ri.instance_name,
+                    ri.instance_rank,
+                    peer_rank=write_meta.peer_rank,
+                    slice_id=write_meta.slice_id,
+                    outcome=transfer_outcome,
+                    transfer_elapsed_ms=(f"{(time.monotonic_ns() - transfer_start_ns) / 1e6:.3f}"),
+                )
                 if send_slot_id is not None:
                     self._bounce.release_send(send_slot_id)
         if timer:
@@ -966,6 +1018,17 @@ class Sender(SenderBase):
         # critical section small.  When not provided, we fetch it here (legacy / standalone path).
         if req_info_snapshot is None:
             req_info_snapshot = dict(self._get_req_info(task._unique_rid) or {})
+        if isinstance(task, KVSendTask):
+            ri = self._registrar.self_rank_info
+            log_kv_transfer_trace(
+                "tx_kv_ready",
+                task._unique_rid,
+                "ctx",
+                ri.instance_name,
+                ri.instance_rank,
+                slice_id=task.slice_id,
+                matched_receiver_count=len(req_info_snapshot),
+            )
         for info in req_info_snapshot.values():
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(info.instance_rank)
@@ -1045,11 +1108,31 @@ class Sender(SenderBase):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock serializes _enqueue calls from both paths.
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        ri = self._registrar.self_rank_info
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
+                log_kv_transfer_trace(
+                    "tx_request_received",
+                    info.unique_rid,
+                    "ctx",
+                    ri.instance_name,
+                    ri.instance_rank,
+                    peer_rank=info.instance_rank,
+                    session_match=False,
+                )
                 self._save_peer_req_info(info)
                 return
+        log_kv_transfer_trace(
+            "tx_request_received",
+            info.unique_rid,
+            "ctx",
+            ri.instance_name,
+            ri.instance_rank,
+            peer_rank=info.instance_rank,
+            session_match=True,
+            session_status=session.status.value,
+        )
         with session.lock:
             self._save_peer_req_info(info)
             tasks = list(session.kv_tasks)
@@ -1636,6 +1719,19 @@ class Receiver(ReceiverBase):
         fanin_bounce = bounced and task.expected_transfers > 1
         key = (receiver_req.unique_rid, receiver_req.slice_id)
         receiver_req_bytes = None if fanin_bounce else receiver_req.to_bytes()
+        ri = self._registrar.self_rank_info
+        log_kv_transfer_trace(
+            "rx_dispatch_begin",
+            task._unique_rid,
+            "gen",
+            ri.instance_name,
+            ri.instance_rank,
+            slice_id=task.slice_id,
+            peer_count=len(peer_overlap.ranks),
+            expected_transfers=task.expected_transfers,
+            sender_dp_rank=sender_dp_rank,
+            bounced=bounced,
+        )
         for i, rank in enumerate(peer_overlap.ranks):
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(rank)
@@ -1643,6 +1739,15 @@ class Receiver(ReceiverBase):
                 receiver_req.bounce_dst_base = self._bounce.writer_base(key, i)
                 receiver_req_bytes = receiver_req.to_bytes()
             self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
+        log_kv_transfer_trace(
+            "rx_request_data_sent",
+            task._unique_rid,
+            "gen",
+            ri.instance_name,
+            ri.instance_rank,
+            slice_id=task.slice_id,
+            peer_count=len(peer_overlap.ranks),
+        )
         return
 
     @staticmethod
@@ -1746,6 +1851,19 @@ class Receiver(ReceiverBase):
             return
         peer_rank, unique_rid, sender_slice_id, is_last_slice, status_code, transfer_size = (
             _KV_RESULT_PREFIX.unpack(message[1])
+        )
+        ri = self._registrar.self_rank_info
+        log_kv_transfer_trace(
+            "rx_agent_result_received",
+            unique_rid,
+            "gen",
+            ri.instance_name,
+            ri.instance_rank,
+            peer_rank=peer_rank,
+            slice_id=sender_slice_id,
+            is_last_slice=is_last_slice,
+            result=_AGENT_RESULT_BY_CODE[status_code],
+            transfer_size_bytes=transfer_size,
         )
         from .bounce import decode_result_tail
 
@@ -1945,6 +2063,15 @@ class RxSession(RxSessionBase):
                                     f"KV transfer perf logging failed for request {request_id} "
                                     f"slice={sender_slice_id}: {e}"
                                 )
+                            log_kv_transfer_trace(
+                                "rx_task_completed",
+                                self.disagg_request_id,
+                                "gen",
+                                instance_name,
+                                instance_rank,
+                                peer_rank=peer_rank,
+                                slice_id=sender_slice_id,
+                            )
                             task.complete()
                             # Transfer end for perf/time-sync: only meaningful once every slice has
                             # landed. Plain attribute write (atomic under the GIL); on_done must stay
@@ -2110,6 +2237,17 @@ class RxSession(RxSessionBase):
             for task in self._kv_tasks:
                 done = task.wait(timeout=timeout)
                 if not done:
+                    ri = self._receiver._registrar.self_rank_info
+                    log_kv_transfer_trace(
+                        "rx_task_wait_timeout",
+                        self.disagg_request_id,
+                        "gen",
+                        ri.instance_name,
+                        ri.instance_rank,
+                        slice_id=task.slice_id,
+                        timeout_s=timeout,
+                        task_status=task.status.value,
+                    )
                     return WaitResult.FAILED  # timeout
                 if task.status == TaskStatus.ERROR:
                     return WaitResult.FAILED

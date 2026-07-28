@@ -22,7 +22,10 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
 )
-from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
+from tensorrt_llm._torch.disaggregation.native.perf_logger import (
+    log_kv_transfer_trace,
+    perf_log_manager,
+)
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -524,6 +527,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         assert rid is not None
         if rid not in self._send_sessions:
             self._send_sessions[rid] = self._transfer_worker.create_tx_session(req)
+            log_kv_transfer_trace(
+                "tx_session_created",
+                rid,
+                "ctx",
+                self._instance_name,
+                self._mapping.rank,
+            )
         return self._send_sessions[rid]
 
     def _finalize_send(self, req: LlmRequest, session: TxSessionBase):
@@ -547,14 +557,32 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def respond_and_send_async(self, req: LlmRequest):
         self._ever_had_send_session = True
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
+        rid = get_unique_rid(req)
+        assert rid is not None
         session = self._get_or_create_send_session(req)
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        log_kv_transfer_trace(
+            "tx_send_begin",
+            rid,
+            "ctx",
+            self._instance_name,
+            self._mapping.rank,
+        )
         session.send(self._create_kv_slice(req))
+        log_kv_transfer_trace(
+            "tx_send_posted",
+            rid,
+            "ctx",
+            self._instance_name,
+            self._mapping.rank,
+            session_status=session.status.value,
+        )
         self._finalize_send(req, session)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest):
         rid = get_unique_rid(req)
+        assert rid is not None
         if rid in self._recv_sessions:
             logger.warning(
                 f"request_and_receive_sync: rid={rid} already has a recv session, skipping"
@@ -562,13 +590,49 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         session = None
+        wait_start_ns = None
+        log_kv_transfer_trace(
+            "rx_sync_begin",
+            rid,
+            "gen",
+            self._instance_name,
+            self._mapping.rank,
+        )
         try:
             session = self._transfer_worker.create_rx_session(req)
             self._recv_sessions[rid] = session
             self._recv_reqs[rid] = req
             kv_slice = self._create_kv_slice(req)
+            receive_start_ns = time.monotonic_ns()
             session.receive(kv_slice)
+            log_kv_transfer_trace(
+                "rx_request_posted",
+                rid,
+                "gen",
+                self._instance_name,
+                self._mapping.rank,
+                dispatch_elapsed_ms=f"{(time.monotonic_ns() - receive_start_ns) / 1e6:.3f}",
+            )
+            wait_start_ns = time.monotonic_ns()
+            log_kv_transfer_trace(
+                "rx_wait_begin",
+                rid,
+                "gen",
+                self._instance_name,
+                self._mapping.rank,
+                timeout_ms=self.kv_transfer_timeout_ms,
+            )
             result = session.wait_complete(blocking=True)
+            log_kv_transfer_trace(
+                "rx_wait_end",
+                rid,
+                "gen",
+                self._instance_name,
+                self._mapping.rank,
+                result=result,
+                wait_elapsed_ms=f"{(time.monotonic_ns() - wait_start_ns) / 1e6:.3f}",
+                session_status=session.status.value,
+            )
 
             if result == WaitResult.COMPLETED:
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
@@ -579,12 +643,31 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
-        except Exception:
+        except Exception as e:
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            details = {"exception_type": type(e).__name__}
+            if wait_start_ns is not None:
+                details["wait_elapsed_ms"] = f"{(time.monotonic_ns() - wait_start_ns) / 1e6:.3f}"
+            log_kv_transfer_trace(
+                "rx_sync_exception",
+                rid,
+                "gen",
+                self._instance_name,
+                self._mapping.rank,
+                **details,
+            )
             raise
         finally:
             if session is not None:
                 session.close()
+            log_kv_transfer_trace(
+                "rx_sync_closed",
+                rid,
+                "gen",
+                self._instance_name,
+                self._mapping.rank,
+                request_state=req.state,
+            )
             self._recv_sessions.pop(rid, None)
             self._recv_reqs.pop(rid, None)
 
