@@ -12,7 +12,7 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 
 from ...interface import AttentionForwardArgs, AttentionInputType
-from ..flashinfer_workspace import get_sparse_mla_op, get_sparse_mla_workspace
+from ..flashinfer_utils import get_sparse_mla_op, get_sparse_mla_workspace
 from ..kernel import deepseek_v4_local_to_global_indices
 from . import footer_scale_kv
 from .deepseek_v4 import DeepseekV4AttentionType, DeepseekV4TrtllmAttentionMetadata, get_token_bytes

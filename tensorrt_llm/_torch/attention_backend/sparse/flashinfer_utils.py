@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared helpers for FlashInfer sparse MLA."""
+"""Shared utilities for FlashInfer sparse MLA."""
 
 from typing import TYPE_CHECKING
 

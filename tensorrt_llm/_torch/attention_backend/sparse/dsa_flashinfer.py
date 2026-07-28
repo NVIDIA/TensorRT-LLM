@@ -12,7 +12,7 @@ from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from ..interface import AttentionForwardArgs, AttentionInputType
 from . import inline_scale_kv
 from .dsa import DSAtrtllmAttentionMetadata
-from .flashinfer_workspace import get_sparse_mla_op, get_sparse_mla_workspace
+from .flashinfer_utils import get_sparse_mla_op, get_sparse_mla_workspace
 
 _KV_SPLIT_TILE = 64  # BLOCK_SIZE_N of the SM120 kernels; sizes split-K scratch
 
