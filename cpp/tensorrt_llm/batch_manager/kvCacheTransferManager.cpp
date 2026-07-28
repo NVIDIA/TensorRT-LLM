@@ -290,14 +290,29 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 // As before, syncTransfers() must be called after the last call to KVCacheManager::addSequenceBatch.
 // Failing to do so will lead to corrupted blocks eventually.
 //
+// The pending-access maps intentionally survive syncTransfers() and syncWithBufferManager(). Those APIs order CUDA
+// streams at iteration boundaries, but the C++ transceiver sender may still schedule offload/onboard work from another
+// thread. Keeping the maps as last-access records preserves raw-slot dependencies across both scheduler and sender
+// threads. A completed event is cheap to wait on, and the maps are bounded by the number of raw KV slots touched by
+// transfers.
+//
 
 void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr const& block,
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
+    std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
     auto const offloadedBlockIndex = getPendingTransferIndex(offloadedBlock);
     auto const blockIndex = getPendingTransferIndex(block);
 
+    // Wait for any pending reads before reading from offloadedBlock. Reads from
+    // the same raw slot could be scheduled on different transfer streams; serializing
+    // them lets one last-read event conservatively represent all prior reads.
+    auto offloadedBlockPendingReadItr = mPendingReads.find(offloadedBlockIndex);
+    if (offloadedBlockPendingReadItr != mPendingReads.end())
+    {
+        mOnboardManager.getStream().wait(offloadedBlockPendingReadItr->second);
+    }
     // Wait for any pending writes before reading from offloadedBlock
     auto offloadedBlockPendingWriteItr = mPendingWrites.find(offloadedBlockIndex);
     if (offloadedBlockPendingWriteItr != mPendingWrites.end())
@@ -350,9 +365,18 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
+    std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
     auto const blockIndex = getPendingTransferIndex(block);
     auto const offloadBlockIndex = getPendingTransferIndex(offloadBlock);
 
+    // Wait for any pending reads before reading from block. Reads from the same
+    // raw slot could be scheduled on different transfer streams; serializing them
+    // lets one last-read event conservatively represent all prior reads.
+    auto blockPendingReadItr = mPendingReads.find(blockIndex);
+    if (blockPendingReadItr != mPendingReads.end())
+    {
+        mOffloadManager.getStream().wait(blockPendingReadItr->second);
+    }
     // Wait for any pending writes before reading from block
     auto blockPendingWriteItr = mPendingWrites.find(blockIndex);
     if (blockPendingWriteItr != mPendingWrites.end())
@@ -394,6 +418,7 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
 
 void KVCacheTransferManager::syncWithBufferManager()
 {
+    std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
     tr::CudaEvent readyForOffloadEvent;
     mBufferManager.getStream().record(readyForOffloadEvent);
     mOffloadManager.getStream().wait(readyForOffloadEvent);
@@ -401,14 +426,11 @@ void KVCacheTransferManager::syncWithBufferManager()
     tr::CudaEvent readyForOnboardEvent;
     mBufferManager.getStream().record(readyForOnboardEvent);
     mOnboardManager.getStream().wait(readyForOnboardEvent);
-
-    // Once we synchronize, clear our list of pending transfers.
-    mPendingReads.clear();
-    mPendingWrites.clear();
 }
 
 void KVCacheTransferManager::syncTransfers()
 {
+    std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
     tr::CudaEvent offloadEvent;
     mOffloadManager.getStream().record(offloadEvent);
     mBufferManager.getStream().wait(offloadEvent);
@@ -416,10 +438,14 @@ void KVCacheTransferManager::syncTransfers()
     tr::CudaEvent onboardEvent;
     mOnboardManager.getStream().record(onboardEvent);
     mBufferManager.getStream().wait(onboardEvent);
+}
 
-    // Once we synchronize, clear our list of pending transfers.
-    mPendingReads.clear();
-    mPendingWrites.clear();
+void KVCacheTransferManager::syncOnboardToBufferManager(tr::BufferManager const& bufferManager)
+{
+    std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
+    tr::CudaEvent onboardEvent;
+    mOnboardManager.getStream().record(onboardEvent);
+    bufferManager.getStream().wait(onboardEvent);
 }
 
 KvCacheTransferStats KVCacheTransferManager::getAndResetTransferStats()

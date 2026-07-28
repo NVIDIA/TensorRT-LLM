@@ -28,7 +28,7 @@ context_servers:
   enable_iter_perf_stats: true
   cache_transceiver_config:
     backend: NIXL
-    transceiver_runtime: PYTHON
+    transceiver_runtime: CPP
     max_tokens_in_buffer: 4096
 generation_servers:
   num_instances: 1
@@ -53,5 +53,5 @@ generation_servers:
   enable_iter_perf_stats: true
   cache_transceiver_config:
     backend: NIXL
-    transceiver_runtime: PYTHON
+    transceiver_runtime: CPP
     max_tokens_in_buffer: 4096
