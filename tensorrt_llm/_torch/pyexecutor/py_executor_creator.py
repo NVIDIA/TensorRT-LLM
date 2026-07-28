@@ -687,16 +687,6 @@ def create_py_executor(
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
                                 max_batch_size * getattr(mapping, "pp_size", 1))
-    if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
-            cache_transceiver_config is not None
-            and cache_transceiver_config.backend is not None
-            and cache_transceiver_config.transceiver_runtime == "PYTHON"):
-        logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models when disagg + Python transceiver enabled"
-        )
-        kv_cache_config.enable_block_reuse = False
-        _set_model_engines_cache_reuse([model_engine, draft_model_engine],
-                                       False)
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
@@ -777,8 +767,9 @@ def create_py_executor(
         ctx_chunk_config = None
 
     if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
-        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK,
-                            kv_cache_config.mamba_state_cache_interval)
+        # Snapshot boundaries come from expect_snapshot_points.  The unit is
+        # only used to align chunks shortened by the scheduling budget.
+        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
 
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:
@@ -913,17 +904,16 @@ def create_py_executor(
 
         if is_disagg and is_hybrid:
             # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
-            # no effect in disagg. The disagg manager choice is driven solely
-            # by transceiver_runtime: PYTHON => PythonMambaCacheManager,
-            # otherwise CppMambaHybridCacheManager (unified pool, default).
+            # no effect in disagg. The disagg manager choice is driven by
+            # get_kv_cache_manager_cls and cache_transceiver_config.
             if os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1":
                 logger.warning(
                     "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
-                    "use cache_transceiver_config.transceiver_runtime='PYTHON' "
-                    "to select PythonMambaCacheManager.")
+                    "configure transceiver_runtime='PYTHON' with backend='NIXL' "
+                    "to select MixedMambaHybridCacheManager.")
             else:
                 logger.info("Disaggregated serving with hybrid model detected. "
-                            "Using CppMambaHybridCacheManager.")
+                            "Using the configured Mamba cache manager.")
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
