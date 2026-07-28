@@ -144,6 +144,13 @@ _K3_FUSED_MOE_FINALIZE_AR_RMS_MAX_TOKENS = _read_fused_finalize_ar_rms_max_token
 
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
 
+KIMI_K3_FUSED_KDA_CONV_STATE_ENV = "KIMI_K3_FUSED_KDA_CONV_STATE"
+"""Set to ``0`` to stage and roll the KDA decode conv windows with the ATen
+gather / repack / concat / scatter sequence instead of the single fused
+Triton pass. Default: fused with fallback."""
+
+_FUSED_KDA_CONV_STATE_ENABLED = os.environ.get(KIMI_K3_FUSED_KDA_CONV_STATE_ENV, "1") == "1"
+
 # Routed-expert MoE TP/EP split overrides (read per model init, not import).
 # Highest precedence; either one may be set alone, the other is derived from
 # tp_size. Without them, an explicit moe_tensor_parallel_size /
@@ -969,6 +976,7 @@ class KimiKDARuntime(nn.Module):
     ):
         super().__init__()
         # Lazy import: pulls in fla/einops.
+        from ..modules.kimi_kda._kda_conv_state import kda_conv_state_decode_step
         from ..modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
 
         lin = cfg.linear_attn_config
@@ -1025,6 +1033,9 @@ class KimiKDARuntime(nn.Module):
         # Persistent batch-row-dense staging for the fused decode kernel's
         # per-section conv windows (lazily sized to the pool slot count).
         self._cs_dense: Optional[torch.Tensor] = None
+        self._fused_conv_state_step = (
+            kda_conv_state_decode_step if _FUSED_KDA_CONV_STATE_ENABLED else None
+        )
 
     def finalize_decode_weights(self) -> None:
         """Build the decode fast-path constants (once, after weight load).
@@ -1345,9 +1356,10 @@ class KimiKDARuntime(nn.Module):
         casts):
 
         * one fused in-projection GEMV (``finalize_decode_weights``);
-        * conv windows staged with one gather + one repack copy into a
-          persistent dense per-section buffer;
-        * conv-pool write-back with one cat + one index_copy_;
+        * conv windows staged into a persistent dense per-section buffer
+          and the pool rolled forward in one indexed pass
+          (``kda_conv_state_decode_step``; ``KIMI_K3_FUSED_KDA_CONV_STATE=0``
+          restores the ATen gather/repack/concat/scatter sequence);
         * constant tensors (transposed conv weights, fp32 A_log/dt_bias/
           o_norm weight) reused instead of rebuilt per step.
 
@@ -1426,12 +1438,25 @@ class KimiKDARuntime(nn.Module):
         qkvg_packed = x_qkvg.unflatten(-1, (4, H, hd)).permute(1, 0, 2, 3).contiguous()
         g = mixer.f_b_proj(f_a)  # [B, d]
 
-        # Gather the HF-layout conv windows once, then repack the
-        # historical W-1 columns into the kernel's dense per-section
-        # [B, d, W-1] layout (single strided copy kernel).
-        cs = conv_pool.index_select(0, slot_indices)  # [B, 3d, W]
+        # Stage the historical W-1 columns of each request's window in the
+        # kernel's dense per-section [B, d, W-1] layout and roll the pool
+        # forward by this token. The fused op does both in one indexed pass
+        # over the windows; the ATen fallback below needs four (gather,
+        # repack, concat, scatter) and materializes ``cs`` for the write-back
+        # further down. The pool is not read again this step -- the decode
+        # kernel takes the staged copy -- so rolling it here is equivalent to
+        # rolling it after the kernel call.
         cs_dense = buf[:, :B]
-        cs_dense.copy_(cs.view(B, 3, d, W)[:, :, :, 1:].permute(1, 0, 2, 3))
+        cs = None
+        if (
+            self._fused_conv_state_step is not None
+            and conv_pool.dtype is x_qkv.dtype
+            and not self._has_kda_replay_caches(layer_cache)
+        ):
+            self._fused_conv_state_step(conv_pool, slot_indices, x_qkv, cs_dense)
+        else:
+            cs = conv_pool.index_select(0, slot_indices)  # [B, 3d, W]
+            cs_dense.copy_(cs.view(B, 3, d, W)[:, :, :, 1:].permute(1, 0, 2, 3))
 
         state = (
             ssm_pool if ssm_state_indices is not None else ssm_pool.index_select(0, slot_indices)
@@ -1470,17 +1495,22 @@ class KimiKDARuntime(nn.Module):
         if ssm_state_indices is None:
             ssm_pool.index_copy_(0, slot_indices, state)
 
-        # Roll the HF-layout conv pool by one token: new window =
-        # [old columns 1..W-1, x_new]. One cat + one scatter.
-        new_win = torch.cat([cs[:, :, 1:], x_qkv.unsqueeze(-1)], dim=-1)
-        if new_win.dtype != conv_pool.dtype:
-            new_win = new_win.to(conv_pool.dtype)
-        conv_pool.index_copy_(0, slot_indices, new_win)
-        # Fused-verify replay caches (spec decoding only): keep the
-        # committed conv window in sync with the plain-decode advance.
-        self._sync_kda_replay_conv_window(
-            layer_cache, slot_indices, new_win[:, :d], new_win[:, d : 2 * d], new_win[:, 2 * d :]
-        )
+        if cs is not None:
+            # Roll the HF-layout conv pool by one token: new window =
+            # [old columns 1..W-1, x_new]. One cat + one scatter.
+            new_win = torch.cat([cs[:, :, 1:], x_qkv.unsqueeze(-1)], dim=-1)
+            if new_win.dtype != conv_pool.dtype:
+                new_win = new_win.to(conv_pool.dtype)
+            conv_pool.index_copy_(0, slot_indices, new_win)
+            # Fused-verify replay caches (spec decoding only): keep the
+            # committed conv window in sync with the plain-decode advance.
+            self._sync_kda_replay_conv_window(
+                layer_cache,
+                slot_indices,
+                new_win[:, :d],
+                new_win[:, d : 2 * d],
+                new_win[:, 2 * d :],
+            )
 
         return mixer.o_proj(o.view(B, d))
 
