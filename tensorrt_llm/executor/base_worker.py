@@ -246,6 +246,17 @@ class BaseWorker(GenerationExecutor):
 
         return {}
 
+    def _get_ep_health_stats(self, timeout: float = 1.0) -> Optional[dict]:
+        """Return committed EP membership when the backend supports it."""
+        health_reader = getattr(self.engine, "_get_ep_health_stats", None)
+        if health_reader is None:
+            return None
+        return health_reader()
+
+    def fetch_ep_health_stats(self) -> Optional[dict]:
+        """RPC entry point for passive committed-membership telemetry."""
+        return self._get_ep_health_stats()
+
     def fetch_kv_cache_events(self) -> list:
         return self.engine.get_latest_kv_cache_events()
 

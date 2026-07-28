@@ -24,15 +24,16 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
 )
 
-from .ep_group_health import EPGroupHealth
+from .ep_group_health import (
+    EP_GROUP_HEALTH_EXTRA_ATTR,
+    EP_GROUP_HEALTH_LEGACY_EXTRA_ATTR,
+    EPGroupHealth,
+)
 
 _ENABLE_ENV = "TLLM_FAULT_TOLERANCE_MODE"
 _TIMEOUT_ENV = "TRTLLM_ALLTOALL_WATCHDOG_TIMEOUT_S"
 _POLL_INTERVAL_ENV = "TRTLLM_ALLTOALL_WATCHDOG_POLL_INTERVAL_S"
 
-# This object contains membership committed by higher-layer recovery
-# coordination.  Detection threads must treat it as read-only.
-_HEALTH_KEY = "wide_ep_ft_ep_group_health"
 _TIMEOUT_KEY = "alltoall_watchdog_timeout_s"
 _POLL_INTERVAL_KEY = "alltoall_watchdog_poll_interval_s"
 
@@ -65,7 +66,9 @@ def get_wide_ep_ft_options(
     """
 
     extra_attrs = getattr(model_config, "extra_attrs", {})
-    health = extra_attrs.get(_HEALTH_KEY) or extra_attrs.get("ep_group_health")
+    health = extra_attrs.get(EP_GROUP_HEALTH_EXTRA_ATTR) or extra_attrs.get(
+        EP_GROUP_HEALTH_LEGACY_EXTRA_ATTR
+    )
     rank_mask_enabled = health is not None or _env_enabled()
     if rank_mask_enabled and getattr(model_config, "use_cuda_graph", False):
         raise ValueError(
@@ -74,7 +77,7 @@ def get_wide_ep_ft_options(
         )
     if health is None and rank_mask_enabled:
         health = EPGroupHealth(model_config.mapping.moe_ep_size)
-        extra_attrs[_HEALTH_KEY] = health
+        extra_attrs[EP_GROUP_HEALTH_EXTRA_ATTR] = health
 
     poll_interval_s = _float_option(
         extra_attrs,
