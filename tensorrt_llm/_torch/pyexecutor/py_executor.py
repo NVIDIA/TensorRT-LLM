@@ -574,6 +574,10 @@ class PyExecutor:
         # so the extended perf time-events path can report per-iteration
         # starvation (capacity-fit but not micro-batch scheduled).
         self._last_num_fitting_reqs = None
+        # Steady-clock time (seconds) at which the last _schedule() returned,
+        # i.e. the scheduler-admission timestamp shared by every request in that
+        # iteration's micro-batch. Populated only when capture_extended is on.
+        self._last_schedule_time = None
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
@@ -1893,7 +1897,8 @@ class PyExecutor:
 
     def _compute_iter_batch_context(self,
                                     scheduled_batch: ScheduledRequests,
-                                    num_fitting_reqs=None) -> dict:
+                                    num_fitting_reqs=None,
+                                    schedule_time=None) -> dict:
         """Build the per-iteration batch-context dict for extended perf events.
 
         Shared by every request scheduled this iteration; merged into each
@@ -1907,6 +1912,14 @@ class PyExecutor:
         (``num_capacity_fitting`` vs ``num_scheduled``). Per-request starvation
         attribution is not possible in Python (``_schedule`` returns only the
         count), so this is a per-iteration count by design.
+
+        ``schedule_time`` is the steady-clock time (seconds) at which
+        ``_schedule()`` returned this iteration's micro-batch -- the
+        scheduler-admission timestamp. It is emitted as ``scheduled_time`` so
+        every admitted request's per-chunk / per-step metric entry carries a
+        distinct admission event (chunked-prefill chunks and decode steps each
+        get their own), and the gap ``forward_start_time - scheduled_time``
+        exposes admission-to-execution latency.
         """
         num_ctx_requests = scheduled_batch.num_context_requests
         num_gen_requests = scheduled_batch.num_generation_requests
@@ -1938,6 +1951,9 @@ class PyExecutor:
             # scheduled this iteration (per-iteration count, not per-request).
             ctx["num_capacity_fitting"] = num_fitting_reqs
             ctx["num_scheduled"] = scheduled_batch.batch_size
+        if schedule_time is not None:
+            # Scheduler-admission timestamp for this iteration's micro-batch.
+            ctx["scheduled_time"] = schedule_time
         return ctx
 
     def _populate_req_stats(
@@ -3750,6 +3766,15 @@ class PyExecutor:
         )
         # Stash for the extended perf time-events path (per-iteration starvation).
         self._last_num_fitting_reqs = num_fitting_reqs
+        # Stamp the scheduler-admission time once per iteration for the extended
+        # perf time-events path. This is the moment _schedule() returned the
+        # micro-batch for this iteration, i.e. when every request in
+        # scheduled_batch was admitted by the capacity + micro-batch schedulers.
+        # It rides the shared iter_batch_context, so it lands on each admitted
+        # request's per-chunk / per-step metric entry (a distinct per-request
+        # admission event for chunked prefill and for every decode step).
+        if self.perf_manager.capture_extended:
+            self._last_schedule_time = get_steady_clock_now_in_seconds()
 
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
@@ -4207,7 +4232,9 @@ class PyExecutor:
 
                     if self.perf_manager.enabled:
                         iter_ctx = (self._compute_iter_batch_context(
-                            scheduled_batch, self._last_num_fitting_reqs)
+                            scheduled_batch,
+                            self._last_num_fitting_reqs,
+                            schedule_time=self._last_schedule_time)
                                     if self.perf_manager.capture_extended else
                                     None)
                         self.perf_manager.save_timing_to_requests(
@@ -4806,7 +4833,9 @@ class PyExecutor:
                 if can_queue:
                     if self.perf_manager.enabled:
                         iter_ctx = (self._compute_iter_batch_context(
-                            scheduled_batch, self._last_num_fitting_reqs)
+                            scheduled_batch,
+                            self._last_num_fitting_reqs,
+                            schedule_time=self._last_schedule_time)
                                     if self.perf_manager.capture_extended else
                                     None)
                         self.perf_manager.save_timing_to_requests(

@@ -246,3 +246,76 @@ class TestPerRankWriter:
         mgr.maybe_write_request_events(resp, rank=0)
         mgr.close()  # safe no-op when no writer thread
         assert glob.glob(str(tmp_path / "*.jsonl")) == []
+
+    def test_record_enriched_with_request_timing_metrics(self, tmp_path):
+        # When get_metrics_dict yields the C++ lifecycle scalars (serve path
+        # forces return_perf_metrics under the env), they ride into the record
+        # under request_timing_metrics as stable str->float keys.
+        from tensorrt_llm.metrics.enums import RequestEventTiming
+
+        fake_metrics = {
+            RequestEventTiming.ARRIVAL_TIME: 100.0,
+            RequestEventTiming.FIRST_SCHEDULED_TIME: 100.5,
+            RequestEventTiming.FIRST_TOKEN_TIME: 101.0,
+            RequestEventTiming.LAST_TOKEN_TIME: 105.0,
+            RequestEventTiming.KV_CACHE_TRANSFER_START: 100.1,
+            RequestEventTiming.KV_CACHE_TRANSFER_END: 100.4,
+            RequestEventTiming.KV_CACHE_SIZE: 4096,
+        }
+        with patch.dict(os.environ, {PERF_TIME_EVENTS_PATH_ENV: str(tmp_path)}):
+            mgr = PerfMetricsManager(enabled=False)
+            resp = self._make_response(7, {"step_metrics": [{"forward_start_time": 1.0}]})
+            with patch(
+                "tensorrt_llm.executor.result.get_metrics_dict",
+                return_value=fake_metrics,
+            ):
+                mgr.maybe_write_request_events(resp, rank=0)
+            mgr.close()
+
+        files = glob.glob(str(tmp_path / "time_events_rank0_pid*.jsonl"))
+        assert len(files) == 1
+        with open(files[0]) as f:
+            rec = json.loads(next(ln for ln in f if ln.strip()))
+        rtm = rec["request_timing_metrics"]
+        # Enum keys stringified to their stable .value.
+        assert rtm["arrival_time"] == 100.0
+        assert rtm["first_scheduled_time"] == 100.5
+        assert rtm["last_token_time"] == 105.0
+        assert rtm["kv_cache_size"] == 4096
+        assert all(isinstance(k, str) for k in rtm)
+
+    def test_empty_timing_metrics_omits_key(self, tmp_path):
+        # Raw LLM-API run (no return_perf_metrics) -> get_metrics_dict is {} ->
+        # the request_timing_metrics key is simply absent (never a crash).
+        with patch.dict(os.environ, {PERF_TIME_EVENTS_PATH_ENV: str(tmp_path)}):
+            mgr = PerfMetricsManager(enabled=False)
+            resp = self._make_response(8, {"step_metrics": [{"forward_start_time": 1.0}]})
+            with patch(
+                "tensorrt_llm.executor.result.get_metrics_dict",
+                return_value={},
+            ):
+                mgr.maybe_write_request_events(resp, rank=0)
+            mgr.close()
+        files = glob.glob(str(tmp_path / "time_events_rank0_pid*.jsonl"))
+        with open(files[0]) as f:
+            rec = json.loads(next(ln for ln in f if ln.strip()))
+        assert "request_timing_metrics" not in rec
+
+    def test_enrichment_failure_is_swallowed(self, tmp_path):
+        # get_metrics_dict raising must NOT crash the writer -- enrichment is
+        # best-effort. The record is still written, sans timing metrics.
+        with patch.dict(os.environ, {PERF_TIME_EVENTS_PATH_ENV: str(tmp_path)}):
+            mgr = PerfMetricsManager(enabled=False)
+            resp = self._make_response(9, {"step_metrics": [{"forward_start_time": 1.0}]})
+            with patch(
+                "tensorrt_llm.executor.result.get_metrics_dict",
+                side_effect=RuntimeError("boom"),
+            ):
+                mgr.maybe_write_request_events(resp, rank=0)
+            mgr.close()
+        files = glob.glob(str(tmp_path / "time_events_rank0_pid*.jsonl"))
+        assert len(files) == 1
+        with open(files[0]) as f:
+            rec = json.loads(next(ln for ln in f if ln.strip()))
+        assert rec["request_id"] == 9
+        assert "request_timing_metrics" not in rec

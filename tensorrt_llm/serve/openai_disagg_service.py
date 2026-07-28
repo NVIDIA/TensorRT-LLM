@@ -168,6 +168,10 @@ class OpenAIDisaggregatedService(OpenAIService):
             ):
                 gen_req.disaggregated_params = None
         if ctx_response is None or self._need_gen(ctx_response):
+            # Mark gen-dispatch start: ctx-response (or arrival, on the no-ctx
+            # path) to here is the pre-generation wait in the orchestrator.
+            if hooks:
+                hooks.on_gen_dispatch(gen_req)
             if not gen_server:
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server, req_id=disagg_request_id

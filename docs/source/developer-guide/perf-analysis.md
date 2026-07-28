@@ -36,6 +36,11 @@ export TRTLLM_PERF_TIME_EVENTS_PATH=/tmp/perf_events
 # Optional but recommended for disaggregated serving — the KV-transfer CSVs
 # written by the native transceiver perf logger:
 export TRTLLM_KVCACHE_TIME_OUTPUT_PATH=/tmp/kv_csv
+# Optional — extend the timeline to the two processes outside the executor.
+# Set on the disaggregated router process (uvicorn) and on the benchmark client
+# respectively; each writes its own per-pid JSONL, independent of the workers:
+export TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH=/tmp/perf_events_router
+export TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH=/tmp/perf_events_client
 ```
 
 Setting `TRTLLM_PERF_TIME_EVENTS_PATH` (to an output **directory**, symmetric
@@ -56,6 +61,16 @@ with `TRTLLM_KVCACHE_TIME_OUTPUT_PATH`) does three things:
 Each JSONL record is `{request_id, rank, ctx_request_id, time_breakdown_metrics}`
 — the same `time_breakdown_metrics` shape the `time_breakdown` tool consumes.
 
+On the serve / disaggregated path (where the entrypoint force-sets
+`return_perf_metrics` under the env), the record additionally carries a
+`request_timing_metrics` sub-dict with the C++ `RequestPerfMetrics` lifecycle
+scalars keyed by their stable enum names: `arrival_time`, `first_scheduled_time`,
+`first_token_time`, `last_token_time`, `kv_cache_transfer_start`,
+`kv_cache_transfer_end`, `kv_cache_size`. These are steady-clock seconds and give
+the request's arrival → first-schedule (admission) → first-token → last-token
+lifecycle. Enrichment is best-effort: on a raw LLM-API run without perf metrics
+the key is simply absent (never a crash).
+
 **Known limitations (Python-only capture):**
 
 * **Starvation is a per-iteration count**, not per-request attribution — the
@@ -66,23 +81,70 @@ Each JSONL record is `{request_id, rank, ctx_request_id, time_breakdown_metrics}
   request's disaggregated `ctx_request_id` when exposed; otherwise the ctx-side
   and gen-side records live in separate per-rank files.
 
-**Optional offline aggregator.** To stitch the per-rank files (and the KV CSVs)
-into one combined JSON — and, optionally, the interactive HTML timeline — run:
+**Extending the timeline beyond the workers (router + client).** The two env
+vars above capture the two processes the executor never sees, so the timeline can
+span client-send → router-dispatch → worker-execute:
+
+* `TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH` — set on the **disaggregated router**
+  (the `trtllm-serve disaggregated` uvicorn process). Each request writes one
+  `disagg_router_pid{P}.jsonl` record with the router's steady-clock stamps:
+  `arrival_time`, `ctx_dispatch_time` (dispatch to the CTX worker),
+  `gen_dispatch_time` (dispatch to the Gen worker), `first_token_time`,
+  `resp_done_time`, plus `ctx_server` / `gen_server` and the join key
+  `ctx_request_id` (known only after the CTX round-trip; gen-only requests have
+  none and are collected separately). The router's clock shares the workers'
+  steady-clock epoch, so router-vs-worker spans are directly comparable.
+* `TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH` — set on the **benchmark client**
+  (`benchmark_serving.py`). Each request writes one `client_pid{P}.jsonl` record:
+  `send_time` / `first_token_time` / `completion_time` (process-local
+  `time.perf_counter`), `ttft`, `latency`, and `send_wall_time` (`time.time`).
+  The client is torch-free and its `response_id` is a fresh UUID, **not** a
+  worker join key — so the client timeline is **standalone**, aligned to the rest
+  only through the wall-clock anchor. It is emitted verbatim in the combined
+  JSON's `client_events`, never joined onto a request record.
+
+Both the router and the client stay torch-free (they must — see the GPU-free
+import contract), so they use a stdlib-only writer with an `atexit` flush rather
+than the worker's daemon-thread writer.
+
+**Optional offline aggregator.** To stitch the per-rank files (plus the KV CSVs,
+the router file, and the client file) into one combined JSON — and, optionally,
+the interactive HTML timeline — run:
 
 ```bash
 python -m tensorrt_llm.serve.scripts.perf_time_events \
     --event-dir /tmp/perf_events \
     --kv-csv-dir /tmp/kv_csv \
+    --router-dir /tmp/perf_events_router \
+    --client-dir /tmp/perf_events_client \
     -o /tmp/perf_events/combined.json \
     --html /tmp/perf_events/timeline.html
 ```
 
-The aggregator joins KV-transfer rows by request id (`unique_rid` for the native
-transceiver; `RequestID` for C++), reports any unmatched rows under
-`unjoined_kv_events` with a match-rate warning, and computes derived
-`inter_step_gaps` / `inter_chunk_gaps` and per-iteration `starved` counts. It is
-a convenience over the per-rank files, not the load-bearing capture path; only
-the `--html` path pulls in `plotly`. See [Introduction to KV Cache
+The four input flags default to their respective env vars
+(`--event-dir` → `$TRTLLM_PERF_TIME_EVENTS_PATH`, `--kv-csv-dir` →
+`$TRTLLM_KVCACHE_TIME_OUTPUT_PATH`, `--router-dir` →
+`$TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH`, `--client-dir` →
+`$TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH`); any one input is sufficient. The
+aggregator:
+
+* joins KV-transfer rows by request id (`unique_rid` for the native transceiver;
+  `RequestID` for C++), reporting unmatched rows under `unjoined_kv_events`;
+* joins the router record onto each worker record by `ctx_request_id`, exposing
+  it as `router_dispatch` and deriving the cross-process spans
+  `router_arrival_to_ctx_dispatch`, `router_ctx_to_gen_dispatch`, and
+  `router_to_worker_arrival`; unmatched router rows (including gen-only records
+  with no `ctx_request_id`) surface under `unjoined_router_events`;
+* derives the worker-side request-lifecycle spans `arrival_to_first_schedule`,
+  `schedule_to_first_token`, and `decode_duration` from `request_timing_metrics`
+  when present;
+* carries the client records through untouched under `client_events` (standalone,
+  as noted above);
+* computes derived `inter_step_gaps` / `inter_chunk_gaps` and per-iteration
+  `starved` counts, and emits a match-rate warning for each join.
+
+It is a convenience over the per-rank files, not the load-bearing capture path;
+only the `--html` path pulls in `plotly`. See [Introduction to KV Cache
 Transmission](./kv-transfer.md) for the KV cache transfer CSVs it consumes.
 
 

@@ -2044,6 +2044,14 @@ class ResponseHooks(ABC):
         or fleet. The default is a no-op for non-instrumented implementations.
         """
 
+    def on_gen_dispatch(self, request: UCompletionRequest):
+        """Record when the disaggregated service starts generation placement.
+
+        Fires just before the router picks + sends to the gen server, i.e. after
+        the ctx round-trip (or immediately, on the gen-only / no-ctx path). The
+        default is a no-op for non-instrumented implementations.
+        """
+
     @abstractmethod
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         pass

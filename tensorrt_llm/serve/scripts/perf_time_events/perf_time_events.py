@@ -92,6 +92,60 @@ def parse_event_dir(event_dir: str) -> List[Dict[str, Any]]:
     return records
 
 
+def parse_router_dir(router_dir: str) -> Dict[str, Dict[str, Any]]:
+    """Parse disagg-router ``disagg_router_*.jsonl`` files, keyed by ctx id.
+
+    Each record is one finished request as written by
+    ``RawRequestResponseHooks._maybe_write_router_event`` -- it carries the
+    router dispatch timeline (arrival / ctx_dispatch / gen_dispatch / first_token
+    / resp_done, all steady-clock seconds) plus both join ids
+    (``ctx_request_id`` -- the cross-process key shared with the worker per-rank
+    files -- and the router's own ``disagg_request_id``).
+
+    Returned keyed by ``str(ctx_request_id)`` so worker records join in O(1).
+    Records without a ``ctx_request_id`` (gen-only / no-ctx path) are collected
+    under the sentinel key ``""`` as a list appended into ``_no_ctx`` so they are
+    still reported rather than silently dropped.
+    """
+    by_ctx: Dict[str, Dict[str, Any]] = {}
+    no_ctx: List[Dict[str, Any]] = []
+    files = sorted(glob.glob(os.path.join(router_dir, "disagg_router_*.jsonl")))
+    for path in files:
+        for obj in _iter_jsonl(path):
+            if not isinstance(obj, dict):
+                continue
+            ctx_id = obj.get("ctx_request_id")
+            if ctx_id is None:
+                no_ctx.append(obj)
+            else:
+                by_ctx[str(ctx_id)] = obj
+    if no_ctx:
+        by_ctx["_no_ctx"] = no_ctx  # type: ignore[assignment]
+    return by_ctx
+
+
+def parse_client_dir(client_dir: str) -> List[Dict[str, Any]]:
+    """Parse benchmark-client ``client_*.jsonl`` files into a flat list.
+
+    Each record is one request's client send timeline (process-local monotonic
+    ``send_time`` + wall-clock ``send_wall_time`` anchor) as written by
+    ``benchmark_serving._maybe_write_client_time_events``. The client has no
+    shared request id and a different clock epoch from the server, so these are
+    surfaced as a STANDALONE timeline (not joined to worker/router records);
+    ``send_wall_time`` is the only cross-process alignment handle and is
+    best-effort. Sorted by ``send_wall_time`` (then ``client_index``) for stable,
+    time-ordered output.
+    """
+    records: List[Dict[str, Any]] = []
+    files = sorted(glob.glob(os.path.join(client_dir, "client_*.jsonl")))
+    for path in files:
+        for obj in _iter_jsonl(path):
+            if isinstance(obj, dict):
+                records.append(obj)
+    records.sort(key=lambda r: (r.get("send_wall_time") or 0.0, r.get("client_index") or 0))
+    return records
+
+
 def _to_float(value: str) -> Optional[float]:
     """Best-effort float parse; blank/None/garbage -> None."""
     if value is None:
@@ -207,12 +261,19 @@ class PerfTimeEventsMerger:
         self.kv: Dict[str, Any] = {"task_events": {}, "gen_summary": {}, "cpp_events": {}}
         self.unjoined_kv_events: Dict[str, Any] = {}
         self.match_stats: Dict[str, int] = {}
+        # Router dispatch records keyed by ctx_request_id (+ "_no_ctx" list).
+        self.router_events: Dict[str, Any] = {}
+        self.unjoined_router_events: List[Dict[str, Any]] = []
+        # Client send timeline -- standalone, not joined (no shared key/clock).
+        self.client_events: List[Dict[str, Any]] = []
 
     def merge(
         self,
         event_dir: Optional[str] = None,
         perf_json: Optional[str] = None,
         kv_csv_dir: Optional[str] = None,
+        router_dir: Optional[str] = None,
+        client_dir: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         records: List[Dict[str, Any]] = []
         if event_dir:
@@ -227,10 +288,17 @@ class PerfTimeEventsMerger:
 
         if kv_csv_dir:
             self.kv = parse_kv_csv_dir(kv_csv_dir)
+        if router_dir:
+            self.router_events = parse_router_dir(router_dir)
+        if client_dir:
+            self.client_events = parse_client_dir(client_dir)
 
         task_events = self.kv.get("task_events", {})
         gen_summary = self.kv.get("gen_summary", {})
         cpp_events = self.kv.get("cpp_events", {})
+        # Router records keyed by ctx id; "_no_ctx" holds the gen-only path list.
+        router_by_ctx = {k: v for k, v in self.router_events.items() if k != "_no_ctx"}
+        matched_router_ctx = set()
 
         matched_rids = set()
         for rec in records:
@@ -262,6 +330,16 @@ class PerfTimeEventsMerger:
             if joined_cpp:
                 rec["kv_cpp_events"] = joined_cpp
 
+            # Router dispatch join (by ctx_request_id -- the cross-process key).
+            router_rec = None
+            for rid in rids:
+                if rid in router_by_ctx:
+                    router_rec = router_by_ctx[rid]
+                    matched_router_ctx.add(rid)
+                    break
+            if router_rec is not None:
+                rec["router_dispatch"] = router_rec
+
             # DERIVED signals.
             tbm = rec.get("time_breakdown_metrics") or {}
             step_metrics = tbm.get("step_metrics") or []
@@ -278,6 +356,34 @@ class PerfTimeEventsMerger:
                     starved.append(m["num_capacity_fitting"] - m["num_scheduled"])
             if starved:
                 derived["starved"] = starved
+
+            # Cross-process lifecycle spans (steady-clock seconds), when the
+            # request-level timing scalars are present (serve path forces
+            # return_perf_metrics on under TRTLLM_PERF_TIME_EVENTS_PATH).
+            rtm = rec.get("request_timing_metrics") or {}
+            arrival = rtm.get("arrival_time")
+            first_sched = rtm.get("first_scheduled_time")
+            first_tok = rtm.get("first_token_time")
+            last_tok = rtm.get("last_token_time")
+            if arrival is not None and first_sched is not None:
+                derived["arrival_to_first_schedule"] = first_sched - arrival
+            if first_sched is not None and first_tok is not None:
+                derived["schedule_to_first_token"] = first_tok - first_sched
+            if first_tok is not None and last_tok is not None:
+                derived["decode_duration"] = last_tok - first_tok
+            # Router-side dispatch waits (steady-clock, same epoch as the worker).
+            if router_rec is not None:
+                r_arr = router_rec.get("arrival_time")
+                r_ctx = router_rec.get("ctx_dispatch_time")
+                r_gen = router_rec.get("gen_dispatch_time")
+                if r_arr is not None and r_ctx is not None:
+                    derived["router_arrival_to_ctx_dispatch"] = r_ctx - r_arr
+                if r_ctx is not None and r_gen is not None:
+                    derived["router_ctx_to_gen_dispatch"] = r_gen - r_ctx
+                # Router arrival -> worker arrival: dispatch + network to the
+                # worker (both steady-clock). Only meaningful when both present.
+                if r_arr is not None and arrival is not None:
+                    derived["router_to_worker_arrival"] = arrival - r_arr
             if derived:
                 rec["derived"] = derived
 
@@ -291,6 +397,15 @@ class PerfTimeEventsMerger:
             "cpp_events": unjoined_cpp,
         }
 
+        # Router records that never joined a request record: the ctx-keyed
+        # leftovers plus every gen-only ("_no_ctx") record (which by construction
+        # cannot join on ctx_request_id).
+        unjoined_router = [
+            row for ctx_id, row in router_by_ctx.items() if ctx_id not in matched_router_ctx
+        ]
+        unjoined_router.extend(self.router_events.get("_no_ctx", []))
+        self.unjoined_router_events = unjoined_router
+
         # Count UNIQUE rids across the three structures: the same rid routinely
         # appears in both task_events and gen_summary (send tasks + gen summary
         # for one request), so summing the dict lengths would double-count it
@@ -298,10 +413,15 @@ class PerfTimeEventsMerger:
         all_kv_rids = set(task_events) | set(gen_summary) | set(cpp_events)
         total_kv = len(all_kv_rids)
         matched_kv = len(matched_rids)
+        total_router = len(router_by_ctx)
+        matched_router = len(matched_router_ctx)
         self.match_stats = {
             "num_records": len(records),
             "total_kv_rids": total_kv,
             "matched_kv_rids": matched_kv,
+            "total_router_ctx": total_router,
+            "matched_router_ctx": matched_router,
+            "num_client_events": len(self.client_events),
         }
         if total_kv:
             rate = 100.0 * matched_kv / total_kv
@@ -311,15 +431,26 @@ class PerfTimeEventsMerger:
                     f"({matched_kv}/{total_kv} rids matched); unmatched rows "
                     f"reported under 'unjoined_kv_events'"
                 )
+        if total_router:
+            rate = 100.0 * matched_router / total_router
+            if rate < 100.0:
+                print(
+                    f"WARNING: router-dispatch join match-rate {rate:.1f}% "
+                    f"({matched_router}/{total_router} ctx ids matched); unmatched "
+                    f"rows reported under 'unjoined_router_events'"
+                )
 
         self.records = records
         return records
 
     def write(self, output_path: str) -> None:
-        """Write the combined JSON (records + unjoined KV + match stats)."""
+        """Write the combined JSON (records + unjoined KV/router + client + stats)."""
         payload = {
             "records": self.records,
             "unjoined_kv_events": self.unjoined_kv_events,
+            "unjoined_router_events": self.unjoined_router_events,
+            # Client send timeline: standalone (no shared key/clock), not joined.
+            "client_events": self.client_events,
             "match_stats": self.match_stats,
         }
         with open(output_path, "w") as f:
@@ -361,6 +492,20 @@ def main():
         help="Directory of KV-transfer CSVs (default: $TRTLLM_KVCACHE_TIME_OUTPUT_PATH).",
     )
     parser.add_argument(
+        "--router-dir",
+        default=os.getenv("TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH") or None,
+        help="Directory of disagg-router disagg_router_*.jsonl files "
+        "(default: $TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH). Joined to request "
+        "records by ctx_request_id.",
+    )
+    parser.add_argument(
+        "--client-dir",
+        default=os.getenv("TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH") or None,
+        help="Directory of benchmark-client client_*.jsonl files "
+        "(default: $TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH). Surfaced as a "
+        "standalone timeline (no shared key/clock with the server records).",
+    )
+    parser.add_argument(
         "--perf-json",
         default=None,
         help="Optional /perf_metrics JSON dump to merge (aggregated runs).",
@@ -380,11 +525,21 @@ def main():
     )
     args = parser.parse_args()
 
-    if not args.event_dir and not args.perf_json:
-        parser.error("provide --event-dir (or $TRTLLM_PERF_TIME_EVENTS_PATH) or --perf-json")
+    if not any((args.event_dir, args.perf_json, args.router_dir, args.client_dir)):
+        parser.error(
+            "provide at least one input: --event-dir (or "
+            "$TRTLLM_PERF_TIME_EVENTS_PATH), --perf-json, --router-dir, or "
+            "--client-dir"
+        )
 
     merger = PerfTimeEventsMerger()
-    merger.merge(event_dir=args.event_dir, perf_json=args.perf_json, kv_csv_dir=args.kv_csv_dir)
+    merger.merge(
+        event_dir=args.event_dir,
+        perf_json=args.perf_json,
+        kv_csv_dir=args.kv_csv_dir,
+        router_dir=args.router_dir,
+        client_dir=args.client_dir,
+    )
     merger.write(args.output)
     if args.html:
         merger.write_html(args.html)

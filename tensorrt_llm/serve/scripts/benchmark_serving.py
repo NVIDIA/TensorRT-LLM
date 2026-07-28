@@ -46,9 +46,69 @@ from tensorrt_llm.serve.scripts.benchmark_dataset import (
 from tensorrt_llm.serve.scripts.benchmark_utils import (
     convert_to_pytorch_benchmark_format, write_to_json)
 from tensorrt_llm.serve.scripts.time_breakdown import RequestTimeBreakdown
+from tensorrt_llm.serve.perf_time_events_writer import (CLIENT_EVENTS_PATH_ENV,
+                                                        make_env_writer)
 # isort: on
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+
+
+def _maybe_write_client_time_events(outputs, input_requests) -> None:
+    """Write the client send timeline as JSONL (perf-time-events client file).
+
+    No-op unless ``TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH`` names an output dir.
+    One record per request, order-aligned with ``input_requests`` (the client's
+    only correlation handle -- the server response id is fresh-minted and not a
+    worker-join key, and the client clock epoch differs from the server steady
+    clock). ``send_wall_time`` is the wall-clock anchor a post-script uses to
+    align this timeline against server-side records; see the aggregator docs.
+    """
+    writer = make_env_writer(CLIENT_EVENTS_PATH_ENV, "client")
+    if not writer.enabled:
+        return
+    for idx, out in enumerate(outputs):
+        prompt_len = None
+        if input_requests is not None and idx < len(input_requests):
+            prompt_len = getattr(input_requests[idx], "prompt_len", None)
+        # send_time/ttft/latency are process-local monotonic seconds; derive the
+        # absolute-ish first-token / completion instants on that same clock so the
+        # record is self-contained.
+        send_time = getattr(out, "send_time", 0.0) or None
+        ttft = getattr(out, "ttft", 0.0)
+        latency = getattr(out, "latency", 0.0)
+        first_token_time = (send_time +
+                            ttft) if (send_time and ttft and ttft > 0) else None
+        completion_time = (send_time +
+                           latency) if (send_time and latency) else None
+        writer.write({
+            "source":
+            "client",
+            "client_index":
+            idx,
+            "response_id":
+            getattr(out, "response_id", "") or None,
+            "success":
+            getattr(out, "success", False),
+            "prompt_len":
+            prompt_len,
+            "output_tokens":
+            getattr(out, "output_tokens", 0),
+            # process-local monotonic (time.perf_counter) seconds
+            "send_time":
+            send_time,
+            "first_token_time":
+            first_token_time,
+            "completion_time":
+            completion_time,
+            "ttft":
+            ttft if ttft and ttft > 0 else None,
+            "latency":
+            latency or None,
+            # wall-clock anchor (time.time) for cross-process alignment
+            "send_wall_time":
+            getattr(out, "send_wall_time", 0.0) or None,
+        })
+    writer.close()
 
 
 @dataclass
@@ -450,6 +510,10 @@ async def benchmark(
                                      session=session)))
         i += 1
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+
+    # Perf time-events: dump the client send timeline (best-effort, gated by
+    # TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH). Post-run, off the request path.
+    _maybe_write_client_time_events(outputs, input_requests)
 
     if profile:
         print("Stopping profiler...")

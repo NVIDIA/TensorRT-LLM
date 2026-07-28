@@ -282,6 +282,11 @@ class PerfMetricsManager:
         For generation phase (``py_decoding_iter >= 1``): saves to
         ``step_metrics``.
 
+        When ``capture_extended`` is on, the shared per-iteration
+        ``iter_batch_context`` is merged into each entry, so batch-context and
+        the ``scheduled_time`` admission timestamp ride onto every ctx chunk and
+        every decode step without any per-request bookkeeping here.
+
         Args:
             request: The :class:`LlmRequest` to update.
             iter_counter: Current iteration number from ``PyExecutor``.
@@ -365,6 +370,19 @@ class PerfMetricsManager:
         aggregator correlate ctx-server and gen-server records. ``None`` on
         non-disagg runs.
 
+        The record is also enriched with the request-level lifecycle scalars from
+        the C++ ``RequestPerfMetrics.timing_metrics`` (arrival / first-scheduled /
+        first-token / last-token / kv-cache-transfer start+end, and kv_cache_size)
+        via :func:`tensorrt_llm.executor.result.get_metrics_dict`. Those fields are
+        populated only when the request carried ``return_perf_metrics=True`` -- the
+        trtllm-serve entrypoints force that on whenever
+        ``TRTLLM_PERF_TIME_EVENTS_PATH`` is set, so on the serve/disagg path the
+        scalars are present; a raw ``LLM``-API run that leaves the flag off yields
+        an empty dict and the key is simply omitted. These scalars are the steady-
+        clock lifecycle anchors the per-iteration ``time_breakdown_metrics`` (a
+        relative interior view) cannot express, and they share the server steady
+        clock with the disagg-router dispatch file for cross-process joins.
+
         The on-loop cost is only a dict build + a non-blocking
         ``queue.Queue.put_nowait``; all file I/O (json.dumps + write + flush)
         happens on a lazily-started daemon thread so the executor loop never
@@ -386,6 +404,15 @@ class PerfMetricsManager:
             "time_breakdown_metrics": time_breakdown_metrics,
         }
 
+        # Request-level lifecycle timestamps (steady-clock seconds). Empty unless
+        # return_perf_metrics was on for the request (forced by the serve layer
+        # under TRTLLM_PERF_TIME_EVENTS_PATH). Lazily imported to avoid a module
+        # import cycle at load time. Enum keys are stringified to their stable
+        # ``.value`` (arrival_time, first_scheduled_time, ...).
+        timing_metrics = self._extract_request_timing_metrics(response)
+        if timing_metrics:
+            record["request_timing_metrics"] = timing_metrics
+
         self._ensure_writer(rank)
         try:
             self._writer_queue.put_nowait(record)
@@ -394,6 +421,27 @@ class PerfMetricsManager:
             # writer thread stalls; dropping a record is preferable to
             # blocking the executor loop.
             logger.warning("perf time-events queue full; dropping one record")
+
+    @staticmethod
+    def _extract_request_timing_metrics(response) -> dict:
+        """Return the C++ request-lifecycle timestamps as a plain str->float dict.
+
+        Reuses ``executor.result.get_metrics_dict`` (which handles the
+        ``timedelta.total_seconds()`` conversion and returns ``{}`` when perf
+        metrics are absent). Keys are the ``RequestEventTiming`` enum's stable
+        ``.value`` strings. Any failure degrades to an empty dict -- this is an
+        enrichment, never load-bearing for the primary time-breakdown record.
+        """
+        try:
+            from tensorrt_llm.executor.result import get_metrics_dict
+
+            metrics = get_metrics_dict(response)
+        except Exception as e:  # noqa: BLE001 - enrichment must never crash the writer
+            logger.debug("perf time-events: request timing enrichment skipped: %s", e)
+            return {}
+        if not metrics:
+            return {}
+        return {(k.value if hasattr(k, "value") else str(k)): v for k, v in metrics.items()}
 
     def _ensure_writer(self, rank: int) -> None:
         """Lazily create the bounded queue + daemon writer thread (once)."""

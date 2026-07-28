@@ -23,11 +23,20 @@ HTML timeline). This is a convenience over the per-rank files, not the
 load-bearing capture path.
 """
 
-from .perf_time_events import PerfTimeEventsMerger, main, parse_event_dir, parse_kv_csv_dir
+from .perf_time_events import (
+    PerfTimeEventsMerger,
+    main,
+    parse_client_dir,
+    parse_event_dir,
+    parse_kv_csv_dir,
+    parse_router_dir,
+)
 
 __all__ = [
     "PerfTimeEventsMerger",
     "parse_event_dir",
     "parse_kv_csv_dir",
+    "parse_router_dir",
+    "parse_client_dir",
     "main",
 ]
