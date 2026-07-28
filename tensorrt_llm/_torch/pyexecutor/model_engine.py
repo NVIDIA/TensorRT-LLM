@@ -650,7 +650,8 @@ class PyTorchModelEngine(ModelEngine):
         self.encoder_attn_metadata = None
         self.spec_metadata = None
         self.iter_states = {}
-        self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
+        self._cuda_graph_mem_pool = (Backend.get_graph_pool_handle()
+                                     if self._torch_compile_enabled else None)
 
         self._cuda_graph_padding_enabled = cuda_graph_padding_enabled
 
@@ -2746,6 +2747,11 @@ class PyTorchModelEngine(ModelEngine):
         if hasattr(self, 'encoder_cuda_graph_runner'
                    ) and self.encoder_cuda_graph_runner is not None:
             self.encoder_cuda_graph_runner.clear()
+        # The graphs reset above were captured into Backend's process-wide pool,
+        # so a later engine in this process (e.g. a second LLM sharing the
+        # worker) must not reuse that now-dead handle.
+        Backend.retire_graph_pool_handle()
+        self._cuda_graph_mem_pool = None
 
     def get_max_num_sequences(self) -> int:
         """

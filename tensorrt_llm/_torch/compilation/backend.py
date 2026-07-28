@@ -78,9 +78,6 @@ class Backend:
         self.events = Backend.Events()
         inductor_config.enable_auto_functionalized_v2 = False
 
-        if Backend._graph_pool_handle is None:
-            Backend._graph_pool_handle = torch.cuda.graph_pool_handle()
-
         self.match_count = []
         self.match_count_by_pass = OrderedDict()
 
@@ -111,6 +108,23 @@ class Backend:
                 PatternMatcherPass("add_norm_fallback", MATCHER_SUBSYSTEM))
             register_add_norm(custom_passes[-1])
         return custom_passes
+
+    @classmethod
+    def get_graph_pool_handle(cls) -> tuple[int, int]:
+        """Return the pool handle shared by every graph runner in this process."""
+        if cls._graph_pool_handle is None:
+            cls._graph_pool_handle = torch.cuda.graph_pool_handle()
+        return cls._graph_pool_handle
+
+    @classmethod
+    def retire_graph_pool_handle(cls) -> None:
+        """Drop the cached handle once its graphs have been reset.
+
+        A private pool cannot outlive its graphs: CUDACachingAllocator asserts
+        on any attempt to incref a pool whose use_count already dropped to
+        zero, so the next caller has to allocate a fresh handle.
+        """
+        cls._graph_pool_handle = None
 
     def bypass_optimization(self):
         self.no_optimization = True
@@ -179,7 +193,7 @@ class Backend:
                 self.enable_inductor,
                 self.input_num_tokens,
                 self.capture_num_tokens,
-                self._graph_pool_handle,
+                self.get_graph_pool_handle(),
                 self.num_streams,
             )
             self._piecewise_runners.update(runners)
