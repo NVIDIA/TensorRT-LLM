@@ -251,16 +251,14 @@ class LoraLayer(torch.nn.Module):
                 module_ids=tuple(layer.lora_module_types),
             ) in cuda_graph_params.layer_info for layer in lora_layers)
 
-        execute_in_parallel = (has_lora_layer 
-                               and do_multi_stream()
+        execute_in_parallel = (has_lora_layer and do_multi_stream()
                                and not torch.compiler.is_compiling())
 
         # Pack all LoRA forwards (e.g., fused/unfused) in a single tuple
         def lora_forward():
             return tuple(
                 lora_layer(x, lora_params, layer_idx)
-                for lora_layer in lora_layers
-            )
+                for lora_layer in lora_layers)
 
         if execute_in_parallel:
             # Lazy allocation of aux stream and parallel events
@@ -268,7 +266,8 @@ class LoraLayer(torch.nn.Module):
                 LoraLayer._aux_stream = torch.cuda.Stream()
             if lora_layers[0]._par_events is None:
                 lora_layers[0]._par_events = [
-                    torch.cuda.Event(), torch.cuda.Event()]
+                    torch.cuda.Event(), torch.cuda.Event()
+                ]
 
             base_output, lora_outputs = maybe_execute_in_parallel(
                 base_forward,
@@ -284,10 +283,7 @@ class LoraLayer(torch.nn.Module):
         for lora_output in lora_outputs:
             if lora_output is None:
                 continue
-            if cuda_graph_params and not torch.compiler.is_compiling():
-                base_output.add_(lora_output)
-            else:
-                base_output = base_output + lora_output
+            base_output.add_(lora_output)
 
         return base_output
 
