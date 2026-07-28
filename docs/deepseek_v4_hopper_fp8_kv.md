@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # DeepSeek-V4 Hopper FP8 KV Cache with Sparse MLA
 
 This document describes the Hopper (SM90) sparse-MLA path for
-DeepSeek-V4, formerly developed under the Mewtwo model name.
+DeepSeek-V4.
 
 ## Summary
 
