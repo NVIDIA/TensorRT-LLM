@@ -153,6 +153,56 @@ class TestRMSNormBasic:
 
         torch.testing.assert_close(output_triton, output_ref, rtol=1e-2, atol=1e-2)
 
+    @pytest.mark.parametrize("scale", [32.0, 0.13])
+    def test_fp8_matches_separate_static_quantization(self, scale):
+        hidden_size = 128
+        batch_size = 32
+        device = "cuda"
+        dtype = torch.bfloat16
+
+        torch.manual_seed(3)
+        norm = RMSNorm(hidden_size, eps=1e-6, norm_before_gate=True).to(device).to(dtype)
+        torch.nn.init.normal_(norm.weight, mean=1.0, std=0.1)
+        x = torch.randn(batch_size, hidden_size, device=device, dtype=dtype)
+        z = torch.randn(batch_size, hidden_size, device=device, dtype=dtype)
+        fp8_scale = torch.tensor(scale, device=device, dtype=torch.float32)
+
+        bf16_output = norm(x, z=z)
+        expected, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(bf16_output, fp8_scale)
+        norm.fp8_scale = fp8_scale
+        actual = norm(x, z=z)
+
+        assert actual.dtype == torch.float8_e4m3fn
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+    @pytest.mark.parametrize("scale", [32.0, 0.13])
+    @pytest.mark.parametrize("num_tokens,heads,N", [(64, 8, 128), (33, 4, 512)])
+    def test_token_major_fp8_matches_separate_static_quantization(
+        self, scale, num_tokens, heads, N
+    ):
+        """Both the multi-row (N<=256) and generic-fallback (N>256) paths of
+        rms_norm_gated_token_major must quantize identically to norm-then-
+        static-quantize."""
+        from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+        device = "cuda"
+        dtype = torch.bfloat16
+
+        torch.manual_seed(3)
+        M = num_tokens * heads
+        x = torch.randn(M, N, device=device, dtype=dtype)
+        weight = torch.randn(N, device=device, dtype=dtype) * 0.1 + 1.0
+        wide = torch.randn(num_tokens, heads * N + 256, device=device, dtype=dtype)
+        z = wide[:, 256:].view(num_tokens, heads, N)
+        fp8_scale = torch.tensor(scale, device=device, dtype=torch.float32)
+
+        bf16_output = rms_norm_gated_token_major(x, z, weight, 1e-6)
+        expected, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(bf16_output, fp8_scale)
+        actual = rms_norm_gated_token_major(x, z, weight, 1e-6, fp8_scale=fp8_scale)
+
+        assert actual.dtype == torch.float8_e4m3fn
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
 
 @skip_no_cuda
 class TestRMSNormNVFP4:

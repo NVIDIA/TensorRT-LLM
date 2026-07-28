@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from collections import defaultdict
+from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -35,16 +36,11 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
-    BatchDesc,
     BufferConfig,
     DataRole,
-    GpuCacheTierConfig,
-    HostCacheTierConfig,
-    KVCacheDesc,
     LayerId,
     PageIndexMode,
     ScratchDesc,
-    SwaScratchReuseConfig,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
@@ -250,7 +246,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
         self._init_indexer_dtype(sparse_attn_config)
 
-        # _build_cache_config() needs them to build constraints
         self._max_input_len = max_input_len
         self._max_num_tokens = max_num_tokens
 
@@ -267,6 +262,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             vocab_size=vocab_size,
             mapping=mapping,
             dtype=dtype,
+            max_num_tokens=max_num_tokens,
             **kwargs,
         )
         self.is_vswa = True  # DeepSeek-V4 must has VSWA
@@ -310,14 +306,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return super()._format_kv_cache_pool_lifecycle_entry(layer_id, role)
 
         model_layer_idx, attn_type = layer_semantics
-        attr = self.impl._storage.get_buffer_attr(layer_id, role)
-        pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
-        lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
         return (
             f"deepseek_role={attn_type.name}, "
             f"compress_ratio={self._compress_ratios[model_layer_idx]}, "
-            f"pool_group_id={int(pool_group_id)}, "
-            f"lifecycle_id={int(attr.life_cycle_id)}, lifecycle={lifecycle}"
+            f"{super()._format_kv_cache_pool_lifecycle_entry(layer_id, role)}"
         )
 
     def get_buffers(self, layer_idx: int, attn_type: DeepseekV4AttentionType) -> torch.Tensor:
@@ -768,16 +760,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return float("inf")
         return self._max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
 
-    def _build_cache_config(
-        self,
-        kv_cache_config: KvCacheConfig,
-        *,
-        tokens_per_block: int,
-        vocab_size: int | None,
-        cache_tiers: List[GpuCacheTierConfig | HostCacheTierConfig],
-    ) -> KVCacheManagerConfigPy:
+    def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
-        Create the cache manager config for DeepSeek-V4.
+        Add DeepSeek-V4 layers to the cache config.
         """
         layers: List[AttentionLayerConfig] = []
         layer_attn_to_layer_id: Dict[Tuple[int, DeepseekV4AttentionType], LayerId] = {}
@@ -864,85 +849,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # number of layers in the KVCacheManagerPy
         self._num_manager_layers = len(layers)
 
-        # Build constraints and typical_step for better pool ratio.
-        max_batch_size = self.max_batch_size
-        max_seq_len = self.max_seq_len
-        max_num_tokens = self._max_num_tokens
-        max_draft_len = self._max_draft_len
-        typical_step = None
-        constraints = []
-        if kv_cache_config.pool_ratio is None:
-            typical_seq_len = (
-                kv_cache_config.avg_seq_len
-                if kv_cache_config.avg_seq_len is not None
-                else max_seq_len
-            )
-            if typical_seq_len > max_seq_len:
-                raise ValueError(
-                    f"kv_cache_config.avg_seq_len ({typical_seq_len}) must be less than or "
-                    f"equal to max_seq_len ({max_seq_len})"
-                )
-
-            # For aggregated serving in large batch size:
-            # Use 1 context request + (max_batch_size - 1) generation requests as
-            # the typical step. An all-generation typical_step over-provisions the
-            # compressed-cache pool at the expense of the SWA pool, starving the
-            # SWA pool and artificially capping the achievable batch size.
-            ctx_capacity = max_num_tokens if max_num_tokens is not None else typical_seq_len
-            generation_history_length = max(0, typical_seq_len - max_draft_len - 1)
-            typical_step = BatchDesc(
-                kv_caches=[
-                    KVCacheDesc(capacity=ctx_capacity, history_length=0),
-                ]
-                + [
-                    KVCacheDesc(
-                        capacity=typical_seq_len,
-                        history_length=generation_history_length,
-                    )
-                ]
-                * (max_batch_size - 1),
-            )
-
-            # Constraint 1: cuda graph generation warmup — one decode request that has
-            # accumulated to the tail of max_seq_len. Using history_length=max_seq_len-1
-            # (instead of 0) lets SWA / SSM pools collapse to their windowed working set,
-            # while full-cache pools still need max_seq_len/tokens_per_block blocks
-            # because they don't age.
-            constraints.append(
-                BatchDesc([KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - 1)])
-            )
-
-            # Constraint 2: general / chunked-prefill warmup — one fresh context request
-            # at max_num_tokens (the per-iteration token budget).
-            if max_num_tokens is not None:
-                constraints.append(
-                    BatchDesc(
-                        [
-                            KVCacheDesc(
-                                capacity=max_num_tokens + self.num_extra_kv_tokens, history_length=0
-                            )
-                        ]
-                    )
-                )
-
-        scratch_reuse_config = None
-        if self.enable_swa_scratch_reuse:
-            # Context requests will allocate num_extra_kv_tokens tokens for spec decoding.
-            # Cache manager should not take them into account when calculating scratch range.
-            # Therefore set max_rewind_len to num_extra_kv_tokens.
-            scratch_reuse_config = SwaScratchReuseConfig(max_rewind_len=self.num_extra_kv_tokens)
-
-        return KVCacheManagerConfigPy(
-            tokens_per_block=tokens_per_block,
-            vocab_size=vocab_size,
-            cache_tiers=cache_tiers,
-            max_util_for_resume=kv_cache_config.max_util_for_resume,
-            swa_scratch_reuse=scratch_reuse_config,
+        return replace(
+            config,
             layers=layers,
-            typical_step=typical_step,
-            constraints=constraints,
-            enable_stats=self.enable_stats,
-            initial_pool_ratio=kv_cache_config.pool_ratio,
         )
 
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:
@@ -1157,9 +1066,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         local_layer_idx: int,
         data_role: DataRole,
     ) -> int:
-        raise NotImplementedError(
-            "DeepSeek-V4 doesn't support get_layer_bytes_per_token, use _get_attn_bytes_per_block"
-        )
+        # The generic layers in the base config are replaced by
+        # _build_cache_config, so their buffer sizes are only placeholders.
+        return 1
 
     def get_indexer_k_cache_buffers(self, layer_idx: int) -> torch.Tensor:
         """
@@ -1297,8 +1206,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         beam_width: int,
         num_contexts: int,
         num_seqs: int,
+        max_blocks: Optional[int] = None,
     ) -> None:
-        """For compatibility with AttentionOp, copy only the SWA block offsets."""
+        """For compatibility with AttentionOp, copy only the SWA block offsets.
+
+        max_blocks is accepted for signature parity with KVCacheManager; the
+        copy below is already bounded by the precomputed SWA table width.
+        """
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         assert dst_tensor.is_cuda, "copy_batch_block_offsets expects a CUDA destination"
         dst_tensor.fill_(BAD_PAGE_INDEX)

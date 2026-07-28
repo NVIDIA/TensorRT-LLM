@@ -35,9 +35,7 @@ import traceback
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional, Type, Union
-
-import grpc
+from typing import Any, Callable, Iterator, MutableMapping, Optional, Protocol, Type, Union
 
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
@@ -58,10 +56,13 @@ from tensorrt_llm.mapping import Mapping
 # for a source. On a cold cluster (no donor up yet), this means the very
 # first replica blocks for an hour before falling back to disk. We cap
 # the default at 30 s so first-replica startup degrades gracefully; users
-# can still override via the env var or a future per-loader knob.
+# can still override via the env var or the per-loader `query_timeout_s` setting.
 # Tracked as MX-4 in §15 (non-blocking source-query API upstream).
 _MX_SOURCE_QUERY_TIMEOUT_DEFAULT_S = "30"
-_MX_PUBLISH_ENV_LOCK = threading.Lock()
+# ModelExpress 0.4.1 reads transfer configuration from process-wide
+# environment variables and exposes a module-level identity builder. Keep all
+# temporary mutation of that shared state in one critical section.
+_MX_TRANSFER_STATE_LOCK = threading.Lock()
 _MX_SOURCE_IDENTITY_METADATA_KEY = "trtllm_source_identity"
 _MX_WEIGHT_LAYOUT_METADATA_KEY = "trtllm_weight_layout"
 _MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY = "trtllm_transform_protocol_version"
@@ -75,9 +76,15 @@ class _MxWeightLayoutStatus(Enum):
     UNSUPPORTED = "unsupported"
 
 
+class _MxSourceIdentity(Protocol):
+    """Subset of ModelExpress's protobuf SourceIdentity used by this adapter."""
+
+    extra_parameters: MutableMapping[str, str]
+
+
 @contextmanager
-def _temporary_env(key: str, value: Optional[str]):
-    """Temporarily set or clear one environment variable."""
+def _temporary_env(key: str, value: Optional[str]) -> Iterator[None]:
+    """Temporarily set one environment variable when a value is provided."""
     if value is None:
         yield
         return
@@ -92,6 +99,95 @@ def _temporary_env(key: str, value: Optional[str]):
             os.environ[key] = prior
 
 
+def _serialize_source_identity(identity: SourceIdentity) -> str:
+    """Serialize TRT-LLM's layout identity for MX's identity map."""
+    payload = identity.to_dict()
+    # `model_name` is a cleartext discovery descriptor and is deliberately
+    # excluded from SourceIdentity compatibility checks. The outer MX identity
+    # already carries the normalized model name; embedding a local checkpoint
+    # path here would make otherwise-compatible no-shards receivers hash to a
+    # different MX source.
+    payload.pop("model_name", None)
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _attach_trtllm_metadata_to_mx_identity(
+    mx_identity: _MxSourceIdentity, source_identity: Optional[SourceIdentity]
+) -> _MxSourceIdentity:
+    """Attach TRT-LLM compatibility metadata to an MX SourceIdentity."""
+    if source_identity is None:
+        return mx_identity
+
+    extra_parameters = getattr(mx_identity, "extra_parameters", None)
+    if extra_parameters is None:
+        raise RuntimeError(
+            "MX SourceIdentity has no extra_parameters field; cannot attach "
+            "TRT-LLM SourceIdentity for compatibility filtering."
+        )
+
+    try:
+        for key, value in _build_mx_source_metadata(source_identity).items():
+            extra_parameters[key] = value
+    except (AttributeError, TypeError, ValueError) as e:
+        raise RuntimeError(
+            "Failed to attach TRT-LLM compatibility metadata to MX "
+            "SourceIdentity; MX P2P compatibility filtering will reject "
+            "this source."
+        ) from e
+    return mx_identity
+
+
+@contextmanager
+def _patched_trtllm_identity_builder(
+    mx_transfer: Any, source_identity: Optional[SourceIdentity]
+) -> Iterator[None]:
+    """Temporarily wrap upstream TRT-LLM identity construction."""
+    original = getattr(mx_transfer, "_build_trtllm_identity", None)
+    if source_identity is None or not callable(original):
+        yield
+        return
+
+    def _wrapped_build_identity(*args: Any, **kwargs: Any) -> _MxSourceIdentity:
+        return _attach_trtllm_metadata_to_mx_identity(
+            original(*args, **kwargs),
+            source_identity,
+        )
+
+    mx_transfer._build_trtllm_identity = _wrapped_build_identity
+    try:
+        yield
+    finally:
+        mx_transfer._build_trtllm_identity = original
+
+
+def _close_mx_client(client: Any) -> None:
+    """Close a best-effort MX discovery client without masking its result."""
+    if client is None:
+        return
+    close = getattr(client, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        logger.warning(
+            f"Failed to close MX discovery client; continuing with the "
+            f"completed probe result.\n{traceback.format_exc()}"
+        )
+
+
+def _synchronize_cuda_for_mx_publish() -> None:
+    """Finish pending CUDA writes before exposing source buffers through MX."""
+    import torch
+
+    if torch.cuda.is_initialized():
+        torch.cuda.synchronize()
+
+
 @register_checkpoint_loader("MX")
 class MXCheckpointLoader(HfCheckpointLoader):
     """Checkpoint loader for MX (ModelExpress) P2P weight transfer.
@@ -102,9 +198,10 @@ class MXCheckpointLoader(HfCheckpointLoader):
     publishes its weights after `post_load_weights()` runs, together with
     metadata that lets compatible targets skip one-shot post-load transforms.
 
-    When the MX server or library is unavailable, this loader
-    transparently falls back to standard HuggingFace checkpoint
-    loading via the parent `HfCheckpointLoader`.
+    When the MX server is unavailable, this loader transparently falls back
+    to standard HuggingFace checkpoint loading via the parent
+    `HfCheckpointLoader`. A missing MX client is treated as a configuration
+    error and reported with an actionable installation command.
 
     All transport-level mechanics (NIXL, dtype casts, source matching,
     fallback) are delegated to `modelexpress.trtllm_live_transfer`
@@ -135,7 +232,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
         # `model_name` is the human-readable identity to publish/look up
         # under on the MX server. Typically the user-supplied
         # `llm_args.model` (a Hub ID like `"Qwen/Qwen2.5-72B-Instruct"`
-        # or a local path). `publish_as_source()` resolves it via
+        # or a local path). Transfer and publish paths resolve it via
         # :func:`_resolve_mx_model_name` (with HF-snapshot path fallback).
         self._model_name = str(model_name) if model_name is not None else None
         self._query_timeout_s = query_timeout_s
@@ -160,9 +257,9 @@ class MXCheckpointLoader(HfCheckpointLoader):
         """Explicit model identity passed to the constructor (if any).
 
         Note this is the *as-configured* value (e.g. `llm_args.model`),
-        not the final resolved identity that ends up in the published
+        not the final resolved identity passed to ModelExpress as
         `MODEL_NAME`. The full resolution (with env var and basename
-        fallbacks) happens inside :meth:`publish_as_source`.
+        fallbacks) happens inside the transfer and publish paths.
         """
         return self._model_name
 
@@ -222,6 +319,9 @@ class MXCheckpointLoader(HfCheckpointLoader):
             mapping: Distributed mapping configuration.
             **kwargs: Additional keyword arguments. When `model` is
                 passed it is used as the target for direct P2P writes.
+                `prepare_post_transform_receiver`, when present, is called
+                after a post-transform source is qualified and before those
+                direct writes begin.
 
         Returns:
             A weights dict. Empty when MX P2P fully succeeded (weights
@@ -232,6 +332,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
         # Popped here so it never leaks into the disk-fallback signature.
         self._local_source_identity = kwargs.pop("source_identity", None)
         allow_post_transform_weights = kwargs.pop("allow_post_transform_weights", False)
+        prepare_post_transform_receiver = kwargs.pop("prepare_post_transform_receiver", None)
         self._p2p_succeeded = False
         self._post_transform_weights_preloaded = False
         self._source_identity_compatible_for_last_load = False
@@ -249,23 +350,68 @@ class MXCheckpointLoader(HfCheckpointLoader):
             )
 
         try:
-            from modelexpress.trtllm_live_transfer import (  # type: ignore[import-not-found]
-                MxClient,
-                MxLiveWeightLoader,
-                _build_trtllm_identity,
+            from modelexpress import (
+                trtllm_live_transfer as mx_transfer,  # type: ignore[import-not-found]
             )
-        except ImportError:
+        except ImportError as exc:
+            raise ImportError(
+                "ModelExpress checkpoint loading was explicitly requested, "
+                "but the ModelExpress client could not be imported. Install "
+                'the MX dependencies with `pip install "tensorrt-llm[mx]"`, '
+                "or select a different "
+                "`checkpoint_format` to continue without MX."
+            ) from exc
+
+        try:
+            with _MX_TRANSFER_STATE_LOCK:
+                MxClient = mx_transfer.MxClient
+                MxLiveWeightLoader = mx_transfer.MxLiveWeightLoader
+                build_trtllm_identity = mx_transfer._build_trtllm_identity
+                # Resolve once so discovery and the released ModelExpress
+                # loader query the same source identity. The lock prevents a
+                # concurrent MX publish from temporarily changing MODEL_NAME or
+                # the identity builder while this state is captured.
+                resolved_name = self._resolve_publish_name(checkpoint_dir)
+        except AttributeError:
             logger.warning(
-                "modelexpress library not installed; cannot use MX P2P "
-                "weight transfer. Install from "
-                "https://github.com/ai-dynamo/modelexpress (Python client at "
-                "modelexpress_client/python). Falling back to disk loading."
+                "modelexpress TRT-LLM live-transfer symbols are missing; "
+                "cannot use MX P2P weight transfer. Falling back to disk "
+                "loading."
             )
             return self._fallback_to_disk(checkpoint_dir, mapping, **kwargs)
 
-        source_metadata = self._fetch_source_metadata(
-            checkpoint_dir, MxClient, _build_trtllm_identity
-        )
+        try:
+            source_metadata = self._fetch_source_metadata(
+                checkpoint_dir,
+                MxClient,
+                build_trtllm_identity,
+                model_name=resolved_name,
+            )
+        except Exception:
+            # Deliberately broad: source discovery is part of the optional MX
+            # fast path, so an upstream client failure must preserve disk
+            # loading as the correctness path.
+            logger.warning(
+                "MX source metadata fetch failed; falling back to disk "
+                f"loading.\n{traceback.format_exc()}"
+            )
+            return self._fallback_to_disk(
+                checkpoint_dir,
+                mapping,
+                reason="MX source metadata probe failed",
+                **kwargs,
+            )
+
+        source_registered = source_metadata is not None
+        if not source_registered and self._local_source_identity is not None:
+            # ModelExpress 0.4.1 hashes every SourceIdentity field, including
+            # extra_parameters. Proceed to MxLiveWeightLoader.load_weights()
+            # even though this immediate probe found no source: that method
+            # retries list_sources every five seconds until a source appears or
+            # query_timeout_s expires. It uses this same patched identity, so
+            # any source discovered later necessarily carries the expected
+            # TRT-LLM identity and layout metadata.
+            source_metadata = _build_mx_source_metadata(self._local_source_identity)
         # Pre-transfer compatibility gate: on mismatch, skip the transfer
         # before any RDMA work starts and fall back to disk.
         self._source_identity_compatible_for_last_load = self._source_metadata_identity_compatible(
@@ -300,33 +446,53 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 mapping,
                 reason=(
                     "source publishes post-transform weights but this model is "
-                    "not allow-listed for staged MX receiver loading"
+                    "not qualified for staged MX receiver loading"
                 ),
                 **kwargs,
             )
+        if self._post_transform_weights_preloaded:
+            if prepare_post_transform_receiver is None:
+                self._post_transform_weights_preloaded = False
+                self._source_identity_compatible_for_last_load = False
+                return self._fallback_to_disk(
+                    checkpoint_dir,
+                    mapping,
+                    reason=(
+                        "post-transform source requires receiver structure "
+                        "preparation before exact-name P2P transfer"
+                    ),
+                    **kwargs,
+                )
+            # Source-side setup_aliases() may change the first canonical name
+            # returned for aliased parameters. Mirror that structural state on
+            # the receiver before upstream MX matches tensors by exact name.
+            prepare_post_transform_receiver(model)
 
         timeout_override = self._resolve_query_timeout_override(
-            checkpoint_dir,
-            MxClient,
-            _build_trtllm_identity,
+            source_registered=source_registered,
+            model_name=resolved_name,
         )
-        with _temporary_env("MX_SOURCE_QUERY_TIMEOUT", timeout_override):
-            try:
+        try:
+            with (
+                _MX_TRANSFER_STATE_LOCK,
+                _temporary_env("MX_SOURCE_QUERY_TIMEOUT", timeout_override),
+                _temporary_env("MODEL_NAME", resolved_name),
+                _patched_trtllm_identity_builder(mx_transfer, self._local_source_identity),
+            ):
                 mx_loader = MxLiveWeightLoader(mx_server=self._mx_server_url)
                 fallback_weights = mx_loader.load_weights(
                     checkpoint_dir,
                     mapping=mapping,
                     model=model,
                 )
-            except Exception:
-                # Deliberately broad: MX is an opportunistic fast path and HF
-                # disk loading remains the correctness path. Preserve the full
-                # traceback so unexpected upstream failures are diagnosable.
-                logger.warning(
-                    "MX P2P transfer failed; falling back to disk loading.\n"
-                    f"{traceback.format_exc()}"
-                )
-                return self._fallback_to_disk(checkpoint_dir, mapping, **kwargs)
+        except Exception:
+            # Deliberately broad: MX is an opportunistic fast path and HF
+            # disk loading remains the correctness path. Preserve the full
+            # traceback so unexpected upstream failures are diagnosable.
+            logger.warning(
+                f"MX P2P transfer failed; falling back to disk loading.\n{traceback.format_exc()}"
+            )
+            return self._fallback_to_disk(checkpoint_dir, mapping, **kwargs)
 
         if fallback_weights:
             fallback_bytes = sum(
@@ -375,7 +541,10 @@ class MXCheckpointLoader(HfCheckpointLoader):
         return {}
 
     def _resolve_query_timeout_override(
-        self, checkpoint_dir: str, MxClient: Type[Any], build_identity: Callable[..., Any]
+        self,
+        *,
+        source_registered: bool,
+        model_name: str,
     ) -> Optional[str]:
         """Return temporary `MX_SOURCE_QUERY_TIMEOUT` override, if any."""
         if self._query_timeout_s is not None:
@@ -384,63 +553,17 @@ class MXCheckpointLoader(HfCheckpointLoader):
         if os.environ.get("MX_SOURCE_QUERY_TIMEOUT"):
             return None
 
-        if self._has_any_source_instance(checkpoint_dir, MxClient, build_identity):
+        if source_registered:
             return None
 
         logger.warning(
             "No MX source is currently registered for "
-            f"{self._resolve_publish_name(checkpoint_dir)}; "
+            f"{model_name}; "
             f"using MX_SOURCE_QUERY_TIMEOUT={_MX_SOURCE_QUERY_TIMEOUT_DEFAULT_S} "
             "for fast disk fallback. Set mx_config.server_query_timeout_s or "
             "MX_SOURCE_QUERY_TIMEOUT for long-running donor-load deployments."
         )
         return _MX_SOURCE_QUERY_TIMEOUT_DEFAULT_S
-
-    def _has_any_source_instance(
-        self, checkpoint_dir: str, MxClient: Type[Any], build_identity: Callable[..., Any]
-    ) -> bool:
-        """Best-effort fast probe for registered MX source instances."""
-        client = None
-        try:
-            identity = build_identity(model_name=self._resolve_publish_name(checkpoint_dir))
-            client = MxClient(server_url=self._mx_server_url)
-            list_resp = client.list_sources(identity=identity)
-            return bool(getattr(list_resp, "instances", []))
-        except (AttributeError, RuntimeError, TimeoutError, grpc.RpcError):
-            # If the probe cannot complete, prefer fast fallback over the
-            # upstream 1-hour default. The actual MxLiveWeightLoader call below
-            # remains the source of truth and may still succeed.
-            logger.warning(
-                f"MX source probe failed; using fast fallback timeout.\n{traceback.format_exc()}"
-            )
-            return False
-        finally:
-            if client is not None and hasattr(client, "close"):
-                client.close()
-
-    def _source_identity_compatible(
-        self, checkpoint_dir: str, MxClient: Type[Any], build_identity: Callable[..., Any]
-    ) -> bool:
-        """Whether the MX source's identity is compatible with this receiver.
-
-        Compares the receiver's local :class:`SourceIdentity` against the
-        publisher's via `check_weight_sharing_compatibility` with the `WARN_FALLBACK`
-        policy.
-
-        Args:
-            checkpoint_dir: The checkpoint directory identifying the source.
-            MxClient: The MX discovery client type (forwarded to the fetch
-                seam).
-            build_identity: Builder used to derive the publisher identity
-                (forwarded to the fetch seam).
-
-        Returns:
-            `True` to proceed with P2P only when both identities are present
-            and compatible. `False` when either identity is missing or the
-            identities mismatch, so the caller falls back to disk loading.
-        """
-        source_identity = self._fetch_source_identity(checkpoint_dir, MxClient, build_identity)
-        return self._source_identity_compatible_with_source(source_identity)
 
     def _source_metadata_identity_compatible(self, metadata: Optional[dict[str, Any]]) -> bool:
         source_identity = _source_identity_from_metadata(metadata)
@@ -457,30 +580,23 @@ class MXCheckpointLoader(HfCheckpointLoader):
         )
         return decision.should_share
 
-    def _fetch_source_identity(
-        self, checkpoint_dir: str, MxClient: Type[Any], build_identity: Callable[..., Any]
-    ) -> Optional[SourceIdentity]:
-        """Fetch the publisher's serialized :class:`SourceIdentity`.
-
-        Args:
-            checkpoint_dir: The checkpoint directory identifying the source.
-            MxClient: The MX discovery client type.
-            build_identity: Builder used to derive the publisher identity.
-
-        Returns:
-            The publisher's identity, or `None` when it cannot be fetched
-            yet (the compatibility gate then rejects P2P and falls back).
-        """
-        metadata = self._fetch_source_metadata(checkpoint_dir, MxClient, build_identity)
-        return _source_identity_from_metadata(metadata)
-
     def _fetch_source_metadata(
-        self, checkpoint_dir: str, MxClient: Type[Any], build_identity: Callable[..., Any]
+        self,
+        checkpoint_dir: str,
+        MxClient: Type[Any],
+        build_identity: Callable[..., Any],
+        *,
+        model_name: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         """Fetch TRT-LLM metadata for the selected MX source, if available."""
         client = None
         try:
-            identity = build_identity(model_name=self._resolve_publish_name(checkpoint_dir))
+            identity = self._build_mx_identity(
+                checkpoint_dir,
+                build_identity,
+                self._local_source_identity,
+                model_name=model_name,
+            )
             client = MxClient(server_url=self._mx_server_url)
             for method_name in ("get_source_metadata", "get_metadata", "get_worker_metadata"):
                 method = getattr(client, method_name, None)
@@ -489,7 +605,13 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 try:
                     metadata = method(identity=identity)
                 except TypeError:
-                    metadata = method(identity)
+                    try:
+                        metadata = method(identity)
+                    except TypeError:
+                        # modelexpress 0.4.1 get_metadata() takes
+                        # mx_source_id/worker_id rather than an identity. Fall
+                        # through to the exact-identity list_sources query.
+                        continue
                 metadata_dict = _metadata_to_dict(metadata)
                 if _metadata_has_trtllm_key(metadata_dict):
                     return metadata_dict
@@ -501,16 +623,36 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 metadata_dict = _source_instance_metadata(instance)
                 if metadata_dict:
                     metadata_candidates.append(metadata_dict)
-            return self._select_source_metadata(metadata_candidates)
-        except (AttributeError, RuntimeError, TimeoutError, TypeError, ValueError, grpc.RpcError):
-            logger.warning(
-                f"MX source metadata fetch failed; falling back to disk loading.\n"
-                f"{traceback.format_exc()}"
-            )
+            selected_metadata = self._select_source_metadata(metadata_candidates)
+            if selected_metadata is not None:
+                return selected_metadata
+
+            # modelexpress 0.4.1 SourceInstanceRef intentionally omits the
+            # queried SourceIdentity. A non-empty response still proves an
+            # exact match because list_sources hashes every identity field,
+            # including extra_parameters. Reconstruct the metadata that was
+            # embedded in the exact query so the compatibility/layout checks
+            # remain fail-closed without a second metadata channel.
+            if instances and self._local_source_identity is not None:
+                return _build_mx_source_metadata(self._local_source_identity)
             return None
         finally:
-            if client is not None and hasattr(client, "close"):
-                client.close()
+            _close_mx_client(client)
+
+    def _build_mx_identity(
+        self,
+        checkpoint_dir: str,
+        build_identity: Callable[..., _MxSourceIdentity],
+        source_identity: Optional[SourceIdentity],
+        *,
+        model_name: Optional[str] = None,
+    ) -> _MxSourceIdentity:
+        """Build the MX identity used for discovery and attach TRT-LLM identity."""
+        resolved_name = model_name or self._resolve_publish_name(checkpoint_dir)
+        return _attach_trtllm_metadata_to_mx_identity(
+            build_identity(model_name=resolved_name),
+            source_identity,
+        )
 
     def _select_source_metadata(
         self, metadata_candidates: list[dict[str, Any]]
@@ -554,7 +696,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
 
         Called by the integration in `model_loader.py` after
         `post_load_weights()` so targets receive the post-transform runtime
-        layout and, when allow-listed, can skip their own one-shot transforms.
+        layout and, when qualified, can skip their own one-shot transforms.
 
         Delegates to the upstream
         `modelexpress.trtllm_live_transfer.publish_model_params`
@@ -581,70 +723,71 @@ class MXCheckpointLoader(HfCheckpointLoader):
             return
 
         try:
-            from modelexpress.trtllm_live_transfer import (
-                publish_model_params,  # type: ignore[import-not-found]
+            from modelexpress import (
+                trtllm_live_transfer as mx_transfer,  # type: ignore[import-not-found]
             )
         except ImportError:
             logger.debug("modelexpress library not installed; skipping MX publish.")
+            return
+        try:
+            publish_model_params = mx_transfer.publish_model_params
+        except AttributeError:
+            logger.debug("modelexpress publish_model_params is missing; skipping MX publish.")
             return
 
         # THREADSAFETY: upstream publish_model_params reads MODEL_EXPRESS_URL and
         # MODEL_NAME from the environment. Set both from our resolved
         # configuration so per-instance values (URL passed via
         # llm_args.mx_config.server_url, identity from llm_args.model) are
-        # respected, then restore prior state. This is safe for the current
-        # sequential TRT-LLM worker path, but co-resident ranks in one Python
-        # interpreter would race on process-wide env. Tracked as MX-2 in §15
-        # (the env-var dance goes away when upstream exports a public identity
-        # builder / publish API).
-        resolved_name = self._resolve_publish_name(checkpoint_dir)
+        # respected, then restore prior state. MX transfer and publish calls in
+        # this interpreter are serialized while upstream requires process-wide
+        # state. Tracked as MX-2 in §15 (the env-var dance goes away when
+        # upstream exports a public identity builder / publish API).
         metadata = _build_mx_source_metadata(source_identity)
-        metadata_kwargs = _publish_metadata_kwargs(publish_model_params, metadata)
-        if metadata_kwargs is None:
+        metadata_kwargs = _publish_metadata_kwargs(publish_model_params, metadata) or {}
+        identity_builder = getattr(mx_transfer, "_build_trtllm_identity", None)
+        if not metadata_kwargs and not callable(identity_builder):
             logger.warning(
                 "Skipping MX post-transform publish because "
-                "publish_model_params does not accept metadata; receivers "
-                "cannot safely verify transformed weights."
+                "publish_model_params does not accept metadata and MX does "
+                "not expose its TRT-LLM identity builder; receivers cannot "
+                "safely verify transformed weights."
             )
             return
 
-        env_overrides = {
-            "MODEL_EXPRESS_URL": self._mx_server_url,
-            "MODEL_NAME": resolved_name,
-        }
         if threading.active_count() > 1:
             logger.warning_once(
                 "MX publish uses process-wide MODEL_EXPRESS_URL/MODEL_NAME "
-                "environment variables; concurrent publish calls in one Python "
-                "process are serialized, but unrelated env readers can still "
-                "observe transient values. Tracked by MX-2.",
+                "environment variables; concurrent MX transfer and publish calls "
+                "in one Python process are serialized, but unrelated env readers "
+                "can still observe transient values. Tracked by MX-2.",
                 key="mx_publish_env_threaded_warning",
             )
-        with _MX_PUBLISH_ENV_LOCK:
-            prior = {key: os.environ.get(key) for key in env_overrides}
-            for key, value in env_overrides.items():
-                os.environ[key] = value
-
-            try:
-                publish_model_params(model, **metadata_kwargs)
+        try:
+            with _MX_TRANSFER_STATE_LOCK:
+                resolved_name = self._resolve_publish_name(checkpoint_dir)
+                # Post-load transforms may enqueue asynchronous writes. Make
+                # the source buffers globally ready before MX publishes their
+                # addresses and allows a receiver to issue RDMA reads.
+                _synchronize_cuda_for_mx_publish()
+                with (
+                    _temporary_env("MODEL_EXPRESS_URL", self._mx_server_url),
+                    _temporary_env("MODEL_NAME", resolved_name),
+                    _patched_trtllm_identity_builder(mx_transfer, source_identity),
+                ):
+                    publish_model_params(model, **metadata_kwargs)
                 logger.info(
                     "Published post-transform weights to MX server at %s as model=%r",
                     self._mx_server_url,
                     resolved_name,
                 )
-            except Exception:
-                # Deliberately broad: publish is best-effort. A publish failure
-                # should not fail the local worker that already loaded weights.
-                logger.warning(
-                    f"Failed to publish weights to MX server at {self._mx_server_url}.\n"
-                    f"{traceback.format_exc()}"
-                )
-            finally:
-                for key, prior_value in prior.items():
-                    if prior_value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = prior_value
+        except Exception:
+            # Deliberately broad: publish is best-effort. A publish failure
+            # should not fail the local worker that already loaded weights.
+            logger.warning(
+                f"Failed to publish weights to MX server at {self._mx_server_url}.\n"
+                f"{traceback.format_exc()}"
+            )
 
     def post_load_publish(
         self,
@@ -740,9 +883,7 @@ def _build_mx_source_metadata(source_identity: Optional[SourceIdentity]) -> dict
         _MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY: str(_MX_STAGED_TRANSFORM_PROTOCOL_VERSION),
     }
     if source_identity is not None:
-        metadata[_MX_SOURCE_IDENTITY_METADATA_KEY] = json.dumps(
-            source_identity.to_dict(), sort_keys=True
-        )
+        metadata[_MX_SOURCE_IDENTITY_METADATA_KEY] = _serialize_source_identity(source_identity)
     return metadata
 
 

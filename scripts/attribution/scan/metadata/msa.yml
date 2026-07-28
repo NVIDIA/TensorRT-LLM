@@ -1,0 +1,5 @@
+name: msa
+description: MiniMax Sparse Attention (fmha_sm100) kernels for SM100 sparse attention
+source: submodule
+directory_matches:
+- 3rdparty/MSA

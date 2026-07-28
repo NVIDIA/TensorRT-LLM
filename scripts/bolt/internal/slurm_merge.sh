@@ -116,7 +116,7 @@ srun --ntasks=1 --ntasks-per-node=1 --nodes=1 \
         # 1) Reconstruct the ORIGINAL libs: install the wheel + back up ELFs.
         #    No instrument -- the collect jobs already produced the .fdata.
         _extract='"$RUNDIR"'/extract
-        mkdir -p "$_extract" && tar xzf /builds/'"$TARBALL_NAME"' -C "$_extract" 2>/dev/null || true
+        mkdir -p "$_extract" && tar xzf /builds/'"$TARBALL_NAME"' -C "$_extract" 2>/dev/null
         /workspace/bolt/setup_env.sh "$_extract"
         source /workspace/bolt/bolt_lib.sh
         bolt_run_stages setup_directories backup_libraries

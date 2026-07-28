@@ -15,7 +15,7 @@
 
 import re
 from types import SimpleNamespace
-from typing import Dict, List
+from typing import Dict, List, Literal
 
 import torch
 from transformers import PretrainedConfig
@@ -34,7 +34,6 @@ from ...inputs import (
 from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
-from .modeling_multimodal_utils import _is_mm_disagg
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen3vl import (
     Qwen3VisionModel,
@@ -670,10 +669,16 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
         # model class (this VLM wrapper), not on the inner decoder. Both
         # inner LMs (`Qwen3_5MoeForCausalLM` / `Qwen3_5ForCausalLM`) inherit
         # `Qwen3NextForCausalLM`'s defaults unchanged, so delegate to it to
-        # propagate `enable_block_reuse=False` — the hybrid Mamba/SSM path
-        # doesn't support KV-cache block reuse. Without this the VLM path
-        # would silently fall back to the global default (block reuse on).
+        # propagate the V2 manager selection and keep block reuse disabled
+        # until a recurrent-state snapshot policy is configured.
         return Qwen3NextForCausalLM.get_model_defaults(llm_args)
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["PYTHON"]:
+        """Match the hybrid text decoder's Python disaggregated route."""
+        return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         kwargs["vision_model_class"] = Qwen3VisionModel
@@ -691,11 +696,20 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
         ]
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
-        if not _is_mm_disagg():
+        # None under MM E/P disagg or disable_mm_encoder.
+        if self.mm_encoder is not None:
             self.mm_encoder.load_weights(weights)
 
         weight_mapper = Qwen3_5MoeHfWeightMapper()
-        weight_mapper.init_model_and_config(self.llm, self.model_config)
+        # Hand the mapper the inner LM's model_config, not the VLM wrapper's:
+        # only the inner config went through the Qwen3.5 quant-dict
+        # normalization applied in the inner LM's __init__ (HF->TRT-LLM key
+        # translation + synthesis of the fused in_proj_qkvz FP8 entry). With
+        # the wrapper's un-normalized copy the mapper misses that FP8 entry,
+        # dequantizes the GDN in_proj projections to bf16 and drops their
+        # calibrated scales; the FP8-built module then re-casts with
+        # weight_scale=1.0 and quantizes activations dynamically every step.
+        weight_mapper.init_model_and_config(self.llm, self.llm.model_config)
         filtered_weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
         params_map = {
             r"^model\.language_model\.(.*)$": r"model.\1",

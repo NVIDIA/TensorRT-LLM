@@ -13,9 +13,11 @@
 #       when --work-dir is given). NETWORK-FREE -- safe anywhere.
 #       (gzip, not zstd: zstd isn't present in the trt-llm containers.)
 #
-#   promote <bundle.tar.gz> <branch> <triple>
-#       Upload the bundle to the branch-keyed path as BOTH a versioned copy and
-#       latest.tar.gz (overwrite). Used by POSTMERGE only.
+#   promote <bundle.tar.gz> <branch> <triple> [promote_latest]
+#       Upload the bundle to the branch-keyed path as a versioned copy, and (when
+#       promote_latest is "true", the default) also overwrite latest.tar.gz.
+#       Pass "false" (or set BOLT_PROMOTE_LATEST=false) to publish a versioned
+#       bundle for an OLD ref without repointing latest at it. Used by POSTMERGE.
 #
 #   pull-latest <branch> <triple> <dest_dir>
 #       Download + extract latest.tar.gz for <branch>/<triple> into <dest_dir>.
@@ -94,16 +96,24 @@ cmd_package() {
 }
 
 cmd_promote() {
-    local bundle="${1:?promote: <bundle.tar.gz> <branch> <triple>}"
+    local bundle="${1:?promote: <bundle.tar.gz> <branch> <triple> [promote_latest]}"
     local branch="${2:?branch required}"
     local triple="${3:?triple required}"
+    # Whether to also overwrite latest.tar.gz. Defaults to true (postmerge on the
+    # current ref); pass "false" (or set BOLT_PROMOTE_LATEST=false) to publish a
+    # versioned bundle for an OLD ref without repointing latest at it.
+    local promote_latest="${4:-${BOLT_PROMOTE_LATEST:-true}}"
     [[ -f "$bundle" ]] || die "bundle not found: $bundle"
     _ensure_jf
     local dir; dir="$(promote_dir "$branch" "$triple")"
-    log "Promoting $(basename "$bundle") -> $dir/ (versioned + latest)"
+    log "Promoting $(basename "$bundle") -> $dir/ (versioned$([[ "$promote_latest" == "true" ]] && echo " + latest"))"
     jf rt upload "$bundle" "$dir/$(basename "$bundle")" --flat
-    jf rt upload "$bundle" "$dir/latest.tar.gz" --flat
-    log "Promoted. latest = $dir/latest.tar.gz"
+    if [[ "$promote_latest" == "true" ]]; then
+        jf rt upload "$bundle" "$dir/latest.tar.gz" --flat
+        log "Promoted. latest = $dir/latest.tar.gz"
+    else
+        log "Promoted versioned bundle only (latest NOT updated)."
+    fi
 }
 
 cmd_pull_latest() {

@@ -93,11 +93,6 @@ BOLT_WORKLOADS = [
     // [name: "dsv32_disagg_32k4k_c1",  testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-v32-fp4_32k4k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]"],
 ]
 
-// Branch-keyed promote path (matches internal/artifactory.sh conventions).
-PROFILE_PROMOTE_DIR = "sw-tensorrt-generic/llm-artifacts/bolt-profiles/${BRANCH}/${TRIPLE}"
-
-POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
-
 // Lightweight CPU dispatcher pod: it only SSHes to the SLURM frontend and polls
 // sacct; the heavy work runs on the cluster. Mirrors the "agent" pod type in
 // L0_MergeRequest.groovy::createKubernetesPodConfig (cloud, nodeSelector,
@@ -195,7 +190,10 @@ def submitProfileGen(pipeline)
     def scratch = cluster.scratchPath ?: "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci"
     // Ephemeral workspaces live under the service-user dir on the lustre root
     // (NOT the project root directly, and NOT $HOME which is size-limited).
-    def ws = "${scratch}/users/svc_tensorrt/bolt-ci/${BRANCH}/${TRIPLE}/${env.BUILD_TAG}"
+    // BUILD_TAG alone isn't unique across Jenkins instances, so key the path on
+    // the instance name too (jobs on different instances can share BUILD_TAGs).
+    def instanceName = (env.JENKINS_URL ?: Jenkins.instance.rootUrl).replaceAll(/\/+$/, '').tokenize('/').last()
+    def ws = "${scratch}/users/svc_tensorrt/bolt-ci/${BRANCH}/${TRIPLE}/${instanceName}/${env.BUILD_TAG}"
     // Run-level shared fdata root: each workload writes $fdataRoot/<workload>/<host>,
     // the single merge job globs across all of them and packages into _bundle.
     def fdataRoot = "${ws}/runs/profile-fdata"
@@ -232,8 +230,10 @@ def submitProfileGen(pipeline)
                 exit 1
             fi
         """.stripIndent()
+        // bashWrappedRemoteCmd: not all clusters default to bash, so wrap the
+        // multi-line script instead of relying on the login shell.
         Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, "\"${tarStage}\""))
+            script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(tarStage)))
 
         // Extract the full source tree + wheel from the tarball (which packs the
         // build commit's TensorRT-LLM/src). The perf harness runs from this
@@ -267,7 +267,7 @@ def submitProfileGen(pipeline)
             fi
         """.stripIndent()
         Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, "\"${llvmStage}\""))
+            script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(llvmStage)))
 
         // 2) Fan-out: ONE perf-sanity run per workload (Jenkins parallel{}).
         //    Each drives the perf harness (run_disagg.sh) for its test id, with
@@ -313,15 +313,17 @@ def submitProfileGen(pipeline)
             pollSlurm(pipeline, remote, mid, "merge")
             pipeline.echo("Merge COMPLETED. Bundle: ${bundle}")
         }
-        // 4) Promote (opt-in via PROMOTE): publish the profile bundle to the
-        //    branch-keyed Artifactory path so premerge can pull `latest`. Done
-        //    cluster-side (the bundle is on the frontend, which already reaches
-        //    Artifactory) using the urm-artifactory-creds Jenkins credential.
-        if (PROMOTE == "true") {
-            stage("Promote") { promoteBundle(pipeline, remote, bundle) }
-        } else {
-            pipeline.echo("PROMOTE=false -> bundle left un-promoted (${bundle}).")
-        }
+        // Promote of the packaged bundle to Artifactory is deferred to the
+        // follow-on deployment PR; the upload will be inserted HERE, immediately
+        // before the retention delete below (promote first, then reclaim scratch).
+
+        // Retention: best-effort purge of workspaces older than 7 days so scratch
+        // doesn't grow unbounded across runs. Depth 4 under the bolt-ci root maps
+        // to <BRANCH>/<TRIPLE>/<instance>/<BUILD_TAG>, i.e. one per-run workspace.
+        def retentionRoot = "${scratch}/users/svc_tensorrt/bolt-ci"
+        Utils.exec(pipeline, timeout: false, numRetries: 1,
+            script: Utils.sshUserCmd(remote,
+                "\"find ${retentionRoot} -mindepth 4 -maxdepth 4 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true\""))
     }
     return bundle
 }
@@ -391,8 +393,11 @@ CONF
 
 def submitMerge(pipeline, remote, String ws, String fdataRoot, String outDir, String partArgs)
 {
+    // Match the enroot URI form used for the collect jobs (imageEnroot): pyxis
+    // expects urm.nvidia.com#<path>, not urm.nvidia.com/<path>.
+    def mergeImage = (LLM_DOCKER_IMAGE ?: "").replace("urm.nvidia.com/", "urm.nvidia.com#")
     def cmd = "cd ${ws}/toolkit && " +
-        "CONTAINER_IMAGE=${LLM_DOCKER_IMAGE} " +
+        "CONTAINER_IMAGE=${mergeImage} " +
         "WORKSPACE=${ws} TOOLKIT_HOST=${ws}/toolkit BUILDS_HOST=${ws}/builds " +
         "BOLT_REF=${BOLT_REF} TRIPLE=${TRIPLE} TARBALL_NAME=${BOLT_TARNAME} " +
         "FDATA_ROOT=${fdataRoot} OUT_DIR=${outDir} BOLT_APPLY=${APPLY_PROFILES == 'true' ? '1' : '0'} " +
