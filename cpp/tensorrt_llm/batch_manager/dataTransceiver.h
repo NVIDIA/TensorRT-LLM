@@ -85,12 +85,14 @@ public:
     };
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
-        std::vector<SizeType32> counterPartRanks, executor::DataTransceiverState const& selfState,
-        executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager, int32_t indexFromEnd,
-        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
+        LlmRequest::RequestIdType requestId, std::vector<SizeType32> counterPartRanks,
+        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
+        runtime::BufferManager const& bufferManager, int32_t indexFromEnd, BlockKey const& lastBlockKey,
+        LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
         : mConnections(std::move(connections))
         , mCounterPartRanks(std::move(counterPartRanks))
         , mDataContext(std::move(dataContext))
+        , mRequestId(requestId)
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
@@ -123,6 +125,11 @@ public:
     void recv(size_t idx, void* data, size_t size);
 
     [[nodiscard]] std::optional<LlmRequest const*> getLlmRequest() const;
+
+    [[nodiscard]] LlmRequest::RequestIdType getRequestId() const noexcept
+    {
+        return mRequestId;
+    }
 
     // in CacheSender, the LlmRequest is not available until the sendSync is called
     void setLlmRequest(LlmRequest const& llmRequest);
@@ -170,8 +177,9 @@ public:
 
 private:
     std::vector<Connection const*> mConnections;
-    std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
+    std::vector<SizeType32> mCounterPartRanks; // Ranks corresponding to mConnections indices
     DataContext mDataContext;
+    LlmRequest::RequestIdType mRequestId{0};
     executor::DataTransceiverState const* mSelfState; // stored in CacheReceiver/CacheSender
     executor::DataTransceiverState mOtherState;
     runtime::BufferManager const* mBufferManager;

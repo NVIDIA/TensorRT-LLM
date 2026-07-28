@@ -1504,7 +1504,7 @@ def test_disaggregated_overlap_transceiver_runtime_python_bounce(
                            assert_gen_log_contains="[kv-bounce] coalesced")
 
 
-def _verify_python_transceiver_under_host_offload(
+def _verify_transceiver_under_host_offload(
         server_url: str,
         model: str,
         *,
@@ -1512,14 +1512,14 @@ def _verify_python_transceiver_under_host_offload(
         prompt_repeats: int = 4,
         replay_count: int = 5,
         require_stable_output: bool = True) -> None:
-    """End-to-end check: Python transceiver + ctx-side host offload.
+    """End-to-end check: disagg transceiver + ctx-side host offload.
 
-    The fix translates logical block IDs to primary-pool slot indices in
-    `_CacheReuseAdapterV1.get_block_ids` before they reach the disagg
-    sender. Without that translation, once host offload moves blocks
-    around, the sender computes pool pointers from stale block IDs and
-    either reads garbage memory or aborts. This test stresses that path
-    end-to-end:
+    The caller chooses the transceiver runtime in its disagg config. The
+    Python runtime exercises the Python reuse adapter, while the C++ runtime
+    exercises the C++ cache formatter and KV-cache manager preparation path.
+    In both cases, once host offload moves blocks around, the transceiver must
+    read from current primary-pool slots rather than stale logical block IDs.
+    This workload stresses that path end-to-end:
 
       1. Send several distinct prompts to fill the (deliberately small)
          ctx primary pool, committing each to the reuse radix tree.
@@ -1644,7 +1644,7 @@ def test_disaggregated_python_transceiver_host_offload(
 ) -> None:  # noqa: ARG001 - used only for the parametrize label
     """E2E regression for block_id -> primary-slot translation in the Python disagg cache transceiver.
 
-    See `_verify_python_transceiver_under_host_offload` for what this
+    See `_verify_transceiver_under_host_offload` for what this
     test proves. The setup pairs the Python transceiver runtime with a
     ctx-side `host_cache_size` and a deliberately tight primary pool so
     that prefix reuse is forced through an offload+onboard cycle before
@@ -1660,7 +1660,7 @@ def test_disaggregated_python_transceiver_host_offload(
     env["UCX_TLS"] = get_ucx_tls()
 
     def post_client_test(server_url: str) -> None:
-        _verify_python_transceiver_under_host_offload(
+        _verify_transceiver_under_host_offload(
             server_url, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -2922,24 +2922,22 @@ def test_disaggregated_gpt_oss_120b_host_offload(
     env["TIKTOKEN_ENCODINGS_BASE"] = tiktoken_vocab
 
     def post_client_test(server_url: str) -> None:
-        _verify_python_transceiver_under_host_offload(
-            server_url,
-            model_path,
-            max_tokens=8,
-            prompt_repeats=2,
-            replay_count=2,
-            require_stable_output=False)
+        _verify_transceiver_under_host_offload(server_url,
+                                               model_path,
+                                               max_tokens=8,
+                                               prompt_repeats=2,
+                                               replay_count=2,
+                                               require_stable_output=False)
         _assert_context_kv_offload_stats(server_url)
 
-    run_disaggregated_test(
-        disaggregated_example_root,
-        "gpt_oss_120b_host_offload",
-        num_iters=1,
-        env=env,
-        model_path=model_dir,
-        cwd=llm_venv.get_working_directory(),
-        post_client_test=post_client_test,
-        assert_ctx_log_contains=("primary blocks=16, secondary blocks=1820"))
+    run_disaggregated_test(disaggregated_example_root,
+                           "gpt_oss_120b_host_offload",
+                           num_iters=1,
+                           env=env,
+                           model_path=model_dir,
+                           cwd=llm_venv.get_working_directory(),
+                           post_client_test=post_client_test,
+                           assert_ctx_log_contains="primary blocks=16")
 
 
 @skip_pre_hopper

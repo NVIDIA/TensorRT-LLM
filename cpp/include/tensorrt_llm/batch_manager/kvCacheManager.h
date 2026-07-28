@@ -1227,6 +1227,9 @@ public:
     //! \brief Make the buffer manager stream wait for scheduled transfer-manager work.
     void syncTransferManagerToBufferManager();
 
+    //! \brief Make a formatter buffer-manager stream wait for scheduled onboard work.
+    void syncOnboardTransferManagerToBufferManager(runtime::BufferManager const& bufferManager);
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -1917,6 +1920,9 @@ public:
     //! \brief Make the buffer manager stream wait for scheduled transfer-manager work.
     void syncTransferManagerToBufferManager();
 
+    //! \brief Make a formatter buffer-manager stream wait for scheduled onboard work.
+    void syncOnboardTransferManagerToBufferManager(runtime::BufferManager const& bufferManager);
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -2039,8 +2045,8 @@ public:
         return mIssuedOnboardCopies;
     }
 
-    //! \brief Make the buffer-manager stream wait on pending onboard copies before transfer formatting reads them.
-    void syncReadyForFormat();
+    //! \brief Make the formatter stream wait on pending onboard copies before transfer formatting reads them.
+    void syncReadyForFormat(runtime::BufferManager const& bufferManager);
 
     //! \brief Release transfer pins before the lease object is destroyed.
     void release();
@@ -2318,9 +2324,7 @@ public:
         std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow,
         LlmRequest::RequestIdType requestId, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
         std::string const& directory = "")
-    {
-        TLLM_THROW("prepareBlocksForTransfer is not implemented for this KV cache manager.");
-    }
+        = 0;
 
     /// @brief Release cached blocks for a token sequence beyond a given prefix length.
     /// @param targetTokens The full token sequence whose cached blocks are walked.

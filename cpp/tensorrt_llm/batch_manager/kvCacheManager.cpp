@@ -1450,11 +1450,18 @@ std::pair<std::vector<KVCacheBlock::IdType>, bool> WindowBlockManager::pinAndOnb
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     try
     {
+        auto getValidBlockById = [this](KVCacheBlock::IdType blockId) -> BlockPtr
+        {
+            if (blockId >= 0 && static_cast<size_t>(blockId) >= mAllBlocksById.size())
+            {
+                return nullptr;
+            }
+            return getBlockById(blockId);
+        };
+
         for (auto const blockId : blockIds)
         {
-            TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
-                "Block id %d is out of range", blockId);
-            auto block = mAllBlocksById[blockId];
+            auto block = getValidBlockById(blockId);
             TLLM_CHECK_WITH_INFO(block != nullptr && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId,
                 "Block id %d is not a valid cache block", blockId);
 
@@ -1464,26 +1471,37 @@ std::pair<std::vector<KVCacheBlock::IdType>, bool> WindowBlockManager::pinAndOnb
             }
             block->incRefCount();
             pinnedBlockIds.push_back(blockId);
+        }
 
+        for (auto const blockId : pinnedBlockIds)
+        {
+            auto block = getValidBlockById(blockId);
+            TLLM_CHECK_WITH_INFO(block != nullptr && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId,
+                "Block id %d is not a valid cache block", blockId);
             if (!block->isPlaceholder() && !block->isPrimary())
             {
-                auto scratchPrimaryBlock = getFreeBlock(requestId, block->getPriority(), block->getDurationMs(), mode,
-                    directory, /*wantPlaceholder=*/false, /*countAllocationStats=*/false);
-                mTransferManager->onboard(block, scratchPrimaryBlock, mPools, 0, mode, directory);
-                block->swapMemoryPoolBlockOffset(scratchPrimaryBlock);
+                BlockPtr scratchPrimaryBlock;
+                try
+                {
+                    scratchPrimaryBlock = getFreeBlock(requestId, block->getPriority(), block->getDurationMs(), mode,
+                        directory, /*wantPlaceholder=*/false, /*countAllocationStats=*/false);
+                    mTransferManager->onboard(block, scratchPrimaryBlock, mPools, 0, mode, directory);
+                    block->swapMemoryPoolBlockOffset(scratchPrimaryBlock);
+                }
+                catch (...)
+                {
+                    if (scratchPrimaryBlock != nullptr)
+                    {
+                        mEvictionPolicy->releaseBlock(scratchPrimaryBlock);
+                    }
+                    throw;
+                }
                 issuedOnboardCopies = true;
                 // Transfer onboarding can consume primary capacity after startScheduling() snapshots
                 // availability. Keep the scheduler-side view conservative for the current iteration.
                 if (mSchedulingNumFreeBlocks > 0)
                 {
                     --mSchedulingNumFreeBlocks;
-                }
-
-                if (mEventManager && blockInRadixTree(block))
-                {
-                    mEventManager->enqueueUpdatedEvent(
-                        tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
-                        mWindowSize);
                 }
                 mEvictionPolicy->releaseBlock(scratchPrimaryBlock);
             }
@@ -2323,6 +2341,19 @@ void BlockManager::syncTransferManagerToBufferManager()
 void WindowBlockManager::syncTransferManagerToBufferManager()
 {
     mTransferManager->syncTransfers();
+}
+
+void BlockManager::syncOnboardTransferManagerToBufferManager(runtime::BufferManager const& bufferManager)
+{
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.syncOnboardTransferManagerToBufferManager(bufferManager);
+    }
+}
+
+void WindowBlockManager::syncOnboardTransferManagerToBufferManager(runtime::BufferManager const& bufferManager)
+{
+    mTransferManager->syncOnboardToBufferManager(bufferManager);
 }
 
 void BlockManager::refreshBlocks()
@@ -3231,11 +3262,11 @@ KvCacheTransferLease& KvCacheTransferLease::operator=(KvCacheTransferLease&& oth
     return *this;
 }
 
-void KvCacheTransferLease::syncReadyForFormat()
+void KvCacheTransferLease::syncReadyForFormat(runtime::BufferManager const& bufferManager)
 {
     if (mBlockManager != nullptr && mIssuedOnboardCopies)
     {
-        mBlockManager->syncTransferManagerToBufferManager();
+        mBlockManager->syncOnboardTransferManagerToBufferManager(bufferManager);
     }
 }
 
@@ -3276,16 +3307,17 @@ void WindowBlockManager::unpinBlocksByIdNoLock(std::vector<KVCacheBlock::IdType>
 {
     for (auto const& blockId : blockIds)
     {
-        TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
-            "Block id %d is out of range", blockId);
-        auto block = mAllBlocksById[blockId];
-        if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
+        BlockPtr block;
+        if (blockId < 0 || static_cast<size_t>(blockId) < mAllBlocksById.size())
         {
-            block->decRefCount();
-            if (!block->hasRefs())
-            {
-                mEvictionPolicy->releaseBlock(block);
-            }
+            block = getBlockById(blockId);
+        }
+        TLLM_CHECK_WITH_INFO(block != nullptr && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId,
+            "Block id %d is not a valid cache block", blockId);
+        block->decRefCount();
+        if (!block->hasRefs())
+        {
+            mEvictionPolicy->releaseBlock(block);
         }
     }
 }

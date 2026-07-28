@@ -338,7 +338,8 @@ inline BlockIterator BlockRangeForWindow::begin() const
 }
 
 inline KvCacheTransferLease prepareBlockRangeForTransfer(BaseKVCacheManager& cacheManager, BlockRange const& blockRange,
-    std::vector<SizeType32> const& windowSizes, LlmRequest::RequestIdType requestId)
+    std::vector<SizeType32> const& windowSizes, LlmRequest::RequestIdType requestId,
+    runtime::BufferManager const& bufferManager, LlmRequest const* llmRequest = nullptr)
 {
     auto const& allBlockIdsPerWindow = blockRange.getBlockIdsPerWindow();
     std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> blockIdsPerWindow;
@@ -351,10 +352,17 @@ inline KvCacheTransferLease prepareBlockRangeForTransfer(BaseKVCacheManager& cac
         }
     }
 
-    auto const& sequence = cacheManager.getSequence(requestId);
-    auto transferLease = cacheManager.prepareBlocksForTransfer(
-        blockIdsPerWindow, requestId, sequence.getTransferMode(), sequence.getDirectory());
-    transferLease.syncReadyForFormat();
+    auto mode = executor::KvCacheTransferMode::DRAM;
+    std::string directory;
+    if (llmRequest != nullptr)
+    {
+        requestId = llmRequest->mRequestId;
+        auto const& sequence = cacheManager.getSequence(requestId);
+        mode = sequence.getTransferMode();
+        directory = sequence.getDirectory();
+    }
+    auto transferLease = cacheManager.prepareBlocksForTransfer(blockIdsPerWindow, requestId, mode, directory);
+    transferLease.syncReadyForFormat(bufferManager);
     return transferLease;
 }
 

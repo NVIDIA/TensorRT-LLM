@@ -47,6 +47,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sys/types.h>
 #include <thread>
@@ -72,17 +73,20 @@ class KVCacheTransferManagerTestAccess
 public:
     [[nodiscard]] static std::size_t pendingReadCount(tbk::KVCacheTransferManager const& transferManager)
     {
+        std::lock_guard<std::mutex> lock(transferManager.mPendingTransfersMutex);
         return transferManager.mPendingReads.size();
     }
 
     [[nodiscard]] static std::size_t pendingWriteCount(tbk::KVCacheTransferManager const& transferManager)
     {
+        std::lock_guard<std::mutex> lock(transferManager.mPendingTransfersMutex);
         return transferManager.mPendingWrites.size();
     }
 
     [[nodiscard]] static bool hasPendingReadForBlock(
         tbk::KVCacheTransferManager const& transferManager, tbk::BlockPtr const& block)
     {
+        std::lock_guard<std::mutex> lock(transferManager.mPendingTransfersMutex);
         return transferManager.mPendingReads.find(tbk::KVCacheTransferManager::getPendingTransferIndex(block))
             != transferManager.mPendingReads.end();
     }
@@ -90,6 +94,7 @@ public:
     [[nodiscard]] static bool hasPendingWriteForBlock(
         tbk::KVCacheTransferManager const& transferManager, tbk::BlockPtr const& block)
     {
+        std::lock_guard<std::mutex> lock(transferManager.mPendingTransfersMutex);
         return transferManager.mPendingWrites.find(tbk::KVCacheTransferManager::getPendingTransferIndex(block))
             != transferManager.mPendingWrites.end();
     }
@@ -4968,7 +4973,7 @@ TEST_F(KVCacheManagerTest, DisaggTransferBlockIndexLookupOnboardsOffloadedBlocks
         auto transferLease
             = kvCacheManager.prepareBlocksForTransfer({{maxAttentionWindow, {offloadedBlockId}}}, requestId);
         EXPECT_TRUE(transferLease.issuedOnboardCopies());
-        transferLease.syncReadyForFormat();
+        transferLease.syncReadyForFormat(blockManager.getBufferManager(maxAttentionWindow));
         ASSERT_TRUE(block->isPrimary());
         EXPECT_EQ(kvCacheManager.getNumAllocTotalBlocks(), allocTotalBeforeTransfer);
         EXPECT_EQ(kvCacheManager.getNumAllocNewBlocks(), allocNewBeforeTransfer);
@@ -5032,7 +5037,8 @@ TEST_F(KVCacheManagerTest, DisaggTransferBlockRangePreparationOnboardsOffloadedB
 
     auto blockRange = BlockRange::fromAllBlockIds(kvCacheManager, requestId);
     {
-        auto transferLease = prepareBlockRangeForTransfer(kvCacheManager, blockRange, {maxAttentionWindow}, requestId);
+        auto transferLease = prepareBlockRangeForTransfer(kvCacheManager, blockRange, {maxAttentionWindow}, requestId,
+            blockManager.getBufferManager(maxAttentionWindow), llmRequest.get());
         EXPECT_TRUE(transferLease.issuedOnboardCopies());
         ASSERT_TRUE(block->isPrimary());
 
@@ -5325,6 +5331,14 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerPendingTransfersDistinguishPrim
 
     transferManager.syncTransfers();
     bufferManager.getStream().synchronize();
+
+    EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingReadCount(transferManager), 2);
+    EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingWriteCount(transferManager), 2);
+
+    transferManager.syncWithBufferManager();
+
+    EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingReadCount(transferManager), 2);
+    EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingWriteCount(transferManager), 2);
 }
 
 TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerSinkTokenLengthTest)
