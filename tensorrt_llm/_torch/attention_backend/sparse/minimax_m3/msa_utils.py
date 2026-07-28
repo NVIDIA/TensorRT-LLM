@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib.util
+import types
 from typing import Optional, Tuple
 
 import torch
@@ -23,7 +24,7 @@ def msa_package_available() -> bool:
     return importlib.util.find_spec("fmha_sm100") is not None
 
 
-def require_msa_module():
+def require_msa_module() -> types.ModuleType:
     """Import the packaged fmha_sm100 module or raise a clear error.
 
     The import is deferred to first kernel use so the MSA backend can be

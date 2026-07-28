@@ -1144,9 +1144,6 @@ def main(*,
                 f"Copied auto-generated attributions to {project_dir / 'ATTRIBUTIONS.md'}"
             )
 
-        build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
-        )
         env = os.environ.copy()
         if mypyc:
             env["TRTLLM_ENABLE_MYPYC"] = "1"
@@ -1154,7 +1151,7 @@ def main(*,
             env["TRTLLM_ENABLE_MYPYC"] = "0"
 
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {plat_name_arg} --no-isolation --wheel --outdir "{dist_dir}"',
+            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"',
             env=env)
 
     if install:
