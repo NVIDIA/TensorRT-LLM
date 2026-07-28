@@ -724,6 +724,54 @@ def test_cache_eviction_leaves_recorded_slots_intact(monkeypatch):
     assert is_multimodal_encoder_ready(request)
 
 
+def test_pipeline_ranks_reach_the_same_encoder_state_independently(monkeypatch):
+    """Every PP rank must resolve cache hits itself, not inherit the leader's.
+
+    Schedule distribution carries request and item ids only, so a follower
+    rank never receives the leader's encoder outputs or its cache lookups. If
+    hits were applied only where scheduling happened, followers would encode
+    work the leader skipped and the ranks would disagree on both embeddings
+    and encoder call counts. Drive the same schedule through two independent
+    engines, each with its own rank-local cache, and require them to converge.
+    """
+    hashes = [[1, 2], [3, 4]]
+    embedding_lengths = [2, 3]
+
+    ranks = []
+    for _ in range(2):
+        cache = TensorLRUCache(1 << 20, name="test")
+        engine = _cache_engine(cache, monkeypatch)
+        # Warm this rank's own cache the way an earlier request would.
+        warmup = _cache_request(1, hashes=hashes, embedding_lengths=embedding_lengths)
+        engine.forward_multimodal_encoder_items([warmup], {1: [0, 1]})
+        ranks.append(engine)
+
+    leader, follower = ranks
+    assert leader.model.encoded_item_counts == follower.model.encoded_item_counts == [2]
+
+    # The scheduler picks on the leader; both ranks receive only these ids.
+    requests = [
+        _cache_request(2, hashes=hashes, embedding_lengths=embedding_lengths) for _ in ranks
+    ]
+    for engine, request in zip(ranks, requests):
+        engine.forward_multimodal_encoder_items([request], {2: [0, 1]})
+
+    # Both ranks served the request entirely from their own cache...
+    assert leader.model.encoded_item_counts == follower.model.encoded_item_counts == [2]
+    # ...and agree on readiness and on every embedding row.
+    leader_request, follower_request = requests
+    assert is_multimodal_encoder_ready(leader_request)
+    assert is_multimodal_encoder_ready(follower_request)
+    leader_embedding = leader_request.py_multimodal_data["multimodal_embedding"]
+    follower_embedding = follower_request.py_multimodal_data["multimodal_embedding"]
+    assert torch.equal(leader_embedding, follower_embedding)
+    # Rank-local storage: agreeing on values must not mean sharing them.
+    assert (
+        leader_embedding.untyped_storage().data_ptr()
+        != follower_embedding.untyped_storage().data_ptr()
+    )
+
+
 def test_cache_off_encodes_every_item_without_touching_cache(monkeypatch):
     # supports_encoder_cache=False -> mm_encoder_cache is None -> pure encode.
     cache = TensorLRUCache(1 << 20, name="test")
