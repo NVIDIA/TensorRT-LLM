@@ -4074,7 +4074,9 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_params.encoder_event = mm_encoder_event
                 request.py_mm_encoder_event = None
             if multimodal_params.has_content():
-                # TODO: Visit later to decide the appropriate position of sending multimodal data & selectively sending multimodal data
+                # TODO(TRTLLM-14726): Check the persistent MM encoder cache before H2D and avoid
+                # transferring raw encoder inputs for full hits in both regular and
+                # side-stream-prefetched paths.
                 multimodal_params.to_device("multimodal_data",
                                             "cuda",
                                             pin_memory=prefer_pinned(),

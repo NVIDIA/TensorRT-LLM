@@ -367,6 +367,8 @@ def test_cross_iter_prefetch_mixed_cache_hit_and_miss_encodes_only_miss():
 
     assert model.encoder_call_count == 2
     assert model.last_encoder_batch_size == 1
+    assert hit.py_multimodal_data["image"]["pixel_values"].device.type == "cpu"
+    assert miss.py_multimodal_data["image"]["pixel_values"].device.type == "cuda"
     torch.testing.assert_close(
         hit.py_multimodal_data["multimodal_embedding"],
         torch.ones((4, 8), device="cuda"),

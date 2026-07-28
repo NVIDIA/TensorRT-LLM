@@ -1257,8 +1257,19 @@ def _dispatch_cross_iter_prefetch(
     encoder_event = None
     try:
         with _run_on_aux_stream(aux_stream) as encoder_event:
-            for p in params_list:
-                p.to_device(
+            encoder_cache = model._get_multimodal_encoder_cache() if encoder_cache_enabled else None
+            params_to_encode = (
+                [
+                    param
+                    for param in params_list
+                    if not model._attach_encoder_cache_hit(param, encoder_cache)
+                ]
+                if encoder_cache is not None
+                else params_list
+            )
+
+            for param in params_to_encode:
+                param.to_device(
                     "multimodal_data",
                     "cuda",
                     pin_memory=prefer_pinned(),
@@ -1271,11 +1282,20 @@ def _dispatch_cross_iter_prefetch(
             # model_engine._prepare_inputs.
             for (req, _, _), p in zip(candidates, params_list):
                 req.py_multimodal_data = p.multimodal_data
-            if encoder_cache_enabled:
-                model._get_or_encode_multimodal_embeddings(params_list)
-            else:
-                encoder_output = model.encode_multimodal_inputs(params_list)
-                _store_chunked_prefill_embeddings(params_list, [encoder_output])
+            if params_to_encode:
+                encoder_output = model.encode_multimodal_inputs(params_to_encode)
+                _store_chunked_prefill_embeddings(params_to_encode, [encoder_output])
+                if encoder_cache is not None:
+                    for param in params_to_encode:
+                        model._write_encoder_cache_entries(param, encoder_cache)
+
+            # Prefetch only needs to attach each request's embedding. Validate each request
+            # independently instead of gathering the unused batch output with `torch.cat`.
+            for param in params_list:
+                embedding = param.multimodal_data.get("multimodal_embedding")
+                if not isinstance(embedding, torch.Tensor):
+                    raise ValueError("Multimodal encoder prefetch did not produce an embedding.")
+                model._validate_embeddings([embedding], [param])
     finally:
         # Stash the event on every candidate's durable LlmRequest (not the
         # per-iter `MultimodalParams`), since `_prepare_inputs` rebuilds the
