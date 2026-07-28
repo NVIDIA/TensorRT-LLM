@@ -2664,6 +2664,11 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                 atol=0,
                 rtol=0,
             )
+        with unittest.mock.patch.object(
+            draft_metadata, "_plan_with_params", wraps=draft_metadata._plan_with_params
+        ) as replan:
+            metadata.prepare()
+        replan.assert_not_called()
 
     @torch.no_grad()
     @unittest.mock.patch(

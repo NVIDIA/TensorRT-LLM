@@ -20,7 +20,7 @@ from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, SpecWorkerBase, uses_shared_kv_cache
+from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPSampler, _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
@@ -1295,8 +1295,8 @@ class MTPEagleWorker(Eagle3OneModelWorker):
 
     def set_draft_model(self, draft_model) -> None:
         super().set_draft_model(draft_model)
-        expects_external_shared_target_kv = uses_shared_kv_cache(
-            self.spec_config)
+        expects_external_shared_target_kv = (
+            self.spec_config._use_shared_kv_cache)
         supports_shared_target_kv = bool(
             getattr(draft_model, "shares_target_kv_cache", False))
         if expects_external_shared_target_kv and not supports_shared_target_kv:

@@ -687,10 +687,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         target.seq_lens_kv_cuda[:num_seqs])
         self._shared_kv_runtime_lens[:num_seqs].copy_(full_kv_lens)
 
-        # Re-plan every known assistant wrapper outside graph capture. The
-        # assistant forces trtllm-gen, whose decode plan does not retain
-        # workspace state shared with another wrapper.
-        self._clean_cached_plans(defer_plan=False)
+        if self.is_cuda_graph:
+            # Graph replay keeps the captured trtllm-gen plan. Refresh only
+            # its stable block-table buffers; re-planning the wrapper would
+            # mutate state owned by the captured kernel.
+            for plan_params, wrappers in self._plan_params_to_wrappers.items():
+                self._build_decode_block_tables(plan_params, wrappers)
+        else:
+            self._clean_cached_plans(defer_plan=False)
 
     def update_shared_kv_draft_lengths(
         self,

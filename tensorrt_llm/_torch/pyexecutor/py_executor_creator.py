@@ -36,7 +36,6 @@ from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
-from ..speculative.interface import uses_shared_kv_cache
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
@@ -454,7 +453,7 @@ def create_py_executor(
 
     if (spec_config is not None and llm_args.attn_backend == "FLASHINFER"
             and spec_config.spec_dec_mode.use_one_engine()
-            and not uses_shared_kv_cache(spec_config)):
+            and not spec_config._use_shared_kv_cache):
         raise ValueError(
             "FLASHINFER attention backend supports one-engine speculative "
             "decoding only when the draft model shares the target KV cache.")

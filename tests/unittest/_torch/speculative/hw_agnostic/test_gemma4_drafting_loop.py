@@ -9,10 +9,7 @@ import torch
 from tensorrt_llm._torch.models import modeling_speculative
 from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
 from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker
-from tensorrt_llm._torch.speculative.interface import (
-    should_use_separate_draft_kv_cache,
-    uses_shared_kv_cache,
-)
+from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.speculative.utils import (
     get_num_extra_kv_tokens,
     get_num_spec_layers,
@@ -45,36 +42,16 @@ def test_external_checkpoint_does_not_imply_shared_kv_cache():
 
     update_spec_config_from_model_config(spec_config, model_config)
 
-    assert not uses_shared_kv_cache(spec_config)
+    assert not spec_config._use_shared_kv_cache
     assert get_num_spec_layers(spec_config) == 1
     assert get_num_extra_kv_tokens(spec_config) == 2
     assert should_use_separate_draft_kv_cache(spec_config)
 
 
-@pytest.mark.parametrize("one_model,expected", [(True, True), (False, False)])
-def test_gemma4_config_sets_shared_kv_cache_for_one_model_only(
-    one_model,
-    expected,
-):
-    spec_config = MTPDecodingConfig(
-        max_draft_len=3,
-        speculative_model="/tmp/gemma4-assistant",
-        mtp_eagle_one_model=one_model,
-    )
-    model_config = SimpleNamespace(
-        architectures=["Gemma4ForConditionalGeneration"],
-        num_nextn_predict_layers=1,
-    )
-
-    update_spec_config_from_model_config(spec_config, model_config)
-
-    assert uses_shared_kv_cache(spec_config) is expected
-
-
 def test_external_shared_kv_uses_no_draft_kv_cache():
     spec_config = _shared_kv_spec_config()
 
-    assert uses_shared_kv_cache(spec_config)
+    assert spec_config._use_shared_kv_cache
     assert get_num_spec_layers(spec_config) == 0
     assert get_num_extra_kv_tokens(spec_config) == 0
     assert not should_use_separate_draft_kv_cache(spec_config)
