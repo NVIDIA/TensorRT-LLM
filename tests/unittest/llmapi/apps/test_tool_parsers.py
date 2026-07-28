@@ -3788,7 +3788,11 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert parser.eot_token == self.EOT
 
     def test_undefined_tool(self, sample_tools, parser, tool_parser_test_cases):
-        """Keep undefined-tool calls at their positional index."""
+        """Keep undefined-tool calls at their positional index.
+
+        K3 warns about undefined tools rather than remapping ``tool_index`` to
+        ``-1``.
+        """
         text = tool_parser_test_cases.undefined_tool
 
         result = parser.detect_and_parse(text, sample_tools)
@@ -3798,7 +3802,11 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert result.calls[0].tool_index == 0
 
     def test_supports_structural_tag(self):
-        """Reject JSON-schema structural tagging for XTML bodies."""
+        """Reject JSON-schema structural tagging for XTML bodies.
+
+        XTML bodies already use tag-structured text, so JSON-schema
+        structural-tag constrained decoding does not apply.
+        """
         parser = KimiK3ToolParser()
         assert parser.supports_structural_tag() is False
         with pytest.raises(NotImplementedError):
@@ -3832,7 +3840,10 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
 
     def test_argument_invalid_json_falls_back_to_raw(self, sample_tools,
                                                      parser):
-        """Keep a non-string argument's invalid JSON body as raw text."""
+        """Keep a non-string argument's invalid JSON body as raw text.
+
+        Invalid JSON should fall back to its original text instead of raising.
+        """
         text = self._section(
             self._call("get_weather", 1,
                        self._argument("count", "number", "not-a-number")))
@@ -3844,7 +3855,10 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         }
 
     def test_attribute_unescaping(self, sample_tools, parser):
-        """Unescape encoded XTML attribute values."""
+        """Unescape encoded XTML attribute values.
+
+        K3 attributes arrive escaped by ``encoding_k3._escape_attr_value``.
+        """
         text = self._section(
             self._call(
                 "get_weather", 1,
@@ -3864,7 +3878,10 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert result.calls[0].parameters == "{}"
 
     def test_trailing_structural_markup_stripped(self, sample_tools, parser):
-        """Strip trailing XTML terminators from standalone normal text."""
+        """Strip trailing XTML terminators from standalone normal text.
+
+        This covers parsing without a tools section or reasoning parser.
+        """
         text = "The answer is 4.<|close|>message<|sep|><|end_of_msg|>"
 
         result = parser.detect_and_parse(text, sample_tools)
@@ -3874,7 +3891,11 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
 
     def test_streaming_buffers_section_until_complete(self, sample_tools,
                                                       parser):
-        """Buffer an incomplete tools section while streaming response text."""
+        """Buffer an incomplete tools section while streaming response text.
+
+        Response text is emitted immediately, but calls wait for the closing
+        ``<|close|>tools<|sep|>`` marker.
+        """
         result = parser.parse_streaming_increment("Checking. ", sample_tools)
         assert result.normal_text == "Checking. "
         assert result.calls == []
@@ -3901,7 +3922,11 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
 
     def test_composes_with_kimi_k3_reasoning_parser(self, sample_tools, parser):
-        """Parse tools passed through the Kimi-K3 reasoning parser."""
+        """Parse tools passed through the Kimi-K3 reasoning parser.
+
+        The reasoning parser preserves the tools section verbatim for this
+        parser.
+        """
         from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 
         completion = (
