@@ -30,17 +30,17 @@ import triton
 from transformers import AutoConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-from tensorrt_llm._torch.distributed import allgather
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheCompressionManager
-from tensorrt_llm._torch.utils import next_positive_power_of_2
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     copy_batch_block_offsets_to_device,
 )
 from tensorrt_llm.logger import logger
 
+from ...distributed import allgather
+from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from ...pyexecutor.llm_request import LlmRequestState
+from ...pyexecutor.resource_manager import KVCacheCompressionManager
+from ...utils import next_positive_power_of_2
 from ..compaction import build_compaction_params, compact
 from .triattention_cute_score_fused import PADDED_HEAD_COLUMNS, build_score_pipeline
 from .triattention_kernels import (
@@ -51,9 +51,10 @@ from .triattention_kernels import (
 )
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
     from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
+
+    from ...pyexecutor.llm_request import LlmRequest
+    from ...pyexecutor.scheduler import ScheduledRequests
 
 
 # Required keys for the calibration ``.pt`` consumed by TriAttention.
