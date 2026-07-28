@@ -525,26 +525,22 @@ def test_autotuner_tuning_configs():
 
 
 def test_load_cache_skips_non_literal_tactic():
-    """Regression: a cache entry whose tactic repr is not a Python literal must
-    be skipped on load, never crash the load.
+    """Regression: a non-literal tactic repr must be skipped on load, not crash it.
 
-    ``trtllm::tunable_fp4_quantize`` caches an ``Fp4QuantTactic`` IntEnum whose
-    ``repr`` is ``"<Fp4QuantTactic.TRTLLM: -1>"``. ``ast.literal_eval`` rejects
-    that with ``SyntaxError``. Before the fix, ``_deserialize_cache_data`` only
-    caught ``(ValueError, TypeError)`` and had no ``continue``, so the
-    ``SyntaxError`` propagated out of ``load_cache`` and crashed the autotuner
-    warmup. The load must now skip the bad entry (that op re-profiles) while
-    every literal-safe entry in the same file still loads correctly.
+    ``_deserialize_cache_data`` reconstructs tactics with ``ast.literal_eval``,
+    which raises ``SyntaxError`` on non-literal reprs (e.g. enum tactic reprs,
+    until #16782 serializes enums by value). It must skip such entries -- once
+    ``SyntaxError`` was uncaught and had no ``continue``, crashing the load.
     """
     import ast
-    import enum
 
-    class _Tactic(enum.IntEnum):
-        TRTLLM = -1
-        FLASHINFER = 1
+    class _NonLiteralTactic:
 
-    poisoned_repr = repr(_Tactic.TRTLLM)  # "<_Tactic.TRTLLM: -1>"
-    # Precondition: this really is the SyntaxError-raising shape we care about.
+        def __repr__(self):
+            return "<_NonLiteralTactic object nvfp4>"
+
+    poisoned_repr = repr(_NonLiteralTactic())  # non-literal object repr
+    # Precondition: confirm this repr really does raise SyntaxError.
     with pytest.raises(SyntaxError):
         ast.literal_eval(poisoned_repr)
 
