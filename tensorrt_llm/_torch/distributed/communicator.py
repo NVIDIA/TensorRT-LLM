@@ -102,17 +102,35 @@ class MpiFtSubcommSetup:
 
 _MPI_FT_PROCESS_LIFETIME_REFS: list[Any] = []
 _MPI_FT_PROCESS_LIFETIME_REFS_LOCK = threading.Lock()
+_MPI_FT_CREATION_LOCK = threading.Lock()
+_MPI_FT_PROCESS_LIFETIME_PARENT: Optional[Any] = None
+
+
+def _is_mpi_ft_int(value: Any) -> bool:
+    """Reject bool/float values that compare equal to MPI integer fields."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _mpi_ft_process_lifetime_parent_is_reserved() -> bool:
+    with _MPI_FT_PROCESS_LIFETIME_REFS_LOCK:
+        return _MPI_FT_PROCESS_LIFETIME_PARENT is not None
+
+
+def _reserve_mpi_ft_process_lifetime_parent(parent_comm: Any) -> None:
+    """Strongly retain the one MVP parent before `MPI_Comm_split`."""
+    global _MPI_FT_PROCESS_LIFETIME_PARENT
+    with _MPI_FT_PROCESS_LIFETIME_REFS_LOCK:
+        if _MPI_FT_PROCESS_LIFETIME_PARENT is not None:
+            raise RuntimeError(
+                "WideEP FT process-lifetime communicator was reserved concurrently"
+            )
+        _MPI_FT_PROCESS_LIFETIME_PARENT = parent_comm
 
 
 def _retain_mpi_ft_comm(comm: Any) -> None:
     """Keep a communicator with unsafe cleanup reachable until process exit."""
     with _MPI_FT_PROCESS_LIFETIME_REFS_LOCK:
         _MPI_FT_PROCESS_LIFETIME_REFS.append(comm)
-
-
-def _is_mpi_ft_int(value: Any) -> bool:
-    """Reject bool/float values that compare equal to MPI integer fields."""
-    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _mpi_ft_local_topology(
@@ -141,7 +159,8 @@ def _mpi_ft_local_topology(
     if provided_thread_level < MPI.THREAD_MULTIPLE:
         error_kind = "runtime"
         error_message = (
-            "WideEP FT requires MPI.THREAD_MULTIPLE because its control-plane "
+            "WideEP FT requires MPI.THREAD_MULTIPLE because its "
+            "failure-notification "
             "thread overlaps other MPI traffic "
             f"(provided={provided_thread_level}, required={MPI.THREAD_MULTIPLE})"
         )
@@ -220,6 +239,7 @@ def _mpi_ft_local_topology(
         "ep_size": ep_size,
         "ep_rank": ep_rank,
         "failure_evidence_size": failure_evidence_size,
+        "ft_comm_reserved": False,
         "error_kind": error_kind,
         "error_message": error_message,
     }
@@ -322,6 +342,11 @@ def _validate_mpi_ft_topologies(topologies: List[Any],
                 "WideEP FT startup topology is inconsistent: parent rank "
                 f"{gather_rank} reports failure-evidence size {failure_evidence_size}, "
                 f"expected {parent_size}")
+        if not isinstance(topology.get("ft_comm_reserved"), bool):
+            raise RuntimeError(
+                "WideEP FT startup topology is inconsistent: parent rank "
+                f"{gather_rank} reports invalid communicator-lifecycle state "
+                f"{topology.get('ft_comm_reserved')!r}")
     # Only dereference peer groups after every gathered record has passed the
     # schema/range checks above. This keeps malformed records rank-attributed and
     # prevents a valid earlier record from indexing into unchecked peer data.
@@ -334,6 +359,20 @@ def _validate_mpi_ft_topologies(topologies: List[Any],
                     "WideEP FT startup topology is inconsistent: parent rank "
                     f"{gather_rank} reports EP group {ep_group}, but member "
                     f"rank {peer_rank} reports {peer_group}")
+
+    reserved_ranks = [
+        gather_rank for gather_rank, topology in enumerate(topologies)
+        if topology["ft_comm_reserved"]
+    ]
+    if reserved_ranks:
+        if len(reserved_ranks) != parent_size:
+            raise RuntimeError(
+                "WideEP FT communicator lifecycle is inconsistent across the "
+                f"parent communicator: reserved ranks={reserved_ranks}, "
+                f"expected either none or all {parent_size} ranks")
+        raise RuntimeError(
+            "WideEP FT MVP supports at most one process-lifetime communicator "
+            "per process")
 
 
 def _mpi_ft_post_split_status(ft_comm: Any, parent_rank: int, ep_rank: int,
@@ -454,21 +493,21 @@ def create_mpi_ft_subcomm(
         mapping: Mapping,
         parent_comm: Optional[Any] = None,
         failure_evidence_size: Optional[int] = None) -> MpiFtSubcommSetup:
-    """Create the dedicated MPI control-plane communicator for WideEP FT.
+    """Create the dedicated MPI failure-notification communicator for WideEP FT.
 
-    This operation is collective across ``parent_comm`` and must run on every
+    This operation is collective across `parent_comm` and must run on every
     rank during startup, before any background failure-broadcast threads are
     launched. The MVP requires one MoE EP group spanning the parent world,
     ordered by the EP-local rank used by the caller's failure-evidence state.
 
     Before splitting, ranks exchange their local validation outcome and EP
     topology on the healthy parent communicator. This prevents one rank from
-    raising locally while its peers block forever inside ``MPI_Comm_split``.
+    raising locally while its peers block forever inside `MPI_Comm_split`.
 
     Args:
         mapping: Distributed topology for the local rank.
         parent_comm: Parent MPI communicator. Defaults to TRT-LLM's active
-            ``mpi_comm()``, which wraps ``MPI.COMM_WORLD`` in the standard
+            `mpi_comm()`, which wraps `MPI.COMM_WORLD` in the standard
             launch path and preserves custom communicator sessions.
         failure_evidence_size: Optional local failure-evidence state size to validate
             collectively before splitting.
@@ -479,7 +518,8 @@ def create_mpi_ft_subcomm(
 
     Raises:
         RuntimeError: If MPI is unavailable, does not provide
-            ``MPI.THREAD_MULTIPLE``, or creates an unexpected communicator.
+            `MPI.THREAD_MULTIPLE`, creates an unexpected communicator, or a
+            process-lifetime FT communicator was already created.
         ValueError: If the mapping's EP group is inconsistent.
     """
     if MPI is None:
@@ -487,11 +527,23 @@ def create_mpi_ft_subcomm(
             "mpi4py is required to create the WideEP FT communicator")
 
     parent_comm = mpi_comm() if parent_comm is None else parent_comm
+    # The MVP topology is world-spanning, so only one FT channel may own this
+    # process. Serialization keeps its reservation atomic for local callers.
+    with _MPI_FT_CREATION_LOCK:
+        return _create_mpi_ft_subcomm(mapping, parent_comm,
+                                      failure_evidence_size)
+
+
+def _create_mpi_ft_subcomm(
+        mapping: Mapping, parent_comm: Any,
+        failure_evidence_size: Optional[int]) -> MpiFtSubcommSetup:
     parent_rank = parent_comm.Get_rank()
     parent_size = parent_comm.Get_size()
     local_topology = _mpi_ft_local_topology(mapping, parent_rank, parent_size,
                                             MPI.Query_thread(),
                                             failure_evidence_size)
+    local_topology[
+        "ft_comm_reserved"] = _mpi_ft_process_lifetime_parent_is_reserved()
     topologies = parent_comm.allgather(local_topology)
     _validate_mpi_ft_topologies(topologies, parent_size)
 
@@ -501,36 +553,29 @@ def create_mpi_ft_subcomm(
 
     # The MVP topology gate above makes the world-spanning group's first rank
     # a stable color shared by every process.
-    ft_comm = parent_comm.Split(color=ep_group[0], key=ep_rank)
-    try:
-        setup_status = _mpi_ft_post_split_status(ft_comm, parent_rank, ep_rank,
-                                                 ep_size)
-        setup_statuses = parent_comm.allgather(setup_status)
-        setup_error, ulfm_available = _mpi_ft_post_split_result(
-            setup_statuses, parent_size)
-        if setup_error is None:
-            setup = MpiFtSubcommSetup(
-                comm=ft_comm,
-                local_rank=ep_rank,
-                ep_size=ep_size,
-                ulfm_available=ulfm_available,
-            )
-            # Enforce process-lifetime ownership at the creation boundary. A
-            # direct or future caller must not be able to drop the last Python
-            # reference and trigger rank-local collective MPI_Comm_free.
-            _retain_mpi_ft_comm(ft_comm)
-            return setup
-    except Exception:
-        # Once Split succeeds, never let an unexpected post-Split exception
-        # drop the last reference and trigger rank-local communicator cleanup.
-        _retain_mpi_ft_comm(ft_comm)
-        raise
+    split = parent_comm.Split
+    _reserve_mpi_ft_process_lifetime_parent(parent_comm)
+    ft_comm = split(color=ep_group[0], key=ep_rank)
+    # Retain immediately after Split. Every later setup failure keeps the same
+    # handle and reservation alive instead of risking rank-local Comm_free.
+    _retain_mpi_ft_comm(ft_comm)
+    setup_status = _mpi_ft_post_split_status(ft_comm, parent_rank, ep_rank,
+                                             ep_size)
+    setup_statuses = parent_comm.allgather(setup_status)
+    setup_error, ulfm_available = _mpi_ft_post_split_result(
+        setup_statuses, parent_size)
+    if setup_error is None:
+        return MpiFtSubcommSetup(
+            comm=ft_comm,
+            local_rank=ep_rank,
+            ep_size=ep_size,
+            ulfm_available=ulfm_available,
+        )
 
     # MPI_Comm_free is collective. Once setup has reported any communicator
     # invariant failure, attempting collective cleanup on that same handle is
     # not provably bounded, even with MPI_ERRORS_RETURN installed. Keep the
     # handle reachable and let MPI reclaim it at process teardown.
-    _retain_mpi_ft_comm(ft_comm)
     logger.warning("WideEP FT retained a communicator after startup failure: "
                    f"{setup_error}")
     raise RuntimeError(setup_error)

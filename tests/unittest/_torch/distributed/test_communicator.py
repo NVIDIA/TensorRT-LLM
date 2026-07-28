@@ -13,12 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from tensorrt_llm._torch.distributed import communicator
+
+
+@pytest.fixture(autouse=True)
+def _restore_mpi_ft_process_lifetime_state() -> Iterator[None]:
+    initial_refs = len(communicator._MPI_FT_PROCESS_LIFETIME_REFS)
+    initial_parent = communicator._MPI_FT_PROCESS_LIFETIME_PARENT
+    yield
+    del communicator._MPI_FT_PROCESS_LIFETIME_REFS[initial_refs:]
+    communicator._MPI_FT_PROCESS_LIFETIME_PARENT = initial_parent
 
 
 def _mapping(**overrides: object) -> SimpleNamespace:
@@ -33,7 +43,11 @@ def _mapping(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
-def _valid_topologies(parent_size: int = 8) -> list[dict[str, object]]:
+def _valid_topologies(
+    parent_size: int = 8,
+    *,
+    ft_comm_reserved: bool = False,
+) -> list[dict[str, object]]:
     topologies = []
     for rank in range(parent_size):
         ep_group = tuple(range(parent_size))
@@ -47,6 +61,7 @@ def _valid_topologies(parent_size: int = 8) -> list[dict[str, object]]:
                 "ep_size": len(ep_group),
                 "ep_rank": ep_group.index(rank),
                 "failure_evidence_size": None,
+                "ft_comm_reserved": ft_comm_reserved,
                 "error_kind": None,
                 "error_message": None,
             }
@@ -78,7 +93,10 @@ def _communicators(*, parent_rank: int = 5, parent_size: int = 8) -> tuple[Mock,
 
     def _allgather(local_record: dict[str, object]) -> list[dict[str, object]]:
         if "ep_group" in local_record:
-            records = _valid_topologies(parent_size)
+            records = _valid_topologies(
+                parent_size,
+                ft_comm_reserved=bool(local_record["ft_comm_reserved"]),
+            )
         else:
             records = _valid_setup_statuses(parent_size)
         records[parent_rank] = local_record
@@ -108,21 +126,85 @@ def test_create_mpi_ft_subcomm_splits_ep_group_and_sets_error_handler(
     monkeypatch.setattr(communicator, "mpi_comm", active_comm)
     initial_refs = len(communicator._MPI_FT_PROCESS_LIFETIME_REFS)
 
-    try:
-        result = communicator.create_mpi_ft_subcomm(_mapping())
+    result = communicator.create_mpi_ft_subcomm(_mapping())
 
-        assert result.comm is ft_comm
-        assert result.local_rank == 5
-        assert result.ep_size == 8
-        assert result.ulfm_available is True
-        active_comm.assert_called_once_with()
-        assert parent_comm.allgather.call_count == 2
-        parent_comm.Split.assert_called_once_with(color=0, key=5)
-        ft_comm.Set_errhandler.assert_called_once_with(fake_mpi.ERRORS_RETURN)
-        ft_comm.Free.assert_not_called()
-        assert communicator._MPI_FT_PROCESS_LIFETIME_REFS[initial_refs:] == [ft_comm]
-    finally:
-        del communicator._MPI_FT_PROCESS_LIFETIME_REFS[initial_refs:]
+    assert result.comm is ft_comm
+    assert result.local_rank == 5
+    assert result.ep_size == 8
+    assert result.ulfm_available is True
+    active_comm.assert_called_once_with()
+    assert parent_comm.allgather.call_count == 2
+    parent_comm.Split.assert_called_once_with(color=0, key=5)
+    ft_comm.Set_errhandler.assert_called_once_with(fake_mpi.ERRORS_RETURN)
+    ft_comm.Free.assert_not_called()
+    assert communicator._MPI_FT_PROCESS_LIFETIME_REFS[initial_refs:] == [ft_comm]
+
+
+def test_create_mpi_ft_subcomm_collectively_rejects_second_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_comm, _ = _communicators()
+    monkeypatch.setattr(communicator, "MPI", _fake_mpi(parent_comm))
+
+    communicator.create_mpi_ft_subcomm(_mapping(), parent_comm)
+
+    with pytest.raises(
+        RuntimeError,
+        match="at most one process-lifetime communicator per process",
+    ):
+        communicator.create_mpi_ft_subcomm(_mapping(), parent_comm)
+
+    parent_comm.Split.assert_called_once()
+    assert parent_comm.allgather.call_count == 3
+    assert communicator._MPI_FT_PROCESS_LIFETIME_PARENT is parent_comm
+
+
+def test_create_mpi_ft_subcomm_rejects_mixed_remote_lifecycle_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_comm, _ = _communicators()
+    monkeypatch.setattr(communicator, "MPI", _fake_mpi(parent_comm))
+    default_allgather = parent_comm.allgather.side_effect
+    initial_parent = communicator._MPI_FT_PROCESS_LIFETIME_PARENT
+
+    def _allgather(local_record: dict[str, object]) -> list[dict[str, object]]:
+        records = default_allgather(local_record)
+        if "ep_group" in local_record:
+            records[2]["ft_comm_reserved"] = True
+        return records
+
+    parent_comm.allgather.side_effect = _allgather
+
+    with pytest.raises(
+        RuntimeError,
+        match="communicator lifecycle is inconsistent.*reserved ranks=\\[2\\]",
+    ):
+        communicator.create_mpi_ft_subcomm(_mapping(), parent_comm)
+
+    parent_comm.Split.assert_not_called()
+    assert communicator._MPI_FT_PROCESS_LIFETIME_PARENT is initial_parent
+
+
+def test_create_mpi_ft_subcomm_burns_reservation_after_post_split_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_comm, ft_comm = _communicators()
+    monkeypatch.setattr(communicator, "MPI", _fake_mpi(parent_comm))
+    ft_comm.Set_errhandler.side_effect = RuntimeError("cannot set error handler")
+    initial_refs = len(communicator._MPI_FT_PROCESS_LIFETIME_REFS)
+
+    with pytest.raises(RuntimeError, match="cannot set error handler"):
+        communicator.create_mpi_ft_subcomm(_mapping(), parent_comm)
+
+    with pytest.raises(
+        RuntimeError,
+        match="at most one process-lifetime communicator per process",
+    ):
+        communicator.create_mpi_ft_subcomm(_mapping(), parent_comm)
+
+    parent_comm.Split.assert_called_once()
+    assert communicator._MPI_FT_PROCESS_LIFETIME_PARENT is parent_comm
+    assert communicator._MPI_FT_PROCESS_LIFETIME_REFS[initial_refs:] == [ft_comm]
 
 
 def test_create_mpi_ft_subcomm_requires_thread_multiple(
@@ -582,6 +664,7 @@ def test_create_mpi_ft_subcomm_rejects_inconsistent_remote_ep_group(
         ("ep_size", 8.0, "reports EP size"),
         ("ep_rank", 2.0, "reports invalid EP rank"),
         ("failure_evidence_size", 8.0, "reports failure-evidence size"),
+        ("ft_comm_reserved", 0, "invalid communicator-lifecycle state"),
     ],
     ids=[
         "missing-group",
@@ -597,6 +680,7 @@ def test_create_mpi_ft_subcomm_rejects_inconsistent_remote_ep_group(
         "float-ep-size",
         "float-ep-rank",
         "float-failure-evidence-size",
+        "invalid-communicator-lifecycle-state",
     ],
 )
 def test_create_mpi_ft_subcomm_rejects_malformed_remote_topology_schema(
