@@ -2171,7 +2171,12 @@ class MLA(nn.Module):
         if self.is_deepseek_v4:
             if flash_mla_cuda is not None and topk_indices is not None:
                 return self.forward_sparse_decode_deepseek_v4_fp8(
-                    q, latent_cache, attn_metadata, output, topk_indices
+                    q,
+                    latent_cache,
+                    attn_metadata,
+                    output,
+                    topk_indices,
+                    position_ids=position_ids,
                 )
             return self.forward_sparse_mla_deepseek_v4_bf16(
                 q,
@@ -2180,6 +2185,7 @@ class MLA(nn.Module):
                 output,
                 topk_indices,
                 is_generation=True,
+                position_ids=position_ids,
             )
         return self.forward_sparse_mla_kvcache_bf16(
             q, latent_cache, attn_metadata, output, topk_indices, is_generation=True
@@ -2935,6 +2941,7 @@ class MLA(nn.Module):
         attn_metadata: TrtllmAttentionMetadata,
         *,
         is_generation: bool,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> None:
         """Apply RoPE and update the DeepSeek-V4 paged cache on Hopper."""
         trtllm_attention = cast(TrtllmAttention, self.mqa)
@@ -2957,7 +2964,8 @@ class MLA(nn.Module):
         mla_bmm1_scale = None
         mla_bmm2_scale = None
         quant_q_buffer = None
-        if getattr(trtllm_attention, "has_fp8_kv_cache", False):
+        has_fp8_kv_cache = getattr(trtllm_attention, "has_fp8_kv_cache", False)
+        if has_fp8_kv_cache:
             mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=q.device)
             mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=q.device)
             quant_q_buffer = torch.empty(
@@ -2980,6 +2988,27 @@ class MLA(nn.Module):
                 mla_bmm1_scale,
                 mla_bmm2_scale,
                 quant_q_buffer,
+            )
+        if has_fp8_kv_cache:
+            if position_ids is None or position_ids.numel() != num_tokens:
+                position_ids_shape = None if position_ids is None else tuple(position_ids.shape)
+                raise ValueError(
+                    "Expected one position ID per generation token, got "
+                    f"{position_ids_shape=} for {num_tokens=}"
+                )
+            if self.compressor is None:
+                raise RuntimeError(
+                    "DeepSeek-V4 Hopper FP8 decode requires a compressor rotary embedding"
+                )
+            torch.ops.trtllm.mla_rope_inplace(
+                q_view,
+                position_ids.view(-1).contiguous(),
+                self.compressor.rotary_emb.rotary_cos_sin,
+                self.num_heads_tp,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+                False,
+                self.compressor.rotary_emb.is_neox,
             )
 
     def _deepseek_v4_hopper_pool_indices(
@@ -3158,6 +3187,7 @@ class MLA(nn.Module):
         output: torch.Tensor,
         topk_indices: Optional[torch.Tensor],
         is_generation: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run DeepSeek-V4 dual-pool sparse MLA on Hopper using BF16 prefill kernels."""
         from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import (
@@ -3173,7 +3203,7 @@ class MLA(nn.Module):
             self._fp8_shadow_needs_bulk = True
 
         self._prepare_deepseek_v4_hopper_q_and_cache(
-            q, latent_cache, attn_metadata, is_generation=is_generation
+            q, latent_cache, attn_metadata, is_generation=is_generation, position_ids=position_ids
         )
 
         num_tokens = q.shape[0]
@@ -3260,6 +3290,7 @@ class MLA(nn.Module):
         attn_metadata: TrtllmAttentionMetadata,
         output: torch.Tensor,
         topk_indices: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run DeepSeek-V4 Hopper decode with FlashMLA's MODEL1 FP8 kernel."""
         from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import (
@@ -3276,7 +3307,11 @@ class MLA(nn.Module):
             )
 
         self._prepare_deepseek_v4_hopper_q_and_cache(
-            q, latent_cache, attn_metadata, is_generation=True
+            q,
+            latent_cache,
+            attn_metadata,
+            is_generation=True,
+            position_ids=position_ids,
         )
 
         kv_cache_manager = attn_metadata.kv_cache_manager
