@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import time
 import uuid
@@ -103,6 +118,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._context_info_endpoint = self._broadcast_context_endpoint()
         self._init_sync_policy()
         self._exchange_rank_info()
+        serving_type = os.getenv("DISAGG_SERVING_TYPE", "unknown")
+        if serving_type.startswith("CTX_"):
+            trace_side = "ctx"
+        elif serving_type.startswith("GEN_"):
+            trace_side = "gen"
+        else:
+            trace_side = serving_type.lower()
+        log_kv_transfer_trace(
+            "trace_enabled",
+            -1,
+            trace_side,
+            self._instance_name,
+            self._mapping.rank,
+            serving_type=serving_type,
+            kv_transfer_timeout_ms=self.kv_transfer_timeout_ms,
+            transfer_overlap_disabled=os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "0"),
+        )
 
         self._send_sessions: Dict[int, TxSessionBase] = {}
         self._recv_sessions: Dict[int, RxSessionBase] = {}
