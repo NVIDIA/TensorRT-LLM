@@ -188,6 +188,7 @@ def _make_forward_only_engine(
     engine.original_max_draft_len = 0
     engine.original_max_total_draft_tokens = 0
     engine._spec_dec_max_total_draft_tokens = 0
+    engine.spec_config = None
     engine.get_runtime_tokens_per_gen_step = Mock(return_value=1)
     engine.iter_states = {}
     engine.forward_pass_callable = None
@@ -688,6 +689,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(key)
         engine.enable_spec_decode = True
+        engine.spec_config = SimpleNamespace(is_linear_tree=True)
         graph_attn_metadata = runner.maybe_get_cuda_graph.return_value[0]
         runner.maybe_get_cuda_graph.return_value = (
             graph_attn_metadata,
@@ -727,6 +729,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(None)
         engine.enable_spec_decode = True
+        engine.spec_config = SimpleNamespace(is_linear_tree=True)
         context = _make_request_stub(1)
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = [context]
@@ -739,6 +742,36 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertIs(actual_outputs, outputs)
         graph_batch = runner.maybe_get_cuda_graph.call_args.args[0]
         self.assertEqual(graph_batch.generation_requests, [context])
+        prepare_args = engine._prepare_inputs.call_args.args
+        self.assertIs(prepare_args[0], batch)
+        self.assertIs(prepare_args[2], semantic_attn_metadata)
+        self.assertIs(prepare_args[3], engine.spec_metadata)
+        self.assertEqual(prepare_args[-1], frozenset())
+        engine._forward_step.assert_called_once()
+        runner.replay.assert_not_called()
+
+    def test_zero_runtime_non_linear_tree_speculation_uses_semantic_eager_batch(
+            self) -> None:
+        engine, runner, resource_manager, semantic_attn_metadata, outputs = \
+            _make_forward_only_engine(None)
+        engine.enable_spec_decode = True
+        engine.spec_config = SimpleNamespace(is_linear_tree=False)
+        context = _make_request_stub(1)
+        generation = _make_request_stub(2)
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [context]
+        batch.generation_requests = [generation]
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine._make_single_token_context_graph_batch"
+        ) as selector, patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
+                return_value=Mock()):
+            actual_outputs = engine.forward(batch, resource_manager)
+
+        self.assertIs(actual_outputs, outputs)
+        selector.assert_not_called()
+        self.assertIs(runner.maybe_get_cuda_graph.call_args.args[0], batch)
         prepare_args = engine._prepare_inputs.call_args.args
         self.assertIs(prepare_args[0], batch)
         self.assertIs(prepare_args[2], semantic_attn_metadata)

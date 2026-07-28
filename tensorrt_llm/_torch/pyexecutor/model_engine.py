@@ -6320,15 +6320,21 @@ class PyTorchModelEngine(ModelEngine):
 
         graph_requests = scheduled_requests
         promoted_context_request_ids: frozenset[int] = frozenset()
+        # Non-linear tree input preparation expands runtime_draft_len to the
+        # total tree width after graph selection. Only linear-tree zero-draft
+        # iterations can therefore safely reuse a zero-draft graph.
+        can_promote_spec_decode = (not self.enable_spec_decode
+                                   or (not self.is_draft_model
+                                       and self.runtime_draft_len == 0
+                                       and self.spec_config is not None
+                                       and self.spec_config.is_linear_tree))
         # TODO: Generalize these conservative gates as actual-draft, beam, and
         # context-parallel providers for decoder-only LLMs gain support for
         # promoted final-context rows. Each relaxation must preserve whole-batch
         # fallback on graph miss and prove parity with the provider's native
         # q_len=1 path. Encoder-decoder and non-LLM engines remain out of scope.
         if (scheduled_requests.num_context_requests > 0
-                and self.cuda_graph_runner.enabled
-                and (not self.enable_spec_decode or
-                     (not self.is_draft_model and self.runtime_draft_len == 0))
+                and self.cuda_graph_runner.enabled and can_promote_spec_decode
                 and not self.use_beam_search
                 and not self._is_encoder_decoder_model()
                 and not self._is_encode_only
