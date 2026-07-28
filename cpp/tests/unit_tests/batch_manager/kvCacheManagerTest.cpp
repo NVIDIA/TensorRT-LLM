@@ -10647,12 +10647,58 @@ TEST_F(KVCacheManagerTest, VswaMixedHeadDimReuseSmoke)
     }
 }
 
+TEST_F(KVCacheManagerTest, HybridDisaggUsesAttentionPoolDtype)
+{
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 2;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr maxAttentionWindow = 16;
+    auto constexpr recurrentStatesBytes = 64;
+    SizeType32 constexpr recurrentStatesWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata const linearAttentionMetadata{
+        .linearLayerIndices = {0},
+        .cacheType = recurrentStatesWindow,
+        .allRecurrentStatesBytes = recurrentStatesBytes,
+    };
+    auto const blocksPerWindow = BlocksPerWindow{
+        {recurrentStatesWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+        {maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+    };
+    auto const poolConfigurations = std::vector<PoolConfiguration>{
+        {recurrentStatesWindow, sizePerHead, tensorrt_llm::DataType::kHALF},
+        {maxAttentionWindow, sizePerHead, tensorrt_llm::DataType::kFP8},
+    };
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    auto kvCacheManager = std::make_unique<KVCacheManager>(std::vector<SizeType32>{0, numKvHeads}, sizePerHead,
+        tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
+        std::vector<SizeType32>{recurrentStatesWindow, maxAttentionWindow}, tensorrt_llm::DataType::kFP8,
+        /*sinkTokenLength=*/0, stream, maxAttentionWindow, /*chunkSize=*/0, /*enableBlockReuse=*/false,
+        CacheType::kSELF, std::nullopt, nullptr, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr,
+        /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
+        /*indexerKCacheUseFp4=*/false, linearAttentionMetadata, poolConfigurations);
+    kvCacheManager->allocatePools(/*useUvm=*/false);
+
+    CacheTransBufferManager cacheTransBufferManager(kvCacheManager.get(), /*maxNumTokens=*/tokensPerBlock);
+    EXPECT_EQ(cacheTransBufferManager.getDataType(), tensorrt_llm::DataType::kFP8);
+
+    auto const bufferId = cacheTransBufferManager.assignBufferIndexForSend();
+    ASSERT_TRUE(bufferId.has_value());
+    EXPECT_EQ(cacheTransBufferManager.getSendBuffer(bufferId)->getDataType(), tensorrt_llm::DataType::kFP8);
+    cacheTransBufferManager.freeBufferIndexForSend(bufferId);
+}
+
 // A6: VSWA + disagg dtype mismatch must fire the A4 guard.
 //
-// The constructor of CacheTransBufferManager picks pool 0's dtype as canonical for
-// the wire transport.  When a KVCacheManager hosts pools with differing dtypes
-// (mixed-precision per-window), that silent coercion would corrupt the wire format.
-// The guard added in cacheTransBuffer.cpp must throw at construction time.
+// CacheTransBufferManager uses a single dtype for the wire transport. When a
+// KVCacheManager hosts attention pools with differing dtypes (mixed-precision
+// per-window), that silent coercion would corrupt the wire format. The guard in
+// cacheTransBuffer.cpp must throw at construction time.
 //
 // This test only exercises the helper / construction path that runs the guard; it
 // does not stand up a full disaggregated transfer (out of scope at unit-test
@@ -10692,14 +10738,23 @@ TEST_F(KVCacheManagerTest, VswaDisaggDtypeMismatchTriggersGuard)
     kvCacheManager->allocatePools(/*useUvm=*/false);
 
     // Sanity: the manager really does host KV pools with two different dtypes.
-    auto const numKvPools = kvCacheManager->getBlockManager().getNumPools(
-        /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
-    ASSERT_GE(numKvPools, 2);
-    auto const dtype0 = kvCacheManager->getPrimaryPool(0)->getDataType();
+    auto const& blockManager = kvCacheManager->getBlockManager();
+    ASSERT_GE(blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false), 2);
+    std::optional<tensorrt_llm::DataType> dtype0;
     bool foundMismatch = false;
-    for (SizeType32 i = 1; i < numKvPools; ++i)
+    for (SizeType32 poolIdx = 0; poolIdx < blockManager.getNumPools(); ++poolIdx)
     {
-        if (kvCacheManager->getPrimaryPool(i)->getDataType() != dtype0)
+        auto const& pool = blockManager.getPool(poolIdx);
+        if (pool.containsBlockScales || pool.containsIndexerKCache)
+        {
+            continue;
+        }
+        auto const dataType = blockManager.getPrimaryPool(poolIdx)->getDataType();
+        if (!dtype0.has_value())
+        {
+            dtype0 = dataType;
+        }
+        else if (dataType != dtype0.value())
         {
             foundMismatch = true;
             break;
@@ -10791,7 +10846,7 @@ std::unique_ptr<BlockManager> makeDiskTierBlockManager(std::shared_ptr<tr::CudaS
     // explicitly to reach them positionally.
     auto blockManager = std::make_unique<BlockManager>(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
         blocksPerWindow, maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, maxAttentionWindow,
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, maxAttentionWindow,
         CacheType::kSELF, /*secondaryOffloadMinPriority=*/std::nullopt, /*eventManager=*/nullptr,
         /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false, /*kvCacheConnectorManager=*/nullptr,
         /*agentConfig=*/std::nullopt, /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128,
@@ -11155,10 +11210,10 @@ void runDiskOnboardByteRoundTrip(char const* readers, int nSlots)
     auto transferManager = KVCacheTransferManager(bufferManager); // reads TLLM_KV_DISK_READERS at construction
 
     auto pool = KVCacheBlockPool(0, /*kvFactor=*/2, 0, 0, 0);
-    pool.primaryPtr = bufferManager.gpu(tr::ITensor::makeShape({nSlots, blockSize}), nvinfer1::DataType::kFLOAT);
+    pool.primaryPtr = bufferManager.gpu(tr::ITensor::makeShape({nSlots, blockSize}), tensorrt_llm::DataType::kFLOAT);
     bufferManager.setZero(*pool.primaryPtr);
     pool.secondaryPtr
-        = tr::BufferManager::pinned(tr::ITensor::makeShape({nSlots, blockSize}), nvinfer1::DataType::kFLOAT);
+        = tr::BufferManager::pinned(tr::ITensor::makeShape({nSlots, blockSize}), tensorrt_llm::DataType::kFLOAT);
 
     // Fill each host slot with its pattern and spill it to disk slot k (synchronous write).
     float* secBase = tr::bufferCast<float>(*pool.secondaryPtr);
@@ -11250,8 +11305,9 @@ TEST_F(KVCacheManagerTest, DiskTierAsyncWriteFailureContainedTest)
     auto bufferManager = tr::BufferManager(std::make_shared<tr::CudaStream>());
     auto transferManager = KVCacheTransferManager(bufferManager);
     auto pool = KVCacheBlockPool(0, /*kvFactor=*/2, 0, 0, 0);
-    pool.primaryPtr = bufferManager.gpu(tr::ITensor::makeShape({2, blockSize}), nvinfer1::DataType::kFLOAT);
-    pool.secondaryPtr = tr::BufferManager::pinned(tr::ITensor::makeShape({2, blockSize}), nvinfer1::DataType::kFLOAT);
+    pool.primaryPtr = bufferManager.gpu(tr::ITensor::makeShape({2, blockSize}), tensorrt_llm::DataType::kFLOAT);
+    pool.secondaryPtr
+        = tr::BufferManager::pinned(tr::ITensor::makeShape({2, blockSize}), tensorrt_llm::DataType::kFLOAT);
 
     auto waitForSpill = [&](std::uint64_t spillId)
     {
@@ -11346,10 +11402,11 @@ TEST_F(KVCacheManagerTest, DiskTierShutdownWithQueuedWorkTest)
     auto transferManager = KVCacheTransferManager(bufferManager); // spawns readers + writers from the env above
 
     auto pool = KVCacheBlockPool(0, /*kvFactor=*/2, 0, 0, 0);
-    pool.primaryPtr = bufferManager.gpu(tr::ITensor::makeShape({2 * nSlots, blockSize}), nvinfer1::DataType::kFLOAT);
+    pool.primaryPtr
+        = bufferManager.gpu(tr::ITensor::makeShape({2 * nSlots, blockSize}), tensorrt_llm::DataType::kFLOAT);
     bufferManager.setZero(*pool.primaryPtr);
     pool.secondaryPtr
-        = tr::BufferManager::pinned(tr::ITensor::makeShape({2 * nSlots, blockSize}), nvinfer1::DataType::kFLOAT);
+        = tr::BufferManager::pinned(tr::ITensor::makeShape({2 * nSlots, blockSize}), tensorrt_llm::DataType::kFLOAT);
 
     // Seed host slots and write them to disk (synchronous) so the queued reads below have files to read.
     float* secBase = tr::bufferCast<float>(*pool.secondaryPtr);

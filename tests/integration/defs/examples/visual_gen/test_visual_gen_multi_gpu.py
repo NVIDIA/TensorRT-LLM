@@ -66,8 +66,10 @@ WAN22_LPIPS_MULTI_GPU_VARIANTS = [
 
 WAN22_LPIPS_TP_VARIANTS = [
     ("tp2", {"tp_size": 2}),
+    ("tp3", {"tp_size": 3}),
     ("cfg2_tp2", {"cfg_size": 2, "tp_size": 2}),
     ("tp2_ulysses2", {"tp_size": 2, "ulysses_size": 2}),
+    ("tp2_attn2d_2x1", {"tp_size": 2, "attn2d_size": (2, 1)}),
 ]
 
 

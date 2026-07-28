@@ -305,6 +305,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         divided by ``spatial_merge_unit`` (the post-merger placeholder count)."""
         if isinstance(image, torch.Tensor):
             image_h, image_w = int(image.shape[-2]), int(image.shape[-1])
+        elif isinstance(image, np.ndarray):
+            # HWC uint8 from ImageMediaIO's "np" format.
+            image_h, image_w = int(image.shape[0]), int(image.shape[1])
         else:
             image_h, image_w = image.height, image.width
         encoder_tokens = self._num_vision_tokens(width=image_w,
@@ -320,6 +323,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         if isinstance(first_frame, torch.Tensor):
             frame_h = int(first_frame.shape[-2])
             frame_w = int(first_frame.shape[-1])
+        elif isinstance(first_frame, np.ndarray):
+            # HWC uint8 from VideoMediaIO's "np" format.
+            frame_h = int(first_frame.shape[0])
+            frame_w = int(first_frame.shape[1])
         else:
             frame_h, frame_w = first_frame.height, first_frame.width
         encoder_tokens = self._num_vision_tokens(width=frame_w,
@@ -1167,7 +1174,10 @@ class Qwen2_5_VLVisionAttention(Attention):
         # uses head_dim=80 (e.g. 1280 hidden / 16 heads), so use PyTorch RoPE.
         if IS_FLASHINFER_AVAILABLE and self.head_dim % 64 == 0 and position_ids is not None:
             try:
-                cos_sin_cache = torch.cat([cos, sin], dim=-1).contiguous()
+                # flashinfer requires cos_sin_cache in float32; upstream may cache
+                # cos/sin in the vision tower dtype (e.g. bf16) as a perf hint.
+                cos_sin_cache = torch.cat([cos, sin], dim=-1).to(
+                    torch.float32).contiguous()
                 flashinfer_apply_rope_with_cos_sin_cache_inplace(
                     position_ids,
                     q,
@@ -1177,7 +1187,7 @@ class Qwen2_5_VLVisionAttention(Attention):
                     is_neox=True,
                 )
                 return q, k, v
-            except RuntimeError as err:
+            except (RuntimeError, ValueError) as err:
                 logger.warning(
                     "Qwen2.5-VL vision RoPE: FlashInfer failed (%s); "
                     "falling back to PyTorch RotaryEmbedding.apply_rotary_pos_emb.",

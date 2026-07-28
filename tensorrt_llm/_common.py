@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ctypes
 import os
 import platform
 import threading
@@ -44,16 +43,6 @@ def _init(log_level: object = None) -> None:
     logger.info("Starting TensorRT LLM init.")
 
     project_dir = str(Path(__file__).parent.absolute())
-
-    # Promote libtensorrt_llm.so symbols to the process's global scope. The KV
-    # cache transfer agent wrappers (libtensorrt_llm_nixl_wrapper.so,
-    # libtensorrt_llm_ucx_wrapper.so) are dlopen'ed at runtime without linking
-    # against libtensorrt_llm.so and resolve its symbols from the global symbol
-    # table, while Python extension modules and their dependencies load with
-    # RTLD_LOCAL. This promotion was previously a side effect of loading the
-    # TensorRT plugin library with RTLD_GLOBAL.
-    if platform.system() != "Windows":
-        ctypes.CDLL(project_dir + "/libs/libtensorrt_llm.so", mode=ctypes.RTLD_GLOBAL)
 
     # Load FT decoder layer and torch custom ops.
     if platform.system() == "Windows":

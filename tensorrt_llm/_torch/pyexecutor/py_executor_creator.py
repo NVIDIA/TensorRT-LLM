@@ -40,7 +40,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_hybrid_linear
+from .config_utils import is_hybrid_linear, is_minimax_m3
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -420,6 +420,13 @@ def create_py_executor(
     if llm_args.attn_backend == "VANILLA":
         tokens_per_block = max_num_tokens
 
+    # The MSA kernels require a page size of 128; the Triton reference uses TRT-LLM's default
+    # of 32.
+    m3_sparse_config = llm_args.sparse_attention_config
+    if is_minimax_m3(m3_sparse_config):
+        tokens_per_block = 128 if m3_sparse_config.implementation == "msa" else 32
+        kv_cache_config.tokens_per_block = tokens_per_block
+
     if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
         # Workaround for flashinfer and star attention
         if kv_cache_config.enable_block_reuse:
@@ -680,16 +687,6 @@ def create_py_executor(
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
                                 max_batch_size * getattr(mapping, "pp_size", 1))
-    if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
-            cache_transceiver_config is not None
-            and cache_transceiver_config.backend is not None
-            and cache_transceiver_config.transceiver_runtime == "PYTHON"):
-        logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models when disagg + Python transceiver enabled"
-        )
-        kv_cache_config.enable_block_reuse = False
-        _set_model_engines_cache_reuse([model_engine, draft_model_engine],
-                                       False)
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
@@ -770,8 +767,9 @@ def create_py_executor(
         ctx_chunk_config = None
 
     if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
-        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK,
-                            kv_cache_config.mamba_state_cache_interval)
+        # Snapshot boundaries come from expect_snapshot_points.  The unit is
+        # only used to align chunks shortened by the scheduling budget.
+        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
 
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:
@@ -906,17 +904,16 @@ def create_py_executor(
 
         if is_disagg and is_hybrid:
             # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
-            # no effect in disagg. The disagg manager choice is driven solely
-            # by transceiver_runtime: PYTHON => PythonMambaCacheManager,
-            # otherwise CppMambaHybridCacheManager (unified pool, default).
+            # no effect in disagg. The disagg manager choice is driven by
+            # get_kv_cache_manager_cls and cache_transceiver_config.
             if os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1":
                 logger.warning(
                     "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
-                    "use cache_transceiver_config.transceiver_runtime='PYTHON' "
-                    "to select PythonMambaCacheManager.")
+                    "configure transceiver_runtime='PYTHON' with backend='NIXL' "
+                    "to select MixedMambaHybridCacheManager.")
             else:
                 logger.info("Disaggregated serving with hybrid model detected. "
-                            "Using CppMambaHybridCacheManager.")
+                            "Using the configured Mamba cache manager.")
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
@@ -1022,6 +1019,7 @@ def create_py_executor(
         assert kv_cache_creator is not None
         with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
+
         # Shut down the transceiver before tearing down KV cache managers so
         # that NIXL-registered (pinned) GPU memory is deregistered first;
         # otherwise the old KV cache memory stays pinned and the subsequent
@@ -1033,13 +1031,11 @@ def create_py_executor(
         finally:
             kv_cache_creator.teardown_managers(resources)
 
-        # Release Phase-1 CUDA graph pools before final KV allocation to avoid overshoot.
+        # configure_kv_cache_capacity shuts down the Phase-1 executor, which
+        # releases its CUDA graphs before its resource managers. Only the
+        # profiling attention metadata remains to be discarded here.
         for eng in [model_engine, draft_model_engine]:
-            if eng is None:
-                continue
-            if eng.attn_metadata is not None:
-                if llm_args.cuda_graph_config is not None:
-                    eng._release_cuda_graphs()
+            if eng is not None:
                 eng.attn_metadata = None
 
         del py_executor  # free before constructing new
