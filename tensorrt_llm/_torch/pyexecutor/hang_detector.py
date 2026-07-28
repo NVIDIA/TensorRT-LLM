@@ -116,10 +116,14 @@ def _remaining_kill_grace(grace: float, deadline: Optional[float]) -> float:
     ``deadline`` (a ``time.monotonic()`` stamp) lets a kill that was already
     armed elsewhere keep its ORIGINAL fire time when it is handed over to
     another waiter, so the handover cannot push the kill out by a second
-    grace. Clamped at 0: a deadline already in the past means fire now, and
-    a negative sleep would raise into the caller's blanket except and drop
-    the kill entirely -- exactly in the case (cleanup outlasted the grace)
-    the watchdog exists for.
+    grace.
+
+    The ``max(0.0, ...)`` is belt-and-braces only: it keeps the return value
+    meaningful as "time left" for callers and logs. It is NOT what stops a
+    negative sleep -- ``_wait_out_kill_grace`` does that with its
+    ``remaining > 0`` guard (and ``Event.wait`` returns immediately for a
+    negative timeout anyway). Do not drop that guard on the strength of this
+    clamp.
     """
     if deadline is None:
         return grace
@@ -131,6 +135,12 @@ def _wait_out_kill_grace(remaining: float, cancelled: Optional[threading.Event])
 
     ``cancelled`` makes the wait interruptible so the timer can be handed
     over to another waiter instead of two clocks running at once.
+
+    The ``remaining > 0`` guard is load-bearing: a deadline already in the
+    past must fire the kill now, and ``time.sleep`` of a negative duration
+    would raise into ``hard_kill_on_rank_crash``'s blanket except and drop
+    the kill -- precisely in the case (cleanup outlasted the grace) the
+    watchdog exists for.
     """
     if cancelled is None:
         if remaining > 0:

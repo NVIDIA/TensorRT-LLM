@@ -2908,6 +2908,12 @@ class PyExecutor:
                 self.iter_counter += 1
 
             # Stage 5: Handle remaining executed batches in the queue.
+            # Note: _event_loop_completed was already set at the break above,
+            # so a raise in this drain is classified as benign teardown rather
+            # than a peer-stranding crash. That is deliberate: reaching here
+            # means every rank observed should_stop_processing, so no peer is
+            # parked in a collective waiting on this one -- this drain only
+            # consumes from a rank-local queue.
             while self.unhandled_batch_counter > 0:
                 with nvtx_range("get_executed_batch"):
                     executed_batch = self.executed_batch_response_queue.get()

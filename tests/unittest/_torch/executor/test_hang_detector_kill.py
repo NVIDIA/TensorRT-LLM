@@ -152,14 +152,17 @@ def test_rank_crash_kill_fires_for_multi_rank(monkeypatch):
 
 
 def _assert_slept_then_killed(order, grace):
-    """Assert the grace was slept out before the kill.
+    """Assert the grace was slept out EXACTLY ONCE before EXACTLY ONE kill.
 
     Patching time.sleep is process-wide, so an unrelated background thread can
-    append its own ("sleep", x) while this runs. Assert on the entries this
-    test is about rather than on exact list equality, which would flake.
+    append its own ("sleep", x) while this runs; asserting exact list equality
+    would flake on that. But the counts must still be pinned: sleeping the
+    grace twice before killing (i.e. crash + 2*grace) is precisely the bug
+    class this PR series introduced with its two independent timers, and a
+    membership-only check accepts it.
     """
-    assert ("sleep", grace) in order, order
-    assert "kill" in order, order
+    assert order.count(("sleep", grace)) == 1, order
+    assert order.count("kill") == 1, order
     assert order.index(("sleep", grace)) < order.index("kill"), order
 
 
@@ -279,39 +282,51 @@ def test_kill_keeps_original_deadline_on_handover(monkeypatch):
     """Handing the kill over must not restart the grace clock.
 
     The caller cancels the watchdog once cleanup returns and carries the kill
-    itself; passing the watchdog's deadline keeps the kill at crash + grace
-    instead of crash + 2*grace. Uses a real (short) sleep rather than patching
-    time.sleep process-wide, so no background thread can busy-spin into the
-    assertion.
+    itself; passing the watchdog's deadline must make it sleep the REMAINING
+    time, not a fresh grace. Asserted on the exact duration handed to sleep
+    (with monotonic pinned) rather than on wall-clock, so the margin does not
+    depend on scheduling luck on a loaded CI node.
     """
-    kills = []
-    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: kills.append(1))
+    order = []
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: order.append("kill"))
+    monkeypatch.setattr(hd_module.time, "sleep", lambda s: order.append(("sleep", s)))
+    monkeypatch.setattr(hd_module.time, "monotonic", lambda: 1000.0)
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "30")
 
-    # Nearly all of the 30s grace has already been burned by the watchdog.
-    t0 = time.monotonic()
-    assert hard_kill_on_rank_crash(world_size=2, deadline=t0 + 0.3) is True
-    elapsed = time.monotonic() - t0
-    assert kills == [1]
-    # Slept out the REMAINING 0.3s, not a fresh 30s grace.
-    assert elapsed == pytest.approx(0.3, abs=0.25)
+    # 29.5s of the 30s grace has already been burned by the watchdog.
+    assert hard_kill_on_rank_crash(world_size=2, deadline=1000.5) is True
+    # Exactly one 0.5s sleep, then exactly one kill -- never a second grace.
+    assert order.count(("sleep", 0.5)) == 1, order
+    assert not any(s == ("sleep", 30.0) for s in order), order
+    _assert_slept_then_killed(order, 0.5)
 
 
 def test_kill_fires_immediately_when_deadline_already_passed(monkeypatch):
-    """A deadline in the past must fire now, not raise into the blanket except.
+    """A deadline in the past must fire the kill now, and never sleep negative.
 
-    Without the max(0.0, ...) clamp this sleeps a negative duration, raises,
-    and hard_kill_on_rank_crash returns False -- silently skipping the kill in
-    exactly the case the watchdog exists for (cleanup outlasted the grace).
+    time.sleep of a negative duration raises into hard_kill_on_rank_crash's
+    blanket except, which would return False and silently skip the kill --
+    exactly in the case the watchdog exists for (cleanup outlasted the grace).
     """
-    kills = []
-    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: kills.append(1))
+    order = []
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: order.append("kill"))
+    monkeypatch.setattr(hd_module.time, "sleep", lambda s: order.append(("sleep", s)))
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "30")
 
     t0 = time.monotonic()
     assert hard_kill_on_rank_crash(world_size=2, deadline=t0 - 100.0) is True
-    assert kills == [1]
-    assert time.monotonic() - t0 < 1.0
+    assert order == ["kill"], order
+    assert not [s for s in order if isinstance(s, tuple) and s[1] < 0], order
+
+
+def test_wait_out_kill_grace_never_sleeps_negative(monkeypatch):
+    """The `remaining > 0` guard, not the deadline clamp, is what protects here."""
+    slept = []
+    monkeypatch.setattr(hd_module.time, "sleep", lambda s: slept.append(s))
+    assert hd_module._wait_out_kill_grace(-100.0, None) is True
+    assert slept == []
+    # The cancellable path must also return promptly, not wait forever.
+    assert hd_module._wait_out_kill_grace(-100.0, threading.Event()) is True
 
 
 # --------------------------------------------------------------------------
@@ -612,8 +627,75 @@ def _executor_loop_ast_nodes():
     }
 
 
-def test_every_executor_loop_break_sets_the_completion_sentinel():
+def _outer_while(fn):
+    """The `while True:` that IS the event loop (the function's own outermost)."""
     import ast
+
+    for node in ast.walk(fn):
+        if isinstance(node, ast.While):
+            return node
+    return None
+
+
+def _loop_terminating_breaks(loop):
+    """(block, index, break_node) for every break that exits ``loop`` itself.
+
+    Recurses through if/try/with, but stops at nested for/while/def: a break
+    inside those binds to the inner construct, not to the event loop.
+    """
+    import ast
+
+    found = []
+
+    def visit(block):
+        for i, stmt in enumerate(block):
+            if isinstance(stmt, ast.Break):
+                found.append((block, i, stmt))
+            elif isinstance(
+                stmt, (ast.For, ast.AsyncFor, ast.While, ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                continue  # binds to the inner construct
+            else:
+                for field in ("body", "orelse", "finalbody", "handlers"):
+                    inner = getattr(stmt, field, None)
+                    if isinstance(inner, list):
+                        if field == "handlers":
+                            for h in inner:
+                                visit(h.body)
+                        else:
+                            visit(inner)
+
+    visit(loop.body)
+    return found
+
+
+def _sets_sentinel_true(stmt):
+    """Exactly `self._event_loop_completed = True` -- object and value both checked."""
+    import ast
+
+    if not isinstance(stmt, ast.Assign):
+        return False
+    if not (isinstance(stmt.value, ast.Constant) and stmt.value.value is True):
+        return False
+    return any(
+        isinstance(t, ast.Attribute)
+        and t.attr == "_event_loop_completed"
+        and isinstance(t.value, ast.Name)
+        and t.value.id == "self"
+        for t in stmt.targets
+    )
+
+
+def test_loop_terminating_break_sets_the_completion_sentinel():
+    """Only the break that exits the OUTER `while True` terminates the event loop.
+
+    Deliberately not "every break": these loops contain inner `for` loops, and
+    an inner break does not end the event loop. Demanding the sentinel there
+    would instruct a contributor to set it while the loop is still running,
+    which makes every later rank-local crash look like a clean shutdown and
+    silently disables the kill -- the same class of bug this predicate has
+    already regressed into twice.
+    """
 
     loops = _executor_loop_ast_nodes()
     assert set(loops) == {"_executor_loop", "_executor_loop_pp", "_executor_loop_overlap"}, (
@@ -621,44 +703,64 @@ def test_every_executor_loop_break_sets_the_completion_sentinel():
     )
 
     for name, fn in loops.items():
-        # Only breaks belonging to THIS function (not to a nested def) end
-        # the event loop.
-        nested = {
-            id(n)
-            for d in ast.walk(fn)
-            if isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef)) and d is not fn
-            for n in ast.walk(d)
-        }
-        own_breaks = [n for n in ast.walk(fn) if isinstance(n, ast.Break) and id(n) not in nested]
-        assert own_breaks, f"{name}: no break found -- did the loop exit change?"
+        outer = _outer_while(fn)
+        assert outer is not None, f"{name}: no `while` loop found -- did the loop shape change?"
 
-        checked = 0
-        for parent in ast.walk(fn):
-            for field in ("body", "orelse", "finalbody"):
-                block = getattr(parent, field, None)
-                if not isinstance(block, list):
-                    continue
-                for i, stmt in enumerate(block):
-                    if not isinstance(stmt, ast.Break) or id(stmt) in nested:
-                        continue
-                    checked += 1
-                    prev = block[i - 1] if i else None
-                    sets_sentinel = isinstance(prev, ast.Assign) and any(
-                        isinstance(t, ast.Attribute) and t.attr == "_event_loop_completed"
-                        for t in prev.targets
-                    )
-                    assert sets_sentinel, (
-                        f"{name}: the `break` at line {stmt.lineno} is not preceded "
-                        "by `self._event_loop_completed = True`. Every normal exit "
-                        "must set it, or _event_loop_wrapper treats a clean "
-                        "shutdown as a peer-stranding crash and SIGKILLs the job."
-                    )
-        assert checked == len(own_breaks)
+        terminating = _loop_terminating_breaks(outer)
+        assert len(terminating) == 1, (
+            f"{name}: expected exactly 1 loop-terminating break, found "
+            f"{len(terminating)} at lines {[b.lineno for _, _, b in terminating]}. "
+            "A new normal-exit path must also set self._event_loop_completed = True."
+        )
+
+        block, idx, brk = terminating[0]
+        prev = block[idx - 1] if idx else None
+        assert _sets_sentinel_true(prev), (
+            f"{name}: the loop-terminating `break` at line {brk.lineno} is not "
+            "preceded by `self._event_loop_completed = True`. Without it "
+            "_event_loop_wrapper treats a clean shutdown as a peer-stranding "
+            "crash and SIGKILLs the job. (Inner-loop breaks must NOT set it.)"
+        )
 
 
-def test_completion_sentinel_is_initialized_false():
+def test_completion_sentinel_is_reset_per_event_loop_run():
+    """The reset in _event_loop_wrapper is load-bearing, not redundant with __init__.
+
+    PyExecutor outlives a single loop run; without the reset a second run
+    starts with the sentinel left True by the first, so a genuine crash in it
+    is misread as a clean shutdown and no kill is armed.
+    """
     import inspect
 
     from tensorrt_llm._torch.pyexecutor import py_executor as pe
 
-    assert "self._event_loop_completed = False" in inspect.getsource(pe.PyExecutor.__init__)
+    assert "self._event_loop_completed = False" in inspect.getsource(
+        pe.PyExecutor._event_loop_wrapper
+    )
+
+
+def test_second_loop_run_still_kills_after_a_clean_first_run(monkeypatch):
+    """Behavioral guard for the reset above: run clean, then crash, on ONE executor."""
+    from tensorrt_llm._torch.pyexecutor import py_executor as pe
+
+    events = []
+    _stub_kill_paths(pe, monkeypatch, events)
+    ex = _bare_executor(pe, monkeypatch, world_size=4)
+    ex._executor_loop_cleanup = lambda: events.append("cleanup")
+
+    # Run 1: reaches the normal-exit break, leaving the sentinel True.
+    def clean():
+        ex._event_loop_completed = True
+
+    ex.event_loop = clean
+    ex._event_loop_wrapper()
+    assert events == ["cleanup"]
+    assert ex._event_loop_completed is True
+
+    # Run 2 on the SAME executor: a genuine crash must still arm the kill.
+    events.clear()
+    ex.event_loop = lambda: (_ for _ in ()).throw(ValueError("boom"))
+    with pytest.raises(ValueError, match="boom"):
+        ex._event_loop_wrapper()
+
+    assert events == [("watchdog", 4), "cleanup", "cancel", ("kill", 4, 1234.5)]
