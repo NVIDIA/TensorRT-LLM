@@ -1346,7 +1346,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     ) -> tuple:
         """Stage 2 (rank-0 only): learned 2x spatial upsample + refinement denoise.
 
-        Returns the refined ``(video_latents, audio_latents)`` in 5-D form.
+        Returns the Stage-2 refined video latents and the original Stage-1
+        audio latents in 5-D form, matching the public LTX-2 two-stage
+        pipeline. Stage 2 still receives audio latents for conditioning, but
+        its returned audio is discarded.
         """
         per_ch_stats = self._get_per_channel_statistics()
         video_latents = upsample_video(
@@ -1355,6 +1358,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             self.spatial_upsampler,
         )
         logger.info("Upsampled video latents via learned upsampler")
+        stage1_audio_latents = (
+            audio_latents.clone() if audio_latents is not None else None
+        )
 
         # The persistent cache owns original and merged tensors when it can be
         # built at load time. Stage 2 only rebinds pointers and FP4 quant_method
@@ -1393,7 +1399,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             # Disable Ulysses for Stage 2: only rank 0 is active, so
             # cross-rank collectives in the attention backend would hang.
             self.transformer.set_ulysses_enabled(False)
-            video_latents, audio_latents = self._refinement_denoise(
+            video_latents, _ = self._refinement_denoise(
                 video_latents=video_latents,
                 audio_latents=audio_latents,
                 prompt=prompt,
@@ -1444,7 +1450,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             else:
                 self._lora_cuda_graph_state = "original"
 
-        return video_latents, audio_latents
+        return video_latents, stage1_audio_latents
 
     def _broadcast_video_latents(
         self, video_latents: Optional[torch.Tensor], vae_group
