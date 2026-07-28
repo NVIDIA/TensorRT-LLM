@@ -5,6 +5,7 @@ import ast
 import functools
 import itertools
 import math
+import os
 from typing import ClassVar, List, Optional, Tuple, Type
 
 import torch
@@ -41,6 +42,8 @@ except ImportError:
 
 # Torch schema parsing rejects ``inf`` as a default value.
 SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
+_CUTEDSL_FC2_N_TILE_SIZE_ENV = "TRTLLM_CUTEDSL_FC2_N_TILE_SIZE"
+_CUTEDSL_FC2_N_TILE_SIZES = (128, 256)
 
 
 def _with_input_cuda_device(function):
@@ -119,6 +122,19 @@ def _get_sm107_nvfp4_default_mma_config(
         (mma_inst_m, 128, 128),
         (mma_inst_m // 128, 1),
     )
+
+
+def _get_cutedsl_fc2_n_tile_size_override() -> Optional[int]:
+    value = os.environ.get(_CUTEDSL_FC2_N_TILE_SIZE_ENV)
+    if value is None:
+        return None
+    valid_values = tuple(
+        str(tile_size) for tile_size in _CUTEDSL_FC2_N_TILE_SIZES)
+    if value not in valid_values:
+        raise ValueError(
+            f"{_CUTEDSL_FC2_N_TILE_SIZE_ENV} must be unset or one of "
+            f"{', '.join(valid_values)}; got {value!r}")
+    return int(value)
 
 
 class GroupedGemmInputsHelper:
@@ -2653,6 +2669,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert output_dtype == torch.bfloat16
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
+            self.fc2_n_tile_size_override = (
+                _get_cutedsl_fc2_n_tile_size_override())
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -2665,7 +2683,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
 
         def unique_id(self):
-            return (
+            runner_id = (
                 self.num_experts,
                 self.top_k,
                 self.num_local_experts,
@@ -2674,6 +2692,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.output_dtype,
                 self.scaling_vector_size,
             )
+            if self.fc2_n_tile_size_override is not None:
+                runner_id += (
+                    "fc2_n_tile_size_override",
+                    self.fc2_n_tile_size_override,
+                )
+            return runner_id
 
         def get_valid_tactics(
             self,
@@ -2687,6 +2711,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
+            if self.fc2_n_tile_size_override is not None:
+                mma_tiler_mn_candidates = [(self.tile_size,
+                                            self.fc2_n_tile_size_override)]
             cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
                                            (self.tile_size // 128, 2)]
             # raster_along_m=False should be theoretically more performant than raster_along_m=True.
