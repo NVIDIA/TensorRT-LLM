@@ -251,7 +251,8 @@ class LoraLayer(torch.nn.Module):
                 module_ids=tuple(layer.lora_module_types),
             ) in cuda_graph_params.layer_info for layer in lora_layers)
 
-        execute_in_parallel = (has_lora_layer and do_multi_stream()
+        execute_in_parallel = (has_lora_layer and lora_params.get(
+            "overlap_lora_and_base", True) and do_multi_stream()
                                and not torch.compiler.is_compiling())
 
         # Pack all LoRA forwards (e.g., fused/unfused) in a single tuple
