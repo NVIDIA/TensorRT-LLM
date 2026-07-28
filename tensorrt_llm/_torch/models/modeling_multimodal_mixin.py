@@ -351,10 +351,10 @@ class MultimodalModelMixin:
     """Whether the model's production forward path uses the persistent encoder cache."""
 
     supports_mm_encoder_item_scheduling: ClassVar[bool] = False
-    """Whether the model supports item-level MM encoder scheduling: it implements
-    the item-encode forward and pairs with a processor that overrides
-    `BaseMultimodalInputProcessor.get_mm_encoder_item_metadata`. This is the
-    executor-layer gate for item scheduling."""
+    """Whether the model supports item-level MM encoder scheduling: it implements the item-encode
+    forward and pairs with a processor that overrides
+    `BaseMultimodalInputProcessor.get_mm_encoder_item_metadata`. This is the executor-layer gate for
+    item scheduling."""
 
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
@@ -463,13 +463,12 @@ class MultimodalModelMixin:
         """Build selected item encoder inputs before the caller performs H2D.
 
         Args:
-            selected_items: `(request params, item index)` pairs in
-                scheduler-selected order. Each params object must contain
-                parallel item references and embedding lengths.
+            selected_items: `(request params, item index)` pairs in scheduler-selected order. Each
+                params object must contain parallel item references and embedding lengths.
 
         Returns:
-            Tuples containing the single-item encoder params, its expected
-            encoder output row count, and its modality, in input order.
+            Tuples containing the single-item encoder params, its expected encoder output row count,
+            and its modality, in input order.
         """
         encoder_inputs: list[tuple[MultimodalParams, int, str]] = []
         for multimodal_param, item_idx in selected_items:
@@ -496,13 +495,12 @@ class MultimodalModelMixin:
         """Forward prepared MM encoder inputs in scheduler item order.
 
         Args:
-            encoder_inputs: Tuples returned by
-                `prepare_multimodal_encoder_inputs`. Consecutive inputs
-                with the same modality must be batch-compatible.
+            encoder_inputs: Tuples returned by `prepare_multimodal_encoder_inputs`. Consecutive
+                inputs with the same modality must be batch-compatible.
 
         Returns:
-            One encoder output tensor per prepared item. Each tensor has the
-            declared embedding row count and retains scheduler input order.
+            One encoder output tensor per prepared item. Each tensor has the declared embedding row
+            count and retains scheduler input order.
         """
         outputs: list[torch.Tensor] = []
         group_params: list[MultimodalParams] = []
@@ -1002,14 +1000,12 @@ class MultimodalModelMixin:
         See `_encoder_cache_keys` for the mixed-modality skip path and its technical limitation.
 
         Scope: the single encoder cache instance for a cache-enabled model
-        (`supports_encoder_cache`). The full-request (legacy inline-encode)
-        consumers — side-stream prefetch, `mm_encoder_only`/disagg encoding —
-        populate and read it inline; the item-scheduling path consumes the
-        same instance read-through at encode time
-        (`ModelEngine.forward_multimodal_encoder_items`). The key format is
-        shared (`_encoder_cache_item_key`) so hits cross between paths. The
-        item path's recorded outputs are cloned, so cache eviction never
-        invalidates an in-flight request.
+        (`supports_encoder_cache`). The full-request (legacy inline-encode) consumers — side-stream
+        prefetch, `mm_encoder_only`/disagg encoding — populate and read it inline; the
+        item-scheduling path consumes the same instance read-through at encode time
+        (`ModelEngine.forward_multimodal_encoder_items`). The key format is shared
+        (`_encoder_cache_item_key`) so hits cross between paths. The item path's recorded outputs
+        are cloned, so cache eviction never invalidates an in-flight request.
         """
         if not self.encoder_cache_active:
             logger.debug_once(
@@ -1159,10 +1155,9 @@ class MultimodalModelMixin:
     ) -> Optional[list[Hashable]]:
         """Build per-item cache keys from request-level item metadata.
 
-        The modality comes from each item's `item_refs` entry, so
-        mixed-modality requests are keyable per item. Returns `None` when the
-        request cannot participate in the cache (missing hashes or kwargs
-        hash, or item counts that do not line up).
+        The modality comes from each item's `item_refs` entry, so mixed-modality requests are
+        keyable per item. Returns `None` when the request cannot participate in the cache (missing
+        hashes or kwargs hash, or item counts that do not line up).
         """
         if multimodal_hashes is None or kwargs_hash is None:
             return None
