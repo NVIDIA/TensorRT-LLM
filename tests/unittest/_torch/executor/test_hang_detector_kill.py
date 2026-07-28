@@ -229,11 +229,13 @@ def test_watchdog_not_armed_when_disabled(monkeypatch):
     assert kills == []
 
 
-def test_watchdog_cancel_prevents_the_kill(monkeypatch):
-    """A cancelled watchdog must not SIGKILL a rank that goes on to exit cleanly.
+def test_watchdog_cancel_disarms_this_timer(monkeypatch):
+    """cancel() must break the grace wait immediately, not after it elapses.
 
-    Without a cancel path an armed watchdog fires at crash + grace no matter
-    what happens afterwards, turning a would-be exit 0 into exit 137.
+    This is the handover primitive, NOT protection against a spurious kill:
+    the only production caller cancels in order to take the same kill over on
+    the same deadline. What decides whether a rank is killed at all is the
+    `crashed` predicate in _event_loop_wrapper.
     """
     kills = []
     monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: kills.append(1))
@@ -243,8 +245,6 @@ def test_watchdog_cancel_prevents_the_kill(monkeypatch):
     assert watchdog is not None
     try:
         watchdog.cancel()
-        # Cancel must break the grace wait immediately, not merely be observed
-        # after it elapses -- otherwise the process still dies 30s later.
         watchdog.join(timeout=10.0)
         assert not watchdog.is_alive()
         assert kills == []
@@ -257,22 +257,49 @@ def test_watchdog_cancel_prevents_the_kill(monkeypatch):
         watchdog.join(timeout=60.0)
 
 
+def test_watchdog_deadline_is_grace_from_arming(monkeypatch):
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "5")
+    watchdog = hd_module.RankCrashKillWatchdog(world_size=2, grace=5.0)
+    assert watchdog.deadline == pytest.approx(time.monotonic() + 5.0, abs=0.5)
+
+
 def test_kill_keeps_original_deadline_on_handover(monkeypatch):
     """Handing the kill over must not restart the grace clock.
 
     The caller cancels the watchdog once cleanup returns and carries the kill
     itself; passing the watchdog's deadline keeps the kill at crash + grace
-    instead of crash + 2*grace.
+    instead of crash + 2*grace. Uses a real (short) sleep rather than patching
+    time.sleep process-wide, so no background thread can busy-spin into the
+    assertion.
     """
-    slept = []
-    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: slept.append("kill"))
-    monkeypatch.setattr(hd_module.time, "sleep", lambda s: slept.append(round(s, 1)))
-    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "10")
+    kills = []
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "30")
 
-    # 6s of the 10s grace has already been burned by the watchdog.
-    deadline = hd_module.time.monotonic() + 4.0
-    assert hard_kill_on_rank_crash(world_size=2, deadline=deadline) is True
-    assert slept == [4.0, "kill"]
+    # Nearly all of the 30s grace has already been burned by the watchdog.
+    t0 = time.monotonic()
+    assert hard_kill_on_rank_crash(world_size=2, deadline=t0 + 0.3) is True
+    elapsed = time.monotonic() - t0
+    assert kills == [1]
+    # Slept out the REMAINING 0.3s, not a fresh 30s grace.
+    assert elapsed == pytest.approx(0.3, abs=0.25)
+
+
+def test_kill_fires_immediately_when_deadline_already_passed(monkeypatch):
+    """A deadline in the past must fire now, not raise into the blanket except.
+
+    Without the max(0.0, ...) clamp this sleeps a negative duration, raises,
+    and hard_kill_on_rank_crash returns False -- silently skipping the kill in
+    exactly the case the watchdog exists for (cleanup outlasted the grace).
+    """
+    kills = []
+    monkeypatch.setattr(hd_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "30")
+
+    t0 = time.monotonic()
+    assert hard_kill_on_rank_crash(world_size=2, deadline=t0 - 100.0) is True
+    assert kills == [1]
+    assert time.monotonic() - t0 < 1.0
 
 
 # --------------------------------------------------------------------------
@@ -289,21 +316,33 @@ def _bare_executor(pe, monkeypatch, world_size, is_shutdown=False):
     ex = pe.PyExecutor.__new__(pe.PyExecutor)
     ex.dist = types.SimpleNamespace(world_size=world_size)
     ex.garbage_collection_gen0_threshold = None
+    # is_shutdown must NOT influence the crash decision -- _handle_errors sets
+    # it rank-locally on a fatal error while peers are told nothing.
     ex.is_shutdown = is_shutdown
+    ex._event_loop_completed = False
     return ex
 
 
 class _FakeWatchdog:
-    """Stand-in for RankCrashKillWatchdog that records cancellation."""
+    """Stand-in for RankCrashKillWatchdog that records cancellation.
+
+    ``cancelled`` is a read-only property, matching the real class: a wiring
+    change that assigned to it would pass against a plain attribute here and
+    raise AttributeError in production.
+    """
 
     def __init__(self, events, world_size):
         self._events = events
+        self._cancelled = False
         self.deadline = 1234.5
-        self.cancelled = False
         events.append(("watchdog", world_size))
 
+    @property
+    def cancelled(self):
+        return self._cancelled
+
     def cancel(self):
-        self.cancelled = True
+        self._cancelled = True
         self._events.append("cancel")
 
 
@@ -422,14 +461,15 @@ def test_event_loop_wrapper_no_kill_on_clean_exit(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# The kill must stay scoped to crashes that actually strand peers. A raise
-# on the way out of an already-shut-down loop happens after every rank has
-# processed the shutdown broadcast and all work is done: escalating it turns
-# a benign teardown error into a whole-job SIGKILL (exit 137 instead of 0).
+# The kill must stay scoped to crashes that actually strand peers, and the
+# only signal that says so is _event_loop_completed -- set at the loops'
+# normal-exit `break` sites and nowhere else. is_shutdown does NOT mean
+# "peers were told": _handle_errors flips it rank-locally on a fatal error.
 # --------------------------------------------------------------------------
 
 
-def test_event_loop_wrapper_no_kill_when_loop_raises_after_shutdown(monkeypatch):
+def test_event_loop_wrapper_no_kill_when_loop_raises_after_completing(monkeypatch):
+    """A raise after the loop's normal-exit break is a teardown error, not a crash."""
     from tensorrt_llm._torch.pyexecutor import py_executor as pe
 
     events = []
@@ -438,9 +478,9 @@ def test_event_loop_wrapper_no_kill_when_loop_raises_after_shutdown(monkeypatch)
     ex._executor_loop_cleanup = lambda: events.append("cleanup")
 
     def late_raise():
-        # The loop processed its shutdown request and drained all work, then
+        # The loop hit its normal-exit `break` and drained all work, then
         # something raised on the way out (e.g. a context manager's __exit__).
-        ex.is_shutdown = True
+        ex._event_loop_completed = True
         raise RuntimeError("teardown hiccup")
 
     ex.event_loop = late_raise
@@ -453,11 +493,65 @@ def test_event_loop_wrapper_no_kill_when_loop_raises_after_shutdown(monkeypatch)
     assert isinstance(ex._event_loop_error, RuntimeError)
 
 
+def test_event_loop_wrapper_kills_world_on_rank_local_fatal(monkeypatch):
+    """REGRESSION: a rank-local CUDA fatal sets is_shutdown but strands peers.
+
+    _handle_errors classifies a device-side fault as immediate_fatal, sets
+    is_shutdown=True on THIS rank and enqueues a shutdown into THIS process's
+    own queue -- peers are told nothing and keep waiting in their collective.
+    An exception raised after that point (e.g. the unguarded
+    guided_decoder.execute(batch_outputs['logits']) on a None batch_outputs)
+    must still hard-kill the world. Keying the decision off is_shutdown
+    silently disabled the kill for this, the feature's most common trigger.
+    """
+    from tensorrt_llm._torch.pyexecutor import py_executor as pe
+
+    events = []
+    _stub_kill_paths(pe, monkeypatch, events)
+    ex = _bare_executor(pe, monkeypatch, world_size=4)
+    ex._executor_loop_cleanup = lambda: events.append("cleanup")
+
+    def cuda_fatal_then_crash():
+        ex.is_shutdown = True  # what _handle_errors does, rank-locally
+        assert ex._event_loop_completed is False  # the loop never terminated
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    ex.event_loop = cuda_fatal_then_crash
+
+    with pytest.raises(TypeError):
+        ex._event_loop_wrapper()
+
+    assert events == [("watchdog", 4), "cleanup", "cancel", ("kill", 4, 1234.5)]
+
+
+def test_event_loop_wrapper_kills_world_when_loop_never_started(monkeypatch):
+    """A failure before the loop runs strands peers just as surely as one inside it."""
+    from tensorrt_llm._torch.pyexecutor import py_executor as pe
+
+    events = []
+    _stub_kill_paths(pe, monkeypatch, events)
+
+    @contextlib.contextmanager
+    def failing_enter(**_kwargs):
+        raise RuntimeError("profiler setup failed")
+        yield  # pragma: no cover
+
+    ex = _bare_executor(pe, monkeypatch, world_size=4)
+    monkeypatch.setattr(pe, "host_profiler_context", lambda enable: failing_enter())
+    ex._executor_loop_cleanup = lambda: events.append("cleanup")
+    ex.event_loop = lambda: pytest.fail("event_loop must not be reached")
+
+    with pytest.raises(RuntimeError, match="profiler setup failed"):
+        ex._event_loop_wrapper()
+
+    assert events == [("watchdog", 4), "cleanup", "cancel", ("kill", 4, 1234.5)]
+
+
 def test_event_loop_wrapper_no_kill_when_enclosing_context_manager_raises(monkeypatch):
-    """Teardown of the host-profiler / GC context managers is not a crash.
+    """Teardown of the host-profiler / GC context managers after a completed loop.
 
     They wrap event_loop() but are not part of it; a failure while unwinding
-    them leaves no peer waiting on this rank.
+    them once the loop has completed leaves no peer waiting on this rank.
     """
     from tensorrt_llm._torch.pyexecutor import py_executor as pe
 
@@ -472,9 +566,87 @@ def test_event_loop_wrapper_no_kill_when_enclosing_context_manager_raises(monkey
     ex = _bare_executor(pe, monkeypatch, world_size=4)
     monkeypatch.setattr(pe, "host_profiler_context", lambda enable: exploding_ctx())
     ex._executor_loop_cleanup = lambda: events.append("cleanup")
-    ex.event_loop = lambda: None
+
+    def completed_loop():
+        ex._event_loop_completed = True
+
+    ex.event_loop = completed_loop
 
     with pytest.raises(RuntimeError, match="profiler teardown failed"):
         ex._event_loop_wrapper()
 
     assert events == ["cleanup"]
+
+
+# --------------------------------------------------------------------------
+# The sentinel is only trustworthy if the real loops actually set it. Assert
+# against the shipped source so a new normal-exit path (or a moved break)
+# cannot silently make every clean shutdown look like a peer-stranding crash.
+# --------------------------------------------------------------------------
+
+
+def _executor_loop_ast_nodes():
+    import ast
+    import inspect
+
+    from tensorrt_llm._torch.pyexecutor import py_executor as pe
+
+    tree = ast.parse(inspect.getsource(pe))
+    wanted = {"_executor_loop", "_executor_loop_pp", "_executor_loop_overlap"}
+    return {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    }
+
+
+def test_every_executor_loop_break_sets_the_completion_sentinel():
+    import ast
+
+    loops = _executor_loop_ast_nodes()
+    assert set(loops) == {"_executor_loop", "_executor_loop_pp", "_executor_loop_overlap"}, (
+        f"executor loops renamed or removed: {sorted(loops)}"
+    )
+
+    for name, fn in loops.items():
+        # Only breaks belonging to THIS function (not to a nested def) end
+        # the event loop.
+        nested = {
+            id(n)
+            for d in ast.walk(fn)
+            if isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef)) and d is not fn
+            for n in ast.walk(d)
+        }
+        own_breaks = [n for n in ast.walk(fn) if isinstance(n, ast.Break) and id(n) not in nested]
+        assert own_breaks, f"{name}: no break found -- did the loop exit change?"
+
+        checked = 0
+        for parent in ast.walk(fn):
+            for field in ("body", "orelse", "finalbody"):
+                block = getattr(parent, field, None)
+                if not isinstance(block, list):
+                    continue
+                for i, stmt in enumerate(block):
+                    if not isinstance(stmt, ast.Break) or id(stmt) in nested:
+                        continue
+                    checked += 1
+                    prev = block[i - 1] if i else None
+                    sets_sentinel = isinstance(prev, ast.Assign) and any(
+                        isinstance(t, ast.Attribute) and t.attr == "_event_loop_completed"
+                        for t in prev.targets
+                    )
+                    assert sets_sentinel, (
+                        f"{name}: the `break` at line {stmt.lineno} is not preceded "
+                        "by `self._event_loop_completed = True`. Every normal exit "
+                        "must set it, or _event_loop_wrapper treats a clean "
+                        "shutdown as a peer-stranding crash and SIGKILLs the job."
+                    )
+        assert checked == len(own_breaks)
+
+
+def test_completion_sentinel_is_initialized_false():
+    import inspect
+
+    from tensorrt_llm._torch.pyexecutor import py_executor as pe
+
+    assert "self._event_loop_completed = False" in inspect.getsource(pe.PyExecutor.__init__)

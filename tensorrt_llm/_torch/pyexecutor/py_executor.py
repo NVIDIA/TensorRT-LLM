@@ -835,6 +835,15 @@ class PyExecutor:
             self.kv_cache_manager.snapshot_warmup_baseline()
 
         self.is_shutdown = False
+        # Set at the executor loops' normal-exit `break` sites, and ONLY
+        # there. It answers exactly one question for _event_loop_wrapper:
+        # "did event_loop() reach its own termination?" -- which decides
+        # whether an escaping exception stranded this rank's peers.
+        # is_shutdown cannot answer it: _handle_errors sets is_shutdown
+        # rank-locally on a fatal error (e.g. a CUDA illegal address on this
+        # rank alone) while peers are told nothing and the loop keeps running
+        # collectives, so a crash after that point still strands them.
+        self._event_loop_completed = False
         self._fatal_error: Optional[BaseException] = None
         self._error_budget = ErrorBudget()
         self._disagg_timed_out_ctx_cancelled_ids: set[int] = set()
@@ -1192,6 +1201,7 @@ class PyExecutor:
 
     def _event_loop_wrapper(self):
         crashed = False
+        self._event_loop_completed = False
         try:
             # Skip line profiler during warmup/memory estimation phase to avoid
             # saving incomplete results that would be overwritten anyway
@@ -1199,23 +1209,22 @@ class PyExecutor:
                 "TLLM_LINE_PROFILER_PATH")) and not self.is_warmup
             with host_profiler_context(enable=enable_profiler), \
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
-                try:
-                    self.event_loop()
-                except Exception:
-                    # Only a loop that dies BEFORE it processed its shutdown
-                    # request strands its peers. Once is_shutdown is set,
-                    # every rank has already seen the shutdown broadcast and
-                    # no peer is waiting on this one, so a raise on the way
-                    # out of an already-shutting-down loop (e.g. from the
-                    # profiler's or hang detector's __exit__) is a teardown
-                    # error to log, never a reason to SIGKILL the job.
-                    #
-                    # The flag is scoped to event_loop() itself for the same
-                    # reason: teardown of the enclosing host-profiler / GC
-                    # context managers is not a stranded-peer condition.
-                    crashed = not self.is_shutdown
-                    raise
+                self.event_loop()
         except Exception as e:
+            # A raise AFTER the loop reached its own normal-exit `break` (from
+            # the profiler's or hang detector's __exit__, or from the enclosing
+            # context managers) is a teardown error: this rank finished its
+            # work and no peer is waiting on it, so log it but never escalate
+            # to SIGKILLing the job. Anything else -- including a raise before
+            # the loop ever started -- leaves peers blocked in their next
+            # collective, which is what the kill exists to cut short.
+            #
+            # Deliberately NOT is_shutdown: _handle_errors flips that flag
+            # rank-locally on a fatal error (a CUDA illegal address on one rank
+            # is classified immediate_fatal and bypasses the error budget) and
+            # tells peers nothing, so a crash after that point -- the single
+            # most common trigger for this kill -- still strands them.
+            crashed = not self._event_loop_completed
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
             # Stash the original error so local consumers
@@ -1247,10 +1256,11 @@ class PyExecutor:
                     # even when cleanup itself raises.
                     #
                     # Cleanup returned, so the watchdog's only job (covering
-                    # a cleanup that never returns) is done: disarm it and
-                    # carry the kill here, on its ORIGINAL deadline. Exactly
-                    # one timer is live at any moment, and the handover
-                    # cannot push the kill out by a second grace.
+                    # a cleanup that never returns) is done: hand the timer
+                    # over rather than leave two running. This is bookkeeping,
+                    # not protection -- the kill still fires, on the SAME
+                    # deadline, one line below. Whether a rank is killed at
+                    # all is decided solely by `crashed` above.
                     deadline = None
                     if watchdog is not None:
                         watchdog.cancel()
@@ -2596,6 +2606,7 @@ class PyExecutor:
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
+                    self._event_loop_completed = True
                     break
 
                 self._handle_control_request()
@@ -4078,6 +4089,7 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
+                    self._event_loop_completed = True
                     break
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
@@ -4554,6 +4566,7 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
+                    self._event_loop_completed = True
                     break
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(

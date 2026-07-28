@@ -50,6 +50,14 @@ def _best_effort_log_error(message: str) -> None:
         pass
 
 
+def _best_effort_log_debug(message: str) -> None:
+    """Log at debug level without ever raising; diagnostics must not block hard kill."""
+    try:
+        logger.debug(message)
+    except Exception:  # noqa: BLE001 - diagnostics must not block hard kill
+        pass
+
+
 def propagate_hard_kill(exit_code: int = _HARD_KILL_EXIT_CODE) -> None:
     """Hard-kill this rank and propagate the kill to peer ranks.
 
@@ -102,20 +110,28 @@ def _rank_crash_kill_grace() -> Optional[float]:
     return None if grace < 0 else grace
 
 
-def _wait_out_kill_grace(
-    grace: float,
-    deadline: Optional[float],
-    cancelled: Optional[threading.Event],
-) -> bool:
-    """Sleep out the crash-kill grace; return False if the kill was cancelled.
+def _remaining_kill_grace(grace: float, deadline: Optional[float]) -> float:
+    """Time left before the kill must fire.
 
     ``deadline`` (a ``time.monotonic()`` stamp) lets a kill that was already
     armed elsewhere keep its ORIGINAL fire time when it is handed over to
-    another waiter, so a handover cannot push the kill out by a second grace.
-    ``cancelled`` makes the wait interruptible: a rank that turns out not to
-    need the kill can disarm it instead of being killed while exiting cleanly.
+    another waiter, so the handover cannot push the kill out by a second
+    grace. Clamped at 0: a deadline already in the past means fire now, and
+    a negative sleep would raise into the caller's blanket except and drop
+    the kill entirely -- exactly in the case (cleanup outlasted the grace)
+    the watchdog exists for.
     """
-    remaining = grace if deadline is None else max(0.0, deadline - time.monotonic())
+    if deadline is None:
+        return grace
+    return max(0.0, deadline - time.monotonic())
+
+
+def _wait_out_kill_grace(remaining: float, cancelled: Optional[threading.Event]) -> bool:
+    """Sleep out the crash-kill grace; return False if the kill was cancelled.
+
+    ``cancelled`` makes the wait interruptible so the timer can be handed
+    over to another waiter instead of two clocks running at once.
+    """
     if cancelled is None:
         if remaining > 0:
             time.sleep(remaining)
@@ -160,13 +176,22 @@ def hard_kill_on_rank_crash(
         grace = _rank_crash_kill_grace()
         if grace is None:
             return False
+        remaining = _remaining_kill_grace(grace, deadline)
         _best_effort_log_error(
             f"Executor loop crashed on this rank; hard-killing all "
-            f"{world_size} ranks in {grace}s (peers cannot make progress "
+            f"{world_size} ranks in {remaining:g}s (peers cannot make progress "
             f"without this rank). Set {RANK_CRASH_KILL_GRACE_ENV}=-1 to disable."
         )
-        if not _wait_out_kill_grace(grace, deadline, cancelled):
-            _best_effort_log_error("Rank-crash hard kill cancelled before the grace elapsed.")
+        if not _wait_out_kill_grace(remaining, cancelled):
+            # Debug, not error: the only caller that cancels does so to take
+            # the same kill over on the same deadline. Logging "cancelled" at
+            # ERROR right before the world is SIGKILLed reads during triage
+            # as "the kill was called off", which is the opposite of what
+            # happens.
+            _best_effort_log_debug(
+                "Rank-crash hard kill timer disarmed (handed over or no "
+                "longer needed); this timer will not fire."
+            )
             return False
         propagate_hard_kill()
         return True
@@ -179,15 +204,16 @@ class RankCrashKillWatchdog(threading.Thread):
     """Daemon thread that hard-kills the world once the crash grace elapses.
 
     A plain ``Thread`` for backwards compatibility (callers may still join it
-    or inspect ``daemon``), plus the two things the caller needs to own the
-    kill deadline:
+    or inspect ``daemon``), plus the two things needed to hand the timer over
+    to another waiter instead of running two clocks:
 
-    - ``cancel()`` disarms the timer. Without it an armed watchdog fires at
-      crash + grace unconditionally, so a rank that ends up exiting cleanly
-      is SIGKILLed anyway and a would-be exit 0 becomes exit 137.
-    - ``deadline`` exposes the original fire time so whoever takes the kill
-      over after cancelling still fires at crash + grace rather than
-      restarting the clock.
+    - ``cancel()`` disarms THIS timer. It is a bookkeeping aid, not a safety
+      net: the only caller cancels in order to take the same kill over on the
+      same deadline one line later, so cancelling does not spare a rank. What
+      decides whether a rank is killed at all is the ``crashed`` predicate in
+      ``PyExecutor._event_loop_wrapper``.
+    - ``deadline`` exposes the original fire time so the caller that takes
+      over still fires at crash + grace rather than restarting the clock.
     """
 
     def __init__(self, world_size: int, grace: float):
