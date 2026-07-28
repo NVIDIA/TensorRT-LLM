@@ -7131,8 +7131,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # full SM-row's worth of CTAs so the sort has long-vs-short rows to
     # swap. Below that threshold the win is noise / can regress a few
     # percent (B200 N∈{8K,16K,32K} sweep 2026-06-23).
+    # xstate is written by the kernel but stays out of mutates_args
+    # (optional-mutate None-default IndexError; see the fp4 op note)
     @torch.library.custom_op("trtllm::cute_dsl_gvr_topk_decode",
-                             mutates_args=("output_indices", "xstate"),
+                             mutates_args=("output_indices", ),
                              device_types="cuda")
     def cute_dsl_gvr_topk_decode(
         logits: torch.Tensor,
@@ -8869,10 +8871,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      None, None, None, None, None, None, None, None)
             return logits
 
+    # NOTE: the optional emission tensors ARE written by the kernel but
+    # deliberately not in mutates_args - torch.library's in-place
+    # bookkeeping IndexErrors on optional mutates left at their None
+    # default (same precedent as heuristic_scratch on
+    # trtllm::indexer_topk_decode).
     @torch.library.custom_op("trtllm::cute_dsl_fp4_paged_mqa_logits",
-                             mutates_args=("block_max_out", "seed_thr",
-                                           "cand_out", "cand_idx_out",
-                                           "cand_ctl_out", "cand_cur_out"),
+                             mutates_args=(),
                              device_types="cuda")
     def cute_dsl_fp4_paged_mqa_logits(
         q: torch.Tensor,
