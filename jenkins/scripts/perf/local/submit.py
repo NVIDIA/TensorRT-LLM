@@ -386,7 +386,7 @@ def detect_cluster_name():
         return name
     try:
         config_out = subprocess.check_output(
-            ["/usr/bin/scontrol", "show", "config"],
+            ["scontrol", "show", "config"],
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=10,
