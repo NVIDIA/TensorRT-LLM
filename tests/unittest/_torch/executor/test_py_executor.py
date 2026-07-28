@@ -1524,6 +1524,42 @@ def test_pad_dummy_still_added_when_surplus_requests_are_unschedulable() -> None
     assert stub.expected_num_active_requests == 2
 
 
+def test_non_dsv4_disagg_adp_mixed_rank_states_stay_queueable():
+    # The generic non-PP path must give both ranks a non-empty scheduled batch:
+    # one rank schedules its real request, while the terminal-only rank
+    # schedules the dummy inserted for the scheduler-excluded request.
+    busy_rank = _StubADPExecutor()
+    busy_rank.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS)]
+    busy_rank.expected_num_active_requests = 2
+    terminal_rank = _StubADPExecutor()
+    terminal_rank.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
+    terminal_rank.expected_num_active_requests = 2
+
+    _run_pad(busy_rank)
+    _run_pad(terminal_rank)
+
+    assert busy_rank.add_dummy_calls == []
+    assert len(terminal_rank.add_dummy_calls) == 1
+    rank_batch_sizes = [
+        busy_rank._count_schedulable_active_requests(),
+        terminal_rank._count_schedulable_active_requests(),
+    ]
+    assert rank_batch_sizes == [1, 1]
+
+    for stub, batch_size in zip((busy_rank, terminal_rank), rank_batch_sizes, strict=True):
+        stub.dist.tp_allgather.side_effect = None
+        stub.dist.tp_allgather.return_value = rank_batch_sizes
+        can_queue, can_queue_this_rank = PyExecutor._can_queue(
+            stub, types.SimpleNamespace(batch_size=batch_size)
+        )
+
+        assert can_queue is True
+        assert can_queue_this_rank is True
+        PyExecutor._finalize_adp_dummy_allocation(stub, can_queue)
+
+    assert terminal_rank._pending_adp_dummy_request is None
+
+
 def test_pad_dummy_allocation_failure_skips_padding():
     # add_dummy_requests returns None when the rank has no free cache
     # resources for even a 1-token dummy (possible while non-schedulable
