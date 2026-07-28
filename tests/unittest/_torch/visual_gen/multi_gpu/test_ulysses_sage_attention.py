@@ -37,10 +37,18 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 try:
+    import sys
+    from pathlib import Path
+
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
     from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
-    from tensorrt_llm._utils import get_free_port
+
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _visual_gen_dist_utils import spawn_with_retry
+
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
     MODULES_AVAILABLE = True
@@ -104,12 +112,13 @@ def run_test_in_distributed(world_size: int, test_fn: Callable):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
 
-    port = get_free_port()
-    mp.spawn(
-        _distributed_worker,
-        args=(world_size, "nccl", test_fn, port),
-        nprocs=world_size,
-        join=True,
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            _distributed_worker,
+            args=(world_size, "nccl", test_fn, port),
+            nprocs=world_size,
+            join=True,
+        )
     )
 
 

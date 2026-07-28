@@ -12,17 +12,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import Request
 from starlette.datastructures import Headers
 
 from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
-from tensorrt_llm.serve.openai_protocol import CompletionRequest, DisaggregatedParams
+from tensorrt_llm.serve.openai_protocol import (
+    CompletionRequest,
+    ConversationParams,
+    DisaggregatedParams,
+)
 
 
 def _raw_request(headers: dict[str, str]):
     return SimpleNamespace(headers=Headers(headers=headers))
+
+
+@pytest.mark.asyncio
+async def test_http_cluster_storage_request_is_proxied_to_coordinator():
+    payload = b'{"key":"worker","value":"ready"}'
+
+    async def receive():
+        return {"type": "http.request", "body": payload, "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/set",
+            "query_string": b"source=worker",
+            "headers": [(b"content-type", b"application/json")],
+        },
+        receive,
+    )
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._coordinator = SimpleNamespace(
+        proxy_cluster_storage_request=AsyncMock(
+            return_value=(b'{"result":true}', 200, "application/json")
+        )
+    )
+
+    response = await server._proxy_cluster_storage_request(request)
+
+    server._coordinator.proxy_cluster_storage_request.assert_awaited_once_with(
+        "POST", "/set", [("source", "worker")], payload, "application/json"
+    )
+    assert response.status_code == 200
+    assert response.body == b'{"result":true}'
 
 
 def test_extract_conversation_id_from_headers():
@@ -61,8 +100,8 @@ def test_extract_conversation_id_from_headers():
 
         OpenAIDisaggServer._extract_conversation_id(request, _raw_request(headers))
 
-        assert request.disaggregated_params is not None
-        assert request.disaggregated_params.conversation_id == expected_conversation_id
+        assert request.disaggregated_params is None
+        assert request.conversation_params.conversation_id == expected_conversation_id
 
 
 def test_extract_conversation_id_ignores_empty_headers():
@@ -81,16 +120,15 @@ def test_extract_conversation_id_ignores_empty_headers():
     )
 
     assert request.disaggregated_params is None
+    assert request.conversation_params is None
 
 
-def test_extract_conversation_id_preserves_body_conversation_id():
+def test_extract_conversation_id_preserves_body_conversation_params():
     request = CompletionRequest(
         model="test-model",
         prompt="hello",
-        disaggregated_params=DisaggregatedParams(
-            request_type="context_only",
-            conversation_id="body-id",
-        ),
+        conversation_params=ConversationParams(conversation_id="body-id"),
+        disaggregated_params=DisaggregatedParams(request_type="context_only"),
     )
 
     OpenAIDisaggServer._extract_conversation_id(
@@ -98,10 +136,11 @@ def test_extract_conversation_id_preserves_body_conversation_id():
         _raw_request({"X-Session-ID": "header-id"}),
     )
 
-    assert request.disaggregated_params.conversation_id == "body-id"
+    assert request.conversation_params.conversation_id == "body-id"
+    assert request.disaggregated_params.conversation_id is None
 
 
-def test_extract_conversation_id_populates_existing_disaggregated_params():
+def test_extract_conversation_id_populates_conversation_params_with_existing_disaggregated_params():
     request = CompletionRequest(
         model="test-model",
         prompt="hello",
@@ -113,7 +152,8 @@ def test_extract_conversation_id_populates_existing_disaggregated_params():
         _raw_request({"x-multi-turn-session-id": "multi-turn-session-id"}),
     )
 
-    assert request.disaggregated_params.conversation_id == "multi-turn-session-id"
+    assert request.conversation_params.conversation_id == "multi-turn-session-id"
+    assert request.disaggregated_params.conversation_id is None
 
 
 def test_disagg_config_allows_request_chat_template_opt_in():

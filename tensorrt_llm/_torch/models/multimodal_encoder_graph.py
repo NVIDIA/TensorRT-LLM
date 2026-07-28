@@ -22,7 +22,6 @@ Design highlights:
 
 from __future__ import annotations
 
-import os
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -45,11 +44,6 @@ from ..utils import make_weak_ref
 if TYPE_CHECKING:
     from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
     from ..attention_backend import AttentionMetadata
-
-# Public env var that toggles the multimodal side-stream prefetch path. The value is read at runner
-# construction time; the runner refuses to start when the prefetch is on because graph replay would
-# potentially race on the static buffers.
-_MM_SIDE_STREAM_ENV = "TLLM_MM_SIDE_STREAM_MAX_AHEAD"
 
 # Single token kept aside for the dummy padding context when `enable_padding=True`.
 # The attention backend rejects zero-length contexts, so the dummy must contain at least one token
@@ -187,8 +181,6 @@ class MultimodalEncoderGraphRunner:
         self._config = config
         # Adopted from the first captured graph so subsequent bucket captures share the pool.
         self._memory_pool = None
-
-        self._check_side_stream_compatibility()
 
         if not config.buckets:
             raise ValueError(
@@ -516,21 +508,6 @@ class MultimodalEncoderGraphRunner:
         if tensor.shape[token_dim] == real_tokens:
             return tensor
         return tensor.narrow(token_dim, 0, real_tokens)
-
-    @staticmethod
-    def _check_side_stream_compatibility() -> None:
-        raw = os.environ.get(_MM_SIDE_STREAM_ENV)
-        if raw is None:
-            return
-        try:
-            value = int(raw)
-        except ValueError as exc:
-            raise ValueError(f"{_MM_SIDE_STREAM_ENV} must be an integer, got {raw!r}.") from exc
-        if value > 0:
-            raise RuntimeError(
-                f"MM CUDA graph capture is incompatible with {_MM_SIDE_STREAM_ENV} > 0. "
-                "Disable side-stream MM prefetch or disable MM CUDA graphs."
-            )
 
     def _log_cuda_graph_memory_warning(self) -> None:
         max_total_tokens = max(bucket.total_tokens for bucket in self._buckets)

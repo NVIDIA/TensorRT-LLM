@@ -68,20 +68,9 @@ BACKEND_CAPS = {
 }
 
 _FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS = (96, 512)
-_FLASHINFER_PAGED_APPEND_OVER_1024_THREADS = (
-    # bf16/fp16 append launches 16 threads/head for head_dim=128. With 128 KV
-    # heads, that exceeds CUDA's 1024 threads/block launch limit.
-    (128, 128, "bfloat16"),
-    (128, 128, "float16"),
-)
 
 _TRTLLM_PAGED_UNSUPPORTED_HEAD_DIMS = (512,)
 _TRTLLM_BLACKWELL_PAGED_UNSUPPORTED_HEAD_DIMS = (96,)
-_TRTLLM_BLACKWELL_SLIDING_DECODE_UNSTABLE = (
-    # Gemma3-27B local layers and Gemma4-31B sliding layers.
-    (32, 16, 128, 1024),
-    (32, 16, 256, 1024),
-)
 
 
 def required_features(case) -> set:
@@ -133,27 +122,16 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     if kv_layout is not None and kv_layout not in caps.get("kv_layouts", ()):
         return f"{backend} does not support kv_layout '{kv_layout}'"
 
-    # FlashInfer's standard paged path has shape-specific kernel limits in this
-    # suite. Keep the skip list explicit so newly supported shapes are not
-    # hidden by a broad dispatch-set predicate.
+    # FlashInfer's standard paged kernels reject these head dimensions. Keep
+    # the skip list explicit so newly supported shapes are not hidden by a
+    # broad dispatch-set predicate.
     if (
         backend == "FLASHINFER"
         and getattr(case, "cache", "paged") != "none"
         and not getattr(case, "is_mla", False)
+        and case.head_dim in _FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS
     ):
-        kv_dtype = getattr(case, "kv_dtype", None) or getattr(case, "dtype", None)
-        if case.head_dim in _FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS:
-            return f"FLASHINFER paged attention is unstable for head_dim {case.head_dim}"
-        if (
-            case.head_dim,
-            case.num_kv_heads,
-            kv_dtype,
-        ) in _FLASHINFER_PAGED_APPEND_OVER_1024_THREADS:
-            return (
-                "FLASHINFER paged KV append exceeds CUDA's 1024 threads/block "
-                f"limit for head_dim={case.head_dim}, "
-                f"num_kv_heads={case.num_kv_heads}, kv_dtype={kv_dtype}"
-            )
+        return f"FLASHINFER paged kernels do not support head_dim {case.head_dim}"
 
     # TRTLLM's standard paged FMHA/MMHA kernels in this build do not cover the
     # Gemma4 head_dim 512 path.
@@ -163,7 +141,7 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
         and not getattr(case, "is_mla", False)
         and case.head_dim in _TRTLLM_PAGED_UNSUPPORTED_HEAD_DIMS
     ):
-        return f"TRTLLM paged attention is unstable for head_dim {case.head_dim}"
+        return f"TRTLLM paged attention does not support head_dim {case.head_dim}"
 
     # TRTLLM's Blackwell paged fallback path aborts for the Phi-3 head_dim 96
     # shape. Hopper covers that context config, but Blackwell must skip it
@@ -175,31 +153,7 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
         and not getattr(case, "is_mla", False)
         and case.head_dim in _TRTLLM_BLACKWELL_PAGED_UNSUPPORTED_HEAD_DIMS
     ):
-        return f"TRTLLM Blackwell paged attention is unstable for head_dim {case.head_dim}"
-
-    # TRTLLM's Blackwell pure-decode sliding-window path is numerically unstable
-    # for the listed Gemma GQA shapes. Mixed batches still use a different path
-    # and match the golden.
-    if (
-        backend == "TRTLLM"
-        and sm >= 100
-        and getattr(case, "sliding_window", None) is not None
-        and getattr(case, "cache", "paged") != "none"
-        and not getattr(case, "is_mla", False)
-        and case.num_contexts == 0
-        and (
-            case.num_heads,
-            case.num_kv_heads,
-            case.head_dim,
-            case.sliding_window,
-        )
-        in _TRTLLM_BLACKWELL_SLIDING_DECODE_UNSTABLE
-    ):
-        return (
-            "TRTLLM Blackwell sliding-window pure decode is unstable for "
-            f"num_heads={case.num_heads}, num_kv_heads={case.num_kv_heads}, "
-            f"head_dim={case.head_dim}, window={case.sliding_window}"
-        )
+        return f"TRTLLM Blackwell paged attention does not support head_dim {case.head_dim}"
 
     # TRTLLM's Blackwell no-cache fallback mismatches the Vanilla golden for the
     # Qwen2-VL vision tower's head_dim 80 workload; other no-cache head dims in
@@ -213,74 +167,4 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     ):
         return "TRTLLM Blackwell no-cache fallback is unstable for head_dim 80"
 
-    # TRTLLM MLA context is validated by test_attention_mla.py through the
-    # production MLA module path. This standalone backend harness feeds already
-    # up-projected random K/V tensors, which does not match the TRTLLM MLA
-    # context op contract and produces invalid output, while Vanilla/FlashInfer
-    # can still validate the up-projected context math and cache append.
-    if (
-        backend == "TRTLLM"
-        and getattr(case, "is_mla", False)
-        and getattr(case, "num_contexts", 0) == len(getattr(case, "seq_lens", ()))
-    ):
-        return (
-            "TRTLLM MLA context is covered by test_attention_mla.py via the "
-            "production MLA module path; standalone up-projected backend "
-            "inputs are validated with Vanilla/FlashInfer"
-        )
-
-    # On Blackwell, TRTLLM-Gen is the supported MLA generation path. The current
-    # kernel set explicitly lacks the DeepSeek-family decode shape at page_size
-    # 32, and the generic fallback then tries to JIT an unsupported generated
-    # kernel. FlashInfer/Vanilla still validate these standalone MLA gen cases.
-    if (
-        backend == "TRTLLM"
-        and sm >= 100
-        and getattr(case, "is_mla", False)
-        and getattr(case, "num_contexts", 0) == 0
-    ):
-        head_dim_qk = getattr(case, "kv_lora_rank", 0) + getattr(case, "qk_rope_head_dim", 0)
-        head_dim_v = getattr(case, "kv_lora_rank", 0)
-        if (head_dim_qk, head_dim_v, getattr(case, "page_size", None)) == (
-            576,
-            512,
-            32,
-        ):
-            return (
-                "TRTLLM-Gen Blackwell MLA generation is missing the decode "
-                "kernel for headDimQk=576, headDimV=512, page_size=32"
-            )
-
-    # TRTLLM's fp8 generation (XQA) path computes in fp8 and needs the model's
-    # real KV-dequant + output scale state (fed by the Attention module's
-    # projection layers). A bare standalone backend lacks it: supplying a unit
-    # output scale lets the kernel run, but the MHA path then produces garbage
-    # (~1e5 abs error) while only GQA happens to tolerate it. fp8 *context*
-    # (pure prefill) is exercised; FlashInfer validates fp8 decode on every arch.
-    if backend == "TRTLLM" and getattr(case, "kv_dtype", None) == "fp8":
-        has_generation = case.num_contexts < len(case.seq_lens)
-        if has_generation:
-            return (
-                "TRTLLM fp8 KV generation (XQA) needs the model's fp8 scale "
-                "state, absent in the standalone backend; fp8 context is covered "
-                "and FlashInfer validates fp8 decode"
-            )
-
-    # TRTLLM cross-attention works through the standard plumbing (prepare()
-    # derives the cross kv_lens from seq_lens_kv; the backend builds cross_kv from
-    # k/v). The aligned q_len == kv_len case is exercised on TRTLLM. The
-    # q_len != kv_len case is numerically correct in isolation (verified vs the
-    # golden to ~2e-3) but exhibits a cross-case state-dependent mismatch when run
-    # after other cross cases in the same process (a TRTLLM cross-path global not
-    # reset between fresh backend instances), so it is validated via
-    # FlashInfer/Vanilla in the suite.
-    if (
-        backend == "TRTLLM"
-        and getattr(case, "is_cross", False)
-        and list(case.seq_lens) != list(case.seq_lens_kv)
-    ):
-        return (
-            "TRTLLM cross q_len != kv_len is correct standalone (~2e-3) but "
-            "flaky across cross cases in-process; validated via FlashInfer/Vanilla"
-        )
     return None

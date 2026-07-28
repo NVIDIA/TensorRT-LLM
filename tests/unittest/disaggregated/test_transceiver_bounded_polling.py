@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import Mock
 
+import pytest
+
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.transfer import TaskStatus, TxSession
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -98,6 +100,10 @@ def _make_transceiver(
     transceiver._send_sessions = sessions
     transceiver._send_reqs = reqs or {rid: _FakeRequest() for rid in sessions}
     transceiver._sender_future_timeout_ms = 123
+    # Attributes read by check_context_transfer_status before it processes sessions.
+    transceiver._ever_had_send_session = True
+    transceiver._ctx_need_tp_sync = False
+    transceiver._ctx_need_pp_sync = False
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._ctx_consensus = lambda local_ids: list(local_ids)
     transceiver._ctx_consensus_outcome = (
@@ -131,9 +137,20 @@ def _make_tx_session(
     return session
 
 
-def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued() -> None:
+def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued(
+    monkeypatch,
+) -> None:
     session = _FakeSession(rid=11, wait_result=None)
     transceiver = _make_transceiver({11: session})
+    monotonic = Mock(side_effect=[0.0, 0.0, 0.123])
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver.time.monotonic",
+        monotonic,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver.time.sleep",
+        Mock(),
+    )
 
     completed, failed = transceiver.check_context_transfer_status(at_least_request_num=1)
 
@@ -144,6 +161,38 @@ def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued() -
     assert 11 in transceiver._send_sessions
     assert 11 in transceiver._send_reqs
     assert transceiver._transfer_worker.sweep_count == 1
+
+
+def test_context_transfer_status_bounded_poll_reaps_completion(monkeypatch) -> None:
+    session = _FakeSession(rid=14, wait_result=WaitResult.COMPLETED)
+    req = _FakeRequest()
+    transceiver = _make_transceiver({14: session}, {14: req})
+
+    def complete_on_poll(blocking: bool = True) -> WaitResult:
+        session.blocking_calls.append(blocking)
+        session._is_completed = True
+        return WaitResult.COMPLETED
+
+    session.wait_complete = complete_on_poll
+    sleep = Mock()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver.time.monotonic",
+        Mock(return_value=0.0),
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver.time.sleep",
+        sleep,
+    )
+
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=1)
+
+    assert completed == [14]
+    assert failed == []
+    assert session.blocking_calls == [False, False]
+    sleep.assert_called_once_with(0.001)
+    assert session.closed
+    assert 14 not in transceiver._send_sessions
+    assert 14 not in transceiver._send_reqs
 
 
 def test_context_transfer_status_block_all_uses_blocking_wait() -> None:
@@ -185,7 +234,9 @@ def test_context_transfer_status_zero_budget_processes_task_level_failure() -> N
     assert 13 not in transceiver._send_reqs
 
 
-def test_context_transfer_status_enters_consensus_when_tp_sync_required() -> None:
+def test_context_transfer_status_skips_consensus_when_never_sent() -> None:
+    # A worker that never sends skips the ctx consensus even when TP sync would need it, but still
+    # sweeps so nothing leaks.
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_send_session = False
     transceiver._ctx_need_tp_sync = True
@@ -193,17 +244,31 @@ def test_context_transfer_status_enters_consensus_when_tp_sync_required() -> Non
     transceiver._send_sessions = {}
     transceiver._send_reqs = {}
     transceiver._transfer_worker = _FakeTransferWorker()
-    transceiver._ctx_consensus = Mock(return_value=[])
-    transceiver._build_to_process = Mock(return_value=[])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
-    transceiver._close_failed_sessions = Mock()
+    transceiver._ctx_consensus = Mock(side_effect=AssertionError("consensus must be skipped"))
 
     completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
 
     assert completed == []
     assert failed == []
-    transceiver._ctx_consensus.assert_called_once_with([])
+    transceiver._ctx_consensus.assert_not_called()
     assert transceiver._transfer_worker.sweep_count == 1
+
+
+def test_context_transfer_status_never_sent_no_sync_is_a_noop() -> None:
+    # With no tp/pp sync (e.g. attention_dp), a never-sent worker skips the consensus and the sweep,
+    # unchanged from before -- a true no-op, so the fix can't slow attention_dp workers.
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_send_session = False
+    transceiver._ctx_need_tp_sync = False
+    transceiver._ctx_need_pp_sync = False
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._transfer_worker = _FakeTransferWorker()
+    transceiver._ctx_consensus = Mock(side_effect=AssertionError("consensus must be skipped"))
+
+    assert transceiver.check_context_transfer_status(at_least_request_num=0) == ([], [])
+    transceiver._ctx_consensus.assert_not_called()
+    assert transceiver._transfer_worker.sweep_count == 0  # matches the original early-out exactly
 
 
 def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
@@ -223,6 +288,72 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     assert failed == []
     assert cancelled == []
     transceiver._gen_consensus.assert_called_once_with([])
+
+
+def test_consensus_outcome_uses_single_batched_allgather() -> None:
+    # The cancelled/failed/completed id lists are exchanged with ONE allgather
+    # (packed as a list-of-lists) instead of three; verify a single call and that
+    # union (cancelled/failed) + intersection (completed) semantics are preserved.
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    calls: list = []
+
+    def fake_allgather(payload):
+        calls.append(payload)
+        # rank0 = this rank's [cancelled, failed, completed]; rank1 = a peer rank.
+        return [payload, [[], [99], [7, 8]]]
+
+    to_process = [1, 2, 7, 8, 99]
+    new_cancelled, new_failed, new_completed = transceiver._consensus_outcome(
+        to_process, [1], [2], [7], fake_allgather, True
+    )
+
+    assert len(calls) == 1  # batched: a single allgather, not three
+    assert calls[0] == [[1], [2], [7]]
+    assert new_cancelled == [1]  # union of cancelled across ranks
+    assert new_failed == [2, 99]  # union of failed across ranks
+    assert new_completed == [7]  # intersection only (8 is completed on the peer only)
+
+
+@pytest.mark.skip(
+    reason="ctx idle fast-path was dropped from this branch. TODO: when the "
+    "fast-path is reintroduced, its terminal-count reduction must mirror "
+    "_ctx_consensus()'s communicator scope (TP group, then PP group; TP "
+    "skipped under attention DP) — a WORLD-scoped allreduce hangs under "
+    "ADP+PP because independent attention-DP lanes poll on their own "
+    "schedules. Re-enable this test and add scoped mock coverage for the "
+    "TP+PP and ADP+PP configurations plus real-collective MP tests."
+)
+def test_ctx_consensus_fastpath_skips_when_idle(monkeypatch) -> None:
+    # With the fast-path enabled, an all-zero terminal count (one fixed-size
+    # allreduce) makes every rank skip the variable-length consensus; a non-zero
+    # count falls through to the normal consensus path.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver._CTX_CONSENSUS_FASTPATH", True
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_send_session = True
+    transceiver._ctx_need_tp_sync = True
+    transceiver._ctx_need_pp_sync = False
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._dist = Mock()
+    transceiver._dist.allreduce = Mock(return_value=0)
+    transceiver._ctx_consensus = Mock(return_value=[])
+    transceiver._build_to_process = Mock(return_value=[])
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
+    transceiver._transfer_worker = _FakeTransferWorker()
+    transceiver._close_failed_sessions = Mock()
+
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
+
+    assert completed == [] and failed == []
+    transceiver._dist.allreduce.assert_called_once()
+    transceiver._ctx_consensus.assert_not_called()  # idle fast-path skipped the consensus
+
+    # Non-zero global terminal count => fast-path does not skip; consensus runs.
+    transceiver._dist.allreduce = Mock(return_value=2)
+    transceiver.check_context_transfer_status(at_least_request_num=0)
+    transceiver._ctx_consensus.assert_called_once()
 
 
 def test_tx_session_wait_complete_defaults_to_blocking() -> None:
@@ -256,3 +387,26 @@ def test_tx_session_has_failed_reports_task_error() -> None:
     session = _make_tx_session([task])
 
     assert session.has_failed()
+
+
+def test_check_context_runs_consensus_after_a_send() -> None:
+    # Once the worker has sent, the ctx consensus runs as usual.
+    transceiver = _make_transceiver({})
+    transceiver._ever_had_send_session = True
+    transceiver._ctx_need_tp_sync = True
+    transceiver._ctx_consensus = Mock(return_value=[])
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
+
+    transceiver.check_context_transfer_status(0)
+    transceiver._ctx_consensus.assert_called_once()
+
+
+def test_prepare_context_requests_skips_consensus_when_nothing_waiting() -> None:
+    # With nothing waiting on any rank, prepare_context_requests returns before the consensus; the
+    # waiting set is the same on every rank.
+    transceiver = _make_transceiver({})
+    transceiver._wait_reqs = {}
+    transceiver._ctx_consensus = Mock(side_effect=AssertionError("consensus must be skipped"))
+
+    transceiver.prepare_context_requests([])
+    transceiver._ctx_consensus.assert_not_called()

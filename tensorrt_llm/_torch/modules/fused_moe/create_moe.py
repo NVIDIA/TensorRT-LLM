@@ -64,10 +64,15 @@ def get_moe_cls(
         quant_config = override_quant_config
     layer_prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
     if moe_backend.upper() == "MARLIN":
-        # Marlin MoE is a Hopper-specific NVFP4 W4A16 backend. Require nvfp4
-        # quantization explicitly so a misconfigured model fails fast.
+        # Marlin MoE is a Hopper-specific NVFP4 W4A16 backend. Layers without
+        # NVFP4 quantization (e.g. deliberately-unquantized MTP draft layers in
+        # MIXED_PRECISION checkpoints) fall back to CutlassFusedMoE, matching
+        # the CUTEDSL / DENSEGEMM / MEGAMOE_* fallback behavior below.
         if quant_config is None or not quant_config.quant_mode.has_nvfp4():
-            raise ValueError("MarlinFusedMoE only supports NVFP4 quantization.")
+            logger.warning(f"{layer_prefix}MarlinFusedMoE only supports NVFP4 "
+                           "quantization. Check out details in quant_config: "
+                           f"{quant_config}. Using CutlassFusedMoE instead.")
+            return CutlassFusedMoE
         return MarlinFusedMoE
     if moe_backend.upper() == "CUTLASS":
         return CutlassFusedMoE
@@ -340,7 +345,7 @@ def create_moe_backend(
     if swiglu_limit_scalar is not None:
         assert moe_cls in [
             CutlassFusedMoE, TRTLLMGenFusedMoE, WideEPMoE, DeepGemmFusedMoE,
-            MegaMoEDeepGemm
+            MegaMoEDeepGemm, CuteDslFusedMoE
         ], f"swiglu_limit_scalar is not supported in {moe_cls.__name__}."
 
     if moe_cls == TRTLLMGenFusedMoE:
@@ -438,6 +443,7 @@ def create_moe_backend(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
             activation_type=activation_type,

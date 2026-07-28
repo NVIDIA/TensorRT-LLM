@@ -34,7 +34,7 @@ import math
 import os
 import tempfile
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -1516,6 +1516,21 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
     """
 
     _LANG_PREFIX = "language_model."
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["PYTHON"]:
+        """Kimi-K2.5 defaults to the Python (v2) KV-cache transceiver.
+
+        The DeepSeek-V3 MLA backbone transfers a large latent KV, which the
+        Python transceiver handles better in disaggregated serving. This is
+        only adopted when the user leaves
+        ``cache_transceiver_config.transceiver_runtime`` at 'auto' and the
+        effective backend is NIXL; otherwise the C++ transceiver is used.
+        """
+        return "PYTHON"
 
     def __init__(
         self,

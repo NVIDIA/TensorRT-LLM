@@ -75,7 +75,25 @@ def simple(
     Returns:
         Output tensor of shape ``(..., out_features)``.
     """
-    # Blackwell (sm>=100) + bf16: route any bf16 linear to trtllm::cublas_mm.
+
+    # Backend selection (most-specific first): the DeepSeek-V3 MLA a-projection
+    # (q_a + kv_a_with_mqa fused by fuse_gemms into a 7168->2112 bf16 GEMM with no
+    # bias) dispatches to the trtllm dsv3 min-latency kernel (cuBLAS fallback for
+    # num_tokens > 16, handled inside the op).  Strictly shape+dtype gated.
+    def use_dsv3_fused_a_gemm() -> bool:
+        # DSv3 MLA fused a-proj shape: q_a 1536 + kv_a_with_mqa 576 = 2112 out, 7168 in, bf16.
+        DSV3_A_IN, DSV3_A_FUSED_OUT = 7168, 2112
+        return (
+            bias is None
+            and input.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and weight.shape[0] == DSV3_A_FUSED_OUT
+            and weight.shape[1] == DSV3_A_IN
+        )
+
+    if use_dsv3_fused_a_gemm():
+        return torch.ops.auto_deploy.dsv3_fused_a_gemm(input, weight)
+    # Blackwell (sm>=100) + bf16: route any other bf16 linear to trtllm::cublas_mm.
     # Selects single-pass cluster-mode cubins instead of cuBLAS-default
     # split-K + reduce + zero-fill for small-M (decode) projection GEMMs.
     # (Same trick PT introduced for GPT-OSS via use_custom_cublas_mm in

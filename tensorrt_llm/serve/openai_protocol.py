@@ -32,12 +32,13 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import (BaseModel, ConfigDict, Field, field_validator,
-                      model_validator)
+from pydantic import (BaseModel, ConfigDict, Field, PositiveInt,
+                      field_validator, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
+from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
@@ -142,6 +143,44 @@ class ModelList(OpenAIBaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
+class TokenizeRequest(OpenAIBaseModel):
+    """Request body for the ``POST /_internal/tokenize`` endpoint.
+
+    Asks the server to encode some text into the token-id sequence its
+    loaded tokenizer would produce, without running any generation.
+
+    Only plain-text ``prompt`` tokenization is supported. A ``messages``
+    path was intentionally left out: to be meaningful it must reuse the full
+    ``/v1/chat/completions`` preprocessing (server chat template, tools,
+    documents, template kwargs, model-type resolution, multimodal handling),
+    otherwise the returned token ids would silently diverge from the actual
+    inference prompt. It can be added once that path is shared.
+
+    Fields:
+        model: Target model name. Accepted for compatibility with
+            multi-model routers but ignored -- the server always tokenizes
+            against its own loaded model.
+        prompt: Plain text to tokenize directly via ``tokenizer.encode``.
+    """
+
+    model: Optional[str] = None
+    prompt: str
+
+
+class TokenizeResponse(OpenAIBaseModel):
+    """Response body for the ``POST /_internal/tokenize`` endpoint.
+
+    Fields:
+        count: Number of tokens in the encoded sequence. Always populated;
+            clients needing only the length can ignore ``tokens``.
+        tokens: The encoded token ids. Kept ``Optional`` so future
+            count-only variants can omit it without breaking the schema.
+    """
+
+    count: int
+    tokens: Optional[List[int]] = None
+
+
 class ResponseFormat(OpenAIBaseModel):
     type: Literal["text", "json", "json_schema", "json_object", "regex", "ebnf",
                   "structural_tag"]
@@ -170,6 +209,28 @@ class DisaggregatedParams(OpenAIBaseModel):
     # encoder embedding handles, multimodal hashes, and optional mRoPE handles.
     # Add them here and in to_disaggregated_params()/to_llm_disaggregated_params()
     # before routing MM encoder -> context -> generation through OpenAI protocol.
+    # Orchestrator -> context-worker instruction: return prompt_token_ids as a
+    # base64 int32 buffer (prompt_token_ids_b64) instead of a JSON int array.
+    return_prompt_token_ids_b64: bool = False
+
+
+class ConversationParams(OpenAIBaseModel):
+    model_config = ConfigDict(extra="forbid",
+                              populate_by_name=True,
+                              validate_assignment=True)
+
+    conversation_id: str = Field(
+        description=("Stable multi-turn conversation id used for routing"), )
+
+    @field_validator("conversation_id", mode="before")
+    @classmethod
+    def validate_conversation_id(cls, value: Any) -> str:
+        if value is None:
+            raise ValueError("conversation_id must be non-empty")
+        conversation_id = str(value).strip()
+        if not conversation_id:
+            raise ValueError("conversation_id must be non-empty")
+        return conversation_id
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -241,6 +302,71 @@ class CompletionStreamResponse(OpenAIBaseModel):
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = Field(default=None)
+
+
+class EmbeddingRequest(OpenAIBaseModel):
+    # OpenAI-compatible embeddings request.
+    # https://platform.openai.com/docs/api-reference/embeddings/create
+    model: str = Field(description="The model to use for the embedding.")
+    input: Union[str, List[str], List[int], List[List[int]]] = Field(
+        description="Text(s) or pre-tokenized token-id list(s) to embed. Accepts "
+        "the four OpenAI forms: str, list[str], list[int], list[list[int]].")
+    encoding_format: Literal["float", "base64"] = Field(
+        default="float",
+        description="Format of the returned embedding: a JSON array of floats "
+        "(\"float\") or a base64-encoded string of packed little-endian float32 "
+        "values (\"base64\").")
+    dimensions: Optional[PositiveInt] = Field(
+        default=None,
+        description="Number of dimensions the resulting embedding should have. "
+        "Only supported by Matryoshka-trained text-embedding models; rejected "
+        "otherwise.")
+    user: Optional[str] = Field(
+        default=None,
+        description="A stable identifier for the end-user (OpenAI-compatible; "
+        "accepted but unused).")
+    add_special_tokens: bool = Field(
+        default=True,
+        description=
+        "TRT-LLM extension: whether to add the model's special tokens "
+        "(e.g. [CLS]/[SEP]) when tokenizing string inputs. Default matches "
+        "llm.encode(); encoder models such as BERT generally need them.")
+
+
+class EmbeddingResponseData(OpenAIBaseModel):
+    index: int = Field(
+        description="Index of this embedding in the request's input list.")
+    object: Literal["embedding"] = "embedding"
+    embedding: Union[List[float], str] = Field(
+        description=
+        "The embedding: a list of floats for encoding_format=\"float\", "
+        "or a base64 string of packed little-endian float32 values for "
+        "encoding_format=\"base64\".")
+
+
+class EmbeddingUsageInfo(OpenAIBaseModel):
+    """Token usage for embeddings.
+
+    OpenAI's embeddings `usage` object contains only `prompt_tokens` and
+    `total_tokens` (no `completion_tokens`), unlike chat/completions.
+    """
+    prompt_tokens: int = Field(default=0,
+                               description="Number of tokens in the input.")
+    total_tokens: int = Field(
+        default=0,
+        description="Total tokens consumed (equal to prompt_tokens for "
+        "embeddings).")
+
+
+class EmbeddingResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"embd-{str(uuid.uuid4().hex)}")
+    object: Literal["list"] = "list"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str = Field(description="The model used for the embedding.")
+    data: List[EmbeddingResponseData] = Field(
+        description="The list of embeddings, one per input item.")
+    usage: EmbeddingUsageInfo = Field(
+        description="Token usage for the request.")
 
 
 def _response_format_to_guided_decoding_params(
@@ -428,6 +554,10 @@ class CompletionRequest(OpenAIBaseModel):
     disaggregated_params: Optional[DisaggregatedParams] = Field(
         default=None,
         description=("Parameters for disaggregated serving"),
+    )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
     )
 
     # doc: end-completion-extra-params
@@ -637,6 +767,9 @@ class ChatCompletionResponse(OpenAIBaseModel):
     # Add prompt_tokens_ids to the response to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[List[int]] = None
+    # base64 int32 buffer alternative to prompt_token_ids; set by the context
+    # worker so the orchestrator can relay a string instead of the int list.
+    prompt_token_ids_b64: Optional[str] = None
 
 
 class DeltaMessage(OpenAIBaseModel):
@@ -694,6 +827,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Add prompt_tokens_ids to the request to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[List[int]] = None
+    # base64 int32 buffer relayed by the orchestrator from the ctx response;
+    # decoded back to prompt_token_ids on the generation worker. Not for clients.
+    prompt_token_ids_b64: Optional[str] = None
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
@@ -806,6 +942,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     disaggregated_params: Optional[DisaggregatedParams] = Field(
         default=None,
         description=("Parameters for disaggregated serving"),
+    )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
     )
 
     cache_salt: Optional[str] = Field(
@@ -951,6 +1091,36 @@ class KVCacheTruncateRequest(OpenAIBaseModel):
     chat_template_kwargs: Optional[dict] = None
     reasoning_effort: Optional[str] = None
     tool_choice: Optional[str] = None
+
+
+class KVCacheTruncateTokensRequest(OpenAIBaseModel):
+    """Token-level analog of :class:`KVCacheTruncateRequest`.
+
+    Posted to the ``/_control/kv_cache/truncate_tokens`` endpoint. Bypasses
+    the chat-template tokenization path entirely: callers (e.g.
+    trace replay) that already operate on raw token ids hand the server a
+    batch of full token-id sequences plus the prefix length to retain for
+    each, and the server trims the corresponding KV-cache blocks in the
+    radix tree. Each ``prefixes[i]`` becomes one
+    :class:`tensorrt_llm.executor.request.TruncateKVCacheRequest` on the
+    executor's KV-cache control queue, so one batched HTTP request fans out
+    into N atomic per-prefix radix-tree mutations while paying a single
+    network round-trip.
+
+    Fields:
+        model: Target model name. Accepted for router compatibility but
+            ignored -- the server uses its own loaded model.
+        prefixes: Batch of full token-id sequences. Each entry is one
+            cached prefix whose KV-cache blocks should be truncated.
+        num_tokens_to_keep: Per-prefix number of leading tokens to retain,
+            parallel to ``prefixes`` (``num_tokens_to_keep[i]`` applies to
+            ``prefixes[i]``). Blocks beyond this length are dropped from the
+            radix tree.
+    """
+
+    model: Optional[str] = None
+    prefixes: List[List[int]]
+    num_tokens_to_keep: List[int]
 
 
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
@@ -1329,6 +1499,7 @@ def to_disaggregated_params(
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
         ctx_usage=ctx_usage,
+        conversation_id=tllm_disagg_params.conversation_id,
     )
 
 
@@ -1353,7 +1524,17 @@ def to_llm_disaggregated_params(
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
         ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
+        conversation_id=disaggregated_params.conversation_id,
     )
+
+
+def to_llm_conversation_params(
+    conversation_params: Optional[ConversationParams]
+) -> Optional[LlmConversationParams]:
+    if conversation_params is None:
+        return None
+    return LlmConversationParams(
+        conversation_id=conversation_params.conversation_id)
 
 
 # ============================================================================

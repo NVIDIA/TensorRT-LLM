@@ -9,7 +9,6 @@ from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_radio
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel
-from tensorrt_llm._torch.models.multimodal_encoder_graph import _MM_SIDE_STREAM_ENV
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -61,13 +60,6 @@ def _make_vision_config():
         "cpe_num_registers": None,
     }
     return config
-
-
-@pytest.fixture(autouse=True)
-def clean_side_stream_env(monkeypatch):
-    """Temporarily unset side-stream prefetch for tests unless a test sets it explicitly."""
-    monkeypatch.delenv(_MM_SIDE_STREAM_ENV, raising=False)
-    yield
 
 
 @pytest.fixture

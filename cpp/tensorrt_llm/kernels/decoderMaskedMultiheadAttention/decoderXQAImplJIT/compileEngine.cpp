@@ -55,7 +55,13 @@ namespace jit
 CubinObj CompileEngine::compile() const
 {
     tllmXqaJitProgram program;
-    bool const useQGMMAKernel = supportConfigQGMMA(mXqaParams, mSM, true);
+    // QGMMA runs attention fully in native FP8 format, including the output of the tiled
+    // Q @ K^T. For the multi-query spec-dec verify, this introduces undue errors on the verify
+    // path, which causes the rejection of otherwise legitimate tokens. In these cases, we defer
+    // to the HMMA kernel, which avoids that particular issue.
+    bool const isLinearSpecDec = mXqaParams.multi_query_tokens && !mXqaParams.is_spec_dec_tree;
+    bool const useQGMMAKernel = supportConfigQGMMA(mXqaParams, mSM, true) && !isLinearSpecDec;
+
     tllmXqaJitRopeStyle ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE;
     bool const applyRoPEInXqaKernel = appliesRoPEInXqaKernel(mXqaParams, useQGMMAKernel);
     if (applyRoPEInXqaKernel)

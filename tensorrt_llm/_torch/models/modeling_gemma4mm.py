@@ -23,6 +23,7 @@ is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
 import copy
 import dataclasses
 import math
+from itertools import groupby
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -43,6 +44,7 @@ from ...inputs import (
     TextPrompt,
     register_input_processor,
 )
+from ...inputs.multimodal import MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -55,6 +57,7 @@ from .modeling_multimodal_utils import (
     _is_mm_disagg,
     find_input_mm_embeds,
     fuse_input_embeds,
+    get_multimodal_embeddings,
 )
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
@@ -876,6 +879,152 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             projected = projected.reshape(-1, projected.shape[-1])
         return projected.contiguous()
 
+    @staticmethod
+    def _has_active_multimodal_tokens(multimodal_param: MultimodalParams) -> bool:
+        """Whether a context parameter needs embeddings in this forward."""
+        runtime = multimodal_param.multimodal_runtime
+        if runtime is not None and runtime.num_mm_tokens_in_chunk == 0:
+            return False
+
+        multimodal_data = multimodal_param.multimodal_data
+        if multimodal_data.get("multimodal_embedding") is not None:
+            return True
+
+        payload_fields = (
+            ("image", "pixel_values"),
+            ("video", "pixel_values"),
+            ("audio", "audio_features"),
+        )
+        return any(
+            multimodal_data.get(modality, {}).get(field) is not None
+            for modality, field in payload_fields
+        )
+
+    def _forward_multimodal_encoder(
+        self, multimodal_params: List[MultimodalParams]
+    ) -> torch.Tensor:
+        """Encode uncached Gemma4 image, video, and audio payloads."""
+        modality_inputs = (
+            ("image", "pixel_values"),
+            ("video", "pixel_values"),
+            ("audio", "audio_features"),
+        )
+        param_modalities = [
+            [
+                modality
+                for modality, input_field in modality_inputs
+                if multimodal_param.multimodal_data.get(modality, {}).get(input_field) is not None
+            ]
+            for multimodal_param in multimodal_params
+        ]
+
+        # The cache helper splits this tensor by request.  Preserve that order while still batching
+        # consecutive requests with the same modality.
+        if (
+            all(len(modalities) == 1 for modalities in param_modalities)
+            and len({modalities[0] for modalities in param_modalities}) > 1
+        ):
+            embeddings = []
+            for _, param_group in groupby(
+                zip(param_modalities, multimodal_params), key=lambda item: item[0][0]
+            ):
+                embeddings.append(
+                    self._forward_multimodal_encoder(
+                        [multimodal_param for _, multimodal_param in param_group]
+                    )
+                )
+            return torch.cat(embeddings, dim=0)
+
+        pixel_values_list = []
+        image_position_ids_list = []
+        image_seq_lens_extended: List[int] = []
+        audio_features_list = []
+        audio_features_mask_list: List[Optional[torch.Tensor]] = []
+        video_pixel_values_list = []
+        video_position_ids_list = []
+        video_seq_lens_extended: List[int] = []
+
+        for multimodal_param in multimodal_params:
+            multimodal_data = multimodal_param.multimodal_data
+            image_data = multimodal_data.get("image", {})
+            pixel_values = image_data.get("pixel_values")
+            if pixel_values is not None:
+                pixel_values_list.append(pixel_values)
+                image_position_ids = image_data.get("image_position_ids")
+                if image_position_ids is not None:
+                    image_position_ids_list.append(image_position_ids)
+                image_seq_lens = image_data.get("image_seq_lens")
+                if image_seq_lens is not None:
+                    image_seq_lens_extended.extend(image_seq_lens)
+
+            audio_data = multimodal_data.get("audio", {})
+            audio_features = audio_data.get("audio_features")
+            if audio_features is not None:
+                audio_features_list.append(audio_features)
+                audio_features_mask_list.append(audio_data.get("audio_features_mask"))
+
+            video_data = multimodal_data.get("video", {})
+            video_pixel_values = video_data.get("pixel_values")
+            if video_pixel_values is not None:
+                video_pixel_values_list.append(video_pixel_values)
+                video_position_ids = video_data.get("image_position_ids")
+                if video_position_ids is not None:
+                    video_position_ids_list.append(video_position_ids)
+                video_seq_lens = video_data.get("image_seq_lens")
+                if video_seq_lens is not None:
+                    video_seq_lens_extended.extend(video_seq_lens)
+
+        multimodal_embeddings = []
+        if pixel_values_list:
+            pixel_values = torch.cat(pixel_values_list)
+            image_position_ids = (
+                torch.cat(image_position_ids_list)
+                if len(image_position_ids_list) == len(pixel_values_list)
+                else None
+            )
+            multimodal_embeddings.append(
+                self._get_image_features(
+                    pixel_values=pixel_values,
+                    image_position_ids=image_position_ids,
+                    image_seq_lens=(
+                        image_seq_lens_extended
+                        if len(image_seq_lens_extended) == pixel_values.shape[0]
+                        else None
+                    ),
+                )
+            )
+
+        # Video frames use the same vision tower as images.
+        if video_pixel_values_list:
+            video_pixel_values = torch.cat(video_pixel_values_list)
+            video_position_ids = (
+                torch.cat(video_position_ids_list)
+                if len(video_position_ids_list) == len(video_pixel_values_list)
+                else None
+            )
+            multimodal_embeddings.append(
+                self._get_image_features(
+                    pixel_values=video_pixel_values,
+                    image_position_ids=video_position_ids,
+                    image_seq_lens=(
+                        video_seq_lens_extended
+                        if len(video_seq_lens_extended) == video_pixel_values.shape[0]
+                        else None
+                    ),
+                )
+            )
+
+        if audio_features_list and self.audio_tower is not None:
+            per_audio_embeddings = [
+                self._get_audio_features(audio_features, audio_features_mask_list[i])
+                for i, audio_features in enumerate(audio_features_list)
+            ]
+            multimodal_embeddings.append(torch.cat(per_audio_embeddings, dim=0))
+
+        if not multimodal_embeddings:
+            raise ValueError("Gemma4 received active multimodal parameters without encoder inputs")
+        return torch.cat(multimodal_embeddings, dim=0)
+
     @torch.inference_mode()
     def forward(
         self,
@@ -886,131 +1035,32 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return_context_logits: Optional[bool] = False,
         **kwargs,
     ) -> torch.Tensor:
-        multimodal_params = kwargs.get("multimodal_params", [])
-
-        # --- Extract image data ---
-        pixel_values_list = []
-        image_position_ids_list = []
-        image_seq_lens_extended: List[int] = []
-        # --- Extract audio data ---
-        audio_features_list = []
-        audio_features_mask_list = []
-        # --- Extract video data (treated as image frames at the tower) ---
-        video_pixel_values_list = []
-        video_position_ids_list = []
-        video_seq_lens_extended: List[int] = []
-        for mp in multimodal_params:
-            img_data = mp.multimodal_data.get("image", {})
-            pv = img_data.get("pixel_values")
-            if pv is not None:
-                pixel_values_list.append(pv)
-                pid = img_data.get("image_position_ids")
-                if pid is not None:
-                    image_position_ids_list.append(pid)
-                seq_lens = img_data.get("image_seq_lens")
-                if seq_lens is not None:
-                    image_seq_lens_extended.extend(seq_lens)
-
-            aud_data = mp.multimodal_data.get("audio", {})
-            af = aud_data.get("audio_features")
-            if af is not None:
-                audio_features_list.append(af)
-                afm = aud_data.get("audio_features_mask")
-                if afm is not None:
-                    audio_features_mask_list.append(afm)
-
-            vid_data = mp.multimodal_data.get("video", {})
-            vpv = vid_data.get("pixel_values")
-            if vpv is not None:
-                video_pixel_values_list.append(vpv)
-                vpid = vid_data.get("image_position_ids")
-                if vpid is not None:
-                    video_position_ids_list.append(vpid)
-                vsl = vid_data.get("image_seq_lens")
-                if vsl is not None:
-                    video_seq_lens_extended.extend(vsl)
+        multimodal_params = kwargs.get("multimodal_params", [])[: attn_metadata.num_contexts]
+        active_multimodal_params = [
+            multimodal_param
+            for multimodal_param in multimodal_params
+            if self._has_active_multimodal_tokens(multimodal_param)
+        ]
 
         mm_embeds = []
-        all_mm_token_ids = []
+        if active_multimodal_params:
+            mm_embeds = get_multimodal_embeddings(
+                encoder_forward_fn=self._forward_multimodal_encoder,
+                multimodal_params=active_multimodal_params,
+            )
+            mm_embeds = find_input_mm_embeds(mm_embeds, active_multimodal_params)
+
         mm_token_type_ids = None
-
-        # --- Process image features ---
-        if len(pixel_values_list) > 0:
-            pixel_values = torch.cat(pixel_values_list)
-            image_position_ids = (
-                torch.cat(image_position_ids_list)
-                if len(image_position_ids_list) == len(pixel_values_list)
-                else None
-            )
-            image_features = self._get_image_features(
-                pixel_values=pixel_values,
-                image_position_ids=image_position_ids,
-                image_seq_lens=(
-                    image_seq_lens_extended
-                    if len(image_seq_lens_extended) == pixel_values.shape[0]
-                    else None
-                ),
-            )
-            mm_embeds.append(image_features)
-            all_mm_token_ids.append(self.image_token_ids)
-
-        # --- Process video frames (each frame goes through the vision tower
-        # exactly like an image).  Gemma4 expands ``<|video|>`` into
-        # ``<|image><|video|>*N<image|>`` (i.e., the soft-token slots use
-        # the dedicated ``video_token_id``, not the image token id), so we
-        # add ``video_token_ids`` separately to ``all_mm_token_ids``.
-        if len(video_pixel_values_list) > 0:
-            video_pixel_values = torch.cat(video_pixel_values_list)
-            video_pos_ids = (
-                torch.cat(video_position_ids_list)
-                if len(video_position_ids_list) == len(video_pixel_values_list)
-                else None
-            )
-            video_features = self._get_image_features(
-                pixel_values=video_pixel_values,
-                image_position_ids=video_pos_ids,
-                image_seq_lens=(
-                    video_seq_lens_extended
-                    if len(video_seq_lens_extended) == video_pixel_values.shape[0]
-                    else None
-                ),
-            )
-            mm_embeds.append(video_features)
-            if self.video_token_ids is not None:
-                all_mm_token_ids.append(self.video_token_ids)
-            else:
-                all_mm_token_ids.append(self.image_token_ids)
-
-        # --- Process audio features ---
-        if len(audio_features_list) > 0 and self.audio_tower is not None:
-            # Different requests in the batch can have different audio
-            # lengths (and ``input_features`` shape ``(1, frames, 128)``
-            # therefore differs in dim 1).  Process each audio independently
-            # and concatenate the resulting valid soft-token embeddings so
-            # that ``mm_embeds`` is a single ``(N_total_audio_tokens, H)``
-            # tensor matching the audio token positions in the batched
-            # ``input_ids``.
-            per_audio_embeds = []
-            for i, af in enumerate(audio_features_list):
-                afm = audio_features_mask_list[i] if i < len(audio_features_mask_list) else None
-                per_audio_embeds.append(self._get_audio_features(af, afm))
-            audio_embeds = torch.cat(per_audio_embeds, dim=0)
-            mm_embeds.append(audio_embeds)
-            if self.audio_token_ids is not None:
-                all_mm_token_ids.append(self.audio_token_ids)
-
-        # Build integer mm_token_type_ids: 0=text, 1=image, 2=video, 3=audio
-        # (matches HF ``Gemma4Processor.create_mm_token_type_ids`` convention).
-        # _get_token_type_mask expects integer type IDs, not a boolean mask.
-        if len(mm_embeds) > 0:
+        if mm_embeds:
+            # Build integer token types only when this chunk contains active
+            # multimodal embeddings. Singleton comparisons avoid repeated
+            # torch.isin scans over the packed input.
             mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.long)
-            mm_token_type_ids[torch.isin(input_ids, self.image_token_ids)] = 1
+            mm_token_type_ids[input_ids == self.image_token_ids[0]] = 1
             if self.video_token_ids is not None:
-                mm_token_type_ids[torch.isin(input_ids, self.video_token_ids)] = 2
+                mm_token_type_ids[input_ids == self.video_token_ids[0]] = 2
             if self.audio_token_ids is not None:
-                mm_token_type_ids[torch.isin(input_ids, self.audio_token_ids)] = 3
-
-        fuse_token_ids = torch.cat(all_mm_token_ids) if all_mm_token_ids else self.image_token_ids
+                mm_token_type_ids[input_ids == self.audio_token_ids[0]] = 3
 
         # Build a PLE-safe view of the original input_ids where every
         # multimodal token is replaced by the text pad_token_id.  The
@@ -1021,26 +1071,21 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # ``fuse_input_embeds`` returns ``input_ids=None`` and PLE is then
         # silently skipped inside ``Gemma4TextModel.forward``.
         ple_input_ids = None
-        if input_ids is not None and len(mm_embeds) > 0:
+        if mm_token_type_ids is not None and self.llm.model.hidden_size_per_layer_input:
             text_config = getattr(self.config, "text_config", self.config)
             pad_id = getattr(text_config, "pad_token_id", None)
             if pad_id is not None:
-                mm_token_ids_for_mask = fuse_token_ids.to(input_ids.device)
-                mm_mask = torch.isin(input_ids, mm_token_ids_for_mask)
-                ple_input_ids = torch.where(mm_mask, torch.full_like(input_ids, pad_id), input_ids)
-
-        # Slice mm_embeds to the current chunk window for chunked prefill /
-        # KV reuse. Without this, the full request's mm_embeds is passed to
-        # fuse_input_embeds even when input_ids is a chunk slice, which trips
-        # the count-equality check in fuse_input_embeds. Mirrors the call in
-        # modeling_qwen2vl / modeling_phi4mm / modeling_mistral.
-        mm_embeds = find_input_mm_embeds(mm_embeds, multimodal_params)
+                ple_input_ids = torch.where(
+                    mm_token_type_ids > 0,
+                    torch.full_like(input_ids, pad_id),
+                    input_ids,
+                )
 
         input_ids, inputs_embeds = fuse_input_embeds(
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
             mm_embeds=mm_embeds,
-            mm_token_ids=fuse_token_ids,
+            mm_token_ids=self.mm_token_ids,
             mm_token_indices=kwargs.get("mm_token_indices"),
             text_token_indices=kwargs.get("text_token_indices"),
         )

@@ -39,6 +39,21 @@ _WEIGHT_KEY_REMAPS = [
     (".net.2.", ".down_proj."),
 ]
 
+# Parameters created by the shared FP8/NVFP4 Linear methods that ModelOpt does
+# not serialize. ``alpha`` and ``inv_input_scale`` are derived from serialized
+# scales by the shared ``Linear.load_weights()`` path. ``kv_scales`` and
+# ``inv_kv_scales`` are placeholders for the LLM fused-QKV path; Qwen-Image
+# uses separate Q/K/V projections without a KV cache, so they remain at their
+# defaults and are never read. Keep the list scoped to parameters actually
+# registered on each Linear so other missing checkpoint weights still fail
+# strict validation.
+_NON_SERIALIZED_QUANT_PARAM_NAMES = (
+    "alpha",
+    "inv_input_scale",
+    "kv_scales",
+    "inv_kv_scales",
+)
+
 
 def _remap_checkpoint_keys(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     remapped = {}
@@ -896,6 +911,20 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                         module._buffers.clear()
                         module.create_weights()
 
+    def _non_serialized_quant_parameter_names(self) -> set[str]:
+        """Return shared Linear parameters absent from ModelOpt checkpoints."""
+        non_serialized = set()
+        for module_name, module in self.named_modules():
+            if not isinstance(module, Linear) or module.quant_config is None:
+                continue
+            prefix = f"{module_name}." if module_name else ""
+            non_serialized.update(
+                f"{prefix}{param_name}"
+                for param_name in _NON_SERIALIZED_QUANT_PARAM_NAMES
+                if module._parameters.get(param_name) is not None
+            )
+        return non_serialized
+
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Load HF ``transformer/*.safetensors`` state_dict.
 
@@ -912,7 +941,10 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
 
         expected = {name for name, _ in self.named_parameters()}
         provided = set(weights)
-        missing = sorted(expected - provided)
+        # WAN uses the same shared Linear methods but does not perform this
+        # model-vs-checkpoint key check. Exempt only their known non-serialized
+        # parameters while retaining strict validation for real Qwen weights.
+        missing = sorted((expected - provided) - self._non_serialized_quant_parameter_names())
         unexpected = sorted(provided - expected)
         # Dynamic quantization creates scale parameters while loading Linear
         # modules, so those keys are expected to be absent from BF16 checkpoints.

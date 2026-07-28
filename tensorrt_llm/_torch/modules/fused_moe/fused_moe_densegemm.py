@@ -192,6 +192,14 @@ class DenseGEMMFusedMoE(MoE):
             f"when weight_per_expert is not MMA tile-K aligned."
         )
 
+        # DenseGEMM only supports TP; EP requires alltoall communication not implemented here.
+        ep_size = model_config.mapping.moe_ep_size
+        assert ep_size == 1, (
+            f"DenseGEMMFusedMoE does not support Expert Parallelism "
+            f"(got ep_size={ep_size}). Use a different MoE backend (e.g. CutlassFusedMoE) "
+            f"when EP is enabled."
+        )
+
         # Call MoE base class directly (not CutlassFusedMoE).
         # Note: `without_comm` and `apply_router_weight_on_input` are accepted
         # for API compatibility with create_moe_backend() but are not passed to
@@ -289,9 +297,6 @@ class DenseGEMMFusedMoE(MoE):
                     f"{self.__class__.__name__} only supports nvfp4 quantization, "
                     f"got {self.quant_config.quant_mode}."
                 )
-
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)
 
     def _transform_w2_weight_scale_for_min_latency(self):
         """Transform w2_weight_scale for minimum latency path optimization."""

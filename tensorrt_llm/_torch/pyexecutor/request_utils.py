@@ -33,13 +33,15 @@ def get_num_child_requests(request: ExecutorRequest) -> int:
 
 
 def collect_py_objects_from_requests(
-    requests: List, attribute_name: str
+    requests: List, attribute_name: str, include_none: bool = False
 ) -> Optional[Tuple[str, Dict]]:
     """Collect Python-only objects from requests.
 
     Args:
         requests: List of RequestQueueItem objects.
         attribute_name: Name of the attribute to collect.
+        include_none: Include requests whose attribute value is None. When
+            enabled, the source request must have the attribute.
 
     Returns:
         Tuple of (attribute_name, dict mapping request_id to object) or None if empty.
@@ -49,9 +51,12 @@ def collect_py_objects_from_requests(
         if not item.is_normal_request:
             continue
         if item.request:
-            obj = getattr(item.request, attribute_name, None)
-            if obj is not None:
-                req_id_to_obj[item.id] = obj
+            if include_none:
+                req_id_to_obj[item.id] = getattr(item.request, attribute_name)
+            else:
+                obj = getattr(item.request, attribute_name, None)
+                if obj is not None:
+                    req_id_to_obj[item.id] = obj
     return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
 
 
@@ -65,9 +70,8 @@ def attach_py_objects_to_requests(requests: List, py_request_objects: Tuple) -> 
     for attr_name, req_obj_dict in py_request_objects:
         for item in requests:
             if item.request:
-                py_obj = req_obj_dict.get(item.id)
-                if py_obj is not None:
-                    setattr(item.request, attr_name, py_obj)
+                if item.id in req_obj_dict:
+                    setattr(item.request, attr_name, req_obj_dict[item.id])
 
 
 def derive_attention_dp_per_rank_request_cap(
@@ -508,6 +512,15 @@ class RequestBroadcaster:
 
     def broadcast(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
         """Broadcast requests and Python objects across ranks."""
+        request_count = len(new_requests) if self.dist.rank == 0 else 0
+        # Idle non-root ranks can wait here while rank 0 blocks in the
+        # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
+        with self.hang_detector.pause():
+            request_count = self._broadcast_request_count(request_count)
+
+        if request_count == 0:
+            return [], None
+
         if self.dist.rank == 0:
             py_request_objects = self._collect_py_objects(new_requests)
         else:
@@ -524,6 +537,30 @@ class RequestBroadcaster:
 
         return new_requests, py_request_objects
 
+    def _broadcast_request_count(self, request_count: int) -> int:
+        """Broadcast rank 0's request count using the same PP route as requests."""
+        if self.dist.world_size == 1:
+            return request_count
+
+        if not self.dist.has_pp:
+            return self.dist.broadcast(request_count, root=0)
+
+        if self.dist.is_first_pp_rank:
+            with nvtx_range("tp_broadcast_request_count"):
+                request_count = self.dist.tp_cp_broadcast(request_count, root=0)
+
+        tag = self.dist.pp_size + 1  # Avoid the heavy request payload tag.
+
+        if not self.dist.is_first_pp_rank:
+            with nvtx_range("recv_request_count_from_prev_pp"):
+                request_count = self.dist.recv_object(self.dist.prev_pp_rank, tag)
+
+        if not self.dist.is_last_pp_rank:
+            with nvtx_range("send_request_count_to_next_pp"):
+                self.dist.send_object(request_count, self.dist.next_pp_rank, tag)
+
+        return request_count
+
     def _collect_py_objects(self, new_requests: List) -> Tuple:
         """Collect Python-only objects from requests."""
         py_logits_post_processors = collect_py_objects_from_requests(
@@ -537,6 +574,9 @@ class RequestBroadcaster:
         py_disaggregated_params = collect_py_objects_from_requests(
             new_requests, "py_disaggregated_params"
         )
+        py_conversation_params = collect_py_objects_from_requests(
+            new_requests, "py_conversation_params", include_none=True
+        )
         py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
 
         return tuple(
@@ -548,6 +588,7 @@ class RequestBroadcaster:
                     py_scheduling_params,
                     py_num_logprobs,
                     py_disaggregated_params,
+                    py_conversation_params,
                     py_lora_path,
                 ],
             )

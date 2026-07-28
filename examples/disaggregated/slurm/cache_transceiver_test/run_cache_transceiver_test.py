@@ -24,7 +24,7 @@ combination x request length, the ctx side fills a request's KV blocks with a
 deterministic, rank-specific pattern, sends it, and the gen side verifies the
 received blocks regenerate to the same pattern. Bandwidth is emitted by the
 transceivers themselves into per-rank CSVs (parsed later by report.py):
-  C++  -> TRTLLM_KVCACHE_TIME_OUTPUT_PATH (rank_*_send.csv / rank_*_recv.csv)
+  C++  -> TRTLLM_KVCACHE_TIME_OUTPUT_PATH (<instanceId>_*_send.csv / <instanceId>_*_recv.csv)
   Py   -> TLLM_KV_TRANSFER_PERF_LOG_FILE  (py_*_*.csv, throughput_mbs)
 
 This driver mirrors the single-process test (tests/unittest/others/
@@ -104,6 +104,8 @@ class KvCacheConfigV2:
     dtype: str = "auto"
     pool_ratio: Optional[List[float]] = None
     avg_seq_len: Optional[int] = None
+    block_reuse_policy: str = "all_reusable"
+    enable_swa_scratch_reuse: bool = False
     disk_prefetch_num_reqs: int = 4
     max_util_for_resume: float = 0.95
 
@@ -171,12 +173,13 @@ def build_kv_cache_manager(cfg_kv, mapping, use_v2):
 def add_sequence(mgr, req, prompt_len, use_v2):
     """Allocate KV blocks for the request. Returns a handle to close (V2) or None."""
     if use_v2:
-        kv = mgr._create_kv_cache(req.py_request_id, None, None)
-        ok = kv.resume(torch.cuda.current_stream().cuda_stream)
+        if req.is_disagg_generation_init_state:
+            ok = mgr.prepare_disagg_gen_init(req)
+        else:
+            ok = mgr.prepare_context(req) and mgr.resize_context(req, prompt_len)
         if not ok:
-            raise RuntimeError(f"V2 resume failed for request {req.py_request_id}")
-        kv.resize(prompt_len)
-        return kv
+            raise RuntimeError(f"V2 KV cache allocation failed for request {req.py_request_id}")
+        return None
     mgr.impl.add_sequence_batch([(req.py_request_id, prompt_len, 1)], [req])
     return None
 
@@ -434,15 +437,19 @@ def _preserve_cpp_csvs(csv_dir, ci, rank):
     request lengths of a combination and appends a row per request, so we move
     the whole combination's output aside (rid encodes req_len).
 
-    Each rank touches ONLY its own files: all ranks share `csv_dir`, so a glob
-    over `rank_*` would race -- multiple ranks renaming the same file, leaving
-    some with FileNotFoundError, crashing those ranks and deadlocking the rest on
-    the next case's collective KVCacheManager allreduce.
+    C++ names files "<instanceId>_<rank>_<tag>.csv" (instanceId is a runtime
+    UUID). Each rank touches ONLY files carrying its own "_<rank>_<tag>.csv"
+    suffix: all ranks share `csv_dir`, so matching a broader pattern would race
+    -- multiple ranks renaming the same file, leaving some with
+    FileNotFoundError, crashing those ranks and deadlocking the rest on the next
+    case's collective KVCacheManager allreduce.
     """
     for tag in ("send", "recv"):
-        path = os.path.join(csv_dir, f"rank_{rank}_{tag}.csv")
-        if os.path.exists(path):
-            os.replace(path, os.path.join(csv_dir, f"rank_{rank}_{tag}__c{ci}.csv"))
+        suffix = f"_{rank}_{tag}.csv"
+        for name in os.listdir(csv_dir):
+            if name.endswith(suffix) and "__c" not in name:
+                base = name[: -len(".csv")]
+                os.replace(os.path.join(csv_dir, name), os.path.join(csv_dir, f"{base}__c{ci}.csv"))
 
 
 def main():

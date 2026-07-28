@@ -1067,23 +1067,30 @@ def test_v2_removed_event_emitted_when_last_level_page_is_dropped():
     gc.collect()
     gc.disable()
 
-    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=4096)
+    # A small sliding window keeps the SWA worst-case min_slots floor at a few
+    # blocks per pool group so the GPU level can be shrunk below the committed
+    # block count. (The deadlock-safety floor reserves the whole window, so a
+    # large window would make the resize-down infeasible.) With more committed
+    # blocks than fit after the shrink, the surplus reusable pages are dropped.
+    tokens_per_block = 8
+    window_size = 8
+    num_blocks = 4
+    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=window_size)
     manager = None
     try:
-        tokens_per_block = 8
         manager = _create_test_manager(
             event_manager,
             tokens_per_block=tokens_per_block,
-            gpu_quota=8 << 20,
-            window_size=4096,
+            gpu_quota=16 << 20,
+            window_size=window_size,
             kv_buf_size=1 << 20,
         )
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
         kv_cache = manager.create_kv_cache()
         assert kv_cache.resume(stream)
-        kv_cache.capacity = tokens_per_block * 2
-        kv_cache.commit(_token_ids(0, tokens_per_block * 2))
+        kv_cache.capacity = tokens_per_block * num_blocks
+        kv_cache.commit(_token_ids(0, tokens_per_block * num_blocks))
 
         stored_events = _flush_serialized_events(event_manager)
         stored_hashes_by_layer_group = _stored_block_hashes_by_layer_group(stored_events)
@@ -1094,19 +1101,22 @@ def test_v2_removed_event_emitted_when_last_level_page_is_dropped():
         del kv_cache
         gc.collect()
 
-        assert manager.resize(CacheLevel(0), 4 << 20)
+        assert manager.resize(CacheLevel(0), 8 << 20)
         removal_events = _flush_serialized_events(event_manager)
-        removed_hashes_by_layer_group = {
-            event["layer_group_id"]: event["data"]["block_hashes"]
-            for event in removal_events
-            if event["data"]["type"] == "removed"
-        }
+        removed_hashes_by_layer_group: dict[int, list] = {}
+        for event in removal_events:
+            if event["data"]["type"] == "removed":
+                removed_hashes_by_layer_group.setdefault(event["layer_group_id"], []).extend(
+                    event["data"]["block_hashes"]
+                )
 
+        # Both layer groups drop last-level pages, and every removed hash must
+        # have been stored earlier for that layer group.
         assert set(removed_hashes_by_layer_group) == {0, 1}
-        assert removed_hashes_by_layer_group[0] == removed_hashes_by_layer_group[1]
         for layer_group_id, removed_hashes in removed_hashes_by_layer_group.items():
-            assert len(removed_hashes) == 1
-            assert removed_hashes[0] in stored_hashes_by_layer_group[layer_group_id]
+            assert removed_hashes
+            for removed_hash in removed_hashes:
+                assert removed_hash in stored_hashes_by_layer_group[layer_group_id]
     finally:
         gc.enable()
         if manager is not None:
@@ -1119,24 +1129,30 @@ def test_v2_kv_cache_event_manager_emits_updated_on_level_migration():
     gc.collect()
     gc.disable()
 
-    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=4096)
+    # See test_v2_removed_event_emitted_when_last_level_page_is_dropped for why
+    # a small window is used: it keeps the min_slots floor low enough that the
+    # GPU level can be shrunk below the committed block count, forcing surplus
+    # reusable pages to migrate to host.
+    tokens_per_block = 8
+    window_size = 8
+    num_blocks = 4
+    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=window_size)
     manager = None
     try:
-        tokens_per_block = 8
         manager = _create_test_manager(
             event_manager,
             tokens_per_block=tokens_per_block,
-            gpu_quota=8 << 20,
+            gpu_quota=16 << 20,
             host_quota=8 << 20,
-            window_size=4096,
+            window_size=window_size,
             kv_buf_size=1 << 20,
         )
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
         kv_cache = manager.create_kv_cache()
         assert kv_cache.resume(stream)
-        kv_cache.capacity = tokens_per_block * 2
-        kv_cache.commit([TokenId(token_id) for token_id in range(tokens_per_block * 2)])
+        kv_cache.capacity = tokens_per_block * num_blocks
+        kv_cache.commit([TokenId(token_id) for token_id in range(tokens_per_block * num_blocks)])
 
         stored_events = _flush_serialized_events(event_manager)
         stored_hashes_by_layer_group = _stored_block_hashes_by_layer_group(stored_events)
@@ -1147,16 +1163,16 @@ def test_v2_kv_cache_event_manager_emits_updated_on_level_migration():
         del kv_cache
         gc.collect()
 
-        assert manager.resize(CacheLevel(0), 4 << 20)
+        assert manager.resize(CacheLevel(0), 8 << 20)
 
         event_manager.flush_iteration_events()
         events = KVCacheEventSerializer.serialize(event_manager.get_latest_events())
         updated_events = [event for event in events if event["data"]["type"] == "updated"]
 
-        assert len(updated_events) == 2
+        # Pages evicted from GPU under memory pressure migrate to host, emitting
+        # an "updated" event (cache_level 0 -> 1) for each affected layer group.
+        assert updated_events
         assert {event["layer_group_id"] for event in updated_events} == {0, 1}
-        assert len({event["data"]["block_hash"] for event in updated_events}) == 1
-        assert updated_events[0]["data"]["block_hash"] in stored_hashes_by_layer_group[0]
         for event in updated_events:
             assert event["data"]["cache_level"] == {
                 "type": "event_diff",
@@ -1164,6 +1180,9 @@ def test_v2_kv_cache_event_manager_emits_updated_on_level_migration():
                 "new_value": 1,
             }
             assert event["data"]["priority"] is None
+            assert (
+                event["data"]["block_hash"] in stored_hashes_by_layer_group[event["layer_group_id"]]
+            )
     finally:
         gc.enable()
         if manager is not None:

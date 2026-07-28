@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 
@@ -5,6 +7,86 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
+
+# 2D block edge of FP8 block-scale tensors (weight_scale_inv), matching
+# FP8BlockScalesLinearMethod.
+_FP8_BLOCK_SIZE = 128
+
+
+def grouped_to_dense_in_proj_qkvz_perm(num_k_heads: int, head_k_dim: int,
+                                       num_v_heads: int, head_v_dim: int,
+                                       tp_size: int) -> torch.Tensor:
+    """Row permutation from grouped-interleaved in_proj_qkvz to dense [Q|K|V|Z].
+
+    HF GDN checkpoints pack in_proj_qkvz rows per key-head group as
+    [q_g | k_g | v_g | z_g]. The GDN mixer consumes the projection as plain
+    column slices (mixed_qkv = [Q|K|V], then z), which requires the dense
+    row order [all Q | all K | all V | all Z]. Rows are permuted per TP-rank
+    chunk so the column-parallel contiguous row split still hands each rank
+    its own heads.
+    """
+    assert num_k_heads % tp_size == 0 and num_v_heads % tp_size == 0
+    ng = num_k_heads // tp_size
+    ratio = num_v_heads // num_k_heads
+    dk, rdv = head_k_dim, ratio * head_v_dim
+    group_size = 2 * dk + 2 * rdv
+    base = torch.arange(ng).unsqueeze(1) * group_size
+    q = (base + torch.arange(dk)).flatten()
+    k = (base + dk + torch.arange(dk)).flatten()
+    v = (base + 2 * dk + torch.arange(rdv)).flatten()
+    z = (base + 2 * dk + rdv + torch.arange(rdv)).flatten()
+    rank_perm = torch.cat([q, k, v, z])
+    rank_rows = ng * group_size
+    return torch.cat([rank_perm + rank * rank_rows for rank in range(tp_size)])
+
+
+def grouped_to_dense_in_proj_ba_perm(num_k_heads: int, num_v_heads: int,
+                                     tp_size: int) -> torch.Tensor:
+    """Row permutation from grouped-interleaved in_proj_ba to dense [b|a]."""
+    assert num_k_heads % tp_size == 0 and num_v_heads % tp_size == 0
+    ng = num_k_heads // tp_size
+    ratio = num_v_heads // num_k_heads
+    base = torch.arange(ng).unsqueeze(1) * (2 * ratio)
+    b = (base + torch.arange(ratio)).flatten()
+    a = (base + ratio + torch.arange(ratio)).flatten()
+    rank_perm = torch.cat([b, a])
+    rank_rows = ng * 2 * ratio
+    return torch.cat([rank_perm + rank * rank_rows for rank in range(tp_size)])
+
+
+def _rows_to_scale_block_perm(perm: torch.Tensor, block: int) -> torch.Tensor:
+    """Derive the permutation of `block`-row scale blocks implied by a row
+    permutation, requiring the row permutation to move whole aligned blocks."""
+    if perm.numel() <= block:
+        # A single scale block covers every row: any within-block row
+        # permutation leaves the (one-row) scale tensor unchanged.
+        return torch.zeros(1, dtype=torch.long)
+    assert perm.numel() % block == 0, (
+        f"row permutation of {perm.numel()} rows is not divisible by the "
+        f"scale block size {block}")
+    blocks = perm.view(-1, block)
+    firsts = blocks[:, :1]
+    assert torch.equal(blocks, firsts + torch.arange(block)) and \
+        (firsts % block == 0).all(), (
+        "in_proj row permutation must move whole aligned scale blocks to "
+        "permute block-scale tensors; head dims must be multiples of "
+        f"{block}")
+    return firsts.squeeze(1) // block
+
+
+def _permute_rows(tensor: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
+    """Reorder dim-0 rows of a (possibly lazy safetensors) tensor.
+
+    Goes through a uint8 view so packed/quantized dtypes (float8, packed FP4
+    uint8) reorder identically to plain floats.
+    """
+    t = tensor[...] if not isinstance(tensor, torch.Tensor) else tensor
+    squeeze = t.dim() == 1
+    if squeeze:
+        t = t.unsqueeze(1)
+    u8 = t.contiguous().view(torch.uint8)
+    out = u8[perm].view(t.dtype)
+    return out.squeeze(1) if squeeze else out
 
 
 @register_mapper("HF", "Qwen3NextForCausalLM")
@@ -39,6 +121,41 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
             return processed_weights
 
         return weights
+
+    def _permute_in_proj_to_dense(self, key: str, tensor, tp_size: int):
+        """Reorder one in_proj_qkvz / in_proj_ba tensor to the dense layout.
+
+        Row tensors (weight of any dtype including packed FP4, per-row
+        scales, bias) are permuted directly; FP8 2D-block ``weight_scale_inv``
+        tensors are permuted at scale-block granularity; scalar per-tensor
+        scales pass through unchanged.
+        """
+        config = self.config.pretrained_config
+        if ".in_proj_qkvz." in key:
+            perm = grouped_to_dense_in_proj_qkvz_perm(
+                config.linear_num_key_heads, config.linear_key_head_dim,
+                config.linear_num_value_heads, config.linear_value_head_dim,
+                tp_size)
+        elif ".in_proj_ba." in key:
+            perm = grouped_to_dense_in_proj_ba_perm(
+                config.linear_num_key_heads, config.linear_num_value_heads,
+                tp_size)
+        else:
+            return tensor
+
+        t = tensor[...] if not isinstance(tensor, torch.Tensor) else tensor
+        if t.dim() == 0 or t.numel() == 1:
+            return t
+        rows = perm.numel()
+        if t.shape[0] == rows:
+            return _permute_rows(t, perm)
+        if key.endswith("weight_scale_inv") and \
+                t.shape[0] == math.ceil(rows / _FP8_BLOCK_SIZE):
+            return _permute_rows(
+                t, _rows_to_scale_block_perm(perm, _FP8_BLOCK_SIZE))
+        raise ValueError(
+            f"Cannot map {key} with shape {tuple(t.shape)} onto the dense "
+            f"in_proj layout ({rows} rows expected)")
 
     def preprocess_weights(self, weights: dict) -> dict:
         config = self.config.pretrained_config
@@ -86,9 +203,13 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
                 w = w.to(torch.float32)
                 new_weights[key] = w
             elif "in_proj" in key:
-                # Don't need to split in_proj weight based on the implementation of reference.
-                # Need to know the reason.
-                new_weights[key] = weights[name]
+                # in_proj stays unsplit here (the column-parallel Linear
+                # splits contiguous row chunks itself); rows are reordered
+                # from the checkpoint's grouped-interleaved layout to the
+                # dense per-rank [Q|K|V|Z] / [b|a] layout the GDN mixer
+                # slices at runtime.
+                new_weights[key] = self._permute_in_proj_to_dense(
+                    key, weights[name], tp_size)
             elif "conv1d" in key:
                 w = weights[name]
                 # removing dim(1) because we are using Linear to store conv1d weights

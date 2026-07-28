@@ -1221,7 +1221,14 @@ class AutoTuner:
             candidates.append(
                 (runner_id, runner, runner_arg_names, all_valid_tactics))
 
-        if total_pairs == 1:
+        # MERGE/PARALLEL strategies rely on comparing per-rank timings to
+        # pick the winning tactic across ranks. If a rank's local set of
+        # tactics has only one entry we must still time it — the shortcut
+        # would record min_time=0.0, which collides with peer ranks' 0.0
+        # in the tie-break and silently drops slower tactics on the floor.
+        if total_pairs == 1 and tuning_config.distributed_tuning_strategy not in (
+                DistributedTuningStrategy.MERGE,
+                DistributedTuningStrategy.PARALLEL):
             # Single-pair shortcut. There is nothing to compare against, so
             # the timed warmup + profile-repeat loop is pure overhead. We
             # fire one forward call on every rank to drive any JIT side

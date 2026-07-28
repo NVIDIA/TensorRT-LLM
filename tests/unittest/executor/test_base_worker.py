@@ -176,7 +176,9 @@ class TestRpcWorkerBaseTP2:
         self.session = self.create_worker_session()
 
     def create_worker_session(self):
-        session = MpiPoolSession(n_workers=2)
+        # wait_shutdown: block shutdown until the workers exited, so a test
+        # handed a live pool right after this one cannot race the GPU release.
+        session = MpiPoolSession(n_workers=2, wait_shutdown=True)
         return session
 
     @pytest.mark.gpu2

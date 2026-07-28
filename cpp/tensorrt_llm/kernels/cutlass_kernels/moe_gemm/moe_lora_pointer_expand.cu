@@ -60,7 +60,7 @@ __device__ inline void expandOneModule(
     mod.ranks_out[i] = rank;
 }
 
-// Reset one module's output slot to a rank-0 no-op. The device-path scratch is
+// Reset one module's output slot to a rank-0 no-op. The grouped-GEMM scratch is
 // persistent and reused, so ghost rows must be explicitly zeroed; otherwise
 // stale ranks or pointers survive into the next grouped GEMM.
 __device__ inline void zeroOneModule(MoeLoraExpandModule const& mod, int64_t i)

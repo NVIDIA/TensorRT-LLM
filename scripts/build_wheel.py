@@ -135,8 +135,10 @@ def create_venv(project_dir: Path):
     return venv_prefix
 
 
-def setup_venv(project_dir: Path, requirements_file: Path,
-               no_venv: bool) -> tuple[Path, Path]:
+def setup_venv(project_dir: Path,
+               requirements_file: Path,
+               no_venv: bool,
+               yes: bool = False) -> tuple[Path, Path]:
     """Creates/updates a venv and installs requirements.
 
     Args:
@@ -170,7 +172,8 @@ def setup_venv(project_dir: Path, requirements_file: Path,
                 f"`build_wheel.py` can recreate a virtual environment using container-provided PyTorch installation."
             )
             print("^^^^^^^^^^ IMPORTANT WARNING ^^^^^^^^^^", file=sys.stderr)
-            input("Press Ctrl+C to stop, any key to continue...\n")
+            if not yes:
+                input("Press Ctrl+C to stop, any key to continue...\n")
 
         # Ensure inherited PyTorch version is compatible
         try:
@@ -261,9 +264,18 @@ def setup_conan(scripts_dir, venv_python):
     return venv_conan
 
 
+def _fmha_generation_stamp(fmha_v2_cu_dir: Path) -> Path:
+    # Written as the last step of generate_fmha_cu; its absence means a
+    # previous generation was interrupted and the directory contents cannot
+    # be trusted (the bare directory exists from the moment generation
+    # starts).
+    return fmha_v2_cu_dir / ".generation_complete"
+
+
 def generate_fmha_cu(project_dir, venv_python):
     fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
     fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
+    _fmha_generation_stamp(fmha_v2_cu_dir).unlink(missing_ok=True)
 
     fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
 
@@ -313,12 +325,19 @@ def generate_fmha_cu(project_dir, venv_python):
         move_if_updated(cu_file, dst_file)
         generated_files.add(str(dst_file.resolve()))
 
+    if not generated_files:
+        raise RuntimeError(
+            f"FMHA generation produced no *_sm*.cu files in {fmha_v2_cu_dir}; "
+            "generation may have failed silently.")
+
     # Remove extra files
     for root, _, files in os.walk(fmha_v2_cu_dir):
         for file in files:
             file_path = os.path.realpath(os.path.join(root, file))
             if file_path not in generated_files:
                 os.remove(file_path)
+
+    _fmha_generation_stamp(fmha_v2_cu_dir).touch()
 
 
 def create_cuda_stub_links(cuda_stub_dir: str, missing_libs: list[str]) -> str:
@@ -486,7 +505,6 @@ def main(*,
          job_count: int = None,
          extra_cmake_vars: Sequence[str] = tuple(),
          extra_make_targets: str = "",
-         trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
          nixl_root: str = None,
          mooncake_root: str = None,
@@ -502,7 +520,6 @@ def main(*,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
-         benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
          skip_stubs: bool = False,
@@ -511,7 +528,8 @@ def main(*,
          nvrtc_dynamic_linking: bool = False,
          mypyc: bool = False,
          require_dynamic_attributions: bool = False,
-         plat_name: Optional[str] = None):
+         plat_name: Optional[str] = None,
+         yes: bool = False):
 
     if clean:
         clean_wheel = True
@@ -535,22 +553,8 @@ def main(*,
     # Setup venv and install requirements
     venv_python, venv_conan = setup_venv(project_dir,
                                          project_dir / requirements_filename,
-                                         no_venv)
-
-    # Ensure base TRT is installed (check inside the venv)
-    try:
-        check_output([str(venv_python), "-m", "pip", "show", "tensorrt"])
-    except CalledProcessError:
-        error_msg = "TensorRT was not installed properly."
-        if on_windows:
-            error_msg += (
-                " Please download the TensorRT zip file manually,"
-                " install it and relaunch build_wheel.py."
-                " See https://docs.nvidia.com/deeplearning/tensorrt/install-guide/index.html#installing-zip for more details."
-            )
-        else:
-            error_msg += f" Please install tensorrt into the venv using \"`{venv_python}` -m pip install tensorrt\" and relaunch build_wheel.py"
-        raise RuntimeError(error_msg)
+                                         no_venv,
+                                         yes=yes)
 
     if cuda_architectures is not None:
         if "70-real" in cuda_architectures:
@@ -607,9 +611,6 @@ def main(*,
         # Don't include duplicate conditions
         cmake_def_args.extend(set(extra_cmake_vars))
 
-    if trt_root is not None:
-        cmake_def_args.append(f"-DTensorRT_ROOT={trt_root}")
-
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
 
@@ -665,7 +666,7 @@ def main(*,
                 "-- BOLT: Forcing NVRTC_DYNAMIC_LINKING=ON (static NVIDIA libs lack relocations)"
             )
 
-    targets = ["tensorrt_llm", "nvinfer_plugin_tensorrt_llm"]
+    targets = ["tensorrt_llm"]
 
     if cpp_only:
         build_pyt = "OFF"
@@ -682,9 +683,6 @@ def main(*,
         build_deep_gemm = "ON"
         build_flash_mla = "ON"
 
-    if benchmarks:
-        targets.append("benchmarks")
-
     if micro_benchmarks:
         targets.append("micro_benchmarks")
         build_micro_benchmarks = "ON"
@@ -693,13 +691,11 @@ def main(*,
 
     disable_nvtx = "OFF" if nvtx else "ON"
 
-    if not on_windows:
-        targets.append("executorWorker")
-
     source_dir = get_source_dir()
 
     fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
-    if clean or generate_fmha or not fmha_v2_cu_dir.exists():
+    if (clean or generate_fmha
+            or not _fmha_generation_stamp(fmha_v2_cu_dir).exists()):
         generate_fmha_cu(project_dir, venv_python)
 
     with working_directory(build_dir):
@@ -822,18 +818,47 @@ def main(*,
 
         # Helper function to resolve symlinks and copy actual content
         def copy_resolving_symlink(src_path, dst_path):
-            """Copy file or directory, resolving symlinks to copy actual content."""
+            """Copy file or directory, resolving symlinks to copy actual content.
+
+            Skips the copy when dst already exists and a stamp file confirms the
+            previous copy completed successfully, and the stamp is at least as new
+            as src.  Using a stamp (rather than dst mtime) avoids two pitfalls:
+            - Directory mtime on Linux only reflects direct-child changes, not
+              deeply nested ones, so a modified source file may not update it.
+            - An interrupted copy leaves dst with a fresh mtime that would
+              incorrectly satisfy an mtime check, causing the next build to skip.
+            """
             if src_path.is_symlink():
                 resolved_src = src_path.resolve()
             else:
                 resolved_src = src_path
 
             if resolved_src.is_dir():
-                if dst_path.exists():
+                stamp = dst_path.parent / f".{dst_path.name}.stamp"
+                if dst_path.exists() and stamp.exists():
+                    if stamp.stat().st_mtime >= resolved_src.stat().st_mtime:
+                        return  # destination is up to date
                     rmtree(dst_path)
-                # Use symlinks=False (default) to follow symlinks and copy actual content
-                # This ensures nested symlinks are also resolved
-                copytree(resolved_src, dst_path, symlinks=False)
+                elif dst_path.exists():
+                    rmtree(
+                        dst_path)  # dst exists but no stamp — interrupted copy
+                stamp.unlink(missing_ok=True)
+                # Shell out to cp -rL: dereferences symlinks like copytree(symlinks=False)
+                # but uses kernel-level copy primitives, which is significantly faster
+                # than Python's file-by-file copytree on network-mounted filesystems.
+                # Fall back to copytree if cp is unavailable (non-Linux or minimal containers).
+                cp_bin = shutil.which("cp")
+                if cp_bin is not None:
+                    try:
+                        run([cp_bin, "-rL",
+                             str(resolved_src),
+                             str(dst_path)],
+                            check=True)
+                    except FileNotFoundError:
+                        copytree(resolved_src, dst_path, symlinks=False)
+                else:
+                    copytree(resolved_src, dst_path, symlinks=False)
+                stamp.touch()
             else:
                 if dst_path.is_dir():
                     dst_path = dst_path / src_path.name
@@ -898,18 +923,11 @@ def main(*,
                      lib_dir / "tensorrt_llm.dll")
         install_file(build_dir / f"tensorrt_llm/thop/th_common.dll",
                      lib_dir / "th_common.dll")
-        install_file(
-            build_dir / f"tensorrt_llm/plugins/nvinfer_plugin_tensorrt_llm.dll",
-            lib_dir / "nvinfer_plugin_tensorrt_llm.dll")
     else:
         install_file(build_dir / "tensorrt_llm/libtensorrt_llm.so",
                      lib_dir / "libtensorrt_llm.so")
         install_file(build_dir / "tensorrt_llm/thop/libth_common.so",
                      lib_dir / "libth_common.so")
-        install_file(
-            build_dir /
-            "tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so",
-            lib_dir / "libnvinfer_plugin_tensorrt_llm.so")
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
@@ -994,23 +1012,9 @@ def main(*,
         clear_folder(deep_gemm_dir)
         deep_gemm_dir.rmdir()
 
-    bin_dir = pkg_dir / "bin"
-    if bin_dir.exists():
-        clear_folder(bin_dir)
-    bin_dir.mkdir(parents=True, exist_ok=True)
-
-    if not on_windows:
-        install_file(build_dir / "tensorrt_llm/executor_worker/executorWorker",
-                     bin_dir / "executorWorker")
-
     scripts_dir = pkg_dir / "scripts"
     if scripts_dir.exists():
         clear_folder(scripts_dir)
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-
-    if not on_windows:
-        install_file(project_dir / "docker/common/install_tensorrt.sh",
-                     scripts_dir / "install_tensorrt.sh")
 
     if not cpp_only:
 
@@ -1239,10 +1243,6 @@ def add_arguments(parser: ArgumentParser):
         help="Additional make targets to build. Example: \"target_1 target_2\"",
         nargs="+",
         default=[])
-    parser.add_argument(
-        "--trt_root",
-        default="/usr/local/tensorrt",
-        help="Directory containing TensorRT headers and libraries")
     parser.add_argument("--nccl_root",
                         help="Directory containing NCCL headers and libraries")
     parser.add_argument("--nixl_root",
@@ -1279,9 +1279,6 @@ def add_arguments(parser: ArgumentParser):
         help=
         "Install the built binary by creating symbolic links instead of copying files"
     )
-    parser.add_argument("--benchmarks",
-                        action="store_true",
-                        help="Build the benchmarks for the C++ runtime")
     parser.add_argument("--micro_benchmarks",
                         action="store_true",
                         help="Build the micro benchmarks for C++ components")
@@ -1324,6 +1321,14 @@ def add_arguments(parser: ArgumentParser):
         type=_plat_name_type,
         help=
         "Wheel platform tag passed to bdist_wheel --plat-name (e.g. linux_x86_64, manylinux_2_28_x86_64)"
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        default=False,
+        help=
+        "Skip interactive confirmation prompts (useful for non-interactive builds)",
     )
 
 

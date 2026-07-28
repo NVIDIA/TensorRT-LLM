@@ -31,7 +31,8 @@ from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
 from .postprocessor_hook import PostProcessorHook, apply_post_processor_hook
-from .utils import ErrorResponse, has_event_loop, is_llm_response
+from .utils import (EngineDeadError, ErrorResponse, has_event_loop,
+                    is_llm_response)
 
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
@@ -191,6 +192,10 @@ class GenerationResultBase:
         # None indicates not yet available (e.g., before first step/stream).
         self.avg_decoded_tokens_per_iter: Optional[float] = None
         self._done = False
+        # Sticky terminal exception (e.g. EngineDeadError). Once set, the result
+        # is permanently failed: result()/aresult()/_exception() re-raise it on
+        # every subsequent call instead of looking successful.
+        self._terminal_error: Optional[BaseException] = None
         self._aborted = False
         self.metrics_dict = {}
         self.candidate_metrics: list[dict] = []
@@ -290,10 +295,21 @@ class GenerationResultBase:
         output = self._outputs[seq_idx]
         output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
+        output._last_logprobs_len = len(output.logprobs)
+        decoder_output_prefix = ()
+        if (self.sampling_params.exclude_input_from_output
+                or getattr(self, "_streaming", False)):
+            decoder_output_prefix = \
+                self.sampling_params._decoder_output_token_prefix
         if self.sampling_params.use_beam_search:
             # Beam search enforces returning all generated tokens
-            output.token_ids = response_tensors.output_token_ids[src_idx]
+            output.token_ids = [
+                *decoder_output_prefix,
+                *response_tensors.output_token_ids[src_idx],
+            ]
         else:
+            if decoder_output_prefix and not output.token_ids:
+                output.token_ids.extend(decoder_output_prefix)
             output.token_ids.extend(response_tensors.output_token_ids[src_idx])
 
         if response_tensors.cum_log_probs is not None:
@@ -305,16 +321,15 @@ class GenerationResultBase:
         # generation logprobs handling (provenance varies by backend)
         if logprobs_result and logprobs_result.generation is not None:  # TRT backend
             # update logprobs from ResponseWrapper (TRT top logprobs WAR)
-            output._last_logprobs_len = len(output.logprobs)
             output.logprobs += logprobs_result.generation
         elif response_tensors.log_probs is not None:  # PyTorch backend
             # handle logprobs directly from response tensors given by sampler
-            output._last_logprobs_len = len(output.logprobs)
-            # In streaming mode, since out-of-order responses are not possible,
-            # each streamed response_tensors.log_probs[src_idx]
-            # contains a streamwise monotonically growing list of logprobs.
-            # so we need to accumulate only the new ones unique to that particular streamed response
-            if self.use_trtllm_sampler:
+            if decoder_output_prefix and self.sampling_params.use_beam_search:
+                output.logprobs = [
+                    *self._get_decoder_output_prefix_logprobs(),
+                    *response_tensors.log_probs[src_idx],
+                ]
+            elif self.use_trtllm_sampler:
                 assert output._last_logprobs_len <= len(
                     response_tensors.log_probs[src_idx]
                 ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
@@ -322,6 +337,9 @@ class GenerationResultBase:
                 output.logprobs += response_tensors.log_probs[src_idx][
                     output._last_logprobs_len:]
             else:
+                if decoder_output_prefix and not output.logprobs:
+                    output.logprobs.extend(
+                        self._get_decoder_output_prefix_logprobs())
                 output.logprobs += response_tensors.log_probs[src_idx]
 
             # overcome some WAR in the cpp executor
@@ -421,6 +439,13 @@ class GenerationResultBase:
         # Tracing is recorded once when the entire request is done.
         if self._done:
             self.do_tracing(output, req_perf_metrics_dict)
+
+    def _get_decoder_output_prefix_logprobs(
+            self) -> TokenLogprobs | SimpleTokenLogprobs:
+        prefix = self.sampling_params._decoder_output_token_prefix
+        if self.sampling_params.logprobs_simple_format:
+            return [0.0] * len(prefix)
+        return [{token_id: Logprob(logprob=0.0, rank=1)} for token_id in prefix]
 
     @print_traceback_on_error
     @nvtx_range_debug("handle_response",
@@ -990,26 +1015,60 @@ class GenerationResult(GenerationResultBase):
         return response
 
     def _result_step(self, timeout: Optional[float] = None):
-        response = self.queue.get()
+        # Honor `timeout`: a bounded `queue.get()` lets the caller regain control if the executor
+        # worker dies silently without pushing a terminal response, instead of blocking potentially
+        # indefinitely.
+        # Raises `queue.Empty` on timeout; `result()` turns that into a `TimeoutError`.
+        response = self.queue.get(timeout=timeout)
+        # Fast-fail: when a worker dies, the proxy enqueues EngineDeadError onto
+        # every pending result so this get() unblocks instead of hanging forever
+        # on a queue whose producer is gone. Record it as the sticky terminal
+        # error and mark the result done before raising, so subsequent
+        # result()/aresult()/_exception() calls keep surfacing the failure
+        # instead of re-blocking on an empty queue or looking successful.
+        if isinstance(response, EngineDeadError):
+            self._terminal_error = response
+            self._done = True
+            raise response
         self._handle_response(response)
 
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
         response = await self.aqueue.get()
         global_tracer().log_instant("result_step.get")
+        if isinstance(response, EngineDeadError):
+            self._terminal_error = response
+            self._done = True
+            raise response
         self._handle_response(response)
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         """Wait for the completion of the request, and return the result.
 
         Args:
-            timeout (float, optional): Timeout. Defaults to None.
+            timeout (float, optional): The maximum number of seconds to wait for the request to
+                complete. `None` (default) waits indefinitely.
+                The timeout is a total budget across all streaming steps, not per-step.
 
         Returns:
             tensorrt_llm.executor.result.GenerationResult: generation result.
+
+        Raises:
+            TimeoutError: If the request does not complete within `timeout` seconds. Bounding the
+                wait prevents a silently-dead executor worker from hanging the caller forever.
         """
+        if self._terminal_error is not None:
+            raise self._terminal_error
+        deadline = None if timeout is None else time.monotonic() + timeout
         while not self._done:
-            self._result_step(timeout)
+            remaining = (None if deadline is None else max(
+                0.0, deadline - time.monotonic()))
+            try:
+                self._result_step(remaining)
+            except Empty:
+                raise TimeoutError(
+                    f"Request {self.request_id} did not complete within "
+                    f"{timeout} seconds.") from None
         return self
 
     async def aresult(self) -> "GenerationResult":
@@ -1018,6 +1077,8 @@ class GenerationResult(GenerationResultBase):
         Returns:
             tensorrt_llm.executor.result.GenerationResult: generation result.
         """
+        if self._terminal_error is not None:
+            raise self._terminal_error
         while not self._done:
             await self._aresult_step()
         return self
@@ -1029,6 +1090,8 @@ class GenerationResult(GenerationResultBase):
         return self
 
     def __next__(self):
+        if self._terminal_error is not None:
+            raise self._terminal_error
         if self._done:
             raise StopIteration
 
@@ -1039,6 +1102,8 @@ class GenerationResult(GenerationResultBase):
         return self
 
     async def __anext__(self):
+        if self._terminal_error is not None:
+            raise self._terminal_error
         if self._done:
             raise StopAsyncIteration
 

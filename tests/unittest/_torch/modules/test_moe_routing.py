@@ -7,7 +7,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -795,15 +794,17 @@ def _perfect_router_worker(parallel_mode, routing_name, num_tokens, dtype,
 
         # Simulate per-rank token-count skew so each rank exercises a
         # different cache key (num_tokens, routing_method, dtype, ep_size).
-        # DEP processes its own share of tokens per rank; TEP replicates
-        # input across ranks so keep a uniform list there.
-        if parallel_mode == "DEP":
+        # When attention uses DP (parallel_mode starts with "D"), each rank
+        # processes its own token share; otherwise all ranks see the same
+        # token count so pass a single-element list.
+        if parallel_mode[0] == "D":
             all_rank_num_tokens = [
                 num_tokens + i for i in range(mapping.world_size)
             ]
+            my_num_tokens = all_rank_num_tokens[mapping.rank]
         else:
-            all_rank_num_tokens = [num_tokens] * mapping.world_size
-        my_num_tokens = all_rank_num_tokens[mapping.rank]
+            all_rank_num_tokens = [num_tokens]
+            my_num_tokens = num_tokens
 
         model_config = ModelConfig(pretrained_config=pretrained_config,
                                    mapping=mapping,
@@ -889,14 +890,66 @@ _PERFECT_ROUTER_ROUTING_SPECS = {
 _PERFECT_ROUTER_ROUTING_NAMES = list(_PERFECT_ROUTER_ROUTING_SPECS)
 
 
+def _reset_perfect_router_comm_state() -> None:
+    """Reset process-global router/comm state between reused-pool cases.
+
+    The shared module-scoped ``mpi_pool_executor`` keeps one set of worker
+    processes alive across cases, so process-global state that the original
+    per-case ``MPIPoolExecutor`` used to discard on teardown must be cleared
+    explicitly. This matches the fresh-process semantics of the previous
+    per-case executor (NVLink one-sided keeps a symmetric-memory workspace
+    singleton keyed by shape, which would otherwise be reused across cases
+    with different shapes).
+    """
+    import gc
+
+    from tensorrt_llm._torch.modules.fused_moe import routing as moe_routing
+
+    # Wait for any in-flight GPU work first. This teardown runs from a
+    # ``finally`` block, so on the error path a worker may raise while kernels
+    # are still running; clearing the cache / NVLink symmetric-memory
+    # workspaces before syncing could free memory that is still in use.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    moe_routing._PERFECT_ROUTER_LOGITS_CACHE.clear()
+    try:
+        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import \
+            NVLinkOneSided as _NVOS
+    except ImportError:
+        _NVOS = None
+    if _NVOS is not None:
+        for _attr in ("_WORKSPACES", "_WORKSPACE_REFCOUNTS"):
+            _d = getattr(_NVOS, _attr, None)
+            if isinstance(_d, dict):
+                _d.clear()
+        if hasattr(_NVOS, "_WORKSPACE"):
+            _NVOS._WORKSPACE = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _perfect_router_worker_entry(*worker_args) -> None:
+    """Run one perfect-router case, then reset state for the reused worker."""
+    try:
+        _perfect_router_worker(*worker_args)
+    finally:
+        _reset_perfect_router_comm_state()
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
+@pytest.mark.threadleak(
+    enabled=False)  # module-scoped MPIPoolExecutor persists by design
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
 @pytest.mark.parametrize("parallel_mode", ["DEP", "TEP"])
 @pytest.mark.parametrize("routing_name", _PERFECT_ROUTER_ROUTING_NAMES)
 @pytest.mark.parametrize("num_tokens", [8, 32, 64])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_perfect_router_load_balanced_multi_gpu(parallel_mode, routing_name,
-                                                num_tokens, dtype):
+                                                num_tokens, dtype,
+                                                mpi_pool_executor) -> None:
     """Verify ENABLE_PERFECT_ROUTER produces balanced EP dispatch on 4 GPUs.
 
     Covers both DEP (attention DP + MoE EP) and TEP (attention TP + MoE EP)
@@ -912,15 +965,14 @@ def test_perfect_router_load_balanced_multi_gpu(parallel_mode, routing_name,
       5. For flat routers, verifies the final receiver-GPU coverage without
          depending on a stable intra-token top-k order.
     """
-    world_size = 4
-    with MPIPoolExecutor(max_workers=world_size) as executor:
-        results = executor.map(
-            _perfect_router_worker,
-            *zip(*[(parallel_mode, routing_name, num_tokens, dtype,
-                    world_size)] * world_size),
-        )
-        for r in results:
-            assert r is None
+    world_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        _perfect_router_worker_entry,
+        *zip(*[(parallel_mode, routing_name, num_tokens, dtype, world_size)] *
+             world_size),
+    )
+    for r in results:
+        assert r is None
 
 
 if __name__ == '__main__':

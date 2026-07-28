@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Tests for request_utils.py functions.
 
 This module tests:
@@ -6,20 +9,25 @@ This module tests:
 
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.request_utils import (
+    RequestBroadcaster,
+    attach_py_objects_to_requests,
     can_process_attention_dp_request,
     derive_attention_dp_per_rank_request_cap,
+    executor_request_to_llm_request,
     get_from_waiting_queue,
     merge_helix_requests,
     merge_requests,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
+from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.mapping import CpType
 
 
@@ -56,6 +64,73 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
     mock_request.input_token_ids = [1, 2, 3]
 
     return mock_request
+
+
+def test_request_broadcaster_collects_conversation_params_with_none():
+    conversation_params = ConversationParams(conversation_id="conv")
+    source_items = [
+        RequestQueueItem(1, SimpleNamespace(py_conversation_params=conversation_params)),
+        RequestQueueItem(2, SimpleNamespace(py_conversation_params=None)),
+    ]
+
+    py_request_objects = RequestBroadcaster._collect_py_objects(None, source_items)
+
+    py_objects = dict(py_request_objects)
+    assert py_objects["py_conversation_params"] == {
+        1: conversation_params,
+        2: None,
+    }
+
+    target_items = [
+        RequestQueueItem(1, SimpleNamespace()),
+        RequestQueueItem(2, SimpleNamespace()),
+    ]
+    attach_py_objects_to_requests(target_items, py_request_objects)
+
+    assert target_items[0].request.py_conversation_params is conversation_params
+    assert hasattr(target_items[1].request, "py_conversation_params")
+    assert target_items[1].request.py_conversation_params is None
+
+
+def test_request_broadcaster_requires_conversation_params_attr():
+    source_items = [RequestQueueItem(1, SimpleNamespace())]
+
+    with pytest.raises(AttributeError):
+        RequestBroadcaster._collect_py_objects(None, source_items)
+
+
+def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> None:
+    request_id = 42
+    first_gen_tokens = [100]
+    draft_tokens = [101, 102, 103]
+    context_phase_params = trtllm.ContextPhaseParams(
+        first_gen_tokens,
+        request_id,
+        None,
+        draft_tokens,
+        None,
+        None,
+    )
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        type=trtllm.RequestType.REQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=context_phase_params,
+    )
+
+    llm_request = executor_request_to_llm_request(
+        request_id,
+        executor_request,
+        child_req_ids=[],
+        exclude_last_generation_logits=False,
+    )
+
+    assert llm_request.is_generation_only_request()
+    assert llm_request.has_draft_tokens()
+    assert llm_request.num_draft_tokens == len(draft_tokens)
+    assert llm_request.draft_tokens == draft_tokens
+    assert llm_request.py_draft_tokens == draft_tokens
+    assert llm_request.context_phase_params.draft_tokens == draft_tokens
 
 
 def test_merge_helix_requests_with_padding():

@@ -32,8 +32,8 @@ class CudaGraphState:
 
     # Indicates that captured-graph wrappers must short-circuit to eager.
     # Set by ad_executor.maybe_pad_for_cuda_graph under attention-DP mixed mode
-    # so all ranks read kwargs (e.g. batch_info_host slot 14) consistently
-    # instead of using stale capture-time scalar kernel args. See
+    # so all ranks size the MoE all-to-all dispatch consistently from the live
+    # input shape instead of using stale capture-time scalar kernel args. See
     # BypassCapturedGraphs() below.
     BYPASS: bool = False
 
@@ -84,10 +84,10 @@ def BypassCapturedGraphs():
     when the cross-rank ``tp_allgather`` vote says some ranks must run eager (e.g.
     one rank is in prefill while others are in decode), all ranks enter this
     context for the call so captured graphs whose shapes happen to match are
-    bypassed too. Otherwise the captured kernel-launch args (notably the
-    ``int(batch_info_host[14].item())`` baked at capture time, where slot 14
-    holds ``max_dp_num_tokens`` per ``BatchInfo``) would diverge from the eager
-    ranks' fresh reads, corrupting the ``MoeAlltoAll`` collective.
+    bypassed too. Otherwise the captured kernel-launch args (notably the MoE
+    all-to-all ``runtime_max_tokens_per_rank``, derived from the capture-time
+    input shape) would diverge from the eager ranks' fresh reads, corrupting the
+    ``MoeAlltoAll`` collective.
     """
     cuda_graph_state.begin_bypass()
     try:

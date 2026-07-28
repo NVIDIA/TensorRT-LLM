@@ -15,6 +15,8 @@
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -45,21 +47,239 @@ def _load_generator() -> ModuleType:
     return module
 
 
-def _golden_path() -> Path:
-    return _repo_root() / "tensorrt_llm/usage/llm_args_golden_manifest.json"
+def _load_manifest_generator() -> ModuleType:
+    module_path = _repo_root() / "scripts/generate_llm_args_golden_manifest.py"
+    spec = importlib.util.spec_from_file_location("generate_llm_args_golden_manifest", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sample_manifest() -> dict[str, list[dict[str, object]]]:
+    # Keep both mapping levels unsorted so the test exercises recursive key sorting.
+    return {
+        "TrtLlmArgs": [],
+        "TorchLlmArgs": [
+            {
+                "path": "flag",
+                "kind": "value",
+                "converter": "",
+                "annotation": "<class 'bool'>",
+                "allowed_values": [],
+            }
+        ],
+    }
+
+
+def test_manifest_generator_write_is_canonical_and_idempotent(tmp_path, monkeypatch):
+    generator = _load_manifest_generator()
+    monkeypatch.setattr(generator, "golden_manifest", _sample_manifest)
+    manifest_path = tmp_path / "manifest.json"
+    canonical = json.dumps(_sample_manifest(), indent=2, sort_keys=True) + "\n"
+
+    assert generator._write_manifest(manifest_path)
+    assert manifest_path.read_text() == canonical
+    assert not generator._write_manifest(manifest_path)
+    assert generator._check_manifest(manifest_path)
+
+    manifest_path.write_bytes(canonical.replace("\n", "\r\n").encode())
+    assert not generator._check_manifest(manifest_path)
+    assert generator._write_manifest(manifest_path)
+    assert manifest_path.read_bytes() == canonical.encode()
+
+
+def test_manifest_generator_check_reports_unified_diff(tmp_path, monkeypatch, capfd):
+    generator = _load_manifest_generator()
+    monkeypatch.setattr(generator, "golden_manifest", _sample_manifest)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text('{"stale": true}\n')
+
+    assert not generator._check_manifest(manifest_path)
+    stderr = capfd.readouterr().err
+    assert f"--- {manifest_path} (committed)" in stderr
+    assert f"+++ {manifest_path} (generated)" in stderr
+    assert '-{"stale": true}' in stderr
+    assert '+  "TorchLlmArgs": [' in stderr
+    assert manifest_path.read_text() == '{"stale": true}\n'
+
+
+def test_manifest_generator_preserves_target_when_generation_fails(tmp_path, monkeypatch):
+    import pytest
+
+    generator = _load_manifest_generator()
+    manifest_path = tmp_path / "manifest.json"
+    old_content = '{"old": true}\n'
+    manifest_path.write_text(old_content)
+
+    def _fail_generation():
+        raise RuntimeError("synthetic generation failure")
+
+    monkeypatch.setattr(generator, "golden_manifest", _fail_generation)
+    with pytest.raises(RuntimeError, match="synthetic generation failure"):
+        generator._write_manifest(manifest_path)
+
+    assert manifest_path.read_text() == old_content
+    assert list(tmp_path.iterdir()) == [manifest_path]
+
+
+def test_manifest_generator_preserves_target_when_replace_fails(tmp_path, monkeypatch):
+    import pytest
+
+    generator = _load_manifest_generator()
+    monkeypatch.setattr(generator, "golden_manifest", _sample_manifest)
+    manifest_path = tmp_path / "manifest.json"
+    old_content = '{"old": true}\n'
+    manifest_path.write_text(old_content)
+
+    def _fail_replace(*_args):
+        raise OSError("synthetic replace failure")
+
+    monkeypatch.setattr(generator.os, "replace", _fail_replace)
+    with pytest.raises(OSError, match="synthetic replace failure"):
+        generator._write_manifest(manifest_path)
+
+    assert manifest_path.read_text() == old_content
+    assert list(tmp_path.iterdir()) == [manifest_path]
+
+
+def test_manifest_generator_main_reports_file_io_failure(monkeypatch, capfd):
+    generator = _load_manifest_generator()
+    monkeypatch.setattr(generator, "_render_manifest", lambda: "{}\n")
+
+    def _fail_write(*_args, **_kwargs):
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr(generator, "_write_manifest", _fail_write)
+    assert generator.main([]) == 2
+    assert "synthetic write failure" in capfd.readouterr().err
+
+
+def test_manifest_generator_main_propagates_generation_failure(monkeypatch):
+    import pytest
+
+    generator = _load_manifest_generator()
+
+    def _fail_generation():
+        raise RuntimeError("synthetic generation failure")
+
+    monkeypatch.setattr(generator, "_render_manifest", _fail_generation)
+    with pytest.raises(RuntimeError, match="synthetic generation failure"):
+        generator.main([])
+
+
+def test_manifest_generator_subprocess_resolves_local_source_without_pythonpath(tmp_path):
+    checkout = tmp_path / "checkout"
+    script_path = checkout / "scripts/generate_llm_args_golden_manifest.py"
+    usage_package = checkout / "tensorrt_llm/usage"
+    script_path.parent.mkdir(parents=True)
+    usage_package.mkdir(parents=True)
+
+    source_script = _repo_root() / "scripts/generate_llm_args_golden_manifest.py"
+    script_path.write_bytes(source_script.read_bytes())
+    (usage_package.parent / "__init__.py").write_text("")
+    (usage_package / "__init__.py").write_text("")
+    (usage_package / "llmapi_config.py").write_text(
+        "def golden_manifest():\n    return {'TorchLlmArgs': [], 'TrtLlmArgs': []}\n"
+    )
+    manifest_path = usage_package / "llm_args_golden_manifest.json"
+    committed = json.dumps({"TorchLlmArgs": [], "TrtLlmArgs": []}, indent=2, sort_keys=True) + "\n"
+    manifest_path.write_text(committed)
+
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+
+    result = subprocess.run(
+        [sys.executable, "-I", str(script_path), "--check"],
+        cwd=checkout,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert manifest_path.read_text() == committed
+
+
+def test_manifest_generator_subprocess_prefers_checkout_over_shadow_package(tmp_path):
+    checkout = tmp_path / "checkout"
+    script_path = checkout / "scripts/generate_llm_args_golden_manifest.py"
+    checkout_usage = checkout / "tensorrt_llm/usage"
+    shadow = tmp_path / "shadow"
+    shadow_usage = shadow / "tensorrt_llm/usage"
+    script_path.parent.mkdir(parents=True)
+    checkout_usage.mkdir(parents=True)
+    shadow_usage.mkdir(parents=True)
+
+    source_script = _repo_root() / "scripts/generate_llm_args_golden_manifest.py"
+    script_path.write_bytes(source_script.read_bytes())
+    for usage_package in (checkout_usage, shadow_usage):
+        (usage_package.parent / "__init__.py").write_text("")
+        (usage_package / "__init__.py").write_text("")
+    checkout_usage.joinpath("llmapi_config.py").write_text(
+        "def golden_manifest():\n    return {'source': 'checkout'}\n"
+    )
+    shadow_usage.joinpath("llmapi_config.py").write_text(
+        "def golden_manifest():\n    return {'source': 'shadow'}\n"
+    )
+    manifest_path = checkout_usage / "llm_args_golden_manifest.json"
+    committed = json.dumps({"source": "checkout"}, indent=2, sort_keys=True) + "\n"
+    manifest_path.write_text(committed)
+
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join((str(shadow), str(checkout)))
+
+    result = subprocess.run(
+        [sys.executable, str(script_path), "--check"],
+        cwd=checkout,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert manifest_path.read_text() == committed
+
+
+def test_manifest_generator_is_not_a_normal_precommit_hook():
+    import yaml
+
+    config = yaml.safe_load((_repo_root() / ".pre-commit-config.yaml").read_text())
+    local_hooks = next(repo["hooks"] for repo in config["repos"] if repo["repo"] == "local")
+
+    assert all(hook["id"] != "generate-llm-args-golden-manifest" for hook in local_hooks)
+
+
+_REGENERATION_MESSAGE = (
+    "The LLM args telemetry manifest is stale; run "
+    "`python3 scripts/generate_llm_args_golden_manifest.py`, then review and commit "
+    "`tensorrt_llm/usage/llm_args_golden_manifest.json` with telemetry/privacy CODEOWNER approval."
+)
+
+
+def _assert_committed_manifest_current(generated_manifest: object) -> None:
+    manifest_path = _repo_root() / "tensorrt_llm/usage/llm_args_golden_manifest.json"
+    committed_manifest = json.loads(manifest_path.read_text())
+    if generated_manifest != committed_manifest:
+        raise AssertionError(_REGENERATION_MESSAGE)
+
+
+def test_committed_golden_failure_gives_exact_regeneration_command():
+    import pytest
+
+    with pytest.raises(AssertionError) as failure:
+        _assert_committed_manifest_current({"stale": True})
+
+    assert str(failure.value) == _REGENERATION_MESSAGE
 
 
 def test_build_capture_manifest_matches_committed_golden():
-    """The CI privacy gate (closes TRTLLM-12872).
-
-    Regenerate in-memory and diff against the committed golden; any drift
-    ('field X now phones home') must be a deliberate, privacy-reviewed golden
-    update committed in the same change.
-    """
+    """The premerge privacy gate (closes TRTLLM-12872)."""
     from tensorrt_llm.usage.llmapi_config import golden_manifest
 
-    golden = json.loads(_golden_path().read_text())
-    assert golden_manifest() == golden
+    _assert_committed_manifest_current(golden_manifest())
 
 
 def test_load_generator_does_not_leak_sys_modules():
@@ -189,6 +409,7 @@ def test_renderer_emits_table_from_committed_golden(tmp_path):
     generator.generate_telemetry_reference(_repo_root(), out)
     text = out.read_text()
     assert "## LLM API Configuration Fields" in text
+    assert "python3 scripts/generate_llm_args_golden_manifest.py" in text
     assert "explicitly marked" not in text  # opt-in prose must be gone
     assert "`backend`" in text  # a known captured key renders
 
