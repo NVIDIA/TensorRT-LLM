@@ -56,5 +56,11 @@ def test_deep_ep_nvfp4_pack_matches_trtllm_bitwise(num_tokens: int, case: str):
         static_scale.expand(num_tokens, 1).contiguous(),
     )
 
-    assert torch.equal(reference_values.view(torch.uint8), deep_ep_values)
-    assert torch.equal(reference_scales.view(torch.uint8), deep_ep_scales.view(torch.uint8))
+    assert torch.equal(
+        reference_values.view(torch.uint8).reshape(-1),
+        deep_ep_values.view(torch.uint8).reshape(-1),
+    )
+    assert torch.equal(
+        reference_scales.view(torch.uint8).reshape(-1),
+        deep_ep_scales.view(torch.uint8).reshape(-1),
+    )

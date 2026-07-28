@@ -199,18 +199,22 @@ class VariableLengthLowLatencyBuffer:
 
         return recv_hidden_states, recv_scales, recv_expert_count, handle
 
-    def low_latency_combine_low_precision(self, precision: str,
+    def low_latency_combine_low_precision(self,
+                                          precision: str,
                                           hidden_states: torch.Tensor,
                                           global_scales: Optional[torch.Tensor],
                                           topk_idx: torch.Tensor,
                                           topk_weights: torch.Tensor,
-                                          handle: Tuple):
+                                          handle: Tuple,
+                                          stage_recv_metadata: bool = False):
         """
             Arguments:
                 precision: the precision of the low-precision kernel, "fp8" for FP8, "nvfp4" for NVFP4.
         """
         combined_hidden_states, event, hook = \
-            self.buffer.low_latency_combine_low_precision(precision, hidden_states, global_scales, topk_idx, topk_weights, handle)
+            self.buffer.low_latency_combine_low_precision(
+                precision, hidden_states, global_scales, topk_idx, topk_weights,
+                handle, stage_recv_metadata=stage_recv_metadata)
         assert event.event is None
         assert hook is None
 
