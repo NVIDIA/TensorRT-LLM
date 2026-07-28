@@ -419,9 +419,7 @@ class DSparkWorker(SpecWorkerBase):
         """
         vocab = gen_logits.shape[-1]
         # Lay the block out step-major ([K, batch, vocab]) so each step's slice is
-        # a contiguous [batch, vocab] tensor: torch.ops.trtllm.logits_bitmask
-        # requires contiguous logits, which a [:, k, :] slice of a
-        # [batch, K, vocab] tensor is not.
+        # a contiguous [batch, vocab] tensor.
         if num_contexts > 0:
             full_logits = gen_logits.new_zeros((K, batch_size, vocab))
             full_logits[:, num_contexts:, :] = gen_logits.transpose(0, 1)
