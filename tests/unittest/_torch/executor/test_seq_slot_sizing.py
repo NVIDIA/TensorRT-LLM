@@ -22,7 +22,7 @@ import pytest
 from tensorrt_llm._torch.pyexecutor._util import (
     compute_max_num_sequences,
     create_torch_sampler_args,
-    should_enable_dsv4_adp_dummy_fixes,
+    should_enable_adp_dummy_fixes,
     should_enable_dsv4_overlap_headroom,
 )
 from tensorrt_llm.mapping import Mapping
@@ -69,20 +69,10 @@ def test_dsv4_overlap_headroom_gate(
     )
 
 
-@pytest.mark.parametrize(
-    "model_type,pp_size,expected",
-    [
-        ("deepseek_v4", 1, True),
-        ("deepseek_v3", 1, False),
-        ("deepseek_v4", 2, False),
-        ("qwen3_5_moe", 1, True),
-        ("qwen3_5_moe", 2, False),
-        ("llama", 1, False),
-    ],
-)
-def test_dsv4_adp_dummy_fix_gate(model_type, pp_size, expected):
+@pytest.mark.parametrize("pp_size,expected", [(1, True), (2, False)])
+def test_adp_dummy_fix_gate(pp_size, expected):
     mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
-    assert should_enable_dsv4_adp_dummy_fixes(model_type, mapping) is expected
+    assert should_enable_adp_dummy_fixes(mapping) is expected
 
 
 @pytest.mark.parametrize(

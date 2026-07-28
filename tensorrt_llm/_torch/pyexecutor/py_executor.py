@@ -569,8 +569,8 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.scheduler = scheduler
         self.model_engine = model_engine
-        self._enable_dsv4_adp_dummy_fixes = getattr(
-            model_engine, "_enable_dsv4_adp_dummy_fixes", False)
+        self._enable_adp_dummy_fixes = getattr(model_engine,
+                                               "_enable_adp_dummy_fixes", False)
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
@@ -3344,7 +3344,7 @@ class PyExecutor:
         must release theirs before retrying or the fixed dummy request ID leaks
         cache resources on every skipped iteration.
         """
-        if not self._enable_dsv4_adp_dummy_fixes:
+        if not self._enable_adp_dummy_fixes:
             return
 
         dummy_request = self._pending_adp_dummy_request
@@ -5765,16 +5765,15 @@ class PyExecutor:
     def _count_schedulable_active_requests(self) -> int:
         """Count active requests that are ready for scheduling.
 
-        The non-PP DeepSeek-V4 disaggregated ADP path mirrors the decoder
-        scheduler's state window [CONTEXT_INIT, GENERATION_TO_COMPLETE). This
-        covers generation-first context requests below the lower bound and
-        terminal requests at the upper bound. Other configurations retain the
-        established ADP behavior; PP eligibility remains follow-up scope.
+        The non-PP disaggregated ADP path mirrors the decoder scheduler's state
+        window [CONTEXT_INIT, GENERATION_TO_COMPLETE). This covers
+        generation-first context requests below the lower bound and terminal
+        requests at the upper bound. PP eligibility remains follow-up scope.
 
         Returns:
             The number of active requests eligible for scheduling.
         """
-        if (not self._enable_dsv4_adp_dummy_fixes
+        if (not self._enable_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
             if self.kv_cache_transceiver is None:
                 return len(self.active_requests)
@@ -5937,7 +5936,7 @@ class PyExecutor:
                 key="attention_dp_dummy_insufficient_kv_capacity")
             return
 
-        if (not self._enable_dsv4_adp_dummy_fixes
+        if (not self._enable_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
@@ -5972,9 +5971,8 @@ class PyExecutor:
         except OutOfPagesError:
             dummy_requests = None
         if not dummy_requests:
-            logger.warning(
-                "Cannot allocate DeepSeek-V4 ADP pad dummy; rank schedules "
-                "an empty batch and the fleet will retry.")
+            logger.warning("Cannot allocate ADP pad dummy; rank schedules "
+                           "an empty batch and the fleet will retry.")
             return
 
         dummy_request = dummy_requests[0]

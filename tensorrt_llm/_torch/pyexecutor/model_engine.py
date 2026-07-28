@@ -360,7 +360,7 @@ class PyTorchModelEngine(ModelEngine):
         # Start with the established pool size. Once the model is loaded we
         # selectively enable headroom for the non-PP DeepSeek-V4 overlap path.
         from ._util import (compute_max_num_sequences,
-                            should_enable_dsv4_adp_dummy_fixes,
+                            should_enable_adp_dummy_fixes,
                             should_enable_dsv4_overlap_headroom)
         self.max_num_seq_slots = compute_max_num_sequences(
             mapping, self.batch_size, llm_args.disable_overlap_scheduler)
@@ -447,11 +447,10 @@ class PyTorchModelEngine(ModelEngine):
             self.model = model
         pretrained_config = self.model.model_config.pretrained_config
         model_type = getattr(pretrained_config, "model_type", None)
-        # Keep the scheduler/dummy fix model-scoped, while the larger slot pool
-        # is restricted to the validated MTP overlap configuration. PP remains
-        # on its established path for follow-up changes.
-        self._enable_dsv4_adp_dummy_fixes = (should_enable_dsv4_adp_dummy_fixes(
-            model_type, mapping))
+        # Apply transactional dummy handling to every non-PP disaggregated ADP
+        # model. The larger slot pool remains restricted to the validated
+        # DeepSeek-V4 MTP overlap configuration.
+        self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
         self._enable_dsv4_overlap_headroom = (
             should_enable_dsv4_overlap_headroom(
                 model_type, spec_config, mapping,
