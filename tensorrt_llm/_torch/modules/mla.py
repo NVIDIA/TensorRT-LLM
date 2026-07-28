@@ -3077,6 +3077,23 @@ class MLA(nn.Module):
         return torch.cat([sink, sink.new_zeros(padded_heads - sink.shape[0])])
 
     @staticmethod
+    def _pad_deepseek_v4_hopper_decode_query(q: torch.Tensor) -> torch.Tensor:
+        """Pad query heads to a shape supported by FlashMLA's Hopper decode kernel."""
+        num_heads = q.shape[-2]
+        padded_heads = 64 if num_heads <= 64 else 128
+        if num_heads == padded_heads:
+            return q
+
+        logger.warning_once(
+            f"Padding num_heads from {num_heads} to {padded_heads} "
+            "for the Hopper FlashMLA sparse decode kernel",
+            key="deepseek_v4_sparse_decode_hopper_padding",
+        )
+        padded_q = q.new_zeros((*q.shape[:-2], padded_heads, q.shape[-1]))
+        padded_q[..., :num_heads, :] = q
+        return padded_q
+
+    @staticmethod
     def _prepare_deepseek_v4_hopper_bf16_pool(
         pool: torch.Tensor,
         indices: torch.Tensor,
@@ -3252,9 +3269,9 @@ class MLA(nn.Module):
 
         if not isinstance(attn_metadata, DeepseekV4TrtllmAttentionMetadata):
             raise TypeError("DeepSeek-V4 Hopper decode requires DeepseekV4TrtllmAttentionMetadata")
-        if self.num_heads_tp not in (64, 128):
+        if self.num_heads_tp > 128:
             raise ValueError(
-                "FlashMLA Hopper sparse decode supports 64 or 128 query heads, "
+                "FlashMLA Hopper sparse decode supports at most 128 query heads, "
                 f"got {self.num_heads_tp}"
             )
 
@@ -3294,7 +3311,8 @@ class MLA(nn.Module):
         self._fp8_shadow_needs_bulk = False
         num_generation_tokens = q.shape[0]
         q_decode = q.view(num_generation_tokens, 1, self.num_heads_tp, self.qk_head_dim)
-        attention_sink = self._deepseek_v4_attention_sink(self.num_heads_tp)
+        q_decode = self._pad_deepseek_v4_hopper_decode_query(q_decode)
+        attention_sink = self._deepseek_v4_attention_sink(q_decode.shape[-2])
 
         if flash_mla_cuda is None:
             raise RuntimeError(
