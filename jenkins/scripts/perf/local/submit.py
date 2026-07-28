@@ -386,14 +386,15 @@ def detect_cluster_name():
         return name
     try:
         config_out = subprocess.check_output(
-            ["scontrol", "show", "config"],
+            ["/usr/bin/scontrol", "show", "config"],
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=10,
         )
         for line in config_out.splitlines():
-            if line.strip().startswith("ClusterName"):
-                return line.split("=", 1)[1].strip()
+            key, separator, value = line.partition("=")
+            if key.strip() == "ClusterName" and separator:
+                return value.strip()
     except (OSError, subprocess.SubprocessError):
         pass
     return ""
@@ -717,10 +718,14 @@ def main():
         with open(config_yaml, "r") as f:
             config = yaml.safe_load(f)
 
-    # Detect GPU type from config metadata; cluster from CLI arg or frontend.
-    supported_gpus = config.get("metadata", {}).get("supported_gpus", [])
-    gpu_type = gpu_type_from_supported_gpus(supported_gpus)
-    cluster_name = args.cluster_name or detect_cluster_name()
+    # Detect GPU type and cluster only for disaggregated UCX selection.
+    if runtime_mode == "disaggregated":
+        supported_gpus = config.get("metadata", {}).get("supported_gpus", [])
+        gpu_type = gpu_type_from_supported_gpus(supported_gpus)
+        cluster_name = args.cluster_name or detect_cluster_name()
+    else:
+        gpu_type = ""
+        cluster_name = ""
 
     # Create timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

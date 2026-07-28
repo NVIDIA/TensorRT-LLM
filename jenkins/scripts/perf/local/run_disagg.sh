@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Generate slurm_launch.sh for a local disaggregated perf-sanity run
 # and submit it via sbatch. Run this on a SLURM login node.
 #

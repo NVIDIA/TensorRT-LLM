@@ -58,8 +58,17 @@ KNOWN_GPU_TYPES = ("GB300", "GB200", "GB10X", "B300", "B200", "H200", "H100", "A
 def gpu_type_from_stage_name(stage_name):
     """Extract the GPU type token from a CI stage name.
 
-    E.g. "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1" -> "GB300",
-    "DGX_B200-8_GPUs-PyTorch-PerfSanity-1" -> "B200".
+    Scans for the first match in KNOWN_GPU_TYPES (ordered longest-first to
+    avoid substring collisions, e.g. GB200 before B200).
+
+    Args:
+        stage_name: CI stage name string, e.g.
+            "DGX_B200-8_GPUs-PyTorch-PerfSanity-1". None or empty string
+            is accepted and returns "".
+
+    Returns:
+        A GPU type token such as "B200" or "GB300", or "" if no known GPU
+        type is found in the stage name.
     """
     upper = (stage_name or "").upper()
     for gpu in KNOWN_GPU_TYPES:
@@ -69,7 +78,16 @@ def gpu_type_from_stage_name(stage_name):
 
 
 def gpu_type_from_supported_gpus(supported_gpus):
-    """Pick the GPU type from a config yaml's metadata.supported_gpus list."""
+    """Pick the GPU type from a config yaml's metadata.supported_gpus list.
+
+    Args:
+        supported_gpus: List of GPU type strings from the config yaml
+            ``metadata.supported_gpus`` field. None or empty list returns "".
+
+    Returns:
+        The first matching GPU type token from KNOWN_GPU_TYPES, or "" if
+        none of the known types appear in the list.
+    """
     gpus = {str(gpu).upper() for gpu in supported_gpus or []}
     for gpu in KNOWN_GPU_TYPES:
         if gpu in gpus:
@@ -78,7 +96,28 @@ def gpu_type_from_supported_gpus(supported_gpus):
 
 
 def get_ucx_tls_cmd(cluster_name, gpu_type):
-    """Return the shell prefix that sets UCX env vars for (cluster, GPU)."""
+    """Return the shell prefix that sets UCX env vars for (cluster, GPU).
+
+    Evaluates UCX_ENV_RULES in order, matching cluster_name and gpu_type
+    against shell-style wildcard patterns (case-insensitive). Cluster
+    patterns are prefix wildcards that match both the bloom CI name (e.g.
+    "aws-cmh") and the cluster's own slurm.conf ClusterName (e.g.
+    "aws-cmh-cs-001"). The first matching rule wins.
+
+    Args:
+        cluster_name: Cluster name string (bloom CI name or detected via
+            scontrol). None or empty string matches only the catch-all "*"
+            rule.
+        gpu_type: GPU type token such as "B200" or "GB300". None or empty
+            string matches only the catch-all "*" rule.
+
+    Returns:
+        A shell command prefix string that unsets leaking UCX env vars and
+        optionally exports cluster-specific overrides, ending with "&&" so
+        it can be prepended directly to the worker command. Example:
+        ``"unset UCX_CUDA_IPC_ENABLE_MNNVL UCX_TLS UCX_NET_DEVICES &&
+        export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp &&"``.
+    """
     cluster = (cluster_name or "").lower()
     gpu = (gpu_type or "").upper()
     extra = ""
