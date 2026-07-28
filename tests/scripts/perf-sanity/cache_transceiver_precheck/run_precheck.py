@@ -718,44 +718,75 @@ def parse_bandwidth_gbps(csv_dir, rank, tag="recv"):
     """Median per-request bandwidth in GB/s (bytes/1e9), best-effort.
 
     Parsed from the C++ transceiver CSV this rank wrote via
-    TRTLLM_KVCACHE_TIME_OUTPUT_PATH.
+    TRTLLM_KVCACHE_TIME_OUTPUT_PATH, named "<instanceId>_<rank>_<tag>.csv"
+    (instanceId is a runtime UUID), so match by the "_<rank>_<tag>.csv"
+    suffix. The suffix's leading "_" keeps rank 1 from matching rank 11.
+
+    Each row repeats the Bandwidth(Gbps) column once per transmission, so use
+    csv.reader (DictReader would keep only the last duplicate) and take the
+    mean transmission bandwidth as that request's value, then the median
+    across requests -- same semantics as the harness report.
     """
     import csv as csv_mod
     import statistics
 
-    path = os.path.join(csv_dir, f"rank_{rank}_{tag}.csv")
+    suffix = f"_{rank}_{tag}.csv"
     try:
-        with open(path) as f:
-            rows = list(csv_mod.DictReader(f))
-        col = next((c for c in (rows[0] or {}) if "Bandwidth" in c), None)
-        if col is None:
-            return None
-        vals = [float(r[col]) / 8.0 for r in rows if r.get(col)]
-        return statistics.median(vals) if vals else None
-    except (OSError, ValueError, IndexError, StopIteration):
+        names = [n for n in os.listdir(csv_dir) if n.endswith(suffix)]
+    except OSError:
         return None
+    vals = []
+    for name in names:
+        try:
+            with open(os.path.join(csv_dir, name)) as f:
+                reader = csv_mod.reader(f)
+                header = next(reader, None)
+                if not header:
+                    continue
+                bw_cols = [i for i, c in enumerate(header) if "Bandwidth" in c]
+                if not bw_cols:
+                    continue
+                for row in reader:
+                    bws = []
+                    for i in bw_cols:
+                        if i < len(row) and row[i]:
+                            try:
+                                bws.append(float(row[i]) / 8.0)  # Gbps -> GB/s
+                            except ValueError:
+                                pass
+                    if bws:
+                        vals.append(sum(bws) / len(bws))
+        except OSError:
+            continue
+    return statistics.median(vals) if vals else None
 
 
 def parse_python_bandwidth_gbps(csv_dir):
     """Median KV-send throughput in GB/s from the Python transceiver's perf CSVs.
 
-    Written by perf_logger.py; enabled via TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1
-    + TLLM_KV_TRANSFER_PERF_LOG_FILE=<base>, which writes
-    <base>_<instance>_<rank>.csv. throughput_mbs (MB/s) is on the SENDER
-    (ctx) side, task_type=KVSendTask; receiver rows have no throughput.
-    Best-effort -- returns None when no perf CSV exists.
+    Written by perf_logger.py, which gives TRTLLM_KVCACHE_TIME_OUTPUT_PATH top
+    priority and names files "{dir}/{instanceUuid}_{rank}.csv" -- so identify
+    the CSVs by their header columns (task_type + throughput_mbs) rather than
+    by name; C++ send/recv CSVs have neither column. throughput_mbs (MiB/s) is
+    on the SENDER (ctx) side, task_type=KVSendTask; receiver rows have no
+    throughput. Best-effort -- returns None when no perf CSV exists.
     """
     import csv as csv_mod
     import glob
     import statistics
 
     vals = []
-    for path in glob.glob(os.path.join(csv_dir, "perf_*_*.csv")):
+    for path in glob.glob(os.path.join(csv_dir, "*.csv")):
         try:
             with open(path) as f:
-                for r in csv_mod.DictReader(f):
+                reader = csv_mod.DictReader(f)
+                fields = reader.fieldnames or []
+                if "task_type" not in fields or "throughput_mbs" not in fields:
+                    continue
+                for r in reader:
                     if r.get("task_type") == "KVSendTask" and r.get("throughput_mbs"):
-                        vals.append(float(r["throughput_mbs"]) / 1024.0)  # MB/s -> GB/s
+                        # MiB/s -> GB/s
+                        vals.append(float(r["throughput_mbs"]) * 1024.0 * 1024.0 / 1e9)
         except (OSError, ValueError):
             continue
     return statistics.median(vals) if vals else None
@@ -816,13 +847,12 @@ class PrecheckRunner:
             enable_attention_dp=par["enable_attention_dp"],
         )
         os.makedirs(self.csv_dir, exist_ok=True)
-        # C++ transceiver bandwidth CSV (per-rank recv).
+        # One env var drives both transceivers' bandwidth CSVs: C++ writes
+        # per-rank "<instanceId>_<rank>_send/recv.csv", and Python's
+        # PerfLogManager gives the same var top priority, writing task CSVs
+        # as "<instanceUuid>_<rank>.csv" (KVSendTask throughput on the ctx
+        # side).
         os.environ["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = self.csv_dir
-        # Python transceiver bandwidth CSV (perf_logger.py): writes
-        # {base}_{instance}_{rank}.csv with KVSendTask throughput on the ctx
-        # side. Harmless to set unconditionally -- the C++ path ignores it.
-        os.environ["TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO"] = "1"
-        os.environ["TLLM_KV_TRANSFER_PERF_LOG_FILE"] = os.path.join(self.csv_dir, "perf")
 
         # Built VERBATIM from the disagg yaml's cache_transceiver_config so
         # backend/max_tokens_in_buffer/timeouts match the real test exactly.

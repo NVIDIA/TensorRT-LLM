@@ -223,26 +223,70 @@ def test_recorder_non_leader_writes_nothing(tmp_path):
 # Bandwidth CSV parsing
 # --------------------------------------------------------------------------- #
 def test_parse_bandwidth_gbps_median(tmp_path):
-    path = tmp_path / "rank_2_recv.csv"
+    # C++ names timing CSVs "<instanceId>_<rank>_<tag>.csv" (instanceId is a
+    # runtime UUID), so the parser must suffix-match, not expect "rank_*".
+    path = tmp_path / "3c9f0e2a-1111-2222-3333-444455556666_2_recv.csv"
     path.write_text("RequestID,Bandwidth(Gbps),Delay(ms)\n1,80,0\n2,160,0\n3,240,0\n")
     # Gbps -> GB/s (/8); median of [10, 20, 30]
     assert rp.parse_bandwidth_gbps(str(tmp_path), 2) == 20.0
 
 
+def test_parse_bandwidth_gbps_duplicate_columns_mean(tmp_path):
+    # C++ repeats the Bandwidth(Gbps) column once per transmission; the parser
+    # must average them per request (DictReader would keep only the last).
+    (tmp_path / "uuid_0_recv.csv").write_text(
+        "RequestID,Bandwidth(Gbps),Bandwidth(Gbps)\n1,80,240\n"
+    )
+    # mean(80, 240) = 160 Gbps -> /8 = 20 GB/s
+    assert rp.parse_bandwidth_gbps(str(tmp_path), 0) == 20.0
+
+
+def test_parse_bandwidth_gbps_rank_suffix_no_cross_match(tmp_path):
+    # Rank 1 must not pick up rank 11's file (the suffix's leading "_").
+    (tmp_path / "uuid_11_recv.csv").write_text("RequestID,Bandwidth(Gbps)\n1,80\n")
+    assert rp.parse_bandwidth_gbps(str(tmp_path), 1) is None
+    assert rp.parse_bandwidth_gbps(str(tmp_path), 11) == 10.0
+
+
 def test_parse_bandwidth_gbps_missing_or_malformed(tmp_path):
     assert rp.parse_bandwidth_gbps(str(tmp_path), 0) is None
-    (tmp_path / "rank_0_recv.csv").write_text("RequestID,Delay(ms)\n1,0\n")
+    (tmp_path / "uuid_0_recv.csv").write_text("RequestID,Delay(ms)\n1,0\n")
     assert rp.parse_bandwidth_gbps(str(tmp_path), 0) is None
 
 
 def test_parse_python_bandwidth_gbps(tmp_path):
-    (tmp_path / "perf_a_0.csv").write_text(
+    # PerfLogManager gives TRTLLM_KVCACHE_TIME_OUTPUT_PATH top priority and
+    # names task CSVs "<instanceUuid>_<rank>.csv" (no fixed prefix); the
+    # parser identifies them by header columns, not name.
+    (tmp_path / "cd93dae6-9d75-4b0e-8a89-2c9e2f0f1a2b_0.csv").write_text(
         "task_type,throughput_mbs\nKVSendTask,1024\nKVRecvTask,\n"
     )
-    (tmp_path / "perf_a_1.csv").write_text("task_type,throughput_mbs\nKVSendTask,3072\n")
-    # MB/s -> GB/s (/1024); median of [1, 3]
-    assert rp.parse_python_bandwidth_gbps(str(tmp_path)) == 2.0
+    (tmp_path / "cd93dae6-9d75-4b0e-8a89-2c9e2f0f1a2b_1.csv").write_text(
+        "task_type,throughput_mbs\nKVSendTask,3072\n"
+    )
+    # MiB/s -> GB/s (*1024^2/1e9); median of [1024, 3072] MiB/s = 2048 MiB/s
+    expected = 2048 * 1024 * 1024 / 1e9
+    assert abs(rp.parse_python_bandwidth_gbps(str(tmp_path)) - expected) < 1e-9
     assert rp.parse_python_bandwidth_gbps(str(tmp_path / "nowhere")) is None
+
+
+def test_parse_python_bandwidth_gbps_ignores_cpp_csvs(tmp_path):
+    # C++ send/recv and gen-summary CSVs share csv_dir; they lack the
+    # task_type/throughput_mbs columns and must not contribute samples.
+    (tmp_path / "uuid_0_recv.csv").write_text("RequestID,Bandwidth(Gbps)\n1,80\n")
+    (tmp_path / "uuid_0_gen_transfer_summary.csv").write_text(
+        "RequestID,gen_side_transfer_time(ms),kv_cache_size\n1,1.0,1024\n"
+    )
+    assert rp.parse_python_bandwidth_gbps(str(tmp_path)) is None
+
+
+def test_parse_bandwidth_gbps_ignores_gen_summary(tmp_path):
+    # "<uuid>_<rank>_gen_transfer_summary.csv" must not match the
+    # "_<rank>_recv.csv" suffix.
+    (tmp_path / "uuid_0_gen_transfer_summary.csv").write_text(
+        "RequestID,gen_side_transfer_time(ms),kv_cache_size\n1,1.0,1024\n"
+    )
+    assert rp.parse_bandwidth_gbps(str(tmp_path), 0) is None
 
 
 # --------------------------------------------------------------------------- #

@@ -743,8 +743,10 @@ def test_sparse_attention_model_uses_simplified_mla_pool(tmp_path):
 def test_python_transceiver_bandwidth_csv(tmp_path):
     """Bandwidth from the Python transceiver's perf_logger CSVs.
 
-    Median over KVSendTask throughput_mbs (MB/s -> GB/s), receiver rows
-    ignored.
+    PerfLogManager names them "<instanceUuid>_<rank>.csv" (it gives
+    TRTLLM_KVCACHE_TIME_OUTPUT_PATH top priority); the parser identifies them
+    by header columns. Median over KVSendTask throughput_mbs (MiB/s -> GB/s),
+    receiver rows ignored.
     """
     header = (
         "timestamp,task_type,unique_rid,peer_rank,transfer_size_bytes,"
@@ -752,17 +754,20 @@ def test_python_transceiver_bandwidth_csv(tmp_path):
         "queue_latency_ms,transfer_latency_ms,task_latency_ms,throughput_mbs"
     )
     # two ctx ranks, each its own perf file; KVSendTask rows carry throughput
-    (tmp_path / "perf_abc_0.csv").write_text(
+    (tmp_path / "cd93dae6-9d75-4b0e-8a89-2c9e2f0f1a2b_0.csv").write_text(
         header + "\n"
-        "t,KVSendTask,1,0,1000,,,0,0,0,0,102400.00\n"  # 100 GB/s
+        "t,KVSendTask,1,0,1000,,,0,0,0,0,102400.00\n"
         "t,AuxSendTask,1,0,10,,,0,0,0,0,1.00\n"  # tiny metadata, ignored
     )
-    (tmp_path / "perf_abc_1.csv").write_text(
-        header + "\nt,KVSendTask,2,1,1000,,,0,0,0,0,204800.00\n"  # 200 GB/s
+    (tmp_path / "cd93dae6-9d75-4b0e-8a89-2c9e2f0f1a2b_1.csv").write_text(
+        header + "\nt,KVSendTask,2,1,1000,,,0,0,0,0,204800.00\n"
     )
     # a receiver file (no throughput) must not contribute
-    (tmp_path / "perf_def_8.csv").write_text(header + "\nt,KVRecvTask,3,0,,,,,,,5.0,\n")
+    (tmp_path / "5d7b1f80-aaaa-bbbb-cccc-ddddeeeeffff_8.csv").write_text(
+        header + "\nt,KVRecvTask,3,0,,,,,,,5.0,\n"
+    )
     bw = rp.parse_python_bandwidth_gbps(str(tmp_path))
-    assert bw == 150.0  # median(100, 200)
+    # median(102400, 204800) = 153600 MiB/s -> GB/s (*1024^2/1e9)
+    assert abs(bw - 153600 * 1024 * 1024 / 1e9) < 1e-9
     # no perf files -> None
     assert rp.parse_python_bandwidth_gbps(str(tmp_path / "empty")) is None

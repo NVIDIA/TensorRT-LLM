@@ -264,6 +264,16 @@ def _assert_all_passed(work_dir, launched):
         assert doc["overall"] == "PASS"
         assert doc["transceiver_runtime"] == "PYTHON"
         assert doc["kv_cache_manager"] == "V2"
+        # The Python transceiver records bandwidth on the ctx (sender) leader
+        # via PerfLogManager CSVs in TRTLLM_KVCACHE_TIME_OUTPUT_PATH. Asserting
+        # it here ties the whole chain (perf_logger naming -> CSV -> parser)
+        # into the e2e check, so a writer/parser naming mismatch fails loudly
+        # instead of silently dropping the bandwidth field.
+        if name.startswith("ctx_"):
+            assert doc.get("per_gpu_bw_gbps", 0) > 0, (
+                f"{name} verdict has no per_gpu_bw_gbps — Python perf CSVs were "
+                f"not written or not parsed\n{_log_tail(log_path)}"
+            )
 
 
 def _jobs(cfg, config_path):
