@@ -1427,6 +1427,8 @@ class TestReceiveReserve:
         session.lock = threading.Lock()
         session._kv_tasks = [task]
         session._receiver = receiver
+        session._last_slice_admitted = True
+        session.transfer_end_time = None
         receiver._sessions = {key[0]: session}
 
         delivered_updates = []

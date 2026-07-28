@@ -62,6 +62,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     WriteMeta,
     WriteMetaType,
 )
+from tensorrt_llm._torch.disaggregation.protocol import ProtocolVersion
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
@@ -159,8 +160,31 @@ def _make_owned_send_task_and_session(*, channel: str, expected_transfers: int):
     return sender, session, task, write_meta
 
 
+def _legacy_sender_registrar() -> SimpleNamespace:
+    lifecycle = {
+        "lifecycle_protocol_version": int(ProtocolVersion.QUALIFIED_LEGACY),
+        "qualified_legacy_mode": True,
+    }
+    return SimpleNamespace(
+        self_rank_info=SimpleNamespace(
+            instance_name="sender",
+            instance_rank=WRITER_RANK,
+            endpoint_incarnation=None,
+            **lifecycle,
+        ),
+        get_peer_rank_info=Mock(
+            return_value=SimpleNamespace(
+                instance_name="receiver",
+                instance_rank=0,
+                **lifecycle,
+            )
+        ),
+    )
+
+
 def _make_sender_for_shutdown() -> Sender:
     sender = object.__new__(Sender)
+    sender._registrar = _legacy_sender_registrar()
     sender._shutdown_attempt_lock = threading.Lock()
     sender._operation_admission_lock = threading.RLock()
     sender._dealer_admission_closed = False
@@ -380,6 +404,10 @@ def _make_legacy_session(cohorts) -> tuple[RxSession, KVRecvTask]:
     session._kv_tasks = [task]
     session._need_aux = True
     session._aux_results = {}
+    session._aux_publication_identities = {}
+    session._aux_submitted_identities = {}
+    session._aux_active_submission_times = {}
+    session._aux_result_identities = {}
     session._aux_exposed_writer_ranks = set(task._exposed_writer_ranks)
     session._aux_publication_closed = True
     session._aux_result_conflict = False
@@ -1695,6 +1723,7 @@ def test_sender_cancel_before_session_replays_failure_for_stored_and_late_reques
     sender._pre_cancelled_rids = set()
     sender._send_failed_result_to_receiver = Mock()
     sender._send_aux_failed_result_to_receiver = Mock()
+    sender._validate_recv_req_info_identity = Mock()
 
     sender._handle_cancel_session([MessageType.CANCEL_SESSION, str(REQUEST_ID).encode("ascii")])
 
@@ -1888,8 +1917,11 @@ def test_early_session_constructor_failure_releases_allocator_owner(
             failed_instances.append(session)
             original_base_init(session, *args, **kwargs)
 
+        def fail_aux_allocation() -> None:
+            raise RuntimeError(error_message)
+
         monkeypatch.setattr(base_type, "__init__", capture_base_init)
-        aux_buffer.alloc_slot.side_effect = RuntimeError(error_message)
+        aux_buffer.alloc_slot.side_effect = fail_aux_allocation
 
     owner = AllocatorOwner()
     owner_ref = weakref.ref(owner)
@@ -2245,6 +2277,7 @@ def test_local_cancel_installs_tombstone_and_retries_settlement() -> None:
     session._closed = True
     session._sender = None
     sender = object.__new__(Sender)
+    sender._registrar = _legacy_sender_registrar()
     sender._shutdown_complete = False
     sender._instance_rank = 0
     sender._sessions = {}
@@ -2361,6 +2394,7 @@ def test_external_backend_fence_coordinates_registry_and_bounce_settlement() -> 
 
 def test_sender_retries_listener_stop_after_first_failure() -> None:
     sender = object.__new__(Sender)
+    sender._registrar = _legacy_sender_registrar()
     sender._instance_rank = 0
     sender._shutdown = False
     sender._shutdown_complete = False
@@ -2522,6 +2556,7 @@ def test_sender_shutdown_is_serialized_and_closes_late_control_admission() -> No
 
 def test_tx_send_admission_finishes_before_sender_shutdown_sentinel() -> None:
     sender = object.__new__(Sender)
+    sender._registrar = _legacy_sender_registrar()
     sender._instance_rank = 0
     sender._operation_admission_lock = threading.RLock()
     sender._shutdown = False
@@ -2551,6 +2586,7 @@ def test_tx_send_admission_finishes_before_sender_shutdown_sentinel() -> None:
     session.lock = threading.Lock()
     session.kv_tasks = []
     session.aux_task = None
+    session.receiver_ready = False
     session._need_aux = False
     session._terminal_status = None
     session._accepting_operations = True
@@ -2620,6 +2656,7 @@ def test_tx_send_admission_finishes_before_sender_shutdown_sentinel() -> None:
 
 def test_sender_retries_failed_worker_local_dealer_close() -> None:
     sender = object.__new__(Sender)
+    sender._registrar = _legacy_sender_registrar()
     sender._instance_rank = 0
     sender._failed_thread_dealers = []
     sender._failed_thread_dealers_lock = threading.Lock()
@@ -2662,6 +2699,7 @@ def test_sender_retries_failed_worker_local_dealer_close() -> None:
 
 def test_sender_shutdown_retains_agent_for_in_doubt_transfer_context() -> None:
     sender = object.__new__(Sender)
+    sender._registrar = _legacy_sender_registrar()
     sender._instance_rank = 0
     sender._shutdown = False
     sender._shutdown_complete = False
@@ -2887,6 +2925,7 @@ def test_tx_session_close_is_serialized_across_concurrent_callers() -> None:
     session._accepting_operations = False
     session._aux_buffer = aux_buffer
     session.aux_slot = 7
+    session._aux_allocation_identity = None
     session._source_owner = object()
     session._sender = sender
     errors: list[Exception] = []
@@ -3341,6 +3380,7 @@ def test_async_send_enrolls_source_owner_before_launch_and_retains_on_error() ->
         request_id=REQUEST_ID,
         py_disaggregated_params=None,
         state=None,
+        set_kv_cache_transfer_start=Mock(),
     )
     session = Mock()
     session.has_transferring_tasks.return_value = True

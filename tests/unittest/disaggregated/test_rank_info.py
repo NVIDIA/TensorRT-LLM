@@ -91,7 +91,7 @@ def test_rank_info_roundtrip_preserves_endpoint_lifecycle_advertisement():
         transfer_engine_info=b"",
         endpoint_incarnation=UUID(int=7),
         lifecycle_protocol_version=1,
-        lifecycle_capabilities=tuple(PROTOCOL_V1_REQUIRED_CAPABILITIES),
+        lifecycle_capabilities=tuple(sorted(PROTOCOL_V1_REQUIRED_CAPABILITIES)),
         qualified_legacy_mode=False,
         sender_endpoint_incarnations=[UUID(int=8)],
     )
@@ -196,6 +196,7 @@ def test_rank_info_revalidates_late_protocol_v1_advertisement():
     )
     ri.lifecycle_protocol_version = 1
     ri.qualified_legacy_mode = False
+    ri.sender_endpoint_incarnations = [UUID(int=8)]
 
     with pytest.raises(ProtocolIdentityError, match="missing identity capabilities"):
         ri.to_bytes()

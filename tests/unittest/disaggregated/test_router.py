@@ -2013,6 +2013,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
     server = OpenAIServer.__new__(OpenAIServer)
     server.allow_request_chat_template = False
     server.await_disconnected = mock.AsyncMock()
+    server.disagg_lifecycle_control = None
     server.generator = SimpleNamespace(
         args=SimpleNamespace(num_postprocess_workers=0),
         generate_async=mock.MagicMock(return_value=promise),

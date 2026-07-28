@@ -56,6 +56,9 @@ class _FakeRequest:
     request_id: int = 0
     py_disaggregated_params: Optional[object] = None
 
+    def set_kv_cache_transfer_start(self, _timestamp: object) -> None:
+        pass
+
 
 class _RetirementRequest:
     """Request with an optionally fallible terminal-state assignment."""
@@ -199,11 +202,28 @@ class _FakeTask:
         return self._wait_result
 
 
+def _make_bare_transceiver() -> KvCacheTransceiverV2:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._mapping = SimpleNamespace(
+        enable_attention_dp=False,
+        pp_rank=0,
+        cp_rank=0,
+        rank=0,
+    )
+    transceiver._bounce_transfer_enabled = False
+    transceiver._lifecycle_contract = TransceiverCapabilities(
+        protocol_version=int(ProtocolVersion.QUALIFIED_LEGACY),
+        qualified_legacy_mode=True,
+    )
+    transceiver._handoff_lifecycle_events = []
+    return transceiver
+
+
 def _make_transceiver(
     sessions: dict[int, _FakeSession],
     reqs: Optional[dict[int, _FakeRequest]] = None,
 ) -> KvCacheTransceiverV2:
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._send_sessions = sessions
     transceiver._send_reqs = reqs or {rid: _FakeRequest() for rid in sessions}
     transceiver._sender_future_timeout_ms = 123
@@ -231,6 +251,7 @@ def _make_tx_session(
     aux_task: Optional[_FakeTask] = None,
 ) -> TxSession:
     session = object.__new__(TxSession)
+    session._base_args = SimpleNamespace(identity=None)
     session._timeout_s = 0.25
     session._need_aux = need_aux
     session._terminal_status = None
@@ -683,7 +704,7 @@ def test_context_transfer_idle_fast_path_still_runs_sender_progress() -> None:
 
 
 def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ever_had_recv_session = False
     transceiver._gen_need_sync = True
     transceiver._recv_sessions = {}
@@ -721,7 +742,7 @@ def test_gen_transfer_status_retains_logical_failure_until_physical_drain() -> N
         has_failed=True,
     )
     req = _FakeRequest(request_id=rid)
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
     transceiver._recv_sessions = {rid: session}
@@ -768,7 +789,7 @@ def test_gen_transfer_status_retains_cancelled_session_until_wait_is_terminal() 
         has_failed=True,
     )
     req = _FakeRequest(request_id=rid)
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
     transceiver._recv_sessions = {rid: session}
@@ -818,7 +839,7 @@ def test_generation_provisional_preparation_retries_each_fallible_phase(failure_
     if failure_stage == "close":
         session.close.side_effect = [RuntimeError("close failed"), None]
 
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
     transceiver.kv_transfer_poll_interval_ms = 0
@@ -890,7 +911,7 @@ def test_generation_provisional_candidate_waits_for_peer_and_readvertises() -> N
         wait_result=WaitResult.COMPLETED,
         is_completed=True,
     )
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = True
     transceiver.kv_transfer_poll_interval_ms = 0
@@ -966,7 +987,7 @@ def test_gen_transfer_timeout_is_not_cleanup_ready() -> None:
     rid = 22
     session = _FakeSession(rid=rid, wait_result=WaitResult.TIMEOUT)
     req = _FakeRequest(request_id=rid)
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
     transceiver._recv_sessions = {rid: session}
@@ -991,7 +1012,7 @@ def test_async_receive_enrolls_owner_before_allocation_and_retains_on_publicatio
     session = Mock()
     session.receive.side_effect = RuntimeError("publication failed")
     session.has_transferring_tasks.return_value = True
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ever_had_recv_session = False
     transceiver._recv_sessions = {}
     transceiver._recv_reqs = {}
@@ -1137,7 +1158,7 @@ def test_gen_status_poll_retains_owner_and_blocks_replacement() -> None:
         return WaitResult.FAILED
 
     original_session.wait_complete.side_effect = wait_complete
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._session_admission_lock = threading.RLock()
     transceiver._shutdown_started = False
     transceiver._send_sessions = {}
@@ -1434,6 +1455,9 @@ def test_prepare_context_requests_skips_consensus_when_nothing_waiting() -> None
 
 def test_sender_shutdown_retains_remote_agents_while_worker_is_alive() -> None:
     sender = object.__new__(Sender)
+    sender._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(endpoint_incarnation=uuid4())
+    )
     worker = _FakeWorkerThread(alive=True)
     dealer = Mock()
     sender._shutdown = False
@@ -1752,7 +1776,7 @@ def test_blocking_generation_poll_shutdown_cancels_without_deadlock() -> None:
 
     session.wait_complete = wait_complete
     session.cancel = cancel_session
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._session_admission_lock = threading.RLock()
     transceiver._shutdown = False
     transceiver._shutdown_started = False
@@ -1827,7 +1851,7 @@ def test_transceiver_shutdown_waits_for_async_enrollment_and_launch(direction) -
 
     worker.shutdown.side_effect = shutdown_worker
     worker.create_rx_session.return_value = session
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._session_admission_lock = threading.RLock()
     transceiver._shutdown_started = False
     transceiver._shutdown = False
@@ -2051,7 +2075,7 @@ def test_sync_receive_releases_admission_gate_while_waiting_for_shutdown() -> No
     worker.create_rx_session.return_value = session
     worker.shutdown.return_value = True
 
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._session_admission_lock = threading.RLock()
     transceiver._shutdown_started = False
     transceiver._shutdown = False
@@ -2128,7 +2152,7 @@ def test_cancel_request_waits_for_async_enrollment_and_launch(direction) -> None
 
     worker = Mock()
     worker.create_rx_session.return_value = session
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._session_admission_lock = threading.RLock()
     transceiver._shutdown_started = False
     transceiver._shutdown = False

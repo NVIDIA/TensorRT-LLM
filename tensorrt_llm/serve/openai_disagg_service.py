@@ -1338,6 +1338,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         gen_task = None
         consume_task = None
         ctx_task = None
+        ctx_attempt_live = False
 
         async def _cleanup_failed_request() -> None:
             for task in (ctx_task, consume_task, gen_task):
@@ -1352,11 +1353,12 @@ class OpenAIDisaggregatedService(OpenAIService):
                 renewal_task,
                 propagate_failure=False,
             )
-            await self._best_effort_abort_context_artifact(
-                None if ctx_req is None else ctx_req.disaggregated_params,
-                server=ctx_server,
-                reason="generation-first coordinator request failed",
-            )
+            if ctx_attempt_live:
+                await self._best_effort_abort_context_artifact(
+                    None if ctx_req is None else ctx_req.disaggregated_params,
+                    server=ctx_server,
+                    reason="generation-first coordinator request failed",
+                )
             if grant_admitted and grant_params is not None:
                 try:
                     await self._abort_generation_grant(
@@ -1484,7 +1486,6 @@ class OpenAIDisaggregatedService(OpenAIService):
 
                 consume_task = asyncio.create_task(_consume_gen())
                 await asyncio.sleep(0)
-                ctx_reservation_live = False
                 ctx_task = asyncio.create_task(
                     self._ctx_client.send_request(
                         ctx_req,
@@ -1493,6 +1494,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                         req_id=disagg_request_id,
                     )
                 )
+                ctx_reservation_live = False
+                ctx_attempt_live = True
                 ctx_response = await self._await_context_with_generation_supervision(
                     ctx_task,
                     consume_task,
@@ -1582,7 +1585,6 @@ class OpenAIDisaggregatedService(OpenAIService):
             gen_reservation_live = False
             if need_ctx:
                 await asyncio.sleep(0)
-                ctx_reservation_live = False
                 ctx_task = asyncio.create_task(
                     self._ctx_client.send_request(
                         ctx_req,
@@ -1591,6 +1593,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                         req_id=disagg_request_id,
                     )
                 )
+                ctx_reservation_live = False
+                ctx_attempt_live = True
                 ctx_response = await self._await_context_with_generation_supervision(
                     ctx_task,
                     gen_task,
