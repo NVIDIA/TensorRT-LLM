@@ -428,7 +428,12 @@ class DiffusionExecutor:
             cache_key = self.pipeline.warmup_cache_key(
                 req.params.height, req.params.width, num_frames=req.params.num_frames
             )
-            if self.pipeline._warmed_up_shapes and cache_key not in self.pipeline._warmed_up_shapes:
+            cache_key_is_resolved = all(value is not None for value in cache_key)
+            if (
+                cache_key_is_resolved
+                and self.pipeline._warmed_up_shapes
+                and cache_key not in self.pipeline._warmed_up_shapes
+            ):
                 logger.warning(
                     f"Requested shape {cache_key} was not warmed up. "
                     f"First request with this shape will be slower due to "

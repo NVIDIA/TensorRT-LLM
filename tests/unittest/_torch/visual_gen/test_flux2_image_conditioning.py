@@ -123,10 +123,14 @@ def test_reference_images_run_with_cache_acceleration(
     transformer = Transformer()
     pipeline.transformer = transformer
     pipeline.scheduler = Scheduler()
+    graph_runner = SimpleNamespace(enabled=True)
+    pipeline._cuda_graph_runners = {"transformer": graph_runner}
 
     denoised_latents: list[torch.Tensor] = []
+    graph_states_during_denoise: list[bool] = []
 
     def denoise(**kwargs) -> torch.Tensor:
+        graph_states_during_denoise.append(graph_runner.enabled)
         result = kwargs["forward_fn"](
             kwargs["latents"],
             {},
@@ -150,8 +154,26 @@ def test_reference_images_run_with_cache_acceleration(
     )
 
     assert transformer.sequence_lengths == [4 + 4 * reference_count]
+    assert graph_states_during_denoise == [False]
+    assert graph_runner.enabled is True
     assert denoised_latents[0].shape == (1, 4, 8)
     assert result.image.shape == (1, 16, 16, 3)
+
+
+def test_cuda_graph_bypass_preserves_text_only_state_and_restores_after_failure() -> None:
+    pipeline = Flux2Pipeline.__new__(Flux2Pipeline)
+    graph_runner = SimpleNamespace(enabled=True)
+    pipeline._cuda_graph_runners = {"transformer": graph_runner}
+
+    with pipeline._temporarily_disable_cuda_graphs(disable=False):
+        assert graph_runner.enabled is True
+
+    with pytest.raises(RuntimeError, match="denoise failed"):
+        with pipeline._temporarily_disable_cuda_graphs(disable=True):
+            assert graph_runner.enabled is False
+            raise RuntimeError("denoise failed")
+
+    assert graph_runner.enabled is True
 
 
 def test_prepare_image_ids_assigns_distinct_time_offsets() -> None:

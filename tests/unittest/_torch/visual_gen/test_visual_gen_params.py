@@ -1201,3 +1201,26 @@ class TestEngineFailureTransport:
         resp = executor.response_queue.put.call_args[0][0]
         assert isinstance(resp, DiffusionResponse)
         assert resp.error_msg == "oops"
+
+    def test_unresolved_reference_size_skips_warmup_warning(self, caplog):
+        from tensorrt_llm._torch.visual_gen.executor import DiffusionExecutor, DiffusionRequest
+        from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
+        from tensorrt_llm.visual_gen.params import VisualGenParams
+
+        executor = self._make_executor(Flux2Pipeline)
+        executor.rank = 1
+        executor._merge_defaults = lambda req: DiffusionExecutor._merge_defaults(executor, req)
+        executor.pipeline.derive_output_size_from_reference = True
+        executor.pipeline.warmup_cache_key = MagicMock(return_value=(None, None))
+        executor.pipeline._warmed_up_shapes = {(1024, 1024)}
+        executor.pipeline.infer = MagicMock(return_value=MagicMock())
+        req = DiffusionRequest(
+            request_id=8,
+            prompt=["test"],
+            params=VisualGenParams(image=b"encoded image"),
+        )
+
+        DiffusionExecutor.process_request(executor, req)
+
+        assert "Requested shape" not in caplog.text
+        executor.pipeline.infer.assert_called_once_with(req)

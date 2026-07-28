@@ -22,7 +22,8 @@ import io
 import json
 import os
 import time
-from typing import Any, List, Optional, Tuple, Union
+from contextlib import contextmanager
+from typing import Any, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import PIL.Image
@@ -526,14 +527,19 @@ class Flux2Pipeline(BasePipeline):
             return noise_pred[:, : latents.shape[1]]
 
         timer.mark_denoise_start()
-        latents = self.denoise(
-            latents=latents,
-            scheduler=self.scheduler,
-            prompt_embeds=prompt_embeds,
-            guidance_scale=1.0,  # No CFG: guidance is embedded
-            forward_fn=forward_fn,
-            timesteps=timesteps,
-        )
+        # Reference count and dimensions change the transformer sequence length.
+        # Run those requests outside CUDA graphs so a long-lived process does not
+        # retain one graph per reference shape. torch.compile remains active and
+        # may compile a new sequence shape; text-only requests still use graphs.
+        with self._temporarily_disable_cuda_graphs(disable=image_latents is not None):
+            latents = self.denoise(
+                latents=latents,
+                scheduler=self.scheduler,
+                prompt_embeds=prompt_embeds,
+                guidance_scale=1.0,  # No CFG: guidance is embedded
+                forward_fn=forward_fn,
+                timesteps=timesteps,
+            )
         timer.mark_post_start()
 
         # Decode
@@ -547,6 +553,23 @@ class Flux2Pipeline(BasePipeline):
 
         timer.mark_end()
         return timer.fill(PipelineOutput(image=image))
+
+    @contextmanager
+    def _temporarily_disable_cuda_graphs(self, disable: bool) -> Iterator[None]:
+        """Bypass CUDA graphs for a request without discarding captured graphs."""
+        runners = list(getattr(self, "_cuda_graph_runners", {}).values())
+        if not disable or not runners:
+            yield
+            return
+
+        previous_states = [runner.enabled for runner in runners]
+        for runner in runners:
+            runner.enabled = False
+        try:
+            yield
+        finally:
+            for runner, enabled in zip(runners, previous_states):
+                runner.enabled = enabled
 
     def _encode_prompt(
         self,
