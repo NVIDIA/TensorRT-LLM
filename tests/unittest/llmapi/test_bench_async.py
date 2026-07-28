@@ -160,6 +160,70 @@ async def test_llm_manager_duration_bounds_runtime_with_eager_dispatch():
 
 
 @pytest.mark.asyncio
+async def test_llm_manager_cancels_in_flight_requests_on_failure():
+    """A failed request aborts the run instead of draining the in-flight ones.
+
+    Only a duration-triggered exit waits for in-flight requests, so that their
+    statistics are recorded. On failure the benchmark is aborting anyway, and
+    waiting would make an erroring run slower than a successful one.
+    """
+    mock_llm = MagicMock(spec=LLM)
+    mock_llm.args = MagicMock()
+    mock_llm.args.parallel_config = MagicMock()
+    mock_llm.args.parallel_config.world_size = 1
+
+    slow_latency = 30  # Far longer than the test should ever wait.
+    call_count = itertools.count()
+
+    def generate_async(*args, **kwargs):
+        output = MagicMock()
+        output.prompt_token_ids = [1, 2, 3]
+        output.outputs = [MagicMock(token_ids=[4, 5])]
+        output.finished = True
+        output.id = next(call_count)
+        output.decoding_iter = 1
+
+        # The first request fails; the rest hang until cancelled.
+        if output.id == 0:
+
+            async def mock_aresult():
+                raise ValueError("simulated request failure")
+        else:
+
+            async def mock_aresult():
+                await asyncio.sleep(slow_latency)
+                return output
+
+        output.aresult = mock_aresult
+        return output
+
+    mock_llm.generate_async.side_effect = generate_async
+
+    outbox = asyncio.Queue()
+    manager = LlmManager(
+        llm=mock_llm,
+        outbox=outbox,
+        streaming=False,
+        concurrency=4,
+    )
+
+    req = InferenceRequest(task_id=0, input_ids=[1, 2, 3], output_tokens=10)
+    for _ in range(4):
+        await manager.enqueue(req, SamplingParams(), PostprocParams())
+
+    start = asyncio.get_running_loop().time()
+    manager.run()
+    with pytest.raises(ValueError, match="simulated request failure"):
+        await asyncio.wait_for(manager._backend_task, timeout=10)
+    elapsed = asyncio.get_running_loop().time() - start
+
+    # Without cancellation the worker would block on the 30s requests.
+    assert elapsed < slow_latency, (
+        "Worker waited for in-flight requests instead of cancelling them."
+    )
+
+
+@pytest.mark.asyncio
 async def test_llm_manager_duration_not_exceeded():
     # Mock LLM
     mock_llm = MagicMock(spec=LLM)

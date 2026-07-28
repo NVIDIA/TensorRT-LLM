@@ -241,6 +241,9 @@ class LlmManager:
 
     async def worker(self) -> None:
         """Worker task that pulls requests from inbox and processes them."""
+        # Only a duration-triggered exit lets in-flight requests finish; a stop
+        # signal or a failure cancels them, as the pre-duration code always did.
+        drain_in_flight = False
         try:
             while not self._stop.is_set():
                 self._raise_for_failed_tasks()
@@ -256,6 +259,7 @@ class LlmManager:
                             self._inbox.get_nowait()
                         except asyncio.QueueEmpty:
                             break
+                    drain_in_flight = True
                     break
 
                 try:
@@ -275,16 +279,14 @@ class LlmManager:
             logger.info("Worker task cancelled.")
         finally:
             logger.debug("Worker task finishing...")
-            if self._stop.is_set():
+            if drain_in_flight:
                 logger.debug(
-                    "Worker task cancelling remaining requests due to stop signal..."
+                    "Duration reached. Waiting for in-flight requests to complete..."
                 )
+            else:
+                logger.debug("Worker task cancelling remaining requests...")
                 for task in self._tasks:
                     task.cancel()
-            else:
-                logger.debug(
-                    "Worker task exiting. Waiting for in-flight tasks to complete..."
-                )
             logger.debug("Waiting for requests...")
             if self._tasks:
                 await asyncio.wait(self._tasks)
