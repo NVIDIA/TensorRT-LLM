@@ -19,6 +19,7 @@ from typing import NamedTuple
 
 import pytest
 
+from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
@@ -3787,8 +3788,7 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert parser.eot_token == self.EOT
 
     def test_undefined_tool(self, sample_tools, parser, tool_parser_test_cases):
-        """K3 keeps undefined-tool calls (with a warning) at their
-        positional index rather than remapping tool_index to -1."""
+        """Keep undefined-tool calls at their positional index."""
         text = tool_parser_test_cases.undefined_tool
 
         result = parser.detect_and_parse(text, sample_tools)
@@ -3798,8 +3798,7 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert result.calls[0].tool_index == 0
 
     def test_supports_structural_tag(self):
-        """XTML bodies are tag-structured text: JSON-schema structural-tag
-        constrained decoding does not apply."""
+        """Reject JSON-schema structural tagging for XTML bodies."""
         parser = KimiK3ToolParser()
         assert parser.supports_structural_tag() is False
         with pytest.raises(NotImplementedError):
@@ -3833,8 +3832,7 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
 
     def test_argument_invalid_json_falls_back_to_raw(self, sample_tools,
                                                      parser):
-        """A declared non-string type whose body is not valid JSON keeps the
-        raw text instead of raising."""
+        """Keep a non-string argument's invalid JSON body as raw text."""
         text = self._section(
             self._call("get_weather", 1,
                        self._argument("count", "number", "not-a-number")))
@@ -3846,19 +3844,15 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         }
 
     def test_attribute_unescaping(self, sample_tools, parser):
-        """Attribute values arrive &amp;/&quot;-escaped (encoding_k3
-        `_escape_attr_value`) and must be unescaped."""
+        """Unescape encoded XTML attribute values."""
         text = self._section(
             self._call(
                 "get_weather", 1,
-                self._argument("say &quot;hi&quot; &amp; bye", "string",
-                               "v")))
+                self._argument("say &quot;hi&quot; &amp; bye", "string", "v")))
 
         result = parser.detect_and_parse(text, sample_tools)
 
-        assert json.loads(result.calls[0].parameters) == {
-            'say "hi" & bye': "v"
-        }
+        assert json.loads(result.calls[0].parameters) == {'say "hi" & bye': "v"}
 
     def test_empty_arguments(self, sample_tools, parser):
         """A call with no argument tags yields an empty JSON object."""
@@ -3870,8 +3864,7 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert result.calls[0].parameters == "{}"
 
     def test_trailing_structural_markup_stripped(self, sample_tools, parser):
-        """Without a tools section, trailing XTML message terminators are
-        stripped from normal_text (standalone use, no reasoning parser)."""
+        """Strip trailing XTML terminators from standalone normal text."""
         text = "The answer is 4.<|close|>message<|sep|><|end_of_msg|>"
 
         result = parser.detect_and_parse(text, sample_tools)
@@ -3881,9 +3874,7 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
 
     def test_streaming_buffers_section_until_complete(self, sample_tools,
                                                       parser):
-        """Streaming flushes response text immediately but holds the tools
-        section until <|close|>tools<|sep|> arrives, then emits complete
-        calls."""
+        """Buffer an incomplete tools section while streaming response text."""
         result = parser.parse_streaming_increment("Checking. ", sample_tools)
         assert result.normal_text == "Checking. "
         assert result.calls == []
@@ -3909,10 +3900,8 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert result.calls[0].name == "get_weather"
         assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
 
-    def test_composes_with_kimi_k3_reasoning_parser(self, sample_tools,
-                                                    parser):
-        """Serving chains the kimi_k3 reasoning parser (which passes the
-        tools section through into content verbatim) into this parser."""
+    def test_composes_with_kimi_k3_reasoning_parser(self, sample_tools, parser):
+        """Parse tools passed through the Kimi-K3 reasoning parser."""
         from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 
         completion = (
@@ -3932,3 +3921,48 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert len(stage2.calls) == 1
         assert stage2.calls[0].name == "get_weather"
         assert json.loads(stage2.calls[0].parameters) == {"location": "NYC"}
+
+
+class TestConfigureParserSpecialTokenDecoding:
+    """Test parser-specific detokenization settings in the OpenAI server."""
+
+    @staticmethod
+    def _configure(reasoning_parser_name: str | None = None,
+                   tool_parser_name: str | None = None,
+                   has_tools: bool = False) -> SamplingParams:
+        from tensorrt_llm.serve.openai_server import \
+            _configure_parser_special_token_decoding
+
+        sampling_params = SamplingParams()
+        _configure_parser_special_token_decoding(
+            sampling_params,
+            reasoning_parser_name=reasoning_parser_name,
+            tool_parser_name=tool_parser_name,
+            has_tools=has_tools)
+        return sampling_params
+
+    def test_kimi_k3_reasoning_parser_preserves_compact_xtml(self) -> None:
+        sampling_params = self._configure(reasoning_parser_name="kimi_k3")
+
+        assert sampling_params.skip_special_tokens is False
+        assert sampling_params.spaces_between_special_tokens is False
+
+    def test_kimi_k3_tool_parser_preserves_compact_xtml(self) -> None:
+        sampling_params = self._configure(tool_parser_name="KIMI_K3",
+                                          has_tools=True)
+
+        assert sampling_params.skip_special_tokens is False
+        assert sampling_params.spaces_between_special_tokens is False
+
+    def test_tool_parser_does_not_apply_without_tools(self) -> None:
+        sampling_params = self._configure(tool_parser_name="kimi_k3")
+
+        assert sampling_params.skip_special_tokens is True
+        assert sampling_params.spaces_between_special_tokens is True
+
+    def test_other_raw_token_parser_keeps_spacing_contract(self) -> None:
+        sampling_params = self._configure(tool_parser_name="deepseek_v32",
+                                          has_tools=True)
+
+        assert sampling_params.skip_special_tokens is False
+        assert sampling_params.spaces_between_special_tokens is True

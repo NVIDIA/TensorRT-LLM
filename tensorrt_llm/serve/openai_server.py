@@ -157,6 +157,36 @@ if _MSGSPEC_ENABLED:
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
 
+def _configure_parser_special_token_decoding(
+        sampling_params: SamplingParams, reasoning_parser_name: Optional[str],
+        tool_parser_name: Optional[str], has_tools: bool) -> None:
+    """Configure detokenization for parsers that consume special tokens."""
+    needs_compact_special_tokens = False
+    if reasoning_parser_name and ReasoningParserFactory.needs_raw_special_tokens(
+            reasoning_parser_name):
+        # Unlike the tool-parser flag below, this applies to every chat
+        # request: reasoning delimiters are special tokens regardless of
+        # whether tools are attached.
+        sampling_params.skip_special_tokens = False
+        needs_compact_special_tokens = reasoning_parser_name.lower(
+        ) == "kimi_k3"
+
+    if tool_parser_name and has_tools:
+        tool_parser_cls = ToolParserFactory.parsers.get(
+            tool_parser_name.lower())
+        if tool_parser_cls and getattr(tool_parser_cls,
+                                       'needs_raw_special_tokens', False):
+            sampling_params.skip_special_tokens = False
+            needs_compact_special_tokens |= tool_parser_name.lower(
+            ) == "kimi_k3"
+
+    if needs_compact_special_tokens:
+        # K3 XTML places ordinary-text tag names directly between special
+        # tokens, for example ``<|open|>tools<|sep|>``. Inserting spaces here
+        # changes the protocol and prevents the K3 parsers from matching it.
+        sampling_params.spaces_between_special_tokens = False
+
+
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
     """Build GuidedDecodingParams with structural tags for tools with strict=True.
 
@@ -1506,18 +1536,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 chat_template_kwargs=request.chat_template_kwargs,
             )
             reasoning_parser_name = self.generator.args.reasoning_parser
-            if reasoning_parser_name and ReasoningParserFactory.needs_raw_special_tokens(
-                    reasoning_parser_name):
-                # Unlike the tool-parser flag below, this applies to every
-                # chat request: the reasoning delimiters are special tokens
-                # regardless of whether tools are attached.
-                sampling_params.skip_special_tokens = False
+            _configure_parser_special_token_decoding(
+                sampling_params,
+                reasoning_parser_name=reasoning_parser_name,
+                tool_parser_name=self.tool_parser,
+                has_tools=bool(request.tools))
             if self.tool_parser and request.tools:
-                tool_parser_cls = ToolParserFactory.parsers.get(
-                    self.tool_parser.lower())
-                if tool_parser_cls and getattr(
-                        tool_parser_cls, 'needs_raw_special_tokens', False):
-                    sampling_params.skip_special_tokens = False
                 # When strict=True on any tool, apply constrained decoding
                 # via structural tags (only if response_format doesn't already
                 # set guided decoding).
