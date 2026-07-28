@@ -734,6 +734,16 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "by the MSA implementation.",
         status="prototype",
     )
+    fuse_qkv_index_projection: bool = Field(
+        default=False,
+        description=
+        "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q "
+        "is sharded with the KV heads and index-K is replicated. This prototype "
+        "currently targets disaggregated prefill workers; leave it disabled on "
+        "decode or mixed workers. The MiniMax-M3-specific path requires the MSA "
+        "implementation.",
+        status="prototype",
+    )
     num_attention_heads: Optional[int] = Field(
         default=None,
         description=
@@ -768,6 +778,10 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         if self.indexer_kv_dtype == "fp8" and not self.sparse_disable_index_value:
             raise ValueError("MiniMax-M3 indexer_kv_dtype='fp8' requires "
                              "sparse_disable_index_value=True.")
+        if self.fuse_qkv_index_projection and self.implementation != "msa":
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
+                "the 'msa' implementation.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -791,6 +805,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             disable_index_value=self.sparse_disable_index_value,
             implementation=self.implementation,
             indexer_kv_dtype=self.indexer_kv_dtype,
+            fuse_qkv_index_projection=self.fuse_qkv_index_projection,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -820,6 +835,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             global_num_kv_heads=num_kv_heads,
             num_index_heads=self.sparse_num_index_heads,
             topk=self.sparse_topk_blocks,
+            fuse_qkv_index_projection=self.fuse_qkv_index_projection,
         )
 
 

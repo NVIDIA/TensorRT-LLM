@@ -43,6 +43,7 @@ class MiniMaxM3SparseParams(SparseParams):
     disable_index_value: bool = True
     implementation: Literal["triton", "msa"] = "triton"
     indexer_kv_dtype: Literal["bf16", "fp8"] = "bf16"
+    fuse_qkv_index_projection: bool = False
 
     @property
     def indices_block_size(self) -> int:
@@ -62,6 +63,7 @@ class MiniMaxM3SparseMetadataParams(SparseMetadataParams):
     global_num_kv_heads: int = 0
     num_index_heads: int = 4
     topk: int = 16
+    fuse_qkv_index_projection: bool = False
 
     def sharded_head_counts(self, mapping: Optional["Mapping"] = None) -> Tuple[int, int]:
         """Return per-rank (num_q_heads, num_kv_heads) for mapping.
@@ -78,6 +80,13 @@ class MiniMaxM3SparseMetadataParams(SparseMetadataParams):
             return (int(num_heads) + tp_size - 1) // tp_size
 
         return _shard(self.global_num_q_heads), _shard(self.global_num_kv_heads)
+
+    def sharded_index_head_count(self, mapping: Optional["Mapping"] = None) -> int:
+        """Return the index-head count used by this rank's proxy attention."""
+        if not self.fuse_qkv_index_projection:
+            return int(self.num_index_heads)
+        _, num_kv_heads = self.sharded_head_counts(mapping)
+        return num_kv_heads
 
 
 @dataclass(frozen=True)
@@ -149,7 +158,11 @@ class MiniMaxM3SparseConfig:
             num_q_heads=int(num_q_heads),
             num_kv_heads=int(num_kv_heads),
             head_dim=int(head_dim),
-            num_index_heads=int(sparse_params.num_index_heads),
+            num_index_heads=(
+                int(num_kv_heads)
+                if sparse_params.fuse_qkv_index_projection
+                else int(sparse_params.num_index_heads)
+            ),
             sparse_index_dim=int(sparse_params.sparse_index_dim),
             block_size=int(sparse_params.block_size),
             topk=int(sparse_params.topk),

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import write_kv_slots
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_scatter import (
@@ -54,6 +55,81 @@ def test_msa_fp8_indexer_config_is_explicit_and_lowered():
             indexer_kv_dtype="fp8",
             sparse_disable_index_value=False,
         )
+
+
+def test_fused_qkv_index_projection_is_explicit_and_shards_index_heads():
+    cfg = MiniMaxM3SparseAttentionConfig(
+        implementation="msa",
+        fuse_qkv_index_projection=True,
+    )
+    sparse_params = cfg.to_sparse_params()
+    metadata_params = cfg.to_sparse_metadata_params(
+        pretrained_config=SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
+    )
+    mapping = SimpleNamespace(tp_size=2, enable_attention_dp=False)
+
+    assert sparse_params.fuse_qkv_index_projection is True
+    assert metadata_params.sharded_head_counts(mapping) == (32, 2)
+    assert metadata_params.sharded_index_head_count(mapping) == 2
+
+    compatibility = MiniMaxM3SparseAttentionConfig(implementation="msa").to_sparse_metadata_params(
+        pretrained_config=SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
+    )
+    assert compatibility.sharded_index_head_count(mapping) == 4
+
+    with pytest.raises(ValueError, match=r"requires the 'msa' implementation"):
+        MiniMaxM3SparseAttentionConfig(
+            implementation="triton",
+            fuse_qkv_index_projection=True,
+        )
+
+
+def test_prepopulated_kv_dispatches_compact_q_and_consumes_marker(monkeypatch):
+    from tensorrt_llm._torch.attention_backend.fmha import msa_sparse_gqa
+
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    q = torch.empty(3, 8 * 128)
+    output = torch.empty_like(q)
+    topk = torch.zeros(3, 1, 16, dtype=torch.int32)
+    eager_plan = object()
+
+    class FakeMetadata:
+        msa_decode_gqa_plan = None
+        msa_eager_gqa_plan = eager_plan
+        msa_decode_dense_plan = None
+        msa_eager_dense_plan = object()
+        _msa_prewritten_layer = 7
+
+    captured = {}
+
+    def fake_run(attn, q_arg, k, v, metadata, output_arg, **kwargs):
+        captured.update(
+            attn=attn,
+            q=q_arg,
+            k=k,
+            v=v,
+            metadata=metadata,
+            output=output_arg,
+            kwargs=kwargs,
+        )
+        metadata._msa_prewritten_layer = None
+
+    monkeypatch.setattr(msa_sparse_gqa, "run_msa_paged_gqa", fake_run)
+    metadata = FakeMetadata()
+    attention.forward_prepopulated_kv(
+        q,
+        metadata,
+        AttentionForwardArgs(output=output, topk_indices=topk),
+    )
+
+    assert captured["attn"] is attention
+    assert captured["q"] is q
+    assert captured["k"] is None and captured["v"] is None
+    assert captured["metadata"] is metadata
+    assert captured["output"] is output
+    assert captured["kwargs"]["kv_block_indexes"] is topk
+    assert captured["kwargs"]["plan"] is eager_plan
+    assert metadata._msa_prewritten_layer is None
 
 
 def test_msa_metadata_rejects_undersized_max_score_buffer():
@@ -225,6 +301,8 @@ def test_msa_fp8_cache_converts_live_index_query_before_scoring():
         msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
         msa_kv_lens_cpu = torch.full((2,), 128, dtype=torch.int32)
         msa_qo_offset_cpu = torch.full((2,), 127, dtype=torch.int32)
+        num_contexts = 0
+        num_generations = 2
 
         def __init__(self):
             self.cache = torch.empty(2, 1, 128, 128, dtype=torch.float8_e4m3fn, device="cuda")

@@ -37,7 +37,9 @@ from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
+    MiniMaxM3QKVIndexerLinear,
     _build_swiglu_oai_dense_mlp,
+    _load_qkv_index_proj_weights,
     _minimax_m3_swiglu_oai,
     _strip_language_model_prefix,
     _wrap_dict_as_config,
@@ -409,6 +411,28 @@ def test_minimax_m3_attention_dense_construction_matches_config():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
+def test_minimax_m3_fused_main_kv_write_is_opt_in(monkeypatch):
+    _, model_cfg = _make_attention_test_config()
+
+    monkeypatch.delenv("TRTLLM_MINIMAX_M3_FUSED_MAIN_KV_WRITE", raising=False)
+    baseline = MiniMaxM3Attention(
+        model_config=model_cfg,
+        layer_idx=0,
+        is_sparse_attention_layer=False,
+    )
+    assert baseline.enable_fused_main_kv_write is False
+
+    monkeypatch.setenv("TRTLLM_MINIMAX_M3_FUSED_MAIN_KV_WRITE", "1")
+    candidate = MiniMaxM3Attention(
+        model_config=model_cfg,
+        layer_idx=0,
+        is_sparse_attention_layer=False,
+    )
+    assert candidate.enable_fused_main_kv_write is True
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
 def test_minimax_m3_attention_partial_rope_dim_is_rotary_dim():
     """Partial RoPE rotates only ``rotary_dim`` of ``head_dim`` channels."""
     text_cfg, model_cfg = _make_attention_test_config()
@@ -534,6 +558,56 @@ def test_minimax_m3_attention_sparse_construction_matches_config():
         assert "attn_metadata" in msg or "kv_cache_manager" in msg, msg
     else:  # pragma: no cover
         raise AssertionError("sparse forward must raise RuntimeError when attn_metadata is None")
+
+
+def test_minimax_m3_five_way_projection_shard_geometry():
+    module = SimpleNamespace(
+        tp_size=2,
+        tp_rank=1,
+        total_num_kv_heads=4,
+        total_num_index_heads=4,
+    )
+    shard_geometry = MiniMaxM3QKVIndexerLinear._shard_geometry
+    assert shard_geometry(module, "q") == (2, 1)
+    assert shard_geometry(module, "k") == (2, 1)
+    assert shard_geometry(module, "v") == (2, 1)
+    assert shard_geometry(module, "index_q") == (2, 1)
+    assert shard_geometry(module, "index_k") == (1, 0)
+
+    # At TP8, each of four KV/index-Q heads is replicated on two ranks.
+    module.tp_size = 8
+    module.tp_rank = 5
+    assert shard_geometry(module, "k") == (4, 2)
+    assert shard_geometry(module, "index_q") == (4, 2)
+    assert shard_geometry(module, "index_k") == (1, 0)
+
+
+def test_minimax_m3_five_way_loader_returns_exact_generic_skip():
+    projection = object.__new__(MiniMaxM3QKVIndexerLinear)
+    nn.Module.__init__(projection)
+    captured = {}
+    projection.load_five_way_weights = lambda shards: captured.update(shards)
+
+    model = nn.Module()
+    model.sparse = nn.Module()
+    model.sparse.qkv_proj = projection
+    weights = {
+        f"sparse.{name}_proj.weight": torch.empty(1)
+        for name in ("q", "k", "v", "index_q", "index_k")
+    }
+
+    loaded_modules = _load_qkv_index_proj_weights(model, weights)
+
+    assert loaded_modules == ["sparse.qkv_proj"]
+    assert set(captured) == {"q", "k", "v", "index_q", "index_k"}
+    assert all(set(shard) == {"weight"} for shard in captured.values())
+    assert weights == {}
+
+    mapper = MiniMaxM3HfWeightMapper()
+    mapper.add_skip_modules(loaded_modules)
+    mapper._model = SimpleNamespace(config=SimpleNamespace(tie_word_embeddings=False))
+    assert mapper.should_skip_module("sparse.qkv_proj")
+    assert not mapper.should_skip_module("dense.qkv_proj")
 
 
 @pytest.mark.gpu
