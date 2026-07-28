@@ -503,6 +503,8 @@ def make_cute_buffers(
     manager = TriAttention.__new__(TriAttention)
     manager.kv_cache_manager = SimpleNamespace(
         num_pools=max(layer_pool_ids) + 1,
+        tokens_per_block=tokens_per_block,
+        max_blocks_per_seq=source_blocks,
         host_kv_cache_block_offsets=torch.empty(1, 1, 2, source_blocks, dtype=torch.int32),
         mapping=SimpleNamespace(tp_size=1, tp_rank=0, enable_attention_dp=False),
     )
