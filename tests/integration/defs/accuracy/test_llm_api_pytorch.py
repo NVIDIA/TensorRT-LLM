@@ -6225,10 +6225,10 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         if moe_backend == "TRTLLM" and get_sm_version() not in (100, 103):
             pytest.skip(f"{moe_backend} backend supports SM 100 and 103 only")
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
-                                            max_batch_size=256)
+                                            max_batch_size=128)
         moe_config = MoeConfig(backend=moe_backend)
 
         # H20 path produces a small but fluctuating gap relative to H100/H200 BF16 MoE config.
@@ -6242,7 +6242,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
-                 max_batch_size=256,
+                 max_batch_size=128,
                  enable_chunked_prefill=True,
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=cuda_graph_config,
