@@ -27,15 +27,25 @@ def test_physical_pool_construction():
     assert pool.base_address == 0x10000
     assert pool.slot_bytes == 256
     assert pool.num_slots == 4
+    assert pool.slot_stride_bytes == 256
+    assert pool.layer_stride_bytes == 1024
 
 
 def test_physical_pool_roundtrip():
-    pool = PhysicalPool(base_address=0x10000, slot_bytes=256, num_slots=4)
+    pool = PhysicalPool(
+        base_address=0x10000,
+        slot_bytes=256,
+        num_slots=4,
+        slot_stride_bytes=2048,
+        layer_stride_bytes=512,
+    )
     d = pool.to_dict()
     restored = PhysicalPool.from_dict(d)
     assert restored.base_address == pool.base_address
     assert restored.slot_bytes == pool.slot_bytes
     assert restored.num_slots == pool.num_slots
+    assert restored.slot_stride_bytes == pool.slot_stride_bytes
+    assert restored.layer_stride_bytes == pool.layer_stride_bytes
 
 
 def test_pool_view_roundtrip():

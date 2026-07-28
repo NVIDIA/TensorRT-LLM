@@ -710,7 +710,7 @@
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
-      "path": "kv_cache_config.mamba_state_cache_interval"
+      "path": "kv_cache_config.mamba_state_config.periodic_snapshot_interval"
     },
     {
       "allowed_values": [],

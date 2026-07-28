@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, ContextChunkingPolicy
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -156,7 +156,11 @@ def _make_llm_args():
         enable_partial_reuse=False,
         tokens_per_block=32,
         max_attention_window=None,
-        mamba_state_cache_interval=1,
+        mamba_state_config=SimpleNamespace(
+            periodic_snapshot_interval=256,
+            additional_snapshot_offsets_from_start=[],
+            additional_snapshot_offsets_from_end=[],
+        ),
     )
     scheduler_config = SimpleNamespace(
         context_chunking_policy=None,
@@ -176,6 +180,7 @@ def _make_llm_args():
         trust_remote_code=False,
         mm_encoder_only=False,
         enable_chunked_prefill=False,
+        sparse_attention_config=None,
         attn_backend="TRTLLM",
         speculative_config=None,
         disable_overlap_scheduler=True,
@@ -202,6 +207,8 @@ def _run_create_py_executor(
     cache_transceiver_config=None,
     enable_flash_mla=False,
     model_max_seq_len=128,
+    is_hybrid_linear_model=False,
+    ctx_chunk_configs=None,
 ):
     """Execute create_py_executor with mocked dependencies and return cache reuse flags.
 
@@ -216,6 +223,8 @@ def _run_create_py_executor(
         cache_transceiver_config: Optional transceiver configuration to mutate.
         enable_flash_mla: Whether to emulate the FlashMLA block-size override.
         model_max_seq_len: Effective sequence length reported by the model engine.
+        is_hybrid_linear_model: Whether to emulate a hybrid linear model.
+        ctx_chunk_configs: Optional list that receives the executor chunk config.
 
     Returns:
         Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag) from created executor.
@@ -252,7 +261,11 @@ def _run_create_py_executor(
     monkeypatch.setattr(py_executor_creator, "_adjust_torch_mem_fraction", lambda: None)
     monkeypatch.setattr(py_executor_creator, "log_memory_usage", lambda *args, **kwargs: None)
     monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: True)
-    monkeypatch.setattr(py_executor_creator, "is_hybrid_linear", lambda _: False)
+    monkeypatch.setattr(
+        py_executor_creator,
+        "is_hybrid_linear",
+        lambda _: is_hybrid_linear_model,
+    )
     monkeypatch.setattr(py_executor_creator, "get_sm_version", lambda: sm_version)
     monkeypatch.setattr(py_executor_creator, "KvCacheCreator", _DummyKvCacheCreator)
 
@@ -277,6 +290,8 @@ def _run_create_py_executor(
     monkeypatch.setattr(py_executor_creator, "PyTorchModelEngine", _create_model_engine)
 
     def _create_py_executor_instance(**kwargs):
+        if ctx_chunk_configs is not None:
+            ctx_chunk_configs.append(kwargs["ctx_chunk_config"])
         return _DummyPyExecutor(
             resources=kwargs["resources"],
             model_engine=kwargs["model_engine"],
@@ -403,3 +418,16 @@ def test_explicit_transceiver_buffer_size_is_preserved(monkeypatch):
     )
 
     assert config.max_tokens_in_buffer == 256
+
+
+def test_hybrid_force_chunk_uses_block_alignment_unit(monkeypatch):
+    ctx_chunk_configs = []
+    _run_create_py_executor(
+        monkeypatch,
+        sm_version=90,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        is_hybrid_linear_model=True,
+        ctx_chunk_configs=ctx_chunk_configs,
+    )
+
+    assert ctx_chunk_configs == [(ContextChunkingPolicy.FORCE_CHUNK, 32)]

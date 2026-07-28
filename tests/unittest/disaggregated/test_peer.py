@@ -210,6 +210,37 @@ def test_no_overlap():
     assert overlap.ranks == []
 
 
+@pytest.mark.parametrize(
+    ("self_heads", "peer_heads"),
+    [(0, 0), (0, 2), (2, 0)],
+)
+def test_attention_free_stage_has_no_head_duplication(
+    self_heads: int,
+    peer_heads: int,
+) -> None:
+    self_ri = make_rankinfo(
+        "self",
+        tp_size=2,
+        tp_rank=0,
+        kv_heads_per_rank=self_heads,
+        layer_num_per_pp=[2],
+    )
+    peer_ri = make_rankinfo(
+        "peer",
+        tp_size=2,
+        tp_rank=0,
+        kv_heads_per_rank=peer_heads,
+        layer_num_per_pp=[2],
+    )
+    reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
+
+    overlap = reg.get_peer_overlap(peer_ri, peer_dp_rank=0)
+
+    assert overlap.duplicate_head_factor == 1
+    assert overlap.peer_duplicate_head_factor == 1
+    assert overlap.ranks == [0]
+
+
 def test_pp_ratio_peer_smaller():
     self_ri = make_rankinfo(
         "self",

@@ -28,7 +28,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-261 captured fields.
+270 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -43,6 +43,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `attention_dp_config.kv_cache_routing_load_balance_weight` | `<class 'float'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_match_rate_threshold` | `<class 'float'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_max_sessions` | `<class 'int'>` | `value` |  |  |
+| `attention_dp_config.kv_cache_routing_new_conv_placement` | `Literal['round_robin', 'least_queued']` | `categorical` |  | `round_robin`, `least_queued` |
 | `attention_dp_config.timeout_iters` | `<class 'int'>` | `value` |  |  |
 | `attn_backend` | `<class 'str'>` | `categorical` | allowlist | `VANILLA`, `TRTLLM`, `FLASHINFER`, `FLASHINFER_STAR_ATTENTION` |
 | `backend` | `Literal['pytorch']` | `categorical` |  | `pytorch` |
@@ -122,7 +123,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.mamba_ssm_cache_dtype` | `Literal['auto', 'float16', 'bfloat16', 'float32']` | `categorical` |  | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
-| `kv_cache_config.mamba_state_cache_interval` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.mamba_state_config.periodic_snapshot_interval` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.max_attention_window` | `Optional[List[int]]` | `value` |  |  |
 | `kv_cache_config.max_gpu_total_bytes` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.max_tokens` | `Optional[int]` | `value` |  |  |

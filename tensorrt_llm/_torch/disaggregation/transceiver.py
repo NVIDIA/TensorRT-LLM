@@ -44,7 +44,10 @@ from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManager,
+    MambaHybridCacheManagerV2,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings import LlmRequestState
@@ -169,7 +172,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
         layer_num = len(self._kv_cache_manager.pp_layers)
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManager) and not isinstance(
+            self._kv_cache_manager, MambaHybridCacheManagerV2
+        ):
             layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
         layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
         self._transfer_worker.populate_instance_and_rank_info(
@@ -262,7 +267,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             groups.append(block_ids)
 
         mamba_state_index = None
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
+            if self._kv_cache_manager.local_num_mamba_layers > 0:
+                mamba_state_index = self._kv_cache_manager._request_id_to_state_index[
+                    req.py_request_id
+                ]
+        elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
             mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
 
         return KVSlice(
@@ -596,12 +606,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
+        need_progress = wait_num > 0
+        if need_progress:
+            self._poll_sessions_for_interval(
+                self._send_sessions,
+                self._send_reqs,
+                wait_num,
+                self._sender_future_timeout_ms,
+            )
 
         local_completed, local_failed = self._collect_done(self._send_sessions, self._send_reqs)
         to_process = self._build_to_process(
             self._send_sessions,
             self._ctx_consensus(local_completed + local_failed),
-            wait_num,
+            0 if need_progress else wait_num,
             block_all,
         )
 
@@ -715,16 +733,30 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return completed, failed, cancelled_reqs
 
     def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
-        poll_interval_s = (self.kv_transfer_poll_interval_ms or 0) / 1000.0
+        self._poll_sessions_for_interval(
+            self._recv_sessions,
+            self._recv_reqs,
+            wait_num,
+            self.kv_transfer_poll_interval_ms,
+        )
+
+    def _poll_sessions_for_interval(
+        self,
+        sessions: dict,
+        reqs: dict,
+        wait_num: int,
+        poll_interval_ms: Optional[int],
+    ) -> None:
+        poll_interval_s = (poll_interval_ms or 0) / 1000.0
         deadline = time.monotonic() + poll_interval_s
         while True:
-            completed, failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+            completed, failed = self._collect_done(sessions, reqs)
             if len(completed) + len(failed) >= wait_num:
                 return
             remaining_s = deadline - time.monotonic()
             if remaining_s <= 0:
                 return
-            for session in self._recv_sessions.values():
+            for session in sessions.values():
                 session.wait_complete(blocking=False)
             time.sleep(min(0.001, remaining_s))
 

@@ -395,6 +395,11 @@ class AttentionPolicy:
         return head_match, is_dup_head
 
     def duplicate_head_factors(self, peer_ri: RankInfo) -> tuple[int, int]:
+        # Head duplication only applies to attention KV.  In particular, do
+        # not divide 0 / 0 for an attention-free hybrid PP stage; MambaPolicy
+        # computes its TP mapping separately.
+        if self._ri.attention.kv_heads_per_rank == 0 or peer_ri.attention.kv_heads_per_rank == 0:
+            return 1, 1
         factor_self, factor_peer = self._head_factors(peer_ri)
         dup_head = max(1, factor_self // factor_peer)
         peer_dup_head = max(1, factor_peer // factor_self)
