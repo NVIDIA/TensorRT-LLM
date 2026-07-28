@@ -25,10 +25,7 @@ from ..params import SparseBackendForwardArgs
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed import AllReduceParams
-    from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modules.mla import MLA
-    from tensorrt_llm.mapping import Mapping
-    from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _q_b_proj_cute_dsl_import_ok: Optional[bool] = None
 
@@ -36,23 +33,9 @@ _q_b_proj_cute_dsl_import_ok: Optional[bool] = None
 # Module initialization and weight lifecycle for DeepSeek-V4 MLA.
 
 
-def initialize_sparse_attn(
-    self,
-    *,
-    config,
-    mapping,
-    mapping_o,
-    rms_norm_eps: float,
-    quant_config,
-    q_scaling: float,
-    bias: bool,
-    dtype: torch.dtype,
-    reduce_output: bool,
-    aux_stream: Optional[torch.cuda.Stream],
-) -> None:
-    """Initialize DeepSeek-V4 module state and remove unused dense modules."""
-    del bias, q_scaling
-    tp_size = mapping.tp_size
+def initialize_sparse_attn(self) -> None:
+    """Initialize DeepSeek-V4 module state."""
+    tp_size = self.num_heads // self.num_heads_tp
     if self.num_groups % tp_size != 0:
         raise ValueError(
             f"DeepSeek-V4 num_groups ({self.num_groups}) must be divisible by tp_size ({tp_size})."
@@ -65,24 +48,20 @@ def initialize_sparse_attn(
     if self.is_lite:
         raise ValueError("DeepSeek-V4 does not support lite MLA")
 
-    del self.kv_b_proj
-    del self.v_b_proj
-    del self.o_proj
-    self.mha = None
     self.indexer = getattr(self.mqa, "indexer", None)
     self.compressor = getattr(self.mqa, "compressor", None)
 
     self.n_local_groups = self.num_groups // tp_size
     self.q_b_layernorm = RMSNorm(
         hidden_size=self.qk_head_dim,
-        eps=rms_norm_eps,
-        dtype=dtype,
+        eps=self.rms_norm_eps,
+        dtype=self.dtype,
         has_weights=False,
     )
     self.kv_a_layernorm = RMSNorm(
         hidden_size=self.kv_lora_rank + self.qk_rope_head_dim,
-        dtype=dtype,
-        eps=rms_norm_eps,
+        dtype=self.dtype,
+        eps=self.rms_norm_eps,
     )
     self.o_a_proj = nn.Parameter(
         torch.empty(
@@ -91,7 +70,7 @@ def initialize_sparse_attn(
                 self.o_lora_rank,
                 self.num_heads * self.qk_head_dim // self.num_groups,
             ),
-            dtype=dtype,
+            dtype=self.dtype,
         ),
         requires_grad=False,
     )
@@ -99,14 +78,14 @@ def initialize_sparse_attn(
         self.num_groups * self.o_lora_rank,
         self.hidden_size,
         bias=False,
-        dtype=dtype,
-        mapping=mapping_o,
+        dtype=self.dtype,
+        mapping=self.mapping_o,
         tensor_parallel_mode=TensorParallelMode.ROW,
-        quant_config=quant_config,
-        skip_create_weights_in_init=config.skip_create_weights_in_init,
-        reduce_output=reduce_output,
-        allreduce_strategy=config.allreduce_strategy,
-        force_dynamic_quantization=config.force_dynamic_quantization,
+        quant_config=self.quant_config,
+        skip_create_weights_in_init=self.skip_create_weights_in_init,
+        reduce_output=self.reduce_output,
+        allreduce_strategy=self.allreduce_strategy,
+        force_dynamic_quantization=self.force_dynamic_quantization,
         use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
         use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
     )
@@ -117,10 +96,10 @@ def initialize_sparse_attn(
     self.indexer_stream = None
     self.indexer_aux_stream = None
     self.compressor_stream = None
-    if self.has_dsv4_indexer and aux_stream is not None:
-        self.indexer_stream = torch.cuda.Stream(device=aux_stream.device)
-        self.indexer_aux_stream = torch.cuda.Stream(device=aux_stream.device)
-        self.compressor_stream = torch.cuda.Stream(device=aux_stream.device)
+    if self.has_dsv4_indexer and self.aux_stream is not None:
+        self.indexer_stream = torch.cuda.Stream(device=self.aux_stream.device)
+        self.indexer_aux_stream = torch.cuda.Stream(device=self.aux_stream.device)
+        self.compressor_stream = torch.cuda.Stream(device=self.aux_stream.device)
     if self.indexer_aux_stream is not None:
         assert self.indexer is not None
         self.indexer.aux_stream = self.indexer_aux_stream
@@ -172,11 +151,6 @@ def create_sparse_attn_weights(self) -> None:
             )
     else:
         self.o_a_proj_scale = None
-
-
-def transform_sparse_attn_weights(self) -> None:
-    """Skip the dense MLA weight transformation for DeepSeek-V4."""
-    return None
 
 
 # Fused epilogue buffer management and output projection.
@@ -827,42 +801,15 @@ def forward_sparse_attn(
 class DeepSeekV4Hooks(MLASparseHooks):
     """Typed DeepSeek-V4 adapter for the shared MLA module."""
 
-    def initialize(
-        self,
-        mla: MLA,
-        *,
-        config: ModelConfig,
-        mapping: Mapping,
-        mapping_o: Mapping,
-        rms_norm_eps: float,
-        quant_config: QuantConfig,
-        q_scaling: float,
-        bias: bool,
-        dtype: torch.dtype,
-        reduce_output: bool,
-        aux_stream: Optional[torch.cuda.Stream],
-    ) -> None:
-        initialize_sparse_attn(
-            mla,
-            config=config,
-            mapping=mapping,
-            mapping_o=mapping_o,
-            rms_norm_eps=rms_norm_eps,
-            quant_config=quant_config,
-            q_scaling=q_scaling,
-            bias=bias,
-            dtype=dtype,
-            reduce_output=reduce_output,
-            aux_stream=aux_stream,
-        )
+    need_absorption = False
+    need_dense_mha = False
+    need_default_o_proj = False
 
-    def create_weights(self, mla: MLA) -> bool:
+    def initialize(self, mla: MLA) -> None:
+        initialize_sparse_attn(mla)
+
+    def create_weights(self, mla: MLA) -> None:
         create_sparse_attn_weights(mla)
-        return True
-
-    def transform_weights(self, mla: MLA) -> bool:
-        transform_sparse_attn_weights(mla)
-        return True
 
     def prepare_outputs(
         self,

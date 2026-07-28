@@ -24,10 +24,7 @@ from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSABackendForwardArgs
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modules.mla import MLA
-    from tensorrt_llm.mapping import Mapping
-    from tensorrt_llm.models.modeling_utils import QuantConfig
 
 try:
     from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
@@ -35,39 +32,23 @@ except ImportError:
     flash_mla_sparse_fwd = None
 
 
-def initialize_sparse_attn(
-    self,
-    *,
-    config,
-    mapping,
-    mapping_o,
-    rms_norm_eps: float,
-    quant_config,
-    q_scaling: float,
-    bias: bool,
-    dtype: torch.dtype,
-    reduce_output: bool,
-    aux_stream: Optional[torch.cuda.Stream],
-) -> None:
-    """Initialize DSA state and remove the unused dense MHA backend."""
-    del mapping, mapping_o, rms_norm_eps, quant_config, q_scaling
-    del bias, dtype, reduce_output, aux_stream
-
+def _get_short_seq_mha_threshold() -> int:
     threshold = os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")
     try:
-        self.short_seq_mha_threshold = int(threshold)
+        return int(threshold)
     except ValueError as err:
         raise ValueError(
             f"TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD must be an integer, got {threshold!r}"
         ) from err
 
-    use_short_seq_mha = self.short_seq_mha_threshold > 0 and self.mqa.support_fused_rope()
-    if not use_short_seq_mha:
-        self.mha = None
+
+def initialize_sparse_attn(self, short_seq_mha_threshold: int) -> None:
+    """Initialize DSA module state."""
+    self.short_seq_mha_threshold = short_seq_mha_threshold
     self.indexer = getattr(self.mqa, "indexer", None)
 
-    pp_mapping = config.mapping
-    num_hidden_layers = getattr(config.pretrained_config, "num_hidden_layers", None)
+    pp_mapping = self.pp_mapping
+    num_hidden_layers = self.num_hidden_layers
     if (
         pp_mapping.has_pp()
         and self.layer_idx is not None
@@ -597,33 +578,16 @@ def forward_sparse_mla_kvcache_bf16(
 class DSAHooks(MLASparseHooks):
     """Typed DSA adapter for the shared MLA module."""
 
-    def initialize(
-        self,
-        mla: MLA,
-        *,
-        config: ModelConfig,
-        mapping: Mapping,
-        mapping_o: Mapping,
-        rms_norm_eps: float,
-        quant_config: QuantConfig,
-        q_scaling: float,
-        bias: bool,
-        dtype: torch.dtype,
-        reduce_output: bool,
-        aux_stream: Optional[torch.cuda.Stream],
-    ) -> None:
-        initialize_sparse_attn(
-            mla,
-            config=config,
-            mapping=mapping,
-            mapping_o=mapping_o,
-            rms_norm_eps=rms_norm_eps,
-            quant_config=quant_config,
-            q_scaling=q_scaling,
-            bias=bias,
-            dtype=dtype,
-            reduce_output=reduce_output,
-            aux_stream=aux_stream,
+    need_absorption = True
+
+    def __init__(self) -> None:
+        self.short_seq_mha_threshold = _get_short_seq_mha_threshold()
+        self.need_dense_mha = self.short_seq_mha_threshold > 0
+
+    def initialize(self, mla: MLA) -> None:
+        initialize_sparse_attn(mla, self.short_seq_mha_threshold)
+        self.need_dense_mha = (
+            self.need_dense_mha and mla.mapping.cp_size == 1 and mla.mqa.support_fused_rope()
         )
 
     def forward(

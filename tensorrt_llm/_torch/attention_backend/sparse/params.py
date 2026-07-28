@@ -40,16 +40,16 @@ class SparseBackendForwardArgs:
 
 @dataclass(kw_only=True, slots=True)
 class SparseRuntimeParams:
-    """Sparse runtime parameters passed from a backend to the attention op."""
+    """Flat optional sparse inputs passed from a backend to ``AttentionOp``."""
 
+    # Sparse index inputs shared by multiple algorithms.
     sparse_kv_indices: Optional[torch.Tensor] = None
     sparse_kv_offsets: Optional[torch.Tensor] = None
     sparse_attn_indices: Optional[torch.Tensor] = None
     sparse_attn_offsets: Optional[torch.Tensor] = None
     sparse_attn_indices_block_size: int = 0
-    # DeepSeek-V4 compressed-cache inputs.
-    sparse_mla_topk_lens: Optional[torch.Tensor] = None
-    compressed_kv_cache_pool_ptr: Optional[int] = None
+    sparse_attn_kv_lens: Optional[torch.Tensor] = None
+    aux_kv_cache_pool_ptr: Optional[int] = None
 
     # SkipSoftmax prefill threshold; kernels divide it by context length.
     threshold_scale_factor_prefill: float = 0.0

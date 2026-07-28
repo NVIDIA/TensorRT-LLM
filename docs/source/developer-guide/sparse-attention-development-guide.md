@@ -143,6 +143,9 @@ sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(q, k, metada
 
 `hooks.py` writes these results to `SparseRuntimeParams`. SkipSoftmax writes
 its thresholds to the same runtime interface consumed by `AttentionOp`.
+`AttentionForwardArgs.sparse_backend_args` carries algorithm inputs from the
+module to the backend, while `sparse_runtime_params` carries lowered inputs
+from the backend to `AttentionOp`.
 
 Different KV heads are allowed to emit different sparse index sets; Q
 heads that map to the same KV head share the KV head's sparse pattern.

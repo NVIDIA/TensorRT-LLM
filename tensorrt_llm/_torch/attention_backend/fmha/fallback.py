@@ -177,10 +177,8 @@ class FallbackFmha(Fmha):
             sparse_attn_indices_block_size=(
                 forward_args.sparse_runtime_params.sparse_attn_indices_block_size
             ),
-            sparse_mla_topk_lens=forward_args.sparse_runtime_params.sparse_mla_topk_lens,
-            compressed_kv_cache_pool_ptr=(
-                forward_args.sparse_runtime_params.compressed_kv_cache_pool_ptr
-            ),
+            sparse_attn_kv_lens=forward_args.sparse_runtime_params.sparse_attn_kv_lens,
+            aux_kv_cache_pool_ptr=(forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr),
             skip_softmax_threshold_scale_factor_prefill=(
                 forward_args.sparse_runtime_params.threshold_scale_factor_prefill
             ),

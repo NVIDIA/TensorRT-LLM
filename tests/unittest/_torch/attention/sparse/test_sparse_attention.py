@@ -38,6 +38,8 @@ from tensorrt_llm._torch.attention_backend.sparse.hooks import (
     get_sparse_attention_hooks,
     get_sparse_mla_hooks,
     prepare_sparse_runtime_params,
+    register_attention_sparse_hooks,
+    register_mla_sparse_hooks,
 )
 from tensorrt_llm._torch.attention_backend.sparse.params import SparseParams, SparseRuntimeParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
@@ -184,7 +186,7 @@ def test_sparse_runtime_params() -> None:
     attention._sparse_attn_indices = torch.tensor([2], dtype=torch.int32)
     attention._sparse_attn_offsets = None
     forward_args = AttentionForwardArgs(
-        sparse_runtime_params=SparseRuntimeParams(sparse_mla_topk_lens=torch.tensor([3]))
+        sparse_runtime_params=SparseRuntimeParams(sparse_attn_kv_lens=torch.tensor([3]))
     )
 
     runtime_params = prepare_sparse_runtime_params(
@@ -197,8 +199,7 @@ def test_sparse_runtime_params() -> None:
     assert runtime_params.sparse_attn_offsets is None
     assert runtime_params.sparse_attn_indices_block_size == 1
     assert (
-        runtime_params.sparse_mla_topk_lens
-        is forward_args.sparse_runtime_params.sparse_mla_topk_lens
+        runtime_params.sparse_attn_kv_lens is forward_args.sparse_runtime_params.sparse_attn_kv_lens
     )
 
 
@@ -207,15 +208,30 @@ def test_sparse_attn_hook_registration() -> None:
     hook_module.sparse_params = MockSparseParams()
 
     hook_module.sparse_params.algorithm = "dsa"
-    assert isinstance(get_sparse_mla_hooks(hook_module), MLASparseHooks)
+    dsa_hooks = get_sparse_mla_hooks(hook_module)
+    assert isinstance(dsa_hooks, MLASparseHooks)
+    assert dsa_hooks.need_absorption
     assert get_sparse_attention_hooks(hook_module) is None
 
     hook_module.sparse_params.algorithm = "deepseek_v4"
-    assert isinstance(get_sparse_mla_hooks(hook_module), MLASparseHooks)
+    dsv4_hooks = get_sparse_mla_hooks(hook_module)
+    assert isinstance(dsv4_hooks, MLASparseHooks)
+    assert not dsv4_hooks.need_absorption
 
     hook_module.sparse_params.algorithm = "rocket"
-    assert isinstance(get_sparse_attention_hooks(hook_module), AttentionSparseHooks)
+    rocket_hooks = get_sparse_attention_hooks(hook_module)
+    assert isinstance(rocket_hooks, AttentionSparseHooks)
     assert get_sparse_mla_hooks(hook_module) is None
+
+    register_mla_sparse_hooks("test_mla_hooks", type(dsa_hooks))
+    hook_module.sparse_params.algorithm = "test_mla_hooks"
+    assert isinstance(get_sparse_mla_hooks(hook_module), type(dsa_hooks))
+    assert get_sparse_mla_hooks(hook_module) is not get_sparse_mla_hooks(hook_module)
+
+    register_attention_sparse_hooks("test_attention_hooks", type(rocket_hooks))
+    hook_module.sparse_params.algorithm = "test_attention_hooks"
+    assert isinstance(get_sparse_attention_hooks(hook_module), type(rocket_hooks))
+    assert get_sparse_attention_hooks(hook_module) is not get_sparse_attention_hooks(hook_module)
 
 
 def test_mla_backend_only_forward() -> None:

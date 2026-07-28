@@ -117,15 +117,15 @@ generic `AttentionBackend` interface.
 `MLASparseHooks` and `AttentionSparseHooks` define separate typed module
 contracts. Concrete adapters override only the lifecycle methods their
 algorithm needs; default adapter methods preserve the dense behavior for
-optional paths. Shared `MLA` code creates the sparse-aware MQA and the ordinary
-dense MHA exactly once, then invokes the adapter initialization method. The
-adapter removes dense modules that the algorithm does not use and initializes
-only algorithm-specific module state.
+optional paths. MLA adapters declare whether absorption modules, a dense MHA
+fallback, and the default output projection are needed. Shared `MLA` reads
+these capabilities before constructing optional modules, then passes only the
+owning module to the adapter initialization method.
 
 `Attention` and `MLA` resolve and cache their typed adapter during module
-initialization. Later lifecycle methods use that cached contract instead of
-redispatching from `sparse_params`. Dense modules and algorithms without
-module-layer overrides receive no adapter.
+initialization. Each module owns a separate adapter instance. Later lifecycle
+methods use that cached contract instead of redispatching from `sparse_params`.
+Dense modules and algorithms without module-layer overrides receive no adapter.
 
 `Attention` invokes its adapter at initialization, `forward_impl()`, and output
 projection. Its initialization method runs before rotary embedding and backend

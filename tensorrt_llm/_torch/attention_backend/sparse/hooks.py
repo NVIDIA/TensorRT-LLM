@@ -11,18 +11,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import replace
-from functools import lru_cache
 from importlib import import_module
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     import torch
 
-    from tensorrt_llm.mapping import Mapping
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-
     from ...distributed import AllReduceParams
-    from ...model_config import ModelConfig
     from ...modules.attention import Attention
     from ...modules.mla import MLA
     from ..interface import AttentionForwardArgs, AttentionMask, AttentionMetadata
@@ -43,31 +38,19 @@ __all__ = [
 class MLASparseHooks(ABC):
     """Typed module-layer adapter for a sparse MLA algorithm."""
 
+    need_absorption = True
+    need_dense_mha = True
+    need_default_o_proj = True
+
     @abstractmethod
-    def initialize(
-        self,
-        mla: "MLA",
-        *,
-        config: "ModelConfig",
-        mapping: "Mapping",
-        mapping_o: "Mapping",
-        rms_norm_eps: float,
-        quant_config: "QuantConfig",
-        q_scaling: float,
-        bias: bool,
-        dtype: "torch.dtype",
-        reduce_output: bool,
-        aux_stream: Optional["torch.cuda.Stream"],
-    ) -> None:
+    def initialize(self, mla: "MLA") -> None:
         """Initialize algorithm-specific MLA state."""
 
-    def create_weights(self, mla: "MLA") -> bool:
-        """Create algorithm-specific weights and return whether handled."""
-        return False
+    def create_weights(self, mla: "MLA") -> None:
+        """Create algorithm-specific weights."""
 
-    def transform_weights(self, mla: "MLA") -> bool:
-        """Transform algorithm-specific weights and return whether handled."""
-        return False
+    def transform_weights(self, mla: "MLA") -> None:
+        """Transform algorithm-specific weights."""
 
     def prepare_outputs(
         self,
@@ -115,21 +98,7 @@ class MLASparseHooks(ABC):
 class AttentionSparseHooks:
     """Typed module-layer adapter for a sparse Attention algorithm."""
 
-    def initialize(
-        self,
-        attention: "Attention",
-        *,
-        config: "ModelConfig",
-        mapping: "Mapping",
-        mapping_o: "Mapping",
-        rms_norm_eps: float,
-        quant_config: "QuantConfig",
-        q_scaling: float,
-        bias: bool,
-        dtype: "torch.dtype",
-        reduce_output: bool,
-        aux_stream: Optional["torch.cuda.Stream"],
-    ) -> None:
+    def initialize(self, attention: "Attention") -> None:
         """Initialize algorithm-specific Attention state."""
 
     def forward(
@@ -189,8 +158,13 @@ def register_attention_sparse_hooks(algorithm: str, hooks: type[AttentionSparseH
     _ATTENTION_HOOKS[algorithm] = hooks
 
 
-@lru_cache(maxsize=None)
-def _get_sparse_mla_hooks_for_algorithm(algorithm: str) -> Optional[MLASparseHooks]:
+def _get_sparse_mla_hooks_for_algorithm(
+    algorithm: str,
+) -> Optional[type[MLASparseHooks]]:
+    hooks = _MLA_HOOKS.get(algorithm)
+    if hooks is not None:
+        return hooks
+
     module_name = _MLA_HOOK_MODULE_PATHS.get(algorithm)
     if module_name is None:
         return None
@@ -198,7 +172,7 @@ def _get_sparse_mla_hooks_for_algorithm(algorithm: str) -> Optional[MLASparseHoo
     hooks = _MLA_HOOKS.get(algorithm)
     if hooks is None:
         raise RuntimeError(f"{module_name} did not register MLA sparse hooks for {algorithm!r}")
-    return hooks()
+    return hooks
 
 
 def get_sparse_mla_hooks(mla: "MLA") -> Optional[MLASparseHooks]:
@@ -206,13 +180,17 @@ def get_sparse_mla_hooks(mla: "MLA") -> Optional[MLASparseHooks]:
     algorithm = getattr(getattr(mla, "sparse_params", None), "algorithm", None)
     if algorithm is None:
         return None
-    return _get_sparse_mla_hooks_for_algorithm(algorithm)
+    hooks = _get_sparse_mla_hooks_for_algorithm(algorithm)
+    return None if hooks is None else hooks()
 
 
-@lru_cache(maxsize=None)
 def _get_sparse_attention_hooks_for_algorithm(
     algorithm: str,
-) -> Optional[AttentionSparseHooks]:
+) -> Optional[type[AttentionSparseHooks]]:
+    hooks = _ATTENTION_HOOKS.get(algorithm)
+    if hooks is not None:
+        return hooks
+
     module_name = _ATTENTION_HOOK_MODULE_PATHS.get(algorithm)
     if module_name is None:
         return None
@@ -222,7 +200,7 @@ def _get_sparse_attention_hooks_for_algorithm(
         raise RuntimeError(
             f"{module_name} did not register Attention sparse hooks for {algorithm!r}"
         )
-    return hooks()
+    return hooks
 
 
 def get_sparse_attention_hooks(attention: "Attention") -> Optional[AttentionSparseHooks]:
@@ -230,7 +208,8 @@ def get_sparse_attention_hooks(attention: "Attention") -> Optional[AttentionSpar
     algorithm = getattr(getattr(attention, "sparse_params", None), "algorithm", None)
     if algorithm is None:
         return None
-    return _get_sparse_attention_hooks_for_algorithm(algorithm)
+    hooks = _get_sparse_attention_hooks_for_algorithm(algorithm)
+    return None if hooks is None else hooks()
 
 
 def prepare_sparse_runtime_params(

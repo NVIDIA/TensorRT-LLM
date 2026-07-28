@@ -143,15 +143,13 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             end_idx = metadata.num_tokens
 
         sparse_args = forward_args.sparse_runtime_params
-        sparse_args.sparse_mla_topk_lens = metadata.sparse_mla_topk_lens[self.compress_ratio][
+        sparse_args.sparse_attn_kv_lens = metadata.sparse_mla_topk_lens[self.compress_ratio][
             start_idx:end_idx
         ]
         if self.compress_ratio > 1:
-            sparse_args.compressed_kv_cache_pool_ptr = metadata.sparse_mla_base_ptrs[
-                self.compress_ratio
-            ]
+            sparse_args.aux_kv_cache_pool_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
         else:
-            sparse_args.compressed_kv_cache_pool_ptr = None
+            sparse_args.aux_kv_cache_pool_ptr = None
 
         metadata.num_sparse_topk = (
             self.sparse_attention_config.window_size

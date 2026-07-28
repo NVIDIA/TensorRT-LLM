@@ -635,20 +635,7 @@ class Attention(nn.Module):
                              key="sparse_attention_config")
 
         if self.sparse_attn_hooks is not None:
-            self.sparse_attn_hooks.initialize(
-                self,
-                config=config,
-                mapping=mapping,
-                mapping_o=mapping_o,
-                rms_norm_eps=getattr(config.pretrained_config, "rms_norm_eps",
-                                     1e-6),
-                quant_config=self.quant_config,
-                q_scaling=self.q_scaling,
-                bias=bias,
-                dtype=dtype,
-                reduce_output=reduce_output,
-                aux_stream=None,
-            )
+            self.sparse_attn_hooks.initialize(self)
 
         if (config.kv_cache_compression_config is not None and
                 config.kv_cache_compression_config.changes_physical_kv_length):

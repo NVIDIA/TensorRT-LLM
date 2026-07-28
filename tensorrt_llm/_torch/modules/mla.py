@@ -389,6 +389,14 @@ class MLA(nn.Module):
             rms_norm_eps = 1e-6
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
+        # Construction settings used by sparse module hooks.
+        self.rms_norm_eps = rms_norm_eps
+        self.reduce_output = reduce_output
+        self.skip_create_weights_in_init = config.skip_create_weights_in_init
+        self.allreduce_strategy = config.allreduce_strategy
+        self.force_dynamic_quantization = config.force_dynamic_quantization
+        self.num_hidden_layers = getattr(config.pretrained_config, "num_hidden_layers", None)
+        self.pp_mapping = config.mapping
 
         self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
@@ -498,44 +506,32 @@ class MLA(nn.Module):
         self.aux_stream_dict = aux_stream_dict or {}
         self.aux_stream = self.aux_stream_dict.get(AuxStreamType.Attention)
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
-        self.kv_a_layernorm = RMSNorm(hidden_size=self.kv_lora_rank, dtype=dtype, eps=rms_norm_eps)
-        self.kv_b_proj = Linear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=bias,
-            dtype=dtype,
-            mapping=mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            quant_config=quant_config,
-            skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
-        )
-        self.v_b_proj = nn.Parameter(
-            torch.empty(
-                (self.num_heads_tp_cp, self.v_head_dim, self.kv_lora_rank),
+        need_absorption = self.sparse_attn_hooks is None or self.sparse_attn_hooks.need_absorption
+        if need_absorption:
+            self.kv_a_layernorm = RMSNorm(
+                hidden_size=self.kv_lora_rank, dtype=dtype, eps=rms_norm_eps
+            )
+            self.kv_b_proj = Linear(
+                self.kv_lora_rank,
+                self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                bias=bias,
                 dtype=dtype,
-            ),
-            requires_grad=False,
-        )
-        self.o_proj = Linear(
-            self.num_key_value_heads * self.v_head_dim,
-            self.hidden_size,
-            bias=self.dense_bias,
-            dtype=dtype,
-            mapping=mapping_o,
-            tensor_parallel_mode=TensorParallelMode.ROW,
-            quant_config=quant_config,
-            skip_create_weights_in_init=config.skip_create_weights_in_init,
-            reduce_output=reduce_output,
-            allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
-        )
-        self.attention_output_hidden_size = self.o_proj.in_features
+                mapping=mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                quant_config=quant_config,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
+                allreduce_strategy=config.allreduce_strategy,
+                force_dynamic_quantization=config.force_dynamic_quantization,
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+            )
+            self.v_b_proj = nn.Parameter(
+                torch.empty(
+                    (self.num_heads_tp_cp, self.v_head_dim, self.kv_lora_rank),
+                    dtype=dtype,
+                ),
+                requires_grad=False,
+            )
 
         self.mqa = create_attention(
             config.attn_backend,
@@ -560,47 +556,57 @@ class MLA(nn.Module):
             aux_stream=self.aux_stream,
             rope_append=True,
         )
-
-        # MHA is the dense expanded-KV path. Algorithms that do not use it
-        # remove it in their initialization hook.
-        mha_sparse_params = self.sparse_params if self.sparse_attn_hooks is None else None
-        self.mha = create_attention(
-            config.attn_backend,
-            self.layer_idx,
-            self.num_heads_tp,
-            head_dim=self.qk_head_dim,
-            num_kv_heads=self.num_key_value_heads_tp,
-            pos_embd_params=self.pos_embd_params,
-            quant_config=quant_config,
-            q_scaling=q_scaling,
-            is_mla_enable=True,
-            q_lora_rank=self.q_lora_rank,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            v_head_dim=self.v_head_dim,
-            predicted_tokens_per_seq=self.predicted_tokens_per_seq,
-            skip_create_weights_in_init=config.skip_create_weights_in_init,
-            sparse_params=mha_sparse_params,
-        )
-
-        if self.sparse_attn_hooks is not None:
-            self.sparse_attn_hooks.initialize(
-                self,
-                config=config,
-                mapping=mapping,
-                mapping_o=mapping_o,
-                rms_norm_eps=rms_norm_eps,
-                quant_config=quant_config,
-                q_scaling=q_scaling,
-                bias=bias,
-                dtype=dtype,
-                reduce_output=reduce_output,
-                aux_stream=self.aux_stream,
-            )
-
         if self.mqa is None:
             raise RuntimeError("MLA requires a non-null MQA attention backend")
+
+        if self.sparse_attn_hooks is not None:
+            self.sparse_attn_hooks.initialize(self)
+
+        create_dense_mha = self.sparse_attn_hooks is None or self.sparse_attn_hooks.need_dense_mha
+        if create_dense_mha:
+            mha_sparse_params = self.sparse_params if self.sparse_attn_hooks is None else None
+            self.mha = create_attention(
+                config.attn_backend,
+                self.layer_idx,
+                self.num_heads_tp,
+                head_dim=self.qk_head_dim,
+                num_kv_heads=self.num_key_value_heads_tp,
+                pos_embd_params=self.pos_embd_params,
+                quant_config=quant_config,
+                q_scaling=q_scaling,
+                is_mla_enable=True,
+                q_lora_rank=self.q_lora_rank,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                v_head_dim=self.v_head_dim,
+                predicted_tokens_per_seq=self.predicted_tokens_per_seq,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
+                sparse_params=mha_sparse_params,
+            )
+        else:
+            self.mha = None
+
+        need_default_o_proj = (
+            self.sparse_attn_hooks is None or self.sparse_attn_hooks.need_default_o_proj
+        )
+        if need_default_o_proj:
+            self.o_proj = Linear(
+                self.num_key_value_heads * self.v_head_dim,
+                self.hidden_size,
+                bias=self.dense_bias,
+                dtype=dtype,
+                mapping=mapping_o,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                quant_config=quant_config,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
+                reduce_output=reduce_output,
+                allreduce_strategy=config.allreduce_strategy,
+                force_dynamic_quantization=config.force_dynamic_quantization,
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+            )
+            self.attention_output_hidden_size = self.o_proj.in_features
 
         self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)
 
@@ -636,7 +642,9 @@ class MLA(nn.Module):
 
         # Although we use FP8 MLA for context/generation phase, the output is still in BF16
         self.out_scale = None
-        if self.sparse_attn_hooks is not None and self.sparse_attn_hooks.create_weights(self):
+        if self.sparse_attn_hooks is not None:
+            self.sparse_attn_hooks.create_weights(self)
+        if self.sparse_attn_hooks is not None and not self.sparse_attn_hooks.need_absorption:
             self._weights_transformed = False
             return
 
@@ -1846,7 +1854,9 @@ class MLA(nn.Module):
         if self._weights_transformed:
             return
         sparse_attn_hooks = getattr(self, "sparse_attn_hooks", None)
-        if sparse_attn_hooks is not None and sparse_attn_hooks.transform_weights(self):
+        if sparse_attn_hooks is not None:
+            sparse_attn_hooks.transform_weights(self)
+        if sparse_attn_hooks is not None and not sparse_attn_hooks.need_absorption:
             self._weights_transformed = True
             return
 
