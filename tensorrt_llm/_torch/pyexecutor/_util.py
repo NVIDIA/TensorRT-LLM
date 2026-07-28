@@ -842,10 +842,9 @@ class KvCacheCreator:
                 dtype=self._model_engine.model.dtype,
             )
         except NotImplementedError:
-            logger.info(
-                "Multimodal memory profiling skipped: %s does not implement "
-                "get_dummy_mm_data().",
-                type(input_processor).__name__)
+            logger.info("Multimodal memory profiling skipped: "
+                        f"{type(input_processor).__name__} does not implement "
+                        "get_dummy_mm_data().")
             return []
         if not mm_data:
             return []

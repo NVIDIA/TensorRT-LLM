@@ -621,15 +621,13 @@ class PyTorchModelEngine(ModelEngine):
                         "return nonempty positive capacities or None")
                 self.mm_encoder_attention_metadata_capacity = (
                     attention_metadata_capacity)
-            logger.info(
-                "Multimodal encoder token budget: configured=%s, base=%d, "
-                "effective=%d, model_atomic_max=%d, attention_capacity=%s.",
-                llm_args.encoder_max_num_tokens,
-                encoder_token_budget_base,
-                self.encoder_max_num_tokens,
-                model_max_atomic_item_tokens,
-                self.mm_encoder_attention_metadata_capacity,
-            )
+            logger.info("Multimodal encoder token budget: "
+                        f"configured={llm_args.encoder_max_num_tokens}, "
+                        f"base={encoder_token_budget_base}, "
+                        f"effective={self.encoder_max_num_tokens}, "
+                        f"model_atomic_max={model_max_atomic_item_tokens}, "
+                        "attention_capacity="
+                        f"{self.mm_encoder_attention_metadata_capacity}.")
             self.mm_encoder_output_budget_bytes = (
                 self._resolve_mm_encoder_output_budget_bytes())
         self._set_up_multimodal_encoder_attn_metadata()
