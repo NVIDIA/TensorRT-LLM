@@ -30,12 +30,11 @@ import triton
 from transformers import AutoConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+from ...._utils import prefer_pinned
+from ....bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     copy_batch_block_offsets_to_device,
 )
-from tensorrt_llm.logger import logger
-
+from ....logger import logger
 from ...distributed import allgather
 from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ...pyexecutor.llm_request import LlmRequestState
@@ -51,8 +50,7 @@ from .triattention_kernels import (
 )
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
-
+    from ....llmapi.llm_args import TriAttentionKvCacheCompressionConfig
     from ...pyexecutor.llm_request import LlmRequest
     from ...pyexecutor.scheduler import ScheduledRequests
 
