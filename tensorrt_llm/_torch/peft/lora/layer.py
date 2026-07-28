@@ -1,6 +1,7 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -162,7 +163,7 @@ MOE_LORA_MODULE_TO_KERNEL_SLOT = {
 class LoraLayer(torch.nn.Module):
 
     # Static aux stream for LoRA computations
-    _aux_stream: Optional[torch.cuda.Stream] = None
+    _aux_stream: torch.cuda.Stream | None = None
 
     def __init__(self, lora_module_types: List[LoraModuleType],
                  output_hidden_sizes: List[int]):
@@ -172,17 +173,33 @@ class LoraLayer(torch.nn.Module):
         self.output_hidden_sizes = output_hidden_sizes
         assert len(lora_module_types) == len(output_hidden_sizes)
 
-        self._par_events: Optional[List[torch.cuda.Event]] = None
+        self._par_events: List[torch.cuda.Event] | None = None
 
     @staticmethod
     def forward_with_base(
-        base_forward: Callable[[], Any],
+        base_forward: Callable[[], torch.Tensor],
         lora_layers: tuple["LoraLayer", ...],
         x: torch.Tensor,
-        lora_params: Dict,
-        layer_idx: Optional[int],
-    ) -> Any:
-        """Run the base and LoRA branches and merge their outputs."""
+        lora_params: dict,
+        layer_idx: int | None,
+    ) -> torch.Tensor:
+        """
+        Run the base and LoRA branches and merge their outputs.
+
+        Args:
+            base_forward: Forward call for base model projection
+            lora_layers: Tuple of LoRA layers to be called
+            x: Input tensor
+            lora_params: CUDA Graph compatible LoRA parameters
+            layer_idx: Current layer index
+
+        Returns:
+            LoRA + base model output tensor
+
+        Note that lora_layers needs to be a tuple in order to
+        handle fused/unfused modules (e.g., QKV), where both
+        variants are invoked but only one runs through.
+        """
         cuda_graph_params = lora_params.get('cuda_graph_params')
         has_lora_layer = bool(cuda_graph_params) and any(
             CudaGraphLoraParams.LoraLayerKey(
@@ -195,7 +212,7 @@ class LoraLayer(torch.nn.Module):
                                and not torch.compiler.is_compiling())
 
         # Pack all LoRA forwards (e.g., fused/unfused) in a single tuple
-        def lora_forward():
+        def lora_forward() -> tuple[torch.Tensor | None, ...]:
             return tuple(
                 lora_layer(x, lora_params, layer_idx)
                 for lora_layer in lora_layers)
