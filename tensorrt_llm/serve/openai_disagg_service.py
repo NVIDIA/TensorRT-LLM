@@ -396,10 +396,14 @@ class OpenAIDisaggregatedService(OpenAIService):
             # arrival->here = pre-ctx wait in the orchestrator/fleet.
             if hooks:
                 hooks.on_ctx_dispatch(request)
-            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
-                request, req_id=disagg_request_id
-            )
+            # ConversationRouter keys per-request load on id(request), and the
+            # client completes the ctx branch with ctx_req. Route on ctx_req so
+            # registration and release use the same object, as the gen-first
+            # branch above already does.
             ctx_req = self._get_ctx_request(request, disagg_request_id)
+            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
+                ctx_req, req_id=disagg_request_id
+            )
         gen_req = self._get_gen_request(
             request,
             ctx_response=None,

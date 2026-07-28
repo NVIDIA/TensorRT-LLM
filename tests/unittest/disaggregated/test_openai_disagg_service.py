@@ -752,3 +752,51 @@ class TestFirstGenLogitsSerializeRoundtrip:
     def test_deserialize_missing_key_raises(self):
         with pytest.raises(ValueError, match="missing required key"):
             _deserialize_first_gen_logits([{"data": "abc", "shape": [1]}])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_ctx_branch_routes_and_finishes_same_object(schedule_style):
+    """The object routed to the ctx router must be the object later completed.
+
+    ConversationRouter keys ``_num_active_requests`` and ``_server_content_load``
+    on ``id(request)``. The context-first branch used to route on ``request`` but
+    send -- and therefore complete -- ``ctx_req = request.model_copy(...)``, so
+    the release looked up an identity that was never registered and both counters
+    grew without bound. Since they feed ``_select_least_loaded``, placement is
+    then decided against stale load.
+
+    Asserting object identity rather than call order keeps this valid under
+    refactoring: any path that routes one object and completes another fails.
+    """
+    service = _make_service(schedule_style)
+
+    routed = {}
+
+    async def _capture_get_next_server(req, *args, **kwargs):
+        routed["ctx"] = req
+        return ("ctx:8000", None)
+
+    service._ctx_router.get_next_server = AsyncMock(side_effect=_capture_get_next_server)
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:8000", None))
+
+    sent = {}
+
+    async def _capture_send(req, *args, **kwargs):
+        sent["ctx"] = req
+        raise RuntimeError("stop after ctx dispatch")
+
+    service._ctx_client.send_request = AsyncMock(side_effect=_capture_send)
+
+    request = CompletionRequest(model="model", prompt=[1] * 8, stream=False)
+    try:
+        await service._send_disagg_request(request, None)
+    except Exception:
+        pass  # we only care about which object reached the router vs the client
+
+    assert "ctx" in routed, "ctx router was never consulted"
+    assert "ctx" in sent, "ctx client was never called"
+    assert routed["ctx"] is sent["ctx"], (
+        "ctx branch routed one object and sent/completed another "
+        f"(routed id={id(routed['ctx'])}, sent id={id(sent['ctx'])}); "
+        "router load state keyed on id(request) can never be released")
