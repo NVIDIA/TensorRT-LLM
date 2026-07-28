@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
-from ..pyexecutor.sampler.ops.spec_decode import (
+from ..pyexecutor.sampler.ops.flashinfer import (
     compute_probs_from_logits, sampling_batch_spec_dec_one_model,
     sampling_batch_spec_dec_one_model_for_rejection)
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
