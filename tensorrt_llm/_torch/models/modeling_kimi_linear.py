@@ -710,7 +710,7 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
 
 
 class KimiK3MoERuntime(nn.Module):
-    """Kimi K3 latent MoE block backed by ConfigurableMoE/TRTLLM-Gen."""
+    """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
     def __init__(
         self,
@@ -751,7 +751,7 @@ class KimiK3MoERuntime(nn.Module):
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)
         routed_quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
-        self.routed_experts = create_moe(
+        routed_moe_kwargs = dict(
             routing_method=self.gate.routing_method,
             num_experts=self.num_experts,
             hidden_size=self.moe_hidden_size,
@@ -765,20 +765,32 @@ class KimiK3MoERuntime(nn.Module):
             model_config=routed_moe_model_config,
             override_quant_config=routed_quant_config,
             layer_idx=layer_idx,
-            trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-            # Cubin alpha is the gate-side SiTU beta; cubin beta is the
-            # linear-side SiTU beta.
-            trtllm_gen_activation_alpha=float(situ_beta),
-            trtllm_gen_activation_beta=float(
-                situ_linear_beta if situ_linear_beta is not None else 1.0
-            ),
             # Let CommunicationFactory select the best available strategy.
             communication_method=None,
         )
+        if routed_moe_model_config.moe_backend == "TRTLLM":
+            routed_moe_kwargs.update(
+                trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
+                # Cubin alpha is the gate-side SiTU beta; cubin beta is the
+                # linear-side SiTU beta.
+                trtllm_gen_activation_alpha=float(situ_beta),
+                trtllm_gen_activation_beta=float(
+                    situ_linear_beta if situ_linear_beta is not None else 1.0
+                ),
+            )
+        self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
                 "Kimi K3 requires ConfigurableMoE; ENABLE_CONFIGURABLE_MOE must not be disabled."
             )
+        if routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
+            from ..modules.fused_moe.mega_moe import MegaMoEDeepGemm
+
+            if not isinstance(self.routed_experts.backend, MegaMoEDeepGemm):
+                raise RuntimeError(
+                    "Kimi K3 explicitly requested MEGAMOE_DEEPGEMM, but the "
+                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
+                )
         if self.routed_experts.layer_load_balancer is not None:
             raise NotImplementedError(
                 "Kimi K3 packed-checkpoint streaming does not yet support "
@@ -801,6 +813,7 @@ class KimiK3MoERuntime(nn.Module):
             not _K3_DISABLE_MIN_LATENCY_LATENT_PROJ
             and not _K3_DISABLE_FUSED_LATENT_DOWN_MXFP8
             and routed_comm is None
+            and hasattr(self.routed_experts.backend, "op_backend")
         )
 
         # Shared experts stay replicated (DeepSeek's attention-DP
@@ -915,7 +928,13 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = False
         routed_model_config.extra_attrs = copy.copy(model_config.extra_attrs)
         routed_model_config.mapping = routed_mapping
-        routed_model_config.moe_backend = "TRTLLM"
+        # Preserve K3's TRTLLM-Gen default while allowing the explicit
+        # DeepGEMM MegaMoE opt-in used by the SM100 FP8xFP4 SiTU path.
+        routed_model_config.moe_backend = (
+            "MEGAMOE_DEEPGEMM"
+            if model_config.moe_backend.upper() == "MEGAMOE_DEEPGEMM"
+            else "TRTLLM"
+        )
         routed_model_config._frozen = True
         return routed_model_config
 
