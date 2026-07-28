@@ -1120,7 +1120,7 @@ def test_oversized_prompt_rejected_with_inflated_max_seq_len():
         model=llama_model_path,
         max_seq_len=max_seq_len,
         max_batch_size=1,
-        max_num_tokens=max_seq_len,
+        max_num_tokens=(max_seq_len + 32),
         kv_cache_config=KvCacheConfig(enable_block_reuse=False),
         speculative_config=SADecodingConfig(max_draft_len=4),
         disable_overlap_scheduler=True,
