@@ -253,8 +253,10 @@ it would look like:
 hostname: localhost
 port: 8000
 backend: pytorch
-# Optional: HTTP keep-alive timeout in seconds (default: 10). Raise it when
-# clients hold large idle connection pools and hit "Connection reset by peer".
+# Optional: HTTP keep-alive timeout in seconds (default: 10), applied to the
+# client-facing listener and to the coordinator's when it runs in-process.
+# Raise it when clients hold large idle connection pools and hit
+# "Connection reset by peer" on a reused connection.
 # server_keep_alive_timeout: 3600
 context_servers:
   num_instances: 2

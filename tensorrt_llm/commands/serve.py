@@ -2078,9 +2078,11 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
 
     async def _serve_and_monitor():
         server_task = asyncio.create_task(
-            CoordinatorServer(coordinator)(public_host,
-                                           coord_port,
-                                           uds=coord_uds))
+            CoordinatorServer(coordinator)(
+                public_host,
+                coord_port,
+                uds=coord_uds,
+                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout))
 
         async def _monitor_fleet():
             while True:

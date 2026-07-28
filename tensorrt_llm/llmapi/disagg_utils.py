@@ -122,7 +122,8 @@ class DisaggServerConfig():
     # fleet delegates to it; when absent, num_workers>1 starts an implicit in-process
     # coordinator and num_workers==1 runs a single self-contained server.
     disagg_coordinator_url: Optional[str] = None
-    # HTTP keep-alive timeout (seconds) of the client-facing uvicorn listener.
+    # HTTP keep-alive timeout (seconds) of the uvicorn listeners: the
+    # client-facing one, plus the coordinator's when it runs in-process.
     # Raise it (e.g. 3600) when clients hold large idle connection pools and hit
     # "Connection reset by peer" on a reused connection.
     server_keep_alive_timeout: int = 10
