@@ -1652,11 +1652,8 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     print(
         f"\n{'=' * 80}\nTesting: {batch_name}, sparse_attn_algo: {sparse_attn_algo}, "
         f"kv_cache_dtype: {kv_cache_dtype}\n{'=' * 80}")
-    if sparse_attn_algo == "deepseek_v4" and get_sm_version() < 100:
-        pytest.skip(
-            "DeepSeek-V4 sparse MLA unittest is not supported on pre-Blackwell architectures"
-        )
-    if kv_cache_dtype == "fp8" and get_sm_version() < 100:
+    if (sparse_attn_algo != "deepseek_v4" and kv_cache_dtype == "fp8"
+            and get_sm_version() < 100):
         pytest.skip(
             "FP8 kv cache is not supported on pre-Blackwell architectures")
 

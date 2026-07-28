@@ -20,12 +20,11 @@ Tests for DeepSeek-V4 sparse MLA attention.
 import math
 import os
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
-from utils.util import skip_no_hopper, skip_pre_blackwell
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs,
@@ -43,7 +42,6 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import get_token_bytes
 from tensorrt_llm._torch.attention_backend.sparse.params import SparseBackendForwardArgs
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
@@ -1670,173 +1668,6 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
 
     cache_manager.shutdown()
     print("\nMixed batch test PASSED!")
-
-
-def test_deepseek_v4_hopper_pool_merge_with_attention_sink():
-    torch.manual_seed(42)
-    num_tokens, num_heads, value_dim = 3, 4, 8
-    scores = [
-        torch.randn(num_tokens, num_heads, 5),
-        torch.randn(num_tokens, num_heads, 7),
-    ]
-    values = [
-        torch.randn(num_tokens, num_heads, 5, value_dim),
-        torch.randn(num_tokens, num_heads, 7, value_dim),
-    ]
-    attention_sink = torch.randn(num_heads)
-
-    pool_lses = [torch.logsumexp(pool_scores, dim=-1) for pool_scores in scores]
-    pool_outputs = [
-        torch.einsum("thk,thkd->thd", torch.softmax(pool_scores, dim=-1), pool_values)
-        for pool_scores, pool_values in zip(scores, values)
-    ]
-    result = MLA._merge_deepseek_v4_hopper_pools(pool_outputs, pool_lses, attention_sink)
-
-    numerators = [
-        torch.einsum("thk,thkd->thd", torch.exp(pool_scores), pool_values)
-        for pool_scores, pool_values in zip(scores, values)
-    ]
-    denominator = sum(torch.exp(pool_scores).sum(dim=-1) for pool_scores in scores)
-    denominator += torch.exp(attention_sink).unsqueeze(0)
-    reference = sum(numerators) / denominator.unsqueeze(-1)
-    torch.testing.assert_close(result, reference)
-
-
-def test_deepseek_v4_hopper_pool_merge_ignores_empty_pool():
-    torch.manual_seed(42)
-    num_tokens, num_heads, value_dim = 3, 4, 8
-    valid_output = torch.randn(num_tokens, num_heads, value_dim)
-    valid_lse = torch.randn(num_tokens, num_heads)
-    empty_output = torch.full_like(valid_output, torch.nan)
-    empty_lse = torch.full_like(valid_lse, -torch.inf)
-
-    result = MLA._merge_deepseek_v4_hopper_pools(
-        [valid_output, empty_output],
-        [valid_lse, empty_lse],
-        attention_sink=None,
-    )
-
-    torch.testing.assert_close(result, valid_output)
-
-
-@pytest.mark.parametrize(
-    ("num_heads", "expected_heads"),
-    [(8, 64), (64, 64), (65, 128), (128, 128)],
-)
-def test_deepseek_v4_hopper_decode_query_head_padding(num_heads: int, expected_heads: int):
-    query = torch.randn(2, 1, num_heads, 192)
-
-    padded_query = MLA._pad_deepseek_v4_hopper_decode_query(query)
-
-    assert padded_query.shape == (2, 1, expected_heads, 192)
-    torch.testing.assert_close(padded_query[:, :, :num_heads], query)
-    if num_heads == expected_heads:
-        assert padded_query.data_ptr() == query.data_ptr()
-    else:
-        assert torch.count_nonzero(padded_query[:, :, num_heads:]) == 0
-
-
-@skip_no_hopper
-def test_deepseek_v4_hopper_gathers_fp8_pool_before_dequantization():
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-    head_dim = 16
-    kv_scale = 0.25
-    pool_bf16 = torch.empty(2, 4, head_dim, dtype=torch.bfloat16, device=device).uniform_(-0.5, 0.5)
-    pool_fp8 = (pool_bf16 / kv_scale).to(torch.float8_e4m3fn).view(torch.uint8)
-    indices = torch.tensor([[7, -1, 2], [0, 5, -1]], dtype=torch.int32, device=device)
-
-    selected_pool, selected_indices = MLA._prepare_deepseek_v4_hopper_bf16_pool(
-        pool_fp8, indices, head_dim, kv_scale
-    )
-
-    safe_indices = indices.clamp_min(0).to(torch.long)
-    reference = (
-        pool_fp8.reshape(-1, 1, head_dim)
-        .view(torch.float8_e4m3fn)[safe_indices.reshape(-1)]
-        .to(torch.bfloat16)
-        * kv_scale
-    )
-    expected_indices = torch.tensor([[0, -1, 2], [3, 4, -1]], dtype=torch.int32, device=device)
-    torch.testing.assert_close(selected_pool, reference)
-    torch.testing.assert_close(selected_indices, expected_indices)
-
-
-@skip_no_hopper
-@pytest.mark.parametrize("use_fp8_pool", [False, True])
-def test_deepseek_v4_hopper_model1_shadow_layout(use_fp8_pool: bool):
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-    num_blocks, tokens_per_block, head_dim = 2, 4, 512
-    pool_bf16 = torch.empty(
-        num_blocks,
-        tokens_per_block,
-        head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    ).uniform_(-0.5, 0.5)
-
-    kv_scale = 0.25
-    if use_fp8_pool:
-        pool_raw = (pool_bf16 / kv_scale).to(torch.float8_e4m3fn).view(torch.uint8)
-        expected = (pool_raw.view(torch.float8_e4m3fn).to(torch.bfloat16) * kv_scale).to(
-            torch.bfloat16
-        )
-    else:
-        pool_raw = pool_bf16
-        expected = pool_bf16
-
-    module = MLA.__new__(MLA)
-    torch.nn.Module.__init__(module)
-    module.layer_idx = 0
-    module.mqa = SimpleNamespace(kv_scale_quant_orig=kv_scale)
-
-    sliding_block_tables = torch.full(
-        (1, len(DeepseekV4AttentionType), 1, 1),
-        -1,
-        dtype=torch.int32,
-        device=device,
-    )
-    sliding_block_tables[0, DeepseekV4AttentionType.SWA.value, 0, 0] = 0
-    metadata = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(layer_offsets=[0]),
-        sliding_block_tables=sliding_block_tables,
-        compress_block_tables={},
-        kv_lens_cuda_runtime=torch.tensor([3], dtype=torch.int32, device=device),
-    )
-
-    shadow = module._ensure_deepseek_v4_fp8_shadow_current(
-        pool_raw,
-        metadata,
-        DeepseekV4AttentionType.SWA,
-        compress_ratio=1,
-    )
-    assert shadow.shape == (num_blocks, tokens_per_block, 1, 584)
-    assert module._fp8_block_fill_gpu[DeepseekV4AttentionType.SWA][0].item() == 3
-
-    shadow_flat = shadow.reshape(num_blocks, -1)
-    data = shadow_flat[:, : tokens_per_block * 576].reshape(num_blocks, tokens_per_block, 576)
-    nope = data[..., :448].view(torch.float8_e4m3fn).to(torch.bfloat16)
-    rope = data[..., 448:].contiguous().view(torch.bfloat16)
-    scales = (
-        shadow_flat[:, tokens_per_block * 576 :]
-        .reshape(num_blocks, tokens_per_block, 8)[..., :7]
-        .contiguous()
-        .view(torch.float8_e8m0fnu)
-        .to(torch.bfloat16)
-    )
-    reconstructed = nope.reshape(num_blocks, tokens_per_block, 7, 64)
-    reconstructed = (reconstructed * scales.unsqueeze(-1)).reshape(
-        num_blocks, tokens_per_block, 448
-    )
-
-    torch.testing.assert_close(
-        reconstructed[0, :3],
-        expected[0, :3, :448],
-        atol=0.04,
-        rtol=0.15,
-    )
-    torch.testing.assert_close(rope[0, :3], expected[0, :3, 448:])
 
 
 if __name__ == "__main__":

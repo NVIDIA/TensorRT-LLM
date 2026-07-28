@@ -23,7 +23,7 @@ FMHA path. Hopper instead uses FlashMLA:
 - ratio-4 decode uses FlashMLA's native `sparse_decode_fwd` extension,
   whose MODEL1 format supports both pools in one kernel call.
 
-FlashMLA is pinned to `71c7379`, which adds the dual-pool FP8 sparse
+FlashMLA is pinned to `15f13e5`, which includes the MODEL1 FP8 sparse
 decode API and the source layout used by this integration.
 
 ## Runtime dispatch
