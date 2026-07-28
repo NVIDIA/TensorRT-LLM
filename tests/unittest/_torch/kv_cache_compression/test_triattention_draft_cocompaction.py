@@ -162,7 +162,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
 
 def test_request_admission_reserves_score_high_watermark():
     manager = _make_triattention(budget=128, beta=64)
-    assert manager._selection_width_capacity == 193
+    assert manager._selection_width_capacity == 256
     manager._phase = mock.Mock()
     manager._selection_width_capacity = 260
     manager._score_token_capacity = 0

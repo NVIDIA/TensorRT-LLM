@@ -61,6 +61,9 @@ _REQUIRED_CALIBRATION_KEYS = frozenset({"E_q", "E_q_norm", "omega", "freq_scale_
 
 _MEAN_PHASE_OFFSETS = tuple(float(1 << exponent) for exponent in range(17))
 
+# Physical TopK rows follow the 256-token reduce/tie kernel tiles.
+_SELECTION_WIDTH_ALIGNMENT = 256
+
 
 class _EvictionRequest(NamedTuple):
     """One due request and the cache state needed by its eviction round."""
@@ -178,7 +181,11 @@ class TriAttention(KVCacheCompressionManager):
         max_draft_tokens = int(kv_cache_manager.max_total_draft_tokens)
         # Crossing a cadence can overshoot by D accepted draft tokens; one
         # suspended due round may resume with another 1 + D confirmed tokens.
-        self._selection_width_capacity = self.budget + self.beta + 2 * max_draft_tokens + 1
+        required_selection_width = self.budget + self.beta + 2 * max_draft_tokens + 1
+        self._selection_width_capacity = (
+            triton.cdiv(required_selection_width, _SELECTION_WIDTH_ALIGNMENT)
+            * _SELECTION_WIDTH_ALIGNMENT
+        )
         max_tail_capacity = max(
             self._protected_tail_capacity,
             self._draft_protected_tail_capacity,
