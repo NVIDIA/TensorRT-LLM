@@ -537,6 +537,7 @@ exclude = [
     "tests/integration/defs/accuracy/accuracy_core.py",
     "tests/integration/defs/accuracy/scripts/collect_evaluated_accuracies.py",
     "tests/integration/defs/accuracy/scripts/compute_theta_and_thresholds.py",
+    "tests/integration/defs/accuracy/test_cli_flow.py",
     "tests/integration/defs/accuracy/test_disaggregated_serving.py",
     "tests/integration/defs/accuracy/test_llm_api_autodeploy.py",
     "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
