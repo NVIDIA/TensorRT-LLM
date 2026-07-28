@@ -39,7 +39,6 @@ from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
@@ -2114,59 +2113,35 @@ def _create_kv_cache_manager(
 def validate_kv_cache_compression_with_spec(
     config: KvCacheCompressionConfig,
     spec_config: Optional[SpeculativeConfig],
-    draft_kv_cache_manager: Optional[KVCacheManagerV2],
+    draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
 ) -> None:
     """Reject speculative setups the compression method cannot run with."""
-    if (spec_config is None
-            or not config.kv_cache_compression_mode.is_eviction_method()):
+    if spec_config is None:
         return
-    # Evicting methods co-compact the draft KV, so the draft must be a
-    # standard paged cache in the same forward (one-model speculation).
+    if not config.kv_cache_compression_mode.is_eviction_method():
+        return
+    if config.eviction_mode != "union":
+        raise ValueError(
+            "KV-cache compression with speculative decoding requires "
+            "eviction_mode='union'")
     mode = spec_config.spec_dec_mode
     if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
         raise ValueError(
-            f"KV-cache compression algorithm {config.algorithm!r} does not "
-            f"support speculative decoding mode {mode.name}: the draft KV "
-            "must be a standard paged cache compacted together with the "
-            "target (one-model MTP/EAGLE3).")
-    if config.algorithm == "triattention":
-        if spec_config.max_draft_len is None:
-            raise ValueError(
-                "TriAttention speculative compatibility requires a resolved "
-                "max_draft_len")
-        if not spec_config.is_linear_tree:
-            raise ValueError(
-                "TriAttention speculative compatibility requires linear "
-                "drafting")
-        if spec_config.draft_len_schedule is not None:
-            raise ValueError("TriAttention does not yet support dynamic "
-                             "speculative draft lengths")
-        # Compression eviction is only validated with greedy acceptance.
-        if spec_config.use_rejection_sampling or getattr(
-                spec_config, "use_relaxed_acceptance_for_thinking", False):
-            raise ValueError("TriAttention does not support speculative "
-                             "rejection sampling or relaxed acceptance")
-        if draft_kv_cache_manager is None:
-            raise ValueError(
-                "TriAttention speculative compatibility requires a separate "
-                "draft KV cache; shared target/draft pools cannot be "
-                "compacted safely")
-        if not draft_kv_cache_manager.is_draft:
-            raise ValueError(
-                "TriAttention speculative compatibility requires the actual "
-                "separate draft KV cache manager")
-        if config.eviction_mode != "union":
-            raise ValueError(
-                "TriAttention draft KV co-compression supports only "
-                "eviction_mode='union'; draft layers are never scored")
-        if any(window is not None
-               for window in draft_kv_cache_manager.max_attention_window_vec
-               ) or any(not isinstance(layer, AttentionLayerConfig)
-                        or layer.sliding_window_size is not None
-                        for layer in draft_kv_cache_manager.
-                        kv_cache_manager_py_config.layers):
-            raise ValueError("TriAttention draft KV co-compression requires "
-                             "full-attention draft V2 lifecycles")
+            f"KV-cache compression does not support speculative decoding "
+            f"mode {mode.name}; use one-model MTP or EAGLE3")
+    if not spec_config.is_linear_tree:
+        raise ValueError(
+            "KV-cache compression requires linear speculative decoding")
+    if spec_config.draft_len_schedule is not None:
+        raise ValueError(
+            "KV-cache compression requires a fixed speculative draft length")
+    if draft_kv_cache_manager is None:
+        raise ValueError(
+            "KV-cache compression requires a separate draft KV cache")
+    if any(window is not None
+           for window in draft_kv_cache_manager.max_attention_window_vec):
+        raise ValueError(
+            "KV-cache compression requires full-attention draft KV")
 
 
 def create_kv_cache_compression_manager(

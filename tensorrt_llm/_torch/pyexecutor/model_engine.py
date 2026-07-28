@@ -4941,6 +4941,7 @@ class PyTorchModelEngine(ModelEngine):
                     and not multimodal_params_list and not lora_params
                     and attn_metadata.padded_num_tokens is None
                     and self._get_position_id_offset() == 0
+                    # Compression may shrink KV history between decode steps.
                     and not getattr(kv_cache_manager,
                                     "kv_compression_manages_history", False)):
                 self._steady_gen_positions_pinned[:_n_gen].copy_(

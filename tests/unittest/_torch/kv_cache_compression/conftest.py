@@ -346,36 +346,29 @@ def make_triattention(**overrides):
         return TriAttention(make_tri_config(**overrides), make_fake_v2())
 
 
-def make_eviction_input(
+def make_eviction_request(
     request=None,
     *,
     request_id=0,
     source_length,
-    logical_source_length=None,
-    prompt_length=0,
     target_tail_length=0,
     target_cache=None,
     draft_cache=None,
-    state=None,
 ):
-    """One due-request item shaped exactly like ``_evict_due_requests`` builds."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        _EvictionInput,
-        _RequestState,
-    )
+    """One due request shaped exactly like ``_evict_due_requests`` builds."""
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import _EvictionRequest
 
     if request is None:
-        request = SimpleNamespace(py_request_id=request_id, py_num_compressed_tokens=0)
-    return _EvictionInput(
+        request = SimpleNamespace(
+            py_request_id=request_id,
+            py_prompt_len=0,
+            py_num_compressed_tokens=0,
+        )
+    return _EvictionRequest(
         request=request,
         target_cache=target_cache,
         draft_cache=draft_cache,
-        state=_RequestState() if state is None else state,
         source_length=int(source_length),
-        logical_source_length=int(
-            source_length if logical_source_length is None else logical_source_length
-        ),
-        prompt_length=int(prompt_length),
         target_tail_length=int(target_tail_length),
     )
 

@@ -36,23 +36,11 @@ from conftest import mocked_eviction_internals as _mocked_eviction_internals
 
 # TriAttention lives in the kv_cache_compression package. It exposes only the
 # compression manager -- no attention classes or KV-cache-manager subclass.
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-    TriAttention,
-    _RequestState,
-)
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
 # Framework base class lives in pyexecutor.resource_manager; the factory lives
 # in pyexecutor._util (next to _create_kv_cache_manager), matching #15106.
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
-
-
-def _set_request_state(manager, request_id, *, confirmed_tokens=0, evicted_tokens=0):
-    state = _RequestState(
-        confirmed_tokens=confirmed_tokens,
-        evicted_tokens=evicted_tokens,
-    )
-    manager._request_states[request_id] = state
-    return state
 
 
 @pytest.fixture
@@ -91,9 +79,7 @@ class TestConfigAndFactory:
 
 
 class TestTriAttentionClass:
-    def test_request_init_and_finish_lifecycle(self):
-        # Init reserves request-dependent capacity and tracks state. Finish
-        # clears only request state; persistent runtime objects stay resident.
+    def test_request_init_validates_and_reserves_capacity(self):
         manager = _make_fake_v2()
         manager.num_extra_kv_tokens = 4
         manager._kv_reserve_draft_tokens = 4
@@ -110,19 +96,8 @@ class TestTriAttentionClass:
 
         assert triattention.adjusts_generation_kv_length is True
         assert manager.kv_compression_manages_history
-        assert set(triattention._request_states) == {11, 12}
         assert validate.call_args_list == [mock.call(request_11), mock.call(request_12)]
         assert reserve.call_args_list == [mock.call(request_11), mock.call(request_12)]
-
-        phase = object()
-        triattention._phase = phase
-        batch = SimpleNamespace()
-        triattention._inflight_scheduled_batch = batch
-        triattention.on_request_finish(_make_request(11))
-        triattention.on_request_finish(_make_request(12))
-        assert triattention._request_states == {}
-        assert triattention._inflight_scheduled_batch is batch
-        assert triattention._phase is phase
 
     def test_capacity_guard_uses_maximum_steady_eviction_peak(self):
         manager = _make_triattention(budget=10, beta=8)
@@ -248,7 +223,7 @@ class TestCompressedTokenPublication:
     def test_identity_selection_is_filtered_before_launch(self):
         # Identity requests (seq_len == prompt + budget) are the pre-launch
         # owner no-op: nothing launches and nothing is published.
-        manager = _make_triattention(budget=4)
+        manager = _make_triattention(budget=4, beta=4)
         manager.kv_cache_manager._stream = mock.Mock()
         request = _make_request(7, py_prompt_len=2)
         # seq_len == prompt + budget: the due filter must drop the request.
@@ -256,14 +231,12 @@ class TestCompressedTokenPublication:
             capacity=6, history_length=0, is_active=True, resize=mock.Mock(return_value=True)
         )
         manager.kv_cache_manager.kv_cache_map = {7: cache}
-        state = _set_request_state(manager, 7, confirmed_tokens=127)
 
         with _mocked_eviction_internals(manager) as internals:
             manager._evict_due_requests(SimpleNamespace(generation_requests=[request]))
 
         internals.execute.assert_not_called()
         assert request.py_num_compressed_tokens == 0
-        assert state.evicted_tokens == 0
         cache.resize.assert_not_called()
 
 
@@ -312,37 +285,45 @@ class TestEvictionLifecycle:
             num_extra_kv_tokens=num_extra_kv_tokens,
             _kv_reserve_draft_tokens=kv_reserve_draft_tokens,
         )
-        mgr._request_states = {}
-        _set_request_state(mgr, 7, confirmed_tokens=127)
         mgr.beta = 128
         mgr.budget = 4096
         return mgr, request, batch
 
     def test_suspended_cache_defers_that_request_pre_launch(self):
         # A suspended cache is a legal overlap-scheduler transient: that
-        # request defers (pre-launch, no cadence mutation) while the rest of
-        # the request group proceeds.
-        manager, first_request, _ = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
+        # request defers while the rest of the request group proceeds, then
+        # catches up to the missed cadence boundary when it resumes.
+        manager, first_request, _ = self._make_due_decode_request(seq_len=1024 + 4096 + 128)
         second_request = _make_request(8, py_prompt_len=1024)
-        manager.kv_cache_manager.kv_cache_map[8] = SimpleNamespace(is_active=False)
-        first_state = manager._request_states[7]
-        second_state = _set_request_state(manager, 8, confirmed_tokens=127)
+        second_cache = SimpleNamespace(
+            capacity=1024 + 4096 + 128,
+            history_length=1024,
+            is_active=False,
+            resize=mock.Mock(return_value=True),
+        )
+        manager.kv_cache_manager.kv_cache_map[8] = second_cache
         batch = SimpleNamespace(generation_requests=[first_request, second_request])
 
         with _mocked_eviction_internals(manager) as internals:
             manager._evict_due_requests(batch)
+            # Only the active request launched in the first round.
+            eviction_requests = internals.execute.call_args.args[0]
+            assert [item.request.py_request_id for item in eviction_requests] == [7]
+            assert second_request.py_num_compressed_tokens == 0
 
-        # Only the active request launched; the suspended one deferred whole.
-        eviction_inputs = internals.execute.call_args.args[0]
-        assert [item.request.py_request_id for item in eviction_inputs] == [7]
-        assert first_state.confirmed_tokens == 128
-        assert second_state.confirmed_tokens == 127
+            second_cache.is_active = True
+            manager._evict_due_requests(SimpleNamespace(generation_requests=[second_request]))
 
-    # ``accepted`` enters the prepared item linearly; the zero and maximal
-    # boundary rows pin the whole family.
+        resumed = internals.execute.call_args.args[0]
+        assert [item.request.py_request_id for item in resumed] == [8]
+        assert second_request.py_num_compressed_tokens == 128
+        second_cache.resize.assert_called_once_with(1024 + 4096, None)
+
+    # Accepted draft tokens may cross the same cadence boundary; they do not
+    # change the fixed overlap reservation.
     @pytest.mark.parametrize("accepted", [0, 3])
     def test_overlap_tail_is_excluded_from_selection_and_compacted(self, accepted):
-        confirmed = 1024 + 4096 + 1 + accepted
+        confirmed = 1024 + 4096 + 128
         reserve = 2
         current_growth = 4
         tail = reserve + current_growth
@@ -356,7 +337,7 @@ class TestEvictionLifecycle:
         request.py_num_accepted_draft_tokens = accepted
         cache = mgr.kv_cache_manager.kv_cache_map[7]
         cache.capacity = confirmed + tail
-        mgr._inflight_scheduled_batch = SimpleNamespace(generation_requests=[request])
+        mgr.on_generation_step_begin(SimpleNamespace(generation_requests=[request]))
         draft_manager = _make_fake_v2(is_draft=True)
         draft_cache = SimpleNamespace(is_active=True, resize=mock.Mock(return_value=True))
         draft_manager.kv_cache_map = {7: draft_cache}
@@ -375,8 +356,6 @@ class TestEvictionLifecycle:
         assert launched.target_cache is cache
         assert launched.draft_cache is draft_cache
         assert launched.source_length == confirmed
-        assert launched.logical_source_length == confirmed
-        assert launched.prompt_length == 1024
         assert launched.target_tail_length == tail
         assert request.py_num_compressed_tokens == confirmed - retained
         cache.resize.assert_called_once_with(retained + tail, None)
@@ -385,9 +364,8 @@ class TestEvictionLifecycle:
     def test_confirmed_length_comes_from_capacity_ledger_not_logical_length(self):
         # The due-branch source length must come from the physical capacity
         # ledger (capacity minus the protected tail), never the logical length.
-        physical_confirmed = 6100
+        physical_confirmed = 6172
         manager = _make_triattention(beta=128)
-        _set_request_state(manager, 7, confirmed_tokens=127, evicted_tokens=100)
         cache = SimpleNamespace(
             capacity=physical_confirmed,
             history_length=1024,
@@ -399,6 +377,7 @@ class TestEvictionLifecycle:
         request = _make_request(
             7,
             py_prompt_len=1024,
+            py_num_compressed_tokens=100,
             max_beam_num_tokens=999999,
             py_draft_tokens=[1, 2, 3, 4],
         )
@@ -406,16 +385,15 @@ class TestEvictionLifecycle:
         with _mocked_eviction_internals(manager) as internals:
             manager._evict_due_requests(SimpleNamespace(generation_requests=[request]))
 
-        eviction_inputs = internals.execute.call_args.args[0]
-        assert eviction_inputs[0].source_length == physical_confirmed
-        # The logical position restores everything already evicted.
-        assert eviction_inputs[0].logical_source_length == physical_confirmed + 100
+        eviction_requests = internals.execute.call_args.args[0]
+        assert eviction_requests[0].source_length == physical_confirmed
+        assert request.py_num_compressed_tokens == (
+            100 + physical_confirmed - 1024 - manager.budget
+        )
         cache.resize.assert_called_once_with(1024 + manager.budget, None)
 
-    def test_one_model_draft_co_compression_contract_is_accepted(self):
-        # Construction accepts the separate draft manager, and the executor
-        # call-site gate accepts the one-model MTP roundtrip (base-ctor
-        # marking is asserted in the executor manager tests).
+    @pytest.mark.parametrize("spec_mode", ["mtp", "eagle3"])
+    def test_one_model_draft_co_compression_is_accepted(self, spec_mode):
         draft_manager = _make_fake_v2(is_draft=True)
         with mock.patch.object(TriAttention, "_initialize_eviction_state"):
             TriAttention(
@@ -425,46 +403,23 @@ class TestEvictionLifecycle:
             )
 
         from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
-        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+        from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
+
+        spec_config = (
+            MTPDecodingConfig(max_draft_len=1)
+            if spec_mode == "mtp"
+            else Eagle3DecodingConfig(
+                max_draft_len=1,
+                speculative_model="draft",
+                eagle3_one_model=True,
+            )
+        )
 
         validate_kv_cache_compression_with_spec(
             _make_tri_config(budget=8),
-            MTPDecodingConfig(max_draft_len=1),
+            spec_config,
             draft_manager,
         )
-
-    @pytest.mark.parametrize(
-        "reserved_draft,expected_growth",
-        [
-            (0, 1),
-            # The reserved draft width protects capacity regardless of any
-            # step's actual draft length: growth is the cached constant.
-            (6, 7),
-        ],
-    )
-    def test_prepare_snapshots_fixed_linear_generation_growth(
-        self, reserved_draft, expected_growth
-    ):
-        manager = _make_fake_v2()
-        manager._kv_reserve_draft_tokens = reserved_draft
-        manager.kv_cache_map = {
-            7: SimpleNamespace(capacity=106, is_active=True),
-        }
-        with mock.patch.object(TriAttention, "_initialize_eviction_state"):
-            triattention = TriAttention(_make_tri_config(budget=8), manager)
-        batch = SimpleNamespace(
-            context_requests=[],
-            generation_requests=[_make_request(7, py_draft_tokens=[1, 2, 3])],
-        )
-
-        triattention.prepare_resources(batch)
-
-        assert triattention._inflight_scheduled_batch is batch
-        # Members of the prepared batch grow by the cached constant; others
-        # by zero. The prepared batch itself is the identity early-out.
-        assert triattention._inflight_generation_growth(SimpleNamespace(), 7) == expected_growth
-        assert triattention._inflight_generation_growth(SimpleNamespace(), 99) == 0
-        assert triattention._inflight_generation_growth(batch, 7) == 0
 
 
 class TestFixedScoreMetadata:

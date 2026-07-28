@@ -5,8 +5,9 @@
 import pytest
 import torch
 from conftest import make_cute_buffers as _make_cute_buffers
-from conftest import make_eviction_input as _make_eviction_input
+from conftest import make_eviction_request as _make_eviction_request
 from conftest import make_ramp_pools as _make_ramp_pools
+from conftest import make_request as _make_request
 from conftest import make_staging_manager as _make_staging_manager
 from conftest import rect_to_score_scratch as _rect_to_score_scratch
 
@@ -373,11 +374,9 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         torch.cuda.Stream(device=device),
         num_slots=2,
     )
-    eviction_inputs = [
-        _make_eviction_input(request_id=7, source_length=seq_len, logical_source_length=0)
-    ]
+    eviction_requests = [_make_eviction_request(request_id=7, source_length=seq_len)]
     tri.kv_cache_manager = manager
-    tri._execute_eviction_round(eviction_inputs)
+    tri._execute_eviction_round(eviction_requests)
     assert torch.equal(tri._kept_ordinal_rows.view_as(expected_keep), expected_keep)
     torch.cuda.synchronize(device)
 
@@ -520,12 +519,10 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
 
         def evict_once() -> tuple[torch.Tensor, torch.Tensor]:
             before = snapshot(seq_len + protected_tail)
-            eviction_inputs = [
-                _make_eviction_input(
-                    request_id=request_id,
+            eviction_requests = [
+                _make_eviction_request(
+                    request=_make_request(request_id, py_prompt_len=prompt_len),
                     source_length=seq_len,
-                    logical_source_length=0,
-                    prompt_length=prompt_len,
                     target_tail_length=protected_tail,
                 )
             ]
@@ -533,7 +530,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             # the derived move offsets stage keep_count + protected_tail
             # moves. Z-normalization is monotonic per row, so the raw-score
             # keep set is unchanged.
-            tri._execute_eviction_round(eviction_inputs)
+            tri._execute_eviction_round(eviction_requests)
             selected = tri._kept_ordinal_rows[0].clone().to(torch.long)
             torch.cuda.synchronize(device)
             assert cache.resize(compacted_capacity, None)

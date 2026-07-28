@@ -3579,28 +3579,17 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "`divide_length`): one speculative iteration may advance the counter "
         "by multiple accepted tokens; at most one eviction is coalesced per update."
     )
-    model_path: Optional[str] = Field(
-        default=None,
+    model_path: str = Field(
+        min_length=1,
         description="Checkpoint path used to derive RoPE tables when converting "
         "the official calibration and to classify kernel-masked sliding-attention "
-        "layers. Required by TriAttention.")
-    calibration_path: Optional[str] = Field(
-        default=None,
+        "layers.")
+    calibration_path: str = Field(
+        min_length=1,
         description="Path to the official TriAttention calibration `.pt` "
         "(produced by github.com/WeianMao/triattention). TRT-LLM does not "
         "compute calibration; it converts this file to the runtime schema at "
         "load.")
-
-    @model_validator(mode="after")
-    def _require_calibration_inputs(self):
-        # Both paths are consumed at manager construction; failing here surfaces
-        # the error at config-validation time instead of deep in executor setup.
-        if not self.model_path or not self.calibration_path:
-            raise ValueError(
-                "TriAttention requires both model_path and calibration_path; "
-                "TRT-LLM consumes an official calibration file and does not "
-                "compute one.")
-        return self
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)

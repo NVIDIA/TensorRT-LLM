@@ -8,17 +8,14 @@ from unittest import mock
 
 import pytest
 import torch
-from conftest import make_eviction_input as _make_eviction_input
+from conftest import make_eviction_request as _make_eviction_request
 from conftest import make_fake_v2 as _make_fake_v2
 from conftest import make_request as _make_request
 from conftest import make_tri_config as _make_tri_config
 from conftest import make_triattention as _make_triattention
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-    TriAttention,
-    _RequestState,
-)
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
 
 def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
@@ -48,7 +45,7 @@ def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
     tri.kv_cache_manager = manager
     tri.draft_kv_cache_manager = draft_manager
     compute_stream = mock.Mock()
-    eviction_inputs = [_make_eviction_input(request_id=7, source_length=8)]
+    eviction_requests = [_make_eviction_request(request_id=7, source_length=8)]
 
     class Boom(RuntimeError):
         pass
@@ -61,7 +58,7 @@ def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
         mock.patch.object(tri, "_stage_block_offsets") as stage,
     ):
         with pytest.raises(Boom):
-            tri._execute_eviction_round(eviction_inputs)
+            tri._execute_eviction_round(eviction_requests)
 
     # Both page-table planes were snapshotted before the round body fired.
     assert stage.call_count == 2
@@ -75,36 +72,47 @@ def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
 @pytest.mark.parametrize(
     "gate,match",
     [
-        # One representative per call-site guard family (the per-mode/per-config
-        # variants raise through the same checks). kv_factor geometry needs no
-        # admission gate: the native compact op TORCH_CHECKs every pool's K/V
-        # plane count at the first compact.
-        ("callsite_dflash", "standard paged cache compacted together"),
+        ("callsite_dflash", "one-model MTP or EAGLE3"),
         ("union_only_per_head", "union"),
-        ("full_attention_draft", "full-attention draft"),
+        ("dynamic_tree", "linear speculative"),
+        ("dynamic_draft_length", "fixed speculative draft length"),
+        ("missing_draft", "separate draft"),
+        ("sliding_draft", "full-attention draft"),
     ],
 )
-def test_draft_admission_gates_raise(gate, match):
-    # Draft/spec admission is owned by the executor call-site gate: rejected
-    # before any compression manager exists.
+def test_speculative_admission_gates_raise(gate, match):
     from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
     from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig, MTPDecodingConfig
 
-    draft_manager = _make_fake_v2(is_draft=True)
-    if gate == "full_attention_draft":
-        draft_manager.max_attention_window_vec = [128]
-    spec_config = (
-        DFlashDecodingConfig(max_draft_len=3)
-        if gate == "callsite_dflash"
-        else MTPDecodingConfig(max_draft_len=1)
-    )
+    if gate == "callsite_dflash":
+        spec_config = DFlashDecodingConfig(max_draft_len=3)
+    elif gate == "dynamic_tree":
+        spec_config = MTPDecodingConfig(
+            max_draft_len=2,
+            use_dynamic_tree=True,
+            dynamic_tree_max_topK=2,
+        )
+    elif gate == "dynamic_draft_length":
+        spec_config = MTPDecodingConfig(
+            max_draft_len=1,
+            draft_len_schedule={1: 1, 8: 0},
+        )
+    else:
+        spec_config = MTPDecodingConfig(max_draft_len=1)
     config = _make_tri_config(
         budget=8,
         eviction_mode="per_head" if gate == "union_only_per_head" else "union",
     )
+    draft_manager = None if gate == "missing_draft" else _make_fake_v2(is_draft=True)
+    if gate == "sliding_draft":
+        draft_manager.max_attention_window_vec = [128]
 
     with pytest.raises(ValueError, match=match):
-        validate_kv_cache_compression_with_spec(config, spec_config, draft_manager)
+        validate_kv_cache_compression_with_spec(
+            config,
+            spec_config,
+            draft_manager,
+        )
 
 
 def test_compressed_count_is_monotone_and_tracks_confirmed_length():
@@ -128,7 +136,6 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     manager._draft_protected_tail_capacity = 1
 
     request = _make_request(7, py_prompt_len=2, py_num_accepted_draft_tokens=1)
-    manager._request_states[7] = _RequestState()
     batch = SimpleNamespace(generation_requests=[request])
 
     # Every step confirms one sampled token plus one accepted draft token.
@@ -136,7 +143,6 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     confirmed = uncompressed
     cache.capacity = confirmed
     previous_published = 0
-    previous_evicted = 0
     eviction_rounds = 0
     with _mocked_eviction_internals(manager) as internals:
         for _ in range(6):
@@ -146,24 +152,18 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
 
             manager._evict_due_requests(batch)
 
-            state = manager._request_states[7]
-            if state.evicted_tokens > previous_evicted:
+            published = request.py_num_compressed_tokens
+            if published > previous_published:
                 # An eviction round compacted the cache to prompt + budget.
                 eviction_rounds += 1
-                confirmed -= state.evicted_tokens - previous_evicted
-                previous_evicted = state.evicted_tokens
+                confirmed -= published - previous_published
                 cache.capacity = confirmed
                 assert confirmed == 2 + 4
-                # The staged logical position restores the uncompressed
-                # length: physical confirmed plus everything evicted so far
-                # (the eviction input's logical_source_length).
-                prepared = internals.execute.call_args.args[0]
-                assert prepared[0].logical_source_length == uncompressed
             # The published count equals the uncompressed confirmed logical
             # length minus the physical confirmed length, and never decreases.
-            assert request.py_num_compressed_tokens == uncompressed - confirmed
-            assert request.py_num_compressed_tokens >= previous_published
-            previous_published = request.py_num_compressed_tokens
+            assert published == uncompressed - confirmed
+            assert published >= previous_published
+            previous_published = published
 
     assert eviction_rounds == 3
     assert previous_published == 12
@@ -236,19 +236,22 @@ def test_staged_block_width_clamps_to_manager_source_width():
     )
 
     anchor_pool = torch.empty(1, 2, 1, 32, 4)
-    host, device_table = _allocate_block_offset_staging(
-        anchor_pool,
+    manager = SimpleNamespace(
         num_pools=1,
+        host_kv_cache_block_offsets=torch.empty(1, 2, 2, 4, dtype=torch.int32),
+    )
+    host, device_table = _allocate_block_offset_staging(
+        manager,
+        anchor_pool,
         request_capacity=2,
         token_capacity=129,
-        max_source_blocks=4,
     )
     assert host.shape[-1] == 4 and device_table.shape[-1] == 4
+    manager.host_kv_cache_block_offsets = torch.empty(1, 2, 2, 64, dtype=torch.int32)
     host, device_table = _allocate_block_offset_staging(
+        manager,
         anchor_pool,
-        num_pools=1,
         request_capacity=2,
         token_capacity=129,
-        max_source_blocks=64,
     )
     assert host.shape[-1] == 8 and device_table.shape[-1] == 8

@@ -311,8 +311,8 @@ class TestFactory:
         # Non-evicting methods pass with any speculative mode; no exception.
         config = KvCacheCompressionConfig(algorithm="offload")
         spec_config = SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode.DFLASH)
-        validate_kv_cache_compression_with_spec(config, spec_config, None)
-        validate_kv_cache_compression_with_spec(config, None, None)
+        validate_kv_cache_compression_with_spec(config, spec_config)
+        validate_kv_cache_compression_with_spec(config, None)
 
 
 # ---------------------------------------------------------------------- #
