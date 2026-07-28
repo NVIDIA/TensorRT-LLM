@@ -530,11 +530,11 @@ public:
             {
                 auto session = cancelFlag != nullptr
                     ? TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
-                        DataContext{tagFromRequestId(requestId), *cancelFlag}, allCounterparts, mSelfState,
+                        DataContext{tagFromRequestId(requestId), *cancelFlag}, requestId, allCounterparts, mSelfState,
                         info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
                         !common::getEnvKVCacheTimeOutputPath().empty())
                     : TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
-                        DataContext{tagFromRequestId(requestId), mTerminate}, allCounterparts, mSelfState,
+                        DataContext{tagFromRequestId(requestId), mTerminate}, requestId, allCounterparts, mSelfState,
                         info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
                         !common::getEnvKVCacheTimeOutputPath().empty());
                 session.setTime(TransferSession::kTimeRequestInfo);
@@ -1380,11 +1380,11 @@ public:
             auto const& resource = getReceiveCacheResource(llmRequest);
             TransferSession session = perRequestCancel != nullptr
                 ? TransferSession(std::move(allConnections),
-                    DataContext{tagFromRequestId(requestId), *perRequestCancel}, std::move(allCounterparts), mSelfState,
-                    contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(),
+                    DataContext{tagFromRequestId(requestId), *perRequestCancel}, requestId, std::move(allCounterparts),
+                    mSelfState, contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(),
                     requestInfo.getLastBlockKey(), &llmRequest, !common::getEnvKVCacheTimeOutputPath().empty())
                 : TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
-                    std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
+                    requestId, std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
                     requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
                     !common::getEnvKVCacheTimeOutputPath().empty());
             if (!recvHolders.empty())
