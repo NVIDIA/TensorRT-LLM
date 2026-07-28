@@ -216,14 +216,19 @@ def test_hybrid_cache_manager_factory_honors_v2_setting(
     assert get_kv_cache_manager_cls(_hybrid_model_config(), kv_cache_config) is expected
 
 
-def test_qwen3_gdn_replay_falls_back_for_v2_manager(monkeypatch):
+def test_qwen3_gdn_replay_requires_cpp_manager(monkeypatch):
     """GDN's all-layer replay commit requires the contiguous C++ state view."""
     captured_cpp = {}
+    captured_mixed = {}
     captured_v2 = {}
 
     class RecordingCppManager(CppMambaHybridCacheManager):
         def __init__(self, *args, **kwargs):
             captured_cpp.update(kwargs)
+
+    class RecordingMixedManager(MixedMambaHybridCacheManager):
+        def __init__(self, *args, **kwargs):
+            captured_mixed.update(kwargs)
 
     class RecordingV2Manager(MambaHybridCacheManagerV2):
         def __init__(self, *args, **kwargs):
@@ -260,6 +265,11 @@ def test_qwen3_gdn_replay_falls_back_for_v2_manager(monkeypatch):
         "tensorrt_llm._torch.pyexecutor._util.extract_mamba_kv_cache_params",
         lambda *args, **kwargs: mamba_params,
     )
+    info_log = MagicMock()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor._util.logger.info",
+        info_log,
+    )
 
     common_kwargs = dict(
         model_engine=None,
@@ -283,6 +293,11 @@ def test_qwen3_gdn_replay_falls_back_for_v2_manager(monkeypatch):
         **common_kwargs,
     )
     _create_kv_cache_manager(
+        kv_cache_manager_cls=RecordingMixedManager,
+        kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False),
+        **common_kwargs,
+    )
+    _create_kv_cache_manager(
         kv_cache_manager_cls=RecordingV2Manager,
         kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
         **common_kwargs,
@@ -290,9 +305,14 @@ def test_qwen3_gdn_replay_falls_back_for_v2_manager(monkeypatch):
 
     assert captured_cpp["use_replay_state_update"] is True
     assert captured_cpp["model_type"] == "qwen3_next"
+    assert captured_mixed["use_replay_state_update"] is False
+    assert captured_mixed["model_type"] == "qwen3_next"
     assert captured_v2["use_replay_state_update"] is False
     assert "model_type" not in captured_v2
     assert captured_v2["conv_state_layout"] == "q_k_v"
+    fallback_logs = [str(call.args[0]) for call in info_log.call_args_list]
+    assert any("RecordingMixedManager was selected" in log for log in fallback_logs)
+    assert any("RecordingV2Manager was selected" in log for log in fallback_logs)
 
 
 def test_hybrid_cache_manager_factory_rejects_cpp_preference_with_explicit_v2(

@@ -2160,14 +2160,15 @@ def _create_kv_cache_manager(
         if not is_gdn_replay_enabled():
             use_replay = False
 
-        # Upstream GDN replay commits all local layer checkpoints through the
-        # contiguous C++ manager state view. V2 exposes per-layer state views,
-        # so enabling the same path there would fail for partitioned batches.
-        if (use_replay and issubclass(kv_cache_manager_cls,
-                                      MambaHybridCacheManagerV2)):
-            logger.info(
-                "GDN replay is not supported by MambaHybridCacheManagerV2; "
-                "using the legacy MTP path")
+        # GDN replay commits all local layer checkpoints through the contiguous
+        # C++ V1 manager state view. Mixed/Python and V2 do not expose the
+        # required all-layer commit, so keep their selected cache manager but
+        # use the non-replay MTP implementation.
+        if (use_replay and not issubclass(kv_cache_manager_cls,
+                                          CppMambaHybridCacheManager)):
+            logger.info("GDN replay requires CppMambaHybridCacheManager; "
+                        f"{kv_cache_manager_cls.__name__} was selected, so the "
+                        "non-replay MTP path will be used")
             use_replay = False
         logger.info("GDN replay state update: " +
                     ("ENABLED" if use_replay else "DISABLED"))
