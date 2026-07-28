@@ -275,7 +275,6 @@ def piecewise_optimizer(
     enable_inductor: bool,
     input_num_tokens: Union[int | torch.SymInt],
     capture_num_tokens: Sequence[int],
-    graph_pool_handle: tuple[int, int],
     max_num_streams: int = 1,
 ) -> tuple[GraphModule, int, List[PiecewiseRunner]]:
     graph_pool_handle = torch.cuda.graph_pool_handle()
