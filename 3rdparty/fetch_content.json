@@ -69,6 +69,13 @@
       "source_subdir": "dont-add-this-project-with-add-subdirectory"
     },
     {
+      "name": "msa",
+      "git_repository": "https://gitlab.com/nvidia/tensorrt-llm/oss-components/msa.git",
+      "git_tag": "e2ebe7656649f619af0ad1d457b534283034655e",
+      "source_subdir": "dont-add-this-project-with-add-subdirectory",
+      "patch_file": "patches/msa_strided_paged_kv.patch"
+    },
+    {
       "name": "nanobind",
       "git_repository": "https://github.com/wjakob/nanobind",
       "git_tag": "a0ed2587f1089ef7657e2ed49ad6756b01c74e9f"

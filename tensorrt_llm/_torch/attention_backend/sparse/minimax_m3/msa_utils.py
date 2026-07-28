@@ -5,8 +5,6 @@
 from __future__ import annotations
 
 import importlib.util
-import sys
-from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
@@ -19,55 +17,25 @@ from .common import _INIT_SCORE, _LOCAL_SCORE, write_kv_slots
 MSA_REQUIRED_TOPK = 16
 MSA_REQUIRED_HEAD_DIM = 128
 
-# Path of the fmha_sm100 package inside the MSA git submodule relative to the
-# repository root (see 3rdparty/MSA/LICENSE and 3rdparty/MSA/NOTICE).
-_MSA_PYTHON_RELPATH = Path("3rdparty") / "MSA" / "python"
-
-
-def _find_msa_python_dir() -> Optional[Path]:
-    """Locate the fmha_sm100 package dir by walking up from this file.
-
-    Returns None in installed layouts where the 3rdparty submodule is not
-    shipped. Walking up avoids hardcoding this module's depth below the
-    repository root.
-    """
-    for parent in Path(__file__).resolve().parents:
-        candidate = parent / _MSA_PYTHON_RELPATH
-        if candidate.is_dir():
-            return candidate
-    return None
-
-
-def _ensure_msa_on_path() -> None:
-    """Prepend the MSA python package directory to sys.path if present."""
-    msa_python = _find_msa_python_dir()
-    if msa_python is not None and str(msa_python) not in sys.path:
-        sys.path.insert(0, str(msa_python))
-
 
 def msa_package_available() -> bool:
-    """True if fmha_sm100 can be imported (submodule checkout or installed)."""
-    _ensure_msa_on_path()
+    """Return whether the packaged fmha_sm100 module can be imported."""
     return importlib.util.find_spec("fmha_sm100") is not None
 
 
 def require_msa_module():
-    """Import fmha_sm100 from the MSA submodule or raise a clear error.
+    """Import the packaged fmha_sm100 module or raise a clear error.
 
     The import is deferred to first kernel use so the MSA backend can be
     advertised in the config schema on systems where the kernels cannot load.
-    The 3rdparty/MSA/python directory is added to sys.path first, so a source
-    checkout with the submodule initialized resolves without a separate install.
     A missing package is a hard error, never a silent fallback to another backend.
     """
-    _ensure_msa_on_path()
     try:
         import fmha_sm100
     except ImportError as exc:
         raise RuntimeError(
-            "MiniMax-M3 MSA attention requires the fmha_sm100 kernels from the "
-            "MSA git submodule at 3rdparty/MSA. Initialize it with "
-            "'git submodule update --init --recursive', or install fmha_sm100."
+            "MiniMax-M3 MSA attention requires the fmha_sm100 kernels packaged "
+            "with TensorRT-LLM. Reinstall TensorRT-LLM from a complete build."
         ) from exc
     return fmha_sm100
 

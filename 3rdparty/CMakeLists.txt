@@ -135,7 +135,7 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
       PATCH_COMMAND
       bash
       -c
-      "patch -p1 --forward --batch --dry-run -i '${_patch_file}' && patch -p1 --forward --batch -i '${_patch_file}' || echo 'Patch already applied, skipping.'"
+      "patch -p1 --forward --batch --dry-run -i '${_patch_file}' && patch -p1 --forward --batch -i '${_patch_file}' || patch -p1 --reverse --batch --dry-run -i '${_patch_file}'"
     )
   endif()
 

@@ -258,7 +258,7 @@ endif()
 FetchContent_MakeAvailable(nanobind)
 include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
 
-FetchContent_MakeAvailable(cutlass cxxopts flashmla json xgrammar)
+FetchContent_MakeAvailable(cutlass cxxopts flashmla json msa xgrammar)
 
 if(ENABLE_UCX)
   FetchContent_MakeAvailable(cppzmq ucxx)
