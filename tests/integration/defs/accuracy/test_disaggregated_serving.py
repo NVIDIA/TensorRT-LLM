@@ -2480,6 +2480,68 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash"
 
+    @pytest.mark.skip_less_device(8)
+    def test_prefill_breakable_cuda_graph(self):
+        """Disaggregated accuracy with BCG enabled only on the prefill worker."""
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": 4,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": True,
+            "max_batch_size": 8,
+            "max_num_tokens": 1024,
+            "max_seq_len": 4096,
+            "moe_config": {
+                "backend": "TRTLLM",
+            },
+            "kv_cache_config": {
+                "dtype": "fp8",
+                "free_gpu_memory_fraction": 0.6,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+            "prefill_cuda_graph_backend": "breakable",
+            "prefill_capture_num_tokens": [128, 256, 512, 1024],
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 4,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": True,
+            "max_batch_size": 8,
+            "max_num_tokens": 1024,
+            "max_seq_len": 4096,
+            "moe_config": {
+                "backend": "TRTLLM",
+            },
+            "kv_cache_config": {
+                "dtype": "fp8",
+                "free_gpu_memory_fraction": 0.6,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      server_waiting_timeout=3600) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
+
     @pytest.mark.skip_less_device(4)
     def test_auto_dtype(self):
         # Disagg smoke test: CTX TP=2 + GEN TP=2 = 4 GPUs.
