@@ -338,7 +338,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # local quarantine roots. They deliberately keep shutdown non-drained.
         self._retained_allocation_leases: list[AllocationLease] = []
         # Control-only notifications consumed by PyExecutor after distributed
-        # receive retirement. Only rank 0 publishes them to the result queue.
+        # receive retirement. Non-ADP retains one event on every replica so
+        # normal rank-0 and gather-all response modes both work. Attention DP
+        # elects the first PP/CP replica of every request-owning TP/DP lane;
+        # PyExecutor gathers those rank-local events before publication.
         self._handoff_lifecycle_events: list[tuple[int, Optional[int], HandoffLifecycleEvent]] = []
         self._page_table = self._transfer_worker.page_table
         # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
@@ -1670,19 +1673,24 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                         self._commit_generation_retirement(progress)
                         if not self._generation_retirement_committed(progress):
                             raise RuntimeError(f"Generation request {rid} commit was incomplete")
-                        if handoff_event is not None and self._dist.rank == 0:
-                            request_id = (
-                                progress.request.py_request_id
-                                if not progress.request.is_child
-                                else progress.request.parent_request_id
+                        if handoff_event is not None:
+                            mapping = self._mapping
+                            event_owner = not mapping.enable_attention_dp or (
+                                mapping.pp_rank == 0 and mapping.cp_rank == 0
                             )
-                            pending_handoff_events.append(
-                                (
-                                    request_id,
-                                    progress.request.py_client_id,
-                                    handoff_event,
+                            if event_owner:
+                                request_id = (
+                                    progress.request.py_request_id
+                                    if not progress.request.is_child
+                                    else progress.request.parent_request_id
                                 )
-                            )
+                                pending_handoff_events.append(
+                                    (
+                                        request_id,
+                                        progress.request.py_client_id,
+                                        handoff_event,
+                                    )
+                                )
                         retirements.pop(rid)
                         if not progress.report_result:
                             continue

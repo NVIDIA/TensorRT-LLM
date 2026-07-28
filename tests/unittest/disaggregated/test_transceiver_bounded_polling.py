@@ -1888,7 +1888,33 @@ def test_transceiver_shutdown_waits_for_async_enrollment_and_launch(direction) -
     assert transceiver._shutdown
 
 
-def test_v1_sync_receive_waits_for_peer_cleanup_before_handoff_commit() -> None:
+@pytest.mark.parametrize(
+    "enable_attention_dp,pp_rank,cp_rank,rank,gen_need_sync,expected_events",
+    [
+        (False, 0, 0, 0, True, 1),
+        (False, 0, 0, 1, True, 1),
+        (True, 0, 0, 1, False, 1),
+        (True, 0, 0, 2, True, 1),
+        (True, 1, 0, 3, True, 0),
+        (True, 0, 1, 4, True, 0),
+    ],
+    ids=[
+        "non-adp-root",
+        "non-adp-gather-all-peer",
+        "adp-pp1-lane-owner",
+        "adp-pp-lane-owner",
+        "adp-pp-replica",
+        "adp-cp-replica",
+    ],
+)
+def test_v1_sync_receive_waits_for_peer_cleanup_before_handoff_commit(
+    enable_attention_dp,
+    pp_rank,
+    cp_rank,
+    rank,
+    gen_need_sync,
+    expected_events,
+) -> None:
     rid = 63
     params = SimpleNamespace(
         disagg_request_id=rid,
@@ -1926,7 +1952,7 @@ def test_v1_sync_receive_waits_for_peer_cleanup_before_handoff_commit() -> None:
     transceiver._create_kv_slice = Mock(return_value=object())
     transceiver._bind_slice_allocation_lease = Mock()
     transceiver._assert_disagg_history_declared = Mock()
-    transceiver._gen_need_sync = True
+    transceiver._gen_need_sync = gen_need_sync
     transceiver._gen_consensus = Mock(side_effect=lambda local_ids: list(local_ids))
     transceiver._gen_consensus_outcome = Mock(
         side_effect=[
@@ -1934,7 +1960,12 @@ def test_v1_sync_receive_waits_for_peer_cleanup_before_handoff_commit() -> None:
             ([], [], [rid]),
         ]
     )
-    transceiver._dist = Mock(rank=0)
+    transceiver._dist = Mock(rank=rank)
+    transceiver._mapping = SimpleNamespace(
+        enable_attention_dp=enable_attention_dp,
+        pp_rank=pp_rank,
+        cp_rank=cp_rank,
+    )
     transceiver.kv_transfer_poll_interval_ms = 0
     transceiver._handoff_lifecycle_events = []
 
@@ -1956,18 +1987,20 @@ def test_v1_sync_receive_waits_for_peer_cleanup_before_handoff_commit() -> None:
     assert transceiver._recv_sessions == {}
     assert transceiver._recv_reqs == {}
     events = transceiver.take_handoff_lifecycle_events()
-    assert len(events) == 1
-    request_id, client_id, event = events[0]
-    assert request_id == rid
-    assert client_id == 7
-    assert event.state is HandoffEventState.HANDOFF_COMMITTED
-    assert event.session == request.py_disagg_transfer_protocol_identity
+    assert len(events) == expected_events
     assert [
         consensus_call.args for consensus_call in transceiver._gen_consensus_outcome.call_args_list
     ] == [
         ([rid], [], [], [rid], [rid]),
         ([rid], [], [], [rid], [rid]),
     ]
+    if not events:
+        return
+    request_id, client_id, event = events[0]
+    assert request_id == rid
+    assert client_id == 7
+    assert event.state is HandoffEventState.HANDOFF_COMMITTED
+    assert event.session == request.py_disagg_transfer_protocol_identity
 
 
 def test_v1_sync_receive_rejects_missing_exact_identity_before_admission() -> None:

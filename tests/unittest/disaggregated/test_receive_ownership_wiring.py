@@ -31,7 +31,10 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     SessionStatus,
     WaitResult,
 )
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import IdentityMapper
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
+    IntactMapper,
+    ReplicatedMapper,
+)
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap
 from tensorrt_llm._torch.disaggregation.native.receive_lifecycle import (
     LogicalState,
@@ -1400,12 +1403,33 @@ def _bounce_proof_page_table(*slot_bytes: int, tokens_per_block: int = 32):
     )
 
 
-def _single_writer_bounce_proof(local_page_table, peer_page_table, mapping) -> bool:
+def _single_writer_bounce_proof(
+    local_page_table,
+    peer_page_table,
+    mapping,
+    mapper_factory=None,
+) -> bool:
+    def exact_mapper(_peer_info, self_key, peer_key):
+        self_lg, self_pool_view_id = self_key
+        peer_lg, peer_pool_view_id = peer_key
+        self_pool_view = local_page_table.layer_groups[self_lg].pool_views[self_pool_view_id]
+        peer_pool_view = peer_page_table.layer_groups[peer_lg].pool_views[peer_pool_view_id]
+        self_pool_group = local_page_table.layer_groups[self_lg].pool_group_idx
+        peer_pool_group = peer_page_table.layer_groups[peer_lg].pool_group_idx
+        self_pool = local_page_table.pool_groups[self_pool_group].pools[self_pool_view.pool_idx]
+        peer_pool = peer_page_table.pool_groups[peer_pool_group].pools[peer_pool_view.pool_idx]
+        return IntactMapper(
+            src_layer_offsets=[0],
+            dst_layer_offsets=[0],
+            self_bytes_per_layer=self_pool.slot_bytes,
+            peer_bytes_per_layer=peer_pool.slot_bytes,
+        )
+
     receiver = object.__new__(Receiver)
     receiver._registrar = SimpleNamespace(
         self_rank_info=SimpleNamespace(layer_num_per_pp=[1], page_table=local_page_table),
         get_pool_mapping=Mock(return_value=mapping),
-        get_kv_map=Mock(return_value=IdentityMapper()),
+        get_kv_map=Mock(side_effect=mapper_factory or exact_mapper),
     )
     peer_info = SimpleNamespace(layer_num_per_pp=[1], page_table=peer_page_table)
     return receiver._single_writer_bounce_exact(peer_info)
@@ -1432,6 +1456,89 @@ def test_single_writer_bounce_rejects_asymmetric_slot_bytes() -> None:
         _bounce_proof_page_table(64),
         _bounce_proof_page_table(128),
         {(0, 0): (0, 0)},
+    )
+
+
+def test_single_writer_bounce_rejects_partial_intact_mapping() -> None:
+    def partial_mapper(_peer_info, _self_key, _peer_key):
+        return IntactMapper(
+            src_layer_offsets=[0],
+            dst_layer_offsets=[0],
+            self_bytes_per_layer=32,
+            peer_bytes_per_layer=32,
+        )
+
+    assert not _single_writer_bounce_proof(
+        _bounce_proof_page_table(64),
+        _bounce_proof_page_table(64),
+        {(0, 0): (0, 0)},
+        mapper_factory=partial_mapper,
+    )
+
+
+def test_single_writer_bounce_accepts_exact_replicated_mapping() -> None:
+    def replicated_mapper(_peer_info, _self_key, _peer_key):
+        return ReplicatedMapper(
+            src_layer_offsets=[0],
+            dst_layer_offsets=[0],
+            self_bytes_per_layer=64,
+            peer_bytes_per_layer=64,
+        )
+
+    assert _single_writer_bounce_proof(
+        _bounce_proof_page_table(64),
+        _bounce_proof_page_table(64),
+        {(0, 0): (0, 0)},
+        mapper_factory=replicated_mapper,
+    )
+
+
+def test_single_writer_bounce_rejects_non_intact_full_slot_mapper() -> None:
+    mapper = Mock()
+    mapper.map.side_effect = AssertionError("non-intact mapper must not be evaluated")
+
+    assert not _single_writer_bounce_proof(
+        _bounce_proof_page_table(64),
+        _bounce_proof_page_table(64),
+        {(0, 0): (0, 0)},
+        mapper_factory=lambda *_args: mapper,
+    )
+    mapper.map.assert_not_called()
+
+
+def test_single_writer_bounce_accepts_disjoint_views_covering_one_pool() -> None:
+    def shared_pool_page_table():
+        return KVCachePageTable(
+            tokens_per_block=32,
+            layer_groups=[
+                AttentionLayerGroup(
+                    pool_group_idx=0,
+                    pool_views=[
+                        PoolView(pool_idx=0, buffer_entries=np.empty(0, BUFFER_ENTRY_DTYPE)),
+                        PoolView(pool_idx=0, buffer_entries=np.empty(0, BUFFER_ENTRY_DTYPE)),
+                    ],
+                )
+            ],
+            pool_groups=[
+                PhysicalPoolGroup(
+                    pools=[PhysicalPool(base_address=0x1000, slot_bytes=64, num_slots=16)]
+                )
+            ],
+        )
+
+    def disjoint_mapper(_peer_info, self_key, peer_key):
+        return IntactMapper(
+            src_layer_offsets=[self_key[1] * 32],
+            dst_layer_offsets=[peer_key[1] * 32],
+            self_bytes_per_layer=32,
+            peer_bytes_per_layer=32,
+        )
+
+    assert _single_writer_bounce_proof(
+        shared_pool_page_table(),
+        shared_pool_page_table(),
+        {(0, 0): (0, 0), (0, 1): (0, 1)},
+        mapper_factory=disjoint_mapper,
     )
 
 

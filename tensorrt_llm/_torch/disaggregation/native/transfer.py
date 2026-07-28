@@ -5458,10 +5458,11 @@ class Receiver(ReceiverBase):
     def _single_writer_bounce_exact(self, peer_info: RankInfo) -> bool:
         """Whether the receiver can prove that one writer maps every reserved byte.
 
-        ``IdentityMapper`` proves positional mapping, not physical extent
-        equality.  Bounce admission additionally requires identical block
-        geometry and a byte-equal bijection over every attention pool view so
-        the sender's coalesced write cannot exceed the receiver-owned slot.
+        Bounce admission requires identical block geometry and a byte-equal
+        bijection over every attention pool view. The mapper's synthetic
+        one-block descriptors must collectively partition each physical slot
+        exactly on both sides, so partial layer/head overlap cannot authorize a
+        sender write larger than the receiver-owned reservation.
         """
         self_ri = self._registrar.self_rank_info
         local_layers = getattr(self_ri, "layer_num_per_pp", None)
@@ -5485,8 +5486,25 @@ class Receiver(ReceiverBase):
         ):
             return False
 
+        from ..base.region import MemRegionGroup, SpecRegion
         from ..resource.utils import get_physical_pool
-        from .mixers.attention.peer import IdentityMapper
+        from .mixers.attention.peer import IntactMapper
+
+        def physical_pool_key(page_table, pool_key):
+            layer_group_id, pool_view_id = pool_key
+            layer_group = page_table.layer_groups[layer_group_id]
+            pool_view = layer_group.pool_views[pool_view_id]
+            return (int(layer_group.pool_group_idx), int(pool_view.pool_idx))
+
+        def covers_exact_slot(intervals, slot_bytes):
+            if slot_bytes <= 0:
+                return False
+            cursor = 0
+            for start, end in sorted(intervals):
+                if start != cursor or end <= start or end > slot_bytes:
+                    return False
+                cursor = end
+            return cursor == slot_bytes
 
         try:
             mapping = get_pool_mapping(peer_info)
@@ -5510,9 +5528,9 @@ class Receiver(ReceiverBase):
             ):
                 return False
 
+            local_intervals = {}
+            peer_intervals = {}
             for self_key, peer_key in mapping.items():
-                if not isinstance(get_kv_map(peer_info, self_key, peer_key), IdentityMapper):
-                    return False
                 self_lg, self_pool_view_id = self_key
                 peer_lg, peer_pool_view_id = peer_key
                 self_pool_view = page_table.layer_groups[self_lg].pool_views[self_pool_view_id]
@@ -5520,6 +5538,65 @@ class Receiver(ReceiverBase):
                 self_pool = get_physical_pool(page_table, self_lg, self_pool_view.pool_idx)
                 peer_pool = get_physical_pool(peer_page_table, peer_lg, peer_pool_view.pool_idx)
                 if self_pool.slot_bytes != peer_pool.slot_bytes:
+                    return False
+
+                mapper = get_kv_map(peer_info, self_key, peer_key)
+                if not isinstance(mapper, IntactMapper):
+                    return False
+                self_region = SpecRegion(
+                    memory=MemRegionGroup(
+                        ptrs=np.array([0], dtype=np.int64),
+                        bytes_per_region=int(self_pool.slot_bytes),
+                    )
+                )
+                peer_region = SpecRegion(
+                    memory=MemRegionGroup(
+                        ptrs=np.array([0], dtype=np.int64),
+                        bytes_per_region=int(peer_pool.slot_bytes),
+                    )
+                )
+                mapped = mapper.map(self_region, peer_region)
+                region_pairs = mapped if isinstance(mapped, list) else [mapped]
+                self_pool_key = physical_pool_key(page_table, self_key)
+                peer_pool_key = physical_pool_key(peer_page_table, peer_key)
+                for region_pair in region_pairs:
+                    src = region_pair.src.memory
+                    dst = region_pair.dst.memory
+                    if (
+                        not isinstance(src, MemRegionGroup)
+                        or not isinstance(dst, MemRegionGroup)
+                        or src.ptrs.size != dst.ptrs.size
+                        or src.bytes_per_region != dst.bytes_per_region
+                        or src.bytes_per_region <= 0
+                    ):
+                        return False
+                    size = int(src.bytes_per_region)
+                    local_intervals.setdefault(self_pool_key, []).extend(
+                        (int(ptr), int(ptr) + size) for ptr in src.ptrs
+                    )
+                    peer_intervals.setdefault(peer_pool_key, []).extend(
+                        (int(ptr), int(ptr) + size) for ptr in dst.ptrs
+                    )
+
+            local_pool_keys = {
+                physical_pool_key(page_table, key) for key in expected_local_pool_keys
+            }
+            peer_pool_keys = {
+                physical_pool_key(peer_page_table, key) for key in expected_peer_pool_keys
+            }
+            for pool_group_id, pool_id in local_pool_keys:
+                slot_bytes = page_table.pool_groups[pool_group_id].pools[pool_id].slot_bytes
+                if not covers_exact_slot(
+                    local_intervals.get((pool_group_id, pool_id), ()),
+                    int(slot_bytes),
+                ):
+                    return False
+            for pool_group_id, pool_id in peer_pool_keys:
+                slot_bytes = peer_page_table.pool_groups[pool_group_id].pools[pool_id].slot_bytes
+                if not covers_exact_slot(
+                    peer_intervals.get((pool_group_id, pool_id), ()),
+                    int(slot_bytes),
+                ):
                     return False
             return True
         except Exception as e:

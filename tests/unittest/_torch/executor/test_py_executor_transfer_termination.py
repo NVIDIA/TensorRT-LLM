@@ -397,6 +397,126 @@ def _make_native_completion_request():
     return request
 
 
+@pytest.mark.parametrize("handoff_events", [[], [(7, 3, Mock())]])
+def test_generation_handoff_response_waits_for_synchronized_flush(handoff_events):
+    executor = _initialize_bare_executor_lifecycle_state(object.__new__(PyExecutor))
+    executor.enable_attention_dp = True
+    executor.dist = SimpleNamespace(rank=1, world_size=2)
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.capabilities.return_value = SimpleNamespace(protocol_version=1)
+    executor.kv_cache_transceiver.check_gen_transfer_status.return_value = ([], [], [])
+    executor.kv_cache_transceiver.take_handoff_lifecycle_events.return_value = handoff_events
+    executor.canceled_req_ids = []
+    executor._is_disagg_inflight_cancel_active = Mock(return_value=True)
+    executor._pending_transfer_responses = []
+    executor._pending_transfer_response_terminals = {}
+    executor._pending_handoff_responses = []
+    executor._enqueue_responses = Mock()
+
+    executor._check_disagg_gen_cache_transfer_status(0)
+
+    executor._enqueue_responses.assert_not_called()
+    pending = executor._pending_handoff_responses
+    if handoff_events:
+        [(request_id, response)] = pending
+        assert request_id == 7
+        assert response.request_id == 7
+        assert response.client_id == 3
+        assert response.disagg_handoff_event is handoff_events[0][2]
+    else:
+        assert pending == []
+    expected_pending = list(pending)
+
+    executor._flush_pending_handoff_responses(rank_synchronous=True)
+
+    executor._enqueue_responses.assert_called_once_with(expected_pending)
+    assert executor._pending_handoff_responses == []
+
+
+def test_non_adp_handoff_precedes_generation_transfer_error():
+    event = Mock()
+    executor = _initialize_bare_executor_lifecycle_state(object.__new__(PyExecutor))
+    executor.enable_attention_dp = False
+    executor.dist = SimpleNamespace(rank=1, world_size=2)
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.capabilities.return_value = SimpleNamespace(protocol_version=1)
+    executor.kv_cache_transceiver.check_gen_transfer_status.return_value = ([], [7], [])
+    executor.kv_cache_transceiver.take_handoff_lifecycle_events.return_value = [(7, 3, event)]
+    executor.canceled_req_ids = []
+    executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+    executor._pending_handoff_responses = []
+    calls = Mock()
+    executor._enqueue_responses = calls.enqueue
+    executor._check_cache_transfer_errors = calls.check_errors
+
+    executor._check_disagg_gen_cache_transfer_status(0)
+
+    assert [entry[0] for entry in calls.method_calls] == [
+        "enqueue",
+        "check_errors",
+    ]
+    [(request_id, response)] = calls.enqueue.call_args.args[0]
+    assert request_id == 7
+    assert response.disagg_handoff_event is event
+    assert executor._pending_handoff_responses == []
+
+
+def test_handoff_enqueue_failure_retains_exact_buffer():
+    response = Mock()
+    pending = [(7, response)]
+    executor = _initialize_bare_executor_lifecycle_state(object.__new__(PyExecutor))
+    executor.enable_attention_dp = True
+    executor.dist = SimpleNamespace(rank=1, world_size=2)
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.capabilities.return_value = SimpleNamespace(protocol_version=1)
+    executor._pending_handoff_responses = pending.copy()
+    executor._enqueue_responses = Mock(side_effect=RuntimeError("enqueue failed"))
+
+    with pytest.raises(RuntimeError, match="enqueue failed"):
+        executor._flush_pending_handoff_responses(rank_synchronous=True)
+
+    assert executor._pending_handoff_responses == pending
+
+
+def test_gather_all_uses_world_vote_before_handoff_error_publication():
+    executor = _initialize_bare_executor_lifecycle_state(object.__new__(PyExecutor))
+    executor.active_requests = []
+    executor.gather_all_responses = True
+    executor.enable_attention_dp = True
+    executor.dist = SimpleNamespace(
+        world_size=4,
+        tp_size=2,
+        allreduce=Mock(return_value=1),
+        tp_allreduce=Mock(),
+    )
+    executor._get_disagg_reqs_in_error_state = Mock(return_value=[])
+    executor._flush_pending_handoff_responses = Mock()
+    executor._handle_errors = Mock()
+
+    executor._check_gen_cache_transfer_errors_consensus()
+
+    executor.dist.allreduce.assert_called_once()
+    assert executor.dist.allreduce.call_args.args[0] == 0
+    executor.dist.tp_allreduce.assert_not_called()
+    executor._flush_pending_handoff_responses.assert_called_once_with(rank_synchronous=True)
+    executor._handle_errors.assert_called_once_with(
+        "Error in kv cache transfer for generation requests",
+        requests=[],
+        charge_budget=False,
+    )
+
+
+def test_shutdown_discards_handoff_only_buffer():
+    executor = _initialize_bare_executor_lifecycle_state(object.__new__(PyExecutor))
+    executor._pending_transfer_responses = []
+    executor._pending_transfer_response_terminals = {}
+    executor._pending_handoff_responses = [(7, Mock())]
+
+    executor._discard_pending_transfer_responses_after_shutdown()
+
+    assert executor._pending_handoff_responses == []
+
+
 @pytest.mark.parametrize("requires_physical_drain", [False, True])
 def test_transceiver_owner_mode_boundary(requires_physical_drain):
     request = _make_native_launch_request()
@@ -1151,11 +1271,14 @@ def test_mixed_provider_completion_publishes_and_terminates_once(first_provider)
     assert executor._pending_transfer_responses == [(7, response)]
     assert executor.async_transfer_manager.end_transfer.call_count == 2
     executor._terminate_request.assert_called_once_with(request)
+    handoff_response = Mock()
+    executor._pending_handoff_responses = [(7, handoff_response)]
 
     executor._flush_pending_transfer_responses()
 
-    executor._enqueue_responses.assert_called_once_with([(7, response)])
+    executor._enqueue_responses.assert_called_once_with([(7, response), (7, handoff_response)])
     assert executor._pending_transfer_responses == []
+    assert executor._pending_handoff_responses == []
     assert executor._pending_transfer_terminals == {}
 
 

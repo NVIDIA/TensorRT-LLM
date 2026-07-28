@@ -1136,6 +1136,10 @@ class PyExecutor:
         # be reused while this entry exists.
         self._pending_transfer_response_terminals: Dict[
             int, _TransferTerminalProgress] = {}
+        # Handoff controls have no _TransferTerminalProgress owner, but must
+        # use the same rank-synchronized publication boundary as terminal
+        # responses because their status polls are rank-divergent.
+        self._pending_handoff_responses: List[Tuple[int, LlmResponse]] = []
         # Same buffer-then-synced-flush pattern as _pending_transfer_responses
         # above: _handle_responses and _append_iter_stats are reached from
         # per-rank-divergent gates, so their tp_allgather collectives are
@@ -1824,15 +1828,18 @@ class PyExecutor:
             PyExecutor._retire_transfer_terminal_if_complete(self, request)
 
     def _flush_pending_transfer_responses(self):
-        """Enqueue buffered transfer-completion responses.
+        """Enqueue buffered transfer-completion and handoff responses.
 
         Must be called at a point where ALL DP ranks execute in lockstep so
         that the tp_gather inside _enqueue_responses does not deadlock.
         """
-        responses = list(self._pending_transfer_responses)
+        terminal_responses = list(self._pending_transfer_responses)
+        handoff_responses = list(getattr(self, "_pending_handoff_responses",
+                                         []))
+        responses = terminal_responses + handoff_responses
         response_terminals = self._get_pending_transfer_response_terminals()
         terminals = []
-        for _request_id, response in responses:
+        for _request_id, response in terminal_responses:
             terminal = response_terminals.get(id(response))
             if terminal is None or terminal.response is not response:
                 raise RuntimeError(
@@ -1844,7 +1851,43 @@ class PyExecutor:
             # collective when ADP is enabled so that the other rank's gather
             # can complete.
             self._enqueue_responses(responses)
+        if handoff_responses:
+            published_ids = {id(response) for _, response in handoff_responses}
+            self._pending_handoff_responses = [
+                entry
+                for entry in getattr(self, "_pending_handoff_responses", [])
+                if id(entry[1]) not in published_ids
+            ]
         self._commit_transfer_response_publication(terminals)
+
+    def _flush_pending_handoff_responses(self,
+                                         *,
+                                         rank_synchronous: bool = False
+                                         ) -> None:
+        """Publish buffered handoff evidence without terminal bookkeeping.
+
+        Rank-divergent generation status polls may call this directly only
+        when response publication is non-collective. Multi-rank attention-DP
+        callers must use a rank-synchronous executor-loop boundary and enter
+        the gather even when their local buffer is empty.
+        """
+        if not self._uses_generation_safe_disagg_lifecycle():
+            return
+        responses = list(getattr(self, "_pending_handoff_responses", []))
+        multi_rank_adp = (self.enable_attention_dp
+                          and self.dist.world_size != 1)
+        if multi_rank_adp and not rank_synchronous:
+            return
+        if responses or multi_rank_adp:
+            self._enqueue_responses(responses)
+        if responses:
+            current = getattr(self, "_pending_handoff_responses", [])
+            if (len(current) < len(responses)
+                    or any(current[index] is not response
+                           for index, response in enumerate(responses))):
+                raise RuntimeError(
+                    "KV-handoff response buffer changed during publication")
+            del current[:len(responses)]
 
     def _discard_pending_transfer_responses_after_shutdown(self) -> None:
         """Discard responses remaining after the rank-synchronous loop stopped.
@@ -1857,15 +1900,23 @@ class PyExecutor:
         local payload after recording the loss.
         """
         responses = getattr(self, "_pending_transfer_responses", None)
-        if not responses:
+        handoff_responses = getattr(self, "_pending_handoff_responses", None)
+        if not responses and not handoff_responses:
             return
-        logger.warning(
-            f"Discarding {len(responses)} KV-transfer completion response(s) "
-            "remaining after the executor loop stopped; shutdown cannot safely "
-            "enter response collectives")
+        if responses:
+            logger.warning(
+                f"Discarding {len(responses)} KV-transfer completion "
+                "response(s) remaining after the executor loop stopped; "
+                "shutdown cannot safely enter response collectives")
+        if handoff_responses:
+            logger.warning(
+                f"Discarding {len(handoff_responses)} KV-handoff response(s) "
+                "remaining after the executor loop stopped; shutdown cannot "
+                "safely enter response collectives")
         self._pending_transfer_responses = []
+        self._pending_handoff_responses = []
         response_terminals = self._get_pending_transfer_response_terminals()
-        for _request_id, response in responses:
+        for _request_id, response in responses or []:
             terminal = response_terminals.pop(id(response), None)
             if terminal is None or terminal.response is not response:
                 logger.error(
@@ -3829,6 +3880,7 @@ class PyExecutor:
                     self._check_disagg_transfer_progress_when_idle(
                         num_fitting_reqs, fitting_disagg_gen_init_requests,
                         wait_for_disagg_gen_transfer_progress, all_gen_first)
+                    self._flush_pending_handoff_responses(rank_synchronous=True)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
@@ -5066,6 +5118,7 @@ class PyExecutor:
             self._check_disagg_transfer_progress_when_idle(
                 num_fitting_reqs, admitted_disagg_gen_init_requests,
                 wait_for_disagg_gen_transfer_progress, all_gen_first)
+            self._flush_pending_handoff_responses(rank_synchronous=True)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously. If some requests are stuck in INIT state and the
@@ -7248,7 +7301,14 @@ class PyExecutor:
         ]
         local_needs_flush = bool(error_requests)
 
-        if self.dist.tp_size > 1:
+        if (getattr(self, "gather_all_responses", False)
+                and self.enable_attention_dp and self.dist.world_size > 1):
+            # Under attention DP, gather_all_responses makes
+            # _enqueue_responses a world collective. Use the same scope for
+            # the decision to enter the handoff/error publication path.
+            any_needs_flush = self.dist.allreduce(int(local_needs_flush),
+                                                  op=ReduceOp.MAX)
+        elif self.dist.tp_size > 1:
             any_needs_flush = self.dist.tp_allreduce(int(local_needs_flush),
                                                      op=ReduceOp.MAX)
         else:
@@ -7256,6 +7316,11 @@ class PyExecutor:
         if not any_needs_flush:
             return
 
+        # Status polling retires the physical transfer before setting the
+        # request error. Publish the corresponding HANDOFF_FAILED/ABORTED
+        # evidence first so the result-side gate cannot observe the terminal
+        # error without its exact transfer outcome.
+        self._flush_pending_handoff_responses(rank_synchronous=True)
         error_msg = "Error in kv cache transfer for generation requests"
         self._handle_errors(error_msg,
                             requests=error_requests,
@@ -8197,7 +8262,6 @@ class PyExecutor:
             "take_handoff_lifecycle_events",
             None,
         )
-        handoff_responses = []
         if take_handoff_events is not None:
             handoff_responses = [(
                 request_id,
@@ -8207,10 +8271,20 @@ class PyExecutor:
                     disagg_handoff_event=event,
                 ),
             ) for request_id, client_id, event in take_handoff_events()]
-        # Every participating rank must enter the response gather even though
-        # only rank 0 owns the control-only notification.
-        if take_handoff_events is not None:
-            self._enqueue_responses(handoff_responses)
+            if handoff_responses:
+                pending_handoff_responses = getattr(
+                    self, "_pending_handoff_responses", None)
+                if pending_handoff_responses is None:
+                    pending_handoff_responses = []
+                    self._pending_handoff_responses = pending_handoff_responses
+                # This status poll has rank-divergent callers. Defer the
+                # collective until the executor loop's synchronized flush.
+                pending_handoff_responses.extend(handoff_responses)
+        # Non-ADP response publication is local, so preserve exact ordering
+        # with the error path without entering a collective from this
+        # rank-divergent status caller. Multi-rank ADP is flushed by the
+        # executor loop after all receive/admission polling.
+        self._flush_pending_handoff_responses()
         if isinstance(result, tuple):
             _, _, cancelled_reqs = result
             user_canceled_set = set(self.canceled_req_ids)
