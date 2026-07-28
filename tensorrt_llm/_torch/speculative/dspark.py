@@ -434,9 +434,10 @@ class DSparkWorker(SpecWorkerBase):
           drafts context requests (zero placeholder), so context rows are padded
           with zeros; their matcher advance/rollback is a net no-op (mirrors
           MTP's context handling) and their draft_probs rows are overwritten by
-          ``write_context_onehot_draft_probs`` below. Gen-only CUDA-graph batches
-          (``num_contexts == 0``) use ``gen_logits`` directly (static shape,
-          capture-safe).
+          ``write_context_onehot_draft_probs`` below. The block is transposed to
+          step-major ([K, batch, vocab]) so each step's slice is contiguous, as
+          the bitmask kernel requires; shapes are static, so this is
+          CUDA-graph-capture-safe.
         * Sampling reuses ``SpecWorkerBase.sample_draft_tokens``' 2D per-step form
           (the same path MTP uses), so the TP vocab gather and the slot-indexed
           ``draft_probs`` scatter are byte-for-byte the ones verification's
@@ -449,11 +450,15 @@ class DSparkWorker(SpecWorkerBase):
           ``rollback_draft_tokens``, restoring the matcher for next iteration.
         """
         vocab = gen_logits.shape[-1]
+        # Lay the block out step-major ([K, batch, vocab]) so each step's slice is
+        # a contiguous [batch, vocab] tensor: torch.ops.trtllm.logits_bitmask
+        # requires contiguous logits, which a [:, k, :] slice of a
+        # [batch, K, vocab] tensor is not.
         if num_contexts > 0:
-            full_logits = gen_logits.new_zeros((batch_size, K, vocab))
-            full_logits[num_contexts:] = gen_logits
+            full_logits = gen_logits.new_zeros((K, batch_size, vocab))
+            full_logits[:, num_contexts:, :] = gen_logits.transpose(0, 1)
         else:
-            full_logits = gen_logits
+            full_logits = gen_logits.transpose(0, 1).contiguous()
 
         # Step-0 matcher-advance token = each request's last committed token (the
         # bonus for gens), mirroring MTP's draft_inputs['input_ids'][last_tokens_idx].
@@ -465,7 +470,7 @@ class DSparkWorker(SpecWorkerBase):
             # Advance the matcher with the token chosen at position k-1 (bonus at
             # k==0) and apply position-k's bitmask before sampling, as MTP does.
             self.guided_decoder.add_draft_batch(new_tokens, num_accepted_tokens, draft_step=k)
-            step_logits = full_logits[:, k, :]
+            step_logits = full_logits[k]
             self.guided_decoder.execute_draft_batch(step_logits, draft_step=k)
             step_tokens = self.sample_draft_tokens(
                 step_logits, spec_metadata, batch_size, draft_step=k
