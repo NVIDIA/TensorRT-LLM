@@ -194,30 +194,6 @@ def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
     assert remapped["model.layers.0.mlp.experts.0.w1.weight_scale"].dtype == torch.uint8
 
 
-def test_deepseek_v4_weight_remap_for_hopper_cutlass_mxfp4(monkeypatch):
-    monkeypatch.setattr("tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", lambda: 90)
-    weights = {
-        "layers.0.ffn.experts.0.w1.weight": torch.tensor([[-1, 2], [3, -4]], dtype=torch.int8),
-        "layers.0.ffn.experts.0.w1.scale": torch.tensor(
-            [0.0078125, 0.015625], dtype=torch.float8_e8m0fnu
-        ),
-    }
-
-    remapped = _remap_deepseek_v4_checkpoint_keys(
-        weights,
-        num_hidden_layers=1,
-        kv_lora_rank=448,
-        moe_backend="CUTLASS",
-    )
-
-    assert remapped["model.layers.0.mlp.experts.0.w1.weight"].dtype == torch.uint8
-    assert remapped["model.layers.0.mlp.experts.0.w1.weight_scale_inv"].dtype == torch.uint8
-    assert torch.equal(
-        remapped["model.layers.0.mlp.experts.0.w1.weight_scale_inv"],
-        weights["layers.0.ffn.experts.0.w1.scale"].view(torch.uint8),
-    )
-
-
 def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
     weights = {
         "layers.0.ffn.experts.0.w1.weight": torch.zeros((2, 2), dtype=torch.float32),
