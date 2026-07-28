@@ -63,6 +63,9 @@ def test_minimax_m3_horizontal_producer_matches_separate_producers(num_tokens):
     slots = (torch.arange(num_tokens, dtype=torch.int32, device="cuda") * 37) % (
         (num_pages - 1) * 128
     )
+    # Keep the parity reference slots valid: the legacy separate main-K/V
+    # producer does not support negative slots. Negative-slot handling is
+    # exercised below using horizontal eager execution versus graph replay.
     rope_cache = _rope_cache(max(256, num_tokens))
 
     main_width = (num_heads_q + 2 * num_kv_heads) * 128
@@ -121,8 +124,9 @@ def test_minimax_m3_horizontal_producer_matches_separate_producers(num_tokens):
         position_ids,
     )
 
-    pages = slots.long() // 128
-    within = slots.long() % 128
+    valid = slots >= 0
+    pages = slots[valid].long() // 128
+    within = slots[valid].long() % 128
     assert torch.equal(q.view(torch.uint8), q_reference.view(torch.uint8))
     # The horizontal producer follows vLLM's CUDA contract and converts its
     # normalized/RoPE FP32 registers directly to E4M3. The existing separate
@@ -144,4 +148,97 @@ def test_minimax_m3_horizontal_producer_matches_separate_producers(num_tokens):
         reference_index_cache[pages, :, within, :].float(),
         rtol=0.13,
         atol=0.05,
+    )
+
+    # Aggregate decode captures this producer in a CUDA graph. The operator
+    # allocates compact Q/index-Q outputs while writing graph-stable paged
+    # caches through a graph-stable slot mapping, so exercise both capture and
+    # replay for decode-sized (1) and larger mixed/prefill token counts.
+    graph_packed = packed.clone()
+    graph_positions = position_ids.clone()
+    graph_slots = slots.clone()
+    graph_main_cache = _main_cache(num_pages, num_kv_heads)
+    graph_index_cache = _index_cache(num_pages)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_q, graph_index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
+            graph_packed,
+            graph_main_cache,
+            graph_index_cache,
+            graph_slots,
+            num_heads_q,
+            num_kv_heads,
+            num_index_heads,
+            128,
+            64,
+            1e-5,
+            q_weight,
+            k_weight,
+            index_q_weight,
+            index_k_weight,
+            rope_cache,
+            graph_positions,
+        )
+
+    # Replay with different projection values, nonuniform positions, and new
+    # cache destinations. This proves replay reads the refreshed graph buffers
+    # rather than retaining capture-time values or slots.
+    replay_packed = torch.randn_like(packed)
+    replay_positions = (
+        torch.arange(num_tokens, dtype=torch.int32, device="cuda") * 7 + 3
+    ) % rope_cache.shape[0]
+    replay_slots = (torch.arange(num_tokens, dtype=torch.int32, device="cuda") * 53 + 11) % (
+        (num_pages - 1) * 128
+    )
+    if num_tokens > 1:
+        replay_slots[-1] = -1
+    graph_packed.copy_(replay_packed)
+    graph_positions.copy_(replay_positions)
+    graph_slots.copy_(replay_slots)
+    graph_main_cache.zero_()
+    graph_index_cache.zero_()
+
+    replay_main_cache = _main_cache(num_pages, num_kv_heads)
+    replay_index_cache = _index_cache(num_pages)
+    replay_q, replay_index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
+        replay_packed,
+        replay_main_cache,
+        replay_index_cache,
+        replay_slots,
+        num_heads_q,
+        num_kv_heads,
+        num_index_heads,
+        128,
+        64,
+        1e-5,
+        q_weight,
+        k_weight,
+        index_q_weight,
+        index_k_weight,
+        rope_cache,
+        replay_positions,
+    )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    replay_valid = replay_slots >= 0
+    replay_pages = replay_slots[replay_valid].long() // 128
+    replay_within = replay_slots[replay_valid].long() % 128
+    assert torch.equal(graph_q.view(torch.uint8), replay_q.view(torch.uint8))
+    torch.testing.assert_close(
+        graph_index_q.float(),
+        replay_index_q.float(),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert torch.equal(
+        graph_main_cache[replay_pages, :, :, replay_within, :].view(torch.uint8),
+        replay_main_cache[replay_pages, :, :, replay_within, :].view(torch.uint8),
+    )
+    torch.testing.assert_close(
+        graph_index_cache[replay_pages, :, replay_within, :].float(),
+        replay_index_cache[replay_pages, :, replay_within, :].float(),
+        rtol=0.0,
+        atol=0.0,
     )

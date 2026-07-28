@@ -1316,7 +1316,12 @@ class MiniMaxM3Attention(Attention):
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Run the vLLM-style horizontal sparse producer for pure prefill."""
+        """Run the vLLM-style horizontal producer for every sparse batch.
+
+        The CUDA kernel is token-major and batch-type agnostic: per-token
+        positions and cache slots cover pure prefill, mixed aggregate batches,
+        and CUDA-graph decode.
+        """
         if (
             not self.enable_fused_qkv_index_projection
             or not isinstance(self.attn, MiniMaxM3MsaSparseAttention)
@@ -1324,13 +1329,7 @@ class MiniMaxM3Attention(Attention):
             or self.attn.indexer_kv_dtype != "fp8"
         ):
             return None
-        if (
-            is_torch_compiling()
-            or getattr(attn_metadata, "is_cuda_graph", False)
-            or int(getattr(attn_metadata, "num_generations", 0)) != 0
-            or int(getattr(attn_metadata, "num_contexts", 0)) == 0
-            or int(packed.shape[0]) != int(attn_metadata.num_tokens)
-        ):
+        if is_torch_compiling() or int(packed.shape[0]) != int(attn_metadata.num_tokens):
             return None
         if (
             packed.dtype != torch.bfloat16
