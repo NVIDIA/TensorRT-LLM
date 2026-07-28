@@ -400,7 +400,7 @@ def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
     assert "has_weights=False" in init_src
     assert "self.kv_lora_rank + self.qk_rope_head_dim" in init_src
     assert "self.kv_a_layernorm=RMSNorm(" in init_src_no_ws
-    assert "initialize_sparse_attn" in mla_init_src
+    assert "self.sparse_attn_hooks.initialize(" in mla_init_src
     assert "deepseek_v4" not in mla_init_src
     assert "q.dim() == 2" in helper_src
     assert "self.num_heads_tp * self.qk_head_dim" in helper_src
