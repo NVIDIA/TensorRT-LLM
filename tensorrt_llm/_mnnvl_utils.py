@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -355,6 +355,12 @@ class MnnvlMemory:
     @staticmethod
     @functools.cache
     def support_nvlink(dev_id: int, need_all_up: bool = True):
+        # ensure nvml is initialized; do not rely on other modules having
+        # initialized it as an import side effect.
+        try:
+            pynvml.nvmlDeviceGetCount()
+        except pynvml.NVMLError_Uninitialized:
+            pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
         link_count = pynvml.NVML_NVLINK_MAX_LINKS
         active_links = 0

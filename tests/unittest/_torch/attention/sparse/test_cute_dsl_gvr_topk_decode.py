@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import pytest
 import torch
 
@@ -35,6 +37,7 @@ def _make_inputs(
     compress_ratio: int = 1,
     preidx_hit_rate: float = 0.0,
     varlen: bool = False,
+    seq_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (logits, pre_idx, seq_lens) for the op.
 
@@ -55,6 +58,11 @@ def _make_inputs(
     ``[top_k*cr + next_n, N*cr]`` so the kernel's per-row N_eff varies.
     Argmax / ref_topk are computed over the smallest group's N_eff so
     they're guaranteed in-range for every row.
+
+    ``seq_lens``: optional pre-built seq_lens tensor (uncompressed space).
+    When provided, overrides ``varlen`` and the internal seq_lens generation.
+    Argmax is still computed over ``min(seq_lens)`` so pre_idx[..., 0]
+    is in-range for every row.
     """
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -65,7 +73,9 @@ def _make_inputs(
     num_groups = num_rows // next_n
 
     # seq_lens in UNCOMPRESSED space. Kernel divides by cr internally.
-    if varlen:
+    if seq_lens is not None:
+        pass  # use caller-provided seq_lens as-is
+    elif varlen:
         lo = top_k * compress_ratio + next_n  # ensures N_eff >= top_k
         seq_lens = torch.randint(
             lo, N * compress_ratio + 1, (num_groups,), dtype=torch.int32, device="cuda"
@@ -293,6 +303,133 @@ def test_cute_dsl_gvr_topk_decode(
 
 
 # ===========================================================================
+# GVR top-K multi-CTA short-row degrade boundary tests.
+#
+# For cluster_size > 1 each row is owned by a cluster of CTAs.  When the
+# actual row length N_eff fits within a single CTA's static slice
+# (N_eff <= ceil(buffer_N / cluster_size)), the cluster degrades: CTA 0
+# scans the row solo (no cluster sync) and the other CTAs exit early.
+# When N_eff > max_slice_len all CTAs cooperate via DSMEM.
+# ===========================================================================
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("cluster_size", [2, 4])
+@pytest.mark.parametrize(
+    "dtype,top_k",
+    [(torch.bfloat16, 512), (torch.float32, 2048)],
+)
+def test_cute_dsl_gvr_topk_multi_cta_shortrow_degrade_boundary(dtype, top_k, cluster_size):
+    """GVR top-K multi-CTA short-row degrade: correctness at the cluster transition boundary.
+
+    When ``cluster_size > 1``, each row is dispatched to a cluster of
+    ``cluster_size`` CTAs.  Whether the cluster cooperates depends on the
+    actual row length N_eff relative to ``max_slice_len = ceil(buffer_N /
+    cluster_size)`` — the per-CTA design slice width:
+
+    * N_eff <= max_slice_len (short row): all tokens fit in CTA 0's static
+      slice; CTA 0 scans solo (``do_cluster_sync=False``), the other
+      ``cluster_size - 1`` CTAs exit early.  This avoids wasted mbarrier
+      overhead when the cluster would add no parallelism.
+
+    * N_eff > max_slice_len (long row): tokens span multiple CTAs; all
+      ``cluster_size`` CTAs cooperate via DSMEM (``do_cluster_sync=True``).
+
+    This test pins N_eff at max_slice_len − 1 / max_slice_len /
+    max_slice_len + 1 to verify correctness exactly at the boundary, and
+    adds a mixed batch with alternating short and long rows.
+    """
+    next_n = 1
+    compress_ratio = 1
+    # Choose N so that per_cta_design (the kernel's ceil(N/cs)) is:
+    #   (a) a multiple of vec_size (128-bit load width) — CTA k starts at
+    #       k*per_cta_design, which must be vec_size-aligned to avoid
+    #       cudaErrorMisalignedAddress on global vector loads.
+    #   (b) >= 2*top_k — GVR histogram uses 256 bins over the value range;
+    #       when N_eff barely exceeds top_k (ratio ~1) the per-bin count is
+    #       too coarse for the threshold bucket to converge, causing -1 outputs.
+    #       A ratio of 2 (per_cta_design = 2*top_k) matches the smallest
+    #       N tested in test_cute_dsl_gvr_topk_decode (N=4096, K=2048).
+    vec_size = 16 // dtype.itemsize  # 128-bit = 16 bytes; bf16→8, fp32→4
+    per_cta_design = ((top_k * 2) + vec_size - 1) // vec_size * vec_size
+    N = per_cta_design * cluster_size
+    max_slice_len = (N + cluster_size - 1) // cluster_size  # == per_cta_design
+
+    torch.manual_seed(7)
+    torch.cuda.manual_seed(7)
+
+    for n_eff, case_name in [
+        (max_slice_len - 1, "degrade_below"),  # CTA 0 solo, N_eff < max_slice_len
+        (max_slice_len, "degrade_exact"),  # CTA 0 solo, fills slice exactly
+        (max_slice_len + 1, "coop_one_extra"),  # CTA 1 gets 1 element
+    ]:
+        batch_size = 8
+        logits = torch.randn(batch_size, N, dtype=dtype, device="cuda") * 2.0
+        seq_lens = torch.full((batch_size,), n_eff, dtype=torch.int32, device="cuda")
+        # Junk-arange pre_idx (same pattern as _make_inputs with preidx_hit_rate=0):
+        # slot 0 = per-row argmax; slots 1..K-1 = arange 1..K-1.  This avoids
+        # duplicate-0 degenerate pre_idx that forces the kernel to find all K
+        # indices from refinement alone.
+        pre_idx = (
+            torch.arange(top_k, dtype=torch.int32, device="cuda")
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            .clone()
+        )
+        pre_idx[:, 0] = logits[:, :n_eff].argmax(dim=-1).int()
+
+        out_indices = torch.empty(batch_size, top_k, dtype=torch.int32, device="cuda")
+        torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+            logits,
+            pre_idx,
+            seq_lens,
+            out_indices,
+            top_k=top_k,
+            next_n=next_n,
+            compress_ratio=compress_ratio,
+            cluster_size=cluster_size,
+        )
+        torch.cuda.synchronize()
+        _tie_aware_check(
+            out_indices, logits, seq_lens, top_k, next_n, compress_ratio=compress_ratio
+        )
+
+    # Mixed batch: alternating degrade (even rows) and co-op (odd rows).
+    batch_size = 8
+    logits = torch.randn(batch_size, N, dtype=dtype, device="cuda") * 2.0
+    n_eff_short = max_slice_len - 1  # degrade
+    n_eff_long = max_slice_len + 1  # co-op
+    seq_lens = torch.tensor(
+        [n_eff_short if i % 2 == 0 else n_eff_long for i in range(batch_size)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    pre_idx = (
+        torch.arange(top_k, dtype=torch.int32, device="cuda")
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+        .clone()
+    )
+    for i in range(batch_size):
+        n_eff_i = int(seq_lens[i].item())
+        pre_idx[i, 0] = int(logits[i, :n_eff_i].argmax().item())
+
+    out_indices = torch.empty(batch_size, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        cluster_size=cluster_size,
+    )
+    torch.cuda.synchronize()
+    _tie_aware_check(out_indices, logits, seq_lens, top_k, next_n, compress_ratio=compress_ratio)
+
+
+# ===========================================================================
 # Load-Balance (hybrid multi-CTA + single-CTA) tests.
 #
 # The LB kernel adds a prepare step that classifies requests as long
@@ -369,17 +506,17 @@ def test_lb_prepare_partition(B, ratio):
     [(torch.bfloat16, 1024), (torch.float32, 2048)],
 )
 @pytest.mark.parametrize(
-    "scenario,N,override",
+    "scenario,N,seq_lens_mode",
     [
         # N picked so all rows fall clearly below / above the 64K long_threshold.
-        ("all_short", 8 * 1024, None),
-        ("all_long", 128 * 1024, None),
-        ("mixed_half", 128 * 1024, "half"),  # 50/50 long/short via override
+        ("all_short", 8 * 1024, "uniform"),
+        ("all_long", 128 * 1024, "uniform"),
+        ("mixed_half", 128 * 1024, "half_short_half_long"),
     ],
 )
 @pytest.mark.parametrize("batch_size", [4, 32])
 @pytest.mark.parametrize("next_n", [1, 2])
-def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size, next_n):
+def test_lb_main_branches(dtype, top_k, scenario, N, seq_lens_mode, batch_size, next_n):
     """Each LB branch (all_long / all_short / mixed) produces correct top-K.
 
     For ``mixed_half`` half the rows are forced to be short (seq_len < threshold)
@@ -393,6 +530,15 @@ def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size, next_
     by ``_tie_aware_check``.
     """
     num_rows = batch_size * next_n
+    num_groups = batch_size  # batch_size groups of next_n rows each
+    # For half_short_half_long, build seq_lens first so _make_inputs computes
+    # argmax over min(seq_lens)=8K, keeping pre_idx[..., 0] in-range for all rows.
+    if seq_lens_mode == "half_short_half_long":
+        seq_lens_override = torch.empty(num_groups, dtype=torch.int32, device="cuda")
+        seq_lens_override[: batch_size // 2] = 8 * 1024  # short half
+        seq_lens_override[batch_size // 2 :] = 128 * 1024  # long half
+    else:
+        seq_lens_override = None
     logits, pre_idx, seq_lens = _make_inputs(
         num_rows,
         N,
@@ -403,11 +549,8 @@ def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size, next_
         compress_ratio=1,
         preidx_hit_rate=0.5,
         varlen=False,
+        seq_lens=seq_lens_override,
     )
-    if override == "half":
-        seq_lens = seq_lens.clone()
-        seq_lens[: batch_size // 2] = 8 * 1024  # short half (< 64K threshold)
-        seq_lens[batch_size // 2 :] = 128 * 1024  # long half  (> 64K threshold)
 
     max_batch_size = 1024
     long_threshold = 64 * 1024

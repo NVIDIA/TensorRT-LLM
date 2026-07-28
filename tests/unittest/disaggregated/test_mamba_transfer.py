@@ -12,12 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import threading
 import uuid
 from typing import Dict, List
 
 import pytest
 import torch
+
+# Force a deterministic UCX/NIXL config regardless of what the cluster/CI
+# injects; see test_kv_transfer.py for the full rationale.
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -329,8 +335,7 @@ def _read_actual(gen_managers, gen_request_ids) -> Dict:
 # ---------------------------------------------------------------------------
 # Main test logic
 # ---------------------------------------------------------------------------
-def test_mamba_disagg_attention_dp_dummy_with_batch_size_one(monkeypatch):
-    monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "0")
+def test_mamba_disagg_attention_dp_dummy_with_batch_size_one():
     mgr = _create_managers(1, max_batch_size=1, enable_attention_dp=True)[0]
     try:
         req = LlmRequest(

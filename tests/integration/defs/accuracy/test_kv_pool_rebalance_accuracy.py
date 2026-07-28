@@ -38,31 +38,17 @@ from ..conftest import llm_models_root, skip_pre_hopper
 def _inject_pool_ratio_mismatch(llm: LLM, *, skew: float = 2.0) -> None:
     """Force the V2 auto-tuner to do real pool-resize work on the next rebalance call.
 
-    Bypasses the 2000-sample / 120s cooldown gates by stomping counters,
-    then perturbs ``_target_ratio_list_gpu`` so it differs from
-    ``_current_gpu_ratio`` by more than the 1.25x threshold inside
-    ``_need_adjustment``.
-
-    Requires a model with >=2 pool groups (e.g. Gemma-3-1B with VSWA).
-    Asserts the precondition so a future model change can't silently
-    turn this test into a no-op.
+    Delegates to the backend-agnostic KVCacheManagerV2 introspection hook, which
+    bypasses the sample-count / cooldown gates and perturbs the target GPU ratio
+    past the auto-tuner's adjustment threshold. The hook requires a model with
+    >=2 pool groups (e.g. Gemma-3-1B with VSWA) and raises otherwise, so a future
+    model change can't silently turn this test into a no-op.
     """
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
+
     executor = llm._executor.engine
     kv_cache_manager = executor.kv_cache_manager
-    impl = kv_cache_manager.impl
-
-    impl._num_sampled_kv_caches = 2001
-    impl._last_adjustment_time = 0.0
-
-    current = list(impl._current_gpu_ratio)
-    assert len(current) >= 2, (
-        f"Ratio injection requires >=2 pool groups; got {len(current)}. "
-        "Check that VSWA is actually configured for this model."
-    )
-
-    skewed = [current[0] * skew] + list(current[1:])
-    total = sum(skewed)
-    impl._target_ratio_list_gpu = [x / total for x in skewed]
+    _introspection.force_rebalance_precondition(kv_cache_manager.impl, skew=skew)
 
 
 # --------------------------------------------------------------------------- #

@@ -64,7 +64,6 @@
 #include "tensorrt_llm/kernels/compressorKernels/compressorKernels.h"
 
 #include "tensorrt_llm/common/assert.h"
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -213,8 +212,8 @@ enum class CacheScaleType
 // ============================================================================
 // Decode Kernel: pagedKvCompressKernel
 //
-// Template: <HEAD_DIM, KV_SCORE_ELEM_BYTES, STATE_ELEM_BYTES, NEXT_N>
-//   NEXT_N: number of new tokens per sequence in this decode step (1-4)
+// Template: <HEAD_DIM, KV_SCORE_ELEM_BYTES, STATE_ELEM_BYTES, COMPRESS_RATIO, NEXT_N, NUM_RED_WARPS>
+//   NEXT_N: number of new tokens per sequence in this decode step (1-8)
 //
 // Grid:  (batch_size) — one block per batch element
 // Block: (NTHRD) where NTHRD = HEAD_DIM / VEC (>= 32 threads)
@@ -623,9 +622,10 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 //   KV_EB    — kv_score element bytes in {2 (bf16), 4 (fp32)}
 //   STATE_EB — paged state element bytes in {2 (bf16), 4 (fp32)}
 //   CR       — COMPRESS_RATIO in {4, 128}
-//   NN       — NEXT_N (new tokens / decode step) in {1..4}
-//   NRW      — NUM_RED_WARPS — 4 only when CR=128 (multi-warp Phase 3 reduce
-//              hides DRAM latency for the heavier R=128 chunk); 1 otherwise.
+//   NN       — NEXT_N (new tokens / decode step) in {1..8}
+//   NRW      — NUM_RED_WARPS — 4 when CR=128 and NN<=4 (multi-warp Phase 3
+//              reduction hides DRAM latency for the heavier R=128 chunk);
+//              1 when CR=4 or when CR=128 and NN>=5.
 //
 // Multi-warp SMEM budget (per block): 3 * NRW * ELEM_PER_BLOCK * sizeof(float).
 //   HD=128:        ELEM_PER_BLOCK=128 → 6 KB
@@ -634,22 +634,30 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 // ============================================================================
 
 // Per-axis fan-outs (used to keep the master list compact).
-#define FOREACH_DECODE_NN(F, HD, KV, ST, CR, NRW)                                                                      \
+#define FOREACH_DECODE_NN_1_4(F, HD, KV, ST, CR, NRW)                                                                  \
     F(HD, KV, ST, CR, 1, NRW) F(HD, KV, ST, CR, 2, NRW) F(HD, KV, ST, CR, 3, NRW) F(HD, KV, ST, CR, 4, NRW)
-#define FOREACH_DECODE_DTYPE(F, HD, CR, NRW)                                                                           \
-    FOREACH_DECODE_NN(F, HD, 2, 2, CR, NRW)                                                                            \
-    FOREACH_DECODE_NN(F, HD, 2, 4, CR, NRW)                                                                            \
-    FOREACH_DECODE_NN(F, HD, 4, 2, CR, NRW) FOREACH_DECODE_NN(F, HD, 4, 4, CR, NRW)
+#define FOREACH_DECODE_NN_5_8(F, HD, KV, ST, CR, NRW)                                                                  \
+    F(HD, KV, ST, CR, 5, NRW) F(HD, KV, ST, CR, 6, NRW) F(HD, KV, ST, CR, 7, NRW) F(HD, KV, ST, CR, 8, NRW)
+#define FOREACH_DECODE_DTYPE_1_4(F, HD, CR, NRW)                                                                       \
+    FOREACH_DECODE_NN_1_4(F, HD, 2, 2, CR, NRW)                                                                        \
+    FOREACH_DECODE_NN_1_4(F, HD, 2, 4, CR, NRW)                                                                        \
+    FOREACH_DECODE_NN_1_4(F, HD, 4, 2, CR, NRW) FOREACH_DECODE_NN_1_4(F, HD, 4, 4, CR, NRW)
+#define FOREACH_DECODE_DTYPE_5_8(F, HD, CR, NRW)                                                                       \
+    FOREACH_DECODE_NN_5_8(F, HD, 2, 2, CR, NRW)                                                                        \
+    FOREACH_DECODE_NN_5_8(F, HD, 2, 4, CR, NRW)                                                                        \
+    FOREACH_DECODE_NN_5_8(F, HD, 4, 2, CR, NRW) FOREACH_DECODE_NN_5_8(F, HD, 4, 4, CR, NRW)
+#define FOREACH_DECODE_DTYPE_1_8(F, HD, CR, NRW)                                                                       \
+    FOREACH_DECODE_DTYPE_1_4(F, HD, CR, NRW) FOREACH_DECODE_DTYPE_5_8(F, HD, CR, NRW)
 
 // Master list. Order does not matter; the dispatcher walks linearly.
 // clang-format off
 #define FOREACH_DECODE_CONFIG(F)                                                                                       \
-    /* CR=4: single-warp only (small reduction; multi-warp would over-subscribe). */                                   \
-    FOREACH_DECODE_DTYPE(F, 128, 4, 1) FOREACH_DECODE_DTYPE(F, 512, 4, 1)                                              \
-    /* CR=128: single-warp fallback (covers next_n>4 path which currently isn't reached). */                           \
-    FOREACH_DECODE_DTYPE(F, 128, 128, 1) FOREACH_DECODE_DTYPE(F, 512, 128, 1)                                          \
-    /* CR=128: multi-warp fast path. Used whenever next_n <= 4 (i.e. MTP-3 and below). */                              \
-    FOREACH_DECODE_DTYPE(F, 128, 128, 4) FOREACH_DECODE_DTYPE(F, 512, 128, 4)
+    /* CR=4: single-warp for next_n 1..8 (small reduction; multi-warp would over-subscribe). */                         \
+    FOREACH_DECODE_DTYPE_1_8(F, 128, 4, 1) FOREACH_DECODE_DTYPE_1_8(F, 512, 4, 1)                                      \
+    /* CR=128: single-warp fallback for next_n 5..8. */                                                                \
+    FOREACH_DECODE_DTYPE_5_8(F, 128, 128, 1) FOREACH_DECODE_DTYPE_5_8(F, 512, 128, 1)                                  \
+    /* CR=128: multi-warp fast path for next_n 1..4. */                                                                \
+    FOREACH_DECODE_DTYPE_1_4(F, 128, 128, 4) FOREACH_DECODE_DTYPE_1_4(F, 512, 128, 4)
 // clang-format on
 
 // Generate explicit template instantiations.
@@ -663,7 +671,7 @@ FOREACH_DECODE_CONFIG(INST_DECODE)
 // Decode Launch Wrapper
 //
 // Dispatches to the correct template instantiation based on head_dim, elem_bytes,
-// and next_n (number of new tokens per decode step, capped at 4).
+// and next_n (number of new tokens per decode step, in the range 1..8).
 // Grid is 2D: (batch_size, head_blocks) where head_blocks = NTHRD_BASE / 32.
 // For HD=512 bf16: head_blocks=2; for HD=128 bf16: head_blocks=1.
 // ============================================================================
@@ -679,6 +687,10 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
     TLLM_CHECK_WITH_INFO(
         (kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4) && (state_elem_bytes == 2 || state_elem_bytes == 4),
         "pagedKvCompressLaunch only supports bf16/fp32 kv_score and paged state");
+    constexpr int kMinNextN = 1;
+    constexpr int kMaxNextN = 8;
+    TLLM_CHECK_WITH_INFO(next_n >= kMinNextN && next_n <= kMaxNextN,
+        "pagedKvCompressLaunch only supports next_n in [1, 8], got %d", next_n);
 
     // Compute HEAD_BLOCKS: mirrors the compile-time constant in the kernel.
     // VEC = max_vec if HEAD_DIM/max_vec >= 32, else HEAD_DIM/32.
@@ -693,10 +705,9 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 
     // For large compress_ratio, use 4-warp parallel reduction to cut the serial
     // softmax loop from COMPRESS_RATIO iterations to COMPRESS_RATIO/4 per warp.
-    // Supported configs: CR=128, (HD=128 or HD=512), NEXT_N in 1..4.  NEXT_N>2
-    // is required for MTP-3 decode (each step accepts up to 4 tokens per request);
-    // without multi-warp the slow path is a single warp doing 128 serial paged
-    // loads, which is DRAM-latency-bound (no other warps to hide it).
+    // The multi-warp path supports CR=128, (HD=128 or HD=512), and NEXT_N in
+    // 1..4. Larger NEXT_N values use a single reduction warp to limit block
+    // size while still processing every new token exactly.
     //
     // smem per block = 3 * MULTI_WARP * ELEM_PER_BLOCK * sizeof(float)
     //   where ELEM_PER_BLOCK = nthreads_inner * vec = HEAD_DIM / HEAD_BLOCKS.
@@ -712,15 +723,11 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 
     dim3 grid(batch_size, head_blocks);
 
-    // Clamp the runtime next_n into the supported range; configs above 4 fall
-    // back to the NN=4 instantiation (matches the prior `default:` arm).
-    int const next_n_dispatch = std::min(next_n, 4);
-
     // Walk FOREACH_DECODE_CONFIG until we find a matching (HD, KV, ST, CR, NN, NRW)
     // tuple, then launch that instantiation. Any unsupported tuple bails via TLLM_THROW.
 #define TRY_LAUNCH(HD, KV_EB, STATE_EB, CR, NN, NRW)                                                                   \
     if (head_dim == HD && kv_score_elem_bytes == KV_EB && state_elem_bytes == STATE_EB && compress_ratio == CR         \
-        && next_n_dispatch == NN && num_red_warps == NRW)                                                              \
+        && next_n == NN && num_red_warps == NRW)                                                                       \
     {                                                                                                                  \
         pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW><<<grid, nthreads, smem_bytes, stream>>>(kv_score, ape, \
             paged_kv, paged_score, block_table_kv, block_table_score, output, kv_lens, cu_seq_lens, cu_kv_comp,        \
@@ -732,12 +739,15 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 
     TLLM_THROW(
         "pagedKvCompressLaunch: no matching instantiation for HD=%d, kv_eb=%d, state_eb=%d, CR=%d, NN=%d, NRW=%d",
-        head_dim, kv_score_elem_bytes, state_elem_bytes, compress_ratio, next_n_dispatch, num_red_warps);
+        head_dim, kv_score_elem_bytes, state_elem_bytes, compress_ratio, next_n, num_red_warps);
 }
 
 #undef FOREACH_DECODE_CONFIG
-#undef FOREACH_DECODE_DTYPE
-#undef FOREACH_DECODE_NN
+#undef FOREACH_DECODE_DTYPE_1_8
+#undef FOREACH_DECODE_DTYPE_5_8
+#undef FOREACH_DECODE_DTYPE_1_4
+#undef FOREACH_DECODE_NN_5_8
+#undef FOREACH_DECODE_NN_1_4
 
 // ============================================================================
 // Prefill Kernel: prefillReductionKernel

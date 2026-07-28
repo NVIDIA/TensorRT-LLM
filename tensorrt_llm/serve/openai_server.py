@@ -30,7 +30,6 @@ from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
 
-from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
@@ -41,12 +40,13 @@ from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
-from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
+from tensorrt_llm.inputs.utils import (ConversationMessage,
+                                       async_apply_chat_template)
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
-from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.llmapi.llm import LLM, RequestOutput
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
@@ -56,6 +56,7 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
@@ -72,8 +73,9 @@ from tensorrt_llm.serve.openai_protocol import (
     EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
     ImageGenerationRequest, ImageGenerationResponse, ImageObject,
     MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    ResponseFormat, ResponsesRequest, ResponsesResponse, UpdateWeightsRequest,
-    UsageInfo, ensure_request_chat_template_allowed, to_llm_conversation_params,
+    ResponseFormat, ResponsesRequest, ResponsesResponse, TokenizeRequest,
+    TokenizeResponse, UpdateWeightsRequest, UsageInfo,
+    ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.postprocess_handlers import (
@@ -99,8 +101,7 @@ from tensorrt_llm.version import __version__ as VERSION
 from tensorrt_llm.visual_gen import VisualGen
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
-from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
-                              maybe_transform_reasoning_effort)
+from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 
 # yapf: enable
 
@@ -400,6 +401,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     self._iteration_stats_buffer = deque(maxlen=max_buf)
                     self._iteration_stats_collector_task = asyncio.create_task(
                         self._iteration_stats_collector_loop())
+                    # Wake up the collector immediately so it processes the
+                    # initial stats emitted by the executor at startup (e.g.
+                    # cache_config_info).
+                    self._iteration_stats_wakeup_event.set()
                     logger.info(
                         "Started background iteration stats collector task")
 
@@ -487,13 +492,21 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.tokenizer.tokenizer, "name_or_path", None) or getattr(
                     self.tokenizer, "name_or_path", None)
         trust_remote_code = self.generator.args.trust_remote_code
-        try:
-            self.processor = AutoProcessor.from_pretrained(
-                hf_tokenizer_path, trust_remote_code=trust_remote_code)
-        except Exception:
-            logger.debug("Failed to load AutoProcessor or AutoConfig for %s",
-                         hf_tokenizer_path)
+        checkpoint_format = getattr(self.generator.args, "checkpoint_format",
+                                    None)
+        if checkpoint_format in ("mistral", "mistral_large_3"):
+            # Do not load HF processor for mistral native checkpoints
+            # even if it is available
             self.processor = None
+        else:
+            try:
+                self.processor = AutoProcessor.from_pretrained(
+                    hf_tokenizer_path, trust_remote_code=trust_remote_code)
+            except Exception:
+                logger.debug(
+                    "Failed to load AutoProcessor or AutoConfig for %s",
+                    hf_tokenizer_path)
+                self.processor = None
 
         # load model config
         try:
@@ -779,9 +792,6 @@ class OpenAIServer(_VideoRoutesMixin):
         batcher = self.embedding_batcher
         if batcher is not None and not batcher.is_alive():
             return False
-        if isinstance(self.generator, LLM):
-            return self.generator._check_health()
-        # llmapi.LLM (e.g. PyTorch backend) is not isinstance(_tensorrt_engine.LLM)
         if hasattr(self.generator, '_check_health'):
             return self.generator._check_health()
         return True
@@ -793,6 +803,9 @@ class OpenAIServer(_VideoRoutesMixin):
                                methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
+        self.app.add_api_route("/v1/data_transceiver_state",
+                               self.data_transceiver_state,
+                               methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
@@ -857,6 +870,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route('/v1/responses/{response_id}',
                                self.openai_responses_delete_response,
                                methods=["DELETE"])
+        self.app.add_api_route("/_internal/tokenize",
+                               self.tokenize,
+                               methods=["POST"])
 
         # RL-only endpoints
         self.app.add_api_route("/release_memory",
@@ -1095,6 +1111,19 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/videos/{video_id}",
                                self.delete_video,
                                methods=["DELETE"])
+
+    async def data_transceiver_state(self) -> JSONResponse:
+        """Return the serialized DataTransceiverState as base64-encoded JSON."""
+        state = self.generator.get_data_transceiver_state()
+        if not state:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "No transceiver state available"})
+        import base64
+        return JSONResponse(content={
+            "data_transceiver_state":
+            base64.b64encode(state).decode("utf-8")
+        })
 
     async def health(self) -> Response:
         if self._check_health():
@@ -1522,20 +1551,22 @@ class OpenAIServer(_VideoRoutesMixin):
                 request.disaggregated_params)
 
             try:
-                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
                 raw_messages = raw_body.get("messages", [])
-                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                )
 
             # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
             if request.prompt_token_ids is None and request.prompt_token_ids_b64:
@@ -1547,7 +1578,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
-                prompt: str = apply_chat_template(
+                prompt_task = async_apply_chat_template(
                     model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
@@ -1559,9 +1590,12 @@ class OpenAIServer(_VideoRoutesMixin):
                     chat_template=request.chat_template or self.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
                 )
+                prompt, (mm_data, mm_embeddings) = await asyncio.gather(
+                    prompt_task, mm_coroutines)
             prompt = prompt_inputs(prompt)
 
-            mm_data, mm_embeddings = await mm_coroutines
+            if request.prompt_token_ids is not None:
+                mm_data, mm_embeddings = await mm_coroutines
             if mm_data:
                 prompt["multi_modal_data"] = mm_data
             if mm_embeddings:
@@ -1570,6 +1604,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise ValueError(
                     "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
                 )
+            if mm_data and mm_item_order:
+                prompt["mm_item_order"] = mm_item_order
 
             if request.mm_processor_kwargs:
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
@@ -1705,25 +1741,27 @@ class OpenAIServer(_VideoRoutesMixin):
             ]
 
             try:
-                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
                 raw_messages = raw_body.get("messages", [])
-                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                )
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
-                prompt: str = apply_chat_template(
+                prompt_task = async_apply_chat_template(
                     model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
@@ -1735,13 +1773,18 @@ class OpenAIServer(_VideoRoutesMixin):
                     chat_template=request.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
                 )
+                prompt, (mm_data, mm_embeddings) = await asyncio.gather(
+                    prompt_task, mm_coroutines)
             prompt = prompt_inputs(prompt)
 
-            mm_data, mm_embeddings = await mm_coroutines
+            if request.prompt_token_ids is not None:
+                mm_data, mm_embeddings = await mm_coroutines
             if mm_embeddings:
                 raise ValueError("Cannot use multimodal embeddings as input")
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
+                if mm_item_order:
+                    prompt["mm_item_order"] = mm_item_order
 
             promise = self.generator.generate_async(inputs=prompt, )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
@@ -2022,34 +2065,18 @@ class OpenAIServer(_VideoRoutesMixin):
             # NOTE: WAR for Disagg failure, may affect perf if no warmup
             if not self.harmony_adapter:
                 self.harmony_adapter = get_harmony_adapter()
-            # Convert Pydantic models to dictionaries for JSON serialization (standard pattern)
-            tools_dict = None
-            if request.tools:
-                tools_dict = [tool.model_dump() for tool in request.tools]
-
-            # Reasoning effort precedence: request.reasoning_effort > system message parsing > serving default
-            reasoning_effort = maybe_transform_reasoning_effort(
-                request.reasoning_effort)
-            # Get tool_choice from request
-            tool_choice = getattr(request, 'tool_choice', None)
 
             # Reuse pre-tokenized harmony tokens when forwarded by an upstream
             # context worker (disaggregated serving). Otherwise, run the
             # Harmony adapter on the request messages.
-            if request.prompt_token_ids is not None:
-                harmony_tokens = request.prompt_token_ids
-            else:
-                try:
-                    harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
-                        request.messages,
-                        tools_dict,
-                        reasoning_effort=reasoning_effort,
-                        tool_choice=tool_choice)
-                except Exception:
-                    logger.error(f"messages_dict: {request.messages}")
-                    logger.error(f"tools_dict: {tools_dict}")
-                    logger.error(f"request: {request}")
-                    raise
+            try:
+                harmony_tokens = tokenize_harmony_chat_request(
+                    request, harmony_adapter=self.harmony_adapter)
+            except Exception:
+                logger.error("messages_dict: %s", request.messages)
+                logger.error("tools: %s", request.tools)
+                logger.error("request: %s", request)
+                raise
 
             # Get harmony stop tokens
             harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
@@ -2171,6 +2198,17 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.background:
                 logger.warning(
                     "Request.background is not supported yet, will fallback to foreground processing."
+                )
+
+            # Reject rather than silently ignore: with storage disabled
+            # (TRTLLM_RESPONSES_API_DISABLE_STORE, postproc workers, or
+            # multi-frontend serving) the previous response can never be
+            # resolved.
+            if request.previous_response_id is not None and not self.enable_store:
+                return self.create_error_response(
+                    err_type="InvalidRequestError",
+                    message=("'previous_response_id' requires response "
+                             "storage, which is disabled on this server."),
                 )
 
             # Get prev response
@@ -2300,6 +2338,17 @@ class OpenAIServer(_VideoRoutesMixin):
             "object": "response",
             "deleted": True
         })
+
+    async def tokenize(self, request: TokenizeRequest) -> JSONResponse:
+        try:
+            token_ids = self.tokenizer.encode(request.prompt)
+            response = TokenizeResponse(count=len(token_ids), tokens=token_ids)
+            return JSONResponse(content=response.model_dump())
+        except Exception as e:
+            return self.create_error_response(
+                message=str(e),
+                err_type="InvalidRequestError",
+                status_code=HTTPStatus.BAD_REQUEST)
 
     async def release_memory(self,
                              request: MemoryUpdateRequest) -> JSONResponse:

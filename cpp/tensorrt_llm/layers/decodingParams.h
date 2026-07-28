@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -192,9 +193,9 @@ class ExplicitDraftTokensSetupParams : public DecodingSetupParams
 public:
     OptVec<float> temperature; // [setupBatchSize]
     // Hack to init some data for the context phase in the setup.
-    TensorPtr randomDataSample; // [maxBatchSize], on gpu
-    TensorPtr temperatures;     // [maxBatchSize], on gpu
-    nvinfer1::DataType dtype;   // [1]
+    TensorPtr randomDataSample;   // [maxBatchSize], on gpu
+    TensorPtr temperatures;       // [maxBatchSize], on gpu
+    tensorrt_llm::DataType dtype; // [1]
 };
 
 class EagleSetupParams : public DecodingSetupParams
@@ -202,9 +203,9 @@ class EagleSetupParams : public DecodingSetupParams
 public:
     OptVec<float> temperature; // [setupBatchSize]
     // Hack to init some data for the context phase in the setup.
-    TensorPtr randomDataSample; // [maxBatchSize], on gpu
-    TensorPtr temperatures;     // [maxBatchSize], on gpu
-    nvinfer1::DataType dtype;   // [1]
+    TensorPtr randomDataSample;   // [maxBatchSize], on gpu
+    TensorPtr temperatures;       // [maxBatchSize], on gpu
+    tensorrt_llm::DataType dtype; // [1]
 };
 
 class DynamicDecodeSetupParams : public BaseSetupParams

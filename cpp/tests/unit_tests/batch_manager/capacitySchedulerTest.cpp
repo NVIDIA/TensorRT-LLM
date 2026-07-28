@@ -31,7 +31,7 @@
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
-#include <NvInferPlugin.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <cstdlib>
 #include <functional>
@@ -132,7 +132,7 @@ protected:
         auto const nbKvHeads = 10;
         auto constexpr sizePerHead = 1;
         auto const maxNumBlocks = tc::divUp(maxNumTokens, tokensPerBlock);
-        auto const kvDtype = nvinfer1::DataType::kHALF;
+        auto const kvDtype = tensorrt_llm::DataType::kHALF;
         CudaStreamPtr streamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>();
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
