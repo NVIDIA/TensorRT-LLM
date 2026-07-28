@@ -670,8 +670,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             n_valid_buf[:total_q].copy_(n_valid.to(torch.int32))
 
         # Plan length mirrors. A plan is (has_mixed, split, batch, decode_sub,
-        # prefill_sub); a mixed batch is split at the first long request, so
-        # each sub-plan mirrors only its own request range. Within a range a
+        # prefill_sub), whose last two entries cover batch rows [0, split) and
+        # [split, batch). Which of the two holds the prefill requests depends on
+        # the batch order, so those names are positional only and nothing here
+        # may key off them; each sub-plan mirrors just its own range. Within a
         # sub-plan holds either one row per request or one per query token,
         # since the planner row-expands dense plans over query tokens, so the row
         # count selects the source. qo_offset must stay non-negative: negative

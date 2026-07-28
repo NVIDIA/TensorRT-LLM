@@ -55,6 +55,7 @@ def msa_package_available() -> bool:
 
 # One symbol per module touched by 3rdparty/patches/msa_strided_paged_kv.patch.
 _MSA_PATCH_MARKERS = (
+    ("fmha_sm100.api", "_mixed_batch_split"),
     ("fmha_sm100.cute.interface", "_prepare_paged_hnd_input"),
     ("fmha_sm100.sparse_fmha_adapter", "_page_table_for_plan"),
 )
