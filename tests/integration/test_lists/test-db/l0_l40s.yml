@@ -76,6 +76,7 @@ l0_l40s:
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v2-graphs-off-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v1-graphs-requested-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v1-decoder-graphs-on-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v1-encoder-graphs-on-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp16-kv-v1-graphs-off-greedy]
 - condition:
     ranges:
