@@ -15,7 +15,6 @@
 import asyncio
 import json
 import os
-import statistics
 import sys
 import time
 from unittest import mock
@@ -24,7 +23,6 @@ import pytest
 import torch
 from datasets import load_dataset
 from defs.conftest import get_sm_version, is_sm_100f
-from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import LLM
@@ -3589,6 +3587,65 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,mtp_nextn,attention_dp,max_batch_size,moe_backend,fp8kv,chunked_prefill",
+        [
+            (8, 1, 8, 0, True, 24, "CUTLASS", False, False),
+            (8, 1, 8, 3, False, 16, "TRTLLM", True, True),
+        ],
+        ids=["baseline", "mtp3_fp8kv_chunked"])
+    def test_nvfp4_multi_gpus_breakable_cuda_graph(
+            self, tp_size, pp_size, ep_size, mtp_nextn, attention_dp,
+            max_batch_size, moe_backend, fp8kv, chunked_prefill):
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version in (120, 121):
+            pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
+
+        moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+            kv_cache_config.enable_block_reuse = True
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(
+                enable_padding=True,
+                max_batch_size=max_batch_size,
+            ),
+            moe_config=moe_config,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_capture_num_tokens=[2048, 8192],
+        )
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+
+        llm_kwargs = dict(
+            max_batch_size=max_batch_size,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            moe_expert_parallel_size=ep_size,
+            kv_cache_config=kv_cache_config,
+            enable_attention_dp=attention_dp,
+            speculative_config=mtp_config,
+        )
+        if chunked_prefill:
+            llm_kwargs.update(
+                enable_chunked_prefill=True,
+                max_num_tokens=8192,
+            )
+
+        with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
+                 **pytorch_config, **llm_kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @skip_pre_blackwell
+    @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,indexer_k_fp4,use_cute_dsl",
         [
             (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, False,
@@ -3925,25 +3982,9 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.threadleak(enabled=False)
-    def test_mixed_breakable_cuda_graph_epilogue_fusion_ab(self, mocker):
+    def test_mixed_breakable_cuda_graph(self):
         from transformers import AutoTokenizer
 
-        from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
-
-        fusion_env = "TRTLLM_DSV4_DISABLE_FMHA_EPILOGUE_FUSION"
-
-        def patched_start_mpi_pool(session):
-            assert not session.mpi_pool, "MPI session already started"
-            session.mpi_pool = MPIPoolExecutor(
-                max_workers=session.n_workers,
-                path=sys.path,
-                env={fusion_env: os.environ.get(fusion_env, "0")},
-            )
-
-        mocker.patch.object(MpiPoolSession, "_start_mpi_pool",
-                            patched_start_mpi_pool)
-
-        prompt_lengths = [64, 129, 257, 385, 513, 769]
         tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
         base_prompt_ids = tokenizer.encode(
             "TensorRT-LLM accelerates reliable large language model inference "
@@ -3951,11 +3992,14 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             add_special_tokens=False,
         )
         assert base_prompt_ids
-        prompts = [
-            (base_prompt_ids * ((prompt_length + len(base_prompt_ids) - 1) //
-                                len(base_prompt_ids)))[:prompt_length]
-            for prompt_length in prompt_lengths
-        ]
+
+        def make_prompt(prompt_length):
+            return (base_prompt_ids *
+                    ((prompt_length + len(base_prompt_ids) - 1) //
+                     len(base_prompt_ids)))[:prompt_length]
+
+        generation_prompt = make_prompt(64)
+        context_prompt = make_prompt(129)
         sampling_params = SamplingParams(
             max_tokens=8,
             min_tokens=8,
@@ -3965,7 +4009,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             detokenize=False,
             add_special_tokens=False,
         )
-        llm_kwargs = dict(
+        common_llm_kwargs = dict(
             tensor_parallel_size=8,
             moe_expert_parallel_size=8,
             moe_config=MoeConfig(backend="TRTLLM"),
@@ -3982,120 +4026,39 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                 batch_sizes=[1, 2, 4, 6, 8],
                 enable_padding=True,
             ),
-            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
-            prefill_capture_num_tokens=[128, 256, 512, 1024],
         )
 
-        def run_variant(disable_fusion: bool) -> dict:
-            variant_start = time.perf_counter()
-            with mock.patch.dict(
-                    os.environ,
-                {fusion_env: "1" if disable_fusion else "0"},
-                    clear=False,
-            ):
-                with LLM(
-                        self.MODEL_PATH,
-                        **llm_kwargs,
-                        env_overrides={
-                            fusion_env: "1" if disable_fusion else "0"
-                        },
-                ) as llm:
-                    init_seconds = time.perf_counter() - variant_start
-                    warmup_start = time.perf_counter()
-                    llm.generate(prompts,
-                                 sampling_params=sampling_params,
-                                 use_tqdm=False)
-                    warmup_seconds = time.perf_counter() - warmup_start
+        def run(backend):
+            with LLM(
+                    self.MODEL_PATH,
+                    **common_llm_kwargs,
+                    prefill_cuda_graph_backend=backend,
+                    prefill_capture_num_tokens=[128, 256, 512, 1024],
+            ) as llm:
+                generation_request = llm.generate_async(
+                    generation_prompt,
+                    sampling_params=sampling_params,
+                    streaming=True,
+                )
+                next(generation_request)
+                assert not generation_request.finished
 
-                    rounds = []
-                    for _ in range(5):
-                        round_start = time.perf_counter()
-                        outputs = llm.generate(
-                            prompts,
-                            sampling_params=sampling_params,
-                            use_tqdm=False,
-                        )
-                        latency_seconds = time.perf_counter() - round_start
-                        token_ids = [
-                            output.outputs[0].token_ids for output in outputs
-                        ]
-                        output_tokens = sum(len(ids) for ids in token_ids)
-                        rounds.append({
-                            "latency_seconds":
-                            latency_seconds,
-                            "output_tokens":
-                            output_tokens,
-                            "output_tokens_per_second":
-                            output_tokens / latency_seconds,
-                            "token_ids":
-                            token_ids,
-                        })
+                # Admit a context request while the first request is decoding.
+                context_request = llm.generate_async(
+                    context_prompt,
+                    sampling_params=sampling_params,
+                    streaming=False,
+                )
+                generation_output = generation_request.result()
+                context_output = context_request.result()
+                return [
+                    generation_output.outputs[0].token_ids,
+                    context_output.outputs[0].token_ids,
+                ]
 
-            latencies = [
-                round_result["latency_seconds"] for round_result in rounds
-            ]
-            throughputs = [
-                round_result["output_tokens_per_second"]
-                for round_result in rounds
-            ]
-            return {
-                "fusion_disabled":
-                disable_fusion,
-                "engine_init_capture_seconds":
-                init_seconds,
-                "warmup_seconds":
-                warmup_seconds,
-                "rounds":
-                rounds,
-                "median_latency_seconds":
-                statistics.median(latencies),
-                "p90_latency_seconds":
-                statistics.quantiles(latencies, n=10, method="inclusive")[8],
-                "median_output_tokens_per_second":
-                statistics.median(throughputs),
-                "p90_output_tokens_per_second":
-                statistics.quantiles(throughputs, n=10, method="inclusive")[8],
-            }
-
-        disabled_result = run_variant(disable_fusion=True)
-        fusion_result = run_variant(disable_fusion=False)
-        disabled_token_ids = [
-            round_result["token_ids"]
-            for round_result in disabled_result["rounds"]
-        ]
-        fusion_token_ids = [
-            round_result["token_ids"]
-            for round_result in fusion_result["rounds"]
-        ]
-        disabled_repeatable = all(token_ids == disabled_token_ids[0]
-                                  for token_ids in disabled_token_ids[1:])
-        fusion_repeatable = all(token_ids == fusion_token_ids[0]
-                                for token_ids in fusion_token_ids[1:])
-        token_ids_match = fusion_token_ids == disabled_token_ids
-
-        result = {
-            "model": self.MODEL_PATH,
-            "prompt_lengths": prompt_lengths,
-            "max_tokens": sampling_params.max_tokens,
-            "disabled": disabled_result,
-            "fusion": fusion_result,
-            "disabled_repeatable": disabled_repeatable,
-            "fusion_repeatable": fusion_repeatable,
-            "token_ids_match": token_ids_match,
-        }
-        result_json = json.dumps(result, sort_keys=True)
-        if MPI.COMM_WORLD.Get_rank() == 0:
-            print(f"DSV4_BCG_EPILOGUE_AB_RESULT={result_json}")
-        result_path = os.environ.get("TRTLLM_DSV4_BCG_AB_RESULT_PATH")
-        if result_path and MPI.COMM_WORLD.Get_rank() == 0:
-            result_dir = os.path.dirname(result_path)
-            if result_dir:
-                os.makedirs(result_dir, exist_ok=True)
-            with open(result_path, "w") as result_file:
-                json.dump(result, result_file, indent=2, sort_keys=True)
-        assert disabled_repeatable
-        assert fusion_repeatable
-        assert token_ids_match
+        eager_token_ids = run(PrefillCudaGraphBackend.DISABLED)
+        breakable_token_ids = run(PrefillCudaGraphBackend.BREAKABLE)
+        assert breakable_token_ids == eager_token_ids
 
 
 _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
