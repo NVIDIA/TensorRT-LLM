@@ -5775,7 +5775,30 @@ class PyExecutor:
         token_nums = None
         if (not self._adp_dummy_is_gen and self.kv_cache_transceiver is not None
                 and self.max_num_tokens is not None):
-            token_nums = [self.max_num_tokens]
+            # max_num_tokens is the aggregate per-iteration budget and can
+            # exceed the legal capacity of one sequence.
+            token_num = min(
+                self.max_num_tokens,
+                self.model_engine.max_num_tokens,
+                self.model_engine.max_seq_len,
+                self.kv_cache_manager.max_seq_len,
+            )
+            # One-engine speculative decoding appends extra KV tokens after
+            # add_sequence_batch(). Keep them in the same block count that
+            # the capacity scheduler reserves from the prompt length.
+            extra_kv_tokens = self.kv_cache_manager.num_extra_kv_tokens
+            tokens_per_block = self.kv_cache_manager.tokens_per_block
+            block_capacity = ((token_num + tokens_per_block - 1) //
+                              tokens_per_block) * tokens_per_block
+            token_num = max(1, min(token_num, block_capacity - extra_kv_tokens))
+            token_nums = [token_num]
+
+        if not self._has_adp_dummy_kv_capacity(token_nums):
+            logger.warning_once(
+                "Unable to fit the complete attention-DP dummy KV allocation; "
+                "skipping this forward iteration and retrying",
+                key="attention_dp_dummy_insufficient_kv_capacity")
+            return
 
         if (not self._enable_dsv4_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
@@ -5798,8 +5821,7 @@ class PyExecutor:
         has_live_adp_dummy = any(
             request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
             for request in self.active_requests)
-        if has_live_adp_dummy or not self._has_adp_dummy_kv_capacity(
-                token_nums):
+        if has_live_adp_dummy:
             return
 
         try:
