@@ -16,8 +16,8 @@
 from tensorrt_llm._torch.configs.cosmos3 import Cosmos3Config
 from tensorrt_llm._torch.configs.deepseek_v3 import DeepseekV3Config
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
-from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
-from tensorrt_llm._torch.configs.gemma4_unified import (
+from tensorrt_llm._torch.configs.gemma4 import (
+    Gemma4AssistantConfig,
     Gemma4UnifiedAudioConfig,
     Gemma4UnifiedConfig,
     Gemma4UnifiedTextConfig,

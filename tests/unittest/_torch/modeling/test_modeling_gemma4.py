@@ -639,7 +639,8 @@ class TestGemma4Assistant(unittest.TestCase):
         expected_source_layers = [2, 2, 2, 3]
         actual_source_layers = [layer.self_attn.attn.layer_idx for layer in assistant.model.layers]
         self.assertEqual(actual_source_layers, expected_source_layers)
-        self.assertIs(assistant._target_embed_tokens_ref(), target.model.embed_tokens)
+        self.assertIs(assistant.target_input_embeddings, target.model.embed_tokens)
+        self.assertIsNot(assistant.model.embed_tokens, target.model.embed_tokens)
 
 
 # ---------------------------------------------------------------------------

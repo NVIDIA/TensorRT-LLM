@@ -16,7 +16,6 @@
 
 import dataclasses
 import math
-import weakref
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -1581,11 +1580,13 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
             if assistant_config.use_ordered_embeddings
             else None
         )
-        self._target_embed_tokens_ref = None
+        # The assistant embedding remains tied to its own LM head. Target input
+        # embeddings have the backbone width and are shared separately.
+        self.target_input_embeddings = None
 
     def load_weights_from_target_model(self, target_model: nn.Module) -> None:
         target_llm = target_model.llm if hasattr(target_model, "llm") else target_model
-        self._target_embed_tokens_ref = weakref.ref(target_llm.model.embed_tokens)
+        self.target_input_embeddings = target_llm.model.embed_tokens
 
         target_config = target_llm.config
         num_kv_shared = getattr(target_config, "num_kv_shared_layers", 0)
@@ -1599,14 +1600,6 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
                 len(source_layer_types) - 1 - source_layer_types[::-1].index(layer_type)
             )
             layer.self_attn.attn.layer_idx = source_layer_idx
-
-    def _get_target_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if self._target_embed_tokens_ref is None:
-            raise RuntimeError("Gemma4 assistant target embeddings have not been initialized")
-        target_embed_tokens = self._target_embed_tokens_ref()
-        if target_embed_tokens is None:
-            raise RuntimeError("Gemma4 assistant target embedding reference is no longer valid")
-        return target_embed_tokens(input_ids)
 
     @staticmethod
     def _constant_position_ids(
@@ -1631,7 +1624,9 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
         spec_metadata=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run one Q-only assistant step over a frozen target KV prefix."""
-        target_embeddings = self._get_target_embeddings(input_ids)
+        if self.target_input_embeddings is None:
+            raise RuntimeError("Gemma4 assistant target embeddings have not been initialized")
+        target_embeddings = self.target_input_embeddings(input_ids)
         assistant_inputs = self.pre_projection(
             torch.cat([target_embeddings, recurrent_hidden_states], dim=-1)
         )
