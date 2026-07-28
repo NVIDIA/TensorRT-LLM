@@ -60,7 +60,10 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluBiasActivation,
     materialize_activation_params,
 )
-from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
+from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import (
+    DeepEPLowLatency,
+    _read_binary_env,
+)
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
@@ -153,6 +156,23 @@ def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
         _select_explicit_fallback_tactic([])
 
 
+@pytest.mark.parametrize(("value", "expected"), [(None, False), ("0", False), ("1", True)])
+def test_deep_ep_binary_env(monkeypatch, value, expected):
+    name = "TRTLLM_TEST_DEEP_EP_BINARY_ENV"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    assert _read_binary_env(name) is expected
+
+
+def test_deep_ep_binary_env_rejects_invalid_value(monkeypatch):
+    name = "TRTLLM_TEST_DEEP_EP_BINARY_ENV"
+    monkeypatch.setenv(name, "true")
+    with pytest.raises(ValueError, match=rf"{name} must be 0 or 1"):
+        _read_binary_env(name)
+
+
 def test_deep_ep_nvfp4_fused_output_scale_skips_standalone_scale_op(monkeypatch):
     calculate_global_scale = MagicMock(
         side_effect=AssertionError("standalone NVFP4 output-scale op must not run")
@@ -171,6 +191,7 @@ def test_deep_ep_nvfp4_fused_output_scale_skips_standalone_scale_op(monkeypatch)
     comm.hidden_size = 4
     comm.use_low_precision_combine = True
     comm._fuse_nvfp4_output_scale = True
+    comm._stage_low_precision_combine_metadata = True
     comm.quant_config = SimpleNamespace(layer_quant_mode=SimpleNamespace(has_nvfp4=lambda: True))
     comm.deep_ep_buffer = SimpleNamespace(low_latency_combine_low_precision=combine_low_precision)
     recv_expert_count = torch.tensor([2, 0], dtype=torch.int32)
@@ -196,6 +217,7 @@ def test_deep_ep_nvfp4_fused_output_scale_skips_standalone_scale_op(monkeypatch)
     assert call_args[3] is topk_idx
     assert call_args[4] is topk_weights
     assert call_args[5] is deep_ep_handle
+    assert combine_low_precision.call_args.kwargs["stage_recv_metadata"] is True
 
 
 def test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch(monkeypatch):
@@ -226,7 +248,11 @@ def test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch(monkeyp
     moe = SimpleNamespace(
         backend=backend,
         comm=comm,
-        routing_method=SimpleNamespace(requires_separated_routing=False),
+        routing_method=SimpleNamespace(
+            requires_separated_routing=False,
+            experts_per_token=1,
+            apply=MagicMock(return_value=(selected_slots, final_scales)),
+        ),
         apply_router_weight_on_input=False,
         layer_load_balancer=None,
         layer_idx=0,

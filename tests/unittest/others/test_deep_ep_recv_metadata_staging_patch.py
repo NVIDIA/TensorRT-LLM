@@ -43,7 +43,11 @@ def test_deep_ep_recv_metadata_staging_patch_contract() -> None:
     # Keep the accepted b2 send-side dynamic-scale fusion in the combined patch.
     assert "if (global_scale_per_token != nullptr)" in source
     assert "getMaxAbs helper performs a block reduction" in source
-    assert "global_scale_val = 448.f * 6.f / per_token_max_abs_val;" in source
+    assert "rounded reciprocal" in source
+    assert "constexpr float kNvfp4GlobalScaleNumerator = 448.f * 6.f;" in source
+    assert "global_scale_val = __fmul_rn(" in source
+    assert "kNvfp4GlobalScaleNumerator, __frcp_rn(per_token_max_abs_val));" in source
+    assert "div.rn.f32" not in source
 
     # The fused dispatch helper shares one 16-value scale across adjacent
     # eight-BF16 lane payloads. Supported widths must keep every pair active.
@@ -51,12 +55,12 @@ def test_deep_ep_recv_metadata_staging_patch_contract() -> None:
     assert "exchanges lane-pair maxima" in source
     assert "if (lane_id % 2 == 0)" in source
 
-    assert source.count(env_name) == 1
-    assert "static bool low_precision_combine_recv_metadata_staging_enabled()" in source
-    assert "static bool const enabled = []()" in source
-    assert "value == nullptr or" in source
-    assert "(value[0] == '0' or value[0] == '1') and value[1] == '\\0'" in source
-    assert "return value != nullptr and value[0] == '1';" in source
+    assert env_name not in source
+    assert "bool stage_recv_metadata" in source
+    assert "stage_recv_metadata: bool = False" in source
+    assert "async_finish, return_recv_hook, out," in source
+    assert "stage_recv_metadata)" in source
+    assert "getenv" not in source
 
     assert "int kNumMaxTopk, bool kStageRecvMetadata" in source
     for precision in ("FP8", "NVFP4"):

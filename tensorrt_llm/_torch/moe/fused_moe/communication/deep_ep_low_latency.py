@@ -35,6 +35,14 @@ from .base import Communication
 
 _NVFP4_FUSED_OUTPUT_SCALE_ENV = "TRTLLM_DEEP_EP_NVFP4_FUSED_OUTPUT_SCALE"
 _NVFP4_FUSED_BF16_DISPATCH_ENV = "TRTLLM_DEEP_EP_NVFP4_FUSED_BF16_DISPATCH"
+_LOW_PRECISION_COMBINE_STAGE_METADATA_ENV = "TRTLLM_DEEP_EP_LP_COMBINE_RECV_METADATA_STAGING"
+
+
+def _read_binary_env(name: str) -> bool:
+    value = os.environ.get(name)
+    if value not in (None, "0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+    return value == "1"
 
 
 class DeepEPLowLatency(Communication):
@@ -92,19 +100,11 @@ class DeepEPLowLatency(Communication):
         self.use_low_precision_combine = (
             use_low_precision_combine and self.supports_low_precision_combine()
         )
-        fused_output_scale_value = os.environ.get(_NVFP4_FUSED_OUTPUT_SCALE_ENV)
-        if fused_output_scale_value not in (None, "0", "1"):
-            raise ValueError(
-                f"{_NVFP4_FUSED_OUTPUT_SCALE_ENV} must be 0 or 1, got {fused_output_scale_value!r}"
-            )
-        self._fuse_nvfp4_output_scale = fused_output_scale_value == "1"
-        fused_bf16_dispatch_value = os.environ.get(_NVFP4_FUSED_BF16_DISPATCH_ENV)
-        if fused_bf16_dispatch_value not in (None, "0", "1"):
-            raise ValueError(
-                f"{_NVFP4_FUSED_BF16_DISPATCH_ENV} must be 0 or 1, "
-                f"got {fused_bf16_dispatch_value!r}"
-            )
-        self._fuse_nvfp4_bf16_dispatch = fused_bf16_dispatch_value == "1"
+        self._fuse_nvfp4_output_scale = _read_binary_env(_NVFP4_FUSED_OUTPUT_SCALE_ENV)
+        self._fuse_nvfp4_bf16_dispatch = _read_binary_env(_NVFP4_FUSED_BF16_DISPATCH_ENV)
+        self._stage_low_precision_combine_metadata = _read_binary_env(
+            _LOW_PRECISION_COMBINE_STAGE_METADATA_ENV
+        )
         if self._fuse_nvfp4_output_scale and (
             not self.use_low_precision_combine or not self._has_nvfp4()
         ):
@@ -431,6 +431,7 @@ class DeepEPLowLatency(Communication):
                 deep_ep_topk_idx,
                 deep_ep_topk_weights,
                 deep_ep_handle,
+                stage_recv_metadata=self._stage_low_precision_combine_metadata,
             )
         else:
             final_hidden_states = self.deep_ep_buffer.low_latency_combine(
