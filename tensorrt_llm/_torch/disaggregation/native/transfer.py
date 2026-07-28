@@ -2354,7 +2354,14 @@ class TransferWorker:
         ptr_num = len(aux_meta.ptrs)
         ptr_descs = []
         for i in range(ptr_num):
+            # An empty aux buffer (draft tokens when max_draft_len == 0) has a null
+            # data_ptr(). NIXL's LIBFABRIC backend rejects a null address and fails the
+            # whole registration; UCX tolerates it. Empty buffers carry no data anyway.
+            if int(aux_meta.ptrs[i]) == 0 or int(aux_meta.size[i]) == 0:
+                continue
             ptr_descs.append((aux_meta.ptrs[i], aux_meta.size[i], 0, f"aux_buffer_ptr_{i}"))
+        if not ptr_descs:
+            return
         reg_memory_desc = RegMemoryDescs("DRAM", ptr_descs)
         self._agent.register_memory(reg_memory_desc)
         logger.debug(f"Registered auxiliary buffer memory with transfer agent: {reg_memory_desc}")
