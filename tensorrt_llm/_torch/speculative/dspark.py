@@ -414,40 +414,8 @@ class DSparkWorker(SpecWorkerBase):
         batch_size: int,
         K: int,
     ):
-        """Grammar-constrained draft sampling for the guided-decoding path.
-
-        The block backbone already produced all ``K`` positions in one forward
-        (``gen_logits`` = ``[num_gens, K, vocab]``); here we sample them
-        left-to-right, advancing the grammar matcher and applying the
-        per-position bitmask BEFORE each position's sample. This is the DSpark
-        parity for MTP's per-draft-step guided masking (``mtp.py``:
-        ``add_draft_batch`` -> ``execute_draft_batch`` inside the draft loop):
-        without it the unconstrained block drafts make the target-verify matcher
-        break mid-block, later verify positions go unmasked, the target commits
-        an illegal token, and guidance is disabled ("failed to accept last new
-        token"), collapsing acceptance on structured traffic.
-
-        Correctness notes:
-        * ``add_draft_batch``/``execute_draft_batch`` are row-per-request over the
-          FULL batch (contexts first), so we feed full-batch per-step logits and
-          full-batch matcher-advance tokens, exactly as MTP does. DSpark never
-          drafts context requests (zero placeholder), so context rows are padded
-          with zeros; their matcher advance/rollback is a net no-op (mirrors
-          MTP's context handling) and their draft_probs rows are overwritten by
-          ``write_context_onehot_draft_probs`` below. The block is transposed to
-          step-major ([K, batch, vocab]) so each step's slice is contiguous, as
-          the bitmask kernel requires; shapes are static, so this is
-          CUDA-graph-capture-safe.
-        * Sampling reuses ``SpecWorkerBase.sample_draft_tokens``' 2D per-step form
-          (the same path MTP uses), so the TP vocab gather and the slot-indexed
-          ``draft_probs`` scatter are byte-for-byte the ones verification's
-          rejection path reads next iteration; because ``execute_draft_batch``
-          masks the (possibly vocab-sharded) step logits in place first, the
-          scattered proposal distribution is the grammar-constrained one.
-        * ``K == guided_decoder.max_num_draft_tokens`` for DSpark (both derive from
-          ``max_draft_len``; ``block_size == max_draft_len`` is asserted), so the
-          last step ``k == K - 1`` triggers ``execute_draft_batch``'s
-          ``rollback_draft_tokens``, restoring the matcher for next iteration.
+        """
+        Grammar-constrained draft sampling for the guided-decoding path.
         """
         vocab = gen_logits.shape[-1]
         # Lay the block out step-major ([K, batch, vocab]) so each step's slice is
@@ -460,15 +428,11 @@ class DSparkWorker(SpecWorkerBase):
         else:
             full_logits = gen_logits.transpose(0, 1).contiguous()
 
-        # Step-0 matcher-advance token = each request's last committed token (the
-        # bonus for gens), mirroring MTP's draft_inputs['input_ids'][last_tokens_idx].
         gidx = (num_accepted_tokens - 1).clamp(min=0).unsqueeze(1)
         new_tokens = accepted_tokens.gather(1, gidx).squeeze(1).to(torch.int32)
 
         gen_draft_tokens = []
         for k in range(K):
-            # Advance the matcher with the token chosen at position k-1 (bonus at
-            # k==0) and apply position-k's bitmask before sampling, as MTP does.
             self.guided_decoder.add_draft_batch(new_tokens, num_accepted_tokens, draft_step=k)
             step_logits = full_logits[k]
             self.guided_decoder.execute_draft_batch(step_logits, draft_step=k)
@@ -585,11 +549,6 @@ class DSparkWorker(SpecWorkerBase):
             )
             if gen_logits is not None:
                 if self.guided_decoder is not None:
-                    # Guided path: grammar-constrain the drafted block position by
-                    # position (parity with MTP's per-draft-step masking), so the
-                    # proposed drafts are grammar-legal and the target-verify
-                    # matcher never breaks mid-block. Reuses the same TP gather +
-                    # draft_probs scatter as the unguided block sampler below.
                     gen_draft_tokens, gen_vocab = self._sample_draft_tokens_guided(
                         gen_logits,
                         spec_metadata,
@@ -600,17 +559,12 @@ class DSparkWorker(SpecWorkerBase):
                         K,
                     )
                 else:
-                    # SpecWorkerBase samples the draft tokens (greedy argmax, or
-                    # rejection sampling for a non-greedy batch), performs the TP
-                    # gather, and scatters the proposal distribution into draft_probs.
+                    # SpecWorkerBase samples the draft tokens.
                     gen_draft_tokens = self.sample_draft_tokens(
                         gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
                     )
                     # The context one-hot must match the width the gen scatter just
-                    # published to draft_probs, NOT gen_logits.shape[-1]: under TP the
-                    # draft logits are vocab-sharded and sample_draft_tokens gathers
-                    # them to full vocab before scattering, so the pre-gather shard
-                    # width would leave stale columns and corrupt rejection.
+                    # published to draft_probs, NOT gen_logits.shape[-1].
                     gen_vocab = spec_metadata.draft_probs_last_dim
             else:
                 gen_draft_tokens = torch.zeros((num_gens, K), dtype=torch.int32, device="cuda")
