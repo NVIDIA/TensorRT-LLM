@@ -774,8 +774,31 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # Runtime cached lengths after overlap/spec-dec correction.
             start_positions = self.kv_lens_cuda[:self.num_seqs] - seq_lens
 
-            # Reuse request-per-token mapping prepared in metadata.prepare().
-            # This avoids repeat_interleave in graph-capture mode.
+            # Rebuild the token->request map from the CURRENT seq_lens.
+            # prepare_for_indices_conversion() runs once per engine step from
+            # the seq_lens of the target forward, which for an MTP generation
+            # batch are (max_draft_len + 1) tokens per request. The MTP draft
+            # loop rewrites seq_lens to one token per request before calling
+            # update_for_spec_dec(), so the map prepared in prepare() maps
+            # token j to request j // (max_draft_len + 1) instead of request j
+            # for every draft iteration after the first. That misroutes both
+            # the sparse top-k index conversion and the indexer K-cache scatter
+            # to another request's pages. Device-side searchsorted keeps this
+            # graph-capture safe and is a no-op on the target forward, where
+            # seq_lens still match what prepare() saw.
+            # Requires num_tokens == sum(seq_lens[:num_seqs]); every in-tree
+            # mutator of _seq_lens/_seq_lens_cuda that precedes a call here also
+            # calls on_update(), which re-derives num_tokens. Tokens past that sum
+            # would resolve to req_idx == num_seqs and index out of bounds below.
+            # Only the device buffer is refreshed: host_req_idx_per_token is read
+            # solely by its own producer in prepare_for_indices_conversion().
+            cu_seq_lens = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
+            token_idx = torch.arange(self.num_tokens,
+                                     device=seq_lens.device,
+                                     dtype=torch.int32)
+            self.req_idx_per_token[:self.num_tokens] = torch.searchsorted(
+                cu_seq_lens, token_idx,
+                right=True).to(self.req_idx_per_token.dtype)
             req_indices = self.req_idx_per_token[:self.num_tokens].to(
                 dtype=torch.int64)
             seq_starts = torch.cumsum(

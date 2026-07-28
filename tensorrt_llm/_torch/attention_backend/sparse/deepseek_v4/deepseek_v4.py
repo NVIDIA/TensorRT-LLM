@@ -858,6 +858,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self._compress_ratios_sorted,
         )
 
+        # The base on_update_kv_lens() already rewrote req_idx_per_token with an
+        # identical searchsorted; it is recomputed here because
+        # _compute_token_positions fuses it with token_positions (reused for
+        # base_pos/offsets below). Both writes are idempotent -- do not drop
+        # the base one, the DSA path depends on it.
         token_positions = self._compute_token_positions(
             seq_lens,
             cached_tokens,
