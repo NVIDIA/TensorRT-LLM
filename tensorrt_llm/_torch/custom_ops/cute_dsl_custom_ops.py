@@ -9290,41 +9290,42 @@ if IS_CUTLASS_DSL_AVAILABLE:
             persistent_candidates = self.get_is_persistent_candidates()
 
             valid = []
-            for mma_qk_tiler_mn, mma_pv_tiler_mn in candidate_tiler_tactics:
-                for split_kv in split_candidates:
-                    for is_persistent in persistent_candidates:
-                        if self.kernel_class.can_implement(
-                                batch_size,
-                                seq_len_q,
-                                self.page_size,
-                                h,
-                                latent_dim,
-                                rope_dim,
-                                self.in_dtype,  # in_dtype
-                                out_dtype,
-                                cutlass.Float32,  # acc_dtype
-                                cutlass.Float32,  # lse_dtype
-                                mma_qk_tiler_mn,
-                                mma_pv_tiler_mn,
-                                split_kv,
-                                is_persistent,
-                                self._IS_VAR_SEQ,
-                                self._IS_VAR_SPLIT_KV,
-                                self.page_size,
-                        ):
-                            valid.append((mma_qk_tiler_mn, mma_pv_tiler_mn,
-                                          split_kv, is_persistent))
-                        else:
-                            logger.debug(
-                                "CuteDSLNVMlaDecodeBlackwellRunner.can_implement "
-                                "rejected tactic: kernel=%s in_dtype=%s "
-                                "H=%d L=%d R=%d S=%d B=%d page_size=%d "
-                                "mma_qk=%s mma_pv=%s persistent=%s var_seq=%s "
-                                "var_split=%s", self.kernel_class.__name__,
-                                self.in_dtype, h, latent_dim, rope_dim,
-                                seq_len_q, batch_size, self.page_size,
-                                mma_qk_tiler_mn, mma_pv_tiler_mn, is_persistent,
-                                self._IS_VAR_SEQ, self._IS_VAR_SPLIT_KV)
+            for (mma_qk_tiler_mn,
+                 mma_pv_tiler_mn), split_kv, is_persistent in itertools.product(
+                     candidate_tiler_tactics, split_candidates,
+                     persistent_candidates):
+                if self.kernel_class.can_implement(
+                        batch_size,
+                        seq_len_q,
+                        self.page_size,
+                        h,
+                        latent_dim,
+                        rope_dim,
+                        self.in_dtype,  # in_dtype
+                        out_dtype,
+                        cutlass.Float32,  # acc_dtype
+                        cutlass.Float32,  # lse_dtype
+                        mma_qk_tiler_mn,
+                        mma_pv_tiler_mn,
+                        split_kv,
+                        is_persistent,
+                        self._IS_VAR_SEQ,
+                        self._IS_VAR_SPLIT_KV,
+                        self.page_size,
+                ):
+                    valid.append((mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv,
+                                  is_persistent))
+                else:
+                    logger.debug(
+                        "CuteDSLNVMlaDecodeBlackwellRunner.can_implement "
+                        "rejected tactic: kernel=%s in_dtype=%s "
+                        "H=%d L=%d R=%d S=%d B=%d page_size=%d "
+                        "mma_qk=%s mma_pv=%s persistent=%s var_seq=%s "
+                        "var_split=%s", self.kernel_class.__name__,
+                        self.in_dtype, h, latent_dim, rope_dim, seq_len_q,
+                        batch_size, self.page_size, mma_qk_tiler_mn,
+                        mma_pv_tiler_mn, is_persistent, self._IS_VAR_SEQ,
+                        self._IS_VAR_SPLIT_KV)
             return valid
 
         def _tuning_inputs_pre_hook(
@@ -9409,14 +9410,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         i, d, lambda shapes, _free=free: shapes[_free][0])
                     for (i, d) in batch_dims if i != free)
 
-                # (input, dim) whose size is a static config quantity, not
+                # page_table dim0 (max_blocks) is a static config quantity, not
                 # per-request: kept at its real size for profiling but excluded
-                # from the cache key (constraint dims are set to -1 in the key).
-                # page_table dim0 (max_blocks) and workspace dim0 -- both small
-                # (page_table is int32 max_blocks x B; the workspace is the
-                # max-batch LSE + a batch-independent split-KV region, tens of
-                # MB), so rebuilding them for profiling is cheap.
-                static_size_dims = ((4, 0), (7, 0))
+                # from the cache key (constraint dims are set to -1 in the key),
+                # since it tracks max_seq_len rather than anything this op sees.
+                # It is a small int32 max_blocks x B tensor, so rebuilding it
+                # for profiling is cheap.
+                #
+                # workspace (index 7) is a fixed-size slice whose size depends only
+                # on (H, seq_len_q, kv_lora_rank, max_num_requests) -- all constant
+                # for a given runner -- so the size is stable in the cache key.
+                static_size_dims = ((4, 0), )
                 static_constraints = tuple(
                     ConstraintSpec(
                         i, d, lambda shapes, _i=i, _d=d: shapes[_i][_d])

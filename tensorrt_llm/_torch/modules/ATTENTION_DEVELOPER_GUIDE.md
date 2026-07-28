@@ -253,8 +253,8 @@ the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
 runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`cute_dsl_mla,flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback`
-or `TLLM_FMHA_LIBS=-cute_dsl_mla,-flashinfer_trtllm_gen` to force the fallback
+`cute_dsl_mla,msa_sparse_gqa,flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback`
+or `TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_trtllm_gen` to force the fallback
 path. Each FMHA library exposes `is_available()` for module/static environment
 checks and `is_supported()` for per-forward request checks.
 

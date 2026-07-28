@@ -72,12 +72,6 @@ class CuteDslMlaFmha(PhasedFmha):
                 f"must be >= 1, got {attn.predicted_tokens_per_seq}."
             )
             return False
-        if attn.kv_lora_rank is None or attn.kv_lora_rank <= 0:
-            logger.debug("CuTe DSL MLA FMHA is unavailable: kv_lora_rank must be positive.")
-            return False
-        if attn.qk_rope_head_dim is None or attn.qk_rope_head_dim <= 0:
-            logger.debug("CuTe DSL MLA FMHA is unavailable: qk_rope_head_dim must be positive.")
-            return False
         if attn.qk_nope_head_dim is None or attn.qk_nope_head_dim <= 0:
             logger.debug("CuTe DSL MLA FMHA is unavailable: qk_nope_head_dim must be positive.")
             return False
@@ -215,7 +209,6 @@ class CuteDslMlaFmha(PhasedFmha):
         num_heads: int,
         batch_size: int,
         seq_len_q: int,
-        predicted_tokens_per_seq: int,
         kernel_dtype: Optional[torch.dtype],
     ) -> tuple[bool, str]:
         """Perf-only gate, separate from the correctness checks, split by the
@@ -272,19 +265,13 @@ class CuteDslMlaFmha(PhasedFmha):
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
         if meta.num_contexts != 0 or meta.num_generations <= 0:
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
+        if meta.helix_position_offsets is not None:
+            return False, "CuTe DSL MLA FMHA does not support Helix parallelism."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
-        # The kernel is dense-only, so any sparse layer or predicted sparse/topk
-        # indices must fall back to a library that consumes them.
-        sparse_kv_indices = fwd.sparse_prediction.sparse_kv_indices
-        sparse_attn_indices = fwd.sparse_prediction.sparse_attn_indices
-        if (
-            (sparse_kv_indices is not None and sparse_kv_indices.numel() > 0)
-            or (sparse_attn_indices is not None and sparse_attn_indices.numel() > 0)
-            or (fwd.topk_indices is not None and fwd.topk_indices.numel() > 0)
-            or meta.num_sparse_topk > 0
-            or attn.sparse_params is not None
-        ):
+        # The kernel is dense-only, so any sparse layer must fall back to a
+        # library that consumes the predicted sparse/topk indices.
+        if attn.sparse_params is not None:
             return False, "CuTe DSL MLA FMHA does not support sparse attention."
         # Linear-chain MTP / spec-decode (seq_len_q > 1) IS supported: the
         # kernel applies the implicit causal mask (q token t attends to KV
@@ -298,15 +285,7 @@ class CuteDslMlaFmha(PhasedFmha):
             or getattr(meta, "is_spec_dec_dynamic_tree", False)
         ):
             return False, "CuTe DSL MLA FMHA does not support custom/tree speculative masks."
-        if q.shape[0] % meta.num_generations != 0:
-            return (
-                False,
-                f"num_tokens ({q.shape[0]}) must be divisible by "
-                f"num_generations ({meta.num_generations}).",
-            )
         seq_len_q = q.shape[0] // meta.num_generations
-        if seq_len_q < 1:
-            return False, f"Query length must be >= 1, got {seq_len_q}."
         batch_size = meta.num_generations
 
         from tensorrt_llm._torch.autotuner import AutoTuner
@@ -322,31 +301,14 @@ class CuteDslMlaFmha(PhasedFmha):
                 attn.num_heads,
                 batch_size,
                 seq_len_q,
-                attn.predicted_tokens_per_seq,
                 self._get_kernel_dtype(attn, q),
             )
             if not favorable:
                 return False, reason
-        if meta.kv_cache_block_offsets is None:
-            return False, "Paged KV block offsets are required."
         if meta.kv_cache_manager is None:
             return False, "KV cache manager is required."
-        pool_mapping = meta.host_kv_cache_pool_mapping
-        if pool_mapping is None:
-            return False, "KV cache pool mapping is required."
-        if fwd.latent_cache is None:
-            return False, "latent_cache is required."
         if fwd.output is None:
             return False, "output is required."
-
-        tokens_per_block = meta.tokens_per_block
-        if tokens_per_block is None:
-            tokens_per_block = getattr(meta.kv_cache_manager, "tokens_per_block", 0)
-        if tokens_per_block <= 1:
-            return (
-                False,
-                f"tokens_per_block must be greater than 1, got {tokens_per_block}.",
-            )
 
         # The kernel type is the input dtype
         kernel_dtype = self._get_kernel_dtype(attn, q)
@@ -356,14 +318,7 @@ class CuteDslMlaFmha(PhasedFmha):
                 f"Unsupported dtype combination: q={q.dtype}, "
                 f"has_fp8_kv_cache={getattr(attn, 'has_fp8_kv_cache', False)}.",
             )
-        if kernel_dtype == torch.float8_e4m3fn and (
-            fwd.quant_q_buffer is None or fwd.mla_bmm1_scale is None or fwd.mla_bmm2_scale is None
-        ):
-            return (
-                False,
-                "FP8 CuTe DSL MLA decode requires quant_q_buffer, "
-                "mla_bmm1_scale, and mla_bmm2_scale from MLA RoPE generation.",
-            )
+
         if kernel_dtype in (torch.float16, torch.bfloat16):
             kv_pool_dtype = meta.kv_cache_manager.get_buffers(attn.layer_idx).dtype
             if kv_pool_dtype != kernel_dtype:
@@ -380,7 +335,7 @@ class CuteDslMlaFmha(PhasedFmha):
             fwd.output.dtype,
             meta.num_generations,
             seq_len_q,
-            tokens_per_block,
+            meta.tokens_per_block,
             attn.num_heads,
             attn.kv_lora_rank,
             attn.qk_rope_head_dim,
@@ -476,7 +431,16 @@ class CuteDslMlaFmha(PhasedFmha):
         c_pool_latent = kv_pages[..., :d_latent].permute(1, 2, 0)
         c_pool_rope = kv_pages[..., d_latent:].permute(1, 2, 0)
 
-        workspace = params.workspace
+        # ``params.workspace`` is the attention workspace SHARED with the C++
+        # kernels, which size it from ``max_num_tokens`` and can grow it to
+        # several GiB. The AutoTuner rebuilds every input carrying a
+        # dynamic dim as a float32 ``torch.rand`` tensor while profiling, i.e.
+        # 4x the int8 byte count, which may cause OOM.
+        required_workspace_numel = math.ceil(
+            self._required_workspace_size(num_heads, seq_len_q, d_latent, meta.max_num_requests)
+            / params.workspace.element_size()
+        )
+        workspace = params.workspace[:required_workspace_numel]
         softmax_scale = float(1.0 / (math.sqrt(qk_nope_head_dim + d_rope) * attn.q_scaling))
         output_scale = 1.0
         if kernel_dtype == torch.float8_e4m3fn:
@@ -540,6 +504,28 @@ class CuteDslMlaFmha(PhasedFmha):
             kernel_dtype,
         )
 
+    def _required_workspace_size(
+        self,
+        num_heads: int,
+        seq_len_q: int,
+        kv_lora_rank: int,
+        max_num_requests: int,
+    ) -> int:
+        """Bytes this kernel owns at the FRONT of the shared attention workspace."""
+        import cutlass
+
+        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+            CuteDSLNVMlaDecodeBlackwellRunner,
+        )
+
+        return CuteDSLNVMlaDecodeBlackwellRunner.get_max_padded_workspace_size(
+            num_heads,
+            seq_len_q,
+            kv_lora_rank,
+            max_num_requests,
+            cutlass.Float32,
+        )
+
     def prepare_workspace(
         self,
         q: torch.Tensor,
@@ -549,18 +535,11 @@ class CuteDslMlaFmha(PhasedFmha):
         forward_args: AttentionForwardArgs,
         workspace: torch.Tensor,
     ) -> None:
-        import cutlass
-
-        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
-            CuteDSLNVMlaDecodeBlackwellRunner,
-        )
-
-        required_workspace_size = CuteDSLNVMlaDecodeBlackwellRunner.get_max_padded_workspace_size(
+        required_workspace_size = self._required_workspace_size(
             self.attn.num_heads,
             q.shape[0] // metadata.num_generations,
             self.attn.kv_lora_rank,
             metadata.max_num_requests,
-            cutlass.Float32,
         )
         current_workspace_size = workspace.numel() * workspace.element_size()
         if current_workspace_size < required_workspace_size:
