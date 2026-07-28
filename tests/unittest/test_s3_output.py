@@ -18,6 +18,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -452,6 +453,111 @@ def test_small_log_file_is_not_inlined(tmp_path):
     section_name, section_content = report.sections[0]
     assert section_name == "Captured log"
     assert "upload skipped" in section_content
+
+
+def _drain_console_pipe(read_fd, expected, timeout=10.0):
+    """Read from ``read_fd`` until ``expected`` is seen or ``timeout`` elapses."""
+    deadline = time.monotonic() + timeout
+    seen = b""
+    os.set_blocking(read_fd, False)
+    while time.monotonic() < deadline:
+        try:
+            chunk = os.read(read_fd, 65536)
+        except BlockingIOError:
+            chunk = b""
+        if chunk:
+            seen += chunk
+            if expected in seen:
+                break
+        else:
+            time.sleep(0.05)
+    return seen
+
+
+def test_session_capture_echoes_output_to_console_before_the_test_ends(tmp_path):
+    """Echo must appear while output is produced, not at teardown.
+
+    A wedged test is killed before its capture is ever published.
+    """
+    console_read, console_write = os.pipe()
+    saved_stdout = os.dup(1)
+    capture = SessionCapture(str(tmp_path), echo_to_console=True)
+    child = None
+    try:
+        os.dup2(console_write, 1)
+        capture.start()
+        # A child that inherits fd 1 and then never exits: the MPI worker case.
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os, time; os.write(1, b'Hang detected after 5 seconds.\\n'); "
+                "time.sleep(300)",
+            ],
+        )
+        seen = _drain_console_pipe(console_read, b"Hang detected after 5 seconds.")
+    finally:
+        if child is not None:
+            child.kill()
+            child.wait()
+        capture.stop()
+        os.dup2(saved_stdout, 1)
+        os.close(saved_stdout)
+        os.close(console_write)
+        os.close(console_read)
+
+    assert b"Hang detected after 5 seconds." in seen
+    capture.remove_files()
+
+
+def test_session_capture_does_not_echo_to_console_by_default(tmp_path):
+    console_read, console_write = os.pipe()
+    saved_stdout = os.dup(1)
+    capture = SessionCapture(str(tmp_path))
+    try:
+        os.dup2(console_write, 1)
+        capture.start()
+        os.write(1, b"spooled only\n")
+        capture.stop()
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.close(saved_stdout)
+        os.close(console_write)
+    try:
+        os.set_blocking(console_read, False)
+        try:
+            leaked = os.read(console_read, 65536)
+        except BlockingIOError:
+            leaked = b""
+    finally:
+        os.close(console_read)
+
+    assert b"spooled only" not in leaked
+    capture.remove_files()
+
+
+def test_fd_redirector_echoes_a_partial_chunk_without_waiting_for_more(tmp_path):
+    """The reader must not wait to fill a buffer before echoing.
+
+    The bytes a hang leaves behind are a short final chunk with nothing to follow.
+    """
+    console_read, console_write = os.pipe()
+    saved_stdout = os.dup(1)
+    redir = FDRedirector(1, str(tmp_path / "stdout.log"), echo_to_original=True)
+    try:
+        os.dup2(console_write, 1)
+        redir.__enter__()
+        os.write(1, b"Hang detected after 5 seconds.\n")  # far below one 4 KiB chunk
+        seen = _drain_console_pipe(console_read, b"Hang detected after 5 seconds.", timeout=5.0)
+        redir.__exit__(None, None, None)
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.close(saved_stdout)
+        os.close(console_write)
+        os.close(console_read)
+
+    assert b"Hang detected after 5 seconds." in seen
+    assert "Hang detected after 5 seconds." in (tmp_path / "stdout.log").read_text()
 
 
 def test_fd_redirector_reader_thread_is_daemon_when_pipe_writer_lingers(tmp_path):

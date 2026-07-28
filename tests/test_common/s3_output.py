@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import codecs
 import io
 import logging
 import os
@@ -106,6 +107,11 @@ class SessionFDSpool:
         self._spool_fd = None
         self._attached = False
 
+    @property
+    def console_fd(self):
+        """The pre-capture duplicate of the target fd, i.e. the real console."""
+        return self._saved_fd
+
     def _flush_target_stream(self):
         stream = sys.stdout if self.target_fd == 1 else sys.stderr
         try:
@@ -160,8 +166,87 @@ class SessionFDSpool:
             self._saved_fd = None
 
 
+class SessionSpoolEchoer:
+    """Mirror the session spool files onto the real console as they grow.
+
+    Session capture points fd 1 and 2 at append-only spool files, so nothing a
+    test -- or any MPI worker rank that inherited those fds -- writes reaches
+    the console; it is published only once the test finishes and its slice is
+    uploaded. A wedged test never finishes: pytest's ``--timeout`` kills the
+    process with ``os._exit``, so the spooled bytes, including any HangDetector
+    dump, are never published anywhere the stage log can see.
+
+    Tailing the spool puts that output on the console while it is produced, at
+    a cost of at most one poll interval of lag, and without changing how
+    capture, per-test slicing, or uploading work. Only the console copy is
+    best-effort: the spool file itself is still written synchronously by the
+    producer, so an abrupt kill cannot lose more than the last poll interval.
+    """
+
+    POLL_INTERVAL_SECONDS = 0.25
+    _READ_CHUNK_BYTES = 1 << 20
+
+    def __init__(self, spools, poll_interval=POLL_INTERVAL_SECONDS):
+        self._spools = list(spools)
+        self._poll_interval = poll_interval
+        self._readers = []
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        for spool in self._spools:
+            if spool.console_fd is None:
+                continue
+            try:
+                self._readers.append((open(spool.path, "rb", buffering=0), spool.console_fd))
+            except OSError as e:
+                logger.warning("Cannot tail spool %s for console echo: %s", spool.path, e)
+        if not self._readers:
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="s3-spool-echo")
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            self._drain()
+            self._stop.wait(self._poll_interval)
+        # Final pass so a graceful stop does not truncate the console copy.
+        self._drain()
+
+    def _drain(self):
+        for reader, console_fd in self._readers:
+            try:
+                while True:
+                    data = reader.read(self._READ_CHUNK_BYTES)
+                    if not data:
+                        break
+                    self._write_all(console_fd, data)
+            except OSError as e:
+                logger.warning("Console echo from %s stopped: %s", reader.name, e)
+
+    @staticmethod
+    def _write_all(fd, data):
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                logger.warning("Spool echo thread did not exit in time")
+            self._thread = None
+        for reader, _ in self._readers:
+            try:
+                reader.close()
+            except OSError:
+                pass
+        self._readers = []
+
+
 class SessionCapture:
-    def __init__(self, output_path):
+    def __init__(self, output_path, echo_to_console=False):
         spool_dir = os.path.join(output_path, ".s3-spool")
         os.makedirs(spool_dir, exist_ok=True)
         suffix = f"{os.getpid()}-{time.time_ns()}"
@@ -171,6 +256,8 @@ class SessionCapture:
         }
         self._suspend_depth = 0
         self._started = False
+        self._echo_to_console = echo_to_console
+        self._echoer = None
 
     def start(self):
         started = []
@@ -183,6 +270,9 @@ class SessionCapture:
                 spool.stop()
             raise
         self._started = True
+        if self._echo_to_console:
+            self._echoer = SessionSpoolEchoer(self._spools.values())
+            self._echoer.start()
 
     def snapshot(self):
         return {filename: spool.snapshot() for filename, spool in self._spools.items()}
@@ -218,6 +308,10 @@ class SessionCapture:
         if not self._started:
             return
         self._suspend_depth = 0
+        # Drain the console copy before the spool fds go away.
+        if self._echoer is not None:
+            self._echoer.stop()
+            self._echoer = None
         for spool in self._spools.values():
             spool.stop()
         self._started = False
@@ -285,7 +379,13 @@ class FDRedirector:
         os.dup2(pipe_write, self.target_fd)
         os.close(pipe_write)
 
-        pipe_stream = os.fdopen(pipe_read, "r", encoding="utf-8", errors="replace", buffering=1)
+        # Unbuffered binary: FileIO.read(n) issues a single read() syscall and
+        # returns whatever is already in the pipe. A buffered *text* stream
+        # would instead block until it has n characters or sees EOF, so the
+        # trailing partial chunk -- exactly where a hang dump lands, since the
+        # writer then stops producing -- would never be drained before the
+        # process is killed.
+        pipe_stream = os.fdopen(pipe_read, "rb", buffering=0)
 
         # Child processes may inherit the redirected fd and keep the pipe open
         # after capture is restored. Do not let that block pytest shutdown.
@@ -298,12 +398,28 @@ class FDRedirector:
 
     def _reader_loop(self, pipe_stream, log_file):
         need_timestamp = True
+        # A raw pipe read can split a multi-byte UTF-8 sequence, so decode
+        # incrementally instead of per chunk.
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         try:
             while True:
-                chunk = pipe_stream.read(4096)
-                if not chunk:
+                raw = pipe_stream.read(4096)
+                if not raw:
                     break
+
+                # Echo first: the whole point of echoing is live visibility, and
+                # the writer may be killed at any moment.
+                if self.echo_to_original and self.saved_fd is not None:
+                    ret = os.write(self.saved_fd, raw)
+                    if ret != len(raw):
+                        logger.warning(
+                            f"Partial write to original FD {self.target_fd}: {ret} != {len(raw)}"
+                        )
+
+                chunk = decoder.decode(raw)
+                if not chunk:
+                    continue
 
                 # Build the timestamp prefix once per chunk and reuse it for every
                 # line in that chunk. The previous implementation walked the chunk
@@ -327,13 +443,6 @@ class FDRedirector:
                     need_timestamp = line.endswith("\n")
                 log_file.write("".join(parts))
                 log_file.flush()
-
-                if self.echo_to_original and self.saved_fd is not None:
-                    ret = os.write(self.saved_fd, chunk.encode("utf-8"))
-                    if ret != len(chunk):
-                        logger.warning(
-                            f"Partial write to original FD {self.target_fd}: {ret} != {len(chunk)}"
-                        )
 
         except Exception as e:
             logger.error(f"Error reading from pipe: {e}")
@@ -444,7 +553,9 @@ class UploadLogPlugin:
         self.inline_output_max_bytes = inline_output_max_bytes
         if self.inline_output_max_bytes < 0:
             raise ValueError("--s3-inline-output-max-bytes must be >= 0")
-        if self.capture_mode in ("session", "direct") and self.echo_to_stdout:
+        # "direct" dup2s the target fd straight onto a log file, so there is
+        # nothing in the process that could copy the bytes on to the console.
+        if self.capture_mode == "direct" and self.echo_to_stdout:
             raise ValueError(
                 f"--s3-capture-mode={self.capture_mode} cannot be used with --s3-echo-stdout"
             )
@@ -593,7 +704,9 @@ class UploadLogPlugin:
         result = yield
         if self.capture_mode == "session":
             if self._session_capture is None:
-                self._session_capture = SessionCapture(self.output_path)
+                self._session_capture = SessionCapture(
+                    self.output_path, echo_to_console=self.echo_to_stdout
+                )
                 self._session_capture.start()
             else:
                 self._session_capture.resume_parent()
@@ -916,11 +1029,13 @@ def add_options(parser):
         action="store_true",
         default=False,
         help="Besides capturing stdout/stderr to per-test log files, also echo "
-        "them through to the original stdout/stderr for live debugging. "
-        "This requires --s3-capture-mode=timestamped and should be set on the outer pytest "
-        "invocation; nested pytest invocations spawned by individual tests "
-        "should NOT set this, to avoid duplicating their output back through "
-        "the outer pipe.",
+        "them through to the original stdout/stderr for live debugging, so that "
+        "output survives a test that is hard-killed before its capture is "
+        "published. Supported by --s3-capture-mode=session (the default, echoed "
+        "by tailing the spool) and =timestamped; not by =direct. Set this on the "
+        "outer pytest invocation only; nested pytest invocations spawned by "
+        "individual tests should NOT set it, to avoid duplicating their output "
+        "back through the outer stream.",
     )
     parser.addoption(
         "--s3-skip-upload",

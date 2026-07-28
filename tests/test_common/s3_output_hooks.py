@@ -54,11 +54,12 @@ def _is_xdist_controller(config: pytest.Config) -> bool:
 
 def _parse_early_capture_options(
     early_config: pytest.Config, args: list[str]
-) -> tuple[str | None, str | None, str, str]:
+) -> tuple[str | None, str | None, str, str, bool]:
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--output-dir", "-O")
     parser.add_argument("--s3-upload-path")
     parser.add_argument("--s3-capture-mode")
+    parser.add_argument("--s3-echo-stdout", action="store_true", default=False)
     parsed, _ = parser.parse_known_args(args)
 
     namespace = early_config.known_args_namespace
@@ -76,8 +77,9 @@ def _parse_early_capture_options(
         str,
         getattr(namespace, "s3_capture_mode", None) or parsed.s3_capture_mode or "session",
     )
+    echo_to_console = bool(getattr(namespace, "s3_echo_stdout", False) or parsed.s3_echo_stdout)
     pytest_capture = cast(str, getattr(namespace, "capture", "fd"))
-    return output_path, upload_path, capture_mode, pytest_capture
+    return output_path, upload_path, capture_mode, pytest_capture, echo_to_console
 
 
 def _capture_state(config: pytest.Config) -> _EarlyCaptureState | None:
@@ -91,9 +93,13 @@ def _capture_state(config: pytest.Config) -> _EarlyCaptureState | None:
 def pytest_load_initial_conftests(
     early_config: pytest.Config, args: list[str]
 ) -> Generator[None, object, object]:
-    output_path, upload_path, capture_mode, pytest_capture = _parse_early_capture_options(
-        early_config, args
-    )
+    (
+        output_path,
+        upload_path,
+        capture_mode,
+        pytest_capture,
+        echo_to_console,
+    ) = _parse_early_capture_options(early_config, args)
     if (
         _capture_state(early_config) is not None
         or _is_xdist_controller(early_config)
@@ -104,7 +110,7 @@ def pytest_load_initial_conftests(
     ):
         return (yield)
 
-    capture = s3_output.SessionCapture(output_path)
+    capture = s3_output.SessionCapture(output_path, echo_to_console=echo_to_console)
     capture.start()
     state = _EarlyCaptureState(capture)
     setattr(early_config, _CAPTURE_STATE_ATTRIBUTE, state)

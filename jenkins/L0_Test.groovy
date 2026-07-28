@@ -1249,11 +1249,40 @@ def getPytestBaseCommandLine(
     testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
     if (ENABLE_UPLOAD_TEST_RESULTS) {
         testCmdLine += ["-o console_output_style=progress-even-when-capture-no"]
+        // ENABLE_S3_ECHO_STDOUT already appends this at the call site; don't duplicate.
+        if (!ENABLE_S3_ECHO_STDOUT && shouldEchoTestOutputToConsole(stageName)) {
+            testCmdLine += ["--s3-echo-stdout"]
+        }
     }
     if (extraArgs) {
         testCmdLine += extraArgs
     }
     return testCmdLine as String[]
+}
+
+// Whether a stage should echo per-test stdout/stderr to the console as well as
+// capturing it for S3.
+//
+// pytest capture is already off (-s), but the S3 log plugin then spools every
+// byte a test -- and every MPI worker rank that inherited its fds -- writes
+// into a session file, and publishes it per test on completion. A test that
+// wedges never completes: pytest's --timeout hard-kills the process with
+// os._exit, so that test's output is never published and the stage log holds
+// no trace of the wedge. The output is not destroyed (the spool ships inside
+// results-<stage>.tar.gz), but recovering it means knowing to download and
+// unpack an artifact, which is not how a stage failure gets triaged.
+//
+// Echoing costs log volume, so it is limited to where the evidence is worth
+// most: post-merge multi-GPU stages. Those are the stages whose timeouts burn
+// the most GPU-hours per occurrence, and the wedges there are the ones that
+// leave nothing behind today. PerfSanity stages are excluded so that timing
+// runs keep their current, quieter console.
+def shouldEchoTestOutputToConsole(String stageName) {
+    if (!stageName.contains("Post-Merge") || stageName.contains("PerfSanity")) {
+        return false
+    }
+    def taskConfig = parseTaskConfigFromStageName(stageName)
+    return taskConfig != null && (taskConfig.system_gpu_count as Integer) > 1
 }
 
 def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
