@@ -1199,9 +1199,23 @@ class PyExecutor:
                 "TLLM_LINE_PROFILER_PATH")) and not self.is_warmup
             with host_profiler_context(enable=enable_profiler), \
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
-                self.event_loop()
+                try:
+                    self.event_loop()
+                except Exception:
+                    # Only a loop that dies BEFORE it processed its shutdown
+                    # request strands its peers. Once is_shutdown is set,
+                    # every rank has already seen the shutdown broadcast and
+                    # no peer is waiting on this one, so a raise on the way
+                    # out of an already-shutting-down loop (e.g. from the
+                    # profiler's or hang detector's __exit__) is a teardown
+                    # error to log, never a reason to SIGKILL the job.
+                    #
+                    # The flag is scoped to event_loop() itself for the same
+                    # reason: teardown of the enclosing host-profiler / GC
+                    # context managers is not a stranded-peer condition.
+                    crashed = not self.is_shutdown
+                    raise
         except Exception as e:
-            crashed = True
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
             # Stash the original error so local consumers
@@ -1214,11 +1228,11 @@ class PyExecutor:
             self._event_loop_error = e
             raise e
         finally:
-            if crashed:
-                # Armed BEFORE cleanup: cleanup can block without bound on a
-                # send handle wedged by the crash, and a kill placed only
-                # after it would never fire.
-                start_rank_crash_kill_watchdog(self.dist.world_size)
+            # Armed BEFORE cleanup: cleanup can block without bound on a
+            # send handle wedged by the crash, and a kill placed only after
+            # it would never fire.
+            watchdog = start_rank_crash_kill_watchdog(
+                self.dist.world_size) if crashed else None
             try:
                 self._executor_loop_cleanup()
             finally:
@@ -1230,9 +1244,19 @@ class PyExecutor:
                     # rank-local waiters and the ready handshake first, so
                     # the client sees the original exception rather than a
                     # bare worker death. Nested finally: the kill must fire
-                    # even when cleanup itself raises; the watchdog above
-                    # covers cleanup blocking.
-                    hard_kill_on_rank_crash(self.dist.world_size)
+                    # even when cleanup itself raises.
+                    #
+                    # Cleanup returned, so the watchdog's only job (covering
+                    # a cleanup that never returns) is done: disarm it and
+                    # carry the kill here, on its ORIGINAL deadline. Exactly
+                    # one timer is live at any moment, and the handover
+                    # cannot push the kill out by a second grace.
+                    deadline = None
+                    if watchdog is not None:
+                        watchdog.cancel()
+                        deadline = watchdog.deadline
+                    hard_kill_on_rank_crash(self.dist.world_size,
+                                            deadline=deadline)
 
     @property
     def is_warmup(self) -> bool:

@@ -102,7 +102,32 @@ def _rank_crash_kill_grace() -> Optional[float]:
     return None if grace < 0 else grace
 
 
-def hard_kill_on_rank_crash(world_size: int) -> bool:
+def _wait_out_kill_grace(
+    grace: float,
+    deadline: Optional[float],
+    cancelled: Optional[threading.Event],
+) -> bool:
+    """Sleep out the crash-kill grace; return False if the kill was cancelled.
+
+    ``deadline`` (a ``time.monotonic()`` stamp) lets a kill that was already
+    armed elsewhere keep its ORIGINAL fire time when it is handed over to
+    another waiter, so a handover cannot push the kill out by a second grace.
+    ``cancelled`` makes the wait interruptible: a rank that turns out not to
+    need the kill can disarm it instead of being killed while exiting cleanly.
+    """
+    remaining = grace if deadline is None else max(0.0, deadline - time.monotonic())
+    if cancelled is None:
+        if remaining > 0:
+            time.sleep(remaining)
+        return True
+    return not cancelled.wait(remaining)
+
+
+def hard_kill_on_rank_crash(
+    world_size: int,
+    deadline: Optional[float] = None,
+    cancelled: Optional[threading.Event] = None,
+) -> bool:
     """Hard-kill the whole world after this rank's executor loop crashed.
 
     A rank whose executor loop died on an exception can never rejoin its
@@ -123,7 +148,9 @@ def hard_kill_on_rank_crash(world_size: int) -> bool:
     Never raises (it runs in a ``finally`` where an exception would mask the
     original loop error). Returns True when the kill path was taken — only
     observable in tests, where ``propagate_hard_kill`` is stubbed; in
-    production that call does not return.
+    production that call does not return. Returns False when the kill does
+    not apply (single rank, disabled by env) or was cancelled during the
+    grace.
     """
     try:
         if world_size <= 1:
@@ -138,8 +165,9 @@ def hard_kill_on_rank_crash(world_size: int) -> bool:
             f"{world_size} ranks in {grace}s (peers cannot make progress "
             f"without this rank). Set {RANK_CRASH_KILL_GRACE_ENV}=-1 to disable."
         )
-        if grace > 0:
-            time.sleep(grace)
+        if not _wait_out_kill_grace(grace, deadline, cancelled):
+            _best_effort_log_error("Rank-crash hard kill cancelled before the grace elapsed.")
+            return False
         propagate_hard_kill()
         return True
     except Exception as e:  # noqa: BLE001 - must not mask the loop's original error
@@ -147,7 +175,40 @@ def hard_kill_on_rank_crash(world_size: int) -> bool:
         return False
 
 
-def start_rank_crash_kill_watchdog(world_size: int) -> Optional[threading.Thread]:
+class RankCrashKillWatchdog(threading.Thread):
+    """Daemon thread that hard-kills the world once the crash grace elapses.
+
+    A plain ``Thread`` for backwards compatibility (callers may still join it
+    or inspect ``daemon``), plus the two things the caller needs to own the
+    kill deadline:
+
+    - ``cancel()`` disarms the timer. Without it an armed watchdog fires at
+      crash + grace unconditionally, so a rank that ends up exiting cleanly
+      is SIGKILLed anyway and a would-be exit 0 becomes exit 137.
+    - ``deadline`` exposes the original fire time so whoever takes the kill
+      over after cancelling still fires at crash + grace rather than
+      restarting the clock.
+    """
+
+    def __init__(self, world_size: int, grace: float):
+        super().__init__(name="rank_crash_kill_watchdog", daemon=True)
+        self._world_size = world_size
+        self.deadline = time.monotonic() + max(0.0, grace)
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        """Disarm the kill. Never raises; safe to call more than once."""
+        self._cancelled.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def run(self) -> None:
+        hard_kill_on_rank_crash(self._world_size, deadline=self.deadline, cancelled=self._cancelled)
+
+
+def start_rank_crash_kill_watchdog(world_size: int) -> Optional[RankCrashKillWatchdog]:
     """Arm a daemon thread that hard-kills the world once the grace elapses.
 
     Must be armed BEFORE executor-loop cleanup: cleanup can block without
@@ -157,7 +218,12 @@ def start_rank_crash_kill_watchdog(world_size: int) -> Optional[threading.Thread
     exists to avoid. The thread reuses ``hard_kill_on_rank_crash``, so the
     kill fires at crash + grace whether cleanup finishes, blocks, or raises.
 
-    Never raises. Returns the armed thread, or ``None`` when the kill is
+    The returned watchdog is the ONLY timer while cleanup runs; the caller
+    is expected to ``cancel()`` it once cleanup returns and carry the kill
+    (with the same ``deadline``) itself, so the two paths never race with
+    two independent clocks.
+
+    Never raises. Returns the armed watchdog, or ``None`` when the kill is
     not applicable (single rank, disabled by env) or the thread could not
     be started — in that case the caller's post-cleanup kill remains the
     only mechanism.
@@ -165,14 +231,10 @@ def start_rank_crash_kill_watchdog(world_size: int) -> Optional[threading.Thread
     try:
         if world_size <= 1:
             return None
-        if _rank_crash_kill_grace() is None:
+        grace = _rank_crash_kill_grace()
+        if grace is None:
             return None
-        watchdog = threading.Thread(
-            target=hard_kill_on_rank_crash,
-            args=(world_size,),
-            name="rank_crash_kill_watchdog",
-            daemon=True,
-        )
+        watchdog = RankCrashKillWatchdog(world_size, grace)
         watchdog.start()
         return watchdog
     except Exception as e:  # noqa: BLE001 - must not mask the loop's original error
