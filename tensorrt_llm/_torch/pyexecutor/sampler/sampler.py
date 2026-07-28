@@ -5092,7 +5092,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # Overlap-scheduler stale flags (per request): True when the host
             # token history lags the device by one token. Only the overlap
             # handler consumes them; computed here as it needs sampler state.
-            stale_by_one = self._compute_stale_by_one(sampling_requests)
+            # Only the suffix-matching bans (bad words, no-repeat ngram) care:
+            # min_length bans EOS from a length count, never from token values,
+            # so a lagging history cannot mismatch it. Skipping the call for
+            # min-length-only batches also avoids emitting the stale-history
+            # warning, which names features such a batch does not use.
+            stale_by_one = (
+                self._compute_stale_by_one(sampling_requests)
+                if (has_bad_words or has_no_repeat_ngram)
+                else None
+            )
             bans = self._token_ban_handler.generate_ban_list(
                 sampling_requests,
                 sampling_requests_metadata.req_num_steps.tolist(),

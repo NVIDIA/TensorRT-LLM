@@ -310,7 +310,18 @@ class TokenBanHandler(ABC):
                 return []
             if n == 1:
                 return [([], col) for col in set(context)]
-            return [(context[i : i + n - 1], context[i + n - 1]) for i in range(length - n + 1)]
+            # Only a window whose head equals the context suffix can ever fire,
+            # and the suffix is known right here. Match now and emit pre-matched
+            # rules with an empty prefix (as the single-beam branch does) instead
+            # of handing every window to the driver: that built one prefix list
+            # per window each step, only for the driver to discard all but the
+            # few that match.
+            suffix = context[-(n - 1) :]
+            return [
+                ([], context[i + n - 1])
+                for i in range(length - n + 1)
+                if context[i : i + n - 1] == suffix
+            ]
 
         def stale_rules(
             index: int, r: LlmRequest, get_context: Callable[[], list[int]]
