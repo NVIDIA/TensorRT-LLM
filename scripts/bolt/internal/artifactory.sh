@@ -31,10 +31,14 @@
 #   <REPO>/<PREFIX>/<branch>/<triple>/latest.tar.gz
 # Defaults match the repo used by jenkins/Build.groovy (sw-tensorrt-generic).
 #
-# Auth: uses the `jf` (JFrog) CLI. If JF_URL + JF_ACCESS_TOKEN are set, this
-# script configures jf automatically; otherwise it assumes `jf` is preconfigured
-# (as on CI agents). Jenkins may alternatively use rtUpload/rtDownload with the
-# same paths (see promote_path() / latest_path()).
+# Auth:
+#   promote     -> `jf` (JFrog) CLI (write). If JF_URL + JF_ACCESS_TOKEN are set
+#                  this configures jf automatically; else assumes jf is
+#                  preconfigured. (The CI postmerge path in BoltProfileGen.groovy
+#                  instead uploads cluster-side via curl + urm-artifactory-creds.)
+#   pull-latest -> anonymous curl (read), matching Build.groovy's phase-1 tarball
+#                  download from the same repo; needs no creds and no jf, so it
+#                  runs in the premerge build pod as-is.
 
 set -euo pipefail
 
@@ -116,13 +120,17 @@ cmd_pull_latest() {
     local branch="${1:?pull-latest: <branch> <triple> <dest_dir>}"
     local triple="${2:?triple required}"
     local dest="${3:?dest_dir required}"
-    _ensure_jf
-    local dir; dir="$(promote_dir "$branch" "$triple")"
+    local base="${BOLT_ARTIFACTORY_BASE:-https://urm.nvidia.com/artifactory}"
+    local url="$base/$(promote_dir "$branch" "$triple")/latest.tar.gz"
     mkdir -p "$dest"
-    log "Pulling $dir/latest.tar.gz -> $dest"
-    # --flat so the file lands directly in dest; fail cleanly if absent.
-    if ! jf rt download "$dir/latest.tar.gz" "$dest/" --flat --fail-no-op; then
-        die "no promoted bundle at $dir/latest.tar.gz (branch may have none yet)"
+    log "Pulling $url -> $dest"
+    # curl (anonymous, like jenkins/Build.groovy's phase-1 tarball download from
+    # the same sw-tensorrt-generic repo): the read path needs no creds, so this
+    # works in the build pod without a configured `jf`. --retry rides out flaky
+    # links; a missing object 404s -> die (fatal for the premerge consumer).
+    if ! curl -fSL --retry 5 --retry-all-errors --retry-delay 10 \
+              --connect-timeout 60 -o "$dest/latest.tar.gz" "$url"; then
+        die "no promoted bundle at $url (branch may have none yet)"
     fi
     tar -xzf "$dest/latest.tar.gz" -C "$dest"
     rm -f "$dest/latest.tar.gz"
