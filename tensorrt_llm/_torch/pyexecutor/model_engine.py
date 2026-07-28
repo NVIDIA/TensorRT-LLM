@@ -4472,14 +4472,14 @@ class PyTorchModelEngine(ModelEngine):
                 request_ids.append(request.py_request_id)
                 is_promoted_context = (request.py_request_id
                                        in promoted_context_request_ids)
-                # the request has no previous tensor:
-                # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
-                # (2) a dummy request; or
-                # (3) the first step in the generation server of disaggregated serving
                 if is_promoted_context:
                     input_ids.append(
                         request.get_tokens(0)[request.context_current_position])
                     past_seen_token_num = request.context_current_position
+                # The request has no previous tensor:
+                # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
+                # (2) a dummy request; or
+                # (3) the first step in the generation server of disaggregated serving.
                 elif new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                     # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                     # can be aligned to the correct positions.
