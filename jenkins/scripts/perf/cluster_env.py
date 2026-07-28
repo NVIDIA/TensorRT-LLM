@@ -34,6 +34,16 @@ BASE_UCX_UNSET = "unset UCX_CUDA_IPC_ENABLE_MNNVL UCX_TLS UCX_NET_DEVICES"
 # both the bloom name (CI, e.g. "aws-cmh") and the cluster's own slurm.conf
 # ClusterName (local detection, e.g. "nsc-svg" -> "nsc-svg-slurm-1").
 UCX_ENV_RULES = [
+    # gcp-nrt: RoCE fabric; pin the usable rocep ports and set the RoCE GID /
+    # QoS parameters required on this fabric.
+    (
+        "gcp-nrt*",
+        "*",
+        "export UCX_NET_DEVICES="
+        "rocep145s0:1,rocep146s0:1,rocep152s0:1,rocep153s0:1,"
+        "rocep198s0:1,rocep199s0:1,rocep205s0:1,rocep206s0:1"
+        " UCX_IB_GID_INDEX=auto UCX_IB_TRAFFIC_CLASS=52 UCX_IB_SL=0",
+    ),
     # nsc-svg: UCX picks wrong RDMA devices; pin the usable mlx5 ports.
     (
         "nsc-svg*",
