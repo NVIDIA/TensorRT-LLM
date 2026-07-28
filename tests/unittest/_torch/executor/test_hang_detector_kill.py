@@ -241,13 +241,20 @@ def test_watchdog_cancel_prevents_the_kill(monkeypatch):
 
     watchdog = start_rank_crash_kill_watchdog(world_size=2)
     assert watchdog is not None
-    watchdog.cancel()
-    # Cancel must break the grace wait immediately, not merely be observed
-    # after it elapses -- otherwise the process still dies 30s later.
-    watchdog.join(timeout=10.0)
-    assert not watchdog.is_alive()
-    assert kills == []
-    assert watchdog.cancelled is True
+    try:
+        watchdog.cancel()
+        # Cancel must break the grace wait immediately, not merely be observed
+        # after it elapses -- otherwise the process still dies 30s later.
+        watchdog.join(timeout=10.0)
+        assert not watchdog.is_alive()
+        assert kills == []
+        assert watchdog.cancelled is True
+    finally:
+        # Never let an armed killer thread outlive the stubbed
+        # propagate_hard_kill: if cancel() ever regresses, the real one would
+        # SIGKILL the pytest process once monkeypatch restores it.
+        watchdog.cancel()
+        watchdog.join(timeout=60.0)
 
 
 def test_kill_keeps_original_deadline_on_handover(monkeypatch):
