@@ -94,9 +94,7 @@ def _allocate_block_offset_snapshot(
     block_offsets_host = torch.empty(
         snapshot_shape, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
     )
-    block_offsets_device = torch.empty(
-        snapshot_shape, dtype=torch.int32, device=anchor_pool.device
-    )
+    block_offsets_device = torch.empty(snapshot_shape, dtype=torch.int32, device=anchor_pool.device)
     return block_offsets_host, block_offsets_device
 
 
@@ -285,10 +283,7 @@ class TriAttention(KVCacheCompressionManager):
             stats = raw["stats"]
             metadata = raw["metadata"]
             if "sampled_heads" in metadata:
-                heads = [
-                    (int(layer), int(head))
-                    for layer, head in metadata["sampled_heads"]
-                ]
+                heads = [(int(layer), int(head)) for layer, head in metadata["sampled_heads"]]
             else:
                 heads = [
                     (
@@ -329,14 +324,10 @@ class TriAttention(KVCacheCompressionManager):
                 omega = (1.0 / (base ** (positions / head_dim)))[:freq_count].clone()
                 attention_scale_sq = 1.0
             else:
-                inv_freq, attention_factor = ROPE_INIT_FUNCTIONS[rope_type](
-                    config, device="cpu"
-                )
+                inv_freq, attention_factor = ROPE_INIT_FUNCTIONS[rope_type](config, device="cpu")
                 omega = inv_freq.to(torch.float32)[:freq_count].clone()
                 attention_scale_sq = float(attention_factor) ** 2
-            freq_scale_sq = torch.full(
-                (freq_count,), attention_scale_sq, dtype=torch.float32
-            )
+            freq_scale_sq = torch.full((freq_count,), attention_scale_sq, dtype=torch.float32)
             logger.info(
                 f"TriAttention: converted official calibration {self.calibration_path}"
                 f" -> E_q[L={num_layers}, H={num_heads}, F={freq_count}]"
@@ -372,9 +363,7 @@ class TriAttention(KVCacheCompressionManager):
         if max_decode_tokens < first_evict_step:
             return
         self._phase.reserve(prompt_length + max_decode_tokens + 1)
-        max_source_tokens = prompt_length + min(
-            max_decode_tokens, self._selection_width_capacity
-        )
+        max_source_tokens = prompt_length + min(max_decode_tokens, self._selection_width_capacity)
         if max_source_tokens <= self._score_token_capacity:
             return
 

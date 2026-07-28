@@ -127,9 +127,7 @@ class TestTriAttentionClass:
         )
         assert mgr._omega.numel() == freq_count
         idx = torch.arange(0, 2 * freq_count, 2, dtype=torch.float32)
-        torch.testing.assert_close(
-            mgr._omega.cpu(), 1.0 / (10000.0 ** (idx / (2 * freq_count)))
-        )
+        torch.testing.assert_close(mgr._omega.cpu(), 1.0 / (10000.0 ** (idx / (2 * freq_count))))
         assert torch.equal(mgr._freq_scale_sq.cpu(), torch.ones(freq_count))
 
     def test_rope_tables_resolve_theta_and_attention_factor(self, tmp_path):

@@ -2298,7 +2298,8 @@ def create_kv_cache_compression_manager(
     """
     if config.algorithm == "triattention":
         # TriAttention imports CuTe/CUTLASS; keep normal executor startup lazy.
-        from ..kv_cache_compression.triattention.triattention import TriAttention
+        from ..kv_cache_compression.triattention.triattention import \
+            TriAttention
 
         return TriAttention(
             config,
