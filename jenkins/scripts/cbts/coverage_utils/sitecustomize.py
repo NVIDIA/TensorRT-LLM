@@ -125,11 +125,10 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         switch_test_context(_initial_nodeid)
 
     if _is_nested_pytest:
-        # Inner pytest: apply the mpi_session env-whitelist patch synchronously instead of via the watcher thread.
+        # Inner pytest: install the pool accounting/env patch synchronously instead of via the watcher.
         try:
-            from cbts_plugin import install_expected_workers_patch, install_mpi_pool_patch
+            from cbts_plugin import install_expected_workers_patch
 
-            install_mpi_pool_patch(raise_on_refactor=False)
             install_expected_workers_patch()
         except Exception as _exc:
             print(
@@ -150,29 +149,20 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     ).start()
 
     if not _skip_daemons:
-        # Coordinator / long-lived non-pytest processes patch mpi_session before they spawn a pool;
-        # pool workers and the outer pytest don't spawn pools, so they skip this.
+        # Coordinator / long-lived non-pytest processes install the pool accounting/env patch before
+        # they spawn a pool; pool workers and the outer pytest don't spawn pools, so they skip this.
 
         def _watch_mpi_session():
-            # Wait until the host has imported the target modules so this daemon triggers no racing import.
+            # Wait until mpi4py.futures is imported so installing the patch triggers no racing import.
             while not _stop_event.is_set():
-                mod = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
-                if (
-                    mod is not None
-                    and hasattr(mod, "MpiPoolSession")
-                    and "mpi4py.futures" in sys.modules
-                ):
+                if "mpi4py.futures" in sys.modules:
                     try:
-                        from cbts_plugin import (
-                            install_expected_workers_patch,
-                            install_mpi_pool_patch,
-                        )
+                        from cbts_plugin import install_expected_workers_patch
 
-                        install_mpi_pool_patch(raise_on_refactor=False)
                         install_expected_workers_patch()
                     except Exception as exc:
                         print(
-                            f"[cbts] mpi_session patch in pid {os.getpid()} failed: {exc!r}",
+                            f"[cbts] pool patch in pid {os.getpid()} failed: {exc!r}",
                             file=sys.stderr,
                         )
                     return

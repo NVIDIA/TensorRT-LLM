@@ -13,7 +13,6 @@
 # limitations under the License.
 """Pytest plugin for CBTS Layer C per-test coverage attribution."""
 
-import inspect
 import os
 import sys
 
@@ -21,57 +20,17 @@ MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", "/tmp/cbts/current_test.txt")
 
 _ENV_WHITELIST_PREFIXES = ("TRTLLM", "TLLM", "COVERAGE_", "CBTS_", "PYTHON")
 
-_PATCHED_MARKER = "_cbts_patched_start_mpi_pool"
-
 _POOL_PATCHED_MARKER = "_cbts_patched_pool_init"
 
 
-def install_mpi_pool_patch(*, raise_on_refactor=True):
-    """Widen ``MpiPoolSession._start_mpi_pool``'s env whitelist; idempotent."""
-    try:
-        from mpi4py.futures import MPIPoolExecutor  # noqa: F401
-
-        import tensorrt_llm.llmapi.mpi_session as _ms
-    except ImportError:
-        return False
-
-    method = _ms.MpiPoolSession._start_mpi_pool
-    if getattr(method, _PATCHED_MARKER, False):
-        return False
-
-    src = inspect.getsource(method)
-    if "TRTLLM" not in src or "MPIPoolExecutor" not in src:
-        msg = (
-            "CBTS: tensorrt_llm.llmapi.mpi_session.MpiPoolSession."
-            "_start_mpi_pool has been refactored upstream; the "
-            "monkeypatch in cbts_plugin.py needs to be updated. See "
-            "jenkins/scripts/cbts/coverage_utils/README.md"
-        )
-        if raise_on_refactor:
-            raise RuntimeError(msg)
-        return False
-
-    def _patched_start_mpi_pool(self):
-        """Widened env whitelist so COVERAGE_* and PYTHON* reach workers."""
-        import sys as _sys
-
-        from mpi4py.futures import MPIPoolExecutor as _MPE
-
-        assert not self.mpi_pool, "MPI session already started"
-        env = {k: v for k, v in os.environ.items() if k.startswith(_ENV_WHITELIST_PREFIXES)}
-        self.mpi_pool = _MPE(
-            max_workers=self.n_workers,
-            path=_sys.path,
-            env=env,
-        )
-
-    setattr(_patched_start_mpi_pool, _PATCHED_MARKER, True)
-    _ms.MpiPoolSession._start_mpi_pool = _patched_start_mpi_pool
-    return True
-
-
 def install_expected_workers_patch():
-    """Count subprocess pool workers per test (any ``MPIPoolExecutor``) for the completeness signal; idempotent."""
+    """Patch ``MPIPoolExecutor.__init__`` for worker accounting + coverage-env propagation.
+
+    Counts the workers each test spawns and widens the workers' env so they inherit the coverage
+    bootstrap; idempotent. Patching the constructor rather than ``MpiPoolSession._start_mpi_pool``
+    leaves the product's pool setup (``env_overrides``, the wait_shutdown worker-identity barrier,
+    …) intact.
+    """
     try:
         from mpi4py.futures import MPIPoolExecutor
     except ImportError:
@@ -89,6 +48,13 @@ def install_expected_workers_patch():
         except (ValueError, TypeError):
             n = 1
         _sitecustomize_call("note_expected_workers", os.environ.get("CBTS_TEST_ID", ""), n)
+        # Add the coverage env without discarding the caller's env: the caller's dict (product
+        # whitelist + env_overrides) wins on conflict. env=None means the worker already inherits
+        # everything, so leave it untouched.
+        env = kwargs.get("env")
+        if env is not None:
+            cov = {k: v for k, v in os.environ.items() if k.startswith(_ENV_WHITELIST_PREFIXES)}
+            kwargs["env"] = {**cov, **env}
         return init(self, *args, **kwargs)
 
     setattr(_patched_init, _POOL_PATCHED_MARKER, True)
@@ -108,14 +74,13 @@ def _sitecustomize_call(func_name, *args):
         fn(*args)
 
 
-# Bind pytest only when already loaded, so importing this module for install_mpi_pool_patch stays cheap.
+# Bind pytest only when already loaded, so importing this module for the patch install stays cheap.
 if "pytest" in sys.modules:
     import pytest
 
     def pytest_configure(config):  # noqa: D401 - pytest hook
-        """Apply the ``mpi_session`` env monkeypatch and the pool-worker accounting patch."""
+        """Install the pool-worker accounting + coverage-env patch."""
         del config
-        install_mpi_pool_patch(raise_on_refactor=True)
         install_expected_workers_patch()
 
     @pytest.hookimpl(hookwrapper=True)
