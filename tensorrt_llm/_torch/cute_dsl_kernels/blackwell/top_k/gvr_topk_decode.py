@@ -1089,6 +1089,68 @@ class GvrTopKKernel:
         cute.arch.barrier()
 
     # ------------------------------------------------------------------
+    # P1r — degenerate-seed rescue: rebuild the refine bracket from the
+    # data itself. Runs only when the preIdx gather produced an unusable
+    # bracket (duplicate or invalid preIdx: cold-start zero-init slots,
+    # stale slots pointing past N, or an all-tied gather). A full-row
+    # min/max restores the P2 invariant count(>= v_lo) >= K, so the
+    # normal pipeline stays exact; the extra row scan is paid only by
+    # the (rare) degenerate rows. Bounds are clamped to +-FLT_MAX/2 so
+    # the secant range arithmetic stays finite against inf-laden rows.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def phase1r_data_reseed(
+        self,
+        input_row,  # cute.Tensor [N] (row-major slice of the row)
+        N,  # runtime row length
+        smem_wmin_f32,  # cute.Tensor [NUM_WARPS] float32 (reused P1 buffer)
+        smem_wmax_f32,  # cute.Tensor [NUM_WARPS] float32 (reused P1 buffer)
+        s_thr,  # cute.Tensor [3] float32: [threshold, val_lo, val_hi]
+        s_iscalars,  # [cand_count, done, cnt_lo, cnt_hi, out_count, ...]
+        s_mt_thr,  # rung columns (r0_vseed parks the seed line here)
+        tidx,
+        warp_id,
+        lane,
+    ):
+        local_min = cutlass.Float32(self.FLT_MAX)
+        local_max = cutlass.Float32(self.NEG_FLT_MAX)
+        i = cutlass.Int32(tidx)
+        while i < N:
+            v = self._load_fp32(input_row, i)
+            local_max = cute.arch.fmax(local_max, v)
+            local_min = _fmin_f32_inline(local_min, v)
+            i = i + cutlass.Int32(self.num_threads)
+        wmin = self.warp_reduce_min_f32(local_min)
+        wmax = self.warp_reduce_max_f32(local_max)
+        if lane == 0:
+            smem_wmin_f32[warp_id] = wmin
+            smem_wmax_f32[warp_id] = wmax
+        cute.arch.barrier()
+        if tidx == 0:
+            rmin = cutlass.Float32(self.FLT_MAX)
+            rmax = cutlass.Float32(self.NEG_FLT_MAX)
+            for w in cutlass.range_constexpr(self.num_warps):
+                rmax = cute.arch.fmax(rmax, smem_wmax_f32[w])
+                rmin = _fmin_f32_inline(rmin, smem_wmin_f32[w])
+            # finite clamp keeps rng = val_hi - val_lo representable; rows
+            # with mass beyond +-FLT_MAX/2 are adversarial-only (production
+            # indexer scores are small finite values).
+            rmin = cute.arch.fmax(rmin, cutlass.Float32(self.NEG_FLT_MAX * 0.5))
+            rmax = _fmin_f32_inline(rmax, cutlass.Float32(self.FLT_MAX * 0.5))
+            mid = (rmin + rmax) * cutlass.Float32(0.5)
+            s_thr[0] = mid
+            s_thr[1] = rmin
+            s_thr[2] = rmax
+            if cutlass.const_expr(self.r0_vseed):
+                s_mt_thr[self.M_thr - 1] = mid
+            s_iscalars[0] = cutlass.Int32(0)  # cand_count
+            s_iscalars[1] = cutlass.Int32(0)  # done
+            s_iscalars[2] = N  # cnt_lo: count(>= row min) = N, truthful
+            s_iscalars[3] = cutlass.Int32(1)  # cnt_hi seed (same as P1)
+            s_iscalars[4] = cutlass.Int32(0)  # out_count
+        cute.arch.barrier()
+
+    # ------------------------------------------------------------------
     # P1b — 256-bin SMEM histogram over the prev-topK gathered values
     # (band [v_lo, v_hi] = P1's pmin/pmax = s_thr[1]/s_thr[2]), then M
     # h-space quantile rungs into s_mt_thr (ascending value order). Reuses
@@ -5632,8 +5694,32 @@ class GvrTopKKernel:
             )
 
         # Degenerate threshold init: val_hi <= -self.FLT_MAX or val_lo >= val_hi.
-        # When preIdx values produce an unusable bracket (e.g. all -inf or
-        # identical), skip Phase 2-4 and emit identity output instead.
+        # A duplicate/invalid preIdx gather (cold-start zero-init slots, stale
+        # slots pointing past N, an all-tied gather) produces an unusable
+        # bracket. When N > K real selection work remains, so rebuild the
+        # bracket from the data itself (P1r) and run the normal pipeline —
+        # the old identity shortcut here returned indices [0, K), which is
+        # NOT the top-K on real data (production hit: the first decode step
+        # of every request feeds the zero-init prev_topk feedback buffer).
+        # If the bracket is STILL degenerate after the rescue, every
+        # in-range value is identical (or N <= K), and identity output is
+        # then exact — keep the shortcut for exactly those rows.
+        v_lo = s_thr[1]
+        v_hi = s_thr[2]
+        if v_hi <= cutlass.Float32(self.NEG_FLT_MAX) or v_lo >= v_hi:
+            if N > cutlass.Int32(self.top_k):
+                self.phase1r_data_reseed(
+                    input_row,
+                    N,
+                    smem_wmin,
+                    smem_wmax,
+                    s_thr,
+                    s_iscalars,
+                    s_mt_thr,
+                    tidx,
+                    warp_id,
+                    lane,
+                )
         v_lo = s_thr[1]
         v_hi = s_thr[2]
         if v_hi <= cutlass.Float32(self.NEG_FLT_MAX) or v_lo >= v_hi:

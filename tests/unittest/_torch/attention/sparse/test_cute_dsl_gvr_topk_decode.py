@@ -1135,3 +1135,141 @@ def test_cute_dsl_gvr_topk_decode_launch_autoconfig(dtype, top_k, N, batch_size)
     _tie_aware_check(out_sec, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
     if dtype == torch.float32:
         assert torch.equal(out.sort(dim=-1).values, out_sec.sort(dim=-1).values)
+
+
+# ===========================================================================
+# Degenerate preIdx states (P1r data reseed).
+#
+# The stock seed path derives the P2 refine bracket from the preIdx gather;
+# its exactness invariant (count(>= gather min) >= K) holds only when the
+# preIdx row carries K DISTINCT in-range positions. Production-reachable
+# violations: the first decode step of a request feeds the zero-init
+# prev_topk feedback buffer (all-duplicate index 0); a reused batch slot can
+# carry stale indices past the new row's N_eff (all-invalid); FP4-quantized
+# logits can tie the whole gather (zero-width bracket). The old degenerate
+# shortcut emitted identity indices [0, K) — NOT the top-K on real data.
+# P1r rebuilds the bracket from the row itself, so all cases must pass the
+# strict multiset check.
+# ===========================================================================
+
+
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "dtype,top_k",
+    [
+        (torch.bfloat16, 512),
+        (torch.float32, 2048),
+    ],
+)
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+@pytest.mark.parametrize("pre_mode", ["zero", "dup", "oob"])
+@pytest.mark.parametrize("data_mode", ["random", "all_tied", "tie_flood"])
+def test_cute_dsl_gvr_topk_decode_degenerate_preidx(
+    dtype, top_k, compress_ratio, pre_mode, data_mode
+):
+    """Degenerate preIdx rows must still produce an exact top-K."""
+    N = 4096
+    num_rows = 4
+    torch.manual_seed(3)
+    torch.cuda.manual_seed(3)
+    if data_mode == "random":
+        logits = (torch.randn(num_rows, N, device="cuda") * 2.0).to(dtype)
+    elif data_mode == "all_tied":
+        # rescue re-degenerates (row min == max) -> identity output, which
+        # is exact here because every value is identical
+        logits = torch.full((num_rows, N), 5.0, device="cuda", dtype=dtype)
+    else:  # tie_flood: kth sits inside a large tie class (within kC —
+        # count(>= tie value) must stay under the candidate capacity; the
+        # beyond-kC flood is a known pre-existing limitation, see the
+        # xfail test below)
+        logits = (torch.rand(num_rows, N, device="cuda") * 0.5).to(dtype)
+        for r in range(num_rows):
+            perm = torch.randperm(N, device="cuda")
+            logits[r, perm[: top_k * 2]] = 1.0
+            logits[r, perm[top_k * 2 : top_k * 2 + top_k // 4]] = 2.0
+
+    if pre_mode == "zero":
+        pre_idx = torch.zeros(num_rows, top_k, dtype=torch.int32, device="cuda")
+    elif pre_mode == "dup":
+        pre_idx = torch.full((num_rows, top_k), 37, dtype=torch.int32, device="cuda")
+    else:  # oob: every slot past N_eff (stale-slot state, pcnt == 0)
+        pre_idx = torch.full((num_rows, top_k), N + 7, dtype=torch.int32, device="cuda")
+
+    seq_lens = torch.full((num_rows,), N * compress_ratio, dtype=torch.int32, device="cuda")
+    out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        next_n=1,
+        compress_ratio=compress_ratio,
+    )
+    torch.cuda.synchronize()
+    _tie_aware_check(out_indices, logits, seq_lens, top_k, 1, compress_ratio=compress_ratio)
+
+
+@skip_not_sm100
+def test_cute_dsl_gvr_topk_decode_degenerate_preidx_cs4():
+    """cs>1 rows run the rescue per-CTA (redundant full-row scan) — the
+    cluster path must stay exact for the zero-init cold-start state too."""
+    N = 65536
+    top_k = 512
+    num_rows = 2
+    torch.manual_seed(5)
+    logits = (torch.randn(num_rows, N, device="cuda") * 2.0).to(torch.bfloat16)
+    pre_idx = torch.zeros(num_rows, top_k, dtype=torch.int32, device="cuda")
+    seq_lens = torch.full((num_rows,), N, dtype=torch.int32, device="cuda")
+    out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        next_n=1,
+        compress_ratio=1,
+        cluster_size=4,
+    )
+    torch.cuda.synchronize()
+    _tie_aware_check(out_indices, logits, seq_lens, top_k, 1, compress_ratio=1)
+
+
+@skip_not_sm100
+@pytest.mark.xfail(
+    reason="known pre-existing limitation (upstream lineage, reproduces on "
+    "the PR-tip kernel unmodified): when the kth tie class alone exceeds "
+    "the candidate capacity kC, no threshold lands in [K, kC]; the selected "
+    "VALUE multiset is still exact but the index list can contain "
+    "duplicate / unwritten (-1) slots. Requires >kC exactly-equal scores "
+    "at the boundary — unreachable for real FP4 indexer logits observed "
+    "so far. Tracked as a follow-up; independent of the P1r rescue.",
+    strict=False,
+)
+def test_cute_dsl_gvr_topk_decode_tie_flood_beyond_capacity():
+    N = 4096
+    top_k = 512
+    num_rows = 4
+    torch.manual_seed(3)
+    torch.cuda.manual_seed(3)
+    logits = torch.ones(num_rows, N, device="cuda", dtype=torch.bfloat16)
+    for r in range(num_rows):
+        hot = torch.randperm(N, device="cuda")[: top_k // 4]
+        logits[r, hot] = 2.0
+    # healthiest possible pre (true previous top-k) — the flood defect is
+    # independent of preIdx quality
+    pre_idx = torch.topk(logits.float(), top_k, dim=-1).indices.int().contiguous()
+    seq_lens = torch.full((num_rows,), N, dtype=torch.int32, device="cuda")
+    out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        next_n=1,
+        compress_ratio=1,
+    )
+    torch.cuda.synchronize()
+    _tie_aware_check(out_indices, logits, seq_lens, top_k, 1, compress_ratio=1)
