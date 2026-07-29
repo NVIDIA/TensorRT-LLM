@@ -1649,6 +1649,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "export ${varName}=\"${escapedValue}\""
                 }.join('\n')
 
+                // Escape pytestCommand for embedding inside bash double-quoted export.
+                // --unittest-markexpr="not cpu_only" contains inner double quotes that
+                // would prematurely close the outer "..." and cause an export error.
+                def safePytestCmd = pytestCommand
+                    .replace('\\', '\\\\')
+                    .replace('"', '\\"')
+
                 def scriptLaunchPrefix = """#!/bin/bash
                     #SBATCH ${exemptionComment}
                     #SBATCH --output=${slurmJobLogPath}
@@ -1670,7 +1677,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export stageName=$stageName
                     export perfMode=$perfMode
                     export resourcePathNode=$resourcePathNode
-                    export pytestCommand="$pytestCommand"
+                    export pytestCommand="$safePytestCmd"
                     export coverageConfigFile="$coverageConfigFile"
                     export testListPathNode="$testListPathNode"
                     export testSplits="$splits"
