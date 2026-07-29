@@ -1559,7 +1559,10 @@ static-analysis-files: &static_analysis_files |
     )$
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
-exclude: '(^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/)'
+# Also excludes the vendored openengine protos (from upstream at the pinned commit)
+# and their generated gRPC stubs: formatters/linters keep the stubs byte-identical to
+# `generate_stubs.sh` output and leave the vendored .proto/LICENSE untouched.
+exclude: '(^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|^tensorrt_llm/grpc/openengine/proto/|^tensorrt_llm/grpc/openengine/[^/]+_pb2(_grpc)?\.pyi?$)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:

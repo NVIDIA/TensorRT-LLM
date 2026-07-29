@@ -1,0 +1,80 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// Model metadata and portable inference capabilities.
+
+syntax = "proto3";
+
+package openengine.v1;
+
+import "google/protobuf/struct.proto";
+
+message GetModelInfoRequest {
+  string model = 1;
+}
+
+message ModelInfo {
+  string model_id = 1;
+  string served_model_name = 2;
+  repeated string served_model_aliases = 3;
+  optional uint32 max_context_length = 4; // Effective context-window limit in this deployment.
+  optional uint32 max_output_tokens = 5; // Effective generated-token limit in this deployment.
+  repeated string tokenizer_modes = 10;
+
+  optional bool supports_text_input = 20;
+  optional bool supports_token_ids_input = 21;
+  GenerationCapabilities generation = 22;
+  optional bool supports_lora = 23;
+  optional bool supports_multimodal = 24;
+
+  // Engine-advertised response parser names. Clients can apply these to a
+  // model's output stream for tool-call extraction or reasoning separation.
+  // Empty means no parser is configured for this model.
+  string reasoning_parser = 25;
+  string tool_call_parser = 26;
+
+  // Engine-specific model metadata with no portable field (e.g. kv-cache dtype,
+  // quantization, capabilities not yet standardized). NOT part of the portable
+  // contract: clients read it opportunistically and never depend on it for
+  // correctness. Carried as a Struct so JSON types survive the wire.
+  google.protobuf.Struct extra = 28;
+}
+
+message GenerationCapabilities {
+  LogprobCapabilities prompt_logprobs = 1;
+  LogprobCapabilities output_logprobs = 2;
+  GuidedDecodingCapabilities guided_decoding = 3;
+  optional uint32 max_num_sequences = 4;
+  optional bool supports_priority = 5;
+  optional bool supports_stop_in_output = 6;
+  optional bool supports_cache_salt = 7;
+  optional bool supports_prefix_cache_bypass = 8;
+}
+
+message LogprobCapabilities {
+  optional bool supported = 1;
+  repeated CandidateTokenSelectionMode candidate_selection_modes = 2;
+  optional uint32 max_top_n = 3;
+}
+
+enum CandidateTokenSelectionMode {
+  CANDIDATE_TOKEN_SELECTION_MODE_UNSPECIFIED = 0;
+  CANDIDATE_TOKEN_SELECTION_MODE_TOP_N = 1;
+  CANDIDATE_TOKEN_SELECTION_MODE_TOKEN_IDS = 2;
+  CANDIDATE_TOKEN_SELECTION_MODE_ALL = 3;
+}
+
+message GuidedDecodingCapabilities {
+  optional bool supported = 1;
+  repeated GuidedDecodingMode modes = 2;
+}
+
+enum GuidedDecodingMode {
+  GUIDED_DECODING_MODE_UNSPECIFIED = 0;
+  GUIDED_DECODING_MODE_JSON_SCHEMA = 1;
+  GUIDED_DECODING_MODE_REGEX = 2;
+  GUIDED_DECODING_MODE_EBNF_GRAMMAR = 3;
+  GUIDED_DECODING_MODE_STRUCTURAL_TAG = 4;
+  GUIDED_DECODING_MODE_CHOICE = 5;
+  GUIDED_DECODING_MODE_JSON_OBJECT = 6;
+}
