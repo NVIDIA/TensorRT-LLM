@@ -1900,6 +1900,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         attn_metadata.is_cuda_graph = False
 
         model_engine.max_num_tokens = 32
+        model_engine.max_num_seq_slots = 8
         model_engine.input_ids_cuda = torch.zeros(32,
                                                   dtype=torch.int32,
                                                   device='cuda')
@@ -1931,6 +1932,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         dummy_request.sampling_config.beam_width = 1
         dummy_request.py_multimodal_data = {}
         dummy_request.is_cuda_graph_dummy = True
+        dummy_request.py_mrope_position_delta = torch.tensor([[0]],
+                                                             dtype=torch.int32,
+                                                             device='cuda')
 
         scheduled_requests = ScheduledRequests()
         scheduled_requests.context_requests_last_chunk = []
@@ -1953,10 +1957,10 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          [0])
         # Read slots are dense w.r.t. the generation batch: the padded dummy
         # has no MRoPE metadata, so it resolves to the reserved zero slot
-        # (max_num_tokens * pp_size) rather than being dropped, which would
+        # (max_num_seq_slots) rather than being dropped, which would
         # shift every later request onto another request's delta.
         self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
-                         [0, 32])
+                         [0, model_engine.max_num_seq_slots])
         self.assertNotIn("multimodal_embedding",
                          multimodal_request.py_multimodal_data)
         kv_cache_manager.shutdown()
@@ -2051,11 +2055,11 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             kv_cache_manager=kv_cache_manager,
             attn_metadata=attn_metadata)
 
-        # One entry per generation request, in batch order. Slot 32 is the
-        # reserved zero slot (max_num_tokens * pp_size) standing in for the
-        # text-only request's zero delta.
+        # One entry per generation request, in batch order. The reserved zero
+        # slot (max_num_seq_slots) stands in for the text-only request's zero
+        # delta.
         self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
-                         [0, 32, 2])
+                         [0, model_engine.max_num_seq_slots, 2])
         # Only the two multimodal requests seed the seq-slot delta cache.
         self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
                          [0, 2])
@@ -2160,6 +2164,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertEqual(attn_metadata.num_contexts, 0)
         self.assertEqual(model_engine.previous_request_ids, [])
         kv_cache_manager.shutdown()
+
+    def test_preconstructed_mrope_model_requires_runtime_seq_slot_capacity(
+            self) -> None:
+        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine.max_num_seq_slots = 8
+        model_engine.model = SimpleNamespace(
+            mrope_position_deltas_cache=torch.zeros(8, dtype=torch.int32))
+
+        with self.assertRaisesRegex(ValueError, "requires at least 9"):
+            model_engine._validate_mrope_position_delta_cache_capacity()
 
     def test_kv_cache_manager_with_execution_stream(self) -> None:
         """Test that KVCacheManager uses the provided execution_stream.

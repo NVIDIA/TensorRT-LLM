@@ -31,7 +31,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.scheduler import RequestScheduler, ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
 
@@ -55,6 +55,8 @@ def _make_active_request(
         LlmRequestState.DISAGG_TRANS_ERROR if in_error else LlmRequestState.GENERATION_IN_PROGRESS
     )
     req.is_attention_dp_dummy = False
+    req.is_context_init_state = False
+    req.py_encoder_output_ready_event = None
     return req
 
 
@@ -594,6 +596,17 @@ class MockPadDummyExecutor:
         self.dist = Mock()
         self.dist.tp_size = tp_size
         self.dist.tp_allgather.side_effect = lambda value: [value]
+
+        self.scheduler = Mock()
+        self.scheduler.scheduling_state_range = (
+            LlmRequestState.CONTEXT_INIT,
+            LlmRequestState.GENERATION_TO_COMPLETE,
+        )
+        self.scheduler.is_request_in_schedulable_state.side_effect = (
+            lambda request: RequestScheduler.is_request_in_schedulable_state(
+                self.scheduler, request
+            )
+        )
 
         self.kv_cache_manager = Mock()
         self.kv_cache_manager.mapping.has_cp_helix.return_value = False

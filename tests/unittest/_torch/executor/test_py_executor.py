@@ -40,6 +40,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
+    RequestScheduler,
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
@@ -1650,6 +1651,8 @@ def _make_adp_request(
     req.py_skip_gen_alloc_revert = False
     req.llm_request_type = llm_request_type
     req.py_seq_slot = None
+    req.is_context_init_state = state == LlmRequestState.CONTEXT_INIT
+    req.py_encoder_output_ready_event = None
     return req
 
 
@@ -1686,6 +1689,17 @@ class _StubADPExecutor:
         self.dist = Mock()
         self.dist.tp_size = 1
         self.dist.tp_allgather.side_effect = lambda value: [value]
+
+        self.scheduler = Mock()
+        self.scheduler.scheduling_state_range = (
+            LlmRequestState.CONTEXT_INIT,
+            LlmRequestState.GENERATION_TO_COMPLETE,
+        )
+        self.scheduler.is_request_in_schedulable_state.side_effect = (
+            lambda request: RequestScheduler.is_request_in_schedulable_state(
+                self.scheduler, request
+            )
+        )
 
         kv_cache_manager = Mock()
         kv_cache_manager.mapping.has_cp_helix.return_value = False
@@ -1881,6 +1895,35 @@ def test_pad_dummy_still_added_when_surplus_requests_are_unschedulable() -> None
 
     assert len(stub.add_dummy_calls) == 1
     assert stub.expected_num_active_requests == 2
+
+
+def test_encoder_init_uses_encoder_decoder_scheduler_state_window():
+    stub = _StubADPExecutor()
+    stub.scheduler.scheduling_state_range = (
+        LlmRequestState.ENCODER_INIT,
+        LlmRequestState.GENERATION_TO_COMPLETE,
+    )
+    stub.active_requests = [_make_adp_request(LlmRequestState.ENCODER_INIT)]
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls == []
+    assert len(stub.active_requests) == 1
+
+
+def test_decoder_context_waiting_for_encoder_output_is_not_counted():
+    stub = _StubADPExecutor()
+    request = _make_adp_request(LlmRequestState.CONTEXT_INIT)
+    request.py_encoder_output_ready_event = Mock()
+    request.py_encoder_output_ready_event.query.return_value = False
+    stub.active_requests = [request]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert len(stub.active_requests) == 2
 
 
 def test_non_dsv4_disagg_adp_mixed_rank_states_stay_queueable():

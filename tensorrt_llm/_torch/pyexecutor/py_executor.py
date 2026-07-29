@@ -6161,10 +6161,10 @@ class PyExecutor:
     def _count_schedulable_active_requests(self) -> int:
         """Count active requests that are ready for scheduling.
 
-        The non-PP disaggregated ADP path mirrors the decoder scheduler's state
-        window [CONTEXT_INIT, GENERATION_TO_COMPLETE). This covers
-        generation-first context requests below the lower bound and terminal
-        requests at the upper bound. PP eligibility remains follow-up scope.
+        The non-PP disaggregated ADP path uses the scheduler's state-
+        eligibility contract. This keeps decoder-only and encoder-decoder
+        boundaries and special exclusions aligned without duplicating them
+        here. PP eligibility remains follow-up scope.
 
         Returns:
             The number of active requests eligible for scheduling.
@@ -6179,12 +6179,8 @@ class PyExecutor:
                 if not (req.is_disagg_generation_init_state
                         or req.is_disagg_generation_transmission_in_progress))
 
-        schedule_from_value = LlmRequestState.CONTEXT_INIT.value
-        to_complete_value = LlmRequestState.GENERATION_TO_COMPLETE.value
-
-        return sum(
-            1 for req in self.active_requests
-            if schedule_from_value <= req.state_value < to_complete_value)
+        return sum(1 for req in self.active_requests
+                   if self.scheduler.is_request_in_schedulable_state(req))
 
     def _has_adp_dummy_kv_capacity(self,
                                    token_nums: Optional[List[int]]) -> bool:

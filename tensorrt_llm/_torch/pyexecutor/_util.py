@@ -2983,8 +2983,12 @@ def create_py_executor_instance(
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
         )
 
-        mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
-                                               ctx_chunk_config)
+        mb_scheduler = BindMicroBatchScheduler(
+            max_batch_size,
+            max_num_tokens,
+            ctx_chunk_config,
+            no_schedule_until_state=no_schedule_until_state,
+        )
 
         reorder_policy_config = llm_args.reorder_policy_config
         if reorder_policy_config is not None:
