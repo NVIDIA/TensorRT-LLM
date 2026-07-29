@@ -1026,21 +1026,26 @@ bash "${scriptPrepareBodyPathNode}"
                 }
             }
 
-            stage("[${stageName}] Prepare Container") {
-                if (cluster.fatBuilderArgs != null) {
-                    try {
-                        Utils.exec(
-                            pipeline,
-                            timeout: false,
-                            script: Utils.sshUserCmd(remote, scriptPreparePathNode),
-                            numRetries: 3
-                        )
-                    } catch (Exception e) {
-                        echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU agent job will fall back to base sqsh + full install."
+            boolean isRetry = retryContext != null && ((retryContext.attempt ?: 1) as int) > 1
+            if (!isRetry) {
+                stage("[${stageName}] Prepare Container") {
+                    if (cluster.fatBuilderArgs != null) {
+                        try {
+                            Utils.exec(
+                                pipeline,
+                                timeout: false,
+                                script: Utils.sshUserCmd(remote, scriptPreparePathNode),
+                                numRetries: 3
+                            )
+                        } catch (Exception e) {
+                            echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU agent job will fall back to base sqsh + full install."
+                        }
+                    } else {
+                        echo "No fat sqsh builder configured; skipping Prepare Container."
                     }
-                } else {
-                    echo "No fat sqsh builder configured; skipping Prepare Container."
                 }
+            } else {
+                echo "[Prepare Container] Skipping on retry attempt ${retryContext.attempt}: reusing fat sqsh built in attempt 1."
             }
 
             stage('Request Node Via Slurm') {
@@ -2174,20 +2179,27 @@ bash "${scriptPrepareBodyPathNode}"
                 )
             }
 
-            stage("[${stageName}] Prepare Container") {
-                // Submit the CPU fat-sqsh builder job (if configured) and poll until
-                // it completes. Non-fatal: any failure here lets the GPU job fall back
-                // to base sqsh + full pip install.
-                try {
-                    Utils.exec(
-                        pipeline,
-                        timeout: false,
-                        script: Utils.sshUserCmd(remote, scriptPreparePathNode),
-                        numRetries: 3
-                    )
-                } catch (Exception e) {
-                    echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU job will fall back to base sqsh + full install."
+            // On retry the fat sqsh is already on disk from attempt 1; skip
+            // Prepare Container entirely so it doesn't appear in the stage view.
+            boolean isRetry = retryContext != null && ((retryContext.attempt ?: 1) as int) > 1
+            if (!isRetry) {
+                stage("[${stageName}] Prepare Container") {
+                    // Submit the CPU fat-sqsh builder job (if configured) and poll until
+                    // it completes. Non-fatal: any failure here lets the GPU job fall back
+                    // to base sqsh + full pip install.
+                    try {
+                        Utils.exec(
+                            pipeline,
+                            timeout: false,
+                            script: Utils.sshUserCmd(remote, scriptPreparePathNode),
+                            numRetries: 3
+                        )
+                    } catch (Exception e) {
+                        echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU job will fall back to base sqsh + full install."
+                    }
                 }
+            } else {
+                echo "[Prepare Container] Skipping on retry attempt ${retryContext.attempt}: reusing fat sqsh built in attempt 1."
             }
 
             stage("[${stageName}] Run Pytest") {
