@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import abc
 import itertools
+import math
 import os
 import socket
 import sys
@@ -230,17 +234,18 @@ def _identity_barrier_timeout() -> float:
     submitted to a freshly built ``MPIPoolExecutor``, and mpi4py spawns lazily
     from its manager thread — so this deadline really bounds the whole worker
     bootstrap: process spawn plus ``import tensorrt_llm``, measured at ~50-65s
-    on an idle node and up to ~117s on a contended one (see
-    ``tests/test_common/session_prefetcher.py``, which budgets 180s for the
-    same work). Hence a ceiling sized against bootstrap cost rather than
-    barrier latency. ``TRTLLM_MPI_IDENTITY_TIMEOUT`` overrides it.
+    on an idle node and up to ~117s on a contended one. Hence a ceiling sized
+    against bootstrap cost rather than barrier latency. The test-session
+    prefetcher derives its own wait budget from this value so it cannot abandon
+    a bootstrap that this layer still considers healthy.
+    ``TRTLLM_MPI_IDENTITY_TIMEOUT`` overrides it.
     """
     raw = os.environ.get("TRTLLM_MPI_IDENTITY_TIMEOUT")
     if not raw:
         return _DEFAULT_IDENTITY_TIMEOUT
     try:
         value = float(raw)
-        if value > 0:  # also rejects NaN, which no comparison accepts
+        if math.isfinite(value) and value > 0:
             return value
     except ValueError:
         pass

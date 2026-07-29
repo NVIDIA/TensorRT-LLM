@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import subprocess  # nosec B404
 import sys
@@ -218,7 +221,11 @@ def test_wait_workers_exit_bounded_by_timeout_on_live_worker():
     assert 0.2 <= waited < 2.0  # bounded: a wedged worker cannot hang teardown
 
 
-def _collect_identities(monkeypatch, results, pending=0, n_workers=2):
+def _collect_identities(monkeypatch,
+                        results,
+                        pending=0,
+                        n_workers=2,
+                        observed_timeouts=None):
     """Drive _collect_worker_identities on an inert stand-in (no MPI spawn)."""
     import types
     from concurrent.futures import Future
@@ -232,7 +239,12 @@ def _collect_identities(monkeypatch, results, pending=0, n_workers=2):
 
     from tensorrt_llm.llmapi import mpi_session as m
 
-    monkeypatch.setattr(m, "futures_wait", lambda fs, timeout: (futs, never))
+    def _fake_wait(fs, timeout):
+        if observed_timeouts is not None:
+            observed_timeouts.append(timeout)
+        return futs, never
+
+    monkeypatch.setattr(m, "futures_wait", _fake_wait)
     killed = []
     monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(pid))
     it = iter(futs + never)
@@ -279,6 +291,18 @@ def test_identity_collection_fails_closed_on_duplicate_pids(monkeypatch):
         _collect_identities(monkeypatch, [me, me])  # one worker answered twice
 
 
+def test_identity_collection_uses_configured_timeout(monkeypatch):
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    monkeypatch.setenv("TRTLLM_MPI_IDENTITY_TIMEOUT", "123.5")
+    observed_timeouts = []
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    _collect_identities(monkeypatch, [me],
+                        n_workers=1,
+                        observed_timeouts=observed_timeouts)
+    assert observed_timeouts == [123.5]
+
+
 def test_identity_timeout_covers_worker_bootstrap(monkeypatch):
     # The deadline bounds spawn + `import tensorrt_llm`, not barrier latency:
     # it must exceed the slowest bootstrap the repo measures (~117s busy node).
@@ -288,12 +312,16 @@ def test_identity_timeout_covers_worker_bootstrap(monkeypatch):
 
 # Invalid values (unparsable, non-positive) fall back to the default rather
 # than turning the barrier into a busy-wait or an unbounded block.
-@pytest.mark.parametrize("raw, expected", [("90", 90.0), ("0.5", 0.5),
-                                           ("", _DEFAULT_IDENTITY_TIMEOUT),
-                                           ("0", _DEFAULT_IDENTITY_TIMEOUT),
-                                           ("-1", _DEFAULT_IDENTITY_TIMEOUT),
-                                           ("abc", _DEFAULT_IDENTITY_TIMEOUT),
-                                           ("nan", _DEFAULT_IDENTITY_TIMEOUT)])
+@pytest.mark.parametrize("raw, expected",
+                         [("90", 90.0), ("0.5", 0.5),
+                          ("", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("0", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("-1", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("abc", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("nan", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("inf", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("-inf", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("1e309", _DEFAULT_IDENTITY_TIMEOUT)])
 def test_identity_timeout_env_override(monkeypatch, raw, expected):
     monkeypatch.setenv("TRTLLM_MPI_IDENTITY_TIMEOUT", raw)
     assert _identity_barrier_timeout() == expected
