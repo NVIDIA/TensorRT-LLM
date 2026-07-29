@@ -44,7 +44,8 @@ if IS_FLASHINFER_AVAILABLE:
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
 
 from ..modules.multi_stream_utils import do_multi_stream
-from ..modules.swiglu import silu_and_mul_kernel
+from ..modules.swiglu import (get_silu_b200_tuning_params,
+                              silu_and_mul_2in_kernel, silu_and_mul_kernel)
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
@@ -2085,6 +2086,71 @@ def _(
 
     o_dtype = dtype or x.dtype
     return x.new_empty((b, d), dtype=o_dtype)
+
+
+@torch.library.custom_op("trtllm::silu_and_mul_2in", mutates_args=())
+def silu_and_mul_2in(gate: torch.Tensor,
+                     up: torch.Tensor,
+                     scale: Optional[torch.Tensor] = None,
+                     dtype: Optional[torch.dtype] = None,
+                     swiglu_limit: Optional[float] = None) -> torch.Tensor:
+    """silu_and_mul for gate and up held in separate tensors.
+
+    Equivalent to silu_and_mul(cat([gate, up], -1), ...) with no concatenation.
+    """
+    # Rank-agnostic: the kernel walks a flat run of numel() elements, so any
+    # matching contiguous shape works. Models carry rank-3 [batch, seq, hidden]
+    # activations, and requiring rank 2 here would force callers to reshape.
+    assert gate.shape == up.shape, (
+        f"gate and up must have the same shape, got {tuple(gate.shape)} and "
+        f"{tuple(up.shape)}")
+    assert gate.dtype == up.dtype, (
+        f"gate and up must have the same dtype, got {gate.dtype} and {up.dtype}"
+    )
+    assert gate.device == up.device, (
+        f"gate and up must be on the same device, got {gate.device} and "
+        f"{up.device}")
+    # The kernel indexes both operands as flat contiguous runs, so a strided
+    # view would read the wrong addresses and silently return garbage. Linear
+    # outputs are contiguous; reject anything else rather than copying.
+    assert gate.is_contiguous() and up.is_contiguous(), (
+        f"gate and up must be contiguous, got strides {gate.stride()} and "
+        f"{up.stride()} for shape {tuple(gate.shape)}")
+
+    o_dtype = dtype or gate.dtype
+    o = torch.empty(gate.shape, dtype=o_dtype, device=gate.device)
+
+    # Validated and performance-tuned on B200 only. Other architectures are
+    # unvalidated and are not rejected; no performance guarantee is made.
+    block_elements, num_warps = get_silu_b200_tuning_params(o_dtype)
+    n_elements = gate.numel()
+
+    silu_and_mul_2in_kernel[(triton.cdiv(n_elements, block_elements), )](
+        o_ptr=o,
+        o_scale_ptr=scale,
+        gate_ptr=gate,
+        up_ptr=up,
+        n_elements=n_elements,
+        swiglu_limit=swiglu_limit or 0.0,
+        BLOCK_SIZE=block_elements,
+        HAS_O_SCALE=scale is not None,
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None and swiglu_limit > 0.0,
+        num_warps=num_warps,
+    )
+
+    return o
+
+
+@silu_and_mul_2in.register_fake
+def _(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    dtype: Optional[torch.dtype] = None,
+    swiglu_limit: Optional[float] = None,
+) -> torch.Tensor:
+    o_dtype = dtype or gate.dtype
+    return gate.new_empty(gate.shape, dtype=o_dtype)
 
 
 class AllReduceRunner(TunableRunner):
