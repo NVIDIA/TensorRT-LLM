@@ -148,6 +148,9 @@ def eager_on_graph(inner: Callable) -> Callable:
 
     @functools.wraps(inner)
     def wrapper(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return inner(*args, **kwargs)
+
         capture = _current_capture.get()
         if capture is None:
             return inner(*args, **kwargs)

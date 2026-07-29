@@ -80,6 +80,17 @@ def test_outside_capture():
     torch.testing.assert_close(outside(value), value + 2)
 
 
+def test_eager_on_graph_during_torch_compile():
+    @eager_on_graph
+    def add_one(value):
+        return value + 1
+
+    compiled_add_one = torch.compile(add_one, backend="eager", fullgraph=True)
+    value = torch.ones(4, device="cuda")
+
+    torch.testing.assert_close(compiled_add_one(value), value + 1)
+
+
 def test_make_weak_ref_option_preserves_unsupported_values():
     unsupported = object()
     with pytest.raises(TypeError, match="Invalid type"):
