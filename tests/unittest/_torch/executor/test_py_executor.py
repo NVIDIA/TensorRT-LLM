@@ -23,7 +23,11 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    DisaggTransferAdmissionController,
+    PyExecutor,
+    _get_diagnostic_disagg_admission_budget_multiplier,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
     ScheduledRequests,
@@ -301,6 +305,83 @@ def _make_disagg_transfer_request(
 
 
 class TestDisaggTransferAdmissionController:
+    def test_diagnostic_multiplier_quadruples_logical_budget(self, monkeypatch):
+        log_info = Mock()
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.info", log_info)
+        controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32,
+            tokens_per_block=32,
+            admission_budget_multiplier=4,
+        )
+        active = _make_disagg_transfer_request(1, 32, in_progress=True)
+        candidates = [_make_disagg_transfer_request(request_id, 32) for request_id in range(2, 5)]
+
+        comparison_result = controller.select(active_requests=[active], candidates=candidates[:1])
+
+        assert comparison_result.admitted_requests == candidates[:1]
+        assert not controller.diagnostic_budget_multiplier_observed
+        assert log_info.call_count == 1
+
+        result = controller.select(active_requests=[active], candidates=candidates)
+
+        assert controller.base_max_transfer_blocks == 1
+        assert controller.max_transfer_blocks == 4
+        assert result.admitted_requests == candidates
+        assert result.active_transfer_blocks + result.admitted_transfer_blocks == 4
+        assert controller.diagnostic_budget_multiplier_observed
+        assert ["DIAGNOSTIC ONLY", "DIAGNOSTIC OBSERVED"] == [
+            invocation.args[0].split(":", maxsplit=1)[0] for invocation in log_info.call_args_list
+        ]
+
+        controller.select(active_requests=[active], candidates=candidates)
+        assert log_info.call_count == 2
+
+    @pytest.mark.parametrize("multiplier", [0, -1, True, 1.5, "4"])
+    def test_rejects_invalid_admission_budget_multiplier(self, multiplier):
+        with pytest.raises(ValueError, match="positive integer"):
+            DisaggTransferAdmissionController(
+                max_tokens_in_buffer=32,
+                tokens_per_block=32,
+                admission_budget_multiplier=multiplier,
+            )
+
+    @pytest.mark.parametrize("raw_multiplier", ["0", "-1", "", "1.5", "invalid"])
+    def test_rejects_invalid_diagnostic_multiplier_env(self, monkeypatch, raw_multiplier):
+        monkeypatch.setenv(
+            "TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BUDGET_MULTIPLIER",
+            raw_multiplier,
+        )
+
+        with pytest.raises(ValueError, match="positive integer"):
+            _get_diagnostic_disagg_admission_budget_multiplier()
+
+    def test_reads_diagnostic_multiplier_env(self, monkeypatch):
+        monkeypatch.delenv(
+            "TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BUDGET_MULTIPLIER",
+            raising=False,
+        )
+        assert _get_diagnostic_disagg_admission_budget_multiplier() == 1
+
+        monkeypatch.setenv("TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BUDGET_MULTIPLIER", "4")
+        assert _get_diagnostic_disagg_admission_budget_multiplier() == 4
+
+    def test_idle_oversized_head_does_not_report_multiplier_exercised(self, monkeypatch):
+        log_info = Mock()
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.info", log_info)
+        controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32,
+            tokens_per_block=32,
+            admission_budget_multiplier=4,
+        )
+        log_info.reset_mock()
+        oversized = _make_disagg_transfer_request(1, 96)
+
+        result = controller.select(active_requests=[], candidates=[oversized])
+
+        assert result.admitted_requests == [oversized]
+        assert not controller.diagnostic_budget_multiplier_observed
+        log_info.assert_not_called()
+
     def test_disabled_preserves_candidates(self):
         controller = DisaggTransferAdmissionController(
             max_tokens_in_buffer=None, tokens_per_block=32
