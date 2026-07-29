@@ -85,8 +85,17 @@ class _CacheStubModel(_StubModel):
         self.encoder_call_count += 1
         self.last_encoder_batch_size = len(multimodal_params)
         self.encoder_call_stream_id = torch.cuda.current_stream().cuda_stream
+        total_rows = sum(
+            sum(
+                param.multimodal_data.get(
+                    "multimodal_embedding_lengths",
+                    [self._tokens_per_image],
+                )
+            )
+            for param in multimodal_params
+        )
         return torch.full(
-            (len(multimodal_params) * self._tokens_per_image, self._hidden_size),
+            (total_rows, self._hidden_size),
             float(self.encoder_call_count),
             device="cuda",
         )
@@ -134,6 +143,34 @@ def _make_cacheable_request(
         multimodal_positions=[0],
         multimodal_lengths=[num_tokens],
         multimodal_uuids=[None],
+    )
+
+
+def _make_two_item_cacheable_request(
+    request_id: int,
+    item_hashes: list[list[int]],
+) -> LlmRequest:
+    tokens_per_item = 4
+    num_tokens = len(item_hashes) * tokens_per_item
+    return LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=[0] * num_tokens,
+        sampling_config=SamplingConfig(beam_width=1),
+        is_streaming=False,
+        py_multimodal_data={
+            "image": {
+                "pixel_values": torch.randn(len(item_hashes), 3, 32, 32),
+                "image_sizes": [[32, 32]] * len(item_hashes),
+            },
+            "multimodal_embed_mask_cumsum": torch.arange(1, num_tokens + 1, dtype=torch.int64),
+            "multimodal_embedding_lengths": [tokens_per_item] * len(item_hashes),
+            "mm_processor_kwargs_hash": "kwargs-a",
+        },
+        multimodal_hashes=item_hashes,
+        multimodal_positions=list(range(0, num_tokens, tokens_per_item)),
+        multimodal_lengths=[tokens_per_item] * len(item_hashes),
+        multimodal_uuids=[None] * len(item_hashes),
     )
 
 
@@ -377,6 +414,43 @@ def test_cross_iter_prefetch_mixed_cache_hit_and_miss_encodes_only_miss():
         miss.py_multimodal_data["multimodal_embedding"],
         torch.full((4, 8), 2.0, device="cuda"),
     )
+
+
+@requires_cuda
+def test_cross_iter_prefetch_partial_hit_encodes_only_missing_item():
+    max_prefetch_ahead = 2
+    model = _CacheStubModel(hidden_size=8, tokens_per_image=4)
+    hit_hash = [1, 2, 3, 4, 5, 6, 7, 8]
+    miss_hash = [9] * 8
+
+    first = _make_cacheable_request(request_id=0, num_tokens=4, item_hash=hit_hash)
+    maybe_prefetch_mm_encoder_for_next_iter(model, [first], max_prefetch_ahead=max_prefetch_ahead)
+    first.py_mm_encoder_event.synchronize()
+
+    partial = _make_two_item_cacheable_request(request_id=1, item_hashes=[hit_hash, miss_hash])
+    assert (
+        maybe_prefetch_mm_encoder_for_next_iter(
+            model,
+            [partial],
+            max_prefetch_ahead=max_prefetch_ahead,
+        )
+        == 1
+    )
+    partial.py_mm_encoder_event.synchronize()
+
+    assert model.encoder_call_count == 2
+    assert model.last_encoder_batch_size == 1
+    torch.testing.assert_close(
+        partial.py_multimodal_data["multimodal_embedding"][:4],
+        torch.ones((4, 8), device="cuda"),
+    )
+    torch.testing.assert_close(
+        partial.py_multimodal_data["multimodal_embedding"][4:],
+        torch.full((4, 8), 2.0, device="cuda"),
+    )
+    cache = model._multimodal_encoder_cache
+    assert cache is not None
+    assert len(cache) == 2
 
 
 @requires_cuda

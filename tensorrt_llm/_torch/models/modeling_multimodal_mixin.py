@@ -1258,17 +1258,24 @@ def _dispatch_cross_iter_prefetch(
     try:
         with _run_on_aux_stream(aux_stream) as encoder_event:
             encoder_cache = model._get_multimodal_encoder_cache() if encoder_cache_enabled else None
-            params_to_encode = (
-                [
-                    param
-                    for param in params_list
-                    if not model._attach_encoder_cache_hit(param, encoder_cache)
-                ]
-                if encoder_cache is not None
-                else params_list
-            )
+            cache_misses: list[MultimodalParams] = []
+            partial_hits: list[tuple[MultimodalParams, EncoderCachePartition]] = []
+            if encoder_cache is None:
+                cache_misses = params_list
+            else:
+                for param in params_list:
+                    partition = model.partition_encoder_cache(param, encoder_cache)
+                    if partition is None or partition.is_full_miss:
+                        cache_misses.append(param)
+                    elif partition.is_full_hit:
+                        param.multimodal_data["multimodal_embedding"] = (
+                            model.assemble_full_embedding(partition.hits, len(partition.keys))
+                        )
+                    else:
+                        partial_hits.append((param, partition))
 
-            for param in params_to_encode:
+            params_to_transfer = cache_misses + [param for param, _ in partial_hits]
+            for param in params_to_transfer:
                 param.to_device(
                     "multimodal_data",
                     "cuda",
@@ -1282,11 +1289,14 @@ def _dispatch_cross_iter_prefetch(
             # model_engine._prepare_inputs.
             for (req, _, _), p in zip(candidates, params_list):
                 req.py_multimodal_data = p.multimodal_data
-            if params_to_encode:
-                encoder_output = model.encode_multimodal_inputs(params_to_encode)
-                _store_chunked_prefill_embeddings(params_to_encode, [encoder_output])
+
+            if partial_hits and encoder_cache is not None:
+                model._encode_with_partial_cache(partial_hits, encoder_cache)
+            if cache_misses:
+                encoder_output = model.encode_multimodal_inputs(cache_misses)
+                _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
                 if encoder_cache is not None:
-                    for param in params_to_encode:
+                    for param in cache_misses:
                         model._write_encoder_cache_entries(param, encoder_cache)
 
             # Prefetch only needs to attach each request's embedding. Validate each request
