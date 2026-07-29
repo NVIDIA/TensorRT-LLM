@@ -1156,13 +1156,6 @@
     },
     {
       "allowed_values": [],
-      "annotation": "Optional[Annotated[int, Ge(ge=0)]]",
-      "converter": "",
-      "kind": "value",
-      "path": "mx_config.server_query_timeout_s"
-    },
-    {
-      "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",

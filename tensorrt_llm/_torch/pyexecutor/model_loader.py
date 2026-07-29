@@ -337,8 +337,6 @@ def _construct_checkpoint_loader(
         if checkpoint_format == "MX":
             if mx_config is not None:
                 extra_kwargs["mx_server_url"] = mx_config.server_url
-                extra_kwargs[
-                    "query_timeout_s"] = mx_config.server_query_timeout_s
             if mx_model_name is not None:
                 extra_kwargs["model_name"] = mx_model_name
 
@@ -456,6 +454,7 @@ class ModelLoader:
         self.weight_mapper = None
         self._weight_pool_proxy = None
         self._gms_backend = None
+        self._checkpoint_loader: Optional[BaseCheckpointLoader] = None
         # Mostly weight loading and processing time metrics, updated when load() is called.
         self._metrics: dict[str, float] = {}
 
@@ -612,6 +611,7 @@ class ModelLoader:
         self._metrics = {}
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
+        self._checkpoint_loader = checkpoint_loader
         # Some model constructors normalize or rewrite config fields. Capture
         # the registry identity from the resolved input before construction so
         # publication and reception qualify the architecture the user asked
@@ -763,6 +763,10 @@ class ModelLoader:
                     "source_identity": self._source_identity,
                 }
                 if checkpoint_loader.checkpoint_format == "MX":
+                    load_weights_kwargs["model_config"] = config
+                    load_weights_kwargs["load_config"] = self.llm_args
+                    load_weights_kwargs[
+                        "post_transform_protocol_version"] = self._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
                     # If a separate draft model still needs a raw disk load,
                     # do not accept post-transform bytes for only the target
                     # model. Enable this only after target and draft subgraphs
@@ -883,6 +887,11 @@ class ModelLoader:
                                 "source_identity": self._source_identity,
                             }
                             if checkpoint_loader.checkpoint_format == "MX":
+                                load_weights_kwargs["model_config"] = config
+                                load_weights_kwargs[
+                                    "load_config"] = self.llm_args
+                                load_weights_kwargs[
+                                    "post_transform_protocol_version"] = self._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
                                 load_weights_kwargs[
                                     "allow_post_transform_weights"] = post_transform_qualification.qualified
                                 if post_transform_qualification.qualified:
@@ -1492,6 +1501,9 @@ class ModelLoader:
         if self._gms_backend is not None:
             self._gms_backend.cleanup()
             self._gms_backend = None
+        if self._checkpoint_loader is not None:
+            self._checkpoint_loader.cleanup()
+            self._checkpoint_loader = None
 
     def _load_and_validate_config(
             self, checkpoint_dir: str,

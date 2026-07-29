@@ -438,7 +438,6 @@ def test_construct_checkpoint_loader_passes_mx_config():
 
     assert isinstance(checkpoint_loader, MXCheckpointLoader)
     assert checkpoint_loader.mx_server_url == "http://mx:8001"
-    assert checkpoint_loader.query_timeout_s == 17
     assert checkpoint_loader.model_name == "Qwen/Qwen2.5-7B-Instruct"
 
 
@@ -543,6 +542,15 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     assert kwargs["mapping"] is loader.mapping
     assert kwargs["model"] is model
     assert kwargs["source_identity"] is loader._source_identity
+    assert (
+        kwargs["model_config"]
+        is model_loader_mod.AutoModelForCausalLM.from_config.call_args.args[0]
+    )
+    assert kwargs["load_config"] is loader.llm_args
+    assert (
+        kwargs["post_transform_protocol_version"]
+        == ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+    )
     assert kwargs["allow_post_transform_weights"] is True
     assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
     assert loader._call_load_weights.call_count == 0
@@ -564,6 +572,20 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     assert model._weights_transformed is False
     assert model.linear._weights_transformed is False
     assert events == ["post_load_weights", "load_weights"]
+
+
+def test_cleanup_releases_active_checkpoint_loader(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader.is_weights_preloaded.return_value = False
+    checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
+
+    loader.load("/ckpt", checkpoint_loader)
+    loader.cleanup()
+
+    checkpoint_loader.cleanup.assert_called_once_with()
+    assert loader._checkpoint_loader is None
 
 
 @pytest.mark.cpu_only
@@ -668,6 +690,15 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(
     loader._call_load_weights.assert_not_called()
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is True
+    assert (
+        kwargs["model_config"]
+        is model_loader_mod.AutoModelForCausalLM.from_config.call_args.args[0]
+    )
+    assert kwargs["load_config"] is loader.llm_args
+    assert (
+        kwargs["post_transform_protocol_version"]
+        == ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+    )
     assert callable(kwargs["prepare_post_transform_receiver"])
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model,
