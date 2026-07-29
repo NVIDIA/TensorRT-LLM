@@ -5,6 +5,7 @@ from collections import defaultdict
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_next_weight_mapper import (
     Qwen3NextHfWeightMapper,
 )
@@ -556,6 +557,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         return remapped_weights
 
     def preprocess_weights(self, weights: dict) -> dict:
+        is_consumable = isinstance(weights, ConsumableWeightsDict)
         quant_algo = self.config.quant_config.quant_algo
 
         normalized_weights = self._normalize_weight_names(weights)
@@ -584,4 +586,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         if not getattr(self.config.pretrained_config, "num_experts", 0):
             packed_weights = self._remap_dense_mlp_weights(packed_weights)
 
-        return super().preprocess_weights(packed_weights)
+        processed_weights = super().preprocess_weights(packed_weights)
+        if is_consumable and not isinstance(processed_weights, ConsumableWeightsDict):
+            return ConsumableWeightsDict(processed_weights)
+        return processed_weights
