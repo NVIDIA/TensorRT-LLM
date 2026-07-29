@@ -197,6 +197,16 @@ def warmup_heuristic_topk_decode(top_k: int = 2048,
 # SM100-aware num_math_warpgroups in the metadata JIT impl).
 _DG_SCHEDULE_BLOCK_KV = 64
 
+# dtype of the indexer MQA-logits that feed the top-k. All paged_mqa_logits
+# paths produce fp32 today (DSL fp8/fp4 default output_dtype=fp32; DeepGEMM
+# fp8 hardcodes kFloat; DeepGEMM fp4 defaults logits_dtype=kFloat32 and is not
+# overridden here), and the decode forward feeds logits to the top-k without a
+# cast. dtype is a top-k compile-key dimension, so the warmup pre-compiles for
+# exactly this value. If a paged_mqa_logits caller ever emits a different dtype
+# (e.g. overriding the DeepGEMM fp4 logits_dtype to bf16), update this constant
+# or the warmup silently compiles the wrong variant.
+_INDEXER_LOGITS_DTYPE = torch.float32
+
 
 def _pick_dsl_expand(
     next_n: int,
@@ -751,6 +761,54 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         return max(
             1,
             self.kv_cache_manager.max_seq_len // self._indexer_compress_ratio)
+
+    def warmup_cute_dsl_radix_topk(self, next_n: int) -> None:
+        """Pre-compile the radix-filter CuTe DSL decode top-k during warmup.
+
+        Eager decode iters (mixed prefill+decode batch, or ``cuda_graph``
+        disabled) whose ``num_rows`` lands in a ``cluster_size`` band that
+        graph capture did not exercise otherwise pay a first-touch JIT stall
+        on a live request. ``num_cols`` is fixed at ``indexer_max_seq_len``,
+        so only the ``cluster_size`` dimension needs sweeping; delegate to the
+        custom-op warmup helper, which owns the band enumeration.
+
+        ``next_n`` (a compile-key dimension) is supplied by the caller from
+        the engine's static spec-decode config.
+
+        No-op unless decode actually routes to
+        ``cute_dsl_indexer_topk_decode``: heuristic top-k uses the GVR kernel
+        and plain (no cute_dsl_topk) decode uses the C++ op. Called once from
+        ``ModelEngine.warmup``.
+        """
+        if not self.use_cute_dsl_topk or self.enable_heuristic_topk:
+            return
+        if self.kv_cache_manager is None:
+            return
+        top_k = getattr(self.sparse_metadata_params, "index_topk", None)
+        if not top_k:
+            return
+        # The radix-filter DSL kernel does not support a compressed indexer
+        # combined with multi-row MTP: decode dispatches to it only when
+        # compress_ratio == 1 or next_n == 1. The compress_ratio > 1 &&
+        # next_n > 1 case routes to the C++ op (or GVR when heuristic top-k is
+        # on), so there is nothing to pre-compile here.
+        # TODO: extending the radix-filter path to compress_ratio > 1 &&
+        # next_n > 1 is straightforward; once the dispatch above is relaxed to
+        # use it there, drop this guard so the case is pre-compiled too.
+        if self._indexer_compress_ratio > 1 and next_n > 1:
+            return
+        try:
+            from ...custom_ops.cute_dsl_custom_ops import \
+                warmup_cute_dsl_radix_topk_decode
+        except ImportError:
+            return
+        warmup_cute_dsl_radix_topk_decode(
+            top_k=int(top_k),
+            num_cols=int(self.get_indexer_max_seq_len()),
+            next_n=next_n,
+            dtype=_INDEXER_LOGITS_DTYPE,
+            num_sms=self.num_sms,
+        )
 
     def on_update_kv_lens(self):
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
@@ -1816,16 +1874,6 @@ class Indexer(nn.Module):
         self._enable_heuristic_topk = (sparse_params.enable_heuristic_topk
                                        and get_sm_version() >= 100)
 
-        if (self.use_cute_dsl_topk
-                or self.use_cute_dsl_paged_mqa_logits) and layer_idx == 0:
-            from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
-
-            if self.use_cute_dsl_topk and not self._enable_heuristic_topk:
-                # the dtype of topk input tensor, which is float32 now.
-                # Note, need to update it if the dtype of topk input tensor is changed.
-                cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
-                    dtype=torch.float32, top_k=self.index_topk)
-
         if self._enable_heuristic_topk and layer_idx == 0:
             # Populate static caches (sm_count, L2 cache size) inside the C++
             # Scheme X dispatcher before any CUDA Graph capture so the host
@@ -2364,16 +2412,27 @@ class Indexer(nn.Module):
 
         return k_fp8, k_scale
 
-    def _call_mqa_logits(self, q_fp8: torch.Tensor, k_fp8: torch.Tensor,
-                         k_scale: torch.Tensor, weights: torch.Tensor,
-                         cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor,
-                         q_scale: Optional[torch.Tensor]) -> torch.Tensor:
+    def _call_mqa_logits(self,
+                         q_fp8: torch.Tensor,
+                         k_fp8: torch.Tensor,
+                         k_scale: torch.Tensor,
+                         weights: torch.Tensor,
+                         cu_seqlen_ks: torch.Tensor,
+                         cu_seqlen_ke: torch.Tensor,
+                         q_scale: Optional[torch.Tensor],
+                         clean_logits: bool = True) -> torch.Tensor:
         """Dispatch fp8_mqa_logits vs fp8_fp4_mqa_logits based on use_fp4.
 
         For FP4 the gather output keeps the legacy float8_e4m3fn dtype for
         API compatibility; reinterpret the bytes as the int8 / int32 layout
         the DeepGEMM kernel expects. The scale tensor is collapsed to 1D for
         the kv side and 2D for the q side per the kernel's asserts.
+
+        clean_logits=False skips DeepGEMM's smxx_clean_logits pass that fills
+        everything outside each row's [ks, ke) window with -inf. Safe only
+        when the consumer never reads outside that window (the custom
+        indexer_topk_prefill kernel); the torch topk fallback scans the full
+        padded row and needs the fill.
         """
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
@@ -2387,9 +2446,13 @@ class Indexer(nn.Module):
                 weights,
                 cu_seqlen_ks,
                 cu_seqlen_ke,
+                clean_logits=clean_logits,
             )
-        return fp8_mqa_logits(q_fp8, (k_fp8, k_scale.reshape(-1)), weights,
-                              cu_seqlen_ks, cu_seqlen_ke)
+        return fp8_mqa_logits(q_fp8, (k_fp8, k_scale.reshape(-1)),
+                              weights,
+                              cu_seqlen_ks,
+                              cu_seqlen_ke,
+                              clean_logits=clean_logits)
 
     def _call_paged_mqa_logits(self, q_decode: torch.Tensor,
                                k_cache: torch.Tensor,
@@ -2534,6 +2597,7 @@ class Indexer(nn.Module):
                             chunk.cu_seqlen_ks[c0:c1],
                             chunk.cu_seqlen_ke[c0:c1],
                             tile_q_scale,
+                            clean_logits=not use_custom_topk,
                         )
                         if use_custom_topk:
                             torch.ops.trtllm.indexer_topk_prefill(
@@ -2589,6 +2653,7 @@ class Indexer(nn.Module):
                     cu_seqlen_ks,
                     cu_seqlen_ke,
                     ctx_q_scale,
+                    clean_logits=not use_custom_topk,
                 )
                 if use_custom_topk:
                     torch.ops.trtllm.indexer_topk_prefill(
@@ -2829,10 +2894,7 @@ class Indexer(nn.Module):
                         max_seq_len=indexer_max_seq_len,
                         order_row=metadata.kv_lens_row_reorder,
                     )
-                # CuTE DSL radix top-k allocates O(num_gen_tokens * kv_len)
-                # global memory. Beyond 256 tokens the extra memory becomes
-                # significant, so we cap it at 256 and fall back to C++.
-                elif (self.use_cute_dsl_topk and num_gen_tokens <= 256
+                elif (self.use_cute_dsl_topk
                       and (self.compress_ratio == 1 or next_n == 1)):
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode, context_lens

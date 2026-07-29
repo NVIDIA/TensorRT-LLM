@@ -15,17 +15,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import itertools
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     ClassVar,
     Dict,
     Hashable,
     Iterable,
     Iterator,
+    List,
     Optional,
     Sequence,
+    Tuple,
+    Union,
 )
 
 import torch
@@ -42,6 +47,173 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
+
+
+@dataclass(frozen=True)
+class EncoderGroup:
+    """Modalities that share a single encoder call.
+
+    Batching all items in a group into one encoder invocation amortizes
+    fixed costs (kernel launches, dispatch) across items. The framework
+    splits the output back per-modality and reorders it into prompt order
+    via each request's `mm_item_order` manifest.
+
+    Contract between `build_batched_input` and `encoder_fn`:
+
+    * `build_batched_input` must concatenate items across requests in
+      `modalities` order (all items for the first modality across requests,
+      then all items for the second modality, etc.).
+    * Within a modality, items must appear in the same per-request iteration
+      order that `_lengths_by_modality` uses (i.e. the order of
+      `multimodal_params` passed in).
+    * `encoder_fn` must return one tensor whose rows correspond 1:1 to the
+      input layout produced by `build_batched_input`, so the framework can
+      split the output by `_lengths_by_modality` and reorder into prompt
+      order via each request's `mm_item_order` manifest.
+    """
+
+    modalities: Tuple[str, ...]
+    """Ordered modality names that share this encoder. Defines the row
+    layout of the encoder output tensor: first all items of
+    `modalities[0]`, then all items of `modalities[1]`, etc."""
+
+    encoder_fn: Callable[..., torch.Tensor]
+    """Encoder call invoked as `encoder_fn(**build_batched_input(params))`.
+    Returns a single tensor with one row per embedding, laid out per the
+    contract above."""
+
+    build_batched_input: Callable[[List[MultimodalParams]], Dict[str, Any]]
+    """Builds the kwargs dict passed to `encoder_fn`. Responsible for
+    concatenating raw per-item tensors from `multimodal_data` across
+    requests in the order described in the class docstring."""
+
+
+def _lengths_by_modality(
+    multimodal_params: List[MultimodalParams],
+    modalities: Tuple[str, ...],
+) -> Dict[str, List[int]]:
+    """Invert prompt-ordered `multimodal_embedding_lengths` (number of
+    embedding rows per item) into per-modality per-item lengths, matching
+    the per-modality item order used by `EncoderGroup.build_batched_input`.
+    """
+    by_modality: Dict[str, List[int]] = {m: [] for m in modalities}
+    for mp in multimodal_params:
+        flat = mp.multimodal_data.get("multimodal_embedding_lengths") or []
+        if mp.mm_item_order:
+            for entry, length in zip(mp.mm_item_order, flat, strict=True):
+                if entry["modality"] in by_modality:
+                    by_modality[entry["modality"]].append(length)
+            continue
+        # Raw-prompt entrypoints (non chat-parsing) do not attach a manifest,
+        # so this is the single enforcement point that a >1-modality request
+        # must carry `mm_item_order` to make prompt-order reordering possible.
+        present = [m for m in modalities if mp.multimodal_data.get(m) is not None]
+        if len(present) > 1:
+            raise ValueError(
+                "Request with multiple modalities present "
+                f"({present}) must carry mm_item_order on MultimodalParams."
+            )
+        if present:
+            by_modality[present[0]].extend(flat)
+    return by_modality
+
+
+def _reorder_embeds_by_manifest(
+    multimodal_params: List[MultimodalParams],
+    per_modality_embeds: Dict[str, torch.Tensor],
+    per_modality_lengths: Dict[str, List[int]],
+) -> torch.Tensor:
+    """Slice per-modality tensors item-by-item and concat in prompt order."""
+    per_modality_row_starts: Dict[str, List[int]] = {
+        m: list(itertools.accumulate(lens, initial=0)) for m, lens in per_modality_lengths.items()
+    }
+
+    slices: List[torch.Tensor] = []
+    # `entry["index"]` is per-request per-modality; advance a cursor to
+    # translate it into a global item index within `per_modality_embeds`.
+    per_modality_cursor: Dict[str, int] = {m: 0 for m in per_modality_embeds}
+    for mp in multimodal_params:
+        manifest = mp.mm_item_order or _synthesize_single_modality_manifest(
+            mp, per_modality_embeds.keys()
+        )
+        req_counts: Dict[str, int] = {}
+        for entry in manifest:
+            m = entry["modality"]
+            if m not in per_modality_embeds:
+                continue
+            i = per_modality_cursor[m] + entry["index"]
+            starts = per_modality_row_starts[m]
+            slices.append(per_modality_embeds[m][starts[i] : starts[i + 1]])
+            req_counts[m] = req_counts.get(m, 0) + 1
+        for m, c in req_counts.items():
+            per_modality_cursor[m] += c
+    if not slices:
+        # No items resolved for any request. This happens on the executor's
+        # KV-cache profiling pass: `_encode_dummy_inputs` runs the encoder on a
+        # worst-case dummy batch that carries the encoder tensors but no
+        # `multimodal_embedding_lengths`, so the per-modality lengths (and thus
+        # the sliced `per_modality_embeds`) come back empty. The encoder forward
+        # still ran (its activation is what peak-memory profiling captures), so
+        # return a correctly-typed empty embedding tensor instead of crashing on
+        # `torch.cat([])`. `per_modality_embeds` values are already zero-row
+        # slices of the encoder output, so their concat preserves dtype/device
+        # and the hidden dim.
+        if per_modality_embeds:
+            return torch.cat(list(per_modality_embeds.values()), dim=0)
+        return torch.empty(0)
+    return torch.cat(slices, dim=0)
+
+
+def _synthesize_single_modality_manifest(
+    mp: MultimodalParams,
+    modalities: Iterable[str],
+) -> List[Dict[str, Union[str, int]]]:
+    """Trivial manifest for requests with only one modality present."""
+    flat = mp.multimodal_data.get("multimodal_embedding_lengths") or []
+    for m in modalities:
+        if mp.multimodal_data.get(m) is not None:
+            return [{"modality": m, "index": i} for i in range(len(flat))]
+    return []
+
+
+def encode_multimodal_by_groups(
+    mm_encoder_groups: Sequence["EncoderGroup"],
+    multimodal_params: List[MultimodalParams],
+) -> torch.Tensor:
+    """Run each group's encoder over its batched items and reorder into
+    per-request prompt order.
+
+    For each group present in the batch, one encoder call is issued over all
+    items across all requests belonging to that group's modalities
+    (arithmetic-intensity win). The output is split back per-modality using
+    the prompt-ordered `multimodal_embedding_lengths` already stashed on
+    `multimodal_data`, then reordered into each request's `mm_item_order`
+    prompt sequence.
+
+    Shared entry point for both the aggregated (`MultimodalModelMixin`) and
+    mm-encoder-only (`Qwen3VisionModelBase.forward`) paths so the ordering
+    contract lives in one place.
+    """
+    per_modality_embeds: Dict[str, torch.Tensor] = {}
+    per_modality_lengths: Dict[str, List[int]] = {}
+    for group in mm_encoder_groups:
+        group_params = [
+            mp
+            for mp in multimodal_params
+            if any(mp.multimodal_data.get(m) is not None for m in group.modalities)
+        ]
+        if not group_params:
+            continue
+        out = group.encoder_fn(**group.build_batched_input(group_params))
+        lengths = _lengths_by_modality(group_params, group.modalities)
+        cursor = 0
+        for m in group.modalities:
+            total = sum(lengths[m])
+            per_modality_embeds[m] = out[cursor : cursor + total]
+            cursor += total
+        per_modality_lengths.update(lengths)
+    return _reorder_embeds_by_manifest(multimodal_params, per_modality_embeds, per_modality_lengths)
+
 
 if TYPE_CHECKING:
     from ..pyexecutor.llm_request import LlmRequest
@@ -152,6 +324,14 @@ class MultimodalModelMixin:
             return tensor.to(dtype=dtype)
 
         return module._apply(convert)
+
+    # Per-model registration of encoder-batching groups. Each `EncoderGroup`
+    # bundles a set of modalities that share one encoder call. Set as a class
+    # attribute or on `self` in `__init__` (when `encoder_fn` binds to instance
+    # methods). Consumers call the module-level `encode_multimodal_by_groups`
+    # with these groups; both the aggregated and mm-encoder-only paths share
+    # that helper so the ordering contract lives in one place.
+    mm_encoder_groups: Sequence[EncoderGroup] = ()
 
     def encode_multimodal_inputs(
         self,
