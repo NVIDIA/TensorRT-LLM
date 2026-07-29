@@ -3,7 +3,11 @@ import base64
 import os
 from typing import Any, Dict, List, Optional
 
-from tensorrt_llm.inputs.media_io import is_decodable_image_bytes, sniff_media_kind
+from tensorrt_llm.inputs.media_io import (
+    is_decodable_image_bytes,
+    is_isobmff_image_bytes,
+    sniff_media_kind,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
 from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
@@ -178,6 +182,12 @@ def parse_visual_gen_params(
                 # check, so a truncated PNG 400s here instead of 500ing at
                 # the worker's load.
                 if not is_decodable_image_bytes(payload):
+                    if is_isobmff_image_bytes(payload):
+                        raise ValueError(
+                            "input_reference is a HEIF/AVIF image, which is not "
+                            "a supported reference format; convert it to PNG or "
+                            "JPEG."
+                        )
                     raise ValueError(
                         "input_reference has an image container signature but "
                         "does not fully decode; the file may be truncated or "

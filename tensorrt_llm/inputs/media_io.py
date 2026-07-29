@@ -356,16 +356,98 @@ def _get_cv2():
 # with what actually decodes.
 
 
+# ISO-BMFF brands that mark a still image or image sequence (HEIF/AVIF/AVC
+# image). `ftyp` identifies the ISO-BMFF *family*, not video — HEIC photos
+# (the iOS camera default) share it with MP4 — so these are split out and
+# rejected at the boundary instead of being sent to a video decoder that
+# cannot use them.
+#
+# Deliberately NOT an exhaustive image registry: an unfamiliar ISO-BMFF
+# still-image brand simply stays a video candidate and gets a 400 from the
+# worker's decoder, which is safe. Registered names per MP4RA
+# (https://mp4ra.org/registered-types/brands).
+_ISOBMFF_IMAGE_BRANDS = frozenset(
+    {
+        b"mif1",
+        b"mif2",
+        b"msf1",  # MIAF image / image sequence
+        b"heic",
+        b"heix",
+        b"heim",
+        b"heis",  # HEVC image
+        b"hevc",
+        b"hevx",
+        b"hevm",
+        b"hevs",  # HEVC image sequence
+        b"avif",
+        b"avis",  # AVIF image / sequence
+        b"avci",
+        b"avcs",  # AVC image / sequence
+    }
+)
+
+# Enough bytes for the whole `ftyp` box in practice: 16 header bytes plus a
+# compatible-brands list, which realistically holds a handful of entries.
+_FTYP_SCAN_BYTES = 64
+
+
+def _isobmff_brands(data) -> frozenset:
+    """Brands declared by a leading ``ftyp`` box: major + compatible.
+
+    Layout: ``size`` [0:4], ``'ftyp'`` [4:8], ``major_brand`` [8:12],
+    ``minor_version`` [12:16], then four-byte compatible brands to the end of
+    the box. Bounds-checked against hostile input — a declared size that is
+    too small, truncated, or uses the 64-bit ``largesize`` escape degrades to
+    the major brand alone rather than reading brands at the wrong offset.
+    """
+    head = bytes(data[:_FTYP_SCAN_BYTES])
+    if len(head) < 12:
+        return frozenset()
+    brands = {head[8:12]}
+
+    size = int.from_bytes(head[0:4], "big")
+    # size 0 -> box runs to EOF; size 1 -> 64-bit largesize shifts every
+    # following field, so do not guess at brand offsets.
+    if size == 1 or 0 < size < 16:
+        return frozenset(brands)
+    end = len(head) if size == 0 else min(size, len(head))
+    for off in range(16, end - 3, 4):
+        brands.add(head[off : off + 4])
+    return frozenset(brands)
+
+
+def is_isobmff_image_bytes(data) -> bool:
+    """True when the payload is an ISO-BMFF still image (HEIF/AVIF/AVC image).
+
+    Lets the boundary say "this format is unsupported, convert it" instead of
+    "this file is corrupt" — the payload is perfectly valid, we just do not
+    decode it.
+    """
+    if bytes(data[4:8]) != b"ftyp":
+        return False
+    return bool(_isobmff_brands(data) & _ISOBMFF_IMAGE_BRANDS)
+
+
 def sniff_media_kind(data) -> Optional[str]:
     """Classify a reference payload by container signature.
 
-    Returns ``"image"`` (PNG/JPEG), ``"video"`` (ISO-BMFF/MP4 family or AVI),
-    or ``None`` for anything unrecognized.
+    Returns ``"image"`` (PNG/JPEG, or an ISO-BMFF still-image brand such as
+    HEIF/AVIF), ``"video"`` (other ISO-BMFF/MP4 family, or AVI), or ``None``
+    for anything unrecognized.
     """
     header = bytes(data[:12])
     if header.startswith(b"\x89PNG\r\n\x1a\n") or header.startswith(b"\xff\xd8\xff"):
         return "image"
     if header[4:8] == b"ftyp":
+        brands = _isobmff_brands(data)
+        if not brands:
+            # `ftyp` present but truncated before the major brand: nothing to
+            # classify on, so reject here rather than sending it to a decoder.
+            return None
+        # AVIF requires `avif`/`avis` among the *compatible* brands, so the
+        # major brand alone is not sufficient to identify still images.
+        if brands & _ISOBMFF_IMAGE_BRANDS:
+            return "image"
         return "video"
     if header.startswith(b"RIFF") and header[8:12] == b"AVI ":
         return "video"

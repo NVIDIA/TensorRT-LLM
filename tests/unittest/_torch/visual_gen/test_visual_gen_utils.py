@@ -455,6 +455,65 @@ class TestMediaBytesProbes:
         # RIFF alone is not AVI (e.g. WAV audio is RIFF too).
         assert sniff_media_kind(b"RIFF\x00\x00\x00\x00WAVEfmt ") is None
 
+    @staticmethod
+    def _ftyp(major: bytes, compatible: tuple = (), *, size: int = None) -> bytes:
+        """Build an ISO-BMFF `ftyp` box: size|'ftyp'|major|minor|compatible*."""
+        body = major + b"\x00\x00\x00\x00" + b"".join(compatible)
+        declared = len(body) + 8 if size is None else size
+        return declared.to_bytes(4, "big") + b"ftyp" + body
+
+    def test_sniff_isobmff_still_images_are_not_video(self):
+        """`ftyp` marks the ISO-BMFF family, not video: HEIF/AVIF photos share
+        it with MP4. Routing them to the video slot would hand a still image to
+        NVDEC; they must classify as image instead."""
+        from tensorrt_llm.inputs.media_io import sniff_media_kind
+
+        # HEIC as major brand (the iOS camera default).
+        assert sniff_media_kind(self._ftyp(b"heic", (b"mif1", b"heic"))) == "image"
+        # `mif1` major with `heic` compatible.
+        assert sniff_media_kind(self._ftyp(b"mif1", (b"heic",))) == "image"
+        # AVIF: the spec requires avif/avis among the COMPATIBLE brands, so a
+        # major-brand-only check would miss this one.
+        assert sniff_media_kind(self._ftyp(b"iso8", (b"avif", b"mif1"))) == "image"
+        assert sniff_media_kind(self._ftyp(b"avis", (b"avif",))) == "image"
+        # HEVC image sequence brands.
+        for brand in (b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs"):
+            assert sniff_media_kind(self._ftyp(brand)) == "image", brand
+        # Ordinary video ISO-BMFF stays video.
+        assert sniff_media_kind(self._ftyp(b"mp42", (b"isom", b"mp42"))) == "video"
+        assert sniff_media_kind(self._ftyp(b"isom", (b"iso2", b"avc1"))) == "video"
+        assert sniff_media_kind(self._ftyp(b"qt  ")) == "video"
+
+    def test_sniff_ftyp_bounds_are_checked(self):
+        """Hostile/degenerate `ftyp` boxes must not read brands at the wrong
+        offset; they degrade to the major brand rather than misclassifying."""
+        from tensorrt_llm.inputs.media_io import sniff_media_kind
+
+        # Declared size larger than the payload (truncated file).
+        assert sniff_media_kind(self._ftyp(b"heic", (b"mif1",), size=4096)) == "image"
+        # Declared size 0 means "box runs to EOF".
+        assert sniff_media_kind(self._ftyp(b"iso8", (b"avif",), size=0)) == "image"
+        # Nonsense small size: fall back to the major brand only.
+        assert sniff_media_kind(self._ftyp(b"heic", (b"mif1",), size=8)) == "image"
+        assert sniff_media_kind(self._ftyp(b"mp42", (b"avif",), size=8)) == "video"
+        # size == 1 is the 64-bit largesize escape: every later field shifts,
+        # so compatible brands must be ignored, not read at bogus offsets.
+        assert sniff_media_kind(self._ftyp(b"mp42", (b"avif",), size=1)) == "video"
+        assert sniff_media_kind(self._ftyp(b"heic", (), size=1)) == "image"
+        # Header shorter than a brand.
+        assert sniff_media_kind(b"\x00\x00\x00\x18ftyp") is None
+
+    def test_heif_reference_rejected_with_actionable_message(self):
+        """A HEIC upload is a valid file we simply do not support — the 400
+        must say so, not claim the file is corrupt."""
+        generator = _StubVisualGen()
+        heic = self._ftyp(b"heic", (b"mif1", b"heic")) + b"\x00" * 64
+        request = VideoGenerationRequest(
+            prompt="x", input_reference=base64.b64encode(heic).decode()
+        )
+        with pytest.raises(ValueError, match="HEIF/AVIF"):
+            parse_visual_gen_params(request, "vid-heic", generator, media_storage_path=None)
+
     def test_truncated_image_bytes_are_not_decodable(self):
         # A truncated PNG still opens (the header parses) but cannot decode
         # its pixels; the probe must reject it so the boundary 400s instead
