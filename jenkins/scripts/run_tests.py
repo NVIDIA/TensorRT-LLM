@@ -259,6 +259,9 @@ def rebuild_pytest_command(base_cmd, drop_patterns, append_args):
     ``--flag value`` the following value token is also dropped (when it does
     not look like another flag).
 
+    Shell pipeline prefixes (e.g. ``unset VAR && ``) are preserved verbatim
+    so that shlex.join does not quote ``&&`` into a literal argument.
+
     Args:
         base_cmd: The original pytest command string.
         drop_patterns: Argument prefixes to strip from base_cmd.
@@ -268,8 +271,17 @@ def rebuild_pytest_command(base_cmd, drop_patterns, append_args):
     Returns:
         Rebuilt pytest command string.
     """
+    # Preserve shell prefix (everything before the last " && ") verbatim so
+    # shlex.join never quotes && into '&&' and breaks the pipeline.
+    shell_prefix = ""
+    cmd_part = base_cmd
+    if " && " in base_cmd:
+        and_parts = base_cmd.split(" && ")
+        shell_prefix = " && ".join(and_parts[:-1]) + " && "
+        cmd_part = and_parts[-1]
+
     parts = []
-    tokens = shlex.split(base_cmd)
+    tokens = shlex.split(cmd_part)
     skip_next = False
     for i, token in enumerate(tokens):
         if skip_next:
@@ -281,7 +293,7 @@ def rebuild_pytest_command(base_cmd, drop_patterns, append_args):
             continue
         parts.append(token)
     parts.extend(append_args)
-    return shlex.join(parts)
+    return shell_prefix + shlex.join(parts)
 
 
 def build_rerun_command(base_cmd, test_list, xml_path, csv_path, reruns):
