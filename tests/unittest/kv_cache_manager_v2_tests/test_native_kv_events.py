@@ -20,7 +20,11 @@ from types import SimpleNamespace
 import msgspec
 import zmq
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_events import KVEventAdapter, NativeKVCacheEventManager
+from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
+    BlockRemoved,
+    KVEventAdapter,
+    NativeKVCacheEventManager,
+)
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 
 
@@ -146,3 +150,47 @@ def test_native_fast_path_publishes_only_full_max_window_blocks():
     replacement = context.socket(zmq.PUB)
     replacement.bind(bind_endpoint)
     replacement.close(linger=0)
+
+
+def test_native_removals_are_never_dropped_by_the_entry_cap():
+    """Removals must survive the per-iteration cap or the consumer desyncs."""
+    adapter = KVEventAdapter(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+    )
+    manager = NativeKVCacheEventManager(
+        adapter,
+        block_size=2,
+        max_window_size=128,
+        max_entries=2,
+    )
+    manager.set_layer_group_window_sizes({0: 128})
+
+    root = SimpleNamespace(ordinal=-1)
+
+    def block(key: bytes, tokens: list[int], prev: object) -> SimpleNamespace:
+        page = object()
+        return SimpleNamespace(
+            key=key,
+            tokens=tokens,
+            prev=prev,
+            ordinal=getattr(prev, "ordinal", -1) + 1,
+            storage=[lambda: page],
+        )
+
+    first = block(b"\x01" * 32, [1, 2], root)
+    second = block(b"\x02" * 32, [3, 4], first)
+    manager.add_stored_block_event_from_block(first)
+    manager.add_stored_block_event_from_block(second)
+
+    # Both stores fill the entry cap (max_entries=2); the removals must still be
+    # emitted rather than dropped, or the consumer treats the blocks as resident
+    # forever.
+    manager.add_removed_event([b"\x01" * 32, b"\x02" * 32])
+
+    removed = [event for event in manager._pending_events if isinstance(event, BlockRemoved)]
+    assert manager.removed_blocks == 2
+    assert sum(len(event.block_hashes) for event in removed) == 2
+
+    manager.shutdown()
+    adapter.shutdown()

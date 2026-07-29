@@ -327,29 +327,13 @@ def create_event_publisher(config: KVEventsConfig, data_parallel_rank: int) -> E
     raise ValueError(f"Unsupported KV event publisher: {config.publisher!r}")
 
 
-def _to_wire_hash(block_hash: int | str | None) -> ExternalBlockHash | None:
-    if block_hash is None:
-        return None
-    if isinstance(block_hash, int):
-        if block_hash >= 2**63:
-            return block_hash - 2**64
-        if block_hash < -(2**63):
-            return ((block_hash + 2**63) % 2**64) - 2**63
-        return block_hash
-    try:
-        return bytes.fromhex(block_hash)
-    except ValueError as error:
-        raise ValueError(f"Invalid hexadecimal KV block hash: {block_hash!r}") from error
-
-
 def _vllm_wire_hash_from_radix_key(block_key: bytes) -> int:
-    """Convert an existing SHA-256 radix key like vLLM's integer event hashes."""
+    """Reuse an existing SHA-256 radix key as vLLM's signed integer event hash."""
     if len(block_key) < 8:
         raise ValueError("V2 radix block keys must contain at least 8 bytes")
     unsigned_hash = int.from_bytes(block_key[-8:], "big", signed=False)
-    wire_hash = _to_wire_hash(unsigned_hash)
-    assert isinstance(wire_hash, int)
-    return wire_hash
+    # Reinterpret the low 64 bits as signed two's-complement for the wire format.
+    return unsigned_hash - 2**64 if unsigned_hash >= 2**63 else unsigned_hash
 
 
 class KVEventAdapter:
@@ -581,8 +565,11 @@ class NativeKVCacheEventManager:
     def _add_removed_hashes(self, block_hashes: list[ExternalBlockHash]) -> None:
         if not block_hashes:
             return
-        if not self._reserve_entries(len(block_hashes)):
-            return
+        # Removals are never dropped by the per-iteration cap: each hash was
+        # already reported as stored, so dropping its removal would leave the
+        # consumer believing the block is resident forever. They are bounded by
+        # the previously-stored set, so they cannot run away.
+        self._pending_entries += len(block_hashes)
         if self._pending_events and isinstance(self._pending_events[-1], BlockRemoved):
             self._pending_events[-1].block_hashes.extend(block_hashes)
         else:

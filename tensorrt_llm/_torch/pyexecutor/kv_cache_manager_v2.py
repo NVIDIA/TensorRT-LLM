@@ -2921,10 +2921,9 @@ class KVCacheManagerV2(BaseResourceManager):
             self.event_manager.flush_iteration_events()
 
     def get_latest_events(self, timeout_ms: Optional[float] = None):
-        if self.kv_event_adapter is not None:
-            raise RuntimeError(
-                "KV cache event polling is unavailable while native publishing is enabled"
-            )
+        # Native publishing pushes events out-of-band; in that mode the event
+        # manager's get_latest_events returns [], so the legacy pull path
+        # degrades cleanly instead of raising.
         if self.event_manager is None:
             return []
         return self.event_manager.get_latest_events(timeout_ms)
