@@ -56,7 +56,7 @@ class BreakableCUDAGraphRunner:
 
     def warmup(self, engine_forward: Callable[[], Any], steps: int = _WARMUP_STEPS) -> None:
         """Run the complete eager engine forward under the warmup state.
-            model_engine.forward will use state to determine what forward to do."""
+        model_engine.forward will use state to determine what forward to do."""
         if self._state != BreakableCUDAGraphRunnerState.IDLE:
             raise RuntimeError(f"Cannot warm up BCG while runner is {self._state.value}")
         self._state = BreakableCUDAGraphRunnerState.WARMUP
@@ -128,7 +128,7 @@ class BreakableCUDAGraphRunner:
             yield
 
     def capture_output(self, output: torch.Tensor) -> torch.Tensor:
-        """Route all bucket outputs through the largest capture's buffer. """
+        """Route all bucket outputs through the largest capture's buffer."""
 
         if not self.is_capturing or self._active_num_tokens is None:
             raise RuntimeError("BCG output registered outside capture")
@@ -147,9 +147,9 @@ class BreakableCUDAGraphRunner:
 
     def capture_model_body(self, outer_forward: Callable[[], Any]) -> Any:
         """Run the outer model while capturing only its decoder body.
-           model_engine.forward is too broad and may pollute the CUDA stream
-           before the actual model forward. We want to reuse the functions
-           in forward that prepare the data and set the relevant flags."""
+        model_engine.forward is too broad and may pollute the CUDA stream
+        before the actual model forward. We want to reuse the functions
+        in forward that prepare the data and set the relevant flags."""
         if not self.is_capturing:
             raise RuntimeError("BCG body capture requested outside capture")
 
@@ -159,8 +159,7 @@ class BreakableCUDAGraphRunner:
         def capture_forward(*args, **kwargs):
             nonlocal captured_output
             with self.capture_context():
-                captured_output = self.capture_output(
-                    original_body_forward(*args, **kwargs))
+                captured_output = self.capture_output(original_body_forward(*args, **kwargs))
             return captured_output
 
         self.layer_model.forward = capture_forward
