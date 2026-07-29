@@ -106,14 +106,11 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # DeepSeek V4 Flash-Base uses WIDEEP for FP8 block-scale on Blackwell.
+        # DeepSeek V4 Flash-Base leaves the MoE backend to AUTO (TRTLLM on Blackwell).
         {
             'patterns': ['deepseek_v4_flash_base'],
             'config': {
                 'enable_attention_dp': True,
-                'moe_config': {
-                    'backend': 'WIDEEP',
-                },
                 'max_seq_len': 10240,
             }
         },

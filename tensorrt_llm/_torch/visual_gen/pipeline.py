@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import itertools
 import os
 import time
@@ -23,6 +24,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from pydantic import Field
 
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.utils import StrictBaseModel
@@ -32,6 +34,7 @@ from tensorrt_llm.mapping import Mapping
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
+from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .profiler import VisualGenProfiler
 
@@ -161,6 +164,18 @@ class BasePipeline(nn.Module):
             logger.info(f"CUDA graph runner: wrapping {name}.forward{compile_note}")
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
+
+    @contextlib.contextmanager
+    def disallow_cuda_graph_capture(self):
+        """Run wrapped forwards eagerly instead of capturing new CUDA graphs."""
+        prev = {name: r.allow_capture for name, r in self._cuda_graph_runners.items()}
+        for r in self._cuda_graph_runners.values():
+            r.allow_capture = False
+        try:
+            yield
+        finally:
+            for name, r in self._cuda_graph_runners.items():
+                r.allow_capture = prev[name]
 
     @property
     def rank(self):
@@ -586,12 +601,14 @@ class BasePipeline(nn.Module):
     def warmup(self) -> None:
         """Run warmup inference to trigger torch.compile and CUDA initialization.
 
-        Resolves warmup shapes from user config or model defaults, then runs
-        a short denoising loop with dummy inputs for each shape. This:
-        1. Triggers torch.compile's lazy compilation (first forward trace + codegen)
-        2. Pre-captures CUDA graphs (if enabled)
-        3. Warms up CUDA kernels and allocators
-        4. Populates any lazy caches (e.g., RoPE frequencies)
+        Resolves warmup shapes from user config or model defaults, then runs a
+        short denoising loop with dummy inputs for each shape, triggering
+        torch.compile, CUDA graph capture (if enabled), and autotuner tuning.
+
+        With autotuning enabled, a single rank tunes and captures in one pass.
+        On multiple ranks, tactics are tuned with capture off, merged across
+        ranks at ``autotune()`` exit, then recaptured — so every rank bakes the
+        same tactic into its graphs.
 
         Called automatically by PipelineLoader after model loading and torch.compile.
         OOM is not caught — if a warmup shape OOMs, the server fails fast at startup.
@@ -601,24 +618,61 @@ class BasePipeline(nn.Module):
             logger.info("Warmup disabled (no warmup shapes)")
             return
 
+        shape_list = ", ".join(f"{h}x{w}x{f}" for h, w, f in shapes)
         logger.info(
-            f"Running warmup for {self.__class__.__name__} "
-            f"with {len(shapes)} shapes and {steps} steps..."
+            f"Running warmup for {self.__class__.__name__}: "
+            f"{len(shapes)} shape(s) [{shape_list}], {steps} steps..."
         )
         warmup_start = time.time()
 
+        # Autotuner tuning knobs: cache path from env, plus (multi-rank only) a
+        # world-group communicator that drives the post-tune cross-rank merge.
+        enable_autotune = self.pipeline_config.torch_compile.enable_autotune
+        cache_path = None
+        post_tune_merge_dist = None
+        if enable_autotune:
+            cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                amap = self.pipeline_config.visual_gen_mapping.to_autotuner_mapping()
+                post_tune_merge_dist = _VisualGenAutotuneDist(amap)
+
         self._is_warmup = True
-        for height, width, num_frames in shapes:
-            logger.info(f"Warmup: {height}x{width}, {num_frames} frames, {steps} steps")
-            self._run_warmup(height, width, num_frames, steps)
-            torch.cuda.synchronize()
-        self._is_warmup = False
+        try:
+            if not enable_autotune:
+                self._run_warmup_pass(shapes, steps)
+            elif post_tune_merge_dist is None:
+                # Single rank: nothing to merge; tune and capture in one pass.
+                with autotune(cache_path=cache_path, skip_dynamic_tuning_buckets=True):
+                    self._run_warmup_pass(shapes, steps)
+            else:
+                # Multi rank: tune with capture off, merge tactics across ranks
+                # at autotune() exit, then recapture from the merged tactics
+                # (only needed when CUDA graphs are enabled).
+                with (
+                    self.disallow_cuda_graph_capture(),
+                    autotune(
+                        cache_path=cache_path,
+                        skip_dynamic_tuning_buckets=True,
+                        post_tune_merge_dist=post_tune_merge_dist,
+                    ),
+                ):
+                    self._run_warmup_pass(shapes, steps)
+                if self.pipeline_config.cuda_graph.enable:
+                    self._run_warmup_pass(shapes, steps)
+        finally:
+            self._is_warmup = False
 
         self._warmed_up_shapes = set(
             self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
         )
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
+
+    def _run_warmup_pass(self, shapes, steps) -> None:
+        """Run one warmup pass over all shapes (denoise loop with dummy inputs)."""
+        for height, width, num_frames in shapes:
+            self._run_warmup(height, width, num_frames, steps)
+            torch.cuda.synchronize()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         """Run warmup for a single shape. Subclasses must override.
