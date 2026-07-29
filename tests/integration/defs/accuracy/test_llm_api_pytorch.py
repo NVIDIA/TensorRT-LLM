@@ -7915,7 +7915,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 moe_expert_parallel_size=ep_size,
                 kv_cache_config=kv_cache_config,
                 sparse_attention_config=MiniMaxM3SparseAttentionConfig(
-                    implementation="msa" if use_msa else "triton"),
+                    implementation="msa" if use_msa else "triton",
+                    fuse_qkv_index_projection=True),
                 moe_config=MoeConfig(backend="CUTLASS"),
                 # The InferenceMAX protocol needs room for thinking output
                 # (12288 generated tokens on a ~2k chat prompt).
