@@ -1449,6 +1449,12 @@ class DisaggTestCmds(NamedTuple):
                 if configs_for_idx is not None:
                     ctx_cfg, gen_cfg, _ = configs_for_idx
                     worker_env.update((ctx_cfg if is_ctx else gen_cfg).to_env())
+                if worker_env.get("TLLM_ENABLE_KV_TRANSFER_TRACE") == "1":
+                    worker_env["TLLM_KV_TRANSFER_TRACE_OUTPUT_DIR"] = self.test_output_dir
+                    print_info(
+                        "KV transfer tracing is enabled; rank-local trace files "
+                        f"will be written to {self.test_output_dir}"
+                    )
                 with open(server_file_path, "w") as server_ctx:
                     server_proc = subprocess.Popen(
                         server_cmd,

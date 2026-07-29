@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import tempfile
 import time
@@ -185,6 +200,11 @@ class TestPerfLogManager:
 
 
 class TestKvTransferTrace:
+    def teardown_method(self):
+        from tensorrt_llm._torch.disaggregation.native import perf_logger
+
+        perf_logger._close_kv_transfer_trace_files()
+
     @patch.dict("os.environ", {"TLLM_ENABLE_KV_TRANSFER_TRACE": "1"}, clear=False)
     def test_logs_structured_lifecycle_event(self):
         from tensorrt_llm._torch.disaggregation.native import perf_logger
@@ -223,3 +243,38 @@ class TestKvTransferTrace:
             )
 
         log_info.assert_not_called()
+
+    def test_writes_and_flushes_rank_local_trace_file(self):
+        from tensorrt_llm._torch.disaggregation.native import perf_logger
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "TLLM_ENABLE_KV_TRANSFER_TRACE": "1",
+                    "TLLM_KV_TRANSFER_TRACE_OUTPUT_DIR": tmpdir,
+                },
+                clear=False,
+            ):
+                with patch.object(perf_logger.logger, "info"):
+                    perf_logger.log_kv_transfer_trace(
+                        "rx_wait_begin",
+                        42,
+                        "gen",
+                        "test/instance",
+                        3,
+                    )
+
+                trace_path = os.path.join(
+                    tmpdir,
+                    "kv_transfer_trace.gen.test_instance.3.log",
+                )
+                assert os.path.exists(trace_path)
+                # Read while the writer remains open to verify the event was
+                # flushed rather than merely buffered until process shutdown.
+                with open(trace_path, encoding="utf-8") as trace_file:
+                    contents = trace_file.read()
+
+                assert contents.endswith("\n")
+                assert "KV_TRANSFER_TRACE event=rx_wait_begin" in contents
+                assert "unique_rid=42 side=gen" in contents

@@ -134,6 +134,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             serving_type=serving_type,
             kv_transfer_timeout_ms=self.kv_transfer_timeout_ms,
             transfer_overlap_disabled=os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "0"),
+            trace_output_dir=os.getenv("TLLM_KV_TRANSFER_TRACE_OUTPUT_DIR", ""),
         )
 
         self._send_sessions: Dict[int, TxSessionBase] = {}

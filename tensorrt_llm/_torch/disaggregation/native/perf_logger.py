@@ -29,6 +29,62 @@ _PERF_CSV_HEADER = (
     "prepare_args_latency_ms,queue_latency_ms,transfer_latency_ms,task_latency_ms,throughput_mbs"
 )
 _KV_TRANSFER_TRACE_ENV = "TLLM_ENABLE_KV_TRANSFER_TRACE"
+_KV_TRANSFER_TRACE_OUTPUT_DIR_ENV = "TLLM_KV_TRANSFER_TRACE_OUTPUT_DIR"
+_KV_TRANSFER_TRACE_FILES = {}
+_KV_TRANSFER_TRACE_FAILED_PATHS = set()
+_KV_TRANSFER_TRACE_FILE_LOCK = threading.Lock()
+
+
+def _trace_file_component(value: object) -> str:
+    """Return a filesystem-safe component for a trace filename."""
+    return "".join(
+        character if character.isalnum() or character in "._-" else "_" for character in str(value)
+    )
+
+
+def _write_kv_transfer_trace_file(
+    message: str,
+    side: str,
+    instance_name: str,
+    instance_rank: int,
+) -> None:
+    """Write and flush one lifecycle event to this rank's dedicated trace file."""
+    output_dir = os.getenv(_KV_TRANSFER_TRACE_OUTPUT_DIR_ENV)
+    if not output_dir:
+        return
+
+    filename = (
+        f"kv_transfer_trace.{_trace_file_component(side)}."
+        f"{_trace_file_component(instance_name)}.{instance_rank}.log"
+    )
+    trace_path = os.path.join(output_dir, filename)
+    with _KV_TRANSFER_TRACE_FILE_LOCK:
+        if trace_path in _KV_TRANSFER_TRACE_FAILED_PATHS:
+            return
+        try:
+            trace_file = _KV_TRANSFER_TRACE_FILES.get(trace_path)
+            if trace_file is None:
+                os.makedirs(output_dir, exist_ok=True)
+                trace_file = open(trace_path, "a", encoding="utf-8", buffering=1)
+                _KV_TRANSFER_TRACE_FILES[trace_path] = trace_file
+            trace_file.write(f"{message}\n")
+            # Flush every event so a pytest timeout or process termination does
+            # not strand the most useful diagnostic records in user-space buffers.
+            trace_file.flush()
+        except (OSError, ValueError) as error:
+            _KV_TRANSFER_TRACE_FAILED_PATHS.add(trace_path)
+            sys.stderr.write(f"Failed to write KV transfer trace file {trace_path}: {error}\n")
+            sys.stderr.flush()
+
+
+def _close_kv_transfer_trace_files() -> None:
+    """Close trace files; used by tests to avoid leaking file descriptors."""
+    with _KV_TRANSFER_TRACE_FILE_LOCK:
+        trace_files = list(_KV_TRANSFER_TRACE_FILES.values())
+        _KV_TRANSFER_TRACE_FILES.clear()
+        _KV_TRANSFER_TRACE_FAILED_PATHS.clear()
+        for trace_file in trace_files:
+            trace_file.close()
 
 
 def log_kv_transfer_trace(
@@ -57,6 +113,7 @@ def log_kv_transfer_trace(
     )
     if detail_text:
         message = f"{message} {detail_text}"
+    _write_kv_transfer_trace_file(message, side, instance_name, instance_rank)
     logger.info(message)
 
 
