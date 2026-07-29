@@ -71,6 +71,15 @@ struct MlaRopeGenArgs
     float host_bmm1_scale;
     int32_t const* helix_position_offsets_ptr;
     bool const* helix_is_inactive_rank_ptr;
+    // Fused generation kv-norm: when `kv_norm_weight_ptr` is set, the KV half of the
+    // latent is produced by `invokeMLAKvNormRopeQuantGeneration` (norm + rope + fp8 +
+    // paged write in one warp-per-row pass) and the RoPE kernel runs Q-only.
+    void const* kv_norm_weight_ptr;
+    float kv_norm_eps;
+    int32_t latent_row_stride;
+    // cu_q_seqlens / cu_kv_seqlens were filled once for the iteration by the attention
+    // metadata; the kernel must not recompute them per layer.
+    bool precomputed_cu_seqlens;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -112,6 +121,18 @@ void invokeMLARopeGenerationHelper(T const* latent_cache_ptr, T* q_pe_ptr, T* fu
     mla_params.helix_position_offsets = args.helix_position_offsets_ptr;
     mla_params.helix_is_inactive_rank = args.helix_is_inactive_rank_ptr;
 
+    mla_params.precomputed_cu_seqlens = args.precomputed_cu_seqlens;
+    mla_params.fuse_kv_norm_in_rope = args.kv_norm_weight_ptr != nullptr;
+    mla_params.kv_norm_weight = args.kv_norm_weight_ptr;
+    mla_params.kv_norm_eps = args.kv_norm_eps;
+    mla_params.latent_row_stride = args.latent_row_stride;
+
+    if (mla_params.fuse_kv_norm_in_rope)
+    {
+        // KV first: the RoPE kernel below no longer writes the latent, and the FMHA
+        // kernel that follows reads the cache both wrote into.
+        tk::invokeMLAKvNormRopeQuantGeneration<T>(mla_params, kv_cache_buffer, stream);
+    }
     tk::invokeMLARopeGeneration<T>(mla_params, kv_cache_buffer, stream);
 }
 
@@ -133,7 +154,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
 
     int64_t const tokens_per_block, int64_t const attention_window_size, int64_t const beam_width,
     int64_t const quant_mode, double const q_scaling, int64_t q_lora_rank, int64_t kv_lora_rank,
-    int64_t qk_nope_head_dim, int64_t qk_rope_head_dim, int64_t v_head_dim, bool rope_append)
+    int64_t qk_nope_head_dim, int64_t qk_rope_head_dim, int64_t v_head_dim, bool rope_append,
+    std::optional<torch::Tensor> kv_norm_weight, double const kv_norm_eps, bool const precomputed_cu_seqlens)
 {
     TLLM_CHECK_WITH_INFO(
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
@@ -225,12 +247,28 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
         ? static_cast<int*>(block_ids_per_seq->data_ptr())
         : nullptr;
 
+    // Fused kv-norm inputs. `latent_cache` is then the RAW kv_a_proj slice -- a
+    // last-dim view whose row stride is q_lora_rank + kv_lora_rank + qk_rope_head_dim,
+    // not the row width -- so the stride is read off the tensor rather than assumed.
+    void const* kv_norm_weight_ptr = nullptr;
+    int32_t latent_row_stride = static_cast<int32_t>(latent_cache.stride(0));
+    if (kv_norm_weight.has_value())
+    {
+        TORCH_CHECK(latent_cache.stride(-1) == 1, "fused kv-norm needs a unit-stride latent row");
+        TORCH_CHECK(kv_norm_weight->scalar_type() == latent_cache.scalar_type(),
+            "kv_norm_weight dtype must match latent_cache");
+        TORCH_CHECK(kv_norm_weight->numel() == kv_lora_rank + qk_rope_head_dim,
+            "kv_norm_weight must have kv_lora_rank + qk_rope_head_dim elements");
+        kv_norm_weight_ptr = kv_norm_weight->data_ptr();
+    }
+
     // Currently NVFP4 KV cache is not supported for MLA
     MlaRopeGenArgs args{q_pe_ld, q_pe_stride, rotary_cos_sin_ptr, num_generations, num_gen_tokens,
         static_cast<int32_t>(num_heads), mla_meta_params, sequence_lengths_ptr, max_context_q_len,
         block_ids_per_seq_ptr, cache_type, cu_q_seqlens_ptr, cu_kv_seqlens_ptr, fmha_tile_counter_ptr,
         mla_bmm1_scale_ptr, mla_bmm2_scale_ptr, quant_q_buffer_ptr, quant_scale_o_ptr, kv_scale_orig_quant_ptr,
-        kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr};
+        kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr,
+        kv_norm_weight_ptr, static_cast<float>(kv_norm_eps), latent_row_stride, precomputed_cu_seqlens};
 
     auto const input_dtype = fused_q.scalar_type();
     if (input_dtype == torch::kFloat16)
@@ -303,6 +341,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int qk_rope_head_dim"
         ", int v_head_dim"
         ", bool rope_append"
+        ", Tensor? kv_norm_weight=None"
+        ", float kv_norm_eps=1e-6"
+        ", bool precomputed_cu_seqlens=False"
         ") -> ()");
 }
 

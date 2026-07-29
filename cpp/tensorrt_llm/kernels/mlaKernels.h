@@ -115,6 +115,11 @@ struct MlaParams
     float const* dequant_scale_kv;
     float host_bmm1_scale;
 
+    // When true, `seqQOffset` / `cu_kv_seqlens` were filled once per iteration by the
+    // attention metadata (they are layer-invariant), so the generation kernel must not
+    // recompute them per layer.
+    bool precomputed_cu_seqlens = false;
+
     // Is it absorption mode?
     bool absorption_mode = false;
 
@@ -161,6 +166,14 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
 
 template <typename T, typename KVCacheBuffer>
 void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
+
+// Generation-phase KV prologue, fused: kv_a_layernorm + RoPE + FP8 quant + paged write
+// in one warp-per-row pass. Replaces the two KV regions of the generation RoPE kernel
+// (which is then launched with `skip_kv = true`) plus the standalone RMSNorm and the
+// `concat([compressed_kv, k_pe])` on the Python side. DSv4 layout only; reads
+// `params.latent_cache` as the RAW kv_a_proj slice with `params.latent_row_stride`.
+template <typename T, typename KVCacheBuffer>
+void invokeMLAKvNormRopeQuantGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 
 template <typename T, typename TCache>
 void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_cache, int const num_contexts,

@@ -1041,22 +1041,22 @@ class MLA(nn.Module):
         return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
 
     def _is_fused_kv_norm_enabled(self, num_generations: int = 0) -> bool:
-        # Mirrors `_is_fused_q_fp8_quant_enabled`. Context-only: the fused kernel
-        # lives in `applyMLARopeAndAssignQKVKernelOptContext`, whose KV region can
-        # give one warp a whole latent row. The generation kernel instead splits a
-        # row across blockIdx.y regions, so no block there can compute the RMS
-        # denominator.
+        # Mirrors `_is_fused_q_fp8_quant_enabled`. Both phases are covered, by two
+        # different kernels that share the same warp-per-row shape:
+        #   context    -> the `kFuseKvNorm` KV region of
+        #                 `applyMLARopeAndAssignQKVKernelOptContext`
+        #   generation -> the standalone `mlaKvNormRopeQuantGenerationKernel`, with
+        #                 the generation RoPE kernel launched `kSkipKv`
+        # A mixed batch is fine: both paths read the same raw latent view.
         # `TRTLLM_DISABLE_FUSED_KV_NORM=1` opts back into the standalone
         # kv_a_layernorm + concat pair as a kill switch.
         if os.environ.get("TRTLLM_DISABLE_FUSED_KV_NORM", "0") == "1":
             return False
         if not self.is_deepseek_v4:
             return False
-        # The kernel describes the latent row with its K_DIM/ROPE_DIM template
+        # The kernels describe the latent row with their K_DIM/ROPE_DIM template
         # constants, so these must be the 448/64 instantiation.
         if self.kv_lora_rank != 448 or self.qk_rope_head_dim != 64:
-            return False
-        if num_generations > 0:
             return False
         # V4 normalizes the whole 512-wide latent; the weight must span it.
         if self.kv_a_layernorm.weight.shape[0] != self.kv_lora_rank + self.qk_rope_head_dim:
@@ -1837,9 +1837,11 @@ class MLA(nn.Module):
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1
         )
 
-        # Fused kv-norm: the context RoPE kernel applies kv_a_layernorm itself, so
-        # skip both the standalone RMSNorm launch and the concat that would only
-        # re-materialize its output, and hand the kernel the RAW latent.
+        # Fused kv-norm: the kernel applies kv_a_layernorm itself -- the context RoPE
+        # kernel's KV region for context tokens, `mlaKvNormRopeQuantGenerationKernel`
+        # for generation tokens -- so skip both the standalone RMSNorm launch and the
+        # concat that would only re-materialize its output, and hand the kernels the
+        # RAW latent.
         self._fused_kv_norm_active = self._is_fused_kv_norm_enabled(num_generations=num_generations)
 
         if self._fused_kv_norm_active:
@@ -1855,9 +1857,11 @@ class MLA(nn.Module):
         compressed_kv, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
         qr = q
         if self._fused_kv_norm_active:
-            # `kv` is already the [compressed_kv | k_pe] row layout the kernel
-            # expects; it takes it as `T const* fuse_buf` and only ever reads it.
-            # The `compressed_kv`/`k_pe` views above are dead on the V4 branch.
+            # `kv` is already the [compressed_kv | k_pe] row layout the kernels
+            # expect; they take it as `T const* fuse_buf` and only ever read it.
+            # The `compressed_kv`/`k_pe` views above are dead on the V4 branch --
+            # verified for generation too: the DSA compressor and indexer read
+            # `hidden_states`/`qr`, not the latent.
             #
             # NOTE: `kv` is a last-dim slice of the kv_a_proj output, so its row
             # stride is q_lora_rank + 512, NOT 512 -- it is a view, not a
@@ -2571,8 +2575,18 @@ class MLA(nn.Module):
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
         num_seqs = attn_metadata.num_seqs
 
-        cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
-        cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
+        # Cumulative Q/KV seqlens are layer-invariant, so the attention metadata
+        # computes them once per iteration into fixed-address buffers and the
+        # generation RoPE kernel skips its per-layer recomputation. Older metadata
+        # objects without the hook fall back to per-layer allocation + in-kernel fill.
+        _mla_prep = getattr(attn_metadata, "mla_prepare_scheduler_buffers", None)
+        if _mla_prep is not None:
+            cu_q_seqlens, cu_kv_seqlens = _mla_prep(self.num_heads_tp)
+            precomputed_cu_seqlens = True
+        else:
+            cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
+            cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
+            precomputed_cu_seqlens = False
         fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=q.device)
         has_fp8_kv_cache = (
             self.mqa.has_fp8_kv_cache if hasattr(self.mqa, "has_fp8_kv_cache") else False
@@ -2594,6 +2608,11 @@ class MLA(nn.Module):
 
         if self.is_deepseek_v4:
             fused_q = q
+            # Fused kv-norm: `latent_cache` is the RAW kv_a_proj slice (the standalone
+            # RMSNorm and the concat were skipped upstream), so hand the op the norm
+            # weight. It then runs `mlaKvNormRopeQuantGenerationKernel` for the KV half
+            # and launches the RoPE kernel `kSkipKv`. Passing None keeps the old path.
+            _fused_kv_norm = getattr(self, "_fused_kv_norm_active", False)
             self.mqa.mla_rope_generation(
                 fused_q,
                 q_pe,
@@ -2605,6 +2624,9 @@ class MLA(nn.Module):
                 mla_bmm1_scale,
                 mla_bmm2_scale,
                 quant_q_buffer,
+                kv_norm_weight=(self.kv_a_layernorm.weight if _fused_kv_norm else None),
+                kv_norm_eps=float(self.kv_a_layernorm.variance_epsilon),
+                precomputed_cu_seqlens=precomputed_cu_seqlens,
             )
         else:
             fused_q = torch.empty(
