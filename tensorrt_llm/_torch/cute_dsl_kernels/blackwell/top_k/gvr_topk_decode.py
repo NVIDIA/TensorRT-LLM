@@ -279,6 +279,7 @@ class GvrTopKKernel:
         kc_diet: Optional[bool] = None,
         pdl_wait_late: bool = True,
         p4_fine_rangetest: Optional[bool] = None,
+        p4_lane_binsum: bool = True,
         enable_r0: bool = True,
         accept_cap: "int | None" = None,
         kc_override: "int | None" = None,
@@ -566,6 +567,12 @@ class GvrTopKKernel:
         # the extra live registers push the fp32 kernel past its budget
         # (0.95-0.99x on 4 of 5 cells).
         self.p4_fine_rangetest = True if p4_fine_rangetest is None else bool(p4_fine_rangetest)
+        # p4_lane_binsum: the per-warp bin sums that open both bin
+        # searches indexed by warp only, so all 32 lanes walked the same
+        # bins_per_warp bins - a dependency chain as long as the segment,
+        # with the whole warp doing identical work. Spread the segment
+        # across the lanes and close with one warp reduction instead.
+        self.p4_lane_binsum = bool(p4_lane_binsum)
         self.r0_qfracs = tuple(float(q) for q in r0_qfracs) if r0_qfracs else ()
         if self.r0_qfracs:
             assert all(0.0 < q < 1.0 for q in self.r0_qfracs), self.r0_qfracs
