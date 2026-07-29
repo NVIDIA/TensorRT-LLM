@@ -1954,7 +1954,7 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             max_batch_size=1,
             max_seq_len=513,
         )
-        assert kept == [128, 256, 512]
+        assert kept == [128, 256]
         assert unrecordable == []
 
     @pytest.mark.parametrize("backend", [

@@ -171,14 +171,14 @@ class ModelEngine(ABC):
         return
 
 
-def _filter_prefill_capture_num_tokens(
+def _filter_piecewise_capture_num_tokens(
     candidate_num_tokens: list[int],
     max_num_tokens: int,
     max_batch_size: int,
     max_seq_len: int,
     num_extra_decoding_steps: int = 0,
 ) -> Tuple[list[int], list[int]]:
-    """Cap prefill CUDA graph capture candidates at the engine's reachable
+    """Cap piecewise CUDA graph capture candidates at the engine's reachable
     `num_tokens` ceiling `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)`
     clamping user-requested sizes above it down to the ceiling.
 
@@ -201,10 +201,10 @@ def _filter_prefill_capture_num_tokens(
     """
     max_capturable_num_tokens = max(
         0, max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps))
-    prefill_capacity_limit = min(max_num_tokens, max_capturable_num_tokens)
-    if prefill_capacity_limit > 0:
+    piecewise_capacity_limit = min(max_num_tokens, max_capturable_num_tokens)
+    if piecewise_capacity_limit > 0:
         kept = sorted({
-            min(i, prefill_capacity_limit)
+            min(i, piecewise_capacity_limit)
             for i in candidate_num_tokens if 0 < i <= max_num_tokens
         })
     else:
@@ -215,6 +215,10 @@ def _filter_prefill_capture_num_tokens(
         if max_capturable_num_tokens < i <= max_num_tokens
     })
     return kept, unrecordable
+
+
+# BCG uses the same capture-bucket filtering semantics as PCG.
+_filter_prefill_capture_num_tokens = _filter_piecewise_capture_num_tokens
 
 
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
