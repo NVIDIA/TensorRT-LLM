@@ -51,7 +51,12 @@ def _registered_descs(worker: SimpleNamespace) -> list[tuple[int, int, int, str]
     return worker._agent.register_memory.call_args[0][0].descs
 
 
-def _build_aux_write_meta(src_buffer: AuxBuffer, dst_buffer: AuxBuffer) -> WriteMeta:
+def _build_aux_write_meta(
+    src_buffer: AuxBuffer,
+    dst_buffer: AuxBuffer,
+    src_slot: int = 0,
+    dst_slot: int = 0,
+) -> tuple[WriteMeta, Mock]:
     """Build auxiliary transfer metadata with minimal sender dependencies."""
     peer_rank_info = SimpleNamespace(
         aux_meta=dst_buffer.meta,
@@ -65,13 +70,13 @@ def _build_aux_write_meta(src_buffer: AuxBuffer, dst_buffer: AuxBuffer) -> Write
     registrar.get_peer_rank_info.return_value = peer_rank_info
     registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
     registrar.should_send_aux.return_value = True
-    registrar.get_aux_transfer_layout.return_value = build_aux_transfer_layout(
-        src_buffer.meta, dst_buffer.meta
-    )
+    registrar.get_aux_transfer_layout.return_value = None
     sender = SimpleNamespace(_registrar=registrar)
-    task = SimpleNamespace(_perf_timer=None, _slot=0, _unique_rid=7)
-    req_info = SimpleNamespace(instance_name="peer", instance_rank=1, aux_slot=0, unique_rid=7)
-    return Sender._build_aux_write_meta(sender, task, req_info)
+    task = SimpleNamespace(_perf_timer=None, _slot=src_slot, _unique_rid=7)
+    req_info = SimpleNamespace(
+        instance_name="peer", instance_rank=1, aux_slot=dst_slot, unique_rid=7
+    )
+    return Sender._build_aux_write_meta(sender, task, req_info), registrar
 
 
 def test_null_pointer_with_non_zero_size_is_rejected() -> None:
@@ -127,21 +132,49 @@ def test_nothing_registered_when_every_buffer_is_empty() -> None:
 
 
 def test_real_empty_draft_buffer_is_skipped_during_transfer() -> None:
-    src_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=0, device="cpu")
-    dst_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=0, device="cpu")
+    src_buffer = AuxBuffer(max_slot_num=3, beam_width=1, max_draft_len=0, device="cpu")
+    dst_buffer = AuxBuffer(max_slot_num=3, beam_width=1, max_draft_len=0, device="cpu")
 
-    write_meta = _build_aux_write_meta(src_buffer, dst_buffer)
+    write_meta, registrar = _build_aux_write_meta(src_buffer, dst_buffer, src_slot=1, dst_slot=2)
 
     expected_indices = np.array([0, 2, 3])
-    np.testing.assert_array_equal(write_meta.src_ptrs, src_buffer.meta.ptrs[expected_indices])
-    np.testing.assert_array_equal(write_meta.dst_ptrs, dst_buffer.meta.ptrs[expected_indices])
+    np.testing.assert_array_equal(
+        write_meta.src_ptrs,
+        src_buffer.meta.ptrs[expected_indices] + src_buffer.meta.item_sizes[expected_indices],
+    )
+    np.testing.assert_array_equal(
+        write_meta.dst_ptrs,
+        dst_buffer.meta.ptrs[expected_indices] + dst_buffer.meta.item_sizes[expected_indices] * 2,
+    )
     np.testing.assert_array_equal(write_meta.sizes, src_buffer.meta.item_sizes[expected_indices])
     assert write_meta.src_ptrs.size == 3
     assert all(int(ptr) != 0 for ptr in write_meta.src_ptrs)
     assert all(int(ptr) != 0 for ptr in write_meta.dst_ptrs)
+    registrar.cache_aux_transfer_layout.assert_called_once()
+    cached_layout = registrar.cache_aux_transfer_layout.call_args.args[2]
+    assert all(
+        not array.flags.writeable
+        for array in (
+            cached_layout.src_base_ptrs,
+            cached_layout.dst_base_ptrs,
+            cached_layout.src_item_sizes,
+            cached_layout.dst_item_sizes,
+        )
+    )
 
 
 def test_non_empty_source_requires_non_empty_destination() -> None:
+    src_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=4, device="cpu")
+    dst_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=0, device="cpu")
+
+    with pytest.raises(
+        ValueError,
+        match="Destination auxiliary buffers are empty for non-empty source indices \\[1\\]",
+    ):
+        build_aux_transfer_layout(src_buffer.meta, dst_buffer.meta)
+
+
+def test_aux_layout_mismatch_is_checked_lazily_during_transfer() -> None:
     src_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=4, device="cpu")
     dst_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=0, device="cpu")
 
@@ -160,4 +193,4 @@ def test_destination_aux_buffer_must_be_large_enough() -> None:
         ValueError,
         match="Destination auxiliary buffers are too small at indices \\[1\\]",
     ):
-        _build_aux_write_meta(src_buffer, dst_buffer)
+        build_aux_transfer_layout(src_buffer.meta, dst_buffer.meta)

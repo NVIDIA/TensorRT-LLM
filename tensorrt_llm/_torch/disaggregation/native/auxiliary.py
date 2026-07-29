@@ -44,6 +44,12 @@ class AuxTransferLayout:
     dst_item_sizes: np.ndarray
 
 
+def _readonly(array: np.ndarray) -> np.ndarray:
+    """Return an array protected from accidental in-place updates."""
+    array.flags.writeable = False
+    return array
+
+
 def get_non_empty_aux_indices(ptrs: np.ndarray, sizes: np.ndarray, context: str) -> np.ndarray:
     """Validate auxiliary memory descriptors and return their non-empty indices."""
     if ptrs.shape != sizes.shape:
@@ -96,10 +102,10 @@ def build_aux_transfer_layout(
         )
 
     return AuxTransferLayout(
-        src_base_ptrs=src_meta.ptrs[src_indices],
-        dst_base_ptrs=dst_meta.ptrs[src_indices],
-        src_item_sizes=src_item_sizes[src_indices],
-        dst_item_sizes=dst_item_sizes[src_indices],
+        src_base_ptrs=_readonly(src_meta.ptrs[src_indices]),
+        dst_base_ptrs=_readonly(dst_meta.ptrs[src_indices]),
+        src_item_sizes=_readonly(src_item_sizes[src_indices]),
+        dst_item_sizes=_readonly(dst_item_sizes[src_indices]),
     )
 
 

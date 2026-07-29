@@ -54,7 +54,11 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
 )
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer, get_non_empty_aux_indices
+from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+    AuxBuffer,
+    build_aux_transfer_layout,
+    get_non_empty_aux_indices,
+)
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
@@ -937,6 +941,11 @@ class Sender(SenderBase):
             layout = self._registrar.get_aux_transfer_layout(
                 peer_ri.instance_name, peer_ri.instance_rank
             )
+            if layout is None:
+                layout = build_aux_transfer_layout(src_aux_meta, peer_aux_meta)
+                self._registrar.cache_aux_transfer_layout(
+                    peer_ri.instance_name, peer_ri.instance_rank, layout
+                )
             src_ptrs = layout.src_base_ptrs + layout.src_item_sizes * task._slot
             dst_ptrs = layout.dst_base_ptrs + layout.dst_item_sizes * peer_slot
             sizes = layout.src_item_sizes
