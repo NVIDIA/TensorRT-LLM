@@ -25,7 +25,7 @@ from torch.cuda import device_count
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
-from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
@@ -1386,7 +1386,11 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
             with open(extra_llm_api_options, 'r') as f:
-                llm_args_extra_dict = yaml.safe_load(f) or {}
+                llm_args_extra_dict = yaml.safe_load(f)
+            if llm_args_extra_dict is None:
+                llm_args_extra_dict = {}
+            elif not isinstance(llm_args_extra_dict, dict):
+                raise ValueError("Configuration file root must be a mapping.")
         extra_allow_request_chat_template = _pop_bool_config_option(
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
@@ -1621,7 +1625,11 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     encoder_args_extra_dict = {}
     if extra_encoder_options is not None:
         with open(extra_encoder_options, 'r') as f:
-            encoder_args_extra_dict = yaml.safe_load(f) or {}
+            encoder_args_extra_dict = yaml.safe_load(f)
+        if encoder_args_extra_dict is None:
+            encoder_args_extra_dict = {}
+        elif not isinstance(encoder_args_extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
     extra_allow_request_chat_template = _pop_bool_config_option(
         encoder_args_extra_dict, "allow_request_chat_template")
     allow_request_chat_template = (allow_request_chat_template
@@ -1739,6 +1747,10 @@ def serve_embedding(
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             extra_dict = yaml.safe_load(f)
+        if extra_dict is None:
+            extra_dict = {}
+        elif not isinstance(extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
     llm_args = update_llm_args_with_extra_dict(
         llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
 
@@ -1822,6 +1834,7 @@ def disaggregated(
     """Running server in disaggregated mode"""
 
     logger.set_level(log_level)
+    set_prometheus_multiproc_dir()
 
     if metrics_log_interval != 0:
         logger.warning(

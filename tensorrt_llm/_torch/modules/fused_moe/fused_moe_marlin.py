@@ -104,31 +104,6 @@ class MarlinFusedMoE(CutlassFusedMoE):
     def _supports_load_balancer(self) -> bool:
         return False
 
-    def validate_configurable_moe(self, moe) -> None:
-        """Reject configs that require external-communication MoE dispatch.
-
-        Marlin is W4A16 (``quantize_input`` produces no activation scale) and
-        routes internally inside ``run_moe``. The host-side all-to-all
-        dispatch/combine path that ConfigurableMoE uses for attention-DP
-        expert parallelism needs the routing decided *before* dispatch and a
-        per-token scale payload, so it is incompatible with Marlin and fails
-        inside ``moe_a2a_dispatch``.
-
-        ConfigurableMoE only creates an external communication strategy when
-        ``enable_attention_dp and dp_size > 1`` (see CommunicationFactory);
-        ``moe.comm`` is not assigned yet when this hook runs, so check that
-        same condition via the mapping. Single-GPU, and TP/EP without
-        attention DP, are supported.
-        """
-        if moe.use_dp and moe.mapping.dp_size > 1:
-            raise ValueError(
-                "MarlinFusedMoE does not support external-communication MoE "
-                "(attention data parallelism combined with expert "
-                "parallelism): its W4A16 layout and internal routing are "
-                "incompatible with the all-to-all dispatch path. Use Marlin "
-                "single-node, or with TP/EP without attention DP."
-            )
-
     def _apply_activation(self, gemm1_out: torch.Tensor) -> torch.Tensor:
         """Apply the activation function to the gemm1 output.
 
@@ -202,6 +177,15 @@ class MarlinFusedMoE(CutlassFusedMoE):
 
         local_n = self.expert_size_per_partition
         if local_n != self.num_experts:
+            # EP: non-local token-expert pairs are clamped to local expert 0
+            # with a zero final scale, so they still run through both GEMMs
+            # and are discarded at the combine.
+            # TODO(perf): skip them instead — e.g. mark non-local pairs with a
+            # sentinel expert id that moe_align_block_size drops. Requires
+            # bounds guards in moeAlignKernels.cu (the histogram and
+            # count_and_sort kernels index shared/cumsum buffers with the raw
+            # id) and zero-initializing unscheduled GEMM output rows before
+            # the index_add_ combine.
             slot_start = self.slot_start
             is_local = (token_selected_experts >= slot_start) & (
                 token_selected_experts < slot_start + local_n

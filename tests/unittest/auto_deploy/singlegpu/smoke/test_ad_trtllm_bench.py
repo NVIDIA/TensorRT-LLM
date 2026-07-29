@@ -65,7 +65,6 @@ def run_benchmark(
 def prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str):
     _DATASET_NAME = "synthetic_128_128.txt"
     dataset_path = Path(temp_dir, _DATASET_NAME)
-    script_dir = Path(root_dir, "benchmarks")
 
     # Generate a small dataset to run a test - matching workload configuration
     command = [
@@ -88,9 +87,7 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str):
         "10",
     ]
     print(f"Running command: {' '.join(command)}")
-    result = subprocess.run(
-        command, cwd=str(script_dir), capture_output=True, text=True, timeout=300
-    )
+    result = subprocess.run(command, cwd=str(temp_dir), capture_output=True, text=True, timeout=300)
     if result.returncode != 0:
         raise RuntimeError(f"Failed to prepare dataset: {result.stderr}")
 

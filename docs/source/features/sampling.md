@@ -143,6 +143,10 @@ llm.generate(["Hello, my name is",
   * Occurrence penalties are not supported in combination with beam search; such requests
     are rejected.
 
+* If `no_repeat_ngram_size = n` is specified, any token that would recreate an `n`-gram already
+  present in the sequence (prompt included) is excluded from sampling. `None` or `0` disables
+  the restriction.
+
 ### Performance
 
 The Torch Sampler leverages the optimized sampling kernels provided by

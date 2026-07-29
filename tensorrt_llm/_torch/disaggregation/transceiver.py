@@ -1,3 +1,4 @@
+import os
 import time
 import uuid
 from collections import defaultdict
@@ -7,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, cast
 import numpy as np
 import torch
 
+import tensorrt_llm.bindings
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
@@ -20,6 +22,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
 )
+from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -30,7 +33,10 @@ from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManager,
+    MambaHybridCacheManagerV2,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings import LlmRequestState
@@ -137,7 +143,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
         layer_num = len(self._kv_cache_manager.pp_layers)
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManager) and not isinstance(
+            self._kv_cache_manager, MambaHybridCacheManagerV2
+        ):
             layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
         layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
         self._transfer_worker.populate_instance_and_rank_info(
@@ -230,7 +238,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             groups.append(block_ids)
 
         mamba_state_index = None
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
+            if self._kv_cache_manager.local_num_mamba_layers > 0:
+                mamba_state_index = self._kv_cache_manager._request_id_to_state_index[
+                    req.py_request_id
+                ]
+        elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
             mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
 
         return KVSlice(
@@ -406,6 +419,57 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             c, f, d = self._consensus_outcome(to_process, c, f, d, pp_allgather, True)
         return c, f, d, timed_out
 
+    def _sync_transfer_timing(self, reqs: list):
+        """Allgather timing for a batch of completed requests in one collective.
+
+        Matches C++ ``batchUpdateKVCacheTransferBW()`` in ``cacheTransceiver.cpp``.
+        Only runs when ``TRTLLM_KVCACHE_TIME_OUTPUT_PATH`` is set (same gate
+        as C++) and multi-rank sync is needed.  All ranks that participate in
+        the allgather update their local request objects.
+        """
+        if not reqs:
+            return
+        if not os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH"):
+            return
+        if not self._gen_need_sync:
+            return
+
+        # Pack local timing for all completed requests into one dict.
+        local_data = {
+            get_unique_rid(req): (
+                req.get_kv_cache_transfer_start(),
+                req.get_kv_cache_transfer_end(),
+                req.kv_cache_size,
+            )
+            for req in reqs
+        }
+
+        # Single allgather for the whole batch.
+        all_data = self._gen_allgather(local_data)
+
+        # Merge: per-rid min(start), max(end), sum(size) across ranks.
+        merged: dict = {}
+        for rank_data in all_data:
+            for rid, (start, end, size) in rank_data.items():
+                if rid in merged:
+                    prev = merged[rid]
+                    merged[rid] = (
+                        min(prev[0], start),
+                        max(prev[1], end),
+                        prev[2] + size,
+                    )
+                else:
+                    merged[rid] = (start, end, size)
+
+        # Every rank updates its own local requests.
+        rid_to_req = {get_unique_rid(r): r for r in reqs}
+        for rid, (min_start, max_end, total_size) in merged.items():
+            req = rid_to_req.get(rid)
+            if req is not None:
+                req.set_kv_cache_transfer_start(min_start)
+                req.set_kv_cache_transfer_end(max_end)
+                req.set_kv_cache_size(total_size)
+
     def _collect_done(self, sessions: dict, reqs: dict):
         """Scan sessions and return (completed_rids, failed_rids)."""
         completed, failed = [], []
@@ -482,6 +546,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest):
         self._ever_had_send_session = True
+        req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         session = self._get_or_create_send_session(req)
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         session.send(self._create_kv_slice(req))
@@ -526,6 +591,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest):
         self._ever_had_recv_session = True
+        req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         rid = get_unique_rid(req)
         if rid in self._recv_sessions:
             logger.warning(
@@ -553,12 +619,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
+        need_progress = wait_num > 0
+        if need_progress:
+            self._poll_sessions_for_interval(
+                self._send_sessions,
+                self._send_reqs,
+                wait_num,
+                self._sender_future_timeout_ms,
+            )
 
         local_completed, local_failed = self._collect_done(self._send_sessions, self._send_reqs)
         to_process = self._build_to_process(
             self._send_sessions,
             self._ctx_consensus(local_completed + local_failed),
-            wait_num,
+            0 if need_progress else wait_num,
             block_all,
         )
 
@@ -633,6 +707,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # distinguish the two cases and set the appropriate state.
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
+                req = self._recv_reqs[rid]
+                if session.transfer_end_time is not None:
+                    req.set_kv_cache_transfer_end(session.transfer_end_time)
+                if session.kv_cache_size_bytes > 0:
+                    req.set_kv_cache_size(session.kv_cache_size_bytes)
                 completed.append(rid)
             elif result == WaitResult.FAILED:
                 failed.append(rid)
@@ -649,6 +728,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._recv_sessions[rid].close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+
+        # Log gen-side transfer summary after consensus.
+        if completed and os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH"):
+            # Batch-sync timing for all completed requests in one allgather.
+            self._sync_transfer_timing([self._recv_reqs[rid] for rid in completed])
+            for rid in completed:
+                req = self._recv_reqs[rid]
+                perf_log_manager.log_gen_transfer_summary(
+                    unique_rid=rid,
+                    instance_name=self._instance_name,
+                    instance_rank=self._mapping.rank,
+                    gen_side_transfer_time_ms=req.kv_cache_transfer_time_ms,
+                    kv_cache_size=req.kv_cache_size,
+                )
 
         for rid in completed:
             session = self._recv_sessions[rid]
@@ -672,16 +765,30 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return completed, failed, cancelled_reqs
 
     def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
-        poll_interval_s = (self.kv_transfer_poll_interval_ms or 0) / 1000.0
+        self._poll_sessions_for_interval(
+            self._recv_sessions,
+            self._recv_reqs,
+            wait_num,
+            self.kv_transfer_poll_interval_ms,
+        )
+
+    def _poll_sessions_for_interval(
+        self,
+        sessions: dict,
+        reqs: dict,
+        wait_num: int,
+        poll_interval_ms: Optional[int],
+    ) -> None:
+        poll_interval_s = (poll_interval_ms or 0) / 1000.0
         deadline = time.monotonic() + poll_interval_s
         while True:
-            completed, failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+            completed, failed = self._collect_done(sessions, reqs)
             if len(completed) + len(failed) >= wait_num:
                 return
             remaining_s = deadline - time.monotonic()
             if remaining_s <= 0:
                 return
-            for session in self._recv_sessions.values():
+            for session in sessions.values():
                 session.wait_complete(blocking=False)
             time.sleep(min(0.001, remaining_s))
 
