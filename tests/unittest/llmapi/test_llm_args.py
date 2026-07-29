@@ -18,6 +18,7 @@ from utils.llm_data import llm_models_root
 from utils.util import force_ampere
 
 import tensorrt_llm.bindings.executor as tle
+import tensorrt_llm.llmapi as public_llmapi
 import tensorrt_llm.llmapi.llm_args as llm_args_mod
 from tensorrt_llm import LLM as TorchLLM
 from tensorrt_llm._torch.auto_deploy.llm_args import \
@@ -42,7 +43,8 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           ExecutorMemoryType,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
-                                          LookaheadDecodingConfig, MoeConfig,
+                                          LookaheadDecodingConfig,
+                                          MambaStateConfig, MoeConfig,
                                           MTPDecodingConfig, MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
                                           PeftCacheConfig, PybindMirror,
@@ -52,7 +54,8 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           StrictBaseModel, TorchCompileConfig,
                                           TorchLlmArgs,
                                           UserProvidedDecodingConfig,
-                                          update_llm_args_with_extra_dict)
+                                          update_llm_args_with_extra_dict,
+                                          update_llm_args_with_extra_options)
 # fmt: on
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
@@ -179,6 +182,37 @@ kv_cache_config:
         assert llm_args.kv_cache_config.max_attention_window == [
             1024, 1024, 1024
         ]
+
+    def test_from_yaml_migrates_legacy_mamba_interval(self, tmp_path):
+        yaml_path = tmp_path / "legacy_mamba_interval.yaml"
+        yaml_path.write_text(
+            yaml.safe_dump({
+                "model": str(llama_model_path),
+                "kv_cache_config": {
+                    "mamba_state_cache_interval": 64,
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        llm_args = TorchLlmArgs.from_yaml(yaml_path)
+
+        assert llm_args.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 64
+
+    def test_from_yaml_empty_file_reports_missing_model(self, tmp_path):
+        yaml_path = tmp_path / "empty.yaml"
+        yaml_path.write_text("", encoding="utf-8")
+
+        with pytest.raises(ValidationError, match="model"):
+            TorchLlmArgs.from_yaml(yaml_path)
+
+    def test_from_yaml_rejects_non_mapping_root(self, tmp_path):
+        yaml_path = tmp_path / "list.yaml"
+        yaml_path.write_text("[]", encoding="utf-8")
+
+        with pytest.raises(ValueError,
+                           match="Configuration file root must be a mapping"):
+            TorchLlmArgs.from_yaml(yaml_path)
 
     def test_llm_args_with_pydantic_options(self):
         yaml_content = """
@@ -460,7 +494,9 @@ class TestModelDefaults:
         model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
 
         apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args,
+                                          model_defaults,
+                                          original_setting="auto")
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
 
@@ -470,6 +506,45 @@ class TestModelDefaults:
         _resolve_kv_cache_manager_v2_auto(llm_args, {})
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+
+    @pytest.mark.parametrize(
+        ("backend", "runtime"),
+        [
+            ("NIXL", "CPP"),
+            ("UCX", None),
+            ("MPI", None),
+        ],
+    )
+    def test_kv_cache_manager_v2_auto_falls_back_for_incompatible_disagg(
+            self, backend, runtime):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend=backend, transceiver_runtime=runtime),
+        )
+        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+
+        apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args,
+                                          model_defaults,
+                                          original_setting="auto")
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+
+    def test_kv_cache_manager_v2_auto_keeps_python_nixl_model_default(self):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="PYTHON"),
+        )
+        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+
+        apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args,
+                                          model_defaults,
+                                          original_setting="auto")
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
 
     @pytest.mark.parametrize("user_setting", [False, True])
     def test_kv_cache_manager_v2_explicit_value_overrides_model_default(
@@ -586,6 +661,8 @@ class TestModelDefaults:
 
 
 def test_KvCacheConfig_declaration():
+    assert KvCacheConfig().mamba_state_cache_interval is None
+    assert KvCacheConfig().mamba_state_config.periodic_snapshot_interval == 0
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig().block_reuse_policy == "all_reusable"
     assert KvCacheConfig().enable_swa_scratch_reuse is False
@@ -596,6 +673,8 @@ def test_KvCacheConfig_declaration():
         use_kv_cache_manager_v2=False).use_kv_cache_manager_v2 is False
     with pytest.raises(ValidationError, match="use_kv_cache_manager_v2"):
         KvCacheConfig(use_kv_cache_manager_v2="invalid")
+    with pytest.raises(ValidationError, match="max_util_for_resume"):
+        KvCacheConfig(max_util_for_resume=0)
 
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
@@ -611,6 +690,11 @@ def test_KvCacheConfig_declaration():
                            enable_swa_scratch_reuse=True,
                            enable_partial_reuse=True,
                            copy_on_partial_reuse=True,
+                           mamba_state_config=MambaStateConfig(
+                               periodic_snapshot_interval=0,
+                               additional_snapshot_offsets_from_start=[128],
+                               additional_snapshot_offsets_from_end=[0, 32],
+                           ),
                            pool_ratio=[0.25, 0.75],
                            avg_seq_len=2048,
                            block_reuse_policy="per_request",
@@ -633,6 +717,13 @@ def test_KvCacheConfig_declaration():
     assert config.pool_ratio == [0.25, 0.75]
     assert config.avg_seq_len == 2048
     assert config.block_reuse_policy == "per_request"
+    assert config.mamba_state_config.periodic_snapshot_interval == 0
+    assert config.mamba_state_config.additional_snapshot_offsets_from_start == [
+        128
+    ]
+    assert config.mamba_state_config.additional_snapshot_offsets_from_end == [
+        0, 32
+    ]
     assert not hasattr(pybind_config, "pool_ratio")
     assert not hasattr(pybind_config, "avg_seq_len")
     assert not hasattr(pybind_config, "block_reuse_policy")
@@ -652,6 +743,149 @@ def test_KvCacheConfig_declaration():
             block_reuse_policy == "per_conversation")
     with pytest.raises(ValidationError):
         KvCacheConfig(block_reuse_policy="invalid")
+
+
+def test_MambaStateConfig_defaults_use_independent_lists():
+    first = MambaStateConfig()
+    second = MambaStateConfig()
+
+    assert first.periodic_snapshot_interval == 0
+    first.additional_snapshot_offsets_from_start.append(128)
+    first.additional_snapshot_offsets_from_end.append(0)
+
+    assert second.additional_snapshot_offsets_from_start == []
+    assert second.additional_snapshot_offsets_from_end == []
+    assert public_llmapi.MambaStateConfig is MambaStateConfig
+
+
+def test_MambaStateConfig_rejects_unknown_fields():
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        MambaStateConfig(unknown_snapshot_policy=1)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("periodic_snapshot_interval", -1),
+        ("additional_snapshot_offsets_from_start", [0]),
+        ("additional_snapshot_offsets_from_start", [True]),
+        ("additional_snapshot_offsets_from_end", [-1]),
+        ("additional_snapshot_offsets_from_end", [1.5]),
+    ],
+)
+def test_MambaStateConfig_rejects_invalid_snapshot_offsets(field, value):
+    with pytest.raises(ValidationError, match=field):
+        MambaStateConfig(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "offsets"),
+    [
+        ("additional_snapshot_offsets_from_start", [128]),
+        ("additional_snapshot_offsets_from_end", [0]),
+    ],
+)
+def test_KvCacheConfig_requires_v2_for_additional_snapshot_offsets(
+        field, offsets):
+    state_config = MambaStateConfig(**{field: offsets})
+
+    with pytest.raises(ValidationError, match="use_kv_cache_manager_v2=True"):
+        KvCacheConfig(
+            mamba_state_config=state_config,
+            use_kv_cache_manager_v2=False,
+        )
+
+    config = KvCacheConfig(
+        mamba_state_config=state_config,
+        use_kv_cache_manager_v2=True,
+    )
+    assert getattr(config.mamba_state_config, field) == offsets
+
+
+def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
+    warnings_seen = []
+    monkeypatch.setattr(llm_args_mod.logger, "warning",
+                        lambda message: warnings_seen.append(message))
+
+    config = KvCacheConfig(mamba_state_cache_interval=64)
+
+    assert config.mamba_state_cache_interval == 64
+    assert config.mamba_state_config.periodic_snapshot_interval == 64
+    assert any("mamba_state_cache_interval' is deprecated" in message
+               for message in warnings_seen)
+    assert "mamba_state_cache_interval" not in config.model_dump()
+
+
+def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
+        monkeypatch):
+    warnings_seen = []
+    monkeypatch.setattr(llm_args_mod.logger, "warning",
+                        lambda message: warnings_seen.append(message))
+
+    config = KvCacheConfig(
+        block_reuse_policy="per_conversation",
+        mamba_state_config=MambaStateConfig(
+            periodic_snapshot_interval=64,
+            additional_snapshot_offsets_from_end=[0],
+        ),
+    )
+
+    assert config.mamba_state_config.periodic_snapshot_interval == 0
+    assert config.mamba_state_config.additional_snapshot_offsets_from_end == [0]
+    assert len(warnings_seen) == 1
+    assert "periodic_snapshot_interval=64" in warnings_seen[0]
+    assert "block_reuse_policy=per_conversation" in warnings_seen[0]
+    assert "setting it to 0" in warnings_seen[0]
+
+    warnings_seen.clear()
+    KvCacheConfig(block_reuse_policy="per_conversation")
+    assert warnings_seen == []
+
+
+def test_update_llm_args_with_empty_options_file(tmp_path):
+    yaml_path = tmp_path / "empty.yaml"
+    yaml_path.write_text("", encoding="utf-8")
+    llm_args = {"model": "dummy"}
+
+    assert update_llm_args_with_extra_options(llm_args,
+                                              str(yaml_path)) == llm_args
+
+
+def test_config_file_merge_migrates_legacy_mamba_interval_without_mutating_input(
+):
+    yaml_dict = {
+        "kv_cache_config": {
+            "mamba_state_cache_interval": 64,
+            "mamba_state_config": {
+                "additional_snapshot_offsets_from_end": [0],
+            },
+        },
+    }
+
+    merged = update_llm_args_with_extra_dict({"model": "dummy"}, yaml_dict)
+
+    assert merged[
+        "kv_cache_config"].mamba_state_config.periodic_snapshot_interval == 64
+    assert merged[
+        "kv_cache_config"].mamba_state_config.additional_snapshot_offsets_from_end == [
+            0
+        ]
+    assert yaml_dict["kv_cache_config"]["mamba_state_cache_interval"] == 64
+
+
+def test_config_file_merge_rejects_legacy_and_new_mamba_intervals():
+    with pytest.raises(ValueError, match="Cannot set both"):
+        update_llm_args_with_extra_dict(
+            {"model": "dummy"},
+            {
+                "kv_cache_config": {
+                    "mamba_state_cache_interval": 64,
+                    "mamba_state_config": {
+                        "periodic_snapshot_interval": 64,
+                    },
+                },
+            },
+        )
 
 
 def test_KvCacheConfig_disk_cache_validation(tmp_path):
@@ -3171,6 +3405,126 @@ class _ArchSensitiveTransceiverModel:
         return None
 
 
+class _NoModelDefaults:
+
+    @classmethod
+    def get_model_defaults(cls, llm_args):
+        return {}
+
+
+class TestMambaSnapshotConfigResolution:
+
+    @staticmethod
+    def _load_config(monkeypatch, args, architecture):
+        from unittest.mock import MagicMock
+
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM,
+            "_resolve_class",
+            staticmethod(lambda config: _NoModelDefaults),
+        )
+        fake_loader = MagicMock()
+        fake_config = MagicMock()
+        fake_config.pretrained_config.architectures = [architecture]
+        fake_config.pretrained_config.hybrid_override_pattern = None
+        fake_loader.load_config.return_value = fake_config
+        return model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+
+    @staticmethod
+    def _capture_warnings(monkeypatch):
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        messages = []
+        monkeypatch.setattr(
+            model_loader_mod.logger, "warning",
+            lambda message, *args: messages.append(message % args
+                                                   if args else message))
+        return messages
+
+    @pytest.mark.parametrize(
+        ("kv_cache_config", "expected_reuse", "expected_warning"),
+        [
+            (KvCacheConfig(), False, True),
+            (
+                KvCacheConfig(
+                    mamba_state_config=MambaStateConfig(
+                        periodic_snapshot_interval=64),
+                    use_kv_cache_manager_v2=False,
+                ),
+                True,
+                False,
+            ),
+            (
+                KvCacheConfig(
+                    mamba_state_config=MambaStateConfig(
+                        additional_snapshot_offsets_from_end=[0]),
+                    use_kv_cache_manager_v2=True,
+                ),
+                True,
+                False,
+            ),
+            (
+                KvCacheConfig(
+                    block_reuse_policy="per_conversation",
+                    mamba_state_config=MambaStateConfig(
+                        periodic_snapshot_interval=64),
+                    use_kv_cache_manager_v2=True,
+                ),
+                False,
+                True,
+            ),
+        ],
+        ids=["none", "periodic", "fixed", "per-conversation-no-fixed"],
+    )
+    def test_hybrid_snapshot_policy_controls_block_reuse(
+        self,
+        monkeypatch,
+        kv_cache_config,
+        expected_reuse,
+        expected_warning,
+    ):
+        args = TorchLlmArgs(model="/tmp/dummy_model",
+                            kv_cache_config=kv_cache_config)
+        warnings = self._capture_warnings(monkeypatch)
+
+        self._load_config(monkeypatch, args, "Qwen3NextForCausalLM")
+
+        assert args.kv_cache_config.enable_block_reuse is expected_reuse
+        assert bool(warnings) is expected_warning
+        if expected_warning:
+            assert "no Mamba state snapshot policy" in warnings[0]
+
+    def test_hybrid_fixed_snapshot_rejects_auto_resolved_v1(self, monkeypatch):
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(
+                mamba_state_config=MambaStateConfig(
+                    additional_snapshot_offsets_from_start=[128]),
+                use_kv_cache_manager_v2="auto",
+            ),
+        )
+
+        with pytest.raises(
+                ValueError,
+                match="use_kv_cache_manager_v2=True after resolving"):
+            self._load_config(monkeypatch, args, "Qwen3NextForCausalLM")
+
+    def test_non_hybrid_without_snapshot_policy_preserves_block_reuse(
+            self, monkeypatch):
+        args = TorchLlmArgs(model="/tmp/dummy_model")
+        warnings = self._capture_warnings(monkeypatch)
+
+        self._load_config(monkeypatch, args, "LlamaForCausalLM")
+
+        assert args.kv_cache_config.enable_block_reuse is True
+        assert warnings == []
+
+
 class TestTransceiverRuntimeAutoResolution:
     """Tests for the transceiver_runtime 'auto' selection mechanism."""
 
@@ -3229,13 +3583,32 @@ class TestTransceiverRuntimeAutoResolution:
         # creation time.
         assert args.cache_transceiver_config.backend == "DEFAULT"
 
-    def test_default_backend_env_override_falls_back_to_cpp(self, monkeypatch):
-        """DEFAULT + TRTLLM_USE_UCX_KVCACHE=1 means effective UCX -> C++."""
-        monkeypatch.delenv("TRTLLM_USE_NIXL_KVCACHE", raising=False)
-        monkeypatch.setenv("TRTLLM_USE_UCX_KVCACHE", "1")
+    @pytest.mark.parametrize(
+        "backend_env",
+        ["TRTLLM_USE_UCX_KVCACHE", "TRTLLM_USE_MPI_KVCACHE"],
+    )
+    def test_default_backend_env_override_falls_back_to_v1_cpp(
+            self, monkeypatch, backend_env):
+        """An incompatible DEFAULT route falls back to the V1 C++ path."""
+        for env_var in (
+                "TRTLLM_USE_NIXL_KVCACHE",
+                "TRTLLM_USE_UCX_KVCACHE",
+                "TRTLLM_USE_MOONCAKE_KVCACHE",
+                "TRTLLM_USE_MPI_KVCACHE",
+        ):
+            monkeypatch.delenv(env_var, raising=False)
+        monkeypatch.setenv(backend_env, "1")
         args = self._disagg_args(backend="DEFAULT")
+        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+        apply_model_defaults_to_llm_args(args, model_defaults)
+
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        _resolve_kv_cache_manager_v2_auto(args,
+                                          model_defaults,
+                                          original_setting="auto")
+
         assert args.cache_transceiver_config.transceiver_runtime is None
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is False
 
     def test_disagg_disabled_is_noop(self):
         """Resolver never creates a config when cache_transceiver_config is None."""
@@ -3435,3 +3808,60 @@ class TestTransceiverRuntimeAutoResolution:
         # An explicit backend bypasses the env vars entirely.
         assert CacheTransceiverConfig(
             backend="UCX")._resolve_default_backend() == ("UCX", None)
+
+
+class TestGlm5TransceiverPreference:
+    """GLM-5 defaults to the Python KV-cache transceiver in disagg.
+
+    DeepseekV3ForCausalLM is shared by DeepSeek-V3/V3.2 and GLM-5
+    (GlmMoeDsaForCausalLM); the preference must apply to GLM checkpoints
+    only.
+    """
+
+    @staticmethod
+    def _pretrained_config(architectures, model_type):
+        from transformers import PretrainedConfig
+        cfg = PretrainedConfig(architectures=architectures)
+        cfg.model_type = model_type
+        return cfg
+
+    @pytest.mark.parametrize(
+        "architectures,model_type,expected",
+        [
+            (["GlmMoeDsaForCausalLM"], "glm_moe_dsa", "PYTHON"),
+            (["DeepseekV3ForCausalLM"], "deepseek_v3", None),
+            (["DeepseekV32ForCausalLM"], "deepseek_v32", None),
+            # Each predicate in isolation: the architecture match and the
+            # model_type fallback must each suffice on their own.
+            (["GlmMoeDsaForCausalLM"], "deepseek_v32", "PYTHON"),
+            (["DeepseekV32ForCausalLM"], "glm_moe_dsa", "PYTHON"),
+        ])
+    def test_preference_per_architecture(self, architectures, model_type,
+                                         expected):
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        cfg = self._pretrained_config(architectures, model_type)
+        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
+            cfg) == expected
+
+    def test_no_config_defers_to_cpp(self):
+        """Without a pretrained config the class defers to the C++ default."""
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime() is None
+
+    def test_glm5_resolves_auto_to_python_on_nixl(self):
+        """GLM-5 on NIXL adopts the Python transceiver from 'auto'.
+
+        End-to-end through _resolve_transceiver_runtime_auto with the real
+        model class and a GLM pretrained config.
+        """
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+        )
+        cfg = self._pretrained_config(["GlmMoeDsaForCausalLM"], "glm_moe_dsa")
+        _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"

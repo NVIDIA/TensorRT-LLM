@@ -247,10 +247,10 @@ def test_encoder_graph_only_captures_during_warmup():
 
 
 def test_encoder_graph_reuses_same_key_for_different_sequence_layouts():
-    runner = _dynamic_layout_runner()
+    key = (2, 580, 320)
+    runner = _dynamic_layout_runner(capture_keys=[key])
     runner.enabled = True
     graph_metadata = object.__new__(TrtllmAttentionMetadata)
-    key = (2, 580, 320)
     runner.graph_metadata[key] = {
         "attn_metadata": graph_metadata,
     }

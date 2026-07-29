@@ -117,6 +117,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     is_spec_dec_tree: bool = False
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
     is_spec_dec_dynamic_tree: bool = False
+    force_prepare_spec_dec_tree_mask: bool = False
 
     # parameters required for spec-dec mode
     max_total_draft_tokens: Optional[int] = None
@@ -1045,6 +1046,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.use_spec_decoding = self.is_spec_decoding_enabled
         self.is_spec_dec_tree = is_spec_dec_tree
         self.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
+        # A hybrid model's first executed attention layer can have a nonzero
+        # cache-local index because recurrent layers precede it.  Do not rely
+        # on the C++ ``layer_idx == 0`` fallback to rebuild the target mask:
+        # the dynamic draft loop clears that mask before the next target step.
+        self.force_prepare_spec_dec_tree_mask = is_spec_dec_dynamic_tree
         # Forward static tree length to FMHA kernel selection.
         self.max_total_draft_tokens = max_total_draft_tokens
 
@@ -1152,8 +1158,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Case 2/3: static tree
             elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
-                assert spec_metadata.spec_dec_mode.is_eagle3(
-                ), "Tree decoding is only supported for Eagle3 now"
+                assert (spec_metadata.spec_dec_mode.is_eagle3()
+                        or spec_metadata.spec_dec_mode.is_eagle3_one_model()
+                        ), "Tree decoding is only supported for Eagle3 now"
 
                 is_target_model = not getattr(spec_metadata, 'is_draft_model',
                                               False)
