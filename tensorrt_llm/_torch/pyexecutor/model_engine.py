@@ -466,6 +466,21 @@ class PyTorchModelEngine(ModelEngine):
                 "decoder CUDA graphs. CUDA graphs will be disabled.")
             self.cuda_graph_config = None
 
+        if (self.cuda_graph_config is not None and self.dtype == torch.float32
+                and self._is_encoder_decoder_model()):
+            # fp32 enc-dec runs unfused cross-attention, whose thop workspace
+            # size query hardcodes cross_kv_length=0 (attentionOp.cpp,
+            # Runner::getWorkspaceSize) and undersizes the workspace. The
+            # graph-capture warmup runs cross_attn in isolation, so the carve
+            # overruns the allocation (surfaces as cublas EXECUTION_FAILED).
+            # Keep eager until the upstream size query is fixed.
+            logger.warning(
+                "CUDA graphs are not supported for float32 encoder-decoder "
+                "models. CUDA graphs will be disabled; use a half-precision "
+                "checkpoint or model_kwargs={'torch_dtype': ...} to enable "
+                "them.")
+            self.cuda_graph_config = None
+
         cuda_graph_batch_sizes = self.cuda_graph_config.batch_sizes if self.cuda_graph_config else CudaGraphConfig.model_fields[
             'batch_sizes'].default
         cuda_graph_padding_enabled = self.cuda_graph_config.enable_padding if self.cuda_graph_config else CudaGraphConfig.model_fields[
@@ -1201,6 +1216,8 @@ class PyTorchModelEngine(ModelEngine):
         # warmup. No-op on non-DSA models.
         self._warmup_dg_paged_mqa_logits_metadata()
         log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
+        self._warmup_cute_dsl_radix_topk()
+        log_mem_snapshot("warmup/after_cute_dsl_radix_topk")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
@@ -1304,6 +1321,28 @@ class PyTorchModelEngine(ModelEngine):
                     f"(block_kv={_DG_SCHEDULE_BLOCK_KV}, num_sms={num_sms}); "
                     f"skipping bucket. {type(e).__name__}: {e}")
         torch.cuda.synchronize()
+
+    def _warmup_cute_dsl_radix_topk(self) -> None:
+        """Pre-compile the DSA radix-filter CuTe DSL decode top-k for every
+        cluster_size band during warmup, before serving.
+
+        Captured geometries are already compiled by the warmup-step forwards;
+        this fills in the bands the eager (non-captured) decode path can still
+        hit (mixed prefill+decode batch, or cuda_graph disabled) so they do
+        not pay a first-touch JIT stall on a live request. DSA-specific params
+        live on the metadata, so delegate to it. No-op on non-DSA models.
+        """
+        attn_meta = getattr(self, "attn_metadata", None)
+        if attn_meta is None:
+            return
+        try:
+            from ..attention_backend.sparse.dsa import \
+                DSAtrtllmAttentionMetadata
+        except ImportError:
+            return
+        if isinstance(attn_meta, DSAtrtllmAttentionMetadata):
+            next_n = 1 + self.original_max_draft_len
+            attn_meta.warmup_cute_dsl_radix_topk(next_n)
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
@@ -1461,6 +1500,18 @@ class PyTorchModelEngine(ModelEngine):
                                  resource_manager=resource_manager)
                 torch.cuda.synchronize()
 
+    @staticmethod
+    def _release_megamoe_profiling_scratch():
+        # MegaMoE tuning resources are shared across layers, so only the engine
+        # can release them after its full autotune warmup and before graph
+        # capture. Later eviction could invalidate a captured workspace pointer.
+        from ..custom_ops import cute_dsl_megamoe_custom_op as _megamoe_op
+        release_megamoe_scratch = getattr(_megamoe_op,
+                                          "release_megamoe_profiling_scratch",
+                                          None)
+        if release_megamoe_scratch is not None:
+            release_megamoe_scratch()
+
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs a forward pass to populate the autotuner cache."""
         if not self.llm_args.enable_autotuner:
@@ -1513,6 +1564,8 @@ class PyTorchModelEngine(ModelEngine):
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
         )
         AutoTuner.get().print_profiling_cache()
+
+        self._release_megamoe_profiling_scratch()
 
         # Clear workspace buffers allocated during the autotuner forward pass.
         # The autotuner runs a context-only forward with max_num_tokens, which
@@ -2263,6 +2316,16 @@ class PyTorchModelEngine(ModelEngine):
         model_config = self.model.model_config.pretrained_config
         max_position_embeddings = getattr(model_config,
                                           'max_position_embeddings', None)
+        if is_enc_dec:
+            # For enc-dec models the engine max_seq_len covers the encoder
+            # sequence, which may exceed the decoder's position table (e.g.
+            # Whisper: 1500 encoder positions vs max_target_positions=448).
+            decoder_position_limit = getattr(model_config,
+                                             'max_target_positions', None)
+            if decoder_position_limit is not None:
+                max_position_embeddings = (
+                    decoder_position_limit if max_position_embeddings is None
+                    else min(max_position_embeddings, decoder_position_limit))
         if max_position_embeddings is not None:
             token_num = min(token_num, max_position_embeddings - _kv_draft)
 
@@ -6384,57 +6447,14 @@ class PyTorchModelEngine(ModelEngine):
 
         return result
 
-    @nvtx_range("_prepare_tp_inputs_encoder")
-    def _prepare_tp_inputs_encoder(
+    def _make_encoder_attn_metadata(
         self,
-        encoder_requests: List[LlmRequest],
-        resource_manager: Optional[ResourceManager] = None,
+        sequence_lengths: List[int],
+        request_ids: List[int],
     ):
-        """Pack encoder-side inputs for an encoder-decoder forward pass.
-
-        Mirrors the no-cache path used by ``mm_encoder_only`` and the
-        legacy ``EncoderBuffers`` shape contract: ``encoder_input_ids``
-        and ``encoder_position_ids`` are concatenated across requests
-        into a single ``[sum(encoder_output_len)]`` tensor, with one
-        non-causal :class:`AttentionMetadata` describing the packed
-        encoder batch.
-
-        The encoder pass does not touch any KV-cache pool. The cross pool is
-        only written by the decoder's cross-attention on the first context
-        step. Self-pool blocks for the decoder are reserved on the next
-        scheduler iteration when the request transitions to ``CONTEXT_INIT``.
-        """
-        if not encoder_requests:
-            raise ValueError(
-                "_prepare_tp_inputs_encoder called with no encoder requests")
-
-        encoder_input_ids: List[int] = []
-        encoder_position_ids: List[int] = []
-        sequence_lengths: List[int] = []
-        request_ids: List[int] = []
-
-        for request in encoder_requests:
-            tokens = request.encoder_tokens
-            if tokens is None:
-                raise ValueError(
-                    f"Encoder request {request.py_request_id} has no "
-                    "encoder_tokens; encoder_input_token_ids must be wired "
-                    "through executor_request_to_llm_request.")
-            seq_len = len(tokens)
-            encoder_input_ids.extend(tokens)
-            encoder_position_ids.extend(
-                self._apply_position_id_offset(list(range(seq_len))))
-            sequence_lengths.append(seq_len)
-            request_ids.append(request.py_request_id)
-
-        num_tokens = len(encoder_input_ids)
-        assert num_tokens <= self.max_num_tokens, (
-            f"encoder packed length ({num_tokens}) exceeds max_num_tokens "
-            f"({self.max_num_tokens})")
-
-        # Build a fresh, no-cache attention metadata for the encoder
-        # pass.  We do not reuse ``self.attn_metadata`` because that
-        # object is bound to the decoder's KV-cache manager.
+        """Build fresh, no-cache attention metadata for one packed encoder
+        batch. ``self.attn_metadata`` is not reused because that object is
+        bound to the decoder's KV-cache manager."""
         sparse_metadata_params = (
             self.sparse_attention_config.to_sparse_metadata_params(
                 pretrained_config=self.model.model_config.pretrained_config)
@@ -6462,10 +6482,119 @@ class PyTorchModelEngine(ModelEngine):
             dtype=torch.int,
             pin_memory=prefer_pinned(),
         )
-        encoder_attn_metadata.num_contexts = len(encoder_requests)
+        encoder_attn_metadata.num_contexts = len(sequence_lengths)
         encoder_attn_metadata.max_seq_len = self.max_seq_len
         encoder_attn_metadata.request_ids = request_ids
         encoder_attn_metadata.prepare_encoder_only()
+        return encoder_attn_metadata
+
+    @nvtx_range("_prepare_tp_inputs_encoder_features")
+    def _prepare_tp_inputs_encoder_features(
+        self,
+        encoder_requests: List[LlmRequest],
+        resource_manager: Optional[ResourceManager] = None,
+    ):
+        """Pack encoder inputs for feature-driven audio encoders (Whisper).
+
+        The encoder input is a per-request feature tensor (an opaque audio
+        tensor, e.g. Whisper's 30 s-padded waveform) rather than token ids, and
+        the packed sequence lengths are the post-encoder position counts
+        (``encoder_output_len``), not the raw feature length.
+        """
+        features: List[torch.Tensor] = []
+        sequence_lengths: List[int] = []
+        request_ids: List[int] = []
+
+        for request in encoder_requests:
+            request_features = request.py_encoder_input_features
+            if request_features is None:
+                raise ValueError(
+                    f"Encoder request {request.py_request_id} has no "
+                    "encoder_input_features; feature- and token-driven "
+                    "encoder requests cannot share one batch.")
+            features.append(request_features)
+            sequence_lengths.append(int(request.encoder_output_len))
+            request_ids.append(request.py_request_id)
+
+        num_tokens = sum(sequence_lengths)
+        assert num_tokens <= self.max_num_tokens, (
+            f"encoder packed length ({num_tokens}) exceeds max_num_tokens "
+            f"({self.max_num_tokens})")
+
+        encoder_attn_metadata = self._make_encoder_attn_metadata(
+            sequence_lengths, request_ids)
+
+        inputs = {
+            'input_features':
+            torch.cat(features, dim=0).to('cuda', non_blocking=True),
+            'encoder_attn_metadata':
+            encoder_attn_metadata,
+            'encoder_seq_lens':
+            sequence_lengths,
+            'resource_manager':
+            resource_manager,
+        }
+        return inputs
+
+    @nvtx_range("_prepare_tp_inputs_encoder")
+    def _prepare_tp_inputs_encoder(
+        self,
+        encoder_requests: List[LlmRequest],
+        resource_manager: Optional[ResourceManager] = None,
+    ):
+        """Pack encoder-side inputs for an encoder-decoder forward pass.
+
+        Mirrors the no-cache path used by ``mm_encoder_only`` and the
+        legacy ``EncoderBuffers`` shape contract: ``encoder_input_ids``
+        and ``encoder_position_ids`` are concatenated across requests
+        into a single ``[sum(encoder_output_len)]`` tensor, with one
+        non-causal :class:`AttentionMetadata` describing the packed
+        encoder batch.
+
+        The encoder pass does not touch any KV-cache pool. The cross pool is
+        only written by the decoder's cross-attention on the first context
+        step. Self-pool blocks for the decoder are reserved on the next
+        scheduler iteration when the request transitions to ``CONTEXT_INIT``.
+        """
+        if not encoder_requests:
+            raise ValueError(
+                "_prepare_tp_inputs_encoder called with no encoder requests")
+
+        # Feature-driven audio encoders (Whisper) carry a tensor instead of
+        # encoder token ids; they take a dedicated prep path (which rejects
+        # mixed feature/token batches).
+        if any(
+                getattr(request, "py_encoder_input_features", None) is not None
+                for request in encoder_requests):
+            return self._prepare_tp_inputs_encoder_features(
+                encoder_requests, resource_manager=resource_manager)
+
+        encoder_input_ids: List[int] = []
+        encoder_position_ids: List[int] = []
+        sequence_lengths: List[int] = []
+        request_ids: List[int] = []
+
+        for request in encoder_requests:
+            tokens = request.encoder_tokens
+            if tokens is None:
+                raise ValueError(
+                    f"Encoder request {request.py_request_id} has no "
+                    "encoder_tokens; encoder_input_token_ids must be wired "
+                    "through executor_request_to_llm_request.")
+            seq_len = len(tokens)
+            encoder_input_ids.extend(tokens)
+            encoder_position_ids.extend(
+                self._apply_position_id_offset(list(range(seq_len))))
+            sequence_lengths.append(seq_len)
+            request_ids.append(request.py_request_id)
+
+        num_tokens = len(encoder_input_ids)
+        assert num_tokens <= self.max_num_tokens, (
+            f"encoder packed length ({num_tokens}) exceeds max_num_tokens "
+            f"({self.max_num_tokens})")
+
+        encoder_attn_metadata = self._make_encoder_attn_metadata(
+            sequence_lengths, request_ids)
 
         encoder_input_ids_t = torch.tensor(encoder_input_ids,
                                            dtype=torch.int,
@@ -6510,6 +6639,17 @@ class PyTorchModelEngine(ModelEngine):
                 "Model does not expose an `encoder` submodule; encoder-decoder "
                 "models must define a top-level `encoder` (or `model.encoder`) "
                 "stack to participate in the encoder iteration.")
+
+        # Feature-driven encoders (Whisper): the feature tensor is opaque to
+        # the engine — no token embedding, no position ids, no dtype cast.
+        # The model's forward casts internally (Whisper's raw waveforms must
+        # reach the log-mel STFT in fp32).
+        input_features = inputs.get('input_features')
+        if input_features is not None:
+            return encoder(
+                input_features=input_features,
+                attn_metadata=inputs['encoder_attn_metadata'],
+            )
 
         # Encoder operates on packed token IDs.  Models like T5 own the
         # shared embedding on ``self.model`` rather than inside the
@@ -6619,8 +6759,10 @@ class PyTorchModelEngine(ModelEngine):
                 "defined in `tensorrtllm.sampling_params`.")
             lp(request.py_request_id, logits_rows, token_ids, None, None)
 
-        logits_tensor[logits_row_offset:logits_row_offset +
-                      beam_width] = logits_rows.view(beam_width, -1)
+        # logits_rows is a view into logits_tensor (narrow + view never
+        # copy), so the processors already mutated it in place. Writing it
+        # back would be a self-assignment, which torch rejects for the
+        # non-contiguous slices a TP-padded vocab produces.
 
     def _execute_logit_post_processors(self,
                                        scheduled_requests: ScheduledRequests,
