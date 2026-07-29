@@ -1319,13 +1319,13 @@ public:
     void setOffsets(kernels::KVCacheIndex* offsetsPtr, tensorrt_llm::Dims const& offsetsShape, SizeType32 beamIdx,
         SizeType32 blockIdx, KVCacheBlock::IdType blockId) const;
 
-    //! \brief Bring offloaded block from secondary to primary memory.
-    //! \details Does nothing if block is already in primary memory.
     //! \brief Reclaim a free secondary (host) block for reuse. If the victim still holds
     //! reusable content and the disk tier has room, spill it to disk first (residency swap;
     //! the tree-resident identity moves to the disk level). Returns a CLAIMED block.
     [[nodiscard]] BlockPtr reclaimSecondaryBlock();
 
+    //! \brief Bring offloaded block from secondary to primary memory.
+    //! \details Does nothing if block is already in primary memory.
     void onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
@@ -1534,6 +1534,11 @@ public:
     [[nodiscard]] std::size_t getNumDiskAdmissionRefused() const
     {
         return mDiskAdmissionRefused;
+    }
+
+    [[nodiscard]] std::size_t getNumDiskWritePressureDropped() const
+    {
+        return mDiskWritePressureDropped;
     }
 
     [[nodiscard]] std::size_t getNumDiskOnboards() const
@@ -2228,6 +2233,16 @@ public:
         for (auto const& [windowSize, manager] : mWindowBlockManagers)
         {
             total += manager.getNumDiskAdmissionRefused();
+        }
+        return total;
+    }
+
+    [[nodiscard]] std::size_t getNumDiskWritePressureDropped() const
+    {
+        std::size_t total = 0;
+        for (auto const& [windowSize, manager] : mWindowBlockManagers)
+        {
+            total += manager.getNumDiskWritePressureDropped();
         }
         return total;
     }
