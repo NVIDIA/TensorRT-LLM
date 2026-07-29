@@ -1211,3 +1211,52 @@ def test_cute_dsl_gvr_topk_decode_pick_policy_single_source():
                     assert (
                         tuning["enable_warp_parallel_reduce"] == cfg["enable_warp_parallel_reduce"]
                     )
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize(
+    "variant",
+    ["rank_scatter_cs1", "rank_scatter_cs4", "snap_cs1"],
+)
+def test_cute_dsl_gvr_topk_decode_plateau_terminal(dtype, variant):
+    """Adversarial plateau terminal (done == 3): a bitwise-equal plateau
+    WIDER than the candidate buffer (kC) straddling the K boundary. Any
+    threshold either overflows the buffer (>= plateau) or undershoots K
+    (> plateau), so the Phase-2 bracket collapses to adjacent floats.
+    The plateau terminal must emit the sure winners plus plateau members
+    (exact tie-aware) instead of the old -1 pad / unfilled tail."""
+    torch.manual_seed(23)
+    top_k, n, bs = 1024, 32768, 2
+    n_hi, n_plateau = 512, 8500  # kC = 6144 for K=1024; 8500 > kC
+    lo = torch.full((bs, n), -1.0, dtype=dtype, device="cuda")
+    for r in range(bs):
+        perm = torch.randperm(n, device="cuda")
+        hi = perm[:n_hi]
+        pl = perm[n_hi : n_hi + n_plateau]
+        lo[r, hi] = (5.0 + torch.arange(n_hi, device="cuda").float() * 0.01).to(dtype)
+        lo[r, pl] = torch.tensor(1.0, dtype=dtype, device="cuda")
+    seq_lens = torch.full((bs,), n, dtype=torch.int32, device="cuda")
+    pre = torch.zeros(bs, top_k, dtype=torch.int32, device="cuda")
+    pre[:, 0] = lo.float().argmax(dim=-1).int()
+    pre[:, 1:] = torch.arange(1, top_k, dtype=torch.int32, device="cuda")
+    out = torch.empty(bs, top_k, dtype=torch.int32, device="cuda")
+    overrides = {}
+    if variant == "rank_scatter_cs4":
+        overrides["cluster_size"] = 4
+    elif variant == "snap_cs1":
+        overrides["enable_p4_rank_scatter"] = False
+    _GvrTopKKernel.launch(lo, pre, seq_lens, out, top_k, compress_ratio=1, **overrides)
+    torch.cuda.synchronize()
+    assert int((out < 0).sum()) == 0, (
+        f"{int((out < 0).sum())} unfilled/-1 slots in the plateau terminal"
+    )
+    # in-range, unique
+    assert out.max() < n and out.min() >= 0
+    for r in range(bs):
+        assert out[r].unique().numel() == top_k
+    sel = torch.gather(lo.float(), -1, out.long())
+    assert int((sel >= 5.0).sum()) == n_hi * bs, "missing sure winners"
+    assert int((sel == 1.0).sum()) == (top_k - n_hi) * bs, "remaining slots must be plateau members"
+    ref = torch.topk(lo.float(), top_k, dim=-1).values.sort(-1).values
+    assert torch.equal(sel.sort(-1).values, ref)
