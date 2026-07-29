@@ -106,6 +106,9 @@ class BasePipeline(nn.Module):
     Base class for diffusion pipelines.
     """
 
+    lora_transformer_strip_prefixes: Tuple[str, ...] = ()
+    lora_transformer_key_map: Dict[str, str] = {}
+
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
         """Return *cls* or a more specialized subclass based on *config*.
@@ -125,6 +128,7 @@ class BasePipeline(nn.Module):
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
+        self._static_lora_applied: bool = False
 
         # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
         self.cache_accelerator: Optional["CacheAccelerator"] = None
@@ -401,6 +405,29 @@ class BasePipeline(nn.Module):
     def post_load_weights(self) -> None:
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
+        self._apply_static_lora()
+
+    def _apply_static_lora(self) -> None:
+        lora_config = self.pipeline_config.lora
+        if lora_config is None:
+            return
+        if self._static_lora_applied:
+            return
+        if lora_config.target_component != PipelineComponent.TRANSFORMER:
+            raise ValueError("VisualGen LoRA currently supports only transformer target_component")
+        if self.transformer is None:
+            raise ValueError("VisualGen LoRA requires a transformer component")
+
+        from .lora import apply_static_lora
+
+        applied = apply_static_lora(
+            self.transformer,
+            lora_config,
+            default_strip_prefixes=self.lora_transformer_strip_prefixes,
+            default_key_map=self.lora_transformer_key_map,
+        )
+        self._static_lora_applied = True
+        logger.info(f"Applied {applied} static LoRA deltas to transformer")
 
     def _apply_teacache_coefficients(self, coefficients: Optional[Dict] = None) -> None:
         """Resolve TeaCache polynomial coefficients into pipeline_config.cache (TeaCacheConfig).

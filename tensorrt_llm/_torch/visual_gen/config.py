@@ -36,6 +36,7 @@ from tensorrt_llm.visual_gen.args import (
     CacheDiTConfig,
     CompilationConfig,
     CudaGraphConfig,
+    LoRAConfig,
     ParallelConfig,
     TeaCacheConfig,
     TorchCompileConfig,
@@ -122,6 +123,7 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
+    lora: Optional[LoRAConfig] = None
 
     # Observability — flat field mirrors VisualGenArgs.enable_layerwise_nvtx_marker.
     enable_layerwise_nvtx_marker: bool = False
@@ -187,6 +189,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
+    lora: Optional[LoRAConfig] = None
 
     # Observability — flat field mirrors VisualGenArgs.enable_layerwise_nvtx_marker.
     enable_layerwise_nvtx_marker: bool = False
@@ -250,6 +253,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             attention_metadata_state=_model_config_value(self.attention_metadata_state),
             parallel=_model_config_value(self.parallel),
             cache=_model_config_value(self.cache),
+            lora=_model_config_value(self.lora),
             enable_layerwise_nvtx_marker=_model_config_value(self.enable_layerwise_nvtx_marker),
         )
 
@@ -474,6 +478,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         parallel_cfg = args.parallel_config if args else ParallelConfig()
         cache_cfg = args.cache_config if args else None
         enable_layerwise_nvtx_marker = bool(args.enable_layerwise_nvtx_marker) if args else False
+        lora_cfg = args.lora_config if args else None
 
         from .pipeline_registry import PipelineComponent
 
@@ -625,6 +630,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
             cache=cache_cfg,
+            lora=lora_cfg,
             enable_layerwise_nvtx_marker=enable_layerwise_nvtx_marker,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,

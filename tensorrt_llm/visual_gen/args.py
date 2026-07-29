@@ -515,6 +515,59 @@ class CompilationConfig(StrictBaseModel):
     )
 
 
+class LoRAConfig(StrictBaseModel):
+    """Static LoRA adapter configuration for VisualGen transformer weights."""
+
+    path: str = Field(
+        "",
+        status="prototype",
+        description=(
+            "Local file or directory containing safetensors LoRA weights. "
+            "The adapter is merged into the target component after base "
+            "weights are loaded and before warmup."
+        ),
+    )
+    strength: float = Field(
+        1.0,
+        status="prototype",
+        description="Scale applied to LoRA deltas before merging into base weights.",
+    )
+    target_component: Literal["transformer"] = Field(
+        "transformer",
+        status="prototype",
+        description="Pipeline component that receives the static LoRA merge.",
+    )
+    strip_prefixes: List[str] = Field(
+        default_factory=list,
+        status="prototype",
+        description=(
+            "Optional LoRA key prefixes to strip before matching module "
+            "parameter names. Common transformer prefixes are stripped by default."
+        ),
+    )
+    key_map: Dict[str, str] = Field(
+        default_factory=dict,
+        status="prototype",
+        description=(
+            "Optional string replacements applied to normalized LoRA module names "
+            "before matching transformer parameters."
+        ),
+    )
+    fuse_qkv: bool = Field(
+        True,
+        status="prototype",
+        description=(
+            "Fuse separate to_q, to_k, and to_v LoRA deltas into qkv_proj when the "
+            "target transformer stores QKV as one fused projection."
+        ),
+    )
+    strict: bool = Field(
+        True,
+        status="prototype",
+        description="Raise when no LoRA weights are applied or a matched delta is invalid.",
+    )
+
+
 # =============================================================================
 # VisualGenArgs - User-facing configuration (CLI / YAML)
 # =============================================================================
@@ -583,6 +636,10 @@ class VisualGenArgs(StrictBaseModel):
         status="prototype",
     )
     cache_config: Optional[CacheConfig] = Field(None, status="prototype")
+
+    lora_config: Optional[LoRAConfig] = Field(
+        None, status="prototype", description="Optional static LoRA adapter configuration."
+    )
 
     pipeline_config: Dict[str, Any] = Field(
         default_factory=dict,
@@ -675,5 +732,6 @@ __all__ = [
     "TorchCompileConfig",
     "CudaGraphConfig",
     "CompilationConfig",
+    "LoRAConfig",
     "VisualGenArgs",
 ]
