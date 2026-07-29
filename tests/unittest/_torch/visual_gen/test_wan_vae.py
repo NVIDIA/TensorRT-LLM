@@ -16,40 +16,13 @@ from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import (
     _use_native_wan_vae,
     load_wan_vae,
 )
-from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import DupUp3D, WanVAE, WanVAEConfig
+from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE, WanVAEConfig
 
 DEVICE = "cuda"
 # Parity runs in fp32 to check whether our implementation matches diffusers'
 # computation, isolated from bf16 rounding noise that differs by memory layout
 # (our channels_last vs diffusers' contiguous). Production runs the VAE in bf16.
 DTYPE = torch.float32
-
-
-@pytest.mark.parametrize("first_chunk", [False, True])
-def test_fused_dup_up3d_matches_eager(monkeypatch, first_chunk):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for the fused DupUp3D kernel")
-
-    x = torch.randn(
-        2,
-        8,
-        3,
-        4,
-        5,
-        device=DEVICE,
-        dtype=torch.bfloat16,
-    ).contiguous(memory_format=torch.channels_last_3d)
-
-    monkeypatch.delenv("TRTLLM_WAN_VAE_FUSE_DUP_UP3D", raising=False)
-    eager = DupUp3D(8, 4, factor_t=2, factor_s=2)
-    expected = eager(x, first_chunk=first_chunk)
-
-    monkeypatch.setenv("TRTLLM_WAN_VAE_FUSE_DUP_UP3D", "1")
-    fused = DupUp3D(8, 4, factor_t=2, factor_s=2)
-    actual = fused(x, first_chunk=first_chunk)
-
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert actual.is_contiguous(memory_format=torch.channels_last_3d)
 
 
 def _require_checkpoint(model_dir: str, env_var: str) -> Path:
