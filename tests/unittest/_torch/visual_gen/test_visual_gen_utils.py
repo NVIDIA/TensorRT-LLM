@@ -424,20 +424,7 @@ class TestInputReferenceMaterialization:
 
 
 class TestMediaBytesProbes:
-    """The in-memory probe/decode primitives the serve boundary runs on."""
-
-    def test_is_decodable_image_bytes(self):
-        from tensorrt_llm.inputs.media_io import is_decodable_image_bytes
-
-        # PNG and JPEG are the two image formats in the documented support
-        # contract; both must probe as decodable.
-        for fmt in ("PNG", "JPEG"):
-            buf = BytesIO()
-            Image.new("RGB", (4, 4), (1, 2, 3)).save(buf, format=fmt)
-            assert is_decodable_image_bytes(buf.getvalue()), fmt
-        assert not is_decodable_image_bytes(b"definitely not an image")
-        # Video bytes are not an image (mp4 has no PIL-openable header).
-        assert not is_decodable_image_bytes(TestInputReferenceMaterialization._mp4_bytes())
+    """The in-memory signature probes the serve boundary routes on."""
 
     def test_sniff_media_kind(self):
         from tensorrt_llm.inputs.media_io import sniff_media_kind
@@ -549,53 +536,30 @@ class TestMediaBytesProbes:
         with pytest.raises(ValueError, match="HEIF/AVIF"):
             parse_visual_gen_params(request, "vid-heic", generator, media_storage_path=None)
 
-    def test_heif_rejected_even_when_pillow_can_decode_it(self, monkeypatch):
-        """Acceptance must not hinge on optional Pillow plugins: a deployment
-        with pillow-heif installed would otherwise admit a HEIC that the
-        worker — a separate process, possibly without the plugin — cannot
-        read, and the documented contract says HEIF/AVIF is a 400."""
-        import tensorrt_llm.serve.visual_gen_utils as serve_utils
+    def test_truncated_image_reference_is_routed_not_decoded(self, tmp_path):
+        """The boundary routes on signature and never decodes.
 
-        monkeypatch.setattr(serve_utils, "is_decodable_image_bytes", lambda _: True)
-        generator = _StubVisualGen()
-        heic = self._ftyp(b"heic", (b"mif1", b"heic")) + b"\x00" * 64
-        request = VideoGenerationRequest(
-            prompt="x", input_reference=base64.b64encode(heic).decode()
-        )
-        with pytest.raises(ValueError, match="HEIF/AVIF"):
-            parse_visual_gen_params(request, "vid-heic-plugin", generator, media_storage_path=None)
-
-    def test_truncated_image_bytes_are_not_decodable(self):
-        # A truncated PNG still opens (the header parses) but cannot decode
-        # its pixels; the probe must reject it so the boundary 400s instead
-        # of the worker 500ing at load time.
+        A truncated PNG reaches the image slot; the worker's load is what
+        rejects it (as a client error). Decoding here would put unbounded,
+        client-controlled CPU on an async request path and duplicate work
+        the worker repeats anyway.
+        """
         rng_pixels = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
         buf = BytesIO()
         Image.fromarray(rng_pixels).save(buf, format="PNG")
         whole = buf.getvalue()
         truncated = whole[: len(whole) // 2]
-        Image.open(BytesIO(truncated))  # sanity: header-only open succeeds
-
-        from tensorrt_llm.inputs.media_io import is_decodable_image_bytes
-
-        assert is_decodable_image_bytes(whole)
-        assert not is_decodable_image_bytes(truncated)
-
-    def test_truncated_image_reference_rejected_at_parse(self):
-        # End of the chain: a truncated image upload sniffs as an image but
-        # fails the strict decode -> client error at the boundary (never
-        # routed into the worker).
-        rng_pixels = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
-        buf = BytesIO()
-        Image.fromarray(rng_pixels).save(buf, format="PNG")
-        truncated = buf.getvalue()[: len(buf.getvalue()) // 2]
+        with pytest.raises(OSError):
+            Image.open(BytesIO(truncated)).load()  # sanity: it really is broken
 
         generator = _StubVisualGen()
         request = VideoGenerationRequest(
             prompt="x", input_reference=base64.b64encode(truncated).decode()
         )
-        with pytest.raises(ValueError, match="does not fully decode"):
-            parse_visual_gen_params(request, "vid-12", generator, media_storage_path=None)
+        params = parse_visual_gen_params(
+            request, "vid-12", generator, media_storage_path=str(tmp_path)
+        )
+        assert Path(params.image).read_bytes() == truncated
 
 
 # =============================================================================

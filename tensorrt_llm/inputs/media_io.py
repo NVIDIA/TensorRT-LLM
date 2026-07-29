@@ -350,10 +350,10 @@ def _get_cv2():
 # The serve boundary routes a metadata-free reference payload (JSON base64
 # carries no filename or MIME type; multipart metadata is client-typed) to the
 # image or video slot by its container signature. Routing only, never
-# acceptance: an image is accepted by a full PIL decode at the boundary, a
-# video by the worker's decoder — so corrupt content behind a valid signature
-# still fails cleanly as a client error, and the signature can never disagree
-# with what actually decodes.
+# acceptance: for both modalities the worker's decoder is what accepts, and
+# its failure is reported as a client error. So the signature can never
+# disagree with what actually decodes, and the boundary never spends a full
+# decode — on an async request path — to answer a routing question.
 
 
 # ISO-BMFF brands that mark a still image or image sequence (HEIF/AVIF/AVC
@@ -474,23 +474,6 @@ def sniff_media_kind(data) -> Optional[str]:
     if header.startswith(b"RIFF") and header[8:12] == b"AVI ":
         return "video"
     return None
-
-
-def is_decodable_image_bytes(data) -> bool:
-    """True when ``data`` holds still-image content PIL can fully decode.
-
-    Strict on purpose: ``Image.open`` is lazy, so this also decodes the
-    pixels (``load``) — a truncated file passes a header-only probe and
-    would then 500 at the worker's load instead of 400ing at the boundary.
-    """
-    try:
-        with Image.open(BytesIO(data)) as image:
-            image.load()
-            return True
-    except OSError:
-        # ``UnidentifiedImageError`` (bad header) subclasses ``OSError``;
-        # truncated files raise plain ``OSError`` from ``load``.
-        return False
 
 
 # Longest video, in frames, a client may request as *output* (the serve's

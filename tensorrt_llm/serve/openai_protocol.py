@@ -1687,24 +1687,25 @@ class VideoGenerationRequest(OpenAIBaseModel):
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,
         description=(
-            "Optional image or video reference that guides generation. "
-            "Content is routed by its container signature — filename and "
-            "MIME metadata are ignored (JSON requests carry bare base64 "
-            "with no such metadata). Images (PNG image/png, JPEG "
-            "image/jpeg) must fully decode with Pillow at the boundary "
-            "and condition image-to-video. Video containers (MP4 "
-            "video/mp4, AVI video/x-msvideo) pass through encoded and "
-            "are decoded on the workers' NVDEC; tested codec is H.264 in "
-            "both containers, other codecs/profiles depend on the GPU's "
-            "decoder capabilities and are best-effort. HEIF/AVIF still "
-            "images share the ISO-BMFF signature with MP4 and are "
-            "rejected with a 400 asking for PNG/JPEG rather than routed "
-            "to the video decoder. Undecodable or "
-            "corrupt content fails as a client error (400); a valid "
-            "reference the deployment cannot fit fails as capacity "
-            "(503). Reference decoding is bounded to 7200 frames by "
-            "default (TRTLLM_MAX_REFERENCE_DECODE_FRAMES). JSON requests "
-            "carry base64 bytes; multipart requests upload the file."),
+            "Optional image or video reference that guides generation. Content "
+            "is routed by its container signature — filename and MIME metadata "
+            "are ignored (JSON requests carry bare base64 with no such "
+            "metadata). Images (PNG image/png, JPEG image/jpeg) condition "
+            "image-to-video. Video containers (MP4 video/mp4, AVI "
+            "video/x-msvideo) pass through encoded and are decoded on the "
+            "workers' NVDEC; tested codec is H.264 in both containers, other "
+            "codecs/profiles depend on the GPU's decoder capabilities and are "
+            "best-effort. The signature only routes: the worker's decoder is "
+            "what accepts a reference, for both modalities. HEIF/AVIF still "
+            "images share the ISO-BMFF signature with MP4 and are rejected "
+            "with a 400 asking for PNG/JPEG rather than routed to the video "
+            "decoder. An unrecognized container is a 400 at the boundary; how "
+            "a decoder failure past it is reported is pipeline-specific — "
+            "Cosmos3 reports undecodable or corrupt references as client "
+            "errors (400) and device-memory exhaustion as capacity (503). "
+            "Reference decoding is bounded to 7200 frames by default "
+            "(TRTLLM_MAX_REFERENCE_DECODE_FRAMES). JSON requests carry base64 "
+            "bytes; multipart requests upload the file."),
     )
 
     # Resolution
