@@ -1,4 +1,18 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Set up error handling
 set -xEeuo pipefail
@@ -15,9 +29,9 @@ if [ $SLURM_PROCID -eq 0 ]; then
     fi
 fi
 
-# Aggregated mode will run install together with pytest in slurm_run.sh
+# Aggregated mode and infrastructure dry runs install in slurm_run.sh.
 # Disaggregated mode will run install separately in slurm_install.sh
-if [[ "$stageName" != *Disagg* ]]; then
+if [[ "${infraDryRun:-false}" == "true" || "$stageName" != *Disagg* ]]; then
     installScriptPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_run\.sh/slurm_install.sh/')"
     source "$installScriptPath"
     slurm_install_setup
@@ -55,6 +69,21 @@ echo "$LD_LIBRARY_PATH"
 env | sort
 
 echo "Full Command: $pytestCommand"
+
+if [[ "${infraDryRun:-false}" == "true" ]]; then
+    export RANK="$SLURM_PROCID"
+    export LOCAL_RANK="$SLURM_LOCALID"
+    export WORLD_SIZE="$SLURM_NTASKS"
+    export MASTER_ADDR="${MASTER_ADDR:?MASTER_ADDR must be set by the Slurm launch script}"
+    export MASTER_PORT="${MASTER_PORT:?MASTER_PORT must be set by the Slurm launch script}"
+
+    python3 "$llmSrcNode/jenkins/scripts/infra_dry_run_benchmark.py" \
+        --output-dir "$jobWorkspace" \
+        --stage "$stageName" \
+        --commit "${gitlabCommit:-}" \
+        --distributed-timeout-seconds 900
+    exit $?
+fi
 
 # For single-node test runs or disaggregated benchmark/server runs, clear all
 # environment variables related to Slurm and MPI. This prevents test processes

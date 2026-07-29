@@ -228,7 +228,14 @@ COMMON_SSH_OPTIONS = Utils.DEFAULT_CUSTOM_SSH_OPTIONS
 // Per-stage CBTS coverage exclusions applied on top of the upstream eligibility decision.
 CBTS_EXCLUDE_STAGES = [] as Set
 
+def isInfraDryRun() {
+    return testFilter[(INFRA_DRY_RUN)] ?: false
+}
+
 def isCbtsStage(String stageName) {
+    if (isInfraDryRun()) {
+        return false
+    }
     // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
     if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
         return false
@@ -390,43 +397,55 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
         def hasTimeoutTest = false
         def downloadResultSucceed = false
         def downloadPerfResultSucceed = false
+        def downloadInfraResultSucceed = false
 
         pipeline.stage('Submit Test Result') {
             sh "mkdir -p ${stageName}"
             // Download timeout test results
-            def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
-            def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, timeoutTestFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
-            if (downloadTimeoutTestSucceed) {
-                if (stageIsInterrupted) {
-                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
-                } else {
-                    sh "ls -al ${stageName}/"
-                    // Generate timeout test result xml if there are terminated unexpectedly tests
-                    hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
+            if (!isInfraDryRun()) {
+                def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
+                def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, timeoutTestFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
+                if (downloadTimeoutTestSucceed) {
+                    if (stageIsInterrupted) {
+                        echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                    } else {
+                        sh "ls -al ${stageName}/"
+                        // Generate timeout test result xml if there are terminated unexpectedly tests
+                        hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
+                    }
                 }
             }
             // Download normal test results
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results*.xml"
             downloadResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, resultsFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
+            if (isInfraDryRun()) {
+                def infraResultPath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/infra_dry_run*.json"
+                downloadInfraResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, infraResultPath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
+                if (!downloadInfraResultSucceed) {
+                    error "Failed to collect infrastructure dry-run JSON results for ${stageName}"
+                }
+            }
 
             // Download perf test results
-            def perfResultsBasePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
-            def folderListOutput = Utils.exec(
-                pipeline,
-                script: Utils.sshUserCmd(
-                    remote,
-                    "\"find '${perfResultsBasePath}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -printf '%f\\n' || true\""
-                ),
-                returnStdout: true,
-                numRetries: 3
-            )?.trim() ?: ""
-            def perfFolders = folderListOutput.split(/\s+/).collect { it.trim().replaceAll(/\/$/, '') }.findAll { it }
-            echo "Perf Result Folders: ${perfFolders}"
-            if (perfFolders) {
-                def scpSources = perfFolders.size() == 1
-                    ? "${perfResultsBasePath}/${perfFolders[0]}"
-                    : "{${perfFolders.collect { "${perfResultsBasePath}/${it}" }.join(',')}}"
-                downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
+            if (!isInfraDryRun()) {
+                def perfResultsBasePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+                def folderListOutput = Utils.exec(
+                    pipeline,
+                    script: Utils.sshUserCmd(
+                        remote,
+                        "\"find '${perfResultsBasePath}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -printf '%f\\n' || true\""
+                    ),
+                    returnStdout: true,
+                    numRetries: 3
+                )?.trim() ?: ""
+                def perfFolders = folderListOutput.split(/\s+/).collect { it.trim().replaceAll(/\/$/, '') }.findAll { it }
+                echo "Perf Result Folders: ${perfFolders}"
+                if (perfFolders) {
+                    def scpSources = perfFolders.size() == 1
+                        ? "${perfResultsBasePath}/${perfFolders[0]}"
+                        : "{${perfFolders.collect { "${perfResultsBasePath}/${it}" }.join(',')}}"
+                    downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
+                }
             }
 
             // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
@@ -499,7 +518,11 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
         }
 
         if ((hasTimeoutTest || downloadResultSucceed) && !suppressTestReporting) {
-            junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
+            if (isInfraDryRun()) {
+                junit(testResults: "${stageName}/results-infra_dry_run*.xml")
+            } else {
+                junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
+            }
         } else if (suppressTestReporting) {
             echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing junit() because a retry is still planned"
         }
@@ -1543,6 +1566,35 @@ def getNodeArgs(int nodeCount, int gpuCount, boolean setSegment = false) {
     return args
 }
 
+def getInfraDryRunNodeArgs(int nodeCount, int gpuCount) {
+    int gpusPerNode = ((gpuCount / nodeCount) as BigDecimal).setScale(0, BigDecimal.ROUND_CEILING).intValue()
+    return [
+        "--nodes=${nodeCount}",
+        "--ntasks=${gpuCount}",
+        "--ntasks-per-node=${gpusPerNode}",
+        "--gpus-per-node=${gpusPerNode}",
+    ]
+}
+
+def getInfraDryRunDirectCommand(String llmSrc, String outputPath, String stageName, String commit) {
+    def benchmarkArgs = [
+        "${llmSrc}/jenkins/scripts/infra_dry_run_benchmark.py",
+        "--output-dir '${outputPath}'",
+        "--stage '${stageName}'",
+        "--commit '${commit}'",
+    ].join(" ")
+    return """
+        set -euo pipefail
+        mkdir -p '${outputPath}'
+        gpu_count=\$(python3 -c 'import torch; print(torch.cuda.device_count())')
+        if [ "\$gpu_count" -gt 1 ]; then
+            torchrun --standalone --nproc-per-node="\$gpu_count" ${benchmarkArgs}
+        else
+            python3 ${benchmarkArgs}
+        fi
+    """
+}
+
 def getPytestBaseCommandLine(
     String llmSrc,
     String stageName,
@@ -1926,7 +1978,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
                 }
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
-                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
+                String[] taskArgs = isInfraDryRun()
+                    ? getInfraDryRunNodeArgs(nodeCount, gpuCount)
+                    : getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
                 }
@@ -2047,6 +2101,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     srunArgs.add("--container-env=S3_SECRET_KEY")
                 }
+                if (isInfraDryRun()) {
+                    srunArgs.add("--container-env=MASTER_ADDR")
+                    srunArgs.add("--container-env=MASTER_PORT")
+                }
                 envVarsToExport.each { varName, varValue ->
                     srunArgs.add("--container-env=${varName}")
                 }
@@ -2091,6 +2149,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
                     export perfMode=$perfMode
+                    export infraDryRun=${isInfraDryRun()}
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
@@ -2107,10 +2166,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
                     echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
 
+                    if [ "\$infraDryRun" = "true" ]; then
+                        export MASTER_ADDR=\$(scontrol show hostnames "\$SLURM_JOB_NODELIST" | head -n 1)
+                        export MASTER_PORT=\$((20000 + SLURM_JOB_ID % 20000))
+                    fi
+
                     ${srunPrologue}
                 """.replaceAll("(?m)^\\s*", "")
 
-                if (disaggMultiNodeMode || aggMultiNodeMode) {
+                if (!isInfraDryRun() && (disaggMultiNodeMode || aggMultiNodeMode)) {
                     def scriptLaunchPrefixPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch_prefix.sh")
                     def scriptLaunchSrunArgsPathLocal = Utils.createTempLocation(pipeline, "./slurm_srun_args.txt")
                     // The unified submit.py handles both agg and disagg; only the
@@ -2542,7 +2606,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
 // CBTS Layer 2.5: rename narrowed stages (reuse-safety) and resize their splits to k.
 def cbtsResizeSplits(configs) {
-    def cbts = testFilter[(CBTS_RESULT)]
+    def cbts = isInfraDryRun() ? null : testFilter[(CBTS_RESULT)]
     if (cbts == null || !cbts.cbts_test_db_artifact_path) {
         return configs
     }
@@ -2572,7 +2636,7 @@ def cbtsResizeSplits(configs) {
 // CBTS Layer 2: replace the normal stage set with the selector's affected
 // stages while retaining the baseline sanity and multi-GPU gates.
 def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter) {
-    def cbts = testFilter[(CBTS_RESULT)]
+    def cbts = isInfraDryRun() ? null : testFilter[(CBTS_RESULT)]
     if (cbts == null) {
         return parallelJobsFiltered
     }
@@ -2690,7 +2754,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
         backoffMs: 60L * 1000L,
       ]
 
-      if (nodeCount > 1 || runWithSbatch) {
+      if (isInfraDryRun() || nodeCount > 1 || runWithSbatch) {
         runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       } else {
         runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
@@ -2831,6 +2895,8 @@ def CBTS_RESULT = "cbts_result"
 // Pipeline-level CBTS coverage eligibility, decided in L0_MergeRequest.groovy.
 @Field
 def CBTS_COVERAGE = "cbts_coverage"
+@Field
+def INFRA_DRY_RUN = "infra_dry_run"
 // Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
@@ -2858,6 +2924,7 @@ def testFilter = [
     (DETAILED_LOG): false,
     (CBTS_RESULT): null,
     (CBTS_COVERAGE): false,
+    (INFRA_DRY_RUN): false,
 ]
 
 @Field
@@ -4061,7 +4128,7 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     // If the download or extraction fails we swallow the error: the override
     // directory will be absent below, the overrideYaml check will fail, and
     // renderTestDB falls back to the source test-db.
-    def cbts = testFilter[(CBTS_RESULT)]
+    def cbts = isInfraDryRun() ? null : testFilter[(CBTS_RESULT)]
     if (cbts != null && cbts.test_db_dir_override && cbts.cbts_test_db_artifact_path) {
         try {
             // Always re-fetch: a reused workspace may hold a stale cbts_test_db/ shadowing this build's YAMLs.
@@ -4911,6 +4978,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
         containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
         withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
+            if (isInfraDryRun()) {
+                def commit = env.artifactCommit ?: env.gitlabCommit ?: ""
+                sh getInfraDryRunDirectCommand(
+                    llmSrc,
+                    "${WORKSPACE}/${stageName}",
+                    stageName,
+                    commit,
+                )
+                return
+            }
             withCredentials([
                 string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
                 string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
@@ -4991,6 +5068,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
+        if (isInfraDryRun()) {
+            return
+        }
+
         // Generate comprehensive rerun report if any reruns occurred
         stage ("Generate Report") {
             timeout(time: 15, unit: 'MINUTES'){
@@ -5067,6 +5148,10 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
                 currentBuild.result = 'FAILURE'
                 error("Error in post-debug session: ${e.message}")
             }
+        }
+        if (isInfraDryRun()) {
+            sh "ls -al ${stageName}/"
+            return
         }
         // If the execution test list is null, remove the test result xml
         sh """
