@@ -69,6 +69,8 @@ class TestFlashInferAttention(unittest.TestCase):
     def test_separate_kv_draft_metadata_uses_draft_manager(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
+        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+            self.skipTest("FlashInfer trtllm-gen requires SM100 or SM103")
 
         def create_manager():
             return KVCacheManager(

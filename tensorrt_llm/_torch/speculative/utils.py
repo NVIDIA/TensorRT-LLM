@@ -448,7 +448,7 @@ def get_spec_drafter(model_engine,
 
 
 def get_num_spec_layers(spec_config):
-    if spec_config._use_shared_kv_cache:
+    if getattr(spec_config, "_use_shared_kv_cache", False):
         return 0
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         return 1
@@ -526,7 +526,7 @@ def get_num_extra_kv_tokens(spec_config):
     """
     if spec_config is None:
         return 0
-    if spec_config._use_shared_kv_cache:
+    if getattr(spec_config, "_use_shared_kv_cache", False):
         return 0
     if spec_config.spec_dec_mode.use_one_engine():
         return spec_config.max_draft_len - 1
