@@ -70,6 +70,7 @@ l0_a10:
   - unittest/disaggregated/test_remoteDictionary.py
   - unittest/disaggregated/test_agent_multi_backends.py
   - unittest/disaggregated/test_messenger.py
+  - unittest/disaggregated/test_peer_endpoint_allowlist.py
   - unittest/disaggregated/test_disagg_cluster_manager_worker.py
   - unittest/disaggregated/test_cluster_storage.py
   - unittest/disaggregated/test_extractor.py

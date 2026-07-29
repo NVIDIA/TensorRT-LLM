@@ -58,6 +58,10 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.peer_allowlist import (
+    check_peer_endpoint,
+    get_peer_endpoint_allowlist,
+)
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
@@ -422,6 +426,7 @@ class Sender(SenderBase):
         access to the same ZMQ socket."""
         if endpoint is None:
             raise ValueError("Sender: peer endpoint is None; peer may not have registered yet")
+        check_peer_endpoint(endpoint)
         dealers = getattr(self._thread_local, "dealers", None)
         if dealers is None:
             dealers = {}
@@ -1088,6 +1093,7 @@ class Sender(SenderBase):
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
         if endpoint is None:
             raise ValueError("Sender: peer endpoint is None; peer may not have registered yet")
+        check_peer_endpoint(endpoint)
         if endpoint not in self._dealers:
             self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return self._dealers[endpoint]
@@ -1659,6 +1665,7 @@ class Receiver(ReceiverBase):
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
         if endpoint is None:
             raise ValueError("Receiver: peer endpoint is None; peer may not have registered yet")
+        check_peer_endpoint(endpoint)
         if endpoint not in self._dealers:
             self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return self._dealers[endpoint]
@@ -1666,6 +1673,7 @@ class Receiver(ReceiverBase):
     def _get_sender_info(self, params: DisaggregatedParams) -> RankInfo:
         info_endpoint = self._extract_info_endpoint(params)
         if self._should_register_peer(params):
+            check_peer_endpoint(info_endpoint)
             logger.info(f"Registering peer in first request to endpoint '{info_endpoint}'")
             messenger = ZMQMessenger(mode="DEALER", endpoint=info_endpoint)
             try:
@@ -2246,6 +2254,8 @@ class TransferWorkerConfig:
 
 class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
+        # Surface a bad allowlist configuration at startup, not mid-transfer.
+        get_peer_endpoint_allowlist()
         self._config = config
         kvm = config.kv_cache_manager
         self._aux_buffer = _make_aux_buffer(
