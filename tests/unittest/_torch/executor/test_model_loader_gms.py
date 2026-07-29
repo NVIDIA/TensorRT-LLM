@@ -159,6 +159,16 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     return loader
 
 
+def test_runtime_model_config_attrs_include_sequence_slot_capacity():
+    loader = object.__new__(ModelLoader)
+    loader.max_num_seq_slots = 16
+    config = SimpleNamespace(extra_attrs={})
+
+    loader._set_runtime_model_config_attrs(config)
+
+    assert config.extra_attrs["max_num_seq_slots"] == 16
+
+
 def _build_gms_backend(*, is_rw, events):
     backend = MagicMock()
     backend.connect.return_value = True

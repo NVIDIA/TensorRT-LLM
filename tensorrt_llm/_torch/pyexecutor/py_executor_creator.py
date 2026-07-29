@@ -784,14 +784,10 @@ def create_py_executor(
     if guided_decoding_config is not None:
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
-                guided_decoder_slots = (max_num_seq_slots if getattr(
-                    model_engine, "_enable_dsv4_overlap_headroom", False) else
-                                        max_batch_size)
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    # The scoped DeepSeek-V4 path follows the expanded slot
-                    # pool. Other configurations retain max_batch_size.
-                    "max_num_sequences": guided_decoder_slots,
+                    # Guided-decoder state is indexed by sequence slot.
+                    "max_num_sequences": max_num_seq_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
                 }
