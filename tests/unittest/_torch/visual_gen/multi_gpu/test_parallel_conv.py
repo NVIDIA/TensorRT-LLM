@@ -116,10 +116,19 @@ def _broadcast_params(module: nn.Module):
         dist.broadcast(p.data, src=0)
 
 
-def _prepare(rank, world_size, chunk_dim, shape, device):
+def _prepare(
+    rank: int,
+    world_size: int,
+    chunk_dim: int,
+    shape: tuple[int, ...],
+    device: str,
+    memory_format: torch.memory_format | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     x = torch.randn(shape, dtype=torch.float32, device=device)
     dist.broadcast(x, src=0)
     local_x = x.chunk(world_size, dim=chunk_dim)[rank]
+    if memory_format is not None:
+        local_x = local_x.contiguous(memory_format=memory_format)
     return x, local_x
 
 
@@ -137,7 +146,7 @@ def _gather_and_check(local_out, ref_out, chunk_dim, world_size, rank, atol=0.01
 # ===========================================================================
 
 
-def _logic_halo_conv3d(rank, world_size):
+def _logic_halo_conv3d(rank: int, world_size: int) -> None:
     """WanCausalConvHalo wrapping WanCausalConv3d (kernel=3, with cache_x)."""
     device = f"cuda:{rank}"
     adj = _make_adj_groups(world_size)
@@ -146,21 +155,31 @@ def _logic_halo_conv3d(rank, world_size):
     _broadcast_params(conv)
 
     for chunk_dim in [3, 4]:
-        x, local_x = _prepare(rank, world_size, chunk_dim, (1, 96, 4, 64, 48), device)
+        for memory_format in [torch.contiguous_format, torch.channels_last_3d]:
+            x, local_x = _prepare(
+                rank,
+                world_size,
+                chunk_dim,
+                (1, 96, 4, 64, 48),
+                device,
+                memory_format,
+            )
 
-        cache_x = torch.randn(1, 96, 2, 64, 48, dtype=torch.float32, device=device)
-        dist.broadcast(cache_x, src=0)
-        local_cache = cache_x.chunk(world_size, dim=chunk_dim)[rank]
+            cache_x = torch.randn(1, 96, 2, 64, 48, dtype=torch.float32, device=device)
+            dist.broadcast(cache_x, src=0)
+            local_cache = cache_x.chunk(world_size, dim=chunk_dim)[rank].contiguous(
+                memory_format=memory_format
+            )
 
-        ref = conv(x, cache_x).detach()
+            ref = conv(x, cache_x).detach()
 
-        par = WanCausalConvHalo(conv, chunk_dim, adj, rank, world_size)
-        local_out = par(local_x, local_cache)
+            par = WanCausalConvHalo(conv, chunk_dim, adj, rank, world_size)
+            local_out = par(local_x, local_cache)
 
-        _gather_and_check(local_out, ref, chunk_dim, world_size, rank)
+            _gather_and_check(local_out, ref, chunk_dim, world_size, rank)
 
 
-def _logic_halo_conv2d(rank, world_size):
+def _logic_halo_conv2d(rank: int, world_size: int) -> None:
     """HaloExchangeConv wrapping nn.Conv2d (kernel=3, stride=1)."""
     device = f"cuda:{rank}"
     adj = _make_adj_groups(world_size)
@@ -169,16 +188,24 @@ def _logic_halo_conv2d(rank, world_size):
     _broadcast_params(conv)
 
     for chunk_dim in [2, 3]:
-        x, local_x = _prepare(rank, world_size, chunk_dim, (1, 96, 64, 48), device)
-        ref = conv(x).detach()
+        for memory_format in [torch.contiguous_format, torch.channels_last]:
+            x, local_x = _prepare(
+                rank,
+                world_size,
+                chunk_dim,
+                (1, 96, 64, 48),
+                device,
+                memory_format,
+            )
+            ref = conv(x).detach()
 
-        par = HaloExchangeConv(conv, chunk_dim, adj, rank, world_size)
-        local_out = par(local_x)
+            par = HaloExchangeConv(conv, chunk_dim, adj, rank, world_size)
+            local_out = par(local_x)
 
-        _gather_and_check(local_out, ref, chunk_dim, world_size, rank)
+            _gather_and_check(local_out, ref, chunk_dim, world_size, rank)
 
 
-def _logic_halo_conv2d_stride2(rank, world_size):
+def _logic_halo_conv2d_stride2(rank: int, world_size: int) -> None:
     """HaloExchangeConv2dStride2 wrapping nn.Conv2d (kernel=3, stride=2)."""
     device = f"cuda:{rank}"
     adj = _make_adj_groups(world_size)
@@ -189,20 +216,28 @@ def _logic_halo_conv2d_stride2(rank, world_size):
     pad = nn.ZeroPad2d((0, 1, 0, 1))
 
     for chunk_dim in [2, 3]:
-        x, local_x = _prepare(rank, world_size, chunk_dim, (4, 96, 64, 48), device)
-        ref = conv(pad(x)).detach()
+        for memory_format in [torch.contiguous_format, torch.channels_last]:
+            x, local_x = _prepare(
+                rank,
+                world_size,
+                chunk_dim,
+                (4, 96, 64, 48),
+                device,
+                memory_format,
+            )
+            ref = conv(pad(x)).detach()
 
-        par = HaloExchangeConv2dStride2(
-            conv,
-            chunk_dim,
-            adj,
-            rank,
-            world_size,
-            pad_before_conv=(0, 1, 0, 1),
-        )
-        local_out = par(local_x)
+            par = HaloExchangeConv2dStride2(
+                conv,
+                chunk_dim,
+                adj,
+                rank,
+                world_size,
+                pad_before_conv=(0, 1, 0, 1),
+            )
+            local_out = par(local_x)
 
-        _gather_and_check(local_out, ref, chunk_dim, world_size, rank)
+            _gather_and_check(local_out, ref, chunk_dim, world_size, rank)
 
 
 def _logic_halo_conv2d_stride2_offset_group(rank: int, world_size: int) -> None:
@@ -287,7 +322,7 @@ class TestSpatialChannelsLastFormat:
         assert out.is_contiguous(memory_format=torch.channels_last_3d)
 
     @pytest.mark.parametrize("dim", [3, 4])
-    def test_physical_layout_cat_preserves_channels_last_3d(self, dim):
+    def test_physical_layout_cat_preserves_channels_last_3d(self, dim: int) -> None:
         x = torch.randn(1, 4, 3, 8, 8).contiguous(memory_format=torch.channels_last_3d)
         halo_shape = list(x.shape)
         halo_shape[dim] = 1
@@ -299,7 +334,7 @@ class TestSpatialChannelsLastFormat:
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert actual.is_contiguous(memory_format=torch.channels_last_3d)
 
-    def test_physical_layout_cat_fuses_row_major_3d_conversion(self):
+    def test_physical_layout_cat_fuses_row_major_3d_conversion(self) -> None:
         x = torch.randn(1, 4, 3, 8, 8)
         halo = torch.randn(1, 4, 3, 8, 1)
 
@@ -310,7 +345,7 @@ class TestSpatialChannelsLastFormat:
         assert actual.is_contiguous(memory_format=torch.channels_last_3d)
 
     @pytest.mark.parametrize("dim", [2, 3])
-    def test_physical_layout_cat_preserves_channels_last_2d(self, dim):
+    def test_physical_layout_cat_preserves_channels_last_2d(self, dim: int) -> None:
         x = torch.randn(1, 4, 8, 8).contiguous(memory_format=torch.channels_last)
         halo_shape = list(x.shape)
         halo_shape[dim] = 1
@@ -322,7 +357,7 @@ class TestSpatialChannelsLastFormat:
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert actual.is_contiguous(memory_format=torch.channels_last)
 
-    def test_physical_layout_cat_fuses_row_major_2d_conversion(self):
+    def test_physical_layout_cat_fuses_row_major_2d_conversion(self) -> None:
         x = torch.randn(1, 4, 8, 8)
         halo = torch.randn(1, 4, 8, 1)
 
@@ -339,7 +374,11 @@ class TestSpatialChannelsLastFormat:
             ((1, 4, 3, 8, 9), 4),
         ],
     )
-    def test_physical_halo_wire_round_trip(self, shape, dim):
+    def test_physical_halo_wire_round_trip(
+        self,
+        shape: tuple[int, ...],
+        dim: int,
+    ) -> None:
         x = torch.randn(shape)
         expected = torch.narrow(x, dim, shape[dim] - 1, 1)
 
@@ -364,7 +403,7 @@ class TestSpatialChannelsLastFormat:
             torch.randn(1, 4, 3, 8, 1),
         ],
     )
-    def test_physical_halo_wire_views_are_bit_exact(self, x):
+    def test_physical_halo_wire_views_are_bit_exact(self, x: torch.Tensor) -> None:
         wire = _logical_to_physical_channels_last(x)
         actual = _physical_to_logical_channels_last(wire)
 
