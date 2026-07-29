@@ -72,10 +72,10 @@ _MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
 
 def _get_multi_ctas_kv_counter_size(
     num_heads: int,
-    max_num_requests: int,
+    max_batch_beam: int,
     multi_processor_count: int,
 ) -> int:
-    num_counters = max(num_heads * max_num_requests, multi_processor_count)
+    num_counters = max(num_heads * max_batch_beam, multi_processor_count)
     aligned_num_counters = (
         (num_counters + _MULTI_CTAS_KV_COUNTER_ALIGNMENT - 1)
         // _MULTI_CTAS_KV_COUNTER_ALIGNMENT
@@ -802,9 +802,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if self._multi_processor_count is None:
             self._multi_processor_count = self._get_multi_processor_count(q.device)
 
+        # One counter per head per decoder sequence; beam search expands each
+        # request into ``beam_width`` sequences.
         required_counter_size = _get_multi_ctas_kv_counter_size(
             attn.num_heads,
-            metadata.max_num_requests,
+            metadata.max_num_requests * metadata.beam_width,
             self._multi_processor_count,
         )
         counter_buffer = self._multi_ctas_kv_counter_buffer
