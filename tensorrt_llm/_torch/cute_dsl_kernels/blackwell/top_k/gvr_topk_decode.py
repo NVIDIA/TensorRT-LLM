@@ -280,6 +280,7 @@ class GvrTopKKernel:
         pdl_wait_late: bool = True,
         p4_fine_rangetest: Optional[bool] = None,
         p4_lane_binsum: bool = True,
+        p4_scat_rangetest: bool = True,
         enable_r0: bool = True,
         accept_cap: "int | None" = None,
         kc_override: "int | None" = None,
@@ -573,6 +574,12 @@ class GvrTopKKernel:
         # with the whole warp doing identical work. Spread the segment
         # across the lanes and close with one warp reduction instead.
         self.p4_lane_binsum = bool(p4_lane_binsum)
+        # p4_scat_rangetest: the scatter classifies each candidate as
+        # above / inside / below the straddling bin and recomputed the
+        # bin index to do it; the same value-range compare the fine
+        # recursion uses answers it without the subtract, multiply and
+        # two clamps per candidate.
+        self.p4_scat_rangetest = bool(p4_scat_rangetest)
         self.r0_qfracs = tuple(float(q) for q in r0_qfracs) if r0_qfracs else ()
         if self.r0_qfracs:
             assert all(0.0 < q < 1.0 for q in self.r0_qfracs), self.r0_qfracs
@@ -3663,6 +3670,12 @@ class GvrTopKKernel:
                 # bin b* value range under the inv1 binning: [f_lo, f_lo + 1/inv1)
                 f_lo = bmin_r + cutlass.Float32(b_star) / inv1
                 finv = (cutlass.Float32(fbins - 1) + cutlass.Float32(0.99)) * inv1
+                # bin b* spans [f_lo, f_hi) under the coarse binning; the
+                # clamped ends fold out-of-range values INTO bin 0 and bin
+                # kBins-1, so those two bins drop the matching side.
+                f_hi = f_lo + cutlass.Float32(1.0) / inv1
+                lo_edge = b_star == cutlass.Int32(0)
+                hi_edge = b_star == cutlass.Int32(kBins - 1)
                 # re-zero (only fbins slots) + build fine sub-hist of bin-b* cands
                 iz = tidx
                 while iz < cutlass.Int32(fbins):
@@ -3677,9 +3690,6 @@ class GvrTopKKernel:
                     # the binning fold out-of-range values INTO bin 0 and
                     # bin kBins-1, so those two bins drop the matching side
                     # of the range test to stay bit-identical.
-                    f_hi = f_lo + cutlass.Float32(1.0) / inv1
-                    lo_edge = b_star == cutlass.Int32(0)
-                    hi_edge = b_star == cutlass.Int32(kBins - 1)
                     ifb = tidx
                     while ifb < cand_count:
                         vf = smem_keys[ifb]
@@ -3782,11 +3792,32 @@ class GvrTopKKernel:
                 isc = tidx
                 while isc < cand_count:
                     v = smem_keys[isc]
-                    bin_i = cutlass.Int32((v - bmin_r) * inv1)
-                    if bin_i < cutlass.Int32(0):
-                        bin_i = cutlass.Int32(0)
-                    if bin_i > cutlass.Int32(kBins - 1):
-                        bin_i = cutlass.Int32(kBins - 1)
+                    if cutlass.const_expr(self.p4_scat_rangetest):
+                        # same three-way split as the bin recompute, by value:
+                        # above b* <=> v >= f_hi (impossible at the top bin,
+                        # which absorbs everything higher), inside b* <=> v in
+                        # [f_lo, f_hi) with the edge bins dropping their
+                        # absorbed side. bin_i is only ever compared against
+                        # b*, so encoding the class as b*-1 / b* / b*+1 keeps
+                        # the branches below unchanged.
+                        abv = v >= f_hi
+                        inb2 = v >= f_lo and v < f_hi
+                        if lo_edge:
+                            inb2 = v < f_hi
+                        if hi_edge:
+                            abv = False
+                            inb2 = v >= f_lo
+                        bin_i = b_star - cutlass.Int32(1)
+                        if abv:
+                            bin_i = b_star + cutlass.Int32(1)
+                        if inb2:
+                            bin_i = b_star
+                    else:
+                        bin_i = cutlass.Int32((v - bmin_r) * inv1)
+                        if bin_i < cutlass.Int32(0):
+                            bin_i = cutlass.Int32(0)
+                        if bin_i > cutlass.Int32(kBins - 1):
+                            bin_i = cutlass.Int32(kBins - 1)
                     if bin_i > b_star:
                         pos = atomicAdd(s_iscalars.iterator + cutlass.Int32(4), cutlass.Int32(1))
                         if pos < cutlass.Int32(kK):
