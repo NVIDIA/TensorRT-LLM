@@ -2223,13 +2223,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return per_step
 
     class PenaltyHandler:
-        """Applies every logits penalty: min-length and occurrence.
+        """Applies the occurrence penalties: repetition, presence and frequency.
 
-        :meth:`apply` is the single per-step entry point and runs the penalties in the
-        order the C++ path uses -- min-length first, then repetition / presence /
-        frequency -- all before the sampling strategy divides by temperature.
+        These rescale or subtract from a token's logit based on how often it has already
+        occurred, and run before the sampling strategy divides by temperature. Bans that
+        force a logit to -inf (min_length, bad words, no-repeat-ngram) are a different
+        kind of transform and live in ``TokenBanHandler``.
 
-        The occurrence half follows the C++ ``batchApplyPenalty`` kernel
+        The implementation follows the C++ ``batchApplyPenalty`` kernel
         (``cpp/tensorrt_llm/kernels/penaltyKernels.cu``) as driven by ``PenaltyLayer``.
         Its persistent device state lives in :class:`PenaltyStore`, which documents the
         workspace semantics. Per-slot parameter buffers are filled once per request,
@@ -2237,9 +2238,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         accumulates on the host, ``update_for_new_requests`` issues the device updates).
         Vocab-sized workspaces are allocated lazily and skipped entirely when no matching
         request uses an occurrence penalty.
-
-        The min-length half is stateless -- it is recomputed from the requests each step --
-        so it needs none of that machinery and stays a static method.
         """
 
         @dataclass(kw_only=True)
@@ -2569,69 +2567,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._to_device(counted_tokens, torch.int64),
             )
 
-        @staticmethod
-        def _apply_min_length(
-            logits: torch.Tensor,
-            requests: list[LlmRequest],
-            num_steps_tensor: torch.Tensor,
-            num_beams_tensor: torch.Tensor,
-        ) -> None:
-            """Suppress the end-of-sequence token until ``min_length`` is reached.
-
-            Args:
-                logits: The logits to apply min length penalty to
-                requests: The requests to apply min length penalty to
-                num_steps_tensor: The number of steps per request (host tensor)
-                num_beams_tensor: The number of beams per request (host tensor)
-            """
-            if not any(
-                r.py_min_length
-                and (r.max_beam_num_tokens - r.py_orig_prompt_len) < r.py_min_length[0]
-                for r in requests
-            ):
-                return
-
-            # Deferred host conversion: only needed on the (rare) penalty path.
-            num_steps = num_steps_tensor.tolist()
-            num_beams = num_beams_tensor.tolist()
-
-            rows: list[int] = []
-            cols: list[int] = []
-            current_offset = 0
-            for index, r in enumerate(requests):
-                # Advance the offset before any guard below can skip the request:
-                # every request occupies its logits rows, penalized or not.
-                req_offset = current_offset
-                current_offset += num_steps[index] * num_beams[index]
-
-                if not r.py_min_length:
-                    continue
-                # Use the original end_id (before ignore_eos override)
-                # so we suppress the real EOS token, not token -1.
-                end_id = getattr(r, "py_original_end_id", r.py_end_id)
-                if end_id is None or end_id <= -1:
-                    continue
-
-                for beam_idx in range(num_beams[index]):
-                    for step in range(num_steps[index]):
-                        if (
-                            r.get_num_tokens(beam_idx) - r.py_orig_prompt_len
-                        ) + step < r.py_min_length[0]:
-                            rows.append(req_offset + num_steps[index] * beam_idx + step)
-                            cols.append(end_id)
-                        else:
-                            break
-
-            if rows:
-                neg_inf = torch.full((), float("-inf"), dtype=logits.dtype, device=logits.device)
-                row_idx = torch.tensor(rows, dtype=torch.long, pin_memory=prefer_pinned()).to(
-                    logits.device, non_blocking=True
-                )
-                col_idx = torch.tensor(cols, dtype=torch.long, pin_memory=prefer_pinned()).to(
-                    logits.device, non_blocking=True
-                )
-                logits.index_put_((row_idx, col_idx), neg_inf, accumulate=False)
-
         @nvtx_range("apply_penalties")
         @torch.inference_mode()
         def apply(
@@ -2643,49 +2578,23 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seq_slots: torch.Tensor,
             request_offsets: torch.Tensor,
             request_num_steps: torch.Tensor,
-            request_num_beams: torch.Tensor,
             is_draft_batch: bool = False,
         ) -> None:
-            """Apply every penalty to ``logits`` in place.
+            """Apply the occurrence penalties to ``logits`` in place.
 
             ``logits`` is the packed generated-token logits ``[sum(num_steps * num_beams),
-            vocab_size]``; request ``r`` owns ``request_num_steps[r] * request_num_beams[r]``
-            consecutive rows starting at ``request_offsets[r]``, in beam-major / step-minor
-            order. ``request_*`` are the caller's pinned host tensors; the occurrence path
-            stages the two it needs to the device.
+            vocab_size]``; request ``r`` owns ``request_num_steps[r]`` consecutive rows
+            starting at ``request_offsets[r]``, in beam-major / step-minor order.
+            ``request_offsets`` / ``request_num_steps`` are the caller's pinned host
+            tensors and are staged to the device here.
 
             Args:
                 is_draft_batch: draft batches share this sampler but draw ``py_seq_slot``
                     from a separate numbering space that collides with target slots, so
-                    occurrence penalties would read/write an unrelated target request's
-                    state and are skipped (like the pending-steps tracking). Min-length
-                    is stateless and still applies.
+                    penalizing them would read/write an unrelated target request's
+                    occurrence state; skip them like the pending-steps tracking.
             """
-            self._apply_min_length(logits, requests, request_num_steps, request_num_beams)
-
-            if is_draft_batch or not requests:
-                return
-            self._apply_occurrence(
-                logits,
-                requests,
-                new_tokens=new_tokens,
-                seq_slots=seq_slots,
-                request_offsets=request_offsets,
-                request_num_steps=request_num_steps,
-            )
-
-        def _apply_occurrence(
-            self,
-            logits: torch.Tensor,
-            requests: list[LlmRequest],
-            *,
-            new_tokens: torch.Tensor,
-            seq_slots: torch.Tensor,
-            request_offsets: torch.Tensor,
-            request_num_steps: torch.Tensor,
-        ) -> None:
-            """Apply repetition / presence / frequency penalties to ``logits`` in place."""
-            if self._num_active_slots == 0:
+            if is_draft_batch or not requests or self._num_active_slots == 0:
                 return
 
             # Cheap per-batch scan so the vocab-sized workspace is only allocated when this
@@ -5662,8 +5571,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
         )
 
-        # Apply min-length and repetition/presence/frequency penalties in place, before
-        # the greedy fast path, so both greedy and grouped-sampling logits are penalized.
+        # Apply repetition/presence/frequency penalties in place, before the greedy fast
+        # path, so both greedy and grouped-sampling logits are penalized.
         self._penalty_handler.apply(
             logits_cuda,
             sampling_requests,
@@ -5671,7 +5580,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seq_slots=seq_slots_cuda,
             request_offsets=sampling_requests_metadata.req_offsets,
             request_num_steps=sampling_requests_metadata.req_num_steps,
-            request_num_beams=sampling_requests_metadata.req_num_beams,
             # _is_draft_batch reads requests[0]; an empty batch has no penalties to apply
             # anyway, so short-circuit rather than index into it.
             is_draft_batch=bool(sampling_requests) and self._is_draft_batch(sampling_requests),

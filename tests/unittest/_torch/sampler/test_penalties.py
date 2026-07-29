@@ -344,10 +344,6 @@ def _make_handler_request(
         py_seq_slot=slot,
         py_return_log_probs=False,
         get_tokens=lambda _beam_idx: tokens,
-        # PenaltyHandler.apply runs the min-length half first; no min_length here means
-        # it short-circuits and leaves the logits to the occurrence half alone.
-        py_min_length=None,
-        max_beam_num_tokens=len(tokens),
         py_is_draft=False,
     )
 
@@ -378,7 +374,6 @@ def _apply_handler(
         seq_slots=torch.tensor([request.py_seq_slot], dtype=torch.int64, device="cuda"),
         request_offsets=torch.zeros(1, dtype=torch.int32),
         request_num_steps=torch.tensor([num_steps], dtype=torch.int32),
-        request_num_beams=torch.ones(1, dtype=torch.int32),
     )
 
 
