@@ -16,7 +16,7 @@
 import os
 from typing import TypeAlias
 
-from .cute_dsl import CuteDslMlaFmha
+from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha

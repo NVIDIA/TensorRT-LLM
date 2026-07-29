@@ -263,7 +263,7 @@ The FMHA package is split by role:
 - `fmha/interface.py` defines the `Fmha` runtime contract.
 - `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
   requests and dispatches them to phase-specific hooks.
-- `fmha/cute_dsl.py` implements the CuTe DSL MLA decode FMHA library.
+- `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the regular `thop.attention` fallback library.

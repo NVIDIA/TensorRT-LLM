@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .cute_dsl import CuteDslMlaFmha
+from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
