@@ -738,10 +738,10 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=False,
         description=
         "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q "
-        "is sharded with the KV heads and index-K is replicated. This prototype "
-        "currently targets disaggregated prefill workers; leave it disabled on "
-        "decode or mixed workers. The MiniMax-M3-specific path requires the MSA "
-        "implementation.",
+        "is sharded with the KV heads and index-K is replicated. MSA batches "
+        "also use a horizontal norm/RoPE/cache-insertion producer for prefill, "
+        "mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "
+        "requires the MSA implementation.",
         status="prototype",
     )
     num_attention_heads: Optional[int] = Field(
