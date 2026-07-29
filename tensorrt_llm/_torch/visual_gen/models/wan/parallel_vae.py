@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -32,6 +32,11 @@ from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import (
     SplitSpec,
 )
 from tensorrt_llm._torch.visual_gen.utils import as_tuple
+
+
+def _native_decode_chunk_size(parallel_size: int) -> int:
+    """Return the validated temporal batch size for native parallel Wan decode."""
+    return 3 if parallel_size == 4 else 1
 
 
 class WanCausalConvHalo(HaloExchangeConv):
@@ -83,7 +88,11 @@ class ParallelVAE_Wan(ParallelVAEBase):
             return (dist,)
         return AutoencoderKLOutput(latent_dist=dist)
 
-    def _decode_impl(self, z: torch.Tensor, **kwargs):
+    def _decode_impl(
+        self,
+        z: torch.Tensor,
+        **kwargs: Any,
+    ) -> DecoderOutput | tuple[torch.Tensor]:
         return_dict = kwargs.pop("return_dict", True)
         z_local, _ = self._split_tensor(z)
         sample = self._gather_tensor(
@@ -215,3 +224,11 @@ class ParallelVAE_TrtllmWan(ParallelVAE_Wan):
 
     _conv3d_cls = wan_vae.WanCausalConv3d
     _attn_cls = wan_vae.WanAttentionBlock
+
+    def _decode_impl(
+        self,
+        z: torch.Tensor,
+        **kwargs: Any,
+    ) -> DecoderOutput | tuple[torch.Tensor]:
+        kwargs["temporal_chunk_size"] = _native_decode_chunk_size(self.world_size)
+        return super()._decode_impl(z, **kwargs)

@@ -16,39 +16,13 @@ from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import (
     _use_native_wan_vae,
     load_wan_vae,
 )
-from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
-    WanVAE,
-    WanVAEConfig,
-    _decode_chunk_size,
-    _decode_chunk_slices,
-)
+from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE, WanVAEConfig
 
 DEVICE = "cuda"
 # Parity runs in fp32 to check whether our implementation matches diffusers'
 # computation, isolated from bf16 rounding noise that differs by memory layout
 # (our channels_last vs diffusers' contiguous). Production runs the VAE in bf16.
 DTYPE = torch.float32
-
-
-@pytest.mark.parametrize(
-    ("num_frames", "chunk_size", "expected"),
-    [
-        (1, 4, [(0, 1)]),
-        (5, 1, [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]),
-        (5, 2, [(0, 1), (1, 3), (3, 5)]),
-        (6, 4, [(0, 1), (1, 5), (5, 6)]),
-    ],
-)
-def test_decode_chunk_slices_preserve_first_frame(num_frames, chunk_size, expected):
-    actual = [(chunk.start, chunk.stop) for chunk in _decode_chunk_slices(num_frames, chunk_size)]
-    assert actual == expected
-
-
-@pytest.mark.parametrize("value", ["0", "-1", "not-an-int"])
-def test_decode_chunk_size_rejects_invalid_values(monkeypatch, value):
-    monkeypatch.setenv("TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE", value)
-    with pytest.raises(ValueError, match="must be a positive integer"):
-        _decode_chunk_size()
 
 
 def _require_checkpoint(model_dir: str, env_var: str) -> Path:
@@ -170,7 +144,7 @@ def test_wan22_ti2v_vae_matches_diffusers_decode_checkpoint(
 
     with torch.inference_mode():
         reference_decoded = reference_vae.decode(latents).sample
-        wan_decoded = wan_vae.decode(latents).sample
+        wan_decoded = wan_vae.decode(latents, temporal_chunk_size=3).sample
 
     # fp32 parity; the residual gap is only channels_last vs contiguous conv
     # reduction order.
@@ -254,7 +228,7 @@ def test_wan21_t2v_vae_matches_diffusers_decode_checkpoint():
 
     with torch.inference_mode():
         reference_decoded = reference_vae.decode(latents).sample
-        wan_decoded = wan_vae.decode(latents).sample
+        wan_decoded = wan_vae.decode(latents, temporal_chunk_size=3).sample
 
     # fp32 parity; the residual gap is only channels_last vs contiguous conv
     # reduction order.

@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -101,19 +100,10 @@ def _to_device_if_needed(x: torch.Tensor, device: torch.device) -> torch.Tensor:
     return x.to(device)
 
 
-def _decode_chunk_size() -> int:
-    value = os.environ.get("TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE", "1")
-    try:
-        chunk_size = int(value)
-    except ValueError:
-        raise ValueError("TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE must be a positive integer") from None
-    if chunk_size < 1:
-        raise ValueError("TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE must be a positive integer")
-    return chunk_size
-
-
 def _decode_chunk_slices(num_frames: int, chunk_size: int) -> list[slice]:
     """Keep the first latent frame separate, then batch later causal chunks."""
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
     if num_frames < 1:
         return []
     return [slice(0, 1)] + [
@@ -1035,7 +1025,11 @@ class WanVAE(nn.Module):
         return AutoencoderKLOutput(latent_dist=posterior)
 
     def _decode(
-        self, z: torch.Tensor, return_dict: bool = True
+        self,
+        z: torch.Tensor,
+        return_dict: bool = True,
+        *,
+        temporal_chunk_size: int = 1,
     ) -> DecoderOutput | tuple[torch.Tensor]:
         _, _, num_frame, _, _ = z.shape
 
@@ -1043,7 +1037,7 @@ class WanVAE(nn.Module):
         z = _channels_last_3d_if_needed(z)
         x = self.post_quant_conv(z)
         out_chunks: list[torch.Tensor] = []
-        for index, frame_slice in enumerate(_decode_chunk_slices(num_frame, _decode_chunk_size())):
+        for index, frame_slice in enumerate(_decode_chunk_slices(num_frame, temporal_chunk_size)):
             self._conv_idx = [0]
             out_chunk = self.decoder(
                 x[:, :, frame_slice, :, :],
@@ -1069,9 +1063,13 @@ class WanVAE(nn.Module):
         return DecoderOutput(sample=out)
 
     def decode(
-        self, z: torch.Tensor, return_dict: bool = True
+        self,
+        z: torch.Tensor,
+        return_dict: bool = True,
+        *,
+        temporal_chunk_size: int = 1,
     ) -> DecoderOutput | tuple[torch.Tensor]:
-        decoded = self._decode(z).sample
+        decoded = self._decode(z, temporal_chunk_size=temporal_chunk_size).sample
 
         if not return_dict:
             return (decoded,)
