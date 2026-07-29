@@ -122,7 +122,12 @@ def test_bsx_fallback_band_table(monkeypatch):
     assert inb(256, 8192) and inb(1024, 8192)
     assert inb(16, 32768) and inb(1024, 65536)
     assert inb(128, 131072) and inb(64, 262144)
-    assert inb(8, 131072)  # 128K x BS8 recalibration (reg-tier floor)
+    assert inb(8, 131072) and inb(8, 131136)  # 128K x BS8 (reg-tier floor)
+    # ... but shapes that only ROUND into the 131072 bucket keep the
+    # calibrated bs>=16 routing: at bs=8 the reg tier is 1.36-1.60x ahead
+    # there, so the low-bs extension must not capture them.
+    assert not inb(8, 163776)
+    assert inb(16, 163776) and inb(255, 163776) and not inb(256, 163776)
     assert inb(48, 40960)  # off-grid npad resolves to the nearest pow2
     # neighbours stay on bsx
     assert not inb(128, 8192)  # direct/tp win band

@@ -95,12 +95,12 @@ def _thresholds(npad):
 # Keys are the nearest power-of-two of npad; values are inclusive bs
 # ranges. TRTLLM_BSX_FALLBACK_BANDS=0 disables the table (bsx serves
 # every guarded shape).
-# 2026-07-29 recalibration: the 131072 band lower bound moved 16 -> 8.
-# The original calibration run measured the reg tier with a faster
-# experimental streaming phase1 inherited from a side branch; on this
-# branch's reg tier the 128K x BS8 shapes dip to 0.82-0.91x vs the
-# in-tree kernel (5 production layers), so they are routed as well
-# (full-grid gm 1.397 -> 1.390).
+# 2026-07-29 recalibration: the 131072 band was extended down to bs=8 for
+# TRUE 128K shapes only (see _BAND_LOW_BS_NPAD_MAX). At bs=8 the reg tier
+# dips to 0.82-0.91x vs the in-tree kernel on 5 production layers at
+# npad=131136, which the floor guarantee cannot admit; the same bucket at
+# npad~163776 wins 1.36-1.60x, and those shapes only land in this bucket
+# through the nearest-power-of-two rounding, so the extension excludes them.
 _FALLBACK_BANDS = {
     8192: (256, 1 << 30),
     16384: (256, 1 << 30),
@@ -110,6 +110,12 @@ _FALLBACK_BANDS = {
     262144: (16, 127),
 }
 
+# The bs=8 end of the 131072 band applies only up to this npad: shapes above
+# it (e.g. npad 163776) round INTO the 131072 bucket but behave like the next
+# tier band, where the bsx reg tier is far ahead. They keep the calibrated
+# bs>=16 routing.
+_BAND_LOW_BS_NPAD_MAX = {131072: 147456}
+
 
 def _in_fallback_band(bs: int, npad: int) -> bool:
     if _env_threshold("TRTLLM_BSX_FALLBACK_BANDS") == _BIG:  # "0" -> off
@@ -117,7 +123,13 @@ def _in_fallback_band(bs: int, npad: int) -> bool:
     up = 1 << max(npad - 1, 1).bit_length()  # pow2 >= npad
     np2 = up if 4 * npad >= 3 * up else up >> 1  # arithmetic-midpoint nearest
     band = _FALLBACK_BANDS.get(np2)
-    return band is not None and band[0] <= bs <= band[1]
+    if band is None:
+        return False
+    lo, hi = band
+    npad_max = _BAND_LOW_BS_NPAD_MAX.get(np2)
+    if npad_max is not None and npad > npad_max and lo < 16:
+        lo = 16
+    return lo <= bs <= hi
 
 
 # tier name -> (kind, params). reg params = (cs, tb, maxv, ar).
