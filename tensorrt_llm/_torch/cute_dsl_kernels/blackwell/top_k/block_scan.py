@@ -71,11 +71,10 @@ def block_prefix_sum_kernel(
     warp_id = tidx // 32
     lane_id = tidx % 32
 
-    # Currently, we only support num_warps > 1, will support num_warps <= 1 logic later.
     assert num_threads % 32 == 0, "num_threads must be divisible by 32, but got {}".format(
         num_threads
     )
-    assert num_warps > 1, "num_warps must be > 1, but got {}".format(num_warps)
+    assert num_warps >= 1, "num_warps must be >= 1, but got {}".format(num_warps)
     assert num_warps == 2 ** int(math.log2(num_warps)), "num_warps must be a power of 2"
 
     # Step 1: Warp-level prefix sum using shuffle
