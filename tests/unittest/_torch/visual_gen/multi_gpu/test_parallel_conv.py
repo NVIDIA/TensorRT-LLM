@@ -148,6 +148,7 @@ def _logic_halo_conv3d(rank, world_size):
         par = WanCausalConvHalo(conv, chunk_dim, adj, rank, world_size)
         local_out = par(local_x, local_cache)
 
+        assert local_out.shape[chunk_dim] == local_x.shape[chunk_dim]
         _gather_and_check(local_out, ref, chunk_dim, world_size, rank)
 
 

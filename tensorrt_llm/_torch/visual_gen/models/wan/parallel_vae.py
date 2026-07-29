@@ -37,6 +37,37 @@ from tensorrt_llm._torch.visual_gen.utils import as_tuple
 class WanCausalConvHalo(HaloExchangeConv):
     """HaloExchangeConv for WanCausalConv3d, which takes an extra cache_x arg."""
 
+    def __init__(
+        self,
+        module: nn.Module,
+        chunk_dim: int,
+        adj_groups: list[torch.distributed.ProcessGroup | None],
+        rank: int,
+        world_size: int,
+    ) -> None:
+        super().__init__(module, chunk_dim, adj_groups, rank, world_size)
+        self._local_output_spatial_padding = self._get_local_output_spatial_padding()
+
+    def _get_local_output_spatial_padding(self) -> tuple[int, int] | None:
+        """Return padding that emits only this rank's output, when supported."""
+        if not isinstance(self.module, wan_vae.WanCausalConv3d):
+            return None
+
+        conv_axis = self.chunk_dim - 2
+        spatial_axis = self.chunk_dim - 3
+        if (
+            self.module.stride[conv_axis] != 1
+            or self.module.dilation[conv_axis] != 1
+            or self.module.kernel_size[conv_axis] % 2 != 1
+            or self.module.padding[conv_axis] != self.halo_left
+            or self.module.padding[conv_axis] != self.halo_right
+        ):
+            return None
+
+        spatial_padding = list(self.module.padding[1:])
+        spatial_padding[spatial_axis] = 0
+        return tuple(spatial_padding)
+
     def forward(self, x, cache_x=None, *args, **kwargs):
         if self.halo_left == 0 and self.halo_right == 0:
             return self.module(x, cache_x, *args, **kwargs)
@@ -44,6 +75,14 @@ class WanCausalConvHalo(HaloExchangeConv):
         x = self._exchange_halos(x)
         if cache_x is not None:
             cache_x = self._exchange_halos(cache_x)
+        if self._local_output_spatial_padding is not None:
+            return self.module(
+                x,
+                cache_x,
+                *args,
+                spatial_padding=self._local_output_spatial_padding,
+                **kwargs,
+            )
         result = self.module(x, cache_x, *args, **kwargs)
         return self._strip_halo(result)
 
