@@ -13,11 +13,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+_PHYSICAL_LAYOUT_HALO_CAT_ENV = "TRTLLM_VAE_PHYSICAL_LAYOUT_HALO_CAT"
+_PHYSICAL_LAYOUT_HALO_WIRE_ENV = "TRTLLM_VAE_PHYSICAL_LAYOUT_HALO_WIRE"
+
+
+def _physical_layout_halo_cat_enabled() -> bool:
+    return os.environ.get(_PHYSICAL_LAYOUT_HALO_CAT_ENV, "0").lower() not in (
+        "0",
+        "",
+        "false",
+        "no",
+    )
+
+
+def _physical_layout_halo_wire_enabled() -> bool:
+    return os.environ.get(_PHYSICAL_LAYOUT_HALO_WIRE_ENV, "0").lower() not in (
+        "0",
+        "",
+        "false",
+        "no",
+    )
 
 
 def _spatial_channels_last_format(x: torch.Tensor) -> Optional[torch.memory_format]:
@@ -37,6 +59,52 @@ def _spatial_channels_last_format(x: torch.Tensor) -> Optional[torch.memory_form
     if x.dim() == 4 and x.is_contiguous(memory_format=torch.channels_last):
         return torch.channels_last
     return None
+
+
+def _cat_spatial_halos(
+    tensors: list[torch.Tensor],
+    dim: int,
+    memory_format: Optional[torch.memory_format],
+) -> torch.Tensor:
+    """Concatenate halos while preserving a channels-last physical layout."""
+    if memory_format is torch.channels_last_3d:
+        physical = [tensor.permute(0, 2, 3, 4, 1) for tensor in tensors]
+        return torch.cat(physical, dim=dim - 1).permute(0, 4, 1, 2, 3)
+    if memory_format is torch.channels_last:
+        physical = [tensor.permute(0, 2, 3, 1) for tensor in tensors]
+        return torch.cat(physical, dim=dim - 1).permute(0, 3, 1, 2)
+    return torch.cat(tensors, dim=dim)
+
+
+def _logical_to_physical_channels_last(x: torch.Tensor) -> torch.Tensor:
+    """Return a contiguous NHWC/NDHWC buffer with the same logical values."""
+    if x.dim() == 5:
+        return x.permute(0, 2, 3, 4, 1).contiguous()
+    if x.dim() == 4:
+        return x.permute(0, 2, 3, 1).contiguous()
+    raise ValueError(f"Expected a four- or five-dimensional halo tensor, got shape {x.shape}")
+
+
+def _physical_to_logical_channels_last(x: torch.Tensor) -> torch.Tensor:
+    """View a contiguous NHWC/NDHWC buffer as logical channels-last."""
+    if x.dim() == 5:
+        return x.permute(0, 4, 1, 2, 3)
+    if x.dim() == 4:
+        return x.permute(0, 3, 1, 2)
+    raise ValueError(f"Expected a four- or five-dimensional halo tensor, got shape {x.shape}")
+
+
+def _pack_spatial_halo(
+    x: torch.Tensor,
+    dim: int,
+    start: int,
+    length: int,
+    physical_wire: bool,
+) -> torch.Tensor:
+    halo = torch.narrow(x, dim, start, length)
+    if physical_wire:
+        return _logical_to_physical_channels_last(halo)
+    return halo.contiguous()
 
 
 class HaloExchangeConv(nn.Module):
@@ -77,6 +145,10 @@ class HaloExchangeConv(nn.Module):
         self.adj_groups = adj_groups
         self.rank = rank
         self.world_size = world_size
+        self._physical_layout_halo_cat = _physical_layout_halo_cat_enabled()
+        self._physical_layout_halo_wire = (
+            self._physical_layout_halo_cat and _physical_layout_halo_wire_enabled()
+        )
 
         # Derive halo size from kernel_size along chunk_dim
         kernel_size = module.kernel_size
@@ -120,8 +192,20 @@ class HaloExchangeConv(nn.Module):
         dim = self.chunk_dim
         exchange_size = max(self.halo_left, self.halo_right)
 
-        send_left = torch.narrow(x, dim, 0, exchange_size).contiguous()
-        send_right = torch.narrow(x, dim, x.shape[dim] - exchange_size, exchange_size).contiguous()
+        send_left = _pack_spatial_halo(
+            x,
+            dim,
+            0,
+            exchange_size,
+            self._physical_layout_halo_wire,
+        )
+        send_right = _pack_spatial_halo(
+            x,
+            dim,
+            x.shape[dim] - exchange_size,
+            exchange_size,
+            self._physical_layout_halo_wire,
+        )
 
         recv_from_left = torch.zeros_like(send_left)
         recv_from_right = torch.zeros_like(send_right)
@@ -149,20 +233,39 @@ class HaloExchangeConv(nn.Module):
         # only the last halo_left of those.
         # recv_from_right holds the right neighbor's left-edge slices; we need
         # only the first halo_right of those.
+        receive_dim = dim - 1 if self._physical_layout_halo_wire else dim
         if self.halo_left < exchange_size:
             recv_from_left = torch.narrow(
-                recv_from_left, dim, exchange_size - self.halo_left, self.halo_left
+                recv_from_left,
+                receive_dim,
+                exchange_size - self.halo_left,
+                self.halo_left,
             )
         if self.halo_right < exchange_size:
-            recv_from_right = torch.narrow(recv_from_right, dim, 0, self.halo_right)
+            recv_from_right = torch.narrow(
+                recv_from_right,
+                receive_dim,
+                0,
+                self.halo_right,
+            )
+        if self._physical_layout_halo_wire:
+            recv_from_left = _physical_to_logical_channels_last(recv_from_left.contiguous())
+            recv_from_right = _physical_to_logical_channels_last(recv_from_right.contiguous())
 
-        # Match the halo slices' layout to ``x`` so the cat preserves
-        # channels-last and downstream convs skip a full-tensor re-conversion.
         mf = _spatial_channels_last_format(x)
-        if mf is not None:
+        if mf is not None and not self._physical_layout_halo_cat:
             recv_from_left = recv_from_left.contiguous(memory_format=mf)
             recv_from_right = recv_from_right.contiguous(memory_format=mf)
 
+        if self._physical_layout_halo_cat:
+            output_format = mf
+            if output_format is None:
+                output_format = torch.channels_last_3d if x.dim() == 5 else torch.channels_last
+            return _cat_spatial_halos(
+                [recv_from_left, x, recv_from_right],
+                dim,
+                output_format,
+            )
         return torch.cat([recv_from_left, x, recv_from_right], dim=dim)
 
     def _strip_halo(self, x: torch.Tensor) -> torch.Tensor:
@@ -226,6 +329,10 @@ class HaloExchangeConv2dStride2(nn.Module):
         self.adj_groups = adj_groups
         self.rank = rank
         self.world_size = world_size
+        self._physical_layout_halo_cat = _physical_layout_halo_cat_enabled()
+        self._physical_layout_halo_wire = (
+            self._physical_layout_halo_cat and _physical_layout_halo_wire_enabled()
+        )
 
         kernel_size = module.kernel_size
         if isinstance(kernel_size, int):
@@ -273,7 +380,13 @@ class HaloExchangeConv2dStride2(nn.Module):
             return x
 
         dim = self.chunk_dim
-        send_left = torch.narrow(x, dim, 0, self.halo_left).contiguous()
+        send_left = _pack_spatial_halo(
+            x,
+            dim,
+            0,
+            self.halo_left,
+            self._physical_layout_halo_wire,
+        )
 
         right_context = None
         if self.rank != self.world_size - 1:
@@ -287,12 +400,18 @@ class HaloExchangeConv2dStride2(nn.Module):
             dist.send(send_left, dst=left_global_rank, group=left_group)
 
         if right_context is not None:
+            if self._physical_layout_halo_wire:
+                right_context = _physical_to_logical_channels_last(right_context)
             # Match the halo slice's layout to ``x`` so the cat preserves
             # channels-last (see ``_spatial_channels_last_format``).
             mf = _spatial_channels_last_format(x)
-            if mf is not None:
+            if mf is not None and not self._physical_layout_halo_cat:
                 right_context = right_context.contiguous(memory_format=mf)
-            x = torch.cat([x, right_context], dim=dim)
+            if self._physical_layout_halo_cat:
+                output_format = mf if mf is not None else torch.channels_last
+                x = _cat_spatial_halos([x, right_context], dim, output_format)
+            else:
+                x = torch.cat([x, right_context], dim=dim)
 
         if self.rank == self.world_size - 1:
             x = self.boundary_pad(x)
