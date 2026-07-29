@@ -178,16 +178,19 @@ def parse_visual_gen_params(
             payload = _read_reference_payload(request.input_reference)
             kind = sniff_media_kind(payload)
             if kind == "image":
+                # Rejected on signature alone, not on a failed decode:
+                # whether Pillow reads HEIF/AVIF depends on optional plugins,
+                # and the worker process need not have the same ones.
+                if is_isobmff_image_bytes(payload):
+                    raise ValueError(
+                        "input_reference is a HEIF/AVIF image, which is not "
+                        "a supported reference format; convert it to PNG or "
+                        "JPEG."
+                    )
                 # Signature routes; the full decode is still the acceptance
                 # check, so a truncated PNG 400s here instead of 500ing at
                 # the worker's load.
                 if not is_decodable_image_bytes(payload):
-                    if is_isobmff_image_bytes(payload):
-                        raise ValueError(
-                            "input_reference is a HEIF/AVIF image, which is not "
-                            "a supported reference format; convert it to PNG or "
-                            "JPEG."
-                        )
                     raise ValueError(
                         "input_reference has an image container signature but "
                         "does not fully decode; the file may be truncated or "

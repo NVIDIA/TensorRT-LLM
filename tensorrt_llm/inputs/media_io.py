@@ -386,33 +386,54 @@ _ISOBMFF_IMAGE_BRANDS = frozenset(
     }
 )
 
-# Enough bytes for the whole `ftyp` box in practice: 16 header bytes plus a
-# compatible-brands list, which realistically holds a handful of entries.
-_FTYP_SCAN_BYTES = 64
+# Work bound, not a format rule. The declared box size is client-controlled,
+# so without a ceiling the scan below costs O(payload): 1.6 s of interpreter
+# time for a 64 MB buffer, on the serving event loop. This admits 1020
+# compatible brands against a registry holding a few hundred in total, so no
+# encoder output comes near it; real boxes are tens of bytes.
+_MAX_FTYP_BOX_BYTES = 4096
 
 
-def _isobmff_brands(data) -> frozenset:
-    """Brands declared by a leading ``ftyp`` box: major + compatible.
+def _isobmff_brands(data) -> Optional[frozenset]:
+    """Brands declared by a leading ``ftyp`` box, or ``None`` if undeterminable.
 
-    Layout: ``size`` [0:4], ``'ftyp'`` [4:8], ``major_brand`` [8:12],
-    ``minor_version`` [12:16], then four-byte compatible brands to the end of
-    the box. Bounds-checked against hostile input — a declared size that is
-    too small, truncated, or uses the 64-bit ``largesize`` escape degrades to
-    the major brand alone rather than reading brands at the wrong offset.
+    Layout per ISO/IEC 14496-12 — ``size`` [0:4], ``'ftyp'`` [4:8], then::
+
+        normal    major [8:12]   minor [12:16]  compatible from 16
+        size == 1 largesize [8:16], major [16:20], minor [20:24], compat from 24
+
+    ``None`` means "do not classify" and callers must treat the payload as
+    unrecognized rather than assuming video: the box is malformed, extends
+    past the payload, or exceeds the scan bound, and a partial scan could
+    miss an image brand late in the compatible-brand list.
     """
-    head = bytes(data[:_FTYP_SCAN_BYTES])
-    if len(head) < 12:
-        return frozenset()
-    brands = {head[8:12]}
+    buf = bytes(data[:_MAX_FTYP_BOX_BYTES])
+    if len(buf) < 16:
+        return None
 
-    size = int.from_bytes(head[0:4], "big")
-    # size 0 -> box runs to EOF; size 1 -> 64-bit largesize shifts every
-    # following field, so do not guess at brand offsets.
-    if size == 1 or 0 < size < 16:
-        return frozenset(brands)
-    end = len(head) if size == 0 else min(size, len(head))
-    for off in range(16, end - 3, 4):
-        brands.add(head[off : off + 4])
+    size = int.from_bytes(buf[0:4], "big")
+    if size == 1:
+        # Extended size: the 64-bit largesize occupies 8:16, shifting the
+        # brands. Reading 8:12 as the major brand here is what makes naive
+        # parsers misclassify.
+        box_end, brands_at = int.from_bytes(buf[8:16], "big"), 16
+    elif size == 0:
+        box_end, brands_at = len(data), 8  # box runs to EOF
+    else:
+        box_end, brands_at = size, 8
+
+    if box_end > len(data) or box_end > _MAX_FTYP_BOX_BYTES:
+        return None  # truncated, or past the work bound — refuse to guess
+    # `FileTypeBox` is a major brand plus a mandatory `minor_version`,
+    # followed by whole compatible brands. A short or misaligned box is
+    # malformed; reject it rather than rounding down to what parses.
+    if box_end < brands_at + 8 or (box_end - brands_at) % 4:
+        return None
+
+    brands = {buf[brands_at : brands_at + 4]}
+    # Skip the 4-byte minor_version between the major and compatible brands.
+    for off in range(brands_at + 8, box_end - 3, 4):
+        brands.add(buf[off : off + 4])
     return frozenset(brands)
 
 
@@ -425,7 +446,8 @@ def is_isobmff_image_bytes(data) -> bool:
     """
     if bytes(data[4:8]) != b"ftyp":
         return False
-    return bool(_isobmff_brands(data) & _ISOBMFF_IMAGE_BRANDS)
+    brands = _isobmff_brands(data)
+    return bool(brands and brands & _ISOBMFF_IMAGE_BRANDS)
 
 
 def sniff_media_kind(data) -> Optional[str]:
@@ -441,8 +463,8 @@ def sniff_media_kind(data) -> Optional[str]:
     if header[4:8] == b"ftyp":
         brands = _isobmff_brands(data)
         if not brands:
-            # `ftyp` present but truncated before the major brand: nothing to
-            # classify on, so reject here rather than sending it to a decoder.
+            # Box unreadable (truncated / malformed / past the work bound):
+            # classify nothing rather than defaulting to video on a partial scan.
             return None
         # AVIF requires `avif`/`avis` among the *compatible* brands, so the
         # major brand alone is not sufficient to identify still images.

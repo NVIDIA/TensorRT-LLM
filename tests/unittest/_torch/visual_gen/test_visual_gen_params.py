@@ -780,7 +780,7 @@ class TestRequestValidation:
         # ``video`` carries encoded MP4/AVI bytes: a video signature passes,
         # empty / non-video bytes are client errors, and anything that is not
         # bytes (e.g. a decoded tensor) fails the type check.
-        _validate({"video": b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00"})
+        _validate({"video": b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"})
         with pytest.raises(ValueError, match="empty"):
             _validate({"video": b""})
         with pytest.raises(ValueError, match="not a recognized video container"):

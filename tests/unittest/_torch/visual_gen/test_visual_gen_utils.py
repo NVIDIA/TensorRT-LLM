@@ -462,6 +462,17 @@ class TestMediaBytesProbes:
         declared = len(body) + 8 if size is None else size
         return declared.to_bytes(4, "big") + b"ftyp" + body
 
+    @staticmethod
+    def _ftyp_ext(major: bytes, compatible: tuple = (), *, largesize: int = None) -> bytes:
+        """Build a 64-bit `ftyp` box: 1|'ftyp'|largesize|major|minor|compat*.
+
+        ``size == 1`` inserts an 8-byte largesize between the type and the
+        brands, so the major brand lives at [16:20], not [8:12].
+        """
+        body = major + b"\x00\x00\x00\x00" + b"".join(compatible)
+        declared = len(body) + 16 if largesize is None else largesize
+        return (1).to_bytes(4, "big") + b"ftyp" + declared.to_bytes(8, "big") + body
+
     def test_sniff_isobmff_still_images_are_not_video(self):
         """`ftyp` marks the ISO-BMFF family, not video: HEIF/AVIF photos share
         it with MP4. Routing them to the video slot would hand a still image to
@@ -484,22 +495,46 @@ class TestMediaBytesProbes:
         assert sniff_media_kind(self._ftyp(b"isom", (b"iso2", b"avc1"))) == "video"
         assert sniff_media_kind(self._ftyp(b"qt  ")) == "video"
 
+    def test_sniff_ftyp_reads_the_whole_declared_box(self):
+        """A brand list longer than a fixed peek window must still be seen —
+        an `avif` brand at the tail decides image-vs-video."""
+        from tensorrt_llm.inputs.media_io import sniff_media_kind
+
+        # 21 compatible brands = a 100-byte box; `avif` sits past byte 64.
+        padded = tuple([b"free"] * 20 + [b"avif"])
+        box = self._ftyp(b"isom", padded)
+        assert len(box) > 64 and box.index(b"avif") > 64
+        assert sniff_media_kind(box) == "image"
+
+    def test_sniff_ftyp_extended_size_shifts_the_brands(self):
+        """`size == 1` puts a 64-bit largesize at [8:16]; a parser that reads
+        the major brand at [8:12] sees half of that integer instead."""
+        from tensorrt_llm.inputs.media_io import sniff_media_kind
+
+        assert sniff_media_kind(self._ftyp_ext(b"heic", (b"mif1",))) == "image"
+        assert sniff_media_kind(self._ftyp_ext(b"isom", (b"avif",))) == "image"
+        assert sniff_media_kind(self._ftyp_ext(b"mp42", (b"isom",))) == "video"
+
     def test_sniff_ftyp_bounds_are_checked(self):
-        """Hostile/degenerate `ftyp` boxes must not read brands at the wrong
-        offset; they degrade to the major brand rather than misclassifying."""
+        """An `ftyp` box we cannot read in full is unclassifiable: guessing
+        "video" off a partial scan is how a HEIC reaches NVDEC."""
         from tensorrt_llm.inputs.media_io import sniff_media_kind
 
         # Declared size larger than the payload (truncated file).
-        assert sniff_media_kind(self._ftyp(b"heic", (b"mif1",), size=4096)) == "image"
-        # Declared size 0 means "box runs to EOF".
+        assert sniff_media_kind(self._ftyp(b"heic", (b"mif1",), size=4096)) is None
+        # Declared size 0 means "box runs to EOF" — readable, so classify.
         assert sniff_media_kind(self._ftyp(b"iso8", (b"avif",), size=0)) == "image"
-        # Nonsense small size: fall back to the major brand only.
-        assert sniff_media_kind(self._ftyp(b"heic", (b"mif1",), size=8)) == "image"
-        assert sniff_media_kind(self._ftyp(b"mp42", (b"avif",), size=8)) == "video"
-        # size == 1 is the 64-bit largesize escape: every later field shifts,
-        # so compatible brands must be ignored, not read at bogus offsets.
-        assert sniff_media_kind(self._ftyp(b"mp42", (b"avif",), size=1)) == "video"
-        assert sniff_media_kind(self._ftyp(b"heic", (), size=1)) == "image"
+        # Nonsense small size: no room for even a major brand.
+        assert sniff_media_kind(self._ftyp(b"heic", (b"mif1",), size=8)) is None
+        assert sniff_media_kind(self._ftyp(b"mp42", (b"avif",), size=8)) is None
+        # `minor_version` is mandatory, so a box is at least 16 bytes (24 with
+        # the largesize escape); stopping at the major brand is malformed.
+        assert sniff_media_kind(self._ftyp(b"heic", (b"mif1",), size=12)) is None
+        assert sniff_media_kind(self._ftyp_ext(b"heic", (b"mif1",), largesize=20)) is None
+        # Compatible-brand area must hold whole four-byte brands.
+        assert sniff_media_kind(self._ftyp(b"mp42", (b"isom",), size=18) + b"\x00\x00") is None
+        # Past the scan bound: bounded rather than scanned.
+        assert sniff_media_kind(self._ftyp(b"mp42", tuple([b"free"] * 2000))) is None
         # Header shorter than a brand.
         assert sniff_media_kind(b"\x00\x00\x00\x18ftyp") is None
 
@@ -513,6 +548,22 @@ class TestMediaBytesProbes:
         )
         with pytest.raises(ValueError, match="HEIF/AVIF"):
             parse_visual_gen_params(request, "vid-heic", generator, media_storage_path=None)
+
+    def test_heif_rejected_even_when_pillow_can_decode_it(self, monkeypatch):
+        """Acceptance must not hinge on optional Pillow plugins: a deployment
+        with pillow-heif installed would otherwise admit a HEIC that the
+        worker — a separate process, possibly without the plugin — cannot
+        read, and the documented contract says HEIF/AVIF is a 400."""
+        import tensorrt_llm.serve.visual_gen_utils as serve_utils
+
+        monkeypatch.setattr(serve_utils, "is_decodable_image_bytes", lambda _: True)
+        generator = _StubVisualGen()
+        heic = self._ftyp(b"heic", (b"mif1", b"heic")) + b"\x00" * 64
+        request = VideoGenerationRequest(
+            prompt="x", input_reference=base64.b64encode(heic).decode()
+        )
+        with pytest.raises(ValueError, match="HEIF/AVIF"):
+            parse_visual_gen_params(request, "vid-heic-plugin", generator, media_storage_path=None)
 
     def test_truncated_image_bytes_are_not_decodable(self):
         # A truncated PNG still opens (the header parses) but cannot decode
