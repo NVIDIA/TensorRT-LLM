@@ -3,7 +3,7 @@
 
 """OpenEngine source identity and compatibility constants."""
 
-OPENENGINE_COMMIT = "57cd5033554cd22ab9645ae6c17f34d7fa9f5bb0"
+OPENENGINE_COMMIT = "d09a7313b3af2fbcd9b17aa4d31c509207ab51db"
 SCHEMA_REVISION = 1
 MINIMUM_CLIENT_REVISION = 1
 
