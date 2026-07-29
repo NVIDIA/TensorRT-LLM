@@ -227,7 +227,16 @@ def _parse_cpp_recv_csvs(csv_dir):
 
 
 def _parse_python_csvs(csv_dir):
-    """Return {rid: [per_rank_GBps, ...]} from perf_logger py_*_*.csv files.
+    """Return {rid: [per_rank_GBps, ...]} from Python perf_logger task CSVs.
+
+    PerfLogManager names its per-task CSV by priority of the env vars it sees:
+    with TRTLLM_KVCACHE_TIME_OUTPUT_PATH set (which this harness always sets
+    for the C++ transceiver), files are "{dir}/{instanceUuid}_{rank}.csv";
+    only the legacy TLLM_KV_TRANSFER_PERF_LOG_FILE fallback produces the old
+    "py_{instanceUuid}_{rank}.csv" prefix. So identify Python task CSVs by
+    their header columns (unique_rid + throughput_mbs) rather than by file
+    name -- C++ send/recv CSVs and the gen_transfer_summary CSV have neither
+    column and are skipped.
 
     `throughput_mbs` is recorded for send tasks in MiB/s (perf_logger divides by
     1024*1024). We convert MiB/s -> GB/s (`* 1024^2 / 1e9`) so it matches the
@@ -235,14 +244,17 @@ def _parse_python_csvs(csv_dir):
     `_parse_cpp_recv_csvs`.
     """
     per_rid = {}  # rid -> list[per-rank throughput GB/s]
-    for path in glob.glob(os.path.join(csv_dir, "py_*_*.csv")):
+    for path in glob.glob(os.path.join(csv_dir, "*.csv")):
         with open(path) as f:
             reader = csv.DictReader(f)
+            fields = reader.fieldnames or []
+            if "unique_rid" not in fields or "throughput_mbs" not in fields:
+                continue  # not a Python perf_logger task CSV (e.g. C++ send/recv)
             for row in reader:
-                if "unique_rid" not in row or "throughput_mbs" not in row:
-                    continue
-                if "Send" not in row.get("task_type", ""):
-                    continue  # throughput is meaningful only for send tasks
+                if row.get("task_type") != "KVSendTask":
+                    continue  # only KV sends carry meaningful throughput;
+                    # AuxSendTask rows are tiny metadata sends that would
+                    # drag the median down, KVRecvTask rows have none
                 try:
                     rid = int(float(row["unique_rid"]))
                     mbs = float(row["throughput_mbs"])

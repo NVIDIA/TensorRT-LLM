@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 KV_CACHE_ITERATION_STATS_REUSE_KEYS = (
     "iterReusedBlocks",
@@ -71,10 +71,38 @@ class KVCacheV2LifeCycleIterationStats:
 
 
 @dataclass(slots=True)
+class KVCacheV2SsmSnapshotIterationStats:
+    iter_snapshot_lookups: int
+    iter_snapshot_hits: int
+    iter_snapshot_misses: int
+    iter_reused_tokens: int
+    iter_unreused_tokens: int
+    iter_aligned_snapshot_hits: int
+    iter_unaligned_snapshot_hits: int
+
+    @property
+    def iter_snapshot_hit_rate(self) -> float:
+        if self.iter_snapshot_hits == 0 or self.iter_snapshot_lookups == 0:
+            return 0.0
+        return self.iter_snapshot_hits / self.iter_snapshot_lookups
+
+
+@dataclass(slots=True)
+class KVCacheV2SsmLifeCycleIterationStats:
+    life_cycle_id: int
+    pool_group_id: int
+    snapshot_stats: KVCacheV2SsmSnapshotIterationStats
+    window_size: None = field(default=None, init=False)
+    kind: Literal["ssm"] = field(default="ssm", init=False)
+
+
+@dataclass(slots=True)
 class KVCacheV2IterationStatsReport:
     by_window_size: dict[int, Any]
     by_pool_group: dict[int, KVCacheV2PoolGroupIterationStats]
-    by_life_cycle: dict[int, KVCacheV2LifeCycleIterationStats] = field(default_factory=dict)
+    by_life_cycle: dict[
+        int, KVCacheV2LifeCycleIterationStats | KVCacheV2SsmLifeCycleIterationStats
+    ] = field(default_factory=dict)
 
 
 def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
@@ -115,6 +143,21 @@ def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = Non
     return {key: fields[key] for key in keys}
 
 
+def serialize_ssm_snapshot_iteration_stats(
+    stats: KVCacheV2SsmSnapshotIterationStats,
+) -> dict:
+    return {
+        "iterSnapshotLookups": stats.iter_snapshot_lookups,
+        "iterSnapshotHits": stats.iter_snapshot_hits,
+        "iterSnapshotMisses": stats.iter_snapshot_misses,
+        "iterSnapshotHitRate": stats.iter_snapshot_hit_rate,
+        "iterReusedTokens": stats.iter_reused_tokens,
+        "iterUnreusedTokens": stats.iter_unreused_tokens,
+        "iterAlignedSnapshotHits": stats.iter_aligned_snapshot_hits,
+        "iterUnalignedSnapshotHits": stats.iter_unaligned_snapshot_hits,
+    }
+
+
 def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
     if kv_iter_stats is None:
         return
@@ -147,13 +190,21 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
     if not kv_iter_stats.by_life_cycle:
         return
 
-    stats_dict["kvCacheIterationStatsByLifecycle"] = {
-        str(life_cycle_id): {
+    stats_by_life_cycle = {}
+    for life_cycle_id, stats in kv_iter_stats.by_life_cycle.items():
+        serialized = {
             "lifeCycleId": stats.life_cycle_id,
             "poolGroupId": stats.pool_group_id,
             "windowSize": stats.window_size,
             "kind": stats.kind,
-            **serialize_kv_cache_iteration_stats(stats.stats, KV_CACHE_ITERATION_STATS_REUSE_KEYS),
         }
-        for life_cycle_id, stats in kv_iter_stats.by_life_cycle.items()
-    }
+        if isinstance(stats, KVCacheV2SsmLifeCycleIterationStats):
+            serialized["snapshotStats"] = serialize_ssm_snapshot_iteration_stats(
+                stats.snapshot_stats
+            )
+        else:
+            serialized.update(
+                serialize_kv_cache_iteration_stats(stats.stats, KV_CACHE_ITERATION_STATS_REUSE_KEYS)
+            )
+        stats_by_life_cycle[str(life_cycle_id)] = serialized
+    stats_dict["kvCacheIterationStatsByLifecycle"] = stats_by_life_cycle

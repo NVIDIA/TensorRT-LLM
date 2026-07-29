@@ -6,9 +6,24 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime
 
 import yaml
+
+
+def _import_precheck_config(llm_src):
+    """Import the pure-stdlib precheck config module from the repo tree.
+
+    It is the single owner of the gate's enable policy and timeout formulas.
+    """
+    path = os.path.join(llm_src, "tests", "scripts", "perf-sanity", "cache_transceiver_precheck")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import precheck_config
+
+    return precheck_config
+
 
 AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
 DISAGG_CONFIG_FOLDER = os.environ.get(
@@ -322,6 +337,25 @@ def get_benchmark_config(config, benchmark_mode):
         "mode": benchmark_mode,
         "concurrency": concurrency,
     }
+
+
+def get_benchmark_request_queue_size(config, concurrency):
+    """Cap the gen-only fill target to the GEN executor's active capacity."""
+    gen_config = (config.get("worker_config", {}) or {}).get("gen", {}) or {}
+    concurrency = int(concurrency)
+    max_batch_size = int(gen_config.get("max_batch_size", concurrency))
+    enable_attention_dp = gen_config.get("enable_attention_dp", False)
+    tp_size = int(gen_config.get("tensor_parallel_size", 1))
+    max_capacity = max_batch_size * tp_size if enable_attention_dp else max_batch_size
+    queue_size = min(max_capacity, concurrency)
+    if queue_size < concurrency:
+        print(
+            "[WARNING] TLLM_BENCHMARK_REQ_QUEUES_SIZE capped to "
+            f"{queue_size} (max_batch_size={max_batch_size}, tp_size={tp_size}, "
+            f"attention_dp={enable_attention_dp}) instead of concurrency={concurrency}. "
+            "The fill loop cannot reach a target above the GEN executor capacity."
+        )
+    return queue_size
 
 
 def partition_has_gpu_gres(partition):
@@ -835,12 +869,13 @@ def main():
             srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
         elif "gen_only" in bm_config.get("mode", ""):
             concurrency = bm_config.get("concurrency", 1)
+            queue_size = get_benchmark_request_queue_size(config, concurrency)
             ctx_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 {ctx_worker_env_vars}"
             )
             gen_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
-                f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
+                f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_size} {gen_worker_env_vars}"
             )
 
         if is_gb300:
@@ -888,6 +923,24 @@ def main():
                 f"export totalGpus={hardware_config.get('total_gpus', '')}",
                 f"export testOutputDir={test_output_dir}",
             ]
+        )
+
+        # Cache-transceiver network precheck (same wiring as jenkins/scripts/
+        # perf/submit.py): reuses the exact ucx_tls_cmd + worker env strings
+        # of the real worker steps; enable policy and timeouts come from
+        # precheck_config (single owner).
+        pcfg = _import_precheck_config(llm_src)
+        script_prefix_lines.extend(
+            pcfg.precheck_prefix_lines(
+                config,
+                benchmark_mode,
+                config_path_expr="$configYamlPath",
+                ucx_tls_cmd=ucx_tls_cmd,
+                max_world=max(
+                    hardware_config.get("gpus_per_ctx_server", 0) or 0,
+                    hardware_config.get("gpus_per_gen_server", 0) or 0,
+                ),
+            )
         )
 
         # Add srun args for disagg
@@ -986,9 +1039,15 @@ def main():
     draft_launch_lines = remove_whitespace_lines(draft_launch_lines)
     draft_launch_content = "\n".join(draft_launch_lines)
 
+    # The disagg draft calls run_cache_transceiver_precheck; splice in the gate
+    # function library ahead of it (single owner: precheck_config).
+    gate_content = ""
+    if runtime_mode == "disaggregated":
+        gate_content = pcfg.gate_library_content(draft_launch_sh, llm_src)
+
     # Combine and write launch script
     script_prefix = "\n".join(script_prefix_lines)
-    final_script = f"{script_prefix}\n\n{srun_args}\n\n{draft_launch_content}"
+    final_script = f"{script_prefix}\n\n{srun_args}\n\n{gate_content}{draft_launch_content}"
 
     with open(launch_sh, "w") as f:
         f.write(final_script)

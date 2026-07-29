@@ -227,8 +227,8 @@ class SamplingParams:
         prompt_ignore_length (int, optional): Controls how many tokens to ignore from the prompt for presence and frequency penalties. Values <= 0 have no effect. Values > input (prompt) length will be clamped. None means using C++ runtime default 0. Defaults to None.
         length_penalty (float, optional): Controls how to penalize longer sequences in beam search. None means using C++ runtime default 0.f. Defaults to None.
         early_stopping (int, optional): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token).  None means using C++ runtime default 1. Defaults to None.
-        no_repeat_ngram_size (int, optional): Controls how many repeat ngram size are acceptable. None means using C++ runtime default 1 << 30. Defaults to None.
-        min_p (float, optional): Restricts sampling to tokens whose probability is at least `min_p` times the probability of the most likely token. Must be in [0, 1]; `min_p = 0` disables the filter and `min_p = 1` implies greedy decoding. None means using C++ runtime default 0.0. Defaults to None.
+        no_repeat_ngram_size (int, optional): Forbids repeating any n-gram of this size: a token is excluded from sampling if it would recreate an n-gram that already occurs in the sequence (prompt included). None or 0 disables the restriction. Defaults to None.
+        min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
         beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
 
         logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token's log probability.

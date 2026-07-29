@@ -27,7 +27,7 @@ add_gtest(loraConfigTest loraConfigTest.cpp)
 add_gtest(coalesceTest coalesceTest.cpp)
 add_gtest(genUniqueAgentNameTest genUniqueAgentNameTest.cpp)
 target_link_libraries(genUniqueAgentNameTest PRIVATE ${Python3_LIBRARIES})
-add_gtest(ucxCommTest ucxCommTest.cpp)
+add_gtest(ucxCommTest ucxCommTest.cpp TIMEOUT 60)
 target_link_libraries(ucxCommTest PRIVATE ${Python3_LIBRARIES})
 target_link_libraries(serializeUtilsTest PRIVATE ${Python3_LIBRARIES})
 

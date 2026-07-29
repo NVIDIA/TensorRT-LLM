@@ -60,6 +60,7 @@ class _StatsRequest:
     state: LlmRequestState = LlmRequestState.GENERATION_IN_PROGRESS
     context_current_position: int = 0
     context_chunk_size: int = 0
+    expect_snapshot_points: list[int] = field(default_factory=list)
     prepopulated_prompt: tuple[int, int] | None = None
     kv_cache_perf_metric_calls: list[dict[str, int]] = field(default_factory=list)
     multimodal_hashes: None = None
