@@ -16,7 +16,7 @@
 
 import dataclasses
 import math
-from typing import Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -60,6 +60,9 @@ from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
 from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_position_ids
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
+
+if TYPE_CHECKING:
+    from .modeling_gemma4mm import Gemma4ForConditionalGeneration
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
 if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
@@ -1367,6 +1370,45 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             token_offset = context_end
         return torch.cat(context_mask_list, dim=0).contiguous()
 
+    def _forward_speculative(
+        self,
+        output: torch.Tensor,
+        input_ids: Optional[torch.IntTensor],
+        orig_input_ids: Optional[torch.IntTensor],
+        position_ids: Optional[torch.IntTensor],
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata,
+        resource_manager,
+    ) -> torch.Tensor:
+        logits = self.logits_processor.forward(
+            output[spec_metadata.gather_ids],
+            self.lm_head,
+            attn_metadata,
+            True,
+        )
+        if self.config.final_logit_softcapping is not None:
+            cap = self.config.final_logit_softcapping
+            logits = torch.tanh(logits / cap) * cap
+
+        spec_input_ids = input_ids if input_ids is not None else orig_input_ids
+        spec_position_ids = position_ids
+        if attn_metadata.padded_num_tokens is not None:
+            if spec_input_ids is not None:
+                spec_input_ids = spec_input_ids[: attn_metadata.num_tokens]
+            if position_ids is not None:
+                spec_position_ids = _slice_spec_position_ids(position_ids, attn_metadata.num_tokens)
+
+        return self.spec_worker(
+            input_ids=spec_input_ids,
+            position_ids=spec_position_ids,
+            hidden_states=output,
+            logits=logits,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=self.draft_model,
+            resource_manager=resource_manager,
+        )
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1377,11 +1419,11 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         return_context_logits: bool = False,
         mm_token_type_ids: Optional[torch.Tensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
+        orig_input_ids: Optional[torch.IntTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         local_attention_mask_data = None
-        resource_manager = kwargs.pop("resource_manager", None)
-        orig_input_ids = kwargs.pop("orig_input_ids", None)
         # Only build bidirectional masks when use_bidirectional_attention is
         # set to "vision" (26B, 31B).  E2B/E4B have this as None and should
         # use standard causal attention even for multimodal tokens. Gemma4
@@ -1411,35 +1453,14 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             output = output[: attn_metadata.num_tokens]
 
         if self.spec_worker is not None:
-            logits = self.logits_processor.forward(
-                output[spec_metadata.gather_ids],
-                self.lm_head,
+            return self._forward_speculative(
+                output,
+                input_ids,
+                orig_input_ids,
+                position_ids,
                 attn_metadata,
-                True,
-            )
-            if self.config.final_logit_softcapping is not None:
-                cap = self.config.final_logit_softcapping
-                logits = torch.tanh(logits / cap) * cap
-
-            spec_input_ids = input_ids if input_ids is not None else orig_input_ids
-            spec_position_ids = position_ids
-            if attn_metadata.padded_num_tokens is not None:
-                if spec_input_ids is not None:
-                    spec_input_ids = spec_input_ids[: attn_metadata.num_tokens]
-                if position_ids is not None:
-                    spec_position_ids = _slice_spec_position_ids(
-                        position_ids, attn_metadata.num_tokens
-                    )
-
-            return self.spec_worker(
-                input_ids=spec_input_ids,
-                position_ids=spec_position_ids,
-                hidden_states=output,
-                logits=logits,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                draft_model=self.draft_model,
-                resource_manager=resource_manager,
+                spec_metadata,
+                resource_manager,
             )
 
         logits = self.logits_processor.forward(
@@ -1474,6 +1495,11 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         self.num_centroids = config.num_centroids
         self.centroid_intermediate_top_k = config.centroid_intermediate_top_k
         self.vocab_size = config.vocab_size
+        if self.vocab_size % self.num_centroids != 0:
+            raise ValueError(
+                "Gemma4 assistant vocab_size must be divisible by num_centroids: "
+                f"got {self.vocab_size} and {self.num_centroids}"
+            )
         self.vocab_size_per_centroid = self.vocab_size // self.num_centroids
         self.centroids = Linear(
             self.hidden_size,
@@ -1487,7 +1513,7 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         )
         self.register_buffer(
             "token_ordering",
-            torch.empty(self.vocab_size, dtype=torch.long, device="cuda"),
+            torch.empty(self.vocab_size, dtype=torch.long),
         )
 
     @staticmethod
@@ -1500,7 +1526,7 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         """Compute selected logits owned by one vocab-parallel shard."""
         local_positions = canonical_positions - vocab_start_index
         is_local = (local_positions >= 0) & (local_positions < lm_head_weight.shape[0])
-        safe_positions = local_positions.clamp(0, lm_head_weight.shape[0] - 1)
+        safe_positions = local_positions.clamp_(0, lm_head_weight.shape[0] - 1)
         selected_embeddings = lm_head_weight[safe_positions.reshape(-1)].view(
             hidden_states.shape[0],
             canonical_positions.shape[1],
@@ -1511,6 +1537,7 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         ).squeeze(1)
         return selected_logits.masked_fill(~is_local, 0)
 
+    @torch.inference_mode()
     def forward(self, hidden_states: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
         centroid_logits = self.centroids(hidden_states)
         _, top_k_indices = torch.topk(
@@ -1584,13 +1611,17 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
         # embeddings have the backbone width and are shared separately.
         self.target_input_embeddings = None
 
-    def load_weights_from_target_model(self, target_model: nn.Module) -> None:
-        target_llm = target_model.llm if hasattr(target_model, "llm") else target_model
+    def load_weights_from_target_model(
+        self,
+        target_model: "Gemma4ForCausalLM | Gemma4ForConditionalGeneration",
+    ) -> None:
+        target_llm = (
+            target_model if isinstance(target_model, Gemma4ForCausalLM) else target_model.llm
+        )
         self.target_input_embeddings = target_llm.model.embed_tokens
 
         target_config = target_llm.config
-        num_kv_shared = getattr(target_config, "num_kv_shared_layers", 0)
-        num_source_layers = target_config.num_hidden_layers - num_kv_shared
+        num_source_layers = target_config.num_hidden_layers - target_config.num_kv_shared_layers
         source_layer_types = target_config.layer_types[:num_source_layers]
         for layer in self.model.layers:
             layer_type = "sliding_attention" if layer.is_sliding else "full_attention"
@@ -1647,6 +1678,7 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
         weights = weight_mapper.preprocess_weights(weights)
         ordering_weight_name = "masked_embedding.token_ordering"
         if self.masked_embedding is not None and ordering_weight_name in weights:
+            # Copy this checkpoint-backed buffer and consume its exact source key.
             self.masked_embedding.token_ordering.copy_(weights[ordering_weight_name])
             del weights[ordering_weight_name]
         super().load_weights(weights, weight_mapper)
