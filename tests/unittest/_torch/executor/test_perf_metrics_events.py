@@ -9,7 +9,10 @@ Covers the Python-only additions behind ``TRTLLM_PERF_TIME_EVENTS_PATH`` /
   batch-context dict + per-request token counts (and does NOT when
   ``capture_extended`` is off -- guards the existing output shape).
 * ``PyExecutor._compute_iter_batch_context`` builds the shared per-iteration
-  dict from a ``ScheduledRequests``-like object.
+  dict from a ``ScheduledRequests``-like object, including the two scheduler-
+  stage admission timestamps (``scheduled_time`` / ``capacity_scheduled_time``).
+* ``SimpleScheduler`` stamps the capacity-scheduler admission time each round
+  only when the executor turns capture on (base path untouched).
 * The off-critical-path per-rank writer enqueues one record per finished
   request, writes a ``time_events_rank{N}_pid{P}.jsonl`` line, and no-ops when
   disabled.
@@ -199,6 +202,44 @@ class TestComputeIterBatchContext:
         assert "num_capacity_fitting" not in ctx
         assert "num_scheduled" not in ctx
 
+    def test_admission_timestamps_emitted_when_given(self):
+        # Both scheduler-stage timestamps ride into the shared dict; the gap
+        # scheduled_time - capacity_scheduled_time isolates the micro-batch stage.
+        scheduled = SimpleNamespace(
+            num_context_requests=0,
+            num_generation_requests=1,
+            batch_size=1,
+            context_requests=[],
+            generation_requests=[SimpleNamespace(num_draft_tokens=0)],
+        )
+        fake_self = SimpleNamespace(iter_counter=3)
+        ctx = PyExecutor._compute_iter_batch_context(
+            fake_self,
+            scheduled,
+            schedule_time=100.5,
+            capacity_admit_time=100.2,
+        )
+        assert ctx["scheduled_time"] == 100.5
+        assert ctx["capacity_scheduled_time"] == 100.2
+        assert ctx["scheduled_time"] >= ctx["capacity_scheduled_time"]
+
+    def test_capacity_scheduled_time_omitted_when_absent(self):
+        # PP local scheduler / non-SimpleScheduler expose no admit time -> the
+        # key must simply not appear (no None leaking into the record).
+        scheduled = SimpleNamespace(
+            num_context_requests=0,
+            num_generation_requests=1,
+            batch_size=1,
+            context_requests=[],
+            generation_requests=[SimpleNamespace(num_draft_tokens=0)],
+        )
+        fake_self = SimpleNamespace(iter_counter=1)
+        ctx = PyExecutor._compute_iter_batch_context(
+            fake_self, scheduled, schedule_time=5.0, capacity_admit_time=None
+        )
+        assert ctx["scheduled_time"] == 5.0
+        assert "capacity_scheduled_time" not in ctx
+
 
 class TestPerRankWriter:
     def _make_response(self, request_id, time_breakdown_metrics):
@@ -319,3 +360,47 @@ class TestPerRankWriter:
             rec = json.loads(next(ln for ln in f if ln.strip()))
         assert rec["request_id"] == 9
         assert "request_timing_metrics" not in rec
+
+
+class TestSimpleSchedulerAdmitStamp:
+    """SimpleScheduler stamps the capacity-admission time only when the executor
+    turns capture on -- the base scheduling path pays nothing."""
+
+    def _make_scheduler(self):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import SimpleScheduler
+
+        # Fake capacity scheduler: returns (fitting, disagg_gen_init, paused).
+        capacity = SimpleNamespace(schedule_request=lambda active: (list(active), [], []))
+        # Fake micro-batch scheduler: returns (encoder, context, generation).
+        micro = SimpleNamespace(schedule=lambda fitting, inflight: ([], list(fitting), []))
+        return SimpleScheduler(capacity, micro)
+
+    def test_no_stamp_by_default(self):
+        sched = self._make_scheduler()
+        assert sched.capture_admit_time is False
+        sched.schedule_request([], set())
+        # Untouched on the base path.
+        assert sched._last_capacity_admit_time is None
+
+    def test_stamp_when_enabled_uses_steady_clock(self):
+        from tensorrt_llm.bindings import steady_clock_now
+
+        sched = self._make_scheduler()
+        sched.capture_admit_time = True
+        before = steady_clock_now().total_seconds()
+        sched.schedule_request([], set())
+        after = steady_clock_now().total_seconds()
+        t = sched._last_capacity_admit_time
+        assert t is not None
+        # Same clock as py_executor's scheduled_time -> bracketed by two reads.
+        assert before <= t <= after
+
+    def test_stamp_refreshes_each_round(self):
+        sched = self._make_scheduler()
+        sched.capture_admit_time = True
+        sched.schedule_request([], set())
+        first = sched._last_capacity_admit_time
+        sched.schedule_request([], set())
+        second = sched._last_capacity_admit_time
+        # A new reading every round (monotonic non-decreasing).
+        assert second >= first

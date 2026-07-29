@@ -578,6 +578,10 @@ class PyExecutor:
         # i.e. the scheduler-admission timestamp shared by every request in that
         # iteration's micro-batch. Populated only when capture_extended is on.
         self._last_schedule_time = None
+        # Steady-clock time (seconds) at which the capacity scheduler admitted
+        # this round's fitting set, stamped inside SimpleScheduler before the
+        # micro-batch stage. Populated only when capture_extended is on.
+        self._last_capacity_admit_time = None
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
@@ -614,6 +618,13 @@ class PyExecutor:
         self.stream_interval = self.llm_args.stream_interval
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))
+        # Extended perf time-events: let the scheduler stamp the capacity-admit
+        # time each round (per-request capacity-scheduler admission event). Gated
+        # on capture_extended so the base scheduling path is untouched. Guarded
+        # by hasattr so non-SimpleScheduler implementations are unaffected.
+        if self.perf_manager.capture_extended and hasattr(
+                self.scheduler, "capture_admit_time"):
+            self.scheduler.capture_admit_time = True
         self.attention_dp_enable_balance = (
             self.llm_args.attention_dp_config is not None
             and self.llm_args.attention_dp_config.enable_balance)
@@ -1898,7 +1909,8 @@ class PyExecutor:
     def _compute_iter_batch_context(self,
                                     scheduled_batch: ScheduledRequests,
                                     num_fitting_reqs=None,
-                                    schedule_time=None) -> dict:
+                                    schedule_time=None,
+                                    capacity_admit_time=None) -> dict:
         """Build the per-iteration batch-context dict for extended perf events.
 
         Shared by every request scheduled this iteration; merged into each
@@ -1920,6 +1932,13 @@ class PyExecutor:
         distinct admission event (chunked-prefill chunks and decode steps each
         get their own), and the gap ``forward_start_time - scheduled_time``
         exposes admission-to-execution latency.
+
+        ``capacity_admit_time`` is the steady-clock time (same clock) at which
+        the capacity scheduler admitted this round's fitting set, stamped inside
+        ``SimpleScheduler`` before micro-batch scheduling. Emitted as
+        ``capacity_scheduled_time``; the gap
+        ``scheduled_time - capacity_scheduled_time`` isolates the micro-batch
+        scheduling stage. Omitted when the active scheduler does not expose it.
         """
         num_ctx_requests = scheduled_batch.num_context_requests
         num_gen_requests = scheduled_batch.num_generation_requests
@@ -1954,6 +1973,14 @@ class PyExecutor:
         if schedule_time is not None:
             # Scheduler-admission timestamp for this iteration's micro-batch.
             ctx["scheduled_time"] = schedule_time
+        if capacity_admit_time is not None:
+            # Capacity-scheduler admission timestamp for this round (stamped
+            # before micro-batch scheduling). Rides onto every admitted
+            # request's per-chunk / per-step entry, so each prefill chunk and
+            # decode step carries a distinct capacity-admission event. The gap
+            # `scheduled_time - capacity_scheduled_time` isolates the
+            # micro-batch scheduling stage.
+            ctx["capacity_scheduled_time"] = capacity_admit_time
         return ctx
 
     def _populate_req_stats(
@@ -3775,6 +3802,14 @@ class PyExecutor:
         # admission event for chunked prefill and for every decode step).
         if self.perf_manager.capture_extended:
             self._last_schedule_time = get_steady_clock_now_in_seconds()
+            # Capacity-scheduler admission time for this round, stamped inside
+            # SimpleScheduler right after the capacity stage (before micro-batch
+            # scheduling). Same clock as _last_schedule_time above, so the gap
+            # `scheduled_time - capacity_scheduled_time` isolates the micro-batch
+            # stage. None on schedulers that don't expose it (e.g. PP local
+            # scheduler / non-SimpleScheduler), in which case the key is omitted.
+            self._last_capacity_admit_time = getattr(
+                self.scheduler, "_last_capacity_admit_time", None)
 
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
@@ -4234,7 +4269,8 @@ class PyExecutor:
                         iter_ctx = (self._compute_iter_batch_context(
                             scheduled_batch,
                             self._last_num_fitting_reqs,
-                            schedule_time=self._last_schedule_time)
+                            schedule_time=self._last_schedule_time,
+                            capacity_admit_time=self._last_capacity_admit_time)
                                     if self.perf_manager.capture_extended else
                                     None)
                         self.perf_manager.save_timing_to_requests(
@@ -4835,7 +4871,8 @@ class PyExecutor:
                         iter_ctx = (self._compute_iter_batch_context(
                             scheduled_batch,
                             self._last_num_fitting_reqs,
-                            schedule_time=self._last_schedule_time)
+                            schedule_time=self._last_schedule_time,
+                            capacity_admit_time=self._last_capacity_admit_time)
                                     if self.perf_manager.capture_extended else
                                     None)
                         self.perf_manager.save_timing_to_requests(
