@@ -907,6 +907,8 @@ class TestGenerationFirstPreActiveRequests:
     def _request(request_id: int, *, priority: float = 0.0):
         return SimpleNamespace(
             request_id=request_id,
+            py_request_id=request_id,
+            is_child=False,
             priority=priority,
             request_type=RequestType.REQUEST_TYPE_CONTEXT_ONLY,
             py_disaggregated_params=SimpleNamespace(
@@ -920,6 +922,7 @@ class TestGenerationFirstPreActiveRequests:
         request_ids=(),
         *,
         max_num_active_requests: int = 4,
+        pre_active_metadata_capacity: int | None = None,
         waiting_queue_policy=WaitingQueuePolicy.FCFS,
         priorities=None,
     ):
@@ -930,6 +933,15 @@ class TestGenerationFirstPreActiveRequests:
         executor._gen_first_pre_active_requests = {}
         executor._gen_first_pre_active_order = {}
         executor._next_gen_first_pre_active_order = 0
+        executor._gen_first_pre_active_metadata_capacity = (
+            max_num_active_requests
+            if pre_active_metadata_capacity is None
+            else pre_active_metadata_capacity
+        )
+        executor._gen_first_pre_active_diagnostics_enabled = False
+        executor._gen_first_pre_active_backlog = 0
+        executor._gen_first_pre_active_diagnostic_count = 0
+        executor._gen_first_pre_active_last_diagnostic = None
         priorities = priorities or {}
         for insertion_order, request_id in enumerate(request_ids):
             request = cls._request(request_id, priority=priorities.get(request_id, 0.0))
@@ -939,6 +951,27 @@ class TestGenerationFirstPreActiveRequests:
         executor.kv_cache_transceiver = Mock()
         executor.kv_cache_transceiver.supports_pre_active_context_requests.return_value = True
         return executor
+
+    def test_metadata_capacity_defaults_to_compute_capacity(self, monkeypatch):
+        monkeypatch.delenv(
+            "TRTLLM_PYTHON_GEN_FIRST_PRE_ACTIVE_METADATA_CAPACITY",
+            raising=False,
+        )
+
+        assert PyExecutor._read_gen_first_pre_active_metadata_capacity(4) == 4
+
+    def test_metadata_capacity_opt_in_is_absolute_and_validated(self, monkeypatch):
+        env_name = "TRTLLM_PYTHON_GEN_FIRST_PRE_ACTIVE_METADATA_CAPACITY"
+        monkeypatch.setenv(env_name, "256")
+        assert PyExecutor._read_gen_first_pre_active_metadata_capacity(4) == 256
+
+        monkeypatch.setenv(env_name, "0")
+        with pytest.raises(ValueError, match="must be positive"):
+            PyExecutor._read_gen_first_pre_active_metadata_capacity(4)
+
+        monkeypatch.setenv(env_name, "3")
+        with pytest.raises(ValueError, match="at least the compute capacity 4"):
+            PyExecutor._read_gen_first_pre_active_metadata_capacity(4)
 
     def test_default_off_leaves_context_request_in_waiting_queue(self):
         executor = self._executor()
@@ -976,26 +1009,125 @@ class TestGenerationFirstPreActiveRequests:
         assert [request.request_id for request in executor.active_requests] == [97, 98, 99]
 
     def test_pre_active_metadata_admission_is_bounded_and_leaves_backlog(self):
-        executor = self._executor((10,), max_num_active_requests=2)
+        executor = self._executor(
+            (10,),
+            max_num_active_requests=2,
+            pre_active_metadata_capacity=4,
+        )
         executor.kv_cache_transceiver.is_context_request_ready_for_activation.return_value = False
         queue = FCFSWaitingQueue()
         items = [
             RequestQueueItem(id=request_id, request=self._request(request_id))
-            for request_id in (1, 2, 3)
+            for request_id in (1, 2, 3, 4)
         ]
         queue.add_requests(items)
 
         admitted = PyExecutor._take_pre_active_context_items(executor, queue)
 
-        assert admitted == [items[0]]
-        assert list(queue) == items[1:]
+        assert admitted == items[:3]
+        assert list(queue) == items[3:]
 
         # Model the subsequent materialization while readiness remains absent.
-        executor._gen_first_pre_active_requests[1] = admitted[0].request
-        executor._gen_first_pre_active_order[1] = 1
+        for insertion_order, item in enumerate(admitted, start=1):
+            executor._gen_first_pre_active_requests[item.id] = item.request
+            executor._gen_first_pre_active_order[item.id] = insertion_order
         assert PyExecutor._select_ready_pre_active_context_request_ids(executor) == []
         assert PyExecutor._take_pre_active_context_items(executor, queue) == []
-        assert list(queue) == items[1:]
+        assert list(queue) == items[3:]
+
+    def test_opt_in_metadata_window_admits_256_without_using_compute_slots(self):
+        executor = self._executor(
+            max_num_active_requests=4,
+            pre_active_metadata_capacity=256,
+        )
+        executor.active_requests = [
+            self._request(request_id) for request_id in (997, 998, 999, 1000)
+        ]
+        queue = FCFSWaitingQueue()
+        items = [
+            RequestQueueItem(id=request_id, request=self._request(request_id))
+            for request_id in range(1, 261)
+        ]
+        queue.add_requests(items)
+
+        admitted = PyExecutor._take_pre_active_context_items(executor, queue)
+
+        assert admitted == items[:256]
+        assert list(queue) == items[256:]
+        assert [request.request_id for request in executor.active_requests] == [
+            997,
+            998,
+            999,
+            1000,
+        ]
+
+    def test_metadata_window_does_not_expand_compute_activation_capacity(self):
+        executor = self._executor(
+            range(1, 9),
+            max_num_active_requests=4,
+            pre_active_metadata_capacity=256,
+        )
+        executor.kv_cache_transceiver.is_context_request_ready_for_activation.return_value = True
+
+        assert PyExecutor._select_ready_pre_active_context_request_ids(executor) == [1, 2, 3, 4]
+
+    def test_metadata_window_diagnostic_is_id_free_and_rate_gated(self, monkeypatch):
+        executor = self._executor(
+            max_num_active_requests=4,
+            pre_active_metadata_capacity=256,
+        )
+        executor._gen_first_pre_active_diagnostics_enabled = True
+        executor.dist = SimpleNamespace(rank=3)
+        info = Mock()
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.pyexecutor.py_executor.logger.info",
+            info,
+        )
+
+        PyExecutor._try_record_pre_active_context_window(
+            executor,
+            admitted=256,
+            backlog=0,
+            ready=0,
+        )
+        PyExecutor._try_record_pre_active_context_window(
+            executor,
+            admitted=256,
+            backlog=0,
+            ready=4,
+        )
+        PyExecutor._try_record_pre_active_context_window(
+            executor,
+            admitted=256,
+            backlog=0,
+            ready=3,
+        )
+
+        assert info.call_count == 2
+        messages = [call.args[0] for call in info.call_args_list]
+        assert all("request_id" not in message for message in messages)
+        assert "admitted=256 backlog=0 ready=4" in messages[-1]
+
+    def test_canceled_overflow_is_removed_without_metadata_or_compute_ownership(self):
+        executor = self._executor(
+            (10,),
+            max_num_active_requests=1,
+            pre_active_metadata_capacity=1,
+        )
+        pre_active_request = executor._gen_first_pre_active_requests[10]
+        executor.canceled_req_ids = [1]
+        executor.waiting_queue = FCFSWaitingQueue()
+        canceled = RequestQueueItem(id=1, request=self._request(1))
+        retained = RequestQueueItem(id=2, request=self._request(2))
+        executor.waiting_queue.add_requests([canceled, retained])
+
+        assert PyExecutor._take_pre_active_context_items(executor, executor.waiting_queue) == []
+        PyExecutor._handle_canceled_requests(executor)
+
+        assert list(executor.waiting_queue) == [retained]
+        assert executor.canceled_req_ids == []
+        assert executor._gen_first_pre_active_requests == {10: pre_active_request}
+        executor.kv_cache_transceiver.prepare_context_requests.assert_not_called()
 
     @pytest.mark.parametrize(
         "waiting_queue_policy",
@@ -1058,8 +1190,14 @@ class TestGenerationFirstPreActiveRequests:
 
     def test_rank_local_capacity_cannot_diverge_pre_active_cohort(self):
         executors = [
-            self._executor(max_num_active_requests=4),
-            self._executor(max_num_active_requests=4),
+            self._executor(
+                max_num_active_requests=4,
+                pre_active_metadata_capacity=256,
+            ),
+            self._executor(
+                max_num_active_requests=4,
+                pre_active_metadata_capacity=256,
+            ),
         ]
         executors[0].active_requests = [
             self._request(request_id) for request_id in (91, 92, 93, 94)
@@ -1070,7 +1208,7 @@ class TestGenerationFirstPreActiveRequests:
             queue.add_requests(
                 [
                     RequestQueueItem(id=request_id, request=self._request(request_id))
-                    for request_id in (1, 2, 3)
+                    for request_id in range(1, 9)
                 ]
             )
             queues.append(queue)
@@ -1080,7 +1218,7 @@ class TestGenerationFirstPreActiveRequests:
             for executor, queue in zip(executors, queues)
         ]
 
-        assert cohorts == [[1, 2, 3], [1, 2, 3]]
+        assert cohorts == [list(range(1, 9)), list(range(1, 9))]
         assert all(not queue for queue in queues)
         assert len(executors[0].active_requests) == 4
         assert executors[1].active_requests == []

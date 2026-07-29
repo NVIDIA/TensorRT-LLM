@@ -114,6 +114,14 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
+# TEST ONLY: generation-first context requests can wait for peer metadata
+# without consuming compute slots. Keep the production default coupled to the
+# compute cap unless the validation harness explicitly widens this window.
+_GEN_FIRST_PRE_ACTIVE_METADATA_CAPACITY_ENV = (
+    "TRTLLM_PYTHON_GEN_FIRST_PRE_ACTIVE_METADATA_CAPACITY")
+_GEN_FIRST_PRE_ACTIVE_DIAGNOSTICS_ENV = (
+    "TRTLLM_PYTHON_TRANSCEIVER_CONTEXT_ACTIVATION_DIGEST")
+
 
 class PPCommTag(IntEnum):
     """
@@ -943,6 +951,14 @@ class PyExecutor:
         self._gen_first_pre_active_requests: Dict[int, LlmRequest] = {}
         self._gen_first_pre_active_order: Dict[int, int] = {}
         self._next_gen_first_pre_active_order = 0
+        self._gen_first_pre_active_metadata_capacity = (
+            self._read_gen_first_pre_active_metadata_capacity(
+                self.max_num_active_requests))
+        self._gen_first_pre_active_diagnostics_enabled = (os.environ.get(
+            _GEN_FIRST_PRE_ACTIVE_DIAGNOSTICS_ENV, "0") == "1")
+        self._gen_first_pre_active_backlog = 0
+        self._gen_first_pre_active_diagnostic_count = 0
+        self._gen_first_pre_active_last_diagnostic = None
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -5242,6 +5258,8 @@ class PyExecutor:
                 for item in waiting_queue
                 if self._is_pre_active_context_item(item)
             }
+            self._gen_first_pre_active_backlog = len(
+                deferred_pre_active_request_ids)
 
         # 3. Pop requests from waiting queue
         new_requests = self._pop_from_waiting_queue(
@@ -5296,6 +5314,65 @@ class PyExecutor:
             is True)
 
     @staticmethod
+    def _read_gen_first_pre_active_metadata_capacity(
+            compute_capacity: int) -> int:
+        raw_capacity = os.environ.get(
+            _GEN_FIRST_PRE_ACTIVE_METADATA_CAPACITY_ENV)
+        if raw_capacity is None:
+            return compute_capacity
+        try:
+            capacity = int(raw_capacity)
+        except ValueError as error:
+            raise ValueError(
+                f"{_GEN_FIRST_PRE_ACTIVE_METADATA_CAPACITY_ENV} must be a "
+                f"positive integer; got {raw_capacity!r}") from error
+        if capacity <= 0:
+            raise ValueError(
+                f"{_GEN_FIRST_PRE_ACTIVE_METADATA_CAPACITY_ENV} must be "
+                f"positive; got {capacity}")
+        if capacity < compute_capacity:
+            raise ValueError(
+                f"{_GEN_FIRST_PRE_ACTIVE_METADATA_CAPACITY_ENV} must be at "
+                f"least the compute capacity {compute_capacity}; got "
+                f"{capacity}")
+        return capacity
+
+    def _try_record_pre_active_context_window(self, *, admitted: int,
+                                              backlog: int, ready: int) -> None:
+        """Record an ID-free, bounded diagnostic snapshot."""
+        if not getattr(self, "_gen_first_pre_active_diagnostics_enabled",
+                       False):
+            return
+        try:
+            active = len(self.active_requests)
+            snapshot = (admitted, backlog, ready, active)
+            previous = getattr(self, "_gen_first_pre_active_last_diagnostic",
+                               None)
+            if snapshot == previous:
+                return
+            self._gen_first_pre_active_last_diagnostic = snapshot
+            self._gen_first_pre_active_diagnostic_count += 1
+            count = self._gen_first_pre_active_diagnostic_count
+            important_transition = (previous is None
+                                    or (ready == 0) != (previous[2] == 0)
+                                    or (backlog == 0) != (previous[1] == 0))
+            if (not important_transition and count & (count - 1) != 0):
+                return
+            capacity = getattr(
+                self,
+                "_gen_first_pre_active_metadata_capacity",
+                self.max_num_active_requests,
+            )
+            logger.info("PYTHON_GEN_FIRST_PRE_ACTIVE_WINDOW "
+                        f"rank={self.dist.rank} snapshots={count} "
+                        f"metadata_capacity={capacity} admitted={admitted} "
+                        f"backlog={backlog} ready={ready} active={active} "
+                        f"compute_capacity={self.max_num_active_requests}")
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            # Diagnostics must not alter request admission or scheduling.
+            pass
+
+    @staticmethod
     def _is_pre_active_context_item(item: RequestQueueItem) -> bool:
         request = item.request
         params = getattr(request, "py_disaggregated_params", None)
@@ -5319,13 +5396,18 @@ class PyExecutor:
         # Metadata-only waiters do not consume compute slots, but each admitted
         # request materializes an LlmRequest and pins native peer metadata.
         # Bound that ownership independently of rank-local active utilization.
-        # max_num_active_requests is identical across the qualified PP domain,
-        # so every rank extracts the same canonical prefix even when their
-        # active-request counts differ.
+        # The metadata capacity is identical across the qualified PP domain, so
+        # every rank extracts the same canonical prefix even when their
+        # active-request counts differ. By default it equals compute capacity;
+        # the TEST ONLY throughput harness can widen it explicitly.
+        metadata_capacity = getattr(
+            self,
+            "_gen_first_pre_active_metadata_capacity",
+            self.max_num_active_requests,
+        )
         available = max(
             0,
-            self.max_num_active_requests -
-            len(self._gen_first_pre_active_requests),
+            metadata_capacity - len(self._gen_first_pre_active_requests),
         )
         if available == 0:
             return []
@@ -5354,11 +5436,17 @@ class PyExecutor:
             return []
         ordered_requests = sorted(self._gen_first_pre_active_requests.values(),
                                   key=self._pre_active_context_order_key)
-        return [
+        ready_request_ids = [
             request.request_id for request in ordered_requests
             if self.kv_cache_transceiver.
             is_context_request_ready_for_activation(request)
-        ][:free_capacity]
+        ]
+        self._try_record_pre_active_context_window(
+            admitted=len(self._gen_first_pre_active_requests),
+            backlog=getattr(self, "_gen_first_pre_active_backlog", 0),
+            ready=len(ready_request_ids),
+        )
+        return ready_request_ids[:free_capacity]
 
     def _activate_pre_active_context_requests(self,
                                               request_ids: List[int]) -> None:
