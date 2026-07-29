@@ -664,9 +664,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 remapped_weights[name] = tensor
         return remapped_weights
 
-    def preprocess_weights(self,
-                           weights: dict,
-                           allow_partial_loading: bool = False) -> dict:
+    def preprocess_weights(self, weights: dict, allow_partial_loading: bool = False) -> dict:
         is_consumable = isinstance(weights, ConsumableWeightsDict)
         quant_algo = self.config.quant_config.quant_algo
 
@@ -701,7 +699,8 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             packed_weights = self._remap_dense_mlp_weights(packed_weights)
 
         processed_weights = super().preprocess_weights(
-            packed_weights, allow_partial_loading=allow_partial_loading)
+            packed_weights, allow_partial_loading=allow_partial_loading
+        )
         if is_consumable and not isinstance(processed_weights, ConsumableWeightsDict):
             return ConsumableWeightsDict(processed_weights)
         return processed_weights
