@@ -1987,6 +1987,21 @@ class PyTorchModelEngine(ModelEngine):
             finally:
                 if force_non_greedy and spec_metadata is not None:
                     spec_metadata._force_non_greedy_for_capture = False
+                    # The base object is not the only holder of the flag: every
+                    # graph captured during this pass cached its own SHALLOW COPY
+                    # of spec_metadata (create_cuda_graph_metadata -> copy.copy),
+                    # which inherited the flag. Those copies are reseated as the
+                    # live spec_metadata on every later replay, so leaving the
+                    # flag set there makes _scan_one_model_sampling overwrite
+                    # every serving request's sampling params with the synthetic
+                    # capture values (0.7 / 50 / 0.9). Clear them here -- after
+                    # the pass has finished capturing, so the flag was still in
+                    # effect for every capture that needed it.
+                    cleared = self.cuda_graph_runner.clear_capture_only_spec_state(
+                    )
+                    logger.info(
+                        f"Cleared capture-only sampling override from {cleared} "
+                        "cached CUDA graph spec metadata object(s).")
 
         # Pass 1: greedy fast-path (dummy requests carry no sampling params,
         # so is_all_greedy_sample is naturally True).
@@ -4983,6 +4998,16 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_draft_tokens)]
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
+            # The capture-only sampling override must never be live outside CUDA
+            # graph warmup: it replaces every request's sampling params with
+            # synthetic capture values. It leaked here once already (inherited by
+            # the cached graph metadata shallow copies), so assert rather than
+            # trust the teardown.
+            assert self.is_warmup or not getattr(
+                spec_metadata, '_force_non_greedy_for_capture', False
+            ), ("capture-only sampling override (_force_non_greedy_for_capture) "
+                "is set outside CUDA graph warmup; serving requests would be "
+                "silently decoded with the synthetic capture sampling params")
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(
                 scheduled_requests.all_requests())
