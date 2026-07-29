@@ -619,7 +619,6 @@ def test_dsv4_pro_fp8_splitk_gemm_reuses_kernels_and_captures_cuda_graph(
     monkeypatch.delenv("TRTLLM_DSV4_OB_SPLIT_K", raising=False)
     monkeypatch.setattr(runner, "kernel_cache", {})
     tuner.clear_cache()
-    tuner.stats.cache_misses = 0
 
     def run(num_tokens: int) -> torch.Tensor:
         aligned_m = (num_tokens + 3) // 4 * 4
@@ -648,8 +647,18 @@ def test_dsv4_pro_fp8_splitk_gemm_reuses_kernels_and_captures_cuda_graph(
         raise AssertionError("CuTe JIT occurred after AutoTuner warmup")
 
     monkeypatch.setattr(cute_dsl_custom_ops.cute, "compile", fail_compile)
+    original_choose_one = tuner.choose_one
+    runtime_tactics = []
 
-    # Cached M=1/128/256 contracts must not compile or fall back at runtime.
+    def track_runtime_tactic(custom_op, runners, tuning_config, inputs, **kwargs):
+        selected = original_choose_one(custom_op, runners, tuning_config, inputs, **kwargs)
+        if not tuner.is_tuning_mode and custom_op.startswith("trtllm::dsv4_fp8_splitk_gemm::"):
+            runtime_tactics.append((inputs[0].shape[0], kwargs["num_splits"], selected[1]))
+        return selected
+
+    monkeypatch.setattr(tuner, "choose_one", track_runtime_tactic)
+
+    # Small and irregular M values must hit the bucket populated by warmup.
     for num_tokens in (1, 37, 128, 256):
         output = run(num_tokens)
         num_splits = runner._select_num_splits(num_tokens)
@@ -658,7 +667,13 @@ def test_dsv4_pro_fp8_splitk_gemm_reuses_kernels_and_captures_cuda_graph(
             output[0, 0].float(), torch.tensor(expected_partial, device="cuda")
         )
     assert len(runner.kernel_cache) == compiled_kernels
-    assert tuner.stats.cache_misses == 0
+    assert [(m, split) for m, split, _ in runtime_tactics] == [
+        (1, 4),
+        (37, 2),
+        (128, 2),
+        (256, 1),
+    ]
+    assert all(tactic != -1 for _, _, tactic in runtime_tactics)
 
     # Capture an irregular shape after warmup and verify replay does not compile.
     num_tokens = 37
@@ -677,7 +692,7 @@ def test_dsv4_pro_fp8_splitk_gemm_reuses_kernels_and_captures_cuda_graph(
         graph_output[0, 0].float(), torch.tensor(expected_partial, device="cuda")
     )
     assert len(runner.kernel_cache) == compiled_kernels
-    assert tuner.stats.cache_misses == 0
+    assert runtime_tactics[-1][2] != -1
 
 
 @skip_pre_blackwell

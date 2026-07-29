@@ -4777,17 +4777,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
         if tuner.is_tuning_mode:
             # The engine's autotuner warmup is context-only and normally sees
             # split-1. Explicitly tune the smaller split-output contracts that
-            # generation can reach so CUDA-graph capture and inference never
-            # trigger synchronous CuTe compilation.
-            tuning_splits = [(4, min(m, runner._SPLIT_K4_MAX_M))]
+            # generation can reach. Each representative contract expands through
+            # its TuningConfig to every mapped M bucket (all SK4/SK2 buckets and
+            # the relevant SK1 prefix), so runtime lookups never fall back.
+            warmup_contracts = [(4, min(m, runner._SPLIT_K4_MAX_M))]
             if m > runner._SPLIT_K4_MAX_M:
-                tuning_splits.append((2, min(m, runner._SPLIT_K2_MAX_M)))
+                warmup_contracts.append((2, min(m, runner._SPLIT_K2_MAX_M)))
             if m > runner._SPLIT_K2_MAX_M:
-                tuning_splits.append((1, m))
-            if (num_splits, m) not in tuning_splits:
-                tuning_splits.append((num_splits, m))
+                warmup_contracts.append((1, m))
+            if (num_splits, m) not in warmup_contracts:
+                warmup_contracts.append((num_splits, m))
 
-            for tuning_split, tuning_m in tuning_splits:
+            for tuning_split, tuning_m in warmup_contracts:
                 if tuning_split == num_splits and tuning_m == m:
                     tuning_inputs = [a, sfa, b, sfb, output]
                 else:
