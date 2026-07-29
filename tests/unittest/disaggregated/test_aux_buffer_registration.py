@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Aux-buffer registration must skip empty (null-pointer) buffers.
+"""Aux-buffer registration and transfer must skip empty buffers.
 
 ``torch.empty(n, 0)`` — which is what the draft-token buffer is when
 ``max_draft_len == 0`` — has ``data_ptr() == 0``. Handing that null address to
@@ -22,20 +22,19 @@ NIXL fails the whole registration on the LIBFABRIC backend.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import List, Sequence, Tuple
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
-from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer, AuxBufferMeta
+from tensorrt_llm._torch.disaggregation.native.transfer import Sender, TransferWorker, WriteMeta
 
 
 pytestmark = pytest.mark.cpu_only
 
 
-def _fake_worker(ptrs: Sequence[int], sizes: Sequence[int]) -> SimpleNamespace:
+def _fake_worker(ptrs: list[int], sizes: list[int]) -> SimpleNamespace:
     """Minimal stand-in exposing only what _register_aux_buffer touches."""
     meta = AuxBufferMeta(ptrs=np.array(ptrs, dtype=np.int64), size=np.array(sizes, dtype=np.int64))
     return SimpleNamespace(
@@ -43,32 +42,60 @@ def _fake_worker(ptrs: Sequence[int], sizes: Sequence[int]) -> SimpleNamespace:
     )
 
 
-def _registered_descs(worker: SimpleNamespace) -> List[Tuple[int, int, int, str]]:
+def _registered_descs(worker: SimpleNamespace) -> list[tuple[int, int, int, str]]:
     worker._agent.register_memory.assert_called_once()
     return worker._agent.register_memory.call_args[0][0].descs
 
 
-def test_null_pointer_aux_buffer_is_skipped() -> None:
-    # Index 1 mirrors the draft-token buffer with max_draft_len == 0. Its size is
-    # deliberately non-zero so this fails if only zero-sized buffers are filtered.
+def _build_aux_write_meta(src_buffer: AuxBuffer, dst_buffer: AuxBuffer) -> WriteMeta:
+    """Build auxiliary transfer metadata with minimal sender dependencies."""
+    peer_rank_info = SimpleNamespace(
+        aux_meta=dst_buffer.meta,
+        instance_name="peer",
+        instance_rank=1,
+        self_endpoint="tcp://peer",
+        dp_rank=0,
+    )
+    registrar = Mock()
+    registrar.self_rank_info = SimpleNamespace(aux_meta=src_buffer.meta)
+    registrar.get_peer_rank_info.return_value = peer_rank_info
+    registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
+    registrar.should_send_aux.return_value = True
+    sender = SimpleNamespace(_registrar=registrar)
+    task = SimpleNamespace(_perf_timer=None, _slot=0, _unique_rid=7)
+    req_info = SimpleNamespace(instance_name="peer", instance_rank=1, aux_slot=0, unique_rid=7)
+    return Sender._build_aux_write_meta(sender, task, req_info)
+
+
+def test_null_pointer_with_non_zero_size_is_rejected() -> None:
     worker = _fake_worker([0x1000, 0, 0x3000, 0x4000], [512, 256, 128, 128])
 
-    TransferWorker._register_aux_buffer(worker)
-
-    descs = _registered_descs(worker)
-    assert [d[0] for d in descs] == [0x1000, 0x3000, 0x4000]
-    # Names keep their original index, so the list is sparse rather than renumbered.
-    assert [d[3] for d in descs] == ["aux_buffer_ptr_0", "aux_buffer_ptr_2", "aux_buffer_ptr_3"]
-    assert len(worker._registered_mem) == 1
+    with pytest.raises(ValueError, match="null pointers with non-zero sizes at indices \\[1\\]"):
+        TransferWorker._register_aux_buffer(worker)
 
 
 def test_zero_size_aux_buffer_is_skipped() -> None:
-    # Mirror image of the case above: a valid pointer with nothing behind it.
     worker = _fake_worker([0x1000, 0x2000], [512, 0])
 
     TransferWorker._register_aux_buffer(worker)
 
     assert [d[0] for d in _registered_descs(worker)] == [0x1000]
+
+
+def test_real_empty_draft_buffer_is_skipped_during_registration() -> None:
+    aux_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=0, device="cpu")
+    worker = SimpleNamespace(_aux_buffer=aux_buffer, _agent=Mock(), _registered_mem=[])
+
+    TransferWorker._register_aux_buffer(worker)
+
+    descs = _registered_descs(worker)
+    assert [d[3] for d in descs] == [
+        "aux_buffer_ptr_0",
+        "aux_buffer_ptr_2",
+        "aux_buffer_ptr_3",
+    ]
+    assert all(int(d[0]) != 0 and int(d[1]) > 0 for d in descs)
+    assert len(worker._registered_mem) == 1
 
 
 def test_all_buffers_registered_when_none_are_empty() -> None:
@@ -90,3 +117,40 @@ def test_nothing_registered_when_every_buffer_is_empty() -> None:
 
     worker._agent.register_memory.assert_not_called()
     assert worker._registered_mem == []
+
+
+def test_real_empty_draft_buffer_is_skipped_during_transfer() -> None:
+    src_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=0, device="cpu")
+    dst_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=0, device="cpu")
+
+    write_meta = _build_aux_write_meta(src_buffer, dst_buffer)
+
+    expected_indices = np.array([0, 2, 3])
+    np.testing.assert_array_equal(write_meta.src_ptrs, src_buffer.meta.ptrs[expected_indices])
+    np.testing.assert_array_equal(write_meta.dst_ptrs, dst_buffer.meta.ptrs[expected_indices])
+    np.testing.assert_array_equal(write_meta.sizes, src_buffer.meta.item_sizes[expected_indices])
+    assert write_meta.src_ptrs.size == 3
+    assert all(int(ptr) != 0 for ptr in write_meta.src_ptrs)
+    assert all(int(ptr) != 0 for ptr in write_meta.dst_ptrs)
+
+
+def test_non_empty_source_requires_non_empty_destination() -> None:
+    src_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=4, device="cpu")
+    dst_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=0, device="cpu")
+
+    with pytest.raises(
+        ValueError,
+        match="Destination auxiliary buffers are empty for non-empty source indices \\[1\\]",
+    ):
+        _build_aux_write_meta(src_buffer, dst_buffer)
+
+
+def test_destination_aux_buffer_must_be_large_enough() -> None:
+    src_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=4, device="cpu")
+    dst_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=2, device="cpu")
+
+    with pytest.raises(
+        ValueError,
+        match="Destination auxiliary buffers are too small at indices \\[1\\]",
+    ):
+        _build_aux_write_meta(src_buffer, dst_buffer)

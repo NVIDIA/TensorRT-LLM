@@ -80,6 +80,24 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
 
 
+def _get_non_empty_aux_mask(ptrs: np.ndarray, sizes: np.ndarray, context: str) -> np.ndarray:
+    """Validate auxiliary memory descriptors and return their non-empty mask."""
+    if ptrs.shape != sizes.shape:
+        raise ValueError(f"{context}: pointer/size count mismatch: {ptrs.shape=} != {sizes.shape=}")
+
+    negative_sizes = sizes < 0
+    if negative_sizes.any():
+        indices = np.flatnonzero(negative_sizes).tolist()
+        raise ValueError(f"{context}: negative sizes at indices {indices}")
+
+    null_non_empty = (ptrs == 0) & (sizes > 0)
+    if null_non_empty.any():
+        indices = np.flatnonzero(null_non_empty).tolist()
+        raise ValueError(f"{context}: null pointers with non-zero sizes at indices {indices}")
+
+    return sizes > 0
+
+
 @dataclass
 class RecvReqInfo:
     sender_req_id: int
@@ -934,9 +952,38 @@ class Sender(SenderBase):
             peer_slot = req_info.aux_slot
             assert peer_slot is not None, f"aux_slot is None for request {req_info.unique_rid}"
             assert task._slot is not None
-            src_ptrs = src_aux_meta.ptrs + src_aux_meta.item_sizes * task._slot
-            dst_ptrs = peer_aux_meta.ptrs + peer_aux_meta.item_sizes * peer_slot
-            sizes = src_aux_meta.item_sizes.astype(np.int64, copy=False)
+            src_item_sizes = src_aux_meta.item_sizes.astype(np.int64, copy=False)
+            dst_item_sizes = peer_aux_meta.item_sizes.astype(np.int64, copy=False)
+            src_non_empty = _get_non_empty_aux_mask(
+                src_aux_meta.ptrs, src_item_sizes, "source auxiliary transfer"
+            )
+            dst_non_empty = _get_non_empty_aux_mask(
+                peer_aux_meta.ptrs, dst_item_sizes, "destination auxiliary transfer"
+            )
+            if src_non_empty.shape != dst_non_empty.shape:
+                raise ValueError(
+                    "Source and destination auxiliary layouts do not match: "
+                    f"{src_non_empty.shape=} != {dst_non_empty.shape=}"
+                )
+
+            missing_dst = src_non_empty & ~dst_non_empty
+            if missing_dst.any():
+                indices = np.flatnonzero(missing_dst).tolist()
+                raise ValueError(
+                    "Destination auxiliary buffers are empty for non-empty source "
+                    f"indices {indices}"
+                )
+
+            too_small = src_non_empty & (dst_item_sizes < src_item_sizes)
+            if too_small.any():
+                indices = np.flatnonzero(too_small).tolist()
+                raise ValueError(
+                    f"Destination auxiliary buffers are too small at indices {indices}"
+                )
+
+            src_ptrs = src_aux_meta.ptrs[src_non_empty] + src_item_sizes[src_non_empty] * task._slot
+            dst_ptrs = peer_aux_meta.ptrs[src_non_empty] + dst_item_sizes[src_non_empty] * peer_slot
+            sizes = src_item_sizes[src_non_empty]
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -2353,14 +2400,9 @@ class TransferWorker:
     def _register_aux_buffer(self):
         assert self._aux_buffer is not None
         aux_meta = self._aux_buffer.meta
-        ptr_num = len(aux_meta.ptrs)
+        non_empty = _get_non_empty_aux_mask(aux_meta.ptrs, aux_meta.size, "auxiliary registration")
         ptr_descs = []
-        for i in range(ptr_num):
-            # An empty aux buffer (draft tokens when max_draft_len == 0) has a null
-            # data_ptr(). NIXL's LIBFABRIC backend rejects a null address and fails the
-            # whole registration; UCX tolerates it. Empty buffers carry no data anyway.
-            if int(aux_meta.ptrs[i]) == 0 or int(aux_meta.size[i]) == 0:
-                continue
+        for i in np.flatnonzero(non_empty):
             ptr_descs.append((aux_meta.ptrs[i], aux_meta.size[i], 0, f"aux_buffer_ptr_{i}"))
         if not ptr_descs:
             return
