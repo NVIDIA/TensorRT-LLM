@@ -14,8 +14,8 @@
 
 """BSX direct (short-row) top-K tier — CuTe DSL, Blackwell SM100.
 
-Port of the op43 ``ct_direct.py`` CuTe DSL translation of the CUDA
-``direct_topk_kernel`` (op42 gvr_bsx.cu), adapted for the production
+CuTe DSL translation of the original CUDA ``direct_topk_kernel``,
+adapted for the production
 ``trtllm::cute_dsl_gvr_topk_decode`` contract (ragged N via a device
 ``seq_lens`` tensor + per-row degenerate identity emit; see the module
 docstring of ``gvr_topk_decode_bsx_tp`` for the shared adaptation inventory).
@@ -70,7 +70,7 @@ class DirectTopKKernel:
     N_eff arithmetic (constexpr; the direct tier reads no hints, so MTP
     support is the N_eff formula alone). SMEM layout
     mirrors gvr_bsx.cu's DSmem<TB> with the same packed (key << 32 | idx)
-    u64 layout (op43 S-E round 6: split key/idx arrays cost 2x smem
+    u64 layout (measured: split key/idx arrays cost 2x smem
     transactions in collect + emits vs CUDA's single STS.64 / LDS.64 per
     candidate):
 
@@ -339,7 +339,7 @@ class DirectTopKKernel:
             )
             row_addr = logits_row.iterator.toint()
             vcnt = npad >> cutlass.Int32(2)  # npad % 4 == 0 (host-asserted)
-            # op43 S-E round 6: npad <= DKCMAX bounds the per-thread trip count
+            # npad <= DKCMAX bounds the per-thread trip count
             # at U = DKCMAX/4/TB (= 3 for TB 1024), so the whole grid-stride
             # loop is flattened into one predicated register batch: issue ALL
             # (<=3) float4 loads back-to-back, then consume. A dynamic
@@ -390,7 +390,7 @@ class DirectTopKKernel:
                 # C == K: every candidate is admitted; identity emit. (With
                 # seq_lens present this is unreachable — n_eff <= npad == K
                 # lands in the degenerate branch — but kept for structural
-                # parity with the op43/CUDA source.)
+                # parity with the CUDA source.)
                 io = tidx
                 while io < npad:
                     out_row[io] = cutlass.Int32(

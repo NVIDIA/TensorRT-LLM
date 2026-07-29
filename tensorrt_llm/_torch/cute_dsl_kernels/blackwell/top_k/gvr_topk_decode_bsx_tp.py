@@ -14,12 +14,12 @@
 
 """BSX throughput (tp) GVR Top-K tier — CuTe DSL, Blackwell SM100.
 
-Port of the op43 ``ct_tp.py`` CuTe DSL translation of the CUDA
-``gvr_topk_tp<TB,CS,AR,UF>`` throughput GVR top-K kernel (op42 iter12-F1b),
+CuTe DSL translation of the CUDA ``gvr_topk_tp<TB,CS,AR,UF>``
+throughput GVR top-K kernel (tuned CUDA head),
 adapted for the production ``trtllm::cute_dsl_gvr_topk_decode`` contract:
 
 * RAGGED N: production logits tails beyond the per-row valid length are
-  stale garbage (NOT -FLT_MAX pad, unlike the op-bench harness). A device
+  stale garbage (NOT -FLT_MAX pad, unlike the standalone bench harness). A device
   ``seq_lens`` tensor is threaded into every tier and every global row read
   is predicated at the LANE level: element index >= N_eff substitutes
   -FLT_MAX AFTER the (always in-bounds, buffer width = logits.shape[1])
@@ -60,7 +60,7 @@ DSMEM (CS > 1) via inline PTX: mapa.shared::cluster + ld/st.shared::cluster
 + atom.relaxed.cluster.shared::cluster.add.u32. Writer-side cluster syncs use
 FULL cluster_arrive (release) — never relaxed (a relaxed arrive has no
 release semantics, so peer CTAs could observe stale DSMEM: see
-``cluster_arrive_relaxed`` DSMEM-race history in the GVR campaign notes).
+``cluster_arrive_relaxed`` DSMEM race observed in development).
 """
 
 import math
@@ -79,13 +79,13 @@ RUNGS = 8
 MAXPASS = 8
 SS = 32  # P2a sample stride (float4s)
 
-# pr6 DATA-ADAPTIVE admission (op43-pr6 campaign, shipped head).
-# This is the pr4 admission machinery
+# DATA-ADAPTIVE admission (measured full-grid verdict).
+# This is the baseline admission machinery
 # BYTE-PARITY on every streaming pass, the fused R=2 count-collect, the
-# reuse rule, the P4 select and the P2c driver (iter1's dedicated window
-# rungs and iter2's R=4 window both taxed the whole kernel 4-15%
+# reuse rule, the P4 select and the P2c driver (a dedicated-window-rung variant
+# rungs and a later R=4 window variant both taxed the whole kernel 4-15%
 # globally — even trivial-branch cells — via register pressure/extra
-# compares/P4 prefilter, and iter1 additionally carried an adversarial
+# compares/P4 prefilter, and the former additionally carried an adversarial
 # under-emit bug). The adaptivity is a PICK-ONLY delta:
 #   * stage 0c LEAN-PIVOT OVERRIDE: when the stage-0 CI admission FAILED
 #     (the pick in hand is a band/2-sigma/overshoot fallback: fat or
@@ -94,12 +94,12 @@ SS = 32  # P2a sample stride (float4s)
 #     1.5-sigma CI on both sides, that rung becomes the pivot (the
 #     rescue is recomputed from it by the standard next-fatter rule).
 #     A fat band pick (est ~3-4x K, the P3-push/P4-radix fatness the
-#     op43-pr6 D2 probe identified as the whole residual-band gap) is
+#     mechanism probe identified as the whole residual-band gap) is
 #     replaced by a lean CI-backed pivot; an undershoot costs ONE rescue
-#     re-stream — pr4's own economics.
-#   * kC pinned to the pr4 flat budget 8192 (K>=2048) / 6144 — the pr6
-#     iron rule (the K-scaled diet was falsified as pure harm).
-#   * ladder quantiles pinned WIDE (pr4): abl3 showed the re-placed
+#     re-stream — the baseline's own economics.
+#   * kC pinned to the flat budget 8192 (K>=2048) / 6144
+#     (the K-scaled diet was falsified as pure harm).
+#   * ladder quantiles pinned WIDE (baseline): ablation showed the re-placed
 #     spread under this admission is a net residual harm.
 #   * the C4 occupancy CS cut keeps the fix-head default (neutral).
 FLT_MAX = 3.4028234663852886e38
@@ -179,7 +179,7 @@ def _st_shared_cluster_i32(mapped_addr, val, *, loc=None, ip=None):
 def _st_shared_cluster_u64(mapped_addr, val, *, loc=None, ip=None):
     """One 8B DSMEM candidate push (CUDA: dst[pos] = (u64)key<<32 | idx).
 
-    op43 S-E round 4: a single packed u64 store halves remote-store
+    Measured: a single packed u64 store halves remote-store
     transactions vs two 4B pushes under CS>1 cluster contention (matches
     the CUDA arm's ``unsigned long long cand[kC]``). Do NOT split back
     into key/idx 4B stores — the split form measurably regresses the
@@ -337,7 +337,7 @@ class GvrTpKernel:
         assert num_threads % 32 == 0
         assert ar in (6, 8)
         assert cluster_size in (1, 2, 4, 8)
-        # pr6 D2a-lean2 interpolation target (per-K: K512 rows carry
+        # Lean-pivot interpolation target (per-K: K512 rows carry
         # 5-20x sparser P2a samples, so 2.0K keeps interpolation-error
         # margin; K>=1024 takes the measured-win 1.5K).
         self.lean_tgt = (2 * top_k) if top_k < 1024 else (3 * top_k) // 2
@@ -405,7 +405,7 @@ class GvrTpKernel:
         s_rungs,
         s_ptcnt,
     ):
-        # op43 S-E: explicit U-batched loads (CUDA `float4 a[U]` idiom) — a
+        # Explicit U-batched loads (CUDA `float4 a[U]` idiom) — a
         # `cutlass.range(unroll=U)` loop leaves ONE load in flight per iter
         # and costs ~11% kernel time in the DRAM-bound regimes. Keep the
         # Python-unrolled register batch.
@@ -558,7 +558,7 @@ class GvrTpKernel:
         NWARP = cutlass.const_expr(self.num_warps)
         copy_atom = self._copy_atom()
         m = cutlass.Float32(-FLT_MAX)
-        # op43 S-E: explicit U=4 batched loads (CUDA `float4 a[4]` idiom).
+        # Explicit U=4 batched loads (CUDA `float4 a[4]` idiom).
         frags = [cute.make_fragment((4,), cutlass.Float32) for _ in range(4)]
         vmain = v1
         vfull = n_eff >> cutlass.Int32(2)
@@ -645,7 +645,7 @@ class GvrTpKernel:
             hv[jj] = cutlass.Float32(0.0)
             if j < cutlass.Int32(K):
                 # pre_idx hardening: clamp hints into [0, N_eff-1] (not
-                # [0, npad-1] as in the op-bench port). Production
+                # [0, npad-1] as in the standalone bench port). Production
                 # cold-start is all zeros and arbitrary garbage must not
                 # crash or corrupt; clamping (rather than skipping, which
                 # the in-tree phase1_preidx_stats does) also keeps the CCDF
@@ -747,8 +747,8 @@ class GvrTpKernel:
                         x = _shfl_up_add(x, tidx, o)
                     A = x - Ssum
                     binw2 = (hmax - tlow) * cutlass.Float32(1.0 / 64.0)
-                    # pr6 D1: WIDE (pr4) quantile spread, pinned — the
-                    # P2A path must stay pr4-parity (abl3: the re-placed
+                    # WIDE (baseline) quantile spread, pinned — the
+                    # P2A path must stay baseline-parity (ablation: the re-placed
                     # spread under this admission is a net residual harm).
                     if cutlass.const_expr(AR == 6):
                         qt = (
@@ -869,7 +869,7 @@ class GvrTpKernel:
             a_cnt = _mapa_shared_cluster(s_isc.iterator + cutlass.Int32(5), cutlass.Int32(0))
             a_st = _mapa_shared_cluster(s_cand.iterator, cutlass.Int32(0))
         # Explicit U-batched loads (CUDA `float4 a[U]` idiom), main +
-        # vec-tail while-loops (same op43 S-E fix as count_pass). Mask
+        # vec-tail while-loops (same fix as count_pass). Mask
         # hoist as in count_pass: [v0, vmain) mask-free (gi computed only
         # inside the rare push branch), [vmain, v1) masked epilogue.
         frags = [cute.make_fragment((4,), cutlass.Float32) for _ in range(U)]
@@ -946,7 +946,7 @@ class GvrTpKernel:
         if cutlass.const_expr(CS > 1):
             a_cnt = _mapa_shared_cluster(s_isc.iterator + cutlass.Int32(5), cutlass.Int32(0))
             a_st = _mapa_shared_cluster(s_cand.iterator, cutlass.Int32(0))
-        # op43 S-E round 3: explicit U=4 batched loads. nvcc auto-unrolls the
+        # Explicit U=4 batched loads. nvcc auto-unrolls the
         # CUDA collect_at loop 4x with 4 LDG.E.128 issued back-to-back; a
         # 1-deep loop was the dominant stall site (36% of all warp-stall
         # samples) on cells whose reuse check fails at big npad x big BS.
@@ -1190,7 +1190,7 @@ class GvrTpKernel:
                 cute.arch.barrier()
                 if tidx == cutlass.Int32(0):
                     # 4-stage pivot pick (R0-admission tightest-in-window ->
-                    # iter7 band -> iter8b 2-sigma -> iter12-F1b gamble)
+                    # band target -> 2-sigma bound -> gamble fallback)
                     lo = cutlass.const_expr((3 * K) // 2)
                     hi = cutlass.const_expr((6 * kC) // 10)
                     tgt_py = min(max(3 * K, (3 * K) // 2), (6 * kC) // 10)
@@ -1267,7 +1267,7 @@ class GvrTpKernel:
                                                 bestd = cutlass.Int32(0)
                                                 best = cutlass.Int32(j)
                                                 adm_est = cnt_j * cutlass.Int32(SS)
-                    # pr6 D1: record the stage-0 CI-admission outcome
+                    # Record the stage-0 CI-admission outcome
                     # BEFORE stages 0b/1/2 mutate bestd; a stage-0 admit
                     # is the "confident P2A" signal — those rows never
                     # take the stage-0c override.
@@ -1341,7 +1341,7 @@ class GvrTpKernel:
                                     if dd < bestd:
                                         bestd = dd
                                         best = cutlass.Int32(j)
-                    # ---- pr6 D1 stage 0c: lean-pivot override ----
+                    # ---- stage 0c: lean-pivot override ----
                     # When the stage-0 CI admission FAILED, npad <=
                     # 262144, and some ladder rung is (i) strictly LEANER
                     # than the pick in hand and (ii) lands in [K, kC] by
@@ -1350,14 +1350,14 @@ class GvrTpKernel:
                     # 1.85/2.0-sigma — rows passing THAT never get here),
                     # make IT the pivot. Rungs are descending in j: scan
                     # ascending and keep the FIRST (tightest) qualifier.
-                    # Hint-unrepresentative rows (the 44f0a208a9 harm
-                    # band) have no CI-qualifying rung and keep the pr4
+                    # Hint-unrepresentative rows (the measured harm
+                    # band) have no CI-qualifying rung and keep the baseline
                     # pick. Same sqrt/div-free margin algebra as stage 0;
                     # everything downstream (fused R=2, rescue, reuse,
-                    # P4, secant) is byte-parity pr4.
+                    # P4, secant) is byte-parity with the baseline.
                     # npad floor 16384: below it the stride-32 sample sees
                     # <= ~128 float4s, the occ-aware CI fires on noise and
-                    # misfire rescues cost 3-5% (v32_8k probe, pr6d1d);
+                    # misfire rescues cost 3-5% (measured, npad~8K probe);
                     # the absolute win-room there is small anyway.
                     gate_ok = cutlass.Int32(0)
                     if npad >= cutlass.Int32(16384):
@@ -1409,7 +1409,7 @@ class GvrTpKernel:
                     resc_ = hmin_floor
                     if best < cutlass.Int32(AR - 1):
                         resc_ = s_rungs[best + cutlass.Int32(1)]
-                    # ---- pr6 D2a lean pivot (ported from pr6d2 lean2,
+                    # ---- lean pivot (per-K interpolated push threshold,
                     # composed AFTER stage 0c): the pick in hand — band,
                     # 2-sigma, overshoot fallback, or a stage-0c lean rung
                     # that is still fat — is structurally FAT on the
@@ -1835,7 +1835,7 @@ def _get_compiled(K: int, CS: int, AR: int, UF: int, TB: int, next_n: int = 1, c
     key = (K, CS, AR, UF, TB, next_n, cr)
     compiled = _LAUNCH_CACHE.get(key)
     if compiled is None:
-        # pr6 iron rule: pr4 flat candidate budget, never the K-scaled
+        # Flat candidate budget, never the K-scaled
         # diet (falsified as pure harm).
         kC = 8192 if K >= 2048 else 6144
         kern = GvrTpKernel(

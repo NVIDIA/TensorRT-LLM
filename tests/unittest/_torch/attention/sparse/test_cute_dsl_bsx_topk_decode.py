@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""BSX (op43 direct/reg/tp CuTe DSL tiers) top-K decode tests.
+"""BSX (direct/reg/tp CuTe DSL tiers) top-K decode tests.
 
 CI-sized exactness grid for the guarded fp32 fast path inside
 ``trtllm::cute_dsl_gvr_topk_decode`` (next_n >= 1, cr in {1, 4}): every reg
@@ -113,7 +113,7 @@ def test_bsx_cuda_graph_capture_replay(monkeypatch, bands):
 def test_bsx_fallback_band_table(monkeypatch):
     """The measured (npad, bs) fallback buckets route to the in-tree kernel
     by default; the kill-switch restores bsx service; neighbours are not
-    over-routed. Bands: op43-pr6 full-grid verdict (2026-07-28), 131072
+    over-routed. Bands: full-grid calibration (2026-07-28), 131072
     lower bound recalibrated to 8 (2026-07-29)."""
     monkeypatch.delenv("TRTLLM_BSX_FALLBACK_BANDS", raising=False)
     bsx_dispatch._reset_env_cache()
@@ -307,7 +307,7 @@ def _skip_if_cluster_capped(bs, npad, top_k):
 
 
 # ---------------------------------------------------------------------------
-# Host-only route-table asserts (mirror of the op42 gvr_bsx.cu dispatch).
+# Host-only route-table asserts (mirror of the original CUDA dispatch).
 # ---------------------------------------------------------------------------
 def test_bsx_route_table():
     r = bsx_dispatch.route

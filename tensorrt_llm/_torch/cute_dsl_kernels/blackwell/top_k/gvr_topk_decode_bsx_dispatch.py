@@ -13,10 +13,10 @@
 # limitations under the License.
 
 """BSX top-K tier dispatcher — routes ``cute_dsl_gvr_topk_decode`` calls to
-the op43 CuTe DSL tiers (direct / reg / tp).
+the BSX CuTe DSL tiers (direct / reg / tp).
 
-Port of the op43 ``ct_bsx.py`` unified launcher, itself an exact
-transcription of the CUDA dispatch in op42 ``gvr_bsx.cu``
+Exact transcription of the original CUDA implementation's dispatch
+(``gvr_topk_launch_batched``)
 (``gvr_topk_launch_batched`` + ``launch_dense`` + ``launch_tp<512>``).
 The gvr streaming tier (cs=16 fallback for npad > 262144) is intentionally
 NOT ported: it is unreachable inside the deployment envelope
@@ -82,12 +82,12 @@ def _thresholds(npad):
     return tpb, dnb
 
 
-# Measured fallback band table (op43-pr6 full-grid verdict, 2026-07-28):
+# Measured fallback band table (full-grid calibration, 2026-07-28):
 # (npad, bs) buckets where the in-tree kernel is faster than every bsx
 # tier by >1.10x on at least one production layer (865 real decode cells
-# x 11 BS, same-rep cold-L2 nsys pairs; data
-# op43_bsx_cutedsl/results/pr6_band_table.json, recalibration recipe in
-# the campaign notes). These are the L2-resident mid-N shapes where the
+# x 11 BS, same-rep cold-L2 nsys pairs; to recalibrate, re-run that
+# paired sweep and route every (npad, bs) bucket whose per-case floor
+# drops below 0.909). These are the L2-resident mid-N shapes where the
 # in-tree exact-count ladder admits a leaner candidate set and its
 # row-slice cluster split keeps every CTA busy through P4. Routing them
 # to the in-tree kernel caps the worst case at 1.10x while keeping the
@@ -185,7 +185,7 @@ def route_cluster_size(bs: int, npad: int, K: int) -> int:
 
 
 # Per-call route()+_parse_reg() string work costs ~2.5-3us host-submit wall
-# on <20us kernels (op43 S-E). The routing decision is pure in (bs, npad, K)
+# on <20us kernels (measured). The routing decision is pure in (bs, npad, K)
 # [env thresholds are cached at first use, like the CUDA static locals], so
 # bind it once per key to a closure.
 _DISPATCH_CACHE = {}  # (bs, npad, K, next_n, cr) -> callable(logits, pre, seq_lens, out)

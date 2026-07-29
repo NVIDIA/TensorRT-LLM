@@ -14,9 +14,9 @@
 
 """BSX register-resident (reg) GVR Top-K tier — CuTe DSL, Blackwell SM100.
 
-Port of the op43 ``ct_reg.py`` CuTe DSL translation of the CUDA
+CuTe DSL translation of the CUDA
 ``gvr_topk_reg<CS,TB,MAXV,AR>`` register-resident GVR top-K kernel
-(op42 iter12-F1b), adapted for the production
+(tuned CUDA head), adapted for the production
 ``trtllm::cute_dsl_gvr_topk_decode`` contract (see the module docstring of
 ``gvr_topk_decode_bsx_tp`` for the shared adaptation inventory: ragged-N
 masking, pre_idx clamping, per-row degenerate identity emit).
@@ -52,7 +52,7 @@ rendezvous where remote (DSMEM) ops can still be in flight — nvcc inserts an
 implicit cluster barrier before ret in DSMEM kernels, the DSL does not
 (missing it => timing-dependent CUDA 719 faults).
 
-op43 S-E convergence notes preserved in this port (do not "simplify away"):
+Convergence notes preserved in this port (do not "simplify away"):
 1. ``cutlass.utils.distributed.atomicAdd`` lowers to sys-scoped
    ``atom.relaxed.SYS.shared`` which blocks ptxas' warp aggregation; the
    CTA-scope relaxed ``_atomic_add_cta`` restores the fast path.
@@ -302,7 +302,7 @@ class GvrRegKernel(GvrTpKernel):
         # Single packed (key<<32 | idx) u64 candidate array — CUDA's
         # `unsigned long long cand[kC]`; one 8B DSMEM push per candidate in
         # the P3 scatter (halves remote-store transactions under 8-cluster
-        # contention at BS>=8 — op43 S-E round 2).
+        # contention at BS>=8 — measured).
         s_cand = smem.allocate_tensor(
             element_type=cutlass.Uint64,
             layout=cute.make_ordered_layout((kC,), order=(0,)),
@@ -782,7 +782,7 @@ class GvrRegKernel(GvrTpKernel):
                                         out_row[m + p] = idx
                             ie = ie + cutlass.Int32(TB)
 
-            # Exit rendezvous — PLATEAU PATH ONLY (op43 S-E wave-overlap fix).
+            # Exit rendezvous — PLATEAU PATH ONLY (wave-overlap fix).
             # On the P3/P4 path the post-merge _cluster_sync_aligned() above is
             # the LAST remote-op rendezvous (P4 is CTA0-local smem + global
             # stores only), so non-rank0 CTAs exit right after it — mirroring
