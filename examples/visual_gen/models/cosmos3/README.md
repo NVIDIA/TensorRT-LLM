@@ -17,6 +17,23 @@ Pass the Hub ID or local path via `--model`:
 - [`nvidia/Cosmos3-Super-Text2Image-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image-4Step) — DMD2-distilled text-to-image: fixed 4-step schedule with classifier-free guidance baked into the weights. Steps/guidance are read from the checkpoint; conflicting request values are rejected. Use with `configs/cosmos3-t2i-1gpu.yaml`.
 - [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) is the deployed shape, so no dedicated config is needed. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
 
+### Static FP8 checkpoints
+
+Statically quantized (ModelOpt) FP8 builds of Nano and Super run on this path.
+Quantization is detected from the checkpoint's own metadata — pass the directory
+to `--model` exactly as you would a BF16 one, with no extra flag:
+
+```bash
+python cosmos3.py --model /path/to/Cosmos3-Nano-FP8 \
+    --prompt_file prompts/t2v.json \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+```
+
+There are no FP8 Hub IDs yet, so use a local path. Support is limited to T2V,
+T2I, I2V and V2V on a **single GPU**; audio (T2AV/TI2AV) and every multi-GPU
+configuration are untested and rejected, so use BF16 for those. FP8 output
+quality has not been benchmarked against BF16.
+
 ## Guardrails
 
 Guardrails are enabled by default (required by the [NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license)). Install and authenticate as follows:
