@@ -18,6 +18,7 @@ Pure tensor functions that operate on logits and probabilities with no
 dependency on the sampling_utils interface or other backend implementation modules.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Optional, cast
 
@@ -62,7 +63,7 @@ def min_p_renorm_probs(
     if isinstance(min_p, torch.Tensor):
         min_p = min_p.reshape(-1, 1)
     thresholds = min_p * max_probs
-    probs = torch.where(probs < thresholds, torch.zeros_like(probs), probs)
+    probs = probs.masked_fill(probs < thresholds, 0.0)
     probs = probs / probs.sum(dim=-1, keepdim=True)
     return probs
 
@@ -76,7 +77,7 @@ def top_k_top_p_sampling_batch(
     min_p: float = 0.0,
     generator: Optional[torch.Generator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Temperature + optional top-k / top-p / min-p filtering + multinomial sampling.
+    """Temperature + optional min-p / top-k / top-p filtering + multinomial sampling.
 
     ``top_k=None`` (or ``vocab_size``) disables top-k filtering; ``top_p=1``
     disables top-p filtering; ``min_p=0`` disables min-p filtering. With all
@@ -96,6 +97,14 @@ def top_k_top_p_sampling_batch(
     need_top_k = top_k < vocab_size
     assert top_p > 0, "non-greedy sampling requires valid top_p"
     need_top_p = top_p < 1
+    assert 0 <= min_p < 1, "non-greedy sampling requires valid min_p"
+    need_min_p = min_p > 0
+
+    if need_min_p:
+        # Thresholding logits at max_logit + log(min_p) keeps the tokens with
+        # prob >= min_p * max_prob; the softmax below renormalizes.
+        min_values = logits.max(dim=-1, keepdim=True).values + math.log(min_p)
+        logits = torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
 
     if need_top_k:
         values, _ = torch.topk(logits, top_k, dim=-1)
@@ -136,9 +145,6 @@ def top_k_top_p_sampling_batch(
         del logits
     else:
         probs = torch.softmax(logits, dim=-1)
-
-    if min_p > 0:
-        probs = min_p_renorm_probs(probs, min_p)
 
     next_tokens = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
     return next_tokens, probs

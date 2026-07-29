@@ -76,19 +76,23 @@ llm.generate(["Hello, my name is",
 * The sampling is controlled via `SamplingParams`.
 
 * By default (`temperature = top_p = top_k = None`), greedy sampling is used
-  (unless top-p decay is active, see below).
+  (unless min-p or top-p decay is active, see below).
 
-* If either `temperature = 0`, `top_p = 0`, and/or `top_k = 1`, is specified, sampling is greedy,
-  irrespective of the values of the remaining parameters.
+* If either `temperature = 0`, `top_p = 0`, `top_k = 1`, and/or `min_p = 1`, is specified,
+  sampling is greedy, irrespective of the values of the remaining parameters.
 
 * Otherwise, sampling proceeds according to the specified sampling parameter values and any
-  unspecified parameters default to `top_k = 0`, `top_p = 1`, `temperature = 1.0`:
+  unspecified parameters default to `top_k = 0`, `top_p = 1`, `min_p = 0`, `temperature = 1.0`:
 
   * The logits are scaled by `1/temperature` before applying softmax to compute probabilities.
     Sampling is performed according to these probabilities.
 
-  * If `top_k = 0` (or `top_k = vocab_size`) and `top_p = 1`, the output tokens are sampled
-    from the entire vocabulary.
+  * If `top_k = 0` (or `top_k = vocab_size`), `top_p = 1` and `min_p = 0`, the output tokens
+    are sampled from the entire vocabulary.
+
+  * If `0 < min_p < 1` is specified, the sampling is restricted to the tokens whose probability
+    is at least `min_p` times the probability of the most likely token ("min-p sampling").
+    When combined with `top_k` and/or `top_p`, `min_p` is applied first.
 
   * If `1 < top_k < vocab_size` is specified, the sampling is restricted to
     the `top_k` highest-probability tokens.
@@ -114,6 +118,9 @@ llm.generate(["Hello, my name is",
 
   * Top-P decay is not supported in combination with beam search or with speculative decoding
     modes that route draft tokens through the Torch Sampler; such requests are rejected.
+
+* Min-P is not supported in combination with one-model speculative decoding. Such requests are
+  rejected at admission.
 
 ### Performance
 

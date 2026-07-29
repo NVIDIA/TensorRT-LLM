@@ -95,9 +95,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         min_p = sampling_config.min_p
         if min_p and min_p[0] > 0.0:
             raise ValueError(
-                "min_p is not supported with one-model speculative decoding "
-                "(MTP / Eagle3 one-model / SA / draft-target-one-model). Drop "
-                "min_p from the request, or disable speculative decoding."
+                "min_p is not supported with one-model speculative decoding. "
+                "Drop min_p from the request, or disable speculative decoding."
             )
 
     @dataclass(kw_only=True)

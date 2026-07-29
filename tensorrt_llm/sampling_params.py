@@ -228,7 +228,7 @@ class SamplingParams:
         length_penalty (float, optional): Controls how to penalize longer sequences in beam search. None means using C++ runtime default 0.f. Defaults to None.
         early_stopping (int, optional): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token).  None means using C++ runtime default 1. Defaults to None.
         no_repeat_ngram_size (int, optional): Controls how many repeat ngram size are acceptable. None means using C++ runtime default 1 << 30. Defaults to None.
-        min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
+        min_p (float, optional): Restricts sampling to tokens whose probability is at least `min_p` times the probability of the most likely token. Must be in [0, 1]; `min_p = 0` disables the filter and `min_p = 1` implies greedy decoding. None means using C++ runtime default 0.0. Defaults to None.
         beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
 
         logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token's log probability.
@@ -466,13 +466,16 @@ class SamplingParams:
         temperature: Optional[float],
         top_p: Optional[float],
         top_k: Optional[int],
+        min_p: Optional[float],
     ) -> bool:
         """Whether the request carries an explicit greedy control.
 
-        Explicit means top_k == 1, top_p == 0.0, or temperature == 0, as opposed
-        to the implicit "all params unset" greedy default.
+        Explicit means top_k == 1, top_p == 0.0, min_p == 1.0, or temperature == 0,
+        as opposed to the implicit "all params unset" greedy default. min_p == 1.0
+        keeps only tokens whose probability equals the row maximum, so like
+        top_p == 0.0 it collapses sampling to a single token.
         """
-        return top_k == 1 or top_p == 0.0 or temperature == 0
+        return top_k == 1 or top_p == 0.0 or min_p == 1.0 or temperature == 0
 
     @staticmethod
     def params_imply_greedy_decoding(
@@ -489,14 +492,14 @@ class SamplingParams:
         An explicit greedy control always wins. The implicit "all params unset"
         greedy default is overridden by any active sampling knob: an active
         top-p decay (which implies top-p sampling so the decayed runtime top-p
-        can take effect) or a positive ``min_p`` (which still selects among
+        can take effect) or a ``min_p`` in ``(0, 1)`` (which still selects among
         multiple tokens); callers that do not support decay may omit
         ``top_p_decay``.
         """
         if use_beam_search:
             return False
         if SamplingParams.params_imply_explicit_greedy(
-            temperature=temperature, top_p=top_p, top_k=top_k
+            temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p
         ):
             return True
         implicitly_greedy = temperature is None and top_p is None and top_k is None

@@ -413,6 +413,14 @@ class TestStrategySelection:
         strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
         assert strat[0] == "temperature"
 
+    def test_min_p_1_is_greedy(self):
+        # min_p == 1 keeps only the row max, i.e. an explicit greedy control
+        # (like top_p == 0), so it must not reach the min_p sampling path.
+        params = SamplingParams(min_p=1.0, temperature=0.7)
+        self._check_params(params)
+        request = self._build_mock_llm_request(params)
+        assert _request_strategy(request, vocab_size=self.VOCAB_SIZE) is GREEDY
+
     @pytest.mark.parametrize(
         "greedy_kwargs",
         [
