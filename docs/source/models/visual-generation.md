@@ -38,6 +38,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
+| `Qwen/Qwen-Image-Edit-2511` | Image Editing (text+images-to-image) |
 | `nvidia/Cosmos3-Nano` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
 
@@ -55,6 +56,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **LTX-2** | Yes | Yes | Yes [^4] | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image** [^5] | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | Yes | No | No | Yes | Yes | No | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.

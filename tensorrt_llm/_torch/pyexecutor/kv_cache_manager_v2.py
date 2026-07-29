@@ -1723,58 +1723,60 @@ class KVCacheManagerV2(BaseResourceManager):
         typical_step = None
         constraints = []
         if kv_cache_config.pool_ratio is None:
-            typical_seq_len = (
-                kv_cache_config.avg_seq_len
-                if kv_cache_config.avg_seq_len is not None
-                else self.max_seq_len
-            )
-            if typical_seq_len > self.max_seq_len:
+            typical_seq_len = self._get_typical_seq_len(kv_cache_config)
+            if typical_seq_len is not None and typical_seq_len > self.max_seq_len:
                 raise ValueError(
                     f"kv_cache_config.avg_seq_len ({typical_seq_len}) must be less than or "
                     f"equal to max_seq_len ({self.max_seq_len})"
                 )
 
-            # Model one context request and enough generation requests to fill
-            # max_batch_size without over-provisioning windowed cache pools.
-            context_capacity = (
-                self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
-            ) + self.num_extra_kv_tokens
-            generation_history_length = max(0, typical_seq_len - self.max_draft_len - 1)
-            typical_step = BatchDesc(
-                [KVCacheDesc(capacity=context_capacity, history_length=0)]
-                + [
-                    KVCacheDesc(
-                        capacity=typical_seq_len,
-                        history_length=generation_history_length,
-                    )
-                ]
-                * (self.max_batch_size - 1)
-            )
-
-            # CUDA graph generation warmup uses one request at max_seq_len and
-            # enough minimal decode requests to fill max_batch_size.
-            min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
-            constraints.append(
-                BatchDesc(
-                    [KVCacheDesc(capacity=self.max_seq_len, history_length=self.max_seq_len - 1)]
-                    + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
+            if typical_seq_len is not None:
+                # Model one context request and enough generation requests to fill
+                # max_batch_size without over-provisioning windowed cache pools.
+                context_capacity = (
+                    self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
+                ) + self.num_extra_kv_tokens
+                generation_history_length = max(0, typical_seq_len - self.max_draft_len - 1)
+                typical_step = BatchDesc(
+                    [KVCacheDesc(capacity=context_capacity, history_length=0)]
+                    + [
+                        KVCacheDesc(
+                            capacity=typical_seq_len,
+                            history_length=generation_history_length,
+                        )
+                    ]
                     * (self.max_batch_size - 1)
                 )
-            )
 
-            # General and chunked-prefill warmup uses one fresh context request
-            # at the per-iteration token budget.
-            if self.max_num_tokens is not None:
+                # CUDA graph generation warmup uses one request at max_seq_len and
+                # enough minimal decode requests to fill max_batch_size.
+                min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
                 constraints.append(
                     BatchDesc(
                         [
                             KVCacheDesc(
-                                capacity=self.max_num_tokens + self.num_extra_kv_tokens,
-                                history_length=0,
+                                capacity=self.max_seq_len,
+                                history_length=self.max_seq_len - 1,
                             )
                         ]
+                        + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
+                        * (self.max_batch_size - 1)
                     )
                 )
+
+                # General and chunked-prefill warmup uses one fresh context request
+                # at the per-iteration token budget.
+                if self.max_num_tokens is not None:
+                    constraints.append(
+                        BatchDesc(
+                            [
+                                KVCacheDesc(
+                                    capacity=self.max_num_tokens + self.num_extra_kv_tokens,
+                                    history_length=0,
+                                )
+                            ]
+                        )
+                    )
 
         buffer_type = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
@@ -1846,6 +1848,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
+        """Return the configured typical sequence length, if any."""
+        return kv_cache_config.avg_seq_len
 
     def _extra_buffers_per_layer(
         self, *, tokens_per_block: int
@@ -1956,18 +1962,19 @@ class KVCacheManagerV2(BaseResourceManager):
         num_heads: int = 1,
         head_dim: int,
         dtype: Union[torch.dtype, "DataType", str] = torch.bfloat16,
+        kv_layout: str = "NHD",
     ) -> Optional[torch.Tensor]:
         """Return a torch view over the V2-managed paged ``Role.INDEX_KEY``
         buffer for ``layer_idx``, or ``None`` when the layer has no
         INDEX_KEY buffer registered (e.g. dense layers in a sparse model,
         or non-local layers on the current PP rank).
 
-        The view has shape ``[num_pages, tokens_per_block, num_heads,
-        head_dim]`` where ``num_pages == impl.get_page_index_upper_bound(
-        layer_idx, Role.INDEX_KEY)``. Sparse modeling code addresses
-        entries by ``(page, within_page, head, dim)`` after decomposing
-        the per-token slot id used by the main paged K/V cache into
-        ``(page, within_page)``.
+        For ``kv_layout="NHD"``, the view has shape ``[num_pages,
+        tokens_per_block, num_heads, head_dim]``. For ``kv_layout="HND"``,
+        it has shape ``[num_pages, num_heads, tokens_per_block, head_dim]``.
+        Sparse modeling code decomposes the per-token slot id used by the
+        main paged K/V cache into ``(page, within_page)`` and indexes the
+        token axis selected by ``kv_layout``.
 
         Because :class:`BufferConfig` only carries an opaque byte ``size``
         per block, the dtype and head shape are caller-side contracts.
@@ -1986,6 +1993,8 @@ class KVCacheManagerV2(BaseResourceManager):
         propagate to the pool, and successive calls return views over
         the same backing storage.
         """
+        if kv_layout not in ("NHD", "HND"):
+            raise ValueError(f"Unsupported kv_layout: {kv_layout}")
         if layer_idx not in self.layer_offsets:
             return None
         layer_offset = self.layer_offsets[layer_idx]
@@ -2040,21 +2049,21 @@ class KVCacheManagerV2(BaseResourceManager):
             f"{num_slots_total} is not divisible by scale = {scale}."
         )
         num_slots = num_slots_total // scale
+        if kv_layout == "NHD":
+            page_shape = [self.tokens_per_block, num_heads, head_dim]
+        else:
+            page_shape = [num_heads, self.tokens_per_block, head_dim]
 
         if scale == 1:
             # Non-coalesced INDEX_KEY pool: the per-buffer stride is
-            # the entire page, so ``[page_upper, tokens_per_block,
-            # num_heads, head_dim]`` is the correct contiguous view.
-            shape = [page_upper, self.tokens_per_block, num_heads, head_dim]
+            # the entire page, so either layout is a contiguous view.
+            shape = [page_upper, *page_shape]
             return convert_to_torch_tensor(TensorWrapper(addr, torch_dtype, shape))
 
-        # Coalesced pool: build a ``[num_slots, scale, tokens_per_block,
-        # num_heads, head_dim]`` view at INDEX_KEY's base, then slice
-        # ``[:, 0]`` to extract this layer's INDEX_KEY data. The slice
-        # preserves dim-0 stride = ``scale * page_stride`` bytes, so
-        # ``view[s, w, h, d]`` lands on the correct byte for any
-        # ``s`` in [0, num_slots).
-        full_slot_shape = [num_slots, scale, self.tokens_per_block, num_heads, head_dim]
+        # Coalesced pool: include the buffers-per-slot dimension, then
+        # slice ``[:, 0]`` to extract this layer's INDEX_KEY data while
+        # preserving dim-0 stride = ``scale * page_stride`` bytes.
+        full_slot_shape = [num_slots, scale, *page_shape]
         full_view = convert_to_torch_tensor(TensorWrapper(addr, torch_dtype, full_slot_shape))
         return full_view[:, 0]
 
