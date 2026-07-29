@@ -378,6 +378,72 @@ class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
 
+    @staticmethod
+    def _checkpoint_has_lm_head_scale(config: ModelConfig[TConfig]) -> bool:
+        """Whether the checkpoint stores a quantized lm_head (a weight scale).
+
+        Used to decide lm_head quantization for homogeneous checkpoints, which
+        carry no explicit per-layer quant entry. Reads only the safetensors
+        header for ``lm_head.weight_scale`` (no weight load).
+        """
+        checkpoint_dir = getattr(config.pretrained_config, "_name_or_path",
+                                 None)
+        if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+            return False
+        return ModelConfig._get_safetensors_header_for_tensor(
+            checkpoint_dir, "lm_head.weight_scale") is not None
+
+    @staticmethod
+    def _resolve_lm_head_quant_config(
+            config: ModelConfig[TConfig]) -> Optional[QuantConfig]:
+        """Resolve the quant config for lm_head, or None to keep it unquantized.
+
+        lm_head is quantized only when the checkpoint actually stores a
+        quantized lm_head: MIXED_PRECISION checkpoints carry an explicit
+        per-layer entry in ``quant_config_dict``; homogeneous checkpoints have
+        no per-layer entry, so we additionally require the checkpoint to carry
+        an ``lm_head`` weight scale. (A bf16 lm_head is commonly left OUT of
+        ``exclude_modules``, so "not excluded" alone must NOT imply quantized —
+        otherwise a homogeneous checkpoint with a bf16 lm_head would be built
+        quantized and fail / change its logits.) Several further cases force it
+        back to unquantized.
+        """
+        if config.quant_config_dict is not None:
+            quant_config = config.quant_config_dict.get("lm_head")
+        elif (config.quant_config is not None
+              and config.quant_config.quant_algo is not None and
+              DecoderModelForCausalLM._checkpoint_has_lm_head_scale(config)):
+            quant_config = config.quant_config
+        else:
+            quant_config = None
+        if quant_config is None:
+            return None
+
+        # exclude_modules always wins (an FP16 lm_head is listed there).
+        if (config.quant_config is not None
+                and config.quant_config.is_module_excluded_from_quantization(
+                    "lm_head")):
+            return None
+
+        # Tied embeddings replace lm_head.weight with the dense bf16 embedding
+        # weight, which would silently clash with a quantized (packed) weight.
+        if getattr(config.pretrained_config, 'tie_word_embeddings', False):
+            logger.info("Ignoring lm_head quant entry: tie_word_embeddings "
+                        "shares the dense embedding weight, so lm_head stays "
+                        "unquantized")
+            return None
+
+        # lm_head TP in ADP slices the dense weight at forward time for the
+        # spec-decoding head (see LMHead.forward), which is incompatible with
+        # quantized (packed) weights — LMHead rejects that at construction.
+        if (config.mapping.enable_attention_dp
+                and config.mapping.enable_lm_head_tp_in_adp):
+            logger.info("Ignoring lm_head quant entry: lm_head TP in ADP "
+                        "slices the dense weight, so lm_head stays unquantized")
+            return None
+
+        return quant_config
+
     def __init__(self, model: TModel, *, config: ModelConfig[TConfig],
                  hidden_size: int, vocab_size: int):
         super().__init__()
@@ -387,39 +453,9 @@ class DecoderModelForCausalLM(nn.Module,
         self.pp_size = config.mapping.pp_size
         self.has_custom_lm_head = False
 
-        # Per-layer quant entry for lm_head (e.g. ModelOpt MIXED_PRECISION
-        # checkpoints that quantize lm_head to NVFP4). Model-specific
-        # config normalizers opt in by keeping/synthesizing this entry;
-        # exclude_modules still wins. Applies to both the attention-DP
-        # (replicated) and TP lm_head below.
-        lm_head_quant_config = None
-        if config.quant_config_dict is not None:
-            lm_head_quant_config = config.quant_config_dict.get("lm_head")
-            if (lm_head_quant_config is not None
-                    and config.quant_config is not None and config.quant_config.
-                    is_module_excluded_from_quantization("lm_head")):
-                lm_head_quant_config = None
-            if (lm_head_quant_config is not None and getattr(
-                    config.pretrained_config, 'tie_word_embeddings', False)):
-                # Tied embeddings replace lm_head.weight with the dense
-                # bf16 embedding weight below, which would silently clash
-                # with a quantized (packed) weight and its quant method.
-                logger.info(
-                    "Ignoring lm_head quant entry: tie_word_embeddings "
-                    "shares the dense embedding weight, so lm_head stays "
-                    "unquantized")
-                lm_head_quant_config = None
-            if (lm_head_quant_config is not None
-                    and config.mapping.enable_attention_dp
-                    and config.mapping.enable_lm_head_tp_in_adp):
-                # lm_head TP in ADP slices the dense weight at forward time
-                # for the spec-decoding head (see LMHead.forward), which is
-                # incompatible with quantized (packed) weights — LMHead
-                # rejects that combination at construction.
-                logger.info(
-                    "Ignoring lm_head quant entry: lm_head TP in ADP "
-                    "slices the dense weight, so lm_head stays unquantized")
-                lm_head_quant_config = None
+        # Quant config for lm_head (applies to both the attention-DP replicated
+        # and TP lm_head below); None keeps it unquantized.
+        lm_head_quant_config = self._resolve_lm_head_quant_config(config)
 
         if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(

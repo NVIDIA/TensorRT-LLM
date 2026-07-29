@@ -147,13 +147,17 @@ def _prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str, num_
     _DATASET_NAME = "synthetic_128_128.txt"
     dataset_path = Path(temp_dir, _DATASET_NAME)
 
-    # Generate a small dataset to run a test - matching workload configuration
+    # Generate a small dataset to run a test - matching workload configuration.
+    # Write straight to a file via --output (the documented usage) instead of
+    # scraping --stdout: trtllm-bench prints an import-time banner on stdout that
+    # would otherwise corrupt the captured JSONL.
     command = [
         "trtllm-bench",
         "--model",
         model_path_or_name,
         "prepare-dataset",
-        "--stdout",
+        "--output",
+        str(dataset_path),
         "token-norm-dist",
         "--input-mean",
         "128",
@@ -170,9 +174,6 @@ def _prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str, num_
     result = subprocess.run(command, cwd=str(temp_dir), capture_output=True, text=True, timeout=300)
     if result.returncode != 0:
         raise RuntimeError(f"Failed to prepare dataset: {result.stderr}")
-    # Grab the stdout and write it to a dataset file for passing to suite.
-    with open(dataset_path, "w") as dataset:
-        dataset.write(result.stdout)
     return dataset_path
 
 

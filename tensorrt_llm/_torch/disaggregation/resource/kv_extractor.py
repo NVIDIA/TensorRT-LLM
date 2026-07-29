@@ -14,9 +14,10 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import numpy as np
+import torch
 
 from tensorrt_llm._torch.disaggregation.base.region import (
     DataLayout,
@@ -41,7 +42,10 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_physical_pool,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManager,
+    MambaHybridCacheManagerV2,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
@@ -106,10 +110,12 @@ class KVRegionExtractorV1(RegionExtractorBase):
 
         base_ptr = pool.base_address
         block_size = pool.slot_bytes
+        block_stride = pool.slot_stride_bytes
+        assert block_stride is not None
 
         # KV cache: filter out invalid block_ids (BAD_PAGE_INDEX = -1)
         valid = region_ids >= 0
-        ptrs = base_ptr + block_size * region_ids[valid]
+        ptrs = base_ptr + block_stride * region_ids[valid]
         memory = MemRegionGroup(ptrs=ptrs, bytes_per_region=block_size)
         return SpecRegion(memory=memory)
 
@@ -134,16 +140,19 @@ def _build_layer_group_for_mamba(
         base_address=conv_state.data_ptr(),
         slot_bytes=conv_state.stride(1) * conv_state.element_size(),
         num_slots=conv_state.shape[1],
+        layer_stride_bytes=conv_state.stride(0) * conv_state.element_size(),
     )
 
     ssm_pool = PhysicalPool(
         base_address=ssm_state.data_ptr(),
         slot_bytes=ssm_state.stride(1) * ssm_state.element_size(),
         num_slots=ssm_state.shape[1],
+        layer_stride_bytes=ssm_state.stride(0) * ssm_state.element_size(),
     )
 
     # Per-section bytes for conv_state and per-head bytes for ssm_state.
-    # conv_state layout: [x: d_inner/tp | B: ng*ds/tp | C: ng*ds/tp] x (d_conv-1)
+    # The section ordering is supplied by the cache manager because Mamba2
+    # uses [x | B | C], while GDN uses [Q | K | V].
     # ssm_state layout: (nheads/tp, head_dim, d_state)
     d_conv_m1 = conv_state.shape[3]
     conv_elem_size = conv_state.element_size()
@@ -153,6 +162,91 @@ def _build_layer_group_for_mamba(
     head_dim = ssm_state.shape[3]
     d_state = ssm_state.shape[4]
     ssm_elem_size = ssm_state.element_size()
+    ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
+
+    return MambaLayerGroup(
+        pool_group_idx=pool_group_idx,
+        mamba_layer_offsets=mamba_layer_offsets,
+        conv_states=conv_pool,
+        ssm_states=ssm_pool,
+        conv_section_bytes=conv_section_bytes,
+        ssm_bytes_per_head=ssm_bytes_per_head,
+    )
+
+
+def _slot_stride_bytes(tensor: torch.Tensor) -> int:
+    return int(tensor.stride(0) * tensor.element_size())
+
+
+def _build_v2_mamba_state_pool(states: Sequence[torch.Tensor]) -> PhysicalPool:
+    """Describe affine layer/slot addressing for one V2 Mamba state role."""
+    if not states:
+        raise ValueError("V2 Mamba state pool requires at least one layer")
+
+    first_state = states[0]
+    base_address = int(first_state.data_ptr())
+    num_slots = int(first_state.shape[0])
+    slot_bytes = int(first_state[0].numel() * first_state.element_size())
+    slot_stride_bytes = _slot_stride_bytes(first_state)
+
+    num_layers = len(states)
+    if slot_stride_bytes % num_layers != 0:
+        raise ValueError("V2 Mamba physical slot must divide evenly across layers")
+    # Each role appears once per layer in its size-class pool. Equal-size SSM
+    # and convolution states share that pool and are interleaved, so their
+    # layer stride includes both role payloads.
+    layer_stride_bytes = slot_stride_bytes // num_layers
+
+    for layer_offset, state in enumerate(states):
+        state_slot_bytes = int(state[0].numel() * state.element_size())
+        if (
+            int(state.shape[0]) != num_slots
+            or state_slot_bytes != slot_bytes
+            or _slot_stride_bytes(state) != slot_stride_bytes
+        ):
+            raise ValueError("V2 Mamba state tensors must share one slot layout per role")
+        expected_address = base_address + layer_offset * layer_stride_bytes
+        if int(state.data_ptr()) != expected_address:
+            raise ValueError("V2 Mamba state tensors must have a uniform layer stride per role")
+
+    return PhysicalPool(
+        base_address=base_address,
+        slot_bytes=slot_bytes,
+        num_slots=num_slots,
+        slot_stride_bytes=slot_stride_bytes,
+        layer_stride_bytes=layer_stride_bytes,
+    )
+
+
+def _build_layer_group_for_v2_mamba(
+    manager: MambaHybridCacheManagerV2, pool_group_idx: int
+) -> MambaLayerGroup:
+    mamba_layer_offsets = {
+        int(global_layer_id): int(local_layer_id)
+        for global_layer_id, local_layer_id in manager.mamba_layer_offsets.items()
+    }
+
+    expected_offsets = list(range(len(mamba_layer_offsets)))
+    if sorted(mamba_layer_offsets.values()) != expected_offsets:
+        raise ValueError("V2 Mamba layer offsets must be dense")
+    if len(manager.all_conv_states) != len(expected_offsets) or len(manager.all_ssm_states) != len(
+        expected_offsets
+    ):
+        raise ValueError("V2 Mamba state tensors must match the layer-offset table")
+
+    first_conv_state = manager.all_conv_states[0]
+    first_ssm_state = manager.all_ssm_states[0]
+    conv_pool = _build_v2_mamba_state_pool(manager.all_conv_states)
+    ssm_pool = _build_v2_mamba_state_pool(manager.all_ssm_states)
+    if conv_pool.num_slots != ssm_pool.num_slots:
+        raise ValueError("V2 Mamba convolution and SSM states must have the same number of slots")
+
+    d_conv_m1 = manager.conv_state_shape[1]
+    conv_elem_size = first_conv_state.element_size()
+    _, head_dim, d_state = manager.ssm_state_shape
+    conv_section_bytes = [dim * d_conv_m1 * conv_elem_size for dim in manager.conv_section_dims]
+
+    ssm_elem_size = first_ssm_state.element_size()
     ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
 
     return MambaLayerGroup(
@@ -419,6 +513,14 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         for variant in pg_desc.slot_desc.variants:
             layer_group_id = int(variant.layer_group_id)
             all_internal_layer_ids = list(manager.impl.layer_grouping[layer_group_id])
+            if isinstance(manager, MambaHybridCacheManagerV2) and any(
+                manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
+            ):
+                layer_groups_by_id[layer_group_id] = _build_layer_group_for_v2_mamba(
+                    manager, storage_pg_to_list_idx[storage_pg_idx]
+                )
+                continue
+
             all_global_layer_ids = _compute_global_layer_ids(manager, layer_group_id)
 
             local_layers = [
@@ -519,7 +621,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             raise ValueError(f"Missing V2 layer group descriptor for layer group {layer_group_id}")
         layer_groups.append(layer_group)
 
-    if isinstance(manager, MambaHybridCacheManager):
+    if isinstance(manager, MambaHybridCacheManager) and not isinstance(
+        manager, MambaHybridCacheManagerV2
+    ):
         mamba_layer_group_idx = len(pool_groups)
         mamba_layer_group = _build_layer_group_for_mamba(manager, mamba_layer_group_idx)
         layer_groups.append(mamba_layer_group)

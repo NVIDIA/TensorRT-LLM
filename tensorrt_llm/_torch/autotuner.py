@@ -261,7 +261,8 @@ class TunableRunner(ABC):
 @contextlib.contextmanager
 def autotune(tune_mode: bool = True,
              cache_path: str = None,
-             skip_dynamic_tuning_buckets: bool = False):
+             skip_dynamic_tuning_buckets: bool = False,
+             post_tune_merge_dist: Optional[Distributed] = None):
     """Context manager for autotuning with distributed support.
 
     Args:
@@ -271,8 +272,21 @@ def autotune(tune_mode: bool = True,
             _optimization_profiles() so only actual input shapes from warmup
             are profiled. Useful for workloads (e.g. diffusion) where the
             LLM-oriented M-bucket sweep is unnecessary.
+        post_tune_merge_dist: Optional ``Distributed``. When set, tactics are
+            tuned per-rank independently and merged across ranks in one
+            collective at context exit (before the cache is saved) — for
+            pipelines whose warmup is not SPMD and so cannot use the per-op
+            distributed strategies.
     """
     autotuner = AutoTuner.get()
+    if post_tune_merge_dist is not None:
+        # Save the singleton's prior state: the full-world dist attached for the
+        # merge is temporary and must not leak into later sessions. Attach the
+        # real (world-sized) mapping now for a correct rank, but with no dist
+        # yet: _is_distributed() stays False so per-op sync is skipped while a
+        # non-SPMD pipeline tunes; the dist is attached at exit to merge.
+        prev_mapping, prev_dist = autotuner.mapping, autotuner._dist
+        autotuner.setup_distributed_state(post_tune_merge_dist.mapping, None)
     rank = autotuner.mapping.rank
 
     # if cache_path is provided, use the rank-specific file
@@ -303,10 +317,24 @@ def autotune(tune_mode: bool = True,
         if autotune_enabled:
             logger.info("[Autotuner] Autotuning process ends")
 
-        # save cache
-        if cache_path is not None:
-            logger.info(f"[Autotuner] Saving cache to {cache_path}")
-            autotuner.profiling_cache.save_cache(cache_path, rank)
+        try:
+            # Merge tactics across ranks in one collective before the cache is
+            # saved, so non-SPMD pipelines can tune independently and still agree.
+            if post_tune_merge_dist is not None:
+                autotuner.setup_distributed_state(post_tune_merge_dist.mapping,
+                                                  post_tune_merge_dist)
+                autotuner.post_tune_merge_tactics()
+
+            # save cache
+            if cache_path is not None:
+                logger.info(f"[Autotuner] Saving cache to {cache_path}")
+                autotuner.profiling_cache.save_cache(cache_path, rank)
+        finally:
+            # Restore the singleton's prior distributed state (see enter) so the
+            # temporary full-world state does not persist past this context.
+            if post_tune_merge_dist is not None:
+                autotuner.mapping = prev_mapping
+                autotuner._dist = prev_dist
 
 
 @dataclass
@@ -760,9 +788,17 @@ class AutoTunerProfilingCache:
             # Convert any simple object to string for JSON compatibility
             key_str = str(key)
             runner_id, tactic, min_time = value
-            tactic_str = repr(tactic)
+            # Enum tactics (e.g. Fp4QuantTactic) repr as "<Fp4QuantTactic.TRTLLM: -1>",
+            # which ast.literal_eval can't parse back -> load_cache crash. Serialize
+            # the underlying value (reload yields that value; an IntEnum compares
+            # equal to it and kernels take the int).
+            is_enum = isinstance(tactic, enum.Enum)
+            tactic_check = tactic.value if is_enum else tactic
+            tactic_str = repr(tactic_check)
             try:
-                assert tactic == ast.literal_eval(
+                # Verify the serialized value round-trips (compare against the
+                # value we store, not the enum member — else non-IntEnum fails).
+                assert tactic_check == ast.literal_eval(
                     tactic_str
                 ), f"Tactic is not compatible with json.dumps/json.loads"
             except Exception as e:
@@ -1953,6 +1989,19 @@ class AutoTuner:
                     merged_cache_data[key] = value
 
         self.profiling_cache.merge_cache_data(merged_cache_data)
+
+    def post_tune_merge_tactics(self) -> None:
+        """Merge tactics across ranks after tuning: all-gather every rank's whole
+        profiling cache and keep the fastest tactic per key. One-shot
+        (session-level, not per-op). Collective — all ranks must call it."""
+        if not self._is_distributed():
+            return
+        merged = dict()
+        for data in self._dist.tp_cp_allgather(obj=self.profiling_cache.cache):
+            for key, value in data.items():
+                if value[-1] < merged.get(key, [float('inf')])[-1]:
+                    merged[key] = value
+        self.profiling_cache.merge_cache_data(merged)
 
     def _broadcast_cache_data(
         self,

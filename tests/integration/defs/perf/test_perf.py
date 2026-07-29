@@ -158,6 +158,11 @@ def import_allowed_perf_config():
     return allowed_configs
 
 
+# Covers both the C++ KVCacheManager and the Python KV cache manager v2 log lines.
+KV_CACHE_SIZE_LOG_QUERY = re.compile(
+    r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"
+    r"|.*KV cache manager v2 device quota set to ([\d\.]+)\s*GiB.*")
+
 # Regex commands used to parse the metric result for the metric type.
 PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.BUILD_TIME:
@@ -189,7 +194,7 @@ PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.CONTEXT_GPU_MEMORY:
     re.compile(r".*Allocated ([\d\.]+) MiB for execution context memory.*"),
     PerfMetricType.KV_CACHE_SIZE:
-    re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
+    KV_CACHE_SIZE_LOG_QUERY,
 }
 
 BENCH_PERF_METRIC_LOG_QUERIES = {
@@ -211,7 +216,7 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     # tensorrt_llm/_torch/auto_deploy/shim/interface.py), so its post-resize
     # capacity also logs this line (max() below picks that final value).
     PerfMetricType.KV_CACHE_SIZE:
-    re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
+    KV_CACHE_SIZE_LOG_QUERY,
     PerfMetricType.PER_USER_OUTPUT_THROUGHPUT:
     re.compile(
         r"Per User Output Throughput \[w\/ ctx\] \(tps\/user\):\s+([\d\.]+)"),
@@ -252,9 +257,9 @@ AGGR_SERVER_PERF_METRIC_LOG_QUERIES = {
     re.compile(r"Median E2EL \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.P99_INFERENCE_TIME:
     re.compile(r"P99 E2EL \(ms\):\s+(-?[\d\.]+)"),
-    # Printed by the shared C++ KVCacheManager on server startup, same as trtllm-bench.
+    # Printed by the KV cache manager on server startup, same as trtllm-bench.
     PerfMetricType.KV_CACHE_SIZE:
-    re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
+    KV_CACHE_SIZE_LOG_QUERY,
 }
 
 # (Relative threshold, Absolute threshold) for all metric types
