@@ -56,6 +56,9 @@ _P4_TAIL_DBG = _env_flag("GVR_P4_TAIL_DBG")
 # P4 sub-phase clock64 breakdown -> xstate[1,2,4,5,6,7] (debug: clobbers
 # the closed-loop thr/anch publish; single-shot cells only, not chains)
 _P4_SUB_DBG = _env_flag("GVR_P4_SUB_DBG")
+# GVR_P4_SUB_DBG=2: publish the P4 HEAD triple (minmax / histogram build /
+# coarse search) instead of the tail triple, so the phase budget adds up.
+_P4_SUB_HEAD = os.environ.get("GVR_P4_SUB_DBG", "0").strip() == "2"
 _SKIP_DBG = _env_flag("GVR_SKIP_DBG")
 
 
@@ -275,6 +278,7 @@ class GvrTopKKernel:
         seqlen_sorted: bool = False,
         kc_diet: Optional[bool] = None,
         pdl_wait_late: bool = True,
+        p4_fine_rangetest: Optional[bool] = None,
         enable_r0: bool = True,
         accept_cap: "int | None" = None,
         kc_override: "int | None" = None,
@@ -553,6 +557,15 @@ class GvrTopKKernel:
         # measured as a wash under the same protocol and stay stock.
         if enable_r0 and top_k == 2048 and self.kNumBins > 512:
             self.kNumBins = 512
+        # p4_fine_rangetest: the fine recursion exists only to locate
+        # the handful of candidates inside the straddling coarse bin, so
+        # filter them with a value-range compare instead of recomputing
+        # each candidate's bin (subtract + multiply + two clamps). It is
+        # 44% of Phase 4 on the small-N cells. Caching the candidates in
+        # registers during the coarse build was measured and rejected:
+        # the extra live registers push the fp32 kernel past its budget
+        # (0.95-0.99x on 4 of 5 cells).
+        self.p4_fine_rangetest = True if p4_fine_rangetest is None else bool(p4_fine_rangetest)
         self.r0_qfracs = tuple(float(q) for q in r0_qfracs) if r0_qfracs else ()
         if self.r0_qfracs:
             assert all(0.0 < q < 1.0 for q in self.r0_qfracs), self.r0_qfracs
@@ -3649,22 +3662,50 @@ class GvrTopKKernel:
                     smem_hist[iz] = cutlass.Int32(0)
                     iz = iz + cutlass.Int32(num_threads)
                 cute.arch.barrier()
-                ifb = tidx
-                while ifb < cand_count:
-                    vf = smem_keys[ifb]
-                    cb = cutlass.Int32((vf - bmin_r) * inv1)
-                    if cb < cutlass.Int32(0):
-                        cb = cutlass.Int32(0)
-                    if cb > cutlass.Int32(kBins - 1):
-                        cb = cutlass.Int32(kBins - 1)
-                    if cb == b_star:
-                        sb = cutlass.Int32((vf - f_lo) * finv)
-                        if sb < cutlass.Int32(0):
-                            sb = cutlass.Int32(0)
-                        if sb > cutlass.Int32(fbins - 1):
-                            sb = cutlass.Int32(fbins - 1)
-                        atomicAdd(smem_hist.iterator + sb, cutlass.Int32(1))
-                    ifb = ifb + cutlass.Int32(num_threads)
+                if cutlass.const_expr(self.p4_fine_rangetest):
+                    # A candidate belongs to bin b* exactly when its value
+                    # lies in [f_lo, f_hi), so the filter is two compares -
+                    # the bin recompute (subtract + multiply + two clamps)
+                    # per candidate is redundant work. The clamped ends of
+                    # the binning fold out-of-range values INTO bin 0 and
+                    # bin kBins-1, so those two bins drop the matching side
+                    # of the range test to stay bit-identical.
+                    f_hi = f_lo + cutlass.Float32(1.0) / inv1
+                    lo_edge = b_star == cutlass.Int32(0)
+                    hi_edge = b_star == cutlass.Int32(kBins - 1)
+                    ifb = tidx
+                    while ifb < cand_count:
+                        vf = smem_keys[ifb]
+                        inb = vf >= f_lo and vf < f_hi
+                        if lo_edge:
+                            inb = vf < f_hi
+                        if hi_edge:
+                            inb = vf >= f_lo
+                        if inb:
+                            sb = cutlass.Int32((vf - f_lo) * finv)
+                            if sb < cutlass.Int32(0):
+                                sb = cutlass.Int32(0)
+                            if sb > cutlass.Int32(fbins - 1):
+                                sb = cutlass.Int32(fbins - 1)
+                            atomicAdd(smem_hist.iterator + sb, cutlass.Int32(1))
+                        ifb = ifb + cutlass.Int32(num_threads)
+                else:
+                    ifb = tidx
+                    while ifb < cand_count:
+                        vfo = smem_keys[ifb]
+                        cbo = cutlass.Int32((vfo - bmin_r) * inv1)
+                        if cbo < cutlass.Int32(0):
+                            cbo = cutlass.Int32(0)
+                        if cbo > cutlass.Int32(kBins - 1):
+                            cbo = cutlass.Int32(kBins - 1)
+                        if cbo == b_star:
+                            sbo = cutlass.Int32((vfo - f_lo) * finv)
+                            if sbo < cutlass.Int32(0):
+                                sbo = cutlass.Int32(0)
+                            if sbo > cutlass.Int32(fbins - 1):
+                                sbo = cutlass.Int32(fbins - 1)
+                            atomicAdd(smem_hist.iterator + sbo, cutlass.Int32(1))
+                        ifb = ifb + cutlass.Int32(num_threads)
                 cute.arch.barrier()
                 # fine 3-step search seeded at rank_above (over fbins bins)
                 fws = cutlass.Int32(0)
@@ -7035,10 +7076,16 @@ class GvrTopKKernel:
                             # (minmax/hist/coarse, wcnt[8..10]) are not
                             # published.
                             xstate_row[1] = s_thr[1]
-                            xstate_row[4] = cutlass.Float32(smem_wcnt[11])
-                            xstate_row[5] = cutlass.Float32(smem_wcnt[12])
-                            xstate_row[6] = cutlass.Float32(smem_wcnt[13])
-                            xstate_row[7] = cutlass.Float32(cutlass.Int32(ck_sw1 - ck_sw0))
+                            if cutlass.const_expr(_P4_SUB_HEAD):
+                                xstate_row[4] = cutlass.Float32(smem_wcnt[8])
+                                xstate_row[5] = cutlass.Float32(smem_wcnt[9])
+                                xstate_row[6] = cutlass.Float32(smem_wcnt[10])
+                                xstate_row[7] = cutlass.Float32(smem_wcnt[11])
+                            else:
+                                xstate_row[4] = cutlass.Float32(smem_wcnt[11])
+                                xstate_row[5] = cutlass.Float32(smem_wcnt[12])
+                                xstate_row[6] = cutlass.Float32(smem_wcnt[13])
+                                xstate_row[7] = cutlass.Float32(cutlass.Int32(ck_sw1 - ck_sw0))
                         # cand_count_p4 = pre-P4 snapshot (P4 repurposes
                         # the s_iscalars slots).
                         xstate_row[3] = cutlass.Float32(cand_count_p4)
