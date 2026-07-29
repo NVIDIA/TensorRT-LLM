@@ -1098,6 +1098,7 @@ def test_context_status_poll_retains_owner_and_blocks_replacement() -> None:
     transceiver._ctx_need_tp_sync = False
     transceiver._ctx_need_pp_sync = False
     transceiver._transfer_worker = _FakeTransferWorker()
+    transceiver._sender_future_timeout_ms = 1_000
     transceiver._ctx_consensus = lambda local_ids: list(local_ids)
     transceiver._ctx_consensus_outcome = (
         lambda _to_process, cancelled, failed, completed, timed_out, _cleanup_ready: (

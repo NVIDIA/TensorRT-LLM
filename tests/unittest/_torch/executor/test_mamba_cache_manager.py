@@ -543,9 +543,21 @@ def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
         assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
 
+def _empty_v2_allocation_lease_handle() -> SimpleNamespace:
+    return SimpleNamespace(
+        snapshot=SimpleNamespace(
+            lease_id=1,
+            identity=SimpleNamespace(allocation_generation=1),
+            ranges=(),
+        ),
+        settle=MagicMock(),
+    )
+
+
 def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 0
+    manager.snapshot_and_lease = MagicMock(return_value=_empty_v2_allocation_lease_handle())
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
@@ -565,6 +577,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 1
     manager._request_id_to_state_index = {123: 7}
+    manager.snapshot_and_lease = MagicMock(return_value=_empty_v2_allocation_lease_handle())
     manager.get_state_indices = MagicMock(
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )

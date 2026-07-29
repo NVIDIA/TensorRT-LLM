@@ -3665,6 +3665,11 @@ class Sender(SenderBase):
                 # No later listener callback or session mutation can dispatch
                 # data. Keep only ACK ingress and immutable outbox replay.
                 self._control_only = True
+                if not control_pending:
+                    # Close control admission before releasing the shared gate.
+                    # Otherwise a late cancellation can create a new replay
+                    # obligation while remote-agent teardown is in progress.
+                    self._dealer_admission_closed = True
 
         if progress_failed:
             return False
@@ -3689,11 +3694,6 @@ class Sender(SenderBase):
 
         if control_pending:
             return False
-
-        with admission_lock if admission_lock is not None else nullcontext():
-            # The outbox is empty and control-only admission prevents a new
-            # operation from creating another result obligation.
-            self._dealer_admission_closed = True
 
         if not getattr(self, "_listener_stopped", False):
             try:

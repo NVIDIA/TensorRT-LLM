@@ -83,6 +83,7 @@ from .._utils import (
     typed_map,
     typed_range,
     unwrap_optional,
+    unwrap_rawref,
     value_or,
 )
 from ._moving_average import Average

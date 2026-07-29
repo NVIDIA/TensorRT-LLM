@@ -1733,14 +1733,14 @@ def test_sender_cancel_before_session_replays_failure_for_stored_and_late_reques
 
     sender._send_failed_result_to_receiver.reset_mock()
     sender._send_aux_failed_result_to_receiver.reset_mock()
-    sender._save_peer_req_info = Mock()
+    sender._save_peer_req_info = Mock(return_value=info)
     sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
     sender._save_peer_req_info.assert_called_once()
     sender._send_failed_result_to_receiver.assert_called_once()
     sender._send_aux_failed_result_to_receiver.assert_called_once()
 
     sender._shutdown = False
-    late_session = Mock(disagg_request_id=REQUEST_ID)
+    late_session = Mock(disagg_request_id=REQUEST_ID, protocol_identity=None)
     sender.setup_session(late_session)
     late_session.cancel.assert_called_once_with()
     assert REQUEST_ID in sender._pre_cancelled_rids
@@ -1750,9 +1750,9 @@ def test_sender_shutdown_late_request_retains_kv_and_aux_no_access_results() -> 
     sender = _make_sender_for_shutdown()
     sender._shutdown = True
     sender._instance_rank = WRITER_RANK
-    sender._save_peer_req_info = Mock()
     sender._send_operation_message = Mock(return_value=False)
     info = _recv_info(writer_rank=0)
+    sender._save_peer_req_info = Mock(return_value=info)
 
     sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
 
@@ -1768,7 +1768,6 @@ def test_sender_shutdown_late_request_retains_kv_and_aux_no_access_results() -> 
 
 def test_sender_shutdown_late_request_cannot_admit_session_source_access() -> None:
     sender = _make_sender_for_shutdown()
-    sender._save_peer_req_info = Mock()
     sender._send_operation_message = Mock(return_value=False)
     session = TxSession(
         request_id=REQUEST_ID,
@@ -1782,6 +1781,7 @@ def test_sender_shutdown_late_request_cannot_admit_session_source_access() -> No
     session.aux_task = aux_task
     sender._shutdown = True
     info = _recv_info()
+    sender._save_peer_req_info = Mock(return_value=info)
     key = (info.instance_name, info.instance_rank)
 
     sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
@@ -2410,7 +2410,7 @@ def test_sender_retries_listener_stop_after_first_failure() -> None:
     sender._dealers = {}
 
     assert sender.shutdown() is False
-    sender._send_task_queues[0].put.assert_not_called()
+    sender._send_task_queues[0].put.assert_called_once_with(None)
 
     assert sender.shutdown() is True
     assert sender._messenger.stop.call_count == 2
@@ -2434,13 +2434,15 @@ def test_sender_shutdown_continues_siblings_after_cancel_failure() -> None:
     first.close.assert_not_called()
     second.cancel.assert_called_once_with()
     second.close.assert_called_once_with()
-    sender._messenger.stop.assert_called_once_with()
-    assert sender._listener_stopped
+    sender._messenger.stop.assert_not_called()
+    assert not sender._listener_stopped
     assert sender._sessions == {REQUEST_ID: first}
 
     assert sender.shutdown() is True
     assert first.cancel.call_count == 2
     first.close.assert_called_once_with()
+    sender._messenger.stop.assert_called_once_with()
+    assert sender._listener_stopped
     assert sender._sessions == {}
 
 
@@ -2539,6 +2541,7 @@ def test_sender_shutdown_is_serialized_and_closes_late_control_admission() -> No
     threads[0].start()
     assert invalidation_started.wait(timeout=1)
     threads[1].start()
+    assert sender._dealer_admission_closed
     sender._handle_cancel_session([MessageType.CANCEL_SESSION, b"999"])
     assert 999 not in sender._pre_cancelled_rids
     assert sender._pre_session_terminal_results == {}
