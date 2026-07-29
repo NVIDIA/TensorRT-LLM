@@ -60,6 +60,9 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from ..top_k.single_pass_multi_cta_radix_topk import red_release_gpu
+from ..utils import griddepcontrol_launch_dependents
+
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
 # form is also accepted by older wrappers, so keep it version-independent.
 _RND_RN = "rn"
@@ -469,6 +472,7 @@ class FP4MQALogitsKernel:
         emit_block_meta: bool = False,
         emit_hit_stats: bool = True,
         emit_seed_counts: bool = False,
+        emit_arrival: bool = False,
         seed_packed: bool = False,
         emit_cand: bool = False,
         cand_cap: int = 5120,
@@ -562,6 +566,15 @@ class FP4MQALogitsKernel:
         if emit_seed_counts and not emit_block_meta:
             raise ValueError("emit_seed_counts requires emit_block_meta")
         self.emit_seed_counts = emit_seed_counts
+        # emit_arrival (fused-handshake mode): per-row arrival counters -
+        # every math warp publishes its split count for a finished row with
+        # a gpu-scope release; the dependent top-k kernel spin-gates each
+        # row on 8 * ceil(num_kv_tiles / 2) instead of waiting for the
+        # whole grid. Rides the q-transition flush points, so it needs the
+        # meta machinery.
+        if emit_arrival and not emit_block_meta:
+            raise ValueError("emit_arrival requires emit_block_meta")
+        self.emit_arrival = emit_arrival
         # seed_packed: single [num_rows, 8] fp32 seed row per the top-k
         # pre-packed contract - lines at cols 0..2, counts ACCUMULATED AS
         # FLOATS at cols 3..5 (exact to 2^24; red.global.add.f32). The
@@ -828,6 +841,7 @@ class FP4MQALogitsKernel:
         cand_ctl: cute.Tensor = None,  # [num_rows, 2] int32 {claimed, void}, zeroed
         cand_idx_t: cute.Tensor = None,  # bucketed: [num_rows, 2*segA+capC] int32 SoA
         cand_cur: cute.Tensor = None,  # bucketed: [num_rows, 4] int32 cursors, zeroed
+        arrival: cute.Tensor = None,  # [num_rows] int32 arrival counters, zeroed
     ):
         # Derive KV data and SF views from the fused uint8 buffer.
         # Fused layout per phys block: [data half_head_dim*phys_block_kv bytes]
@@ -1035,6 +1049,7 @@ class FP4MQALogitsKernel:
             cand_ctl,
             cand_idx_t,
             cand_cur,
+            arrival,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -1236,6 +1251,7 @@ class FP4MQALogitsKernel:
         mCandCtl: cute.Tensor,  # [num_rows, 2] int32 {claimed, void} (or None)
         mCandIdx: cute.Tensor,  # bucketed: [num_rows, 2*segA+capC] int32 SoA (or None)
         mCandCur: cute.Tensor,  # bucketed: [num_rows, 4] int32 cursors (or None)
+        mArrival: cute.Tensor,  # [num_rows] int32 arrival counters (or None)
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -1289,6 +1305,12 @@ class FP4MQALogitsKernel:
         # element), but it is never used because has_work will be False.
         start_q_clamped = min(start_q, batch_size - 1)
         current_num_kv = (mContextLens[start_q_clamped] + self.block_kv - 1) // self.block_kv
+
+        if cutlass.const_expr(self.emit_arrival):
+            # fused handshake: release the dependent (top-k) grid NOW -
+            # data safety rides on the per-row arrival counters, PDL only
+            # lets consumer CTAs stage onto SMs as producer CTAs retire.
+            griddepcontrol_launch_dependents()
 
         if is_tma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -2277,6 +2299,9 @@ class FP4MQALogitsKernel:
                         meta_j = cutlass.Int32(0)
                         hitw_batch = cutlass.Int32(0)
 
+                # fused handshake: this warp's split count for the current row
+                arr_cnt = cutlass.Int32(0)
+
                 while has_work:
                     # fetch_next_task: commit next → current
                     q_idx_old = q_idx
@@ -2344,6 +2369,21 @@ class FP4MQALogitsKernel:
                                     self._flush_cand_window_bucketed(
                                         mCand, mCandIdx, q_idx_old, cwbase, cwleft, meta_lane
                                     )
+                            if cutlass.const_expr(self.emit_arrival):
+                                if q_idx_old < batch_size:
+                                    # publish this warp's split count for
+                                    # the finished row: sync_warp + the
+                                    # fence inside red_release_gpu order
+                                    # every prior write of this warp's
+                                    # lanes (logits STGs + emission
+                                    # atomics) before the add lands
+                                    cute.arch.sync_warp()
+                                    if meta_lane == 0:
+                                        red_release_gpu(
+                                            mArrival.iterator + q_idx_old,
+                                            arr_cnt,
+                                        )
+                                arr_cnt = cutlass.Int32(0)
                             ctx_cur = mContextLens[q_idx]
 
                     # Process KV block for group 0 (kv_idx + 0)
@@ -2949,6 +2989,9 @@ class FP4MQALogitsKernel:
                             out_row = q_idx * next_n + t
                             mLogits[(out_row, kv_pos)] = result_arr[t]
 
+                    if cutlass.const_expr(self.emit_arrival):
+                        arr_cnt = arr_cnt + cutlass.Int32(1)
+
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
                     if next_kv_idx >= num_kv:
@@ -2980,6 +3023,12 @@ class FP4MQALogitsKernel:
                         self._flush_cand_window_bucketed(
                             mCand, mCandIdx, q_idx, cwbase, cwleft, meta_lane
                         )
+
+                if cutlass.const_expr(self.emit_arrival):
+                    if q_idx < batch_size:
+                        cute.arch.sync_warp()
+                        if meta_lane == 0:
+                            red_release_gpu(mArrival.iterator + q_idx, arr_cnt)
 
                 # Release last Q stage (WG 0)
                 if q_idx < batch_size:
@@ -3070,6 +3119,9 @@ class FP4MQALogitsKernel:
                         meta_j = cutlass.Int32(0)
                         hitw_batch = cutlass.Int32(0)
 
+                # fused handshake: this warp's split count for the current row
+                arr_cnt = cutlass.Int32(0)
+
                 while has_work:
                     # fetch_next_task: commit next → current
                     q_idx_old = q_idx
@@ -3136,6 +3188,21 @@ class FP4MQALogitsKernel:
                                     self._flush_cand_window_bucketed(
                                         mCand, mCandIdx, q_idx_old, cwbase, cwleft, meta_lane
                                     )
+                            if cutlass.const_expr(self.emit_arrival):
+                                if q_idx_old < batch_size:
+                                    # publish this warp's split count for
+                                    # the finished row: sync_warp + the
+                                    # fence inside red_release_gpu order
+                                    # every prior write of this warp's
+                                    # lanes (logits STGs + emission
+                                    # atomics) before the add lands
+                                    cute.arch.sync_warp()
+                                    if meta_lane == 0:
+                                        red_release_gpu(
+                                            mArrival.iterator + q_idx_old,
+                                            arr_cnt,
+                                        )
+                                arr_cnt = cutlass.Int32(0)
                             ctx_cur = mContextLens[q_idx]
 
                     # Process KV block for group 1 (kv_idx + 1)
@@ -3735,6 +3802,9 @@ class FP4MQALogitsKernel:
                             out_row = q_idx * next_n + t
                             mLogits[(out_row, kv_pos)] = result_arr[t]
 
+                    if cutlass.const_expr(self.emit_arrival):
+                        arr_cnt = arr_cnt + cutlass.Int32(1)
+
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
                     if next_kv_idx >= num_kv:
@@ -3766,6 +3836,12 @@ class FP4MQALogitsKernel:
                         self._flush_cand_window_bucketed(
                             mCand, mCandIdx, q_idx, cwbase, cwleft, meta_lane
                         )
+
+                if cutlass.const_expr(self.emit_arrival):
+                    if q_idx < batch_size:
+                        cute.arch.sync_warp()
+                        if meta_lane == 0:
+                            red_release_gpu(mArrival.iterator + q_idx, arr_cnt)
 
                 # Release last Q stage (WG 1)
                 if q_idx < batch_size:

@@ -6724,6 +6724,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cand_cap: int = 5120,
             accept_cap: Optional[int] = None,
             kc_override: Optional[int] = None,
+            handshake: bool = False,
         ) -> tuple:
             key = (dtype, top_k, next_n, enable_unroll_4, enable_phase3_unroll,
                    use_constant_hint, min_blocks_per_mp, use_256bit_load,
@@ -6731,7 +6732,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                    compress_ratio, return_output_values, cluster_size,
                    seqlen_sorted, enable_block_skip, use_ext_counts,
                    emit_xstate, use_ext_cand, ext_rungs, cand_cap, accept_cap,
-                   kc_override)
+                   kc_override, handshake)
             if key in cls.kernel_cache:
                 return key
             n_rows = cute.sym_int()
@@ -6778,6 +6779,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cutlass.Float32, (n_rows, 8),
                 stride_order=(1, 0),
                 assumed_align=4) if emit_xstate else None)
+            arrival_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n_rows, ), stride_order=(0, ), assumed_align=4)
+                            if handshake else None)
             cand_vals_fake = (cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32, (n_rows, cand_cap),
                 stride_order=(1, 0),
@@ -6811,6 +6815,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 enable_block_skip=enable_block_skip,
                 use_ext_counts=use_ext_counts,
                 emit_xstate=emit_xstate,
+                handshake=handshake,
                 use_ext_cand=use_ext_cand,
                 ext_rungs=ext_rungs,
                 cand_cap=cand_cap,
@@ -6834,6 +6839,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 seed_thr=seed_thr_fake,
                 seed_counts=None,
                 xstate=xstate_fake,
+                arrival=arrival_fake,
                 cand_vals=cand_vals_fake,
                 cand_idx=cand_idx_fake,
                 cand_ctl=cand_ctl_fake,
@@ -6952,6 +6958,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cand_idx: Optional[torch.Tensor] = None,
             cand_ctl: Optional[torch.Tensor] = None,
             block_max: Optional[torch.Tensor] = None,
+            arrival: Optional[torch.Tensor] = None,
             num_threads: Optional[int] = None,
             accept_cap: Optional[int] = None,
             kc_override: Optional[int] = None,
@@ -7089,6 +7096,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             use_ext_cand = cand_vals is not None
             enable_block_skip = block_max is not None
             emit_xstate = xstate is not None
+            handshake = arrival is not None
+            if handshake:
+                assert (arrival.dtype == torch.int32 and arrival.is_cuda
+                        and arrival.is_contiguous() and arrival.numel()
+                        >= num_rows), ("arrival must be int32 [>= num_rows]")
+                assert next_n == 1, "handshake requires next_n == 1"
             if use_ext_cand:
                 assert use_ext_counts, (
                     "candidate list requires the packed seed row "
@@ -7123,12 +7136,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_cap=(cand_vals.shape[1] if use_ext_cand else 5120),
                 accept_cap=accept_cap,
                 kc_override=kc_override,
+                handshake=handshake,
                 **tuning,
             )
             cls.kernel_cache[key](logits, pre_idx, seq_lens, None,
                                   output_indices, order_row, block_max,
                                   seed_thr, None, xstate, cand_vals, cand_idx,
-                                  cand_ctl)
+                                  cand_ctl, arrival)
 
     # TODO(dsa.py): wire ``order_row = argsort(seq_lens, descending=True)``
     # (device-side, graph-safe) into the LJF row-reorder branch when
@@ -7156,6 +7170,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         max_batch_size: Optional[int] = None,
         seed_thr: Optional[torch.Tensor] = None,
         xstate: Optional[torch.Tensor] = None,
+        arrival: Optional[torch.Tensor] = None,
         cand_vals: Optional[torch.Tensor] = None,
         cand_idx: Optional[torch.Tensor] = None,
         cand_ctl: Optional[torch.Tensor] = None,
@@ -7235,6 +7250,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_batch_size=max_batch_size,
             seed_thr=seed_thr,
             xstate=xstate,
+            arrival=arrival,
             cand_vals=cand_vals,
             cand_idx=cand_idx,
             cand_ctl=cand_ctl,
@@ -7260,6 +7276,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         max_batch_size: Optional[int] = None,
         seed_thr: Optional[torch.Tensor] = None,
         xstate: Optional[torch.Tensor] = None,
+        arrival: Optional[torch.Tensor] = None,
         cand_vals: Optional[torch.Tensor] = None,
         cand_idx: Optional[torch.Tensor] = None,
         cand_ctl: Optional[torch.Tensor] = None,
@@ -8391,13 +8408,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      emit_cand=False,
                      cand_cap=5120,
                      emit_cand_bucketed=False,
-                     accept_cap=8192):
+                     accept_cap=8192,
+                     emit_arrival=False):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
-                   emit_cand_bucketed, accept_cap)
+                   emit_cand_bucketed, accept_cap, emit_arrival)
             if key in cls.kernel_cache:
                 return
 
@@ -8511,6 +8529,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cutlass.Int32, (cute.sym_int(), 4),
                     stride_order=(1, 0),
                     assumed_align=4)
+            arrival_fake = None
+            if emit_arrival:
+                arrival_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), ),
+                    stride_order=(0, ),
+                    assumed_align=4)
             seed_thr_fake = None
             seed_counts_fake = None
             if emit_seed_counts:
@@ -8559,6 +8583,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_cap=cand_cap,
                 emit_cand_bucketed=emit_cand_bucketed,
                 accept_cap=accept_cap,
+                emit_arrival=emit_arrival,
             )
 
             compiled = cute.compile(
@@ -8583,6 +8608,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_ctl=cand_ctl_fake,
                 cand_idx_t=cand_idx_fake,
                 cand_cur=cand_cur_fake,
+                arrival=arrival_fake,
                 options="--enable-tvm-ffi",
             )
             cls.kernel_cache[key] = compiled
@@ -8618,6 +8644,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             accept_cap: int = 8192,
             cand_idx_out: Optional[torch.Tensor] = None,
             cand_cur_out: Optional[torch.Tensor] = None,
+            arrival_out: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             """Execute FP4 paged MQA logits kernel.
 
@@ -8838,11 +8865,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_cur_out = None
 
             # Compile if needed (fake tensors, no real data required)
+            emit_arrival = arrival_out is not None
+            if emit_arrival:
+                assert (arrival_out.dtype == torch.int32 and arrival_out.is_cuda
+                        and arrival_out.is_contiguous()
+                        and arrival_out.numel() >= B * next_n), (
+                            "arrival_out must be int32 [>= B*next_n] "
+                            "(zero-initialized; consumer self-resets)")
+                assert emit_block_meta and next_n == 1, (
+                    "emit_arrival requires emit_block_meta and next_n == 1")
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
-                   emit_cand_bucketed, accept_cap)
+                   emit_cand_bucketed, accept_cap, emit_arrival)
             if key not in cls.kernel_cache:
                 cls._compile(
                     compute_block_kv,
@@ -8862,7 +8898,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     emit_cand=emit_cand,
                     cand_cap=cand_cap,
                     emit_cand_bucketed=emit_cand_bucketed,
-                    accept_cap=accept_cap)
+                    accept_cap=accept_cap,
+                    emit_arrival=emit_arrival)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
@@ -8871,11 +8908,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          context_lens, schedule_meta, num_phys_blocks, B,
                          block_max_out, hit_stats_out, hit_bitmap, seed_thr,
                          seed_counts_out, cand_out, cand_ctl_out, cand_idx_out,
-                         cand_cur_out)
+                         cand_cur_out, arrival_out)
                 return logits, block_max_out, hit_stats_out
             compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
                      context_lens, schedule_meta, num_phys_blocks, B, None,
-                     None, None, None, None, None, None, None, None)
+                     None, None, None, None, None, None, None, None, None)
             return logits
 
     # NOTE: the optional emission tensors ARE written by the kernel but
@@ -8906,6 +8943,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         cand_ctl_out: Optional[torch.Tensor] = None,
         cand_cur_out: Optional[torch.Tensor] = None,
         accept_cap: int = 8192,
+        arrival_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not is_sm_100f():
             raise ValueError(
@@ -8954,7 +8992,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cand_out=cand_out,
             cand_idx_out=cand_idx_out,
             cand_ctl_out=cand_ctl_out,
-            cand_cur_out=cand_cur_out)
+            cand_cur_out=cand_cur_out,
+            arrival_out=arrival_out)
         # with emission on, the runner returns (logits, block_max,
         # hit_stats) - the emission buffers are caller-owned mutates,
         # the op face stays logits-only
@@ -8981,6 +9020,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         cand_ctl_out: Optional[torch.Tensor] = None,
         cand_cur_out: Optional[torch.Tensor] = None,
         accept_cap: int = 8192,
+        arrival_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B = q.shape[0]
         next_n = q.shape[1]

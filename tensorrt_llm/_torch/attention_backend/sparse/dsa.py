@@ -1819,6 +1819,12 @@ class Indexer(nn.Module):
                             and self.use_cute_dsl_topk
                             and self.use_cute_dsl_paged_mqa_logits
                             and sparse_params.indexer_k_dtype == "fp4")
+        # fused-handshake mode (TRTLLM_GVR_FUSE=1, requires GVR_EXT): the
+        # indexer emits per-row arrival counters and releases the top-k
+        # grid early via PDL; the top-k spin-gates each row on its counter
+        # instead of waiting for the whole indexer grid.
+        self.use_gvr_fuse = (os.environ.get("TRTLLM_GVR_FUSE", "0") == "1"
+                             and self.use_gvr_ext)
         self._gvr_ext = None  # lazy GvrExtState (first decode step)
         self._gvr_route = None
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
@@ -2784,7 +2790,8 @@ class Indexer(nn.Module):
                             self._gvr_ext = GvrExtState(
                                 max_rows=metadata.max_num_sequences,
                                 top_k=self.index_topk,
-                                device=q_fp8.device)
+                                device=q_fp8.device,
+                                enable_fused_handshake=self.use_gvr_fuse)
                         st = self._gvr_ext
                         n_comp = indexer_max_seq_len // max(
                             self.compress_ratio, 1)
@@ -2800,6 +2807,19 @@ class Indexer(nn.Module):
                             gvr_emit_kwargs["block_max_out"] = (
                                 st.ensure_block_max(
                                     indexer_max_seq_len)[:batch_size])
+                        # fused handshake only when BOTH sides of this
+                        # step run an ext tier: the first step emits
+                        # counts but its top-k still routes "rungs" and
+                        # would never consume/reset the counters -
+                        # skipping emission keeps them clean
+                        self._gvr_emitted_arrival = (
+                            st.arrival is not None
+                            and emit_tier in ("counts", "list")
+                            and self._gvr_route.tier in ("counts", "list")
+                            and self._gvr_route.cluster_size == 1)
+                        if self._gvr_emitted_arrival:
+                            gvr_emit_kwargs["arrival_out"] = (
+                                st.arrival[:batch_size])
                     logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
                         dsl_q, decode_q_scale, k_cache, weights_decode,
                         dsl_context_lens, dsl_block_table, dsl_schedule_meta,
@@ -2896,6 +2916,10 @@ class Indexer(nn.Module):
                         self._gvr_route, num_gen_tokens,
                         st.block_max[:num_gen_tokens]
                         if st.block_max is not None else None)
+                    if getattr(self, "_gvr_emitted_arrival", False):
+                        # fused handshake: gate each row on this step's
+                        # indexer arrival counter (consumer resets it)
+                        ext_kw["arrival"] = st.arrival[:num_gen_tokens]
                     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
                         logits_decode,
                         st.prev_topk[:num_gen_tokens],

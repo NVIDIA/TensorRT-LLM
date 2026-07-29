@@ -41,6 +41,7 @@ from cutlass.utils.smem_allocator import SmemAllocator
 
 from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 from .block_scan import warp_scan
+from .single_pass_multi_cta_radix_topk import ld_acquire_gpu, st_release_gpu
 
 
 def _env_flag(name: str) -> bool:
@@ -274,6 +275,7 @@ class GvrTopKKernel:
         smem_cache_elems: int = 32768,
         seqlen_sorted: bool = False,
         kc_diet: Optional[bool] = None,
+        handshake: bool = False,
         enable_r0: bool = True,
         accept_cap: "int | None" = None,
         kc_override: "int | None" = None,
@@ -527,6 +529,12 @@ class GvrTopKKernel:
         # kernel passes False for BOTH member instances so their SMEM layouts
         # stay byte-identical (the DSL sizes the launch from the last-traced
         # SmemAllocator only; see GvrTopKLBKernel).
+        # handshake (fused-op mode): spin-gate each row on the producer
+        # indexer's per-row arrival counter instead of relying on the
+        # grid-wide PDL wait. MVP scope pins next_n == 1 / cluster_size == 1.
+        self.handshake = bool(handshake)
+        if self.handshake and (next_n != 1 or cluster_size != 1):
+            raise ValueError("handshake requires next_n == 1 and cluster_size == 1")
         if kc_diet is None:
             kc_diet = cluster_size == 1
         if enable_r0 and top_k == 512 and kc_diet and self.kC > 3072:
@@ -4809,6 +4817,7 @@ class GvrTopKKernel:
         cand_vals: cute.Tensor,  # [numRows, CAP] fp32 scores (or None)
         cand_idx: cute.Tensor,  # [numRows, CAP] int32 positions (or None)
         cand_ctl: cute.Tensor,  # [numRows, 2] int32 {claimed, void} (or None)
+        arrival: cute.Tensor,  # [numRows] int32 arrival counters (or None)
     ):
         """Thin entry: bidx → row_idx → run_one_row.
 
@@ -4867,6 +4876,7 @@ class GvrTopKKernel:
             cand_vals=cand_vals,
             cand_idx=cand_idx,
             cand_ctl=cand_ctl,
+            arrival=arrival,
         )
 
     @cute.jit
@@ -4885,6 +4895,7 @@ class GvrTopKKernel:
         cand_vals: cute.Tensor = None,  # [numRows, CAP] fp32 (ext cand)
         cand_idx: cute.Tensor = None,  # [numRows, CAP] int32 (ext cand)
         cand_ctl: cute.Tensor = None,  # [numRows, 2] int32 (ext cand)
+        arrival: cute.Tensor = None,  # [numRows] int32 arrival counters
     ):
         """Dispatch: compute per-row slice + cluster sync mode, call _run_phases.
 
@@ -5216,6 +5227,22 @@ class GvrTopKKernel:
             s_r0col = None
             s_cluster_partial_m = None
             smem_gath = None
+
+        if cutlass.const_expr(self.handshake):
+            # fused handshake: gate this row on the producer indexer's
+            # arrival counter (8 math warps each publish their split count;
+            # total = 8 * ceil(num_kv_tiles / 2)), then reset the counter
+            # for the next layer's reuse. The reset cannot race the next
+            # indexer launch: its CTAs only start after this kernel's
+            # trailing launch_dependents (PDL stream chain).
+            nkv_hs = (N + cutlass.Int32(127)) // cutlass.Int32(128)
+            target_hs = cutlass.Int32(8) * ((nkv_hs + cutlass.Int32(1)) // cutlass.Int32(2))
+            arr_ptr_hs = arrival.iterator + row_idx
+            if tidx == cutlass.Int32(0):
+                while ld_acquire_gpu(arr_ptr_hs) < target_hs:
+                    pass
+                st_release_gpu(arr_ptr_hs, cutlass.Int32(0))
+            cute.arch.barrier()
 
         # ---- Per-row dispatch ----
         # Three branches:
@@ -7159,6 +7186,7 @@ class GvrTopKKernel:
         cand_vals: cute.Tensor = None,  # [num_rows, CAP] fp32 (ext cand)
         cand_idx: cute.Tensor = None,  # [num_rows, CAP] int32 (ext cand)
         cand_ctl: cute.Tensor = None,  # [num_rows, 2] int32 (ext cand)
+        arrival: cute.Tensor = None,  # [num_rows] int32 (handshake)
     ):
         num_rows = input_data.shape[0]
         cluster_size = cutlass.const_expr(self.cluster_size)
@@ -7187,6 +7215,7 @@ class GvrTopKKernel:
             cand_vals,
             cand_idx,
             cand_ctl,
+            arrival,
         ).launch(
             grid=(total_ctas, 1, 1),
             block=(self.num_threads, 1, 1),
