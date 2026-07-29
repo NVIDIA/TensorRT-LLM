@@ -20,20 +20,25 @@ def _fi_decode_available() -> bool:
         return False
     try:
         from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule  # noqa: F401
-    except Exception:
+    except (ImportError, RuntimeError):
+        # Mirror the guard in fused_sigmoid_gating_recurrent.py (and
+        # FlashInfer's own gdn_kernels/__init__.py): a missing build raises
+        # ImportError, a CuTe/CUTLASS mismatch raises RuntimeError; in both
+        # cases production falls back to Triton, so the FI path is
+        # unavailable and the test must skip.
         return False
     return True
 
 
-skip_unsupported = pytest.mark.skipif(
+SKIP_UNSUPPORTED = pytest.mark.skipif(
     not _fi_decode_available(),
     reason="Requires SM90/SM100/SM103 and a FlashInfer build with "
     "gdn_decode_bf16_state.gated_delta_rule",
 )
 
 
-@skip_unsupported
-def test_fi_decode_misaligned_index_slice():
+@SKIP_UNSUPPORTED
+def test_fi_decode_misaligned_index_slice() -> None:
     """Index slices with a non-32B-aligned storage offset must be realigned.
 
     A caller splitting a mixed batch passes the decode half
