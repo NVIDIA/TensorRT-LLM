@@ -29,11 +29,12 @@ while [ ! -f "$PROGRESS_DONE_FILE" ]; do
     _poll=$((_poll + 1))
 
     if [ -n "$SLURM_SSH_STAT_CMD" ]; then
-        _raw=$(eval "$SLURM_SSH_STAT_CMD" 2>&1)
-        _rc=$?
-        m=$(printf '%s' "$_raw" | tr -dc '0-9')
+        # SLURM_SSH_STAT_CMD runs ls on the remote dir first to flush the NFS
+        # attribute cache, then stats results.xml. Use grep to extract the
+        # integer mtime so SSH banners cannot pollute the value.
+        m=$(eval "$SLURM_SSH_STAT_CMD" 2>/dev/null | grep -oE '^[0-9]+$' | head -1)
         [ -z "$m" ] && m=0
-        echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: poll #${_poll} ssh_rc=${_rc} raw='${_raw}' mtime=${m} last=${last}"
+        echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: poll #${_poll} mtime=${m} last=${last}"
         [ "$m" -le "$last" ] && continue
         last=$m
         mkdir -p "${WORKSPACE}/${STAGE_NAME}"
