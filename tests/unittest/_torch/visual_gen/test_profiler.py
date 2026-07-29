@@ -451,8 +451,11 @@ def _denoise_loops() -> List[Tuple[str, str, ast.For, ast.AST]]:
 
 def test_every_denoise_loop_is_instrumented() -> None:
     loops = _denoise_loops()
-    # base denoise(), Qwen-Image forward(), LTX-2 stage 2 _refinement_denoise()
-    assert len(loops) == 3, [(f, n) for f, n, _, _ in loops]
+    # Lower bound only: base denoise(), Qwen-Image forward(), and LTX-2 stage 2
+    # _refinement_denoise() always exist, and new pipelines add more. A hard
+    # count would fail on every added pipeline instead of on the thing that
+    # matters, which is whether each loop is instrumented.
+    assert len(loops) >= 3, f"denoise-loop detector found nothing: {loops}"
 
     for filename, fn_name, loop, _ in loops:
         assert _PROFILE_STEPS_HOOK in _self_calls(loop.iter), (
