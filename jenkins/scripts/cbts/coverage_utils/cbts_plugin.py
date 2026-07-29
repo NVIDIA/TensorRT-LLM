@@ -52,11 +52,13 @@ def install_expected_workers_patch():
         except (ValueError, TypeError):
             n = 1
         _sitecustomize_call("note_expected_workers", os.environ.get("CBTS_TEST_ID", ""), n)
-        # Add the coverage env without discarding the caller's env: the caller's dict (product
-        # whitelist + env_overrides) wins on conflict. env=None means the worker already inherits
-        # everything, so leave it untouched.
+        # Widen the env only for pools that also propagate the coordinator's sys.path (TRT-LLM's
+        # MpiPoolSession passes path=sys.path). A path-less raw MPIPoolExecutor — e.g. the
+        # disaggregated test's own ctx/gen server pool — is left uninstrumented: instrumenting those
+        # UCX/Ray servers hangs them. The count above still runs, so disagg is flagged incomplete and
+        # force-run. The caller's env dict wins on conflict here (preserving env_overrides).
         env = kwargs.get("env")
-        if env is not None:
+        if env is not None and kwargs.get("path") is not None:
             cov = {k: v for k, v in os.environ.items() if k.startswith(_ENV_WHITELIST_PREFIXES)}
             kwargs["env"] = {**cov, **env}
         return init(self, *args, **kwargs)
