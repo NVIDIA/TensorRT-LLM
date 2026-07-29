@@ -42,8 +42,6 @@ from .remove_copy_pass import remove_copy_for_mutates_args
 
 class Backend:
 
-    _graph_pool_handle: tuple[int, int] = None
-
     # Following classes are used to let weakref ref the stream and eventlist objects.
     class Streams(list):
         pass
@@ -78,8 +76,12 @@ class Backend:
         self.events = Backend.Events()
         inductor_config.enable_auto_functionalized_v2 = False
 
-        if Backend._graph_pool_handle is None:
-            Backend._graph_pool_handle = torch.cuda.graph_pool_handle()
+        # Per-instance pool: the decode CUDA graph runner borrows this handle
+        # (PyTorchModelEngine._cuda_graph_mem_pool), so its lifetime must not
+        # outlive this backend. _release_cuda_graphs() resets every graph that
+        # allocated from the pool, which drops the allocator's use_count for it
+        # to 0.
+        self._graph_pool_handle = torch.cuda.graph_pool_handle()
 
         self.match_count = []
         self.match_count_by_pass = OrderedDict()
