@@ -40,7 +40,7 @@ This section can be skipped if you already have TensorRT LLM installed and have 
 
 #### 1. Download TensorRT LLM
 
-**You can also find more comprehensive instructions to install TensorRT LLM in this [TensorRT LLM installation guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source.html), refer to that guide for common issues if you encounter any here.**
+**You can also find more comprehensive instructions to install TensorRT LLM in this [TensorRT LLM installation guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html), refer to that guide for common issues if you encounter any here.**
 
 ``` bash
 # Prerequisites
@@ -92,7 +92,7 @@ Here we set `LOCAL_USER=1` argument to set up the local user instead of root acc
 Here we compile the source inside the container:
 
 ``` bash
-python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --cuda_architectures "90-real;100-real"  --python_bindings --clean
+python3 ./scripts/build_wheel.py --cuda_architectures "90-real;100-real" --clean
 ```
 You can set the cuda_architectures to "100-real" if targeting Blackwell only, and "90-real" to target Hopper only to save some build time.
 

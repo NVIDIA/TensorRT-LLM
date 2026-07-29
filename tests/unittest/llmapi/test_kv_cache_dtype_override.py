@@ -22,6 +22,27 @@ def _write_hf_quant_config(model_dir, kv_cache_quant_algo: str = "FP8"):
         )
 
 
+def _compressed_tensors_nvfp4_config(**overrides):
+    config = {
+        "quant_method": "compressed-tensors",
+        "config_groups": {
+            "group_0": {
+                "weights": {
+                    "num_bits": 4,
+                    "type": "float",
+                    "strategy": "tensor_group",
+                    "group_size": 16,
+                },
+                "input_activations": {
+                    "strategy": "tensor_group",
+                },
+            },
+        },
+    }
+    config.update(overrides)
+    return config
+
+
 def test_get_llm_args_plumbs_kv_cache_dtype():
     llm_args, _ = get_llm_args(model="dummy", kv_cache_dtype="nvfp4")
     assert llm_args["kv_cache_config"].dtype == "nvfp4"
@@ -65,3 +86,42 @@ def test_update_from_hf_quant_config_explicit_dtype_overrides(tmp_path):
 
     assert model_loader._update_from_hf_quant_config() is True
     assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+
+
+def test_update_from_hf_quant_config_parses_compressed_tensors_model_kwargs(tmp_path):
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        model_kwargs={
+            "quantization_config": _compressed_tensors_nvfp4_config(
+                kv_cache_scheme={
+                    "num_bits": 8,
+                    "type": "float",
+                }
+            ),
+        },
+    )
+    model_loader = ModelLoader(llm_args)
+
+    assert model_loader._update_from_hf_quant_config() is True
+    assert llm_args.quant_config.quant_algo == QuantAlgo.NVFP4
+    assert llm_args.quant_config.group_size == 16
+    assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+def test_update_from_hf_quant_config_rejects_compressed_tensors_kv_conflict(tmp_path):
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        model_kwargs={
+            "quantization_config": _compressed_tensors_nvfp4_config(
+                kv_cache_scheme={
+                    "num_bits": 8,
+                    "type": "float",
+                }
+            ),
+        },
+    )
+    llm_args.quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)
+    model_loader = ModelLoader(llm_args)
+
+    with pytest.raises(ValueError, match="conflicting with FP8 KV cache"):
+        model_loader._update_from_hf_quant_config()

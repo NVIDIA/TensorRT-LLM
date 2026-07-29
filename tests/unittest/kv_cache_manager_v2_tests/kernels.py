@@ -73,6 +73,7 @@ __device__ inline void check(bool condition) {
 
 using uint32_t = unsigned int;
 using uint16_t = unsigned short;
+using uint64_t = unsigned long long;
 
 struct alignas(16) Value {
     uint32_t token;
@@ -143,13 +144,23 @@ extern "C" __global__ void checkValues(Value const* data, uint32_t valuesPerHead
         __nanosleep(sleepTime);
     }
 }
+
+// Spin until the host sets *flag to non-zero (or a bail-out iteration budget is
+// exhausted so a buggy/leaked gate cannot hang the GPU forever). Used to keep a
+// stream deterministically busy from the host side in ordering tests.
+extern "C" __global__ void spinUntilFlag(volatile uint32_t const* flag, uint64_t maxIters)
+{
+    for (uint64_t i = 0; *flag == 0u && i < maxIters; ++i) {
+        __nanosleep(1'000'000u);
+    }
+}
     """
     macros = [("MAX_TOKENS", str(max_tokens))]
     program_options = ProgramOptions(std="c++17", lineinfo=True, debug=debug, define_macro=macros)  # type: ignore[arg-type]
     if not debug:
         program_options.use_fast_math = True
     prog = Program(code, code_type="c++", options=program_options)
-    mod = prog.compile("cubin", name_expressions=("fillValues", "checkValues"))
+    mod = prog.compile("cubin", name_expressions=("fillValues", "checkValues", "spinUntilFlag"))
     return mod
 
 
@@ -158,7 +169,7 @@ def get_kernel(name: str, num_tokens: int) -> tuple[Kernel, int]:
 
     @lru_cache(maxsize=None)
     def impl(name: str, max_tokens: int) -> Kernel:
-        assert name in ("fillValues", "checkValues")
+        assert name in ("fillValues", "checkValues", "spinUntilFlag")
         assert max_tokens != 0 and (max_tokens & (max_tokens - 1)) == 0, (
             "max_tokens must be a power of 2"
         )
@@ -355,3 +366,39 @@ def debug_dump_tokens(
         for j in range(1, values_per_token):
             assert token[j] == token[0]
         yield value
+
+
+class HostGate:
+    """Deterministically blocks CUDA streams until the host calls release().
+
+    Enqueues a device-side spin kernel that polls a host-mapped flag. Work
+    enqueued on a gated stream after block_stream() cannot start until
+    release() is called (or the kernel's bail-out iteration budget expires,
+    which makes dependent ordering assertions fail loudly instead of hanging).
+    """
+
+    def __init__(self) -> None:
+        result, ptr = drv.cuMemHostAlloc(4, drv.CU_MEMHOSTALLOC_DEVICEMAP)
+        _unwrap(result)
+        self._host_ptr = int(ptr)
+        ctypes.c_uint32.from_address(self._host_ptr).value = 0
+        result, device_ptr = drv.cuMemHostGetDevicePointer(self._host_ptr, 0)
+        _unwrap(result)
+        self._device_ptr = int(device_ptr)
+
+    def block_stream(self, stream: CudaStream, max_iters: int = 100_000) -> None:
+        kernel, _ = get_kernel("spinUntilFlag", 1)
+        args = (self._device_ptr, max_iters)
+        arg_types = (ctypes.c_void_p, ctypes.c_uint64)
+        _unwrap(
+            drv.cuLaunchKernel(kernel._handle, 1, 1, 1, 1, 1, 1, 0, stream, (args, arg_types), 0)
+        )
+
+    def release(self) -> None:
+        ctypes.c_uint32.from_address(self._host_ptr).value = 1
+
+    def close(self) -> None:
+        if self._host_ptr:
+            self.release()
+            _unwrap(drv.cuMemFreeHost(self._host_ptr))
+            self._host_ptr = 0

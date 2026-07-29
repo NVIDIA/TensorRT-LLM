@@ -18,7 +18,7 @@ import os
 from dataclasses import dataclass
 from typing import Final, NewType
 
-NDEBUG: Final[int] = int(os.environ.get("TLLM_KV_CACHE_MANAGER_V2_DEBUG", "0")) == 0
+NDEBUG: Final[bool] = os.environ.get("TLLM_DEBUG_MODE", "")[0:1] != "1"
 
 
 class PageStatus(enum.IntEnum):
@@ -45,7 +45,11 @@ class PageIndexMode(enum.IntEnum):
 
 CacheLevel = NewType("CacheLevel", int)
 
+
 GPU_LEVEL: Final[CacheLevel] = CacheLevel(0)
+# First cache level below GPU. Its semantic tier depends on the configured
+# cache_tiers: host when a host tier exists, otherwise disk.
+CACHE_LEVEL1: Final[CacheLevel] = CacheLevel(1)
 
 # Normal token id that falls in the tokenizer vocabulary.
 TokenId = NewType("TokenId", int)
@@ -56,6 +60,7 @@ TokenId = NewType("TokenId", int)
 #   3. Hash the multi-modal token embedding data and use the digest as TokenIdExt for every multi-modal token.
 #      If we do this, we can't skip the encoder.
 TokenIdExt = TokenId | bytes
+
 
 BlockOrdinal = NewType("BlockOrdinal", int)
 BlockOrdinalT = type(BlockOrdinal(0))

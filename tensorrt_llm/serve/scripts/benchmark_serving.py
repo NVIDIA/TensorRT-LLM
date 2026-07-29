@@ -1222,7 +1222,7 @@ if __name__ == "__main__":
         "--custom-tokenizer",
         type=str,
         default=None,
-        help="Custom tokenizer alias (e.g., 'deepseek_v32', 'glm_moe_dsa') or "
+        help="Custom tokenizer alias (e.g., 'deepseek_v32') or "
         "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
         "is incompatible with AutoTokenizer.",
     )

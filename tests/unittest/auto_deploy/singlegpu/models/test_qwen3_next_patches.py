@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Testing module patches that enable export of Qwen3Next MoE.
 
 This test verifies that the patched Qwen3NextSparseMoeBlock forward function
@@ -78,11 +92,11 @@ def test_qwen3_next_moe_patch():
     assert module is not None, "Failed to load Qwen3Next MoE layer"
 
     # Convert module to bfloat16 to match inference dtype
-    module = module.to(torch.bfloat16)
+    module = module.to(torch.bfloat16).cuda()
 
     # Create test input: (batch_size=2, seq_len=6, hidden_size=16)
     hidden_size = 16
-    inputs = torch.randn(2, 6, hidden_size, dtype=torch.bfloat16)
+    inputs = torch.randn(2, 6, hidden_size, dtype=torch.bfloat16, device="cuda")
 
     # Reference: original HF forward returns a single tensor in transformers 5.x
     with torch.no_grad():

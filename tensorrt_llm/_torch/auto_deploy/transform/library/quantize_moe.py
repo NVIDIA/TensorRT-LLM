@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -70,7 +70,8 @@ def _quantize_moe_node(
                 submod.register_buffer(scale_name, scale_val)
 
             # Register load hook
-            gm._register_load_state_dict_pre_hook(partial(quant_impl.load_hook, weight_name=name))
+            hook = partial(quant_impl.load_hook, weight_name=name)
+            gm._register_load_state_dict_pre_hook(hook)
 
             # Create get_attr nodes for new param and each scale
             with gm.graph.inserting_before(node):

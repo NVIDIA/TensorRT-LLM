@@ -108,7 +108,7 @@ template <typename Arch, typename T, typename CTA_M_, typename CTA_N_, typename 
     typename CGA_N_, typename CGA_K_, typename XSM_>
 size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,
     float const* global_sf, int m, int n, int k, int batch_count, tkc::CutlassGemmConfig gemmConfig, char* workspace,
-    size_t const workspaceBytes, cudaStream_t stream, int* occupancy)
+    size_t const workspaceBytes, cudaStream_t stream, int* occupancy, void const* bias = nullptr)
 {
     static_assert(always_false<T>, "Kernel should be explicitly instantiated.");
     return 0;
@@ -122,7 +122,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         cute::Int<CTA_K_>, cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_>(void* D, void const* A,      \
         void const* B, void const* input_sf, void const* weight_sf, float const* global_sf, int m, int n, int k,       \
         int batch_count, tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes,              \
-        cudaStream_t stream, int* occupancy)                                                                           \
+        cudaStream_t stream, int* occupancy, void const* bias)                                                         \
     {                                                                                                                  \
         throw std::runtime_error(                                                                                      \
             "[TensorRT LLM Error][FP4 gemm Runner] TensorRT LLM is not compiled with support for this Architecture."); \
@@ -147,7 +147,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         using ElementB = ElementType;                                                                                  \
         using LayoutB = cutlass::layout::ColumnMajor;                                                                  \
         static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementType>::value;                              \
-        /* // Input C */                                                                                               \
+        /* // Input C: ElementC=void (no C-tile SMEM); per-N bias via LinCombPerColBias EVT below. */                  \
         using ElementC = void;                                                                                         \
         using LayoutC = cutlass::layout::RowMajor;                                                                     \
         static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;                           \
@@ -162,10 +162,12 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         using MainloopSchedule = SMTypeAdapter<Arch, XSM_>::MainloopSchedule;                                          \
         using MmaTileShape = cute::Shape<cute::Int<CTA_M_ * SMTypeAdapter<Arch, XSM_>::Scale>, cute::Int<CTA_N_>,      \
             cute::Int<CTA_K_*(std::is_same_v<Arch, cutlass::arch::Sm103> ? 3 : 1)>>;                                   \
+        /* D = alpha * Acc + bias[N]; bias_ptr=null resolves to null_default=0 (no-op). */                             \
         using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<Arch, OperatorClass,      \
             MmaTileShape, ClusterShape, EpilogueTileType, ElementAccumulator, ElementCompute, ElementC, LayoutC,       \
             AlignmentC, OutElementType, LayoutC, AlignmentC, EpilogueSchedule,                                         \
-            cutlass::epilogue::fusion::LinearCombination<OutElementType, float, void, float>>::CollectiveOp;           \
+            cutlass::epilogue::fusion::LinCombPerColBias<OutElementType, float, OutElementType, void,                  \
+                float>>::CollectiveOp;                                                                                 \
                                                                                                                        \
         using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<Arch,                         \
             cutlass::arch::OpClassBlockScaledTensorOp, cute::tuple<ElementA, SFType>, LayoutA, AlignmentA,             \
@@ -205,7 +207,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
     typename Gemm::Arguments                                                                                           \
         prepareGemmArgs_##ARCH_##_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_(void* D, \
             void const* A, void const* B, void const* input_sf, void const* weight_sf, float const* global_sf, int m,  \
-            int n, int k, int batch_count)                                                                             \
+            int n, int k, int batch_count, void const* bias = nullptr)                                                 \
     {                                                                                                                  \
         using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;              \
         using ElementA = typename Gemm::ElementA;                                                                      \
@@ -220,6 +222,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;                                                  \
         auto& fusion_args = operator_args.epilogue.thread;                                                             \
         fusion_args.alpha_ptr = static_cast<ElementCompute const*>(global_sf);                                         \
+        fusion_args.bias_ptr = static_cast<ElementD const*>(bias);                                                     \
                                                                                                                        \
         operator_args.problem_shape = cute::make_shape(m, n, k, batch_count);                                          \
                                                                                                                        \
@@ -263,7 +266,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         cute::Int<CTA_K_>, cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_>(void* D, void const* A,      \
         void const* B, void const* input_sf, void const* weight_sf, float const* global_sf, int m, int n, int k,       \
         int batch_count, tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes,              \
-        cudaStream_t stream, int* occupancy)                                                                           \
+        cudaStream_t stream, int* occupancy, void const* bias)                                                         \
     {                                                                                                                  \
         using ElementOutput__ = typename cutlass::platform::conditional<cutlass::platform::is_same<T, half>::value,    \
             cutlass::half_t, T>::type;                                                                                 \
@@ -280,7 +283,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         Fp4GemmOperator gemm;                                                                                          \
         auto args                                                                                                      \
             = prepareGemmArgs_##ARCH_##_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_<   \
-                Fp4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count);                       \
+                Fp4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, bias);                 \
         /* // Check shared memory size; throw when SMEM exceeds */                                                     \
         int smem_size = int(sizeof(typename Fp4GemmOperator::GemmKernel::SharedStorage));                              \
         static int mMaxSmemSize = tk::getMaxSharedMemoryPerBlockOptin();                                               \

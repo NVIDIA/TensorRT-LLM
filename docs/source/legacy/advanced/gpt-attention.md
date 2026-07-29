@@ -118,14 +118,11 @@ Support matrix of the XQA optimization:
  - FP16 / BF16 / FP8 / INT8 KV cache data type.
  - Paged KV cache (8 / 16 / 32 / 64 / 128 tokens per block).
 
-This is default enabled. To disable this, you need to use the
-flag `--disable_xqa` when building the engines. Note that a heuristic algorithm
+By default, this is enabled. Note that a heuristic algorithm
 is also used to decide whether to use XQA kernel or masked MHA kernel to get
-better performance. That means even `--disable_xqa` is not set, XQA kernels
-may not also be used. If you want to always use that kernel when possible,
-`TRTLLM_FORCE_XQA=1` can be set to force use XQA kernels when the model config
-is supported. Detailed supported configuration can be found function `shouldUse`
-of class `DecoderXQARunner` in
+better performance.
+If you want to use that kernel whenever possible, set `TRTLLM_FORCE_XQA=1` to force use of the XQA kernel when the model config is supported.
+Supported configurations can be found using the `shouldUse` function of the `DecoderXQARunner` class in
 `cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h`.
 
 

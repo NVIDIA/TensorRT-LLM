@@ -55,6 +55,7 @@ from torch._inductor.pattern_matcher import (
 from torch.fx import GraphModule
 
 from ..export import torch_export_to_gm
+from .node_utils import collect_classification_hints, stamp_hints
 
 
 @contextlib.contextmanager
@@ -127,12 +128,28 @@ class ADReplacementPatternEntry(ReplacementPatternEntry):
         del node
         assert match.replacement_graph is not None
         output_nodes = match.output_nodes()
+
+        # Carry layer-level classification hints (currently ``layer_type``) from the matched
+        # nodes onto the replacement op(s). This is the only sharding-related metadata that is
+        # well-defined to propagate across an N->1 rewrite: it is invariant across the
+        # fine-grained ops of one logical layer and is consumed by the downstream hint-driven
+        # sharder (``apply_sharding_hints`` / ``shard_layers``). Per-weight mechanics (tp_mode,
+        # output_sizes, ...) are intentionally NOT carried -- the replacement op's ShardableNode
+        # re-derives them structurally. Collect before the rewrite (cheap; reads only the
+        # matched nodes) so the node-set diff below is paid only when there is a hint to carry.
+        class_hints = collect_classification_hints(match.nodes)
+        nodes_before = set(graph.nodes) if class_hints else None
+
         self.replace_with_graph(
             match,
             graph,
             match.replacement_graph,
             self.normalize_args(*match.args, **match.kwargs),
         )
+
+        if class_hints:
+            inserted_nodes = [n for n in graph.nodes if n not in nodes_before]
+            stamp_hints(inserted_nodes, class_hints)
 
         if len(output_nodes) > 1:
             # Torch's generic replacement path inserts the copied replacement graph relative to the

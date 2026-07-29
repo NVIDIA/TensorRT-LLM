@@ -41,8 +41,6 @@ environment:
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 profiling:
   nsys_on: false
-accuracy:
-  enable_accuracy_test: false
 worker_config:
   gen:
     tensor_parallel_size: 8
@@ -68,6 +66,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
+      transceiver_runtime: PYTHON
     stream_interval: 100
     num_postprocess_workers: 4
   ctx:
@@ -92,3 +91,4 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
+      transceiver_runtime: PYTHON

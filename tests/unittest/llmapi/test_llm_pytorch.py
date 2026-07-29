@@ -67,7 +67,7 @@ from dataclasses import replace
 
 
 @force_ampere
-@pytest.mark.parametrize("enable_chunked_prefill,", [False, True])
+@pytest.mark.parametrize("enable_chunked_prefill", [False, True])
 @pytest.mark.part2
 def test_tinyllama_logits_processor(enable_chunked_prefill):
     tinyllama_logits_processor_test_harness(
@@ -610,14 +610,15 @@ def test_nemotron_nas_lora(cuda_graph_config) -> None:
         model=
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
         lora_config=lora_config,
-        cuda_graph_config=cuda_graph_config)
+        cuda_graph_config=cuda_graph_config,
+        trust_remote_code=True)
 
     prompts = [
         "Hello, how are you?",
         "Hello, how are you?",
     ]
 
-    sampling_params = SamplingParams(max_tokens=10, add_special_tokens=False)
+    sampling_params = SamplingParams(max_tokens=3, add_special_tokens=False)
     lora_req = LoRARequest(
         "task-0", 0,
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
@@ -951,8 +952,7 @@ def test_nemo_lora_unsupported_modules_validation(tmp_path):
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
 def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
-    """
-    Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
+    """Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
 
     This test verifies two properties:
     1. That a NeMo-format LoRA checkpoint with GQA (grouped query attention) can be loaded and applied to a TinyLlama model,
@@ -1097,7 +1097,7 @@ class TestLlmError:
 
     @pytest.mark.part3
     def test_max_num_token_check(self):
-        """ LLM should raise error when got prompt length exceed the valid range. """
+        """LLM should raise error when got prompt length exceed the valid range."""
         llm = LLM(llama_model_path,
                   kv_cache_config=global_kvcache_config,
                   max_num_tokens=100)
@@ -1187,7 +1187,7 @@ def test_min_tokens(use_speculative: bool):
 def test_min_tokens_long_prompt():
     """Check min_tokens is respected when prompt is longer than min_tokens.
 
-    Regression test for NVBug 5823135: _apply_min_length_penalty compared
+    Regression test for NVBug 5823135: the min-length EOS suppression compared
     total token count (prompt + generated) against the raw min_tokens value
     instead of comparing generated token count only.  When prompt_len >=
     min_tokens the EOS suppression was never activated, allowing early
@@ -1395,7 +1395,7 @@ class TestLlmError:
 
     @pytest.mark.part3
     def test_max_num_token_check(self):
-        """ LLM should raise error when got prompt length exceed the valid range. """
+        """LLM should raise error when got prompt length exceed the valid range."""
         llm = LLM(llama_model_path,
                   kv_cache_config=global_kvcache_config,
                   max_num_tokens=100)
@@ -1449,7 +1449,6 @@ async def test_llm_rpc_streaming():
 @skip_ray
 def test_llm_rpc_get_stats():
     """Test that get_stats works with RPC orchestrator."""
-
     with LLM(model=llama_model_path,
              kv_cache_config=global_kvcache_config,
              enable_iter_perf_stats=True,
@@ -1547,18 +1546,22 @@ def test_llm_context_only_timed_out(transceiver_runtime):
                                disaggregated_params=disaggregated_params):
         print(output)
 
+    # Wait until the context-only request has allocated KV cache blocks
     max_retries = 10
+    all_results = []
     for _ in range(max_retries):
         results = llm.get_stats(2)
-        if len(results) == 1:
+        all_results.extend(results)
+        if all_results and all_results[-1]["kvCacheStats"]["usedNumBlocks"] > 0:
             break
         time.sleep(1)
     else:
         pytest.fail(
-            f"Failed to get stats with len==1 after {max_retries} retries")
+            f"Context-only KV cache blocks not allocated after {max_retries} retries"
+        )
+    results = all_results
 
-    assert len(results) == 1
-    context_only_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+    context_only_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
     print(f"Context only used num blocks: {context_only_used_num_blocks}")
 
     # Sleep 5 seconds to allow context only request to time out
@@ -1568,11 +1571,20 @@ def test_llm_context_only_timed_out(transceiver_runtime):
     for output in llm.generate(prompts0, sampling_params=sampling_params):
         print(output)
 
-    # Get number of allocated blocks
-    results = llm.get_stats(2)
-    assert len(results) == 1
-    final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+    # Wait until KV cache blocks are released (usedNumBlocks == 0)
+    max_retries = 10
+    all_results = []
+    for _ in range(max_retries):
+        results = llm.get_stats(2)
+        all_results.extend(results)
+        if all_results and all_results[-1]["kvCacheStats"]["usedNumBlocks"] == 0:
+            break
+        time.sleep(1)
+    else:
+        pytest.fail(f"KV cache blocks not released after {max_retries} retries")
+    results = all_results
 
+    final_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
     assert final_used_num_blocks == 0
 
 

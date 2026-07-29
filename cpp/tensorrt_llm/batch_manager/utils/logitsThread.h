@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -46,6 +47,6 @@ void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadS
     std::mutex* draftRequestsMtx);
 
 void targetModelReceiveLogits(runtime::ITensor::SharedPtr& draftLogitsHost,
-    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, nvinfer1::DataType logitsDtype);
+    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, tensorrt_llm::DataType logitsDtype);
 
 } // namespace tensorrt_llm::batch_manager::utils

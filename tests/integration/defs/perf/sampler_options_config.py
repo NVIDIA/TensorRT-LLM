@@ -28,8 +28,6 @@ def get_sampler_options_config(model_label: str) -> dict:
     """
     base_config = {}
     if model_label in [
-            'llama_v3.1_70b_instruct-bench-pytorch-bfloat16-maxbs:512-maxnt:2048-input_output_len:200,2000-reqs:64-con:200-gpus:8',
-            'llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:128,128-gpus:8',
             'llama_v3.2_1b-bench-pytorch-bfloat16-maxbs:512-maxnt:2048-input_output_len:500,2000-gpus:2',
             'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:128,128-gpus:4',
             'llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:20000-kv_frac:0.6-input_output_len:20000,2000-reqs:1000-ep:8-gpus:8',

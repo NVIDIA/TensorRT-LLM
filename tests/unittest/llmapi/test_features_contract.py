@@ -152,4 +152,6 @@ def test_all_features_enabled_real_configs():
         "cuda_graphs": True,
         "chunked_context": True,
         "data_parallel_size": 8,
+        "checkpoint_format": "HF",
+        "load_format": "AUTO",
     }

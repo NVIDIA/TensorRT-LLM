@@ -1,0 +1,42 @@
+name: Label Component for PR
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label-component:
+    runs-on: ubuntu-latest
+    if: github.repository == 'NVIDIA/TensorRT-LLM'
+    # This workflow is advisory: it must never turn a PR check red. Every step
+    # is continue-on-error, so the check is always green even if setup or
+    # labeling fails.
+    steps:
+      - name: Checkout base repository
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        continue-on-error: true
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        continue-on-error: true
+        run: pip install requests
+
+      - name: Label PR by component
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          python .github/scripts/label_component.py
+          --pr ${{ github.event.pull_request.number }}
+          --codeowners .github/CODEOWNERS

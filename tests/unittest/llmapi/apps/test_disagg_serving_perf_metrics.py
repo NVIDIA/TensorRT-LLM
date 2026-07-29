@@ -94,6 +94,7 @@ def workers(model_name: str, disagg_cluster_config: dict, ctx_port: int, gen_por
 @pytest.fixture
 def disagg_server(disagg_cluster_config: dict, workers, disagg_port: int):
     disagg_config = {
+        "hostname": "localhost",
         "port": disagg_port,
         "disagg_cluster": disagg_cluster_config,
         "perf_metrics_max_requests": 1000,

@@ -1,8 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from functools import partial
 
 import pytest
 import torch
-from _graph_test_helpers import run_test_transformed_gm
+from _graph_test_helpers import FakeFactory, run_test_transformed_gm
 from _model_test_utils import (
     apply_rotary_pos_emb_complex,
     apply_rotary_pos_emb_ds,
@@ -13,6 +27,10 @@ from torch.export import Dim
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.mla_rope_utils import (
     _rope_deinterleave_load_hook,
+)
+from tensorrt_llm._torch.auto_deploy.models.custom.rotary_utils import (
+    RotaryEmbeddingBase,
+    build_rope_cos_sin_cache,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_output_tuple, is_op
@@ -555,6 +573,142 @@ def test_optimize_interleaved_rope(num_heads, num_kv_heads):
         dynamic_shapes,  # dynamic_shapes
         None,  # check_num_matches
         False,  # skip_output_assert
+    )
+
+
+class DynamicCosSinRotaryEmbedding(RotaryEmbeddingBase):
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        attention_scaling=1.0,
+        device=None,
+    ):
+        super().__init__()
+        self.max_position_embeddings = max_position_embeddings
+        self.attention_scaling = attention_scaling
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x):
+        return build_rope_cos_sin_cache(
+            self.inv_freq,
+            self.max_position_embeddings,
+            x,
+            self.attention_scaling,
+        )
+
+
+class DynamicCosSinExplicitRoPEModel(torch.nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        max_seq,
+        num_heads,
+        num_kv_heads,
+        attention_scaling=1.0,
+    ):
+        super().__init__()
+        self.head_dim = hidden_size // num_heads
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.q_lin = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
+        self.k_lin = torch.nn.Linear(hidden_size, num_kv_heads * self.head_dim)
+        self.rotary = DynamicCosSinRotaryEmbedding(
+            self.head_dim,
+            max_seq,
+            base=10000,
+            attention_scaling=attention_scaling,
+            device="cuda",
+        )
+
+    def forward(self, x):
+        b, s, _ = x.shape
+        q = self.q_lin(x).view(b, s, self.num_heads, self.head_dim)
+        k = self.k_lin(x).view(b, s, self.num_kv_heads, self.head_dim)
+        cos_table, sin_table = self.rotary(x)
+        position_ids = torch.arange(s, device=x.device).unsqueeze(0).expand(b, s)
+        cos = cos_table[position_ids]
+        sin = sin_table[position_ids]
+        q_out, k_out = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 2)
+        return torch.cat([q_out.reshape(b, s, -1), k_out.reshape(b, s, -1)], dim=-1)
+
+    def get_dynamic_shapes(self):
+        return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
+
+
+@torch.inference_mode()
+def test_optimize_rope_prefuses_dynamic_cos_sin_cache_from_rotary_util():
+    batch, seq, hidden_size = 4, 12, 256
+    max_seq = 16
+    num_heads = 4
+    num_kv_heads = 2
+    attention_scaling = 1.25
+    model = DynamicCosSinExplicitRoPEModel(
+        hidden_size,
+        max_seq,
+        num_heads,
+        num_kv_heads,
+        attention_scaling=attention_scaling,
+    ).to("cuda", torch.float16)
+
+    x = torch.randn(batch, seq, hidden_size, device="cuda", dtype=torch.float16)
+    dynamic_shapes = model.get_dynamic_shapes()
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
+
+    assert any(
+        is_op(n, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin) for n in gm.graph.nodes
+    ), "Expected torch_rope_with_explicit_cos_sin in graph before optimization"
+
+    factory = FakeFactory()
+    gm_transformed = InferenceOptimizer(
+        factory,
+        {"optimize_rope": {"stage": "pattern_matcher"}},
+    )(None, gm)
+    gm_transformed.to("cuda")
+
+    cache_names = [
+        name
+        for name, _ in gm_transformed.named_buffers()
+        if name.startswith("_prefused_rope_cache")
+    ]
+    assert len(cache_names) == 1
+
+    cache = gm_transformed.get_buffer(cache_names[0])
+    inv_freq = model.rotary.inv_freq
+    positions = torch.arange(factory.max_seq_len, dtype=inv_freq.dtype, device=inv_freq.device)
+    freqs = torch.outer(positions, inv_freq)
+    expected_cache = torch.cat(
+        [freqs.cos() * attention_scaling, freqs.sin() * attention_scaling],
+        dim=-1,
+    ).to(torch.float32)
+    torch.testing.assert_close(cache, expected_cache)
+
+    def checker(gm):
+        flash_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.flashinfer_rope)]
+        if len(flash_nodes) != 1:
+            return False
+
+        cache_arg = flash_nodes[0].args[3]
+        return (
+            isinstance(cache_arg, torch.fx.Node)
+            and cache_arg.op == "get_attr"
+            and cache_arg.target == cache_names[0]
+        )
+
+    run_test_transformed_gm(
+        model,
+        x,
+        gm_transformed,
+        checker,
+        lambda num_p: num_p,
+        atol=1e-2,
+        rtol=1e-2,
+        test_load_hook=True,
+        strict_loading=True,
+        dynamic_shapes=dynamic_shapes,
+        skip_output_assert=False,
     )
 
 

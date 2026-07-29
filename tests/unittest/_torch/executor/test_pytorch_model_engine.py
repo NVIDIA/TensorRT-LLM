@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import unittest
 from dataclasses import dataclass
 from unittest.mock import Mock
@@ -8,8 +11,11 @@ import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
+    _restore_spec_decode_capture_state, _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import (
+    PyTorchModelEngine, _build_request_multimodal_input)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # isort: off
@@ -143,6 +149,44 @@ def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None,
 
 
 class PyTorchModelEngineTestCase(unittest.TestCase):
+
+    def test_build_request_multimodal_input_skips_when_cache_disabled(
+            self) -> None:
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=1,
+            input_tokens=[0, 1, 2],
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(1),
+            is_streaming=False,
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[1],
+            multimodal_lengths=[1],
+            multimodal_uuids=["image-0"],
+        )
+
+        # With the encoder cache disabled, nothing consumes `multimodal_input`,
+        # so it should not be built at all.
+        self.assertIsNone(
+            _build_request_multimodal_input(request, cache_enabled=False))
+
+    def test_spec_decode_capture_restores_kv_lens_between_warmups(self) -> None:
+        attn_metadata = Mock()
+        attn_metadata.num_seqs = 1
+        attn_metadata.kv_lens_cuda = torch.tensor([4095], dtype=torch.int32)
+
+        saved_kv_lens_cuda = _save_spec_decode_capture_state(
+            attn_metadata, enable_spec_decode=True)
+
+        # CUDA graph capture performs two eager warmup forwards. A speculative
+        # draft loop may advance the static attention metadata during each
+        # forward, but the next warmup must start from the original input.
+        for _ in range(2):
+            attn_metadata.kv_lens_cuda.add_(1)
+            _restore_spec_decode_capture_state(attn_metadata,
+                                               saved_kv_lens_cuda)
+            self.assertEqual(attn_metadata.kv_lens_cuda.tolist(), [4095])
+
+        self.assertEqual(attn_metadata.on_update_kv_lens.call_count, 2)
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
@@ -611,7 +655,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         multimodal_request.py_multimodal_data = {
             "mrope_config": {
                 "mrope_position_deltas": torch.tensor([[10]], dtype=torch.int32)
-            }
+            },
+            "multimodal_embedding": torch.ones((1, 1), dtype=torch.float16),
         }
 
         dummy_request = _create_request(6, 2)
@@ -639,6 +684,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                 dtype=torch.int32,
                                 device='cuda')
         torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
+        self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
+                         [0])
+        self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
+                         [0])
+        self.assertNotIn("multimodal_embedding",
+                         multimodal_request.py_multimodal_data)
         kv_cache_manager.shutdown()
 
     def test_kv_cache_manager_with_execution_stream(self):

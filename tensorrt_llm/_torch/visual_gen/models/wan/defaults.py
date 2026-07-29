@@ -110,7 +110,6 @@ def get_wan_default_params(
     num_heads: int,
     *,
     is_wan22_5b: bool = False,
-    include_i2v: bool = False,
 ) -> dict:
     """Return the default generation params dict for a Wan model.
 
@@ -119,7 +118,6 @@ def get_wan_default_params(
         name_or_path: Checkpoint path or HF model ID (_name_or_path).
         num_heads: Number of attention heads from transformer config.
         is_wan22_5b: Whether this is a Wan 2.2 TI2V-5B model.
-        include_i2v: If True, add I2V-specific defaults (image_cond_strength).
     """
     if is_wan22_5b:
         params = dict(_WAN22_5B_PARAMS)
@@ -129,9 +127,6 @@ def get_wan_default_params(
         params = dict(_WAN21_480P_PARAMS)
     else:
         params = dict(_WAN21_720P_PARAMS)
-
-    if include_i2v:
-        params["image_cond_strength"] = 1.0
 
     return params
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,17 +16,18 @@
  */
 
 #include "algorithms.h"
+#include "tensorrt_llm/batch_manager/agentTree.h"
 #include "tensorrt_llm/batch_manager/allocateKvCache.h"
 #include "tensorrt_llm/batch_manager/assignReqSeqSlots.h"
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/pauseRequests.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/torch.h"
@@ -35,7 +36,9 @@
 #include <ATen/core/TensorBody.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/list.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 #include <torch/extension.h>
@@ -49,14 +52,50 @@ using namespace tensorrt_llm::batch_manager;
 
 void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_& m)
 {
+    auto agentTreeConfigGetstate = [](batch_scheduler::AgentTreeConfig const& self)
+    { return nb::make_tuple(self.agentPercentage, self.agentTypes, self.agentInflightSeqNum); };
+    auto agentTreeConfigSetstate = [](batch_scheduler::AgentTreeConfig& self, nb::tuple const& state)
+    {
+        if (state.size() != 3)
+        {
+            throw std::runtime_error("Invalid AgentTreeConfig state!");
+        }
+        new (&self) batch_scheduler::AgentTreeConfig();
+        self.agentPercentage = nb::cast<float>(state[0]);
+        self.agentTypes = nb::cast<std::optional<std::vector<std::string>>>(state[1]);
+        self.agentInflightSeqNum = nb::cast<SizeType32>(state[2]);
+    };
+    nb::class_<batch_scheduler::AgentTreeConfig>(m, "AgentTreeConfig")
+        .def(
+            "__init__",
+            [](batch_scheduler::AgentTreeConfig* self, float agentPercentage,
+                std::optional<std::vector<std::string>> agentTypes, SizeType32 agentInflightSeqNum)
+            {
+                new (self) batch_scheduler::AgentTreeConfig();
+                self->agentPercentage = agentPercentage;
+                self->agentTypes = std::move(agentTypes);
+                self->agentInflightSeqNum = agentInflightSeqNum;
+            },
+            nb::arg("agent_percentage") = -1.0f, nb::arg("agent_types") = nb::none(),
+            nb::arg("agent_inflight_seq_num") = std::numeric_limits<SizeType32>::max())
+        .def_rw("agent_percentage", &batch_scheduler::AgentTreeConfig::agentPercentage)
+        .def_rw("agent_types", &batch_scheduler::AgentTreeConfig::agentTypes)
+        .def_rw("agent_inflight_seq_num", &batch_scheduler::AgentTreeConfig::agentInflightSeqNum)
+        .def("__getstate__", agentTreeConfigGetstate)
+        .def("__setstate__", agentTreeConfigSetstate);
+
     nb::class_<CapacityScheduler>(m, CapacityScheduler::name)
-        .def(nb::init<SizeType32, executor::CapacitySchedulerPolicy, bool, bool, LlmRequestState, LlmRequestState>(),
+        .def(nb::init<SizeType32, executor::CapacitySchedulerPolicy, bool, bool, LlmRequestState, LlmRequestState,
+                 bool>(),
             nb::arg("max_num_requests"), nb::arg("capacity_scheduler_policy"), nb::arg("has_kv_cache_manager"),
             nb::arg("two_step_lookahead") = false, nb::arg("no_schedule_until_state") = LlmRequestState::kCONTEXT_INIT,
-            nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_COMPLETE)
+            nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_COMPLETE,
+            nb::arg("enable_prefix_aware_scheduling") = true)
         .def("__call__", &CapacityScheduler::operator(), nb::arg("active_requests"),
             nb::arg("kv_cache_manager") = nullptr, nb::arg("peft_cache_manager") = nullptr,
             nb::arg("cross_kv_cache_manager") = nullptr)
+        .def("set_agent_tree_reorder_policy", &CapacityScheduler::setAgentTreeReorderPolicy,
+            nb::arg("agent_percentage"), nb::arg("agent_types"), nb::arg("agent_inflight_seq_num"))
         .def("name", [](CapacityScheduler const&) { return CapacityScheduler::name; });
 
     nb::class_<MicroBatchScheduler>(m, MicroBatchScheduler::name)
@@ -90,13 +129,6 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
             nb::call_guard<nb::gil_scoped_release>())
         .def("name", [](AllocateKvCache const&) { return AllocateKvCache::name; });
 
-    nb::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)
-        .def(nb::init<>())
-        .def("__call__", &LogitsPostProcessor::operator(), nb::arg("decoder_input_buffers"),
-            nb::arg("replicate_logits_post_processor"), nb::arg("world_config"), nb::arg("stream"),
-            nb::arg("logits_post_processor_batched") = std::nullopt)
-        .def("name", [](LogitsPostProcessor const&) { return LogitsPostProcessor::name; });
-
     nb::class_<CreateNewDecoderRequests>(m, CreateNewDecoderRequests::name)
         .def(nb::init<bool, bool, bool>(), nb::arg("speculative_decoding_fast_logits"),
             nb::arg("is_leader_in_orch_mode"), nb::arg("is_normalize_log_probs"))
@@ -104,7 +136,7 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
             "__call__",
             [](CreateNewDecoderRequests& self, tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
                 executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
-                nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
+                tensorrt_llm::DataType logitsType, DecoderInputBuffers& inputBuffers,
                 runtime::decoder::DecoderState& decoderState, tensorrt_llm::runtime::CudaStream const& runtimeStream,
                 tensorrt_llm::runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
                 SizeType32 beamWidth)

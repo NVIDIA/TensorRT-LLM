@@ -1,10 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import pathlib
 import subprocess
 import sys
 import unittest
 from typing import NamedTuple, Tuple
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -12,8 +15,9 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             PeftCacheManager)
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager, PeftCacheManager, _merge_kv_cache_pool_pointers,
+    _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
@@ -24,6 +28,9 @@ from tensorrt_llm.bindings.internal.testing import \
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
+                                                KV_CACHE_HASH_ALGO_V1,
+                                                KV_CACHE_HASH_ALGO_V2)
 from tensorrt_llm.sampling_params import SamplingParams
 
 DataType = tensorrt_llm.bindings.DataType
@@ -33,6 +40,128 @@ current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent.parent
 
 sys.path.append(str(root_dir / "tests" / "integration"))
+
+
+def test_v1_kv_cache_event_hash_algo_warning_for_non_v1():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(KV_CACHE_HASH_ALGO_V2)
+
+    warning.assert_called_once()
+    assert KV_CACHE_HASH_ALGO_V1 in warning.call_args.args[0]
+    assert KV_CACHE_HASH_ALGO_V2 in warning.call_args.args[0]
+
+
+def test_v1_kv_cache_event_hash_algo_no_warning_for_v1():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(KV_CACHE_HASH_ALGO_V1)
+
+    warning.assert_not_called()
+
+
+def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(
+            KV_CACHE_HASH_ALGO_AUTO)
+
+    warning.assert_not_called()
+
+
+class TestMergeKVCachePoolPointers(unittest.TestCase):
+
+    def test_mixed_half_nvfp4_pools_align_scale_rows(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+        scale_pointers = torch.tensor([[31, 32]])
+        layer_to_pool_mapping = torch.tensor([[0, 0], [1, 0]])
+
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            scale_pointers,
+            layer_to_pool_mapping,
+            [DataType.HALF, DataType.NVFP4],
+        )
+
+        expected = torch.tensor([
+            [[11, 0], [12, 0]],
+            [[21, 31], [22, 32]],
+        ])
+        self.assertEqual(merged.shape, (2, 2, 2))
+        self.assertTrue(torch.equal(merged, expected))
+
+    def test_shared_nvfp4_pool_consumes_one_scale_row(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+        scale_pointers = torch.tensor([[31, 32]])
+        layer_to_pool_mapping = torch.tensor([[0, 0], [0, 0], [1, 0]])
+
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            scale_pointers,
+            layer_to_pool_mapping,
+            [DataType.NVFP4, DataType.NVFP4, DataType.HALF],
+        )
+
+        expected = torch.tensor([
+            [[11, 31], [12, 32]],
+            [[21, 0], [22, 0]],
+        ])
+        self.assertTrue(torch.equal(merged, expected))
+
+    def test_physical_pool_ids_map_to_compact_data_rows(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+        scale_pointers = torch.tensor([[31, 32]])
+        layer_to_pool_mapping = torch.tensor([[0, 0], [2, 0]])
+
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            scale_pointers,
+            layer_to_pool_mapping,
+            [DataType.NVFP4, DataType.HALF],
+        )
+
+        expected = torch.tensor([
+            [[11, 31], [12, 32]],
+            [[21, 0], [22, 0]],
+        ])
+        self.assertTrue(torch.equal(merged, expected))
+
+
+class TestKVCacheManagerPoolPointers(unittest.TestCase):
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_default_nvfp4_pool_configuration_merges_scale_pointers(self):
+        manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=64),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=128,
+            tokens_per_block=32,
+            max_seq_len=64,
+            max_batch_size=1,
+            mapping=Mapping(),
+            dtype=DataType.NVFP4,
+        )
+        try:
+            data_pointers = manager.impl.get_block_pool_pointers()
+            scale_pointers = manager.impl.get_block_scale_pool_pointers()
+
+            self.assertEqual(manager.pool_configurations, [])
+            self.assertEqual(
+                [(config.window_size, config.dtype)
+                 for config in manager.impl.pool_configurations],
+                [(64, DataType.NVFP4)],
+            )
+            self.assertTrue(
+                torch.equal(manager.kv_cache_pool_pointers[..., 0],
+                            data_pointers))
+            self.assertTrue(
+                torch.equal(manager.kv_cache_pool_pointers[..., 1],
+                            scale_pointers))
+        finally:
+            manager.shutdown()
 
 
 class TestResourceManager(unittest.TestCase):
@@ -794,6 +923,42 @@ class TestResourceManager(unittest.TestCase):
         simulate_prefill_completion_only_use_for_testing(req3)
         kv_cache_manager.free_resources(req3)
 
+    def test_batch_cache_indices_honor_requested_blocks_with_beams(self):
+        """V1 truncates packed beam cache indices to the requested blocks."""
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=256,
+                                          enable_block_reuse=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=8,
+            max_seq_len=64,
+            max_batch_size=1,
+            max_beam_width=2,
+            mapping=Mapping(),
+        )
+        try:
+            request_id = 7
+            kv_cache_manager.add_dummy_requests([request_id], [64],
+                                                max_beam_width=2)
+
+            full_indices = kv_cache_manager.get_batch_cache_indices(
+                [request_id], beam_width=2)
+            requested_blocks = 4
+            truncated_indices = kv_cache_manager.get_batch_cache_indices(
+                [request_id],
+                beam_width=2,
+                num_blocks_per_seq=[requested_blocks],
+            )
+
+            self.assertGreater(len(full_indices[0]), requested_blocks)
+            self.assertEqual(truncated_indices,
+                             [full_indices[0][:requested_blocks]])
+        finally:
+            kv_cache_manager.shutdown()
+
     def test_kv_cache_manager_with_execution_stream(self):
         """
         Test that KVCacheManager uses the provided execution_stream.
@@ -880,6 +1045,71 @@ class TestResourceManager(unittest.TestCase):
 
         # The PeftCacheManager should be created successfully with the provided stream
         self.assertTrue(peft_cache_manager.impl.enabled)
+
+
+class TestKVCacheManagerConfigForwarding(unittest.TestCase):
+
+    def test_secondary_offload_min_priority_forwarded_to_cpp_manager(self):
+        """Regression guard: preserve explicit priority 0 when building C++ kwargs."""
+        kv_cache_config = KvCacheConfig(max_tokens=64,
+                                        secondary_offload_min_priority=0)
+
+        mock_impl = MagicMock()
+        mock_impl.get_block_pool_pointers.return_value = torch.empty(0)
+        mock_impl.get_block_scale_pool_pointers.return_value = torch.empty(0)
+        mock_impl.get_layer_to_pool_mapping.return_value = [0]
+        mock_impl.num_pools = 1
+        mock_impl.max_blocks_per_seq = 1
+
+        class MockStream:
+            cuda_stream = 0
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.resource_manager.KVCacheManagerCpp",
+                return_value=mock_impl) as mock_cpp_manager:
+            with patch("torch.cuda.mem_get_info",
+                       return_value=(1 << 30, 2 << 30)):
+                kv_cache_manager = KVCacheManager(
+                    kv_cache_config=kv_cache_config,
+                    kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+                    CacheType.SELF,
+                    num_layers=1,
+                    num_kv_heads=1,
+                    head_dim=128,
+                    tokens_per_block=32,
+                    max_seq_len=64,
+                    max_batch_size=1,
+                    mapping=Mapping(),
+                    execution_stream=MockStream(),
+                )
+
+        try:
+            mock_cpp_manager.assert_called_once()
+            self.assertEqual(
+                mock_cpp_manager.call_args.
+                kwargs["secondary_offload_min_priority"], 0)
+        finally:
+            kv_cache_manager.shutdown()
+
+
+class TestResolveWindowSize(unittest.TestCase):
+
+    @staticmethod
+    def _make_manager(max_attention_window_vec, is_vswa):
+        mgr = KVCacheManager.__new__(KVCacheManager)
+        mgr.max_attention_window_vec = max_attention_window_vec
+        mgr.is_vswa = is_vswa
+        return mgr
+
+    def test_uniform_multi_layer_vector_does_not_raise(self):
+        mgr = self._make_manager([4096, 4096, 4096], is_vswa=False)
+        self.assertEqual(mgr._resolve_window_size(None), 4096)
+
+    def test_genuine_vswa_requires_window_size(self):
+        mgr = self._make_manager([4096, 8192], is_vswa=True)
+        with self.assertRaises(ValueError):
+            mgr._resolve_window_size(None)
+        self.assertEqual(mgr._resolve_window_size(8192), 8192)
 
 
 if __name__ == "__main__":

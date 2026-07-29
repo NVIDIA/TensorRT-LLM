@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,11 +21,77 @@
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 
-#include <NvInferRuntimeBase.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <mutex>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+
+namespace
+{
+
+bool isCachePool(BlockManager const& blockManager, SizeType32 poolIdx)
+{
+    auto const& pool = blockManager.getPool(poolIdx);
+    return !pool.containsBlockScales && !pool.containsIndexerKCache;
+}
+
+bool isAttentionCachePool(BlockManager const& blockManager, SizeType32 poolIdx)
+{
+    return isCachePool(blockManager, poolIdx)
+        && !LinearAttentionMetadata::hasLinearCache(blockManager.getPoolWindowSize(poolIdx));
+}
+
+tensorrt_llm::DataType getTransferDataType(KVCacheManager::BaseKVCacheManager* cacheManager, bool transferIndexerKCache)
+{
+    TLLM_CHECK(cacheManager);
+    if (transferIndexerKCache)
+    {
+        auto const indexerKCachePool = cacheManager->getIndexerKCachePool();
+        TLLM_CHECK(indexerKCachePool);
+        return indexerKCachePool->getDataType();
+    }
+
+    auto const& blockManager = cacheManager->getBlockManager();
+    std::optional<tensorrt_llm::DataType> cacheDataType;
+    std::optional<tensorrt_llm::DataType> attentionDataType;
+    SizeType32 firstPoolIdx = -1;
+    // Recurrent-state pools have a separate transfer manager and formatter. Only
+    // attention pools determine the KV transfer-buffer dtype.
+    for (SizeType32 poolIdx = 0; poolIdx < blockManager.getNumPools(); ++poolIdx)
+    {
+        if (!isCachePool(blockManager, poolIdx))
+        {
+            continue;
+        }
+
+        auto const poolDataType = blockManager.getPrimaryPool(poolIdx)->getDataType();
+        if (!cacheDataType.has_value())
+        {
+            cacheDataType = poolDataType;
+        }
+        if (!isAttentionCachePool(blockManager, poolIdx))
+        {
+            continue;
+        }
+        if (!attentionDataType.has_value())
+        {
+            attentionDataType = poolDataType;
+            firstPoolIdx = poolIdx;
+            continue;
+        }
+
+        TLLM_CHECK_WITH_INFO(poolDataType == attentionDataType.value(),
+            "Disaggregated KV cache transfer does not yet support attention pools with differing dtypes "
+            "(pool %d dtype=%d, pool %d dtype=%d). TODO(disagg-multi-dtype): per-pool dtype dispatch in formatter.",
+            firstPoolIdx, static_cast<int>(attentionDataType.value()), poolIdx, static_cast<int>(poolDataType));
+    }
+
+    TLLM_CHECK_WITH_INFO(cacheDataType.has_value(), "Disaggregated KV cache transfer requires a cache pool");
+    return attentionDataType.value_or(cacheDataType.value());
+}
+
+} // namespace
 
 // ============================================================================
 // FabricMemory Implementation
@@ -128,7 +194,7 @@ size_t FabricMemory::getAlignedSize(size_t size)
     return (size + granularity - 1) / granularity * granularity;
 }
 
-bool FabricMemory::supportFbaricMemory()
+bool FabricMemory::supportFabricMemory()
 {
 #ifdef __aarch64__
     auto support_fun = []()
@@ -194,39 +260,38 @@ bool FabricMemory::supportFbaricMemory()
 size_t CacheTransBufferManager::computeTransferBufferSize(
     KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
 {
-    nvinfer1::DataType dataType;
-    if (transferIndexerKCache)
-    {
-        dataType = cacheManager->getIndexerKCachePool()->getDataType();
-    }
-    else
-    {
-        dataType = cacheManager->getPrimaryPool(0)->getDataType();
-    }
+    auto const dataType = getTransferDataType(cacheManager, transferIndexerKCache);
 
-    auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+    auto const& blockManager = cacheManager->getBlockManager();
+    auto const tokensPerBlock = blockManager.getTokensPerBlock();
+    bool hasAttentionCachePool = false;
+    for (SizeType32 poolIdx = 0; poolIdx < blockManager.getNumPools(); ++poolIdx)
+    {
+        hasAttentionCachePool |= isAttentionCachePool(blockManager, poolIdx);
+    }
     size_t bufferSizeFromMaxNumToken = 0;
 
     if (maxNumTokens.has_value())
     {
         TLLM_CHECK(maxNumTokens.value() % tokensPerBlock == 0);
-        auto dataSize = common::getDTypeSize(dataType);
-        SizeType32 kvCacheByteSizePerTokenPerLayer = 0;
+        auto const dataSize = common::getDTypeSize(dataType);
+        SizeType32 indexerCacheByteSizePerTokenPerLayer = 0;
         if (transferIndexerKCache)
         {
-            kvCacheByteSizePerTokenPerLayer
+            indexerCacheByteSizePerTokenPerLayer
                 = cacheManager->getIndexerKCachePool()->getDimension<-1>() * dataSize / tokensPerBlock;
         }
-        else
+        for (auto layerId = 0; layerId < blockManager.getNumLayers(); layerId++)
         {
-            auto primaryPool = cacheManager->getPrimaryPool(0);
-            kvCacheByteSizePerTokenPerLayer
-                = primaryPool->getDimension<-1>() * primaryPool->getDimension<2>() * dataSize / tokensPerBlock;
-        }
-        for (auto layerId = 0; layerId < cacheManager->getBlockManager().getNumLayers(); layerId++)
-        {
-            auto poolIdx = cacheManager->getBlockManager().getLayerPoolIdx(layerId);
-            auto windowSize = static_cast<size_t>(cacheManager->getBlockManager().getPoolWindowSize(poolIdx));
+            auto const poolIdx = blockManager.getLayerPoolIdx(layerId);
+            auto const encodedWindowSize = blockManager.getPoolWindowSize(poolIdx);
+            if (!transferIndexerKCache && hasAttentionCachePool
+                && LinearAttentionMetadata::hasLinearCache(encodedWindowSize))
+            {
+                continue;
+            }
+
+            auto const windowSize = static_cast<size_t>(encodedWindowSize);
             auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
             auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
             if (common::getEnvKVCacheTransferAllBlocksForWindow())
@@ -235,7 +300,17 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
             }
             validTokenNum += tokensPerBlock; // add one more block
 
-            bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
+            if (transferIndexerKCache)
+            {
+                bufferSizeFromMaxNumToken += validTokenNum * indexerCacheByteSizePerTokenPerLayer;
+            }
+            else
+            {
+                auto const primaryPool = blockManager.getPrimaryPool(poolIdx);
+                auto const kvCacheByteSizePerTokenPerLayer
+                    = primaryPool->getDimension<-1>() * primaryPool->getDimension<2>() * dataSize / tokensPerBlock;
+                bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
+            }
         }
     }
 
@@ -245,9 +320,7 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
 CacheTransBufferManager::CacheTransBufferManager(
     KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
     : BaseTransBufferManager(computeTransferBufferSize(cacheManager, maxNumTokens, transferIndexerKCache),
-        transferIndexerKCache ? cacheManager->getIndexerKCachePool()->getDataType()
-                              : cacheManager->getPrimaryPool(0)->getDataType(),
-        maxNumTokens)
+        getTransferDataType(cacheManager, transferIndexerKCache), maxNumTokens)
     , mCacheManager{cacheManager}
     , mTransferIndexerKCache{transferIndexerKCache}
 {
@@ -287,7 +360,7 @@ size_t CacheTransBufferManager::preAllocBufferSize(
             transferBufferSize += validTokenNum * cacheSizeBytesPerToken;
         }
     }
-    bool useFabricMemory = FabricMemory::supportFbaricMemory()
+    bool useFabricMemory = FabricMemory::supportFabricMemory()
         && (!(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer()));
     if (useFabricMemory)
     {

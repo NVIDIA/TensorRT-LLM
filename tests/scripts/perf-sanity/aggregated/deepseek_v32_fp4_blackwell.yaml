@@ -7,6 +7,7 @@ hardware:
 server_configs:
   # 8k1k configs - TEP8 with TRTLLM, MTP3
   - name: "v32_fp4_tep8_mtp3_8k1k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
     model_name: "deepseek_v32_fp4"
     tensor_parallel_size: 8
     moe_expert_parallel_size: 8
@@ -38,6 +39,7 @@ server_configs:
 
   # 8k1k configs - DEP8 with CUTEDSL, MTP1
   - name: "v32_fp4_dep8_mtp1_8k1k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
     model_name: "deepseek_v32_fp4"
     tensor_parallel_size: 8
     moe_expert_parallel_size: 8

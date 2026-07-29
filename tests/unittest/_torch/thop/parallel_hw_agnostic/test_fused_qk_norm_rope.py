@@ -3,7 +3,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import RopeParams
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
 
 @torch.inference_mode()
@@ -178,6 +178,10 @@ def test_fused_qk_norm_rope(
         high,
         attention_factor,
         True,
+        False,  # use_gemma (standard RMSNorm reference below)
+        False,  # use_mrope (plain RoPE)
+        0,  # mrope_section1 (unused when use_mrope=False)
+        0,  # mrope_section2
     )
     output = qkv  # This op is inplace
 
@@ -204,3 +208,135 @@ def test_fused_qk_norm_rope(
         rtol=5e-2,
         atol=1e-1,
     )
+
+
+@torch.inference_mode()
+def torch_ref_gemma_mrope(
+    qkv,
+    num_heads_q,
+    num_heads_k,
+    num_heads_v,
+    head_dim,
+    rotary_dim,
+    eps,
+    q_weight,
+    k_weight,
+    base,
+    is_neox,
+    position_ids_3d,
+    mrope_section,
+):
+    """Reference for the Gemma-RMSNorm + interleaved-mRoPE fused path.
+
+    Mirrors apply_qk_norm_rope's fused branch: Gemma RMSNorm (scale by
+    (1 + weight)) on Q/K, then interleaved mRoPE via MRotaryEmbedding.
+    """
+    num_tokens = qkv.shape[0]
+    q_size = num_heads_q * head_dim
+    k_size = num_heads_k * head_dim
+    q = qkv[:, :q_size]
+    k = qkv[:, q_size : q_size + k_size]
+    v = qkv[:, q_size + k_size :]
+
+    q_norm = RMSNorm(hidden_size=head_dim, eps=eps, use_gemma=True).to(qkv.device).to(qkv.dtype)
+    k_norm = RMSNorm(hidden_size=head_dim, eps=eps, use_gemma=True).to(qkv.device).to(qkv.dtype)
+    q_norm.weight.data.copy_(q_weight)
+    k_norm.weight.data.copy_(k_weight)
+    q_n = q_norm(q.reshape(num_tokens * num_heads_q, head_dim)).reshape(num_tokens, q_size)
+    k_n = k_norm(k.reshape(num_tokens * num_heads_k, head_dim)).reshape(num_tokens, k_size)
+
+    rope_params = RopeParams(dim=rotary_dim, theta=base, max_positions=8192)
+    rotary_emb = MRotaryEmbedding(
+        rope_params=rope_params,
+        head_dim=head_dim,
+        mrope_section=mrope_section,
+        is_neox=is_neox,
+        mrope_interleaved=True,
+    ).to(qkv.device)
+    [q_rope, k_rope] = rotary_emb(position_ids_3d, [q_n, k_n])
+    return torch.cat([q_rope, k_rope, v], dim=1)
+
+
+@pytest.mark.skip(
+    reason="WIP: standalone MRotaryEmbedding reference shape handling needs "
+    "fixing. The kernel's Gemma + interleaved-mRoPE path is validated "
+    "end-to-end by the Qwen3.5 accuracy test."
+)
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("num_heads_group", [(16, 8, 8), (32, 8, 8)])
+@pytest.mark.parametrize("num_tokens", [1, 3, 8, 256])
+@pytest.mark.parametrize("is_neox", [False, True])
+@pytest.mark.parametrize("partial_rotary_factor", [1.0, 0.5])
+def test_fused_qk_norm_rope_gemma_mrope(
+    head_dim, num_heads_group, num_tokens, partial_rotary_factor, is_neox
+):
+    """Cover the Gemma-RMSNorm + interleaved-mRoPE fused path (Qwen3.5)."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    num_heads_q, num_heads_k, num_heads_v = num_heads_group
+    hidden_size = (num_heads_q + num_heads_k + num_heads_v) * head_dim
+
+    torch.random.manual_seed(0)
+    qkv = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    qkv_copy = qkv.clone()
+
+    # 3D position_ids [3, num_tokens] with distinct t/h/w to exercise the
+    # interleaved section selection (identical components would hide bugs).
+    base_pos = torch.arange(num_tokens, dtype=torch.int32, device=device)
+    position_ids_3d = torch.stack(
+        [base_pos + 100, base_pos + 50, base_pos + 10], dim=0
+    ).contiguous()
+
+    q_weight = torch.randn(head_dim, dtype=dtype, device=device) * 5.0
+    k_weight = torch.randn(head_dim, dtype=dtype, device=device) * 5.0
+
+    eps = 1e-5
+    base = 10000.0
+    factor, low, high, attention_factor = 1.0, 0, 0, 1.0
+    rotary_dim = int(head_dim * partial_rotary_factor)
+    half = rotary_dim // 2
+    s = half // 3
+    mrope_section = [half - 2 * s, s, s]  # sums to half (rotary_dim/2)
+
+    torch.ops.trtllm.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        rotary_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids_3d,
+        factor,
+        low,
+        high,
+        attention_factor,
+        True,  # is_qk_norm
+        True,  # use_gemma
+        True,  # use_mrope
+        mrope_section[1],
+        mrope_section[2],
+    )
+    output = qkv
+
+    ref_output = torch_ref_gemma_mrope(
+        qkv_copy,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        rotary_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids_3d,
+        mrope_section,
+    )
+
+    torch.testing.assert_close(output, ref_output, rtol=5e-2, atol=1e-1)

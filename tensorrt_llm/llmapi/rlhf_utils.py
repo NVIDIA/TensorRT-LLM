@@ -159,6 +159,11 @@ class WorkerExtension:
         """Invalidate the KV cache prefix reuse state after weight updates."""
         self.engine.reset_prefix_cache()
 
+    @control_action_decorator
+    def wait_for_engine_idle(self) -> None:
+        """Block until the engine has no active or queued requests."""
+        pass
+
     def check_weights_updated(self) -> bool:
         """Check if the weights are updated to 0."""
         weights_updated = True

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,7 +44,22 @@ struct IpcNvlsHandle
 
 void MPI_group_barrier(std::set<int> ranks);
 
+//! \brief Whether NVLS (NVLink SHARP) multicast memory can be allocated on this
+//! node. Checks only the static capability (CUDA driver >= 12010 and
+//! CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED). This is the precondition for
+//! ipcNvlsAllocate(): the allocator itself selects a fabric or POSIX-FD handle
+//! via getMemHandleType(), so single-node NVLS works over POSIX-FD even when the
+//! fabric/IMEX plane is not provisioned. The result is cached.
 bool ipcNvlsSupported();
+
+//! \brief Whether the NVLink fabric/IMEX plane is provisioned so that NVLS
+//! multicast memory can actually be *bound* (not merely statically supported).
+//! Extends ipcNvlsSupported() with a live fabric probe (getMemHandleType() must
+//! resolve to CU_MEM_HANDLE_TYPE_FABRIC). Use this to decide whether NCCL may
+//! attempt NVLS: on an unprovisioned node the static multicast attribute is a
+//! false positive and NCCL aborts during init, so callers should disable
+//! NCCL_NVLS when this returns false. The (heavy) result is cached.
+bool ipcNvlsFabricUsable();
 
 IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> ranks);
 

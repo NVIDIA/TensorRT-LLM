@@ -1,5 +1,5 @@
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -9,14 +9,31 @@ from tqdm import tqdm
 
 from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
+from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
+    apply_fused_layernorm_adaln_quant,
+    apply_fused_layernorm_affine_quant,
+    get_nvfp4_input_scale,
+)
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+try:
+    # Available in transformers<5
+    from transformers.modeling_utils import get_parameter_device
+except ImportError:
+    # Removed in transformers>=5
+    def get_parameter_device(module):
+        return next(module.parameters()).device
+
 
 # =========================================================================
 # 1. Rotary Positional Embeddings
@@ -119,6 +136,7 @@ class WanImageEmbedding(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization
             if model_config
             else False,
+            reduce_output=False,
         )
         self.ff_out = Linear(
             in_features,
@@ -133,6 +151,7 @@ class WanImageEmbedding(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization
             if model_config
             else False,
+            reduce_output=False,
         )
 
         self.norm2 = LayerNorm(
@@ -191,6 +210,7 @@ class WanTimeTextImageEmbedding(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         self.text_embedder = PixArtAlphaTextProjection(text_embed_dim, dim, act_fn="gelu_tanh")
 
@@ -233,6 +253,19 @@ class WanTimeTextImageEmbedding(nn.Module):
         return temb, temb_proj, encoder_hidden_states, encoder_hidden_states_image
 
 
+def _default_vsa_gate(linear: Linear, bias_value: float) -> None:
+    """Default a VSA gate Linear absent from the checkpoint: weight=0, bias=bias_value
+    (G_c=0 / G_f=1, preserving dense behavior at sparsity=0)."""
+    if not linear._weights_created:
+        linear.create_weights()
+    if linear.weight.is_meta:
+        return
+    with torch.no_grad():
+        linear.weight.zero_()
+        if linear.bias is not None:
+            linear.bias.fill_(bias_value)
+
+
 class WanBlock(nn.Module):
     def __init__(
         self,
@@ -271,19 +304,37 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
 
-        # Self-attention with fused QKV
-        # Default fuse_qk_norm_rope=False: flashinfer QKRMSNorm is faster for WAN's
-        # full-dim norm. User can override via config.attention.fuse_qk_norm_rope=True.
+        # Self-attention with fused QKV. All WAN variants (1.3B 12h, 5B 24h,
+        # 14B 40h) fit the default fused_dit_qk_norm_rope op's full-dim
+        # template now that the num_heads cap is 64 (post-survey 2026-05).
+        # However, this kernel does not support TP due to the cross-head
+        # normalization being a collective op. Thus, we must disable it if
+        # using TP.
+        # When ulysses_size > 1 AND parallel.async_ulysses is set, switch
+        # to SEPARATE_QKV so V/Q/K projections can stream-pipeline through
+        # the async ulysses A2A path.
+        tp_size = model_config.mapping.tp_size if model_config.mapping else 1
+        vgm_self = model_config.visual_gen_mapping
+        ulysses_size_self = vgm_self.ulysses_size if vgm_self is not None else 1
+        _async_a2a = model_config.parallel.async_ulysses if model_config is not None else False
+        self._use_async_ulysses = bool(ulysses_size_self > 1) and _async_a2a
+        _qkv_mode_self = QKVMode.SEPARATE_QKV if self._use_async_ulysses else QKVMode.FUSE_QKV
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
             head_dim=head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
+            qkv_mode=_qkv_mode_self,
             qk_norm=True,
             eps=eps,
-            fuse_qk_norm_rope=False,
+            # fuse_qk_norm_rope=True drives the packed kernel on sync (FUSE_QKV)
+            # and the split kernel on async (SEPARATE_QKV via forward_async).
+            # Disabled when TP>1 since the fused kernel lacks cross-rank
+            # all-reduce for the cross-head RMSNorm variance.
+            fuse_qk_norm_rope=(tp_size == 1),
             config=model_config,
             layer_idx=_layer_idx,
+            async_ulysses=self._use_async_ulysses,
+            module_name=f"blocks.{_layer_idx}.attn1",
         )
 
         # Cross-attention with separate Q, K, V
@@ -296,6 +347,8 @@ class WanBlock(nn.Module):
             eps=eps,
             config=model_config,
             layer_idx=_layer_idx,
+            module_name=f"blocks.{_layer_idx}.attn2",
+            enable_sequence_parallel=False,
         )
 
         if cross_attn_norm:
@@ -312,21 +365,69 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
 
+        # FP4 input scales propagated from downstream Linear modules in post_load_weights().
+        # None until post_load_weights is called; fusion is skipped when None.
+        self._norm1_fp4_scale: Optional[torch.Tensor] = None
+        self._norm2_fp4_scale: Optional[torch.Tensor] = None
+        self._norm3_fp4_scale: Optional[torch.Tensor] = None
+        self._fused_ln_supported = hidden_size == 5120
+
         self.ffn = MLP(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
             bias=True,
-            activation=lambda x: F.gelu(x, approximate="tanh"),
+            activation=gelu_tanh,  # named (not a lambda) so MLP can detect+fuse GELU+NVFP4
             dtype=dtype,
             config=model_config,
             layer_idx=_layer_idx,
-            reduce_output=False,
+            reduce_output=(tp_size != 1),
         )
 
-        # I2V: Additional K/V projections for image embeddings
+        # VSA gates (CUTEDSL backend, sparse_attention_config.algorithm == "vsa").
+        # G_c weights the coarse branch; G_f weights the fine branch.
+        self.to_gate_compress = None
+        self.to_gate_fine = None
+        _attn_cfg = getattr(model_config, "attention", None)
+        _sa_cfg = getattr(_attn_cfg, "sparse_attention_config", None) if _attn_cfg else None
+        _is_vsa = (
+            _attn_cfg is not None
+            and getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
+            and _sa_cfg is not None
+            and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        )
+        if _is_vsa:
+            q_dim = num_heads * head_dim
+            gate_tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
+            self.to_gate_compress = Linear(
+                hidden_size,
+                q_dim,
+                bias=True,
+                dtype=dtype,
+                mapping=model_config.mapping,
+                quant_config=quant_config,
+                skip_create_weights_in_init=skip_create_weights,
+                force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=gate_tp_mode,
+                reduce_output=False,
+            )
+            self.to_gate_fine = Linear(
+                hidden_size,
+                q_dim,
+                bias=True,
+                dtype=dtype,
+                mapping=model_config.mapping,
+                quant_config=quant_config,
+                skip_create_weights_in_init=skip_create_weights,
+                force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=gate_tp_mode,
+                reduce_output=False,
+            )
+
+        # I2V: Additional K/V projections for image embeddings.
         self.add_k_proj = self.add_v_proj = None
         self.norm_added_k = None
         if added_kv_proj_dim is not None:
+            tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
             self.add_k_proj = Linear(
                 added_kv_proj_dim,
                 hidden_size,
@@ -335,6 +436,9 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=tp_mode,
+                reduce_output=False,
+                override_tp_sharding=(self.attn2.local_kv_dim_start, self.attn2.local_kv_dim_end),
             )
             self.add_v_proj = Linear(
                 added_kv_proj_dim,
@@ -344,15 +448,66 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=tp_mode,
+                reduce_output=False,
+                override_tp_sharding=(self.attn2.local_kv_dim_start, self.attn2.local_kv_dim_end),
             )
-            self.norm_added_k = RMSNorm(
-                hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=True
+            self.norm_added_k = RMSNormTPAware(
+                hidden_size=hidden_size,
+                eps=eps,
+                dtype=dtype,
+                has_weights=True,
+                enable_tp=(tp_size > 1),
+                mapping=model_config.mapping,
+                override_tp_sharding=(self.attn2.local_kv_dim_start, self.attn2.local_kv_dim_end),
             )
 
         # Use torch.empty().normal_(std=...) instead of torch.randn()/scale for MetaInitMode compatibility
         self.scale_shift_table = nn.Parameter(
             torch.empty(1, 6, hidden_size).normal_(std=hidden_size**-0.5)
         )
+
+    def _fused_adaln_quant(self, x, scale_msa, shift_msa, temb, fp4_scale, eps):
+        """Shared norm1/norm3 path: flatten x to 2D, build the per-token or
+        per-batch modulation rows, and run the fused LayerNorm+AdaLN+NVFP4 op.
+
+        Returns the 2D fused result (Fp4QuantizedTensor when quantizing,
+        else a dense tensor). The caller reshapes it back to 3D (norm1) or
+        feeds it straight to the MLP's 2D fused-GELU kernel (norm3).
+        """
+        _x_2d = x.reshape(-1, x.shape[-1])
+        if temb.ndim == 4:
+            # scale/shift are [B, S, D] here; flatten per-token so each row of
+            # _x_2d gets its own modulation row (seq_len_per_batch=1).
+            _scale_2d = scale_msa.reshape(-1, scale_msa.shape[-1])
+            _shift_2d = shift_msa.reshape(-1, shift_msa.shape[-1])
+            _seq_len_per_batch = 1
+        else:
+            # scale/shift are [B, D] here; one modulation row per batch element.
+            _batch_size = temb.shape[0]
+            _scale_2d = scale_msa.reshape(_batch_size, -1)
+            _shift_2d = shift_msa.reshape(_batch_size, -1)
+            _seq_len_per_batch = _x_2d.shape[0] // _batch_size
+        return apply_fused_layernorm_adaln_quant(
+            _x_2d,
+            _scale_2d,
+            _shift_2d,
+            _seq_len_per_batch,
+            fp4_scale,
+            eps=eps,
+        )
+
+    @staticmethod
+    def _reshape_fused_output(normed, shape):
+        """Reshape a fused-op output (Fp4QuantizedTensor or dense) from the
+        2D op layout back to shape."""
+        if isinstance(normed, Fp4QuantizedTensor):
+            return Fp4QuantizedTensor(
+                normed.fp4_tensor.reshape(*shape[:-1], normed.fp4_tensor.shape[-1]),
+                normed.scaling_factor,
+                normed.is_sf_swizzled,
+            )
+        return normed.reshape(shape)
 
     def forward(
         self,
@@ -361,6 +516,7 @@ class WanBlock(nn.Module):
         temb,
         freqs_cos,
         freqs_sin,
+        timestep=None,
     ):
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, hidden_size
@@ -380,23 +536,51 @@ class WanBlock(nn.Module):
                 self.scale_shift_table.float() + temb.float()
             ).chunk(6, dim=1)
 
-        normed = self.norm1(x.float()) * (1 + scale_msa) + shift_msa
-        normed = normed.to(x.dtype)
+        if self._fused_ln_supported:
+            # x is [B, S, D]; flatten to 2D for the fused op, reshape output back.
+            normed = self._fused_adaln_quant(
+                x, scale_msa, shift_msa, temb, self._norm1_fp4_scale, self.norm1.variance_epsilon
+            )
+            normed = self._reshape_fused_output(normed, x.shape)
+        else:
+            normed = self.norm1(x.float()) * (1 + scale_msa) + shift_msa
+            normed = normed.to(x.dtype)
 
         # Prepare frequencies for Attention
         freqs = (freqs_cos, freqs_sin) if freqs_cos is not None and freqs_sin is not None else None
 
-        # Self-attention with RoPE
-        x = (
-            x.float()
-            + self.attn1(
-                normed,
-                freqs=freqs,
-            ).float()
-            * gate_msa
-        ).to(x.dtype)
+        attn1_kwargs = {}
+        if self.to_gate_compress is not None:
+            attn1_kwargs["gate_compress"] = self.to_gate_compress(normed)
+        if self.to_gate_fine is not None:
+            attn1_kwargs["gate_fine"] = self.to_gate_fine(normed)
 
-        norm_x = self.norm2(x.float()).to(x.dtype)
+        # Self-attention with RoPE. Async-ulysses dispatches to forward_async
+        # so each V/Q/K GEMM + norm + RoPE overlaps with the peer push on the
+        # side stream; both paths return 3D [B, S, H*D].
+        if self._use_async_ulysses:
+            attn1_out = self.attn1.forward_async(normed, freqs=freqs, timestep=timestep)
+        else:
+            attn1_out = self.attn1(normed, freqs=freqs, timestep=timestep, **attn1_kwargs)
+
+        x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
+
+        if (
+            self._fused_ln_supported
+            and isinstance(self.norm2, LayerNorm)
+            and self.norm2.weight is not None
+        ):
+            _x_2d = x.reshape(-1, x.shape[-1])
+            norm_x = apply_fused_layernorm_affine_quant(
+                _x_2d,
+                self.norm2.weight.to(x.dtype),
+                self.norm2.bias.to(x.dtype),
+                self._norm2_fp4_scale,
+                eps=self.norm2.variance_epsilon,
+            )
+            norm_x = self._reshape_fused_output(norm_x, x.shape)
+        else:
+            norm_x = self.norm2(x.float()).to(x.dtype)
 
         # I2V: Split encoder_hidden_states into image and text parts if needed
         encoder_hidden_states_img = None
@@ -417,6 +601,7 @@ class WanBlock(nn.Module):
             batch_size=batch_size,
             seq_len=seq_len,
             kv_seq_len=encoder_hidden_states_text.shape[1],
+            timestep=timestep,
         )
 
         # I2V: image cross-attention
@@ -431,65 +616,48 @@ class WanBlock(nn.Module):
                 batch_size=batch_size,
                 seq_len=seq_len,
                 kv_seq_len=encoder_hidden_states_img.shape[1],
+                timestep=timestep,
             )
             attn2_output = attn2_output + attn_img_output
 
         # Apply to_out once to the combined (text + image) attention output
         x = x + self.attn2.to_out[0](attn2_output)
 
-        # 3. Feed-forward
-        normed = self.norm3(x.float()) * (1 + c_scale_msa) + c_shift_msa
-        normed = normed.to(x.dtype)
+        # 3. Feed-forward. Mirrors norm1: fused LN+AdaLN (with optional NVFP4
+        # quant) reshaped back to [B, S, D]; self.ffn consumes it.
+        if self._fused_ln_supported:
+            normed = self._fused_adaln_quant(
+                x,
+                c_scale_msa,
+                c_shift_msa,
+                temb,
+                self._norm3_fp4_scale,
+                self.norm3.variance_epsilon,
+            )
+            normed = self._reshape_fused_output(normed, x.shape)
+        else:
+            normed = self.norm3(x.float()) * (1 + c_scale_msa) + c_shift_msa
+            normed = normed.to(x.dtype)
+        ffn_out = self.ffn(normed)
 
-        x = (x.float() + self.ffn(normed).float() * c_gate_msa).to(x.dtype)
+        x = (x.float() + ffn_out.float() * c_gate_msa).to(x.dtype)
 
         return x
 
 
-class WanTransformer3DModel(nn.Module):
+class WanTransformer3DModel(BaseDiffusionModel):
     _supports_gradient_checkpointing = True
 
     def __init__(
         self,
         model_config: DiffusionModelConfig,
     ):
-        super().__init__()
-
-        self.model_config = model_config
+        super().__init__(model_config)
 
         vgm = model_config.visual_gen_mapping
-        if vgm is not None and vgm.tp_size > 1:
-            raise ValueError(f"WAN does not support tensor parallelism. Got tp_size={vgm.tp_size}")
 
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 12)
-        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
-        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
-        attn2d_mesh_size = attn2d_row_size * attn2d_col_size
-        ulysses_size = vgm.ulysses_size if vgm else 1
-        use_attn2d = attn2d_mesh_size > 1
-        use_ulysses = ulysses_size > 1
-
-        if use_ulysses and num_heads % ulysses_size != 0:
-            raise ValueError(
-                f"num_attention_heads ({num_heads}) must be divisible by "
-                f"ulysses_size ({ulysses_size})"
-            )
-
-        if use_attn2d:
-            self.use_seq_parallel = True
-            self.seq_parallel_size = attn2d_mesh_size
-            self.seq_parallel_pg = vgm.attn2d_mesh_group
-            self.seq_parallel_rank = vgm.attn2d_mesh_rank
-        elif use_ulysses:
-            self.use_seq_parallel = True
-            self.seq_parallel_size = ulysses_size
-            self.seq_parallel_pg = vgm.ulysses_group
-            self.seq_parallel_rank = vgm.ulysses_rank
-        else:
-            self.use_seq_parallel = False
-            self.seq_parallel_size = 1
-            self.seq_parallel_pg = None
-            self.seq_parallel_rank = 0
+        self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_heads)
 
         config = model_config.pretrained_config
 
@@ -587,6 +755,7 @@ class WanTransformer3DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         # Use torch.empty().normal_(std=...) instead of torch.randn()/scale for MetaInitMode compatibility
         self.scale_shift_table = nn.Parameter(
@@ -635,20 +804,23 @@ class WanTransformer3DModel(nn.Module):
     def forward(
         self,
         hidden_states,
-        timestep,
-        encoder_hidden_states,
+        timestep=None,
+        encoder_hidden_states=None,
         encoder_hidden_states_image=None,
         **kwargs,
     ):
         """
-        Forward pass with optional parallelism (Ulysses head-sharding or Attention2D context parallelism).
+        Forward pass with optional sequence parallelism (Ring, Ulysses, or Attention2D).
 
-        With parallelism enabled (seq_parallel_size > 1):
-            1. Shard input sequence across ranks: [B, S] -> [B, S/P]
-            2. Each block's attention handles communication internally
-            3. Gather output sequence: [B, S/P] -> [B, S]
+        When sharder is active:
+            1. Shard input sequence (and matching RoPE) across ranks: [B, S] -> [B, S/P]
+            2. Each block's attention handles cross-rank communication internally
+            3. All-gather output sequence: [B, S/P] -> [B, S]
 
         When TeaCache is enabled, TeaCacheHook intercepts and replaces this call.
+
+        Args:
+            timestep: Normalized scheduler timestep tensor in [0, 1].
         """
         original_shape = hidden_states.shape
         B, C, T, H, W = original_shape
@@ -660,39 +832,26 @@ class WanTransformer3DModel(nn.Module):
         # Patchify and flatten: [B, C, T, H, W] -> [B, S, hidden_size]
         x = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
 
-        # Shard sequence across ranks: [B, S] -> [B, S/P]
-        chunk_size = None
-        if self.use_seq_parallel:
-            seq_len = x.shape[1]
-            if seq_len % self.seq_parallel_size != 0:
-                raise ValueError(
-                    f"Sequence length ({seq_len}) is not divisible by "
-                    f"seq_parallel_size ({self.seq_parallel_size}). "
-                    f"Adjust video dimensions or parallelism settings."
-                )
+        # Shard sequence + matching RoPE across ranks (no-op when sharder is inactive).
+        seq_len = x.shape[1]
+        x = self.sharder.shard(x, dim=1)
+        rope = self.sharder.shard_rope((freqs_cos, freqs_sin), seq_len=seq_len, seq_dim=1)
+        if rope is not None:
+            freqs_cos, freqs_sin = rope
 
-            chunk_size = seq_len // self.seq_parallel_size
-            chunk_start = self.seq_parallel_rank * chunk_size
-            chunk_end = chunk_start + chunk_size
-            x = x[:, chunk_start:chunk_end, :]
-
-            # Shard RoPE frequencies to match sequence sharding
-            # RoPE freqs shape: [B, S, ...], so shard along dim 1 (sequence dimension)
-            if freqs_cos is not None and freqs_sin is not None:
-                freqs_cos = freqs_cos[:, chunk_start:chunk_end]
-                freqs_sin = freqs_sin[:, chunk_start:chunk_end]
-
-        # Time and text/image embeddings
+        # Time and text/image embeddings. WAN timestep embeddings use the
+        # scheduler's 1000-step scale internally.
+        timestep_for_embedding = timestep * 1000
         # Timestep shape: [batch_size] or [batch_size, seq_len]
-        if timestep.ndim == 2:
-            ts_seq_len = timestep.shape[1]
-            timestep = timestep.flatten()
+        if timestep_for_embedding.ndim == 2:
+            ts_seq_len = timestep_for_embedding.shape[1]
+            timestep_for_embedding = timestep_for_embedding.flatten()
         else:
             ts_seq_len = None
 
         temb, temb_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self.condition_embedder(
-                timestep,
+                timestep_for_embedding,
                 encoder_hidden_states,
                 encoder_hidden_states_image,
                 timestep_seq_len=ts_seq_len,
@@ -703,8 +862,7 @@ class WanTransformer3DModel(nn.Module):
             # batch_size, seq_len, 6, hidden_size
             temb_proj = temb_proj.unflatten(2, (6, self.config.hidden_size))
             # Shard per-patch temb_proj to match the local sequence chunk
-            if chunk_size is not None:
-                temb_proj = temb_proj[:, chunk_start:chunk_end]
+            temb_proj = self.sharder.shard(temb_proj, dim=1, expected_seq_len=seq_len)
         else:
             # batch_size, 6, hidden_size
             temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))
@@ -731,15 +889,11 @@ class WanTransformer3DModel(nn.Module):
                 temb_proj,
                 freqs_cos,
                 freqs_sin,
+                timestep=timestep,
             )
 
-        # Gather sequence from all ranks: [B, S/P] -> [B, S]
-        if self.use_seq_parallel:
-            # Ensure tensor is contiguous before all_gather
-            x = x.contiguous()
-            x_list = [torch.zeros_like(x) for _ in range(self.seq_parallel_size)]
-            torch.distributed.all_gather(x_list, x, group=self.seq_parallel_pg)
-            x = torch.cat(x_list, dim=1)
+        # All-gather sequence from all ranks: [B, S/P] -> [B, S] (no-op when inactive).
+        x = self.sharder.gather(x, dim=1)
 
         # Output projection and unpatchify
         if temb.ndim == 3:
@@ -807,8 +961,17 @@ class WanTransformer3DModel(nn.Module):
 
                 if weight_dicts:
                     loader.load_linear_weights(module, name, weight_dicts)
+                # VSA gates absent from the checkpoint default to G_c=0 / G_f=1
+                # (dense behavior at sparsity=0).
+                elif name.endswith(".to_gate_compress"):
+                    _default_vsa_gate(module, 0.0)
+                elif name.endswith(".to_gate_fine"):
+                    _default_vsa_gate(module, 1.0)
                 elif "add_k_proj" in name or "add_v_proj" in name:
                     logger.info(f"[Weight Loading] No weights found for I2V module: {name}")
+            elif isinstance(module, RMSNormTPAware):
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights)
             else:
                 module_weights = loader.filter_weights(name, weights)
                 for param_name, param in module._parameters.items():
@@ -830,3 +993,13 @@ class WanTransformer3DModel(nn.Module):
         for _, module in self.named_modules():
             if isinstance(module, Linear):
                 module.post_load_weights()
+
+        # Wire each norm's fp4_scale from the first downstream Linear that consumes its output.
+        for block in self.blocks:
+            if not isinstance(block, WanBlock):
+                continue
+            # qkv_proj exists in FUSE_QKV mode; fall back to to_q in SEPARATE_QKV (async Ulysses).
+            attn1_qkv = getattr(block.attn1, "qkv_proj", None) or getattr(block.attn1, "to_q", None)
+            block._norm1_fp4_scale = get_nvfp4_input_scale(attn1_qkv)
+            block._norm2_fp4_scale = get_nvfp4_input_scale(getattr(block.attn2, "to_q", None))
+            block._norm3_fp4_scale = get_nvfp4_input_scale(getattr(block.ffn, "up_proj", None))

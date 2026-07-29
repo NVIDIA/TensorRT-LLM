@@ -25,7 +25,9 @@ from xdsl.ir import Operation, SSAValue
 from ..dialect import (
     AdAdd,
     AdCast,
+    AdEq,
     AdExp,
+    AdFloorDiv,
     AdGelu,
     AdMul,
     AdNeg,
@@ -69,6 +71,8 @@ FUSIBLE_OPS = frozenset(
         AdReduceSum,
         AdReduceMean,
         AdCast,
+        AdFloorDiv,
+        AdEq,
         AdSplat,
     }
 )

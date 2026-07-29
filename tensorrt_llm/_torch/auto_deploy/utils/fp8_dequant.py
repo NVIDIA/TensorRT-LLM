@@ -39,9 +39,19 @@ def dequant_fp8_weight_two_dim_block_grid(
     """
     N, K = weight_fp8.shape
     scale_n, scale_k = weight_scale.shape
-    # Ceil division so the expanded scale covers non-divisible dims (see torch_quant).
-    actual_block_n = math.ceil(N / scale_n) if scale_n > 0 else block_n
-    actual_block_k = math.ceil(K / scale_k) if scale_k > 0 else block_k
+    # How each scale value maps to weight rows depends on the scale layout:
+    #  - coarse 128-block scale (scale_n == ceil(N/128)): expand by the canonical 128. Using
+    #    ceil(N/scale_n) equals 128 only when N is a 128-multiple; for a partial last block
+    #    (e.g. N=576 -> 116) it maps scales onto the wrong rows and corrupts the weights.
+    #  - per-row scale (scale_n == N): expand by 1, which ceil(N/scale_n) already yields.
+    n_is_block_scale = scale_n > 0 and scale_n == math.ceil(N / 128)
+    k_is_block_scale = scale_k > 0 and scale_k == math.ceil(K / 128)
+    actual_block_n = (
+        128 if n_is_block_scale else (math.ceil(N / scale_n) if scale_n > 0 else block_n)
+    )
+    actual_block_k = (
+        128 if k_is_block_scale else (math.ceil(K / scale_k) if scale_k > 0 else block_k)
+    )
     scale_expanded = weight_scale.repeat_interleave(actual_block_n, dim=0).repeat_interleave(
         actual_block_k, dim=1
     )

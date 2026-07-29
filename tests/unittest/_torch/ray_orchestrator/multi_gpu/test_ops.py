@@ -86,7 +86,7 @@ class PgOpTest:
         return True
 
 
-@pytest.mark.gpu2
+@pytest.mark.part0
 @pytest.mark.parametrize("hidden_size", [128, 1024],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("seq_len", [16, 64], ids=lambda x: f"seqlen:{x}")
@@ -148,7 +148,7 @@ def test_allgather_pg_op(setup_ray_cluster, seq_len, hidden_size, var_len):
         assert r is True
 
 
-@pytest.mark.gpu2
+@pytest.mark.part1
 @pytest.mark.parametrize("hidden_size", [128, 1024],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("seq_len", [16, 64], ids=lambda x: f"seqlen:{x}")
@@ -208,7 +208,7 @@ def test_reducescatter_pg_op(setup_ray_cluster, seq_len, hidden_size, var_len):
         assert r is True
 
 
-@pytest.mark.gpu2
+@pytest.mark.part2
 @pytest.mark.parametrize("hidden_size", [128, 1024],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("seq_len", [16, 64], ids=lambda x: f"seqlen:{x}")
@@ -353,7 +353,7 @@ class CpBroadcastTest:
         return result == root_obj
 
 
-@pytest.mark.gpu2
+@pytest.mark.part3
 @pytest.mark.parametrize("hidden_size", [128, 512], ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("seq_len", [16, 32], ids=lambda x: f"seqlen:{x}")
 def test_cp_broadcast_tensor(setup_ray_cluster, seq_len, hidden_size):
@@ -394,7 +394,7 @@ def test_cp_broadcast_tensor(setup_ray_cluster, seq_len, hidden_size):
         assert r is True, "Tensor broadcast from root=0 failed"
 
 
-@pytest.mark.gpu2
+@pytest.mark.part4
 @pytest.mark.parametrize("test_object", [
     {
         "key1": "value1",

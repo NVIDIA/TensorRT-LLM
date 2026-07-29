@@ -16,6 +16,8 @@
 
 #include "tensorrt_llm/batch_manager/blockKey.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/executor/executor.h"
 
 #include <gtest/gtest.h>
 
@@ -167,6 +169,114 @@ TEST_F(BlockKeyTest, HashWithExtraKeys)
     BlockKey bk0(false, std::nullopt, {{1, 0}}, {makeMmKey(0xAA, 0)});
     BlockKey bk1(false, std::nullopt, {{1, 0}}, {makeMmKey(0xBB, 0)});
     EXPECT_FALSE(BlockKeyHasher::hash(bk0) == BlockKeyHasher::hash(bk1));
+}
+
+TEST_F(BlockKeyTest, GenerateExtraKeysUsesExactMultimodalRuns)
+{
+    using tensorrt_llm::batch_manager::LlmRequest;
+    using tensorrt_llm::executor::MultimodalInput;
+    using tensorrt_llm::executor::OutputConfig;
+    using tensorrt_llm::executor::Request;
+    using tensorrt_llm::executor::SamplingConfig;
+
+    MultimodalInput multimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}},
+        /*multimodalPositions=*/{1},
+        /*multimodalLengths=*/{4},
+        /*multimodalUuids=*/std::vector<std::optional<std::string>>{std::string("item-0")},
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 2},
+        /*multimodalRunPositions=*/std::vector<SizeType32>{1, 8},
+        /*multimodalRunLengths=*/std::vector<SizeType32>{2, 2});
+
+    Request executorRequest({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
+        OutputConfig(), /*endId=*/std::nullopt, /*padId=*/std::nullopt,
+        /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt, /*stopWords=*/std::nullopt,
+        /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
+        /*pTuningConfig=*/std::nullopt, multimodalInput);
+    LlmRequest llmRequest(/*requestId=*/0, executorRequest);
+
+    auto firstRunKeys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/0, /*endTokenIdx=*/4);
+    ASSERT_EQ(firstRunKeys.size(), 1);
+    EXPECT_EQ(firstRunKeys[0].startOffset, 0);
+    ASSERT_TRUE(firstRunKeys[0].uuid.has_value());
+    EXPECT_EQ(firstRunKeys[0].uuid.value(), "item-0");
+
+    auto gapKeys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/3, /*endTokenIdx=*/8);
+    EXPECT_TRUE(gapKeys.empty());
+
+    auto secondRunKeys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/7, /*endTokenIdx=*/10);
+    ASSERT_EQ(secondRunKeys.size(), 1);
+    EXPECT_EQ(secondRunKeys[0].startOffset, 2);
+    ASSERT_TRUE(secondRunKeys[0].uuid.has_value());
+    EXPECT_EQ(secondRunKeys[0].uuid.value(), "item-0");
+}
+
+TEST_F(BlockKeyTest, GenerateExtraKeysFallsBackToLegacyForIncompleteRunMetadata)
+{
+    using tensorrt_llm::batch_manager::LlmRequest;
+    using tensorrt_llm::executor::MultimodalInput;
+    using tensorrt_llm::executor::OutputConfig;
+    using tensorrt_llm::executor::Request;
+    using tensorrt_llm::executor::SamplingConfig;
+
+    MultimodalInput multimodalInputA({{1, 2, 3, 4, 5, 6, 7, 8}},
+        /*multimodalPositions=*/{1},
+        /*multimodalLengths=*/{2},
+        /*multimodalUuids=*/std::nullopt,
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 1});
+    MultimodalInput multimodalInputB({{8, 7, 6, 5, 4, 3, 2, 1}},
+        /*multimodalPositions=*/{1},
+        /*multimodalLengths=*/{2},
+        /*multimodalUuids=*/std::nullopt,
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 1});
+
+    Request executorRequestA({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
+        OutputConfig(),
+        /*endId=*/std::nullopt, /*padId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
+        /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
+        /*pTuningConfig=*/std::nullopt, multimodalInputA);
+    Request executorRequestB({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
+        OutputConfig(),
+        /*endId=*/std::nullopt, /*padId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
+        /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
+        /*pTuningConfig=*/std::nullopt, multimodalInputB);
+    LlmRequest llmRequestA(/*requestId=*/0, executorRequestA);
+    LlmRequest llmRequestB(/*requestId=*/1, executorRequestB);
+
+    auto keysA = generateBlockHashExtraKeys(llmRequestA, /*startTokenIdx=*/0, /*endTokenIdx=*/4);
+    auto keysB = generateBlockHashExtraKeys(llmRequestB, /*startTokenIdx=*/0, /*endTokenIdx=*/4);
+    ASSERT_EQ(keysA.size(), 1);
+    ASSERT_EQ(keysB.size(), 1);
+    EXPECT_EQ(keysA[0].startOffset, 0);
+    EXPECT_EQ(keysB[0].startOffset, 0);
+    EXPECT_NE(keysA[0].hash, keysB[0].hash);
+}
+
+TEST_F(BlockKeyTest, GenerateExtraKeysFallsBackToLegacyForInvalidRunRange)
+{
+    using tensorrt_llm::batch_manager::LlmRequest;
+    using tensorrt_llm::executor::MultimodalInput;
+    using tensorrt_llm::executor::OutputConfig;
+    using tensorrt_llm::executor::Request;
+    using tensorrt_llm::executor::SamplingConfig;
+
+    MultimodalInput multimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}},
+        /*multimodalPositions=*/{1},
+        /*multimodalLengths=*/{2},
+        /*multimodalUuids=*/std::nullopt,
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 1},
+        /*multimodalRunPositions=*/std::vector<SizeType32>{1},
+        /*multimodalRunLengths=*/std::vector<SizeType32>{-1});
+
+    Request executorRequest({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
+        OutputConfig(), /*endId=*/std::nullopt, /*padId=*/std::nullopt,
+        /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt, /*stopWords=*/std::nullopt,
+        /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
+        /*pTuningConfig=*/std::nullopt, multimodalInput);
+    LlmRequest llmRequest(/*requestId=*/0, executorRequest);
+
+    auto keys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/0, /*endTokenIdx=*/4);
+    ASSERT_EQ(keys.size(), 1);
+    EXPECT_EQ(keys[0].startOffset, 0);
 }
 
 // ---------------------------------------------------------------------------

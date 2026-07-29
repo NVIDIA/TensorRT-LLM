@@ -36,7 +36,7 @@ namespace
 using tensorrt_llm::common::check;
 
 void cuda_core_nvfp4_gemm_caller(Tensor& out, Tensor const& a, Tensor const& b, Tensor const& scale_a,
-    Tensor const& scale_b, Tensor const& alpha, bool fast_acc = false)
+    Tensor const& scale_b, Tensor const& alpha, std::optional<at::Tensor> const& bias, bool fast_acc = false)
 {
     int32_t m = a.sizes()[0];
     int32_t n = b.sizes()[0];
@@ -67,9 +67,22 @@ void cuda_core_nvfp4_gemm_caller(Tensor& out, Tensor const& a, Tensor const& b, 
     cudaDataType_t alphaType = convert_torch_dtype(alpha.scalar_type());
     TORCH_CHECK(alphaType == CUDA_R_32F);
 
+    void const* bias_ptr = nullptr;
+    if (bias.has_value())
+    {
+        auto const& bias_tensor = *bias;
+        CHECK_TH_CUDA(bias_tensor);
+        TORCH_CHECK(bias_tensor.device() == out.device(), "bias must reside on the same CUDA device as the output");
+        TORCH_CHECK(bias_tensor.is_contiguous(), "bias must be contiguous");
+        TORCH_CHECK(bias_tensor.dim() == 1, "bias must be 1-D");
+        TORCH_CHECK(bias_tensor.sizes()[0] == n, "bias size must equal n=", n);
+        TORCH_CHECK(bias_tensor.scalar_type() == out.scalar_type(), "bias dtype must match output dtype");
+        bias_ptr = bias_tensor.data_ptr();
+    }
+
     tensorrt_llm::kernels::cuda_core_gemm_nvfp4::Params params(a_ptr, b_ptr, out_ptr, m, n, k,
         reinterpret_cast<__nv_fp8_e4m3 const*>(a_scale), reinterpret_cast<__nv_fp8_e4m3 const*>(b_scale), aType,
-        outType, reinterpret_cast<float const*>(alpha_ptr));
+        outType, reinterpret_cast<float const*>(alpha_ptr), bias_ptr);
     bool dispatched = tensorrt_llm::kernels::cuda_core_gemm_nvfp4::cudaCoreGemmDispatcher(params, stream);
     TORCH_CHECK(dispatched, "Failed to dispatch cudaCoreGemmLauncher");
 }
@@ -94,12 +107,10 @@ Tensor& cuda_core_nvfp4_gemm_out(Tensor const& mat_a, Tensor const& mat_b, Tenso
     TORCH_CHECK(mat_a.sizes()[1] == mat_b.sizes()[1]);
     TORCH_CHECK(mat_b.sizes()[0] == out.sizes()[1]);
 
-    TORCH_CHECK(!bias.has_value(), "bias is not support yet");
-
     TORCH_CHECK(scale_a.dtype() == SF_DTYPE);
     TORCH_CHECK(scale_b.dtype() == SF_DTYPE);
 
-    cuda_core_nvfp4_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, alpha, true);
+    cuda_core_nvfp4_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, alpha, bias, true);
     return out;
 }
 

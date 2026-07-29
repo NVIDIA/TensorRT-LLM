@@ -27,6 +27,7 @@ server_configs:
   - name: "v3lite_fp8_bs1_128_128"
     model_name: "deepseek_v3_lite_fp8"
     tensor_parallel_size: 1
+    trust_remote_code: true
     max_batch_size: 1
     max_num_tokens: 256
     moe_config:
@@ -49,6 +50,7 @@ server_configs:
   - name: "v3lite_fp8_bs8_128_256"
     model_name: "deepseek_v3_lite_fp8"
     tensor_parallel_size: 1
+    trust_remote_code: true
     max_batch_size: 8
     max_num_tokens: 2048
     moe_config:

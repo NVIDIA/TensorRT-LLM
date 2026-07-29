@@ -1,8 +1,23 @@
 """Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
 
+import os
 import random
 import time
 import uuid
+
+# Force a deterministic UCX config regardless of what the cluster/CI injects
+# (the CI agent bootstrap exports UCX_TLS=tcp,cuda_copy,cuda_ipc before pytest
+# starts, which a setdefault would leave in place): exclude IB (no fabric
+# assumed) and gdr_copy (UCX rcache SIGABRT at teardown).
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+# Each NIXL agent spawns TRTLLM_NIXL_NUM_THREADS (default 8) busy-polling
+# progress threads, and a single case builds up to 8 TransferWorkers (one per
+# rank). On CI nodes shared with other single-GPU jobs the resulting CPU
+# oversubscription inflates agent construction from ~3s to ~30s each, blowing
+# the 120s per-test timeout intermittently (https://nvbugs/6426834). One
+# progress thread is enough here: these tests verify transfer logic, not
+# transfer-engine threading.
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -11,6 +26,7 @@ import pytest
 import torch
 
 import tensorrt_llm
+import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
@@ -24,14 +40,23 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
+
+# Default to 4 worker threads for all KV transfer tests in this module.
+KV_TRANSFER_TEST_NUM_THREADS = 4
+
+
+@pytest.fixture(autouse=True)
+def _set_kv_transfer_num_threads(monkeypatch):
+    monkeypatch.setattr(transfer_mod, "KV_TRANSFER_NUM_THREADS", KV_TRANSFER_TEST_NUM_THREADS)
 
 
 @dataclass
@@ -44,14 +69,22 @@ class KvCacheConfigV2:
     sink_token_length: Optional[int] = None
     free_gpu_memory_fraction: Optional[float] = None
     host_cache_size: Optional[int] = None
+    disk_cache_size: Optional[int] = None
+    disk_cache_path: Optional[str] = None
     cross_kv_cache_fraction: Optional[float] = None
     secondary_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
+    kv_cache_event_hash_algo: str = "auto"
 
     max_gpu_total_bytes: Optional[int] = None
     enable_partial_reuse: bool = False
     copy_on_partial_reuse: bool = False
     dtype: str = "auto"
+    disk_prefetch_num_reqs: int = 4
+    pool_ratio: Optional[List[float]] = None
+    avg_seq_len: Optional[int] = None
+    block_reuse_policy: str = "all_reusable"
+    enable_swa_scratch_reuse: bool = False
     # V2 specific field
     max_util_for_resume: float = 0.95
 
@@ -488,7 +521,15 @@ def get_block_data(
     """Unified block data retrieval for both V1 and V2 KVCacheManager."""
     if use_v2:
         layer_grouping = kv_cache_manager.impl.layer_grouping
-        local_layer_indices = layer_grouping[layer_group_id]
+        # Read layers in ascending global-layer order so this verification does
+        # not depend on the KV-cache manager's internal layer_grouping order
+        # (an implementation detail, not an API contract). The merge below packs
+        # ranks at ascending layer offsets, so the per-rank stack must also be
+        # ascending by global layer.
+        local_layer_indices = sorted(
+            layer_grouping[layer_group_id],
+            key=lambda lid: kv_cache_manager.pp_layers[lid],
+        )
 
         all_layer_data = []
         for local_layer_idx in local_layer_indices:
@@ -1064,14 +1105,13 @@ def test_transfer_with_gen_prefix_offset(use_v2):
     """Verify that only suffix blocks are transferred when gen has a prefix offset.
 
     Simulates gen-side prefix cache: ctx sends all blocks for [0, request_len),
-    gen only provides suffix block IDs with start_token_idx > 0.
-    _align_kv_blocks should align correctly so only the suffix data is written.
+    gen only provides the suffix block list. The receiver-side prefix is
+    implicit in the block count; the sender derives dst_start from it.
     """
     tensorrt_llm.logger.set_level("info")
     tokens_per_block = 8
     request_len = 32  # 4 blocks
     prefix_blocks = 2  # gen has 2 blocks already cached
-    prefix_tokens = prefix_blocks * tokens_per_block
 
     setup = create_transfer_worker_setup(
         ctx_tp=1,
@@ -1158,12 +1198,12 @@ def test_transfer_with_gen_prefix_offset(use_v2):
             token_range=TokenRange(start=0, end=request_len),
         )
 
-        # Gen receives only suffix blocks with start_token_idx offset
+        # Gen receives only the suffix list; dst_start is derived from block count.
         rx = gen_tw.create_rx_session(gen_request)
         recv_slice = KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=gen_suffix_block_ids,
-            token_range=TokenRange(start=prefix_tokens, end=request_len),
+            token_range=TokenRange(start=0, end=request_len),
         )
         rx.receive(recv_slice)
         tx.send(send_slice)

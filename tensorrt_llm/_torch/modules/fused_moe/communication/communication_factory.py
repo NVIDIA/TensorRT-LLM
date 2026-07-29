@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,10 +28,12 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
 
+from ..wide_ep_ft import get_wide_ep_ft_options
 from .allgather_reducescatter import AllGatherReduceScatter
 from .base import Communication
 from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
+from .nccl_ep import NcclEP
 from .nvlink_one_sided import NVLinkOneSided
 from .nvlink_two_sided import NVLinkTwoSided
 from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
@@ -67,6 +69,7 @@ class CommunicationFactory:
         2. Auto-selection (tries in order):
            - NVLinkOneSided (highest priority for throughput)
            - NVLinkTwoSided (high priority for latency)
+           - NcclEP (if nccl-ep is available)
            - DeepEP (if enabled via TRTLLM_CAN_USE_DEEP_EP)
            - DeepEPLowLatency (if enabled via TRTLLM_CAN_USE_DEEP_EP)
            - AllGather + ReduceScatter (fallback, always works)
@@ -129,10 +132,13 @@ class CommunicationFactory:
             )
 
         # Auto-selection: Try strategies in priority order using try-catch
-        # Priority: NVLinkOneSided > NVLinkTwoSided > DeepEP > DeepEPLowLatency > AllGather
+        # Priority: NVLinkOneSided > NVLinkTwoSided > NcclEP > DeepEP > DeepEPLowLatency > AllGather
 
         try:
             enable_eplb = model_config.moe_load_balancer is not None
+            ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
+                model_config
+            )
             strategy = NVLinkOneSided(
                 mapping,
                 num_slots,
@@ -143,11 +149,22 @@ class CommunicationFactory:
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
                 use_low_precision_combine=use_low_precision_combine,
+                ep_group_health=ep_group_health,
+                alltoall_watchdog_timeout_s=watchdog_timeout_s,
+                alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
             return strategy
         except Exception as e:
             logger.info(f"NVLinkOneSided not available: {e}")
+
+        # Non-divisible EP: NVLinkTwoSided and DeepEP require num_experts % ep_size == 0.
+        if num_experts % mapping.moe_ep_size != 0:
+            logger.info(
+                f"Non-divisible EP (num_experts={num_experts}, ep_size={mapping.moe_ep_size}): "
+                "falling back to AllGatherReduceScatter"
+            )
+            return AllGatherReduceScatter(mapping)
 
         try:
             if use_flashinfer:
@@ -172,6 +189,34 @@ class CommunicationFactory:
             return strategy
         except Exception as e:
             logger.info(f"NVLinkTwoSided not available: {e}")
+
+        # Try NCCL EP (rank-major LL). Falls through to DeepEP/AllGather if
+        # prerequisites are not met or libnccl_ep.so is not available.
+        nccl_ep_unavailable_reason = CommunicationFactory._get_nccl_ep_unavailable_reason(
+            act_dtype,
+            quant_config,
+            num_slots,
+            hidden_size,
+            max_num_tokens,
+            moe_max_num_tokens,
+            top_k,
+        )
+        if nccl_ep_unavailable_reason is None:
+            try:
+                strategy = NcclEP(
+                    mapping,
+                    num_slots,
+                    hidden_size,
+                    max_num_tokens,
+                    moe_max_num_tokens,
+                    top_k=top_k,
+                )
+                logger.info("Selected communication strategy: NcclEP")
+                return strategy
+            except RuntimeError as e:
+                logger.debug(f"NcclEP not available: {e}")
+        else:
+            logger.debug(f"NcclEP not available: {nccl_ep_unavailable_reason}")
 
         # Try DeepEP (if enabled and weight dtype is bfloat16)
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "1") == "1" and act_dtype == torch.bfloat16:
@@ -246,6 +291,15 @@ class CommunicationFactory:
 
         method = method.upper()
 
+        # Whitelist check: non-divisible EP only supports NVLinkOneSided and AllGather.
+        _NONDIVISIBLE_EP_ALLOWED = {"NVLINK_ONE_SIDED", "ALLGATHER"}
+        if num_experts % mapping.moe_ep_size != 0 and method not in _NONDIVISIBLE_EP_ALLOWED:
+            raise ValueError(
+                f"Communication method '{method}' requires num_experts % ep_size == 0, "
+                f"but got num_experts={num_experts}, ep_size={mapping.moe_ep_size}. "
+                f"Allowed methods for non-divisible EP: {sorted(_NONDIVISIBLE_EP_ALLOWED)}"
+            )
+
         # Create strategy - will raise RuntimeError if platform not supported
         if method in ["NVLINK_TWO_SIDED"]:
             if use_flashinfer:
@@ -268,6 +322,9 @@ class CommunicationFactory:
                 )
         elif method in ["NVLINK_ONE_SIDED"]:
             enable_eplb = model_config.moe_load_balancer is not None
+            ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
+                model_config
+            )
             return NVLinkOneSided(
                 mapping,
                 num_slots,
@@ -278,6 +335,9 @@ class CommunicationFactory:
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
                 use_low_precision_combine=use_low_precision_combine,
+                ep_group_health=ep_group_health,
+                alltoall_watchdog_timeout_s=watchdog_timeout_s,
+                alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
             )
         elif method == "DEEPEP":
             return DeepEP(
@@ -301,7 +361,56 @@ class CommunicationFactory:
                 use_low_precision_combine,
                 moe_max_num_tokens,
             )
+        elif method == "NCCL_EP":
+            nccl_ep_unavailable_reason = CommunicationFactory._get_nccl_ep_unavailable_reason(
+                act_dtype,
+                quant_config,
+                num_slots,
+                hidden_size,
+                max_num_tokens,
+                moe_max_num_tokens,
+                top_k,
+            )
+            if nccl_ep_unavailable_reason is not None:
+                raise ValueError(nccl_ep_unavailable_reason)
+            return NcclEP(
+                mapping,
+                num_slots,
+                hidden_size,
+                max_num_tokens,
+                moe_max_num_tokens,
+                top_k=top_k,
+            )
         elif method == "ALLGATHER":
             return AllGatherReduceScatter(mapping)
         else:
             raise ValueError(f"Unknown communication method: {method}")
+
+    @staticmethod
+    def _get_nccl_ep_unavailable_reason(
+        act_dtype: torch.dtype,
+        quant_config,
+        num_slots: int,
+        hidden_size: int,
+        max_num_tokens: int,
+        moe_max_num_tokens: Optional[int],
+        top_k: int,
+    ) -> Optional[str]:
+        if act_dtype != torch.bfloat16:
+            return f"NcclEP requires act_dtype=torch.bfloat16, got {act_dtype}."
+        if quant_config is not None:
+            quant_mode = getattr(quant_config, "layer_quant_mode", None)
+            if quant_mode is not None and quant_mode.has_any_quant(exclude_kv_cache=True):
+                return "NcclEP v0.1 does not support quantized MoE communication."
+        if num_slots <= 0 or hidden_size <= 0 or max_num_tokens <= 0:
+            return (
+                "NcclEP requires positive num_slots, hidden_size, and max_num_tokens, got "
+                f"{num_slots=}, {hidden_size=}, {max_num_tokens=}."
+            )
+        if moe_max_num_tokens is not None and moe_max_num_tokens <= 0:
+            return (
+                f"NcclEP requires moe_max_num_tokens > 0 when provided, got {moe_max_num_tokens}."
+            )
+        if top_k <= 0 or top_k > num_slots:
+            return f"NcclEP requires 0 < top_k <= num_slots, got {top_k=}, {num_slots=}."
+        return None

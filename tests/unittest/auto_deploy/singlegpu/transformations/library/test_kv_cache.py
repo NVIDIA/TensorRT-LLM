@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from types import SimpleNamespace
 from typing import List, Optional
 from unittest.mock import MagicMock
@@ -12,7 +26,10 @@ import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 
 # Initialize resources first (KVPagedResourceHandler is used within tests below)
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import KVPagedResourceHandler
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
+    AttentionType,
+    KVPagedResourceHandler,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.factory import (
     FullModelExportInfo,
@@ -300,8 +317,8 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
             x.flatten().tolist(),
             cu_seqlen=cu_seqlen,
             input_pos=input_pos,
-            cache_loc=list(range(bs)),
-            cu_num_pages=list(range(bs + 1)),
+            cache_loc_per_pool=[list(range(bs))],
+            cu_num_pages_per_pool=[list(range(bs + 1))],
             slot_idx=list(range(bs)),
             gather_context_logits=True,
         )
@@ -420,7 +437,7 @@ def test_insert_cached_attention_lowers_semantic_mask_for_torch_backend():
 
 
 @torch.inference_mode()
-def test_insert_cached_attention_lowers_semantic_mask_for_triton_paged_backend():
+def test_insert_cached_attention_lowers_semantic_mask_for_triton_backend():
     model = SpanMaskedAttentionModel().eval()
     input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
     position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).repeat(input_ids.shape[0], 1)
@@ -445,7 +462,7 @@ def test_insert_cached_attention_lowers_semantic_mask_for_triton_paged_backend()
         {
             "insert_cached_attention": {
                 "stage": "cache_init",
-                "backend": "triton_paged",
+                "backend": "triton",
             },
         },
     )(cm, gm)
@@ -457,7 +474,7 @@ def test_insert_cached_attention_lowers_semantic_mask_for_triton_paged_backend()
     cached_nodes = [
         node
         for node in gm_transformed.graph.nodes
-        if is_op(node, torch.ops.auto_deploy.triton_paged_mha_with_cache)
+        if is_op(node, torch.ops.auto_deploy.triton_mha_with_cache)
     ]
     assert len(cached_nodes) == 1
     assert is_op(cached_nodes[0].args[-1], torch.ops.auto_deploy.gemma4_prepare_multimodal_mask)
@@ -489,7 +506,7 @@ def test_insert_cached_attention_rejects_unsupported_semantic_mask_backend():
         RuntimeError,
         match=(
             "Cached attention backend 'flashinfer' does not support lowering semantic mask op"
-            ".*gemma4_multimodal_mask.*Supported backends: torch, triton_paged"
+            ".*gemma4_multimodal_mask.*Supported backends: torch, triton"
         ),
     ):
         InferenceOptimizer(
@@ -539,7 +556,8 @@ def test_initialize_cache_transform_calls_initialize_resources(dummy_cached_inte
     )
 
     dummy_cached_interface.add_resource(
-        "kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16)
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
     )
 
     # Mock the factory and shared_config
@@ -560,7 +578,8 @@ def test_initialize_cache_transform_calls_initialize_resources(dummy_cached_inte
 def test_resize_kv_cache_transform_skipped_when_not_needed(dummy_cached_interface):
     """Verify ResizeKVCache transform is skipped when resize not needed."""
     dummy_cached_interface.add_resource(
-        "kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16)
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
     )
     dummy_cached_interface.initialize_resources()
 
@@ -601,7 +620,10 @@ def test_resize_kv_cache_transform_runs_when_needed():
         kv_cache_config=kv_cache_config,
     )
 
-    cm.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    cm.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     cm.initialize_resources()
 
     # Create the transform with a proper config
@@ -692,10 +714,10 @@ def test_insert_cached_attention_uses_add_resource():
 
     # Verify resources were added
     assert len(cm._resource_lookup) > 0
-    # Should have k_cache and v_cache resources registered
+    # Triton attention registers one combined paged KV cache resource.
     resource_names = list(cm._resource_lookup.keys())
-    assert any("k_cache" in name for name in resource_names)
-    assert any("v_cache" in name for name in resource_names)
+    assert any(name.endswith("kv_cache") for name in resource_names)
+    assert any(handler.is_paged for handler in cm._resource_lookup.values())
 
 
 def test_insert_cached_attention_passes_kv_cache_config():
@@ -770,9 +792,7 @@ def test_insert_cached_attention_passes_kv_cache_config():
     # Initialize resources
     cm.initialize_resources()
 
-    assert not any(handler.is_paged for handler in cm._resource_lookup.values()), (
-        "triton should not use paged resources"
-    )
+    assert any(handler.is_paged for handler in cm._resource_lookup.values())
     assert cm._caches, "at least some resources should be present"
 
     # Verify cache dtype matches config
@@ -819,3 +839,457 @@ def test_insert_cached_mla_attention_preserves_non_flashinfer_backend():
     backend = InsertCachedMLAAttention.resolve_backend_for_node("torch_mla", attn_node)
 
     assert backend == "torch_mla"
+
+
+# =============================================================================
+# Sliding Window KV Cache Integration Tests
+# =============================================================================
+
+
+class SlidingWindowGQA(GQAWithSdpaAndEmbedding):
+    """GQA model with a configurable per-layer sliding_window for testing."""
+
+    def __init__(
+        self,
+        num_attention_heads: int,
+        hidden_size: int,
+        num_key_value_heads: int,
+        vocab_size: int = 1000,
+        sliding_window: Optional[int] = None,
+    ):
+        super().__init__(num_attention_heads, hidden_size, num_key_value_heads, vocab_size)
+        self._sliding_window = sliding_window
+
+    @torch.no_grad()
+    def forward(
+        self, input_ids: torch.Tensor, position_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        x = self.embed_tokens(input_ids)
+        b, s, _ = x.shape
+        q = self.q_proj(x).view(b, s, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(b, s, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(b, s, self.num_kv_heads, self.head_dim)
+        attn_output = torch.ops.auto_deploy.torch_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=None,
+            sinks=None,
+            sliding_window=self._sliding_window,
+            logit_cap=None,
+            layout="bsnd",
+        )
+        return self.o_proj(attn_output.reshape(b, s, -1))
+
+
+class VSWAModel(nn.Module):
+    """Model with two attention layers: one sliding-window, one full-attention (VSWA)."""
+
+    def __init__(
+        self,
+        num_attention_heads: int,
+        hidden_size: int,
+        num_key_value_heads: int,
+        vocab_size: int = 1000,
+        sliding_window: int = 32,
+    ):
+        super().__init__()
+        self.num_heads = num_attention_heads
+        self.num_kv_heads = num_key_value_heads
+        self.head_dim = hidden_size // num_attention_heads
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.q_proj_0 = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj_0 = nn.Linear(hidden_size, num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj_0 = nn.Linear(hidden_size, num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj_0 = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.q_proj_1 = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj_1 = nn.Linear(hidden_size, num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj_1 = nn.Linear(hidden_size, num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj_1 = nn.Linear(hidden_size, hidden_size, bias=False)
+        self._sliding_window = sliding_window
+
+    @torch.no_grad()
+    def forward(
+        self, input_ids: torch.Tensor, position_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        x = self.embed_tokens(input_ids)
+        b, s, _ = x.shape
+
+        # Layer 0: sliding window attention
+        q0 = self.q_proj_0(x).view(b, s, self.num_heads, self.head_dim)
+        k0 = self.k_proj_0(x).view(b, s, self.num_kv_heads, self.head_dim)
+        v0 = self.v_proj_0(x).view(b, s, self.num_kv_heads, self.head_dim)
+        a0 = torch.ops.auto_deploy.torch_attention(
+            q0,
+            k0,
+            v0,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=None,
+            sinks=None,
+            sliding_window=self._sliding_window,
+            logit_cap=None,
+            layout="bsnd",
+        )
+        x = x + self.o_proj_0(a0.reshape(b, s, -1))
+
+        # Layer 1: full attention (no sliding window)
+        q1 = self.q_proj_1(x).view(b, s, self.num_heads, self.head_dim)
+        k1 = self.k_proj_1(x).view(b, s, self.num_kv_heads, self.head_dim)
+        v1 = self.v_proj_1(x).view(b, s, self.num_kv_heads, self.head_dim)
+        a1 = torch.ops.auto_deploy.torch_attention(
+            q1,
+            k1,
+            v1,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=None,
+            sinks=None,
+            sliding_window=None,
+            logit_cap=None,
+            layout="bsnd",
+        )
+        return x + self.o_proj_1(a1.reshape(b, s, -1))
+
+
+def _build_optimizer_with_backend(model, backend="triton"):
+    """Helper to create an InferenceOptimizer for testing."""
+    return InferenceOptimizer(
+        DummyFactory(model, cache_config_updates={}),
+        {
+            "build_model": {
+                "stage": "factory",
+                "run_per_gm": False,
+                "device": "cuda",
+                "run_graph_cleanup": False,
+                "requires_clean_graph": False,
+            },
+            "export_to_gm": {
+                "stage": "export",
+                "strict": False,
+                "run_per_gm": False,
+                "clone_state_dict": True,
+                "run_graph_cleanup": False,
+                "requires_clean_graph": False,
+            },
+            "cleanup_input_constraints": {
+                "stage": "post_export",
+            },
+            "insert_cached_attention": {
+                "stage": "cache_init",
+                "backend": backend,
+            },
+        },
+    )
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_no_sliding_window_leaves_config_unchanged():
+    """Verify insert_cached_attention does not set max_attention_window for non-SWA models."""
+    max_seq_len = 128
+    batch_size = 4
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=max_seq_len,
+        max_tokens=batch_size * max_seq_len,
+        free_gpu_memory_fraction=0.0,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+    )
+
+    model = GQAWithSdpaAndEmbedding(
+        num_attention_heads=8,
+        hidden_size=512,
+        num_key_value_heads=8,
+    ).to(dtype=torch.float16, device="cuda")
+
+    optimizer = _build_optimizer_with_backend(model)
+    optimizer(cm)
+
+    assert cm.kv_cache_config.max_attention_window is None
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_respects_user_override():
+    """Verify insert_cached_attention does not overwrite user-set max_attention_window."""
+    max_seq_len = 128
+    batch_size = 4
+    user_window = [64]
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=max_seq_len,
+        max_tokens=batch_size * max_seq_len,
+        free_gpu_memory_fraction=0.0,
+        max_attention_window=user_window,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+    )
+
+    model = SlidingWindowGQA(
+        num_attention_heads=8,
+        hidden_size=512,
+        num_key_value_heads=8,
+        sliding_window=32,
+    ).to(dtype=torch.float16, device="cuda")
+
+    optimizer = _build_optimizer_with_backend(model)
+    optimizer(cm)
+
+    # User-provided value must be preserved
+    assert cm.kv_cache_config.max_attention_window == user_window
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_vswa_preserves_per_layer_windows():
+    """Verify VSWA model preserves per-layer window sizes for proportional allocation."""
+    sliding_window = 32
+    max_seq_len = 128
+    batch_size = 4
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=32,
+        max_tokens=batch_size * max_seq_len,
+        free_gpu_memory_fraction=0.0,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+    )
+
+    model = VSWAModel(
+        num_attention_heads=8,
+        hidden_size=512,
+        num_key_value_heads=8,
+        sliding_window=sliding_window,
+    ).to(dtype=torch.float16, device="cuda")
+
+    optimizer = _build_optimizer_with_backend(model)
+    optimizer(cm)
+
+    # VSWA preserves per-layer windows: [32, 128] (not collapsed)
+    assert cm.kv_cache_config.max_attention_window is not None
+    assert len(cm.kv_cache_config.max_attention_window) == 2
+    assert cm.kv_cache_config.max_attention_window == [sliding_window, max_seq_len]
+
+    # Window groups should be registered on SequenceInfo
+    assert cm.info.num_window_groups == 2
+    assert cm.info.window_groups == [sliding_window, max_seq_len]
+    assert cm.info.window_group_map == {sliding_window: 0, max_seq_len: 1}
+
+
+@torch.inference_mode()
+def test_kv_cache_manager_initialized_with_sliding_window():
+    """Verify KVCacheManager receives max_attention_window_vec from SWA model.
+
+    Runs the full insert_cached_attention + initialize_cache pipeline.
+    """
+    import math
+
+    sliding_window = 32
+    max_seq_len = 128
+    batch_size = 4
+    tokens_per_block = 16
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=tokens_per_block,
+        max_tokens=batch_size * max_seq_len,
+        free_gpu_memory_fraction=0.0,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+    )
+
+    model = SlidingWindowGQA(
+        num_attention_heads=8,
+        hidden_size=512,
+        num_key_value_heads=8,
+        sliding_window=sliding_window,
+    ).to(dtype=torch.float16, device="cuda")
+
+    # Run insert_cached_attention + initialize_cache
+    optimizer = InferenceOptimizer(
+        DummyFactory(model, cache_config_updates={}),
+        {
+            "build_model": {
+                "stage": "factory",
+                "run_per_gm": False,
+                "device": "cuda",
+                "run_graph_cleanup": False,
+                "requires_clean_graph": False,
+            },
+            "export_to_gm": {
+                "stage": "export",
+                "strict": False,
+                "run_per_gm": False,
+                "clone_state_dict": True,
+                "run_graph_cleanup": False,
+                "requires_clean_graph": False,
+            },
+            "cleanup_input_constraints": {
+                "stage": "post_export",
+            },
+            "insert_cached_attention": {
+                "stage": "cache_init",
+                "backend": "triton",
+            },
+            "initialize_cache": {
+                "stage": "cache_init",
+                "run_per_gm": False,
+            },
+        },
+    )
+    optimizer(cm)
+
+    # KVCacheManager should exist and carry the window vector
+    mgr = cm.kv_cache_manager
+    assert mgr.max_attention_window_vec == [sliding_window]
+
+    # max_blocks_per_seq is based on max_seq_len (not window) because sequences
+    # temporarily need full blocks during prefill; SWA eviction frees them during decode.
+    expected_max_blocks = math.ceil(max_seq_len / tokens_per_block)
+    assert cm.info.max_blocks_per_seq == expected_max_blocks
+
+
+# =============================================================================
+# VSWA SequenceInfo and Graph Wiring Tests
+# =============================================================================
+
+
+@torch.inference_mode()
+def test_sequence_info_register_window_groups():
+    """Verify register_window_groups creates per-group tensors in InputBuffer."""
+    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
+
+    max_seq_len = 128
+    batch_size = 4
+    tokens_per_block = 16
+
+    seq_info = SequenceInfo(
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
+        tokens_per_block=tokens_per_block,
+    )
+
+    # Before registration: no window groups
+    assert seq_info.num_window_groups == 0
+    assert seq_info.window_groups == []
+
+    # Register two groups: [32, 128]
+    seq_info.register_window_groups([32, 128])
+
+    assert seq_info.num_window_groups == 2
+    assert seq_info.window_groups == [32, 128]
+    assert seq_info.window_group_map == {32: 0, 128: 1}
+
+    # Group 0 reuses existing tensors (cache_loc, cu_num_pages, etc.)
+    # Group 1 gets new tensors
+    assert "cache_loc_g1" in seq_info.available_args
+    assert "cu_num_pages_g1" in seq_info.available_args
+    assert "cu_num_pages_g1_host" in seq_info.available_args
+    assert "last_page_len_g1" in seq_info.available_args
+    assert "last_page_len_g1_host" in seq_info.available_args
+    assert "extra_page_per_seq_g1" in seq_info.available_args
+
+    # Group 0 names should NOT appear with _g0 suffix
+    assert "cache_loc_g0" not in seq_info.available_args
+
+
+# ============================================================================
+# Speculative-only resource gating in the kvcache insert transform
+# ============================================================================
+# This is the core of nvbug 6261164: when spec decoding is off, the transform must drop
+# speculative-only handlers (intermediate SSM/conv state + replay buffers) to the None
+# sentinel BEFORE registering them, otherwise they leak an unmanaged per-layer allocation.
+# These CPU-only tests pin the gate decision directly so a regression (e.g. inverting the
+# spec_config check, or narrowing the set back to a hard-coded type tuple that misses the
+# replay family) is caught without the slow weights-dependent e2e smoke.
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (  # noqa: E402
+    CausalConvResourceHandler,
+    IntermediateConvStateHandler,
+    IntermediateSSMStateHandler,
+    ReplayCacheBufIdxHandler,
+    ReplayOldBHandler,
+    ReplayOldDAcumsumHandler,
+    ReplayOldDtHandler,
+    ReplayOldXHandler,
+    ReplayPrevNumAcceptedHandler,
+    SSMResourceHandler,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (  # noqa: E402
+    _InsertCachedOperator,
+)
+
+
+def _speculative_only_handlers():
+    """Fresh instances of every speculative-only handler (intermediate state + replay)."""
+    return [
+        IntermediateSSMStateHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
+        IntermediateConvStateHandler(conv_dim=128, d_conv=4, dtype=torch.float32),
+        ReplayOldXHandler(num_heads=4, head_dim=64, dtype=torch.bfloat16),
+        ReplayOldBHandler(n_groups=2, d_state=16, dtype=torch.bfloat16),
+        ReplayOldDtHandler(num_heads=4),
+        ReplayOldDAcumsumHandler(num_heads=4),
+        ReplayCacheBufIdxHandler(),
+        ReplayPrevNumAcceptedHandler(),
+    ]
+
+
+def _non_speculative_handlers():
+    """Fresh instances of base (non-speculative) handlers that must never be dropped."""
+    return [
+        SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
+        CausalConvResourceHandler(conv_dim=128, d_conv=4, dtype=torch.float32),
+        KVPagedResourceHandler(
+            num_kv_heads=4, head_dim=64, dtype=torch.bfloat16, attention_type=AttentionType.mha
+        ),
+    ]
+
+
+def test_gate_when_spec_off():
+    """Spec decoding off: speculative-only handlers are dropped to None; base handlers are kept."""
+    # Dropped: every speculative-only handler becomes the None sentinel (never registered).
+    for handler in _speculative_only_handlers():
+        result = _InsertCachedOperator._suppress_spec_handlers_maybe(handler, None)
+        assert result is None, f"{type(handler).__name__} should be dropped when spec is off"
+
+    # Kept: base (non-speculative) handlers pass through unchanged.
+    for handler in _non_speculative_handlers():
+        result = _InsertCachedOperator._suppress_spec_handlers_maybe(handler, None)
+        assert result is handler, f"{type(handler).__name__} should be kept when spec is off"
+
+    # An existing None sentinel passes through unchanged.
+    assert _InsertCachedOperator._suppress_spec_handlers_maybe(None, None) is None
+
+
+def test_gate_when_spec_on():
+    """Spec decoding on: nothing is dropped — speculative-only AND base handlers are all kept."""
+    spec_config = object()  # any non-None spec config
+    for handler in _speculative_only_handlers() + _non_speculative_handlers():
+        result = _InsertCachedOperator._suppress_spec_handlers_maybe(handler, spec_config)
+        assert result is handler, f"{type(handler).__name__} should be kept when spec is on"
+
+    # The None sentinel passes through unchanged regardless of spec state.
+    assert _InsertCachedOperator._suppress_spec_handlers_maybe(None, spec_config) is None

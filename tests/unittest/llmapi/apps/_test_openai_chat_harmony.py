@@ -256,3 +256,52 @@ async def test_streaming_tool_call(client: openai.AsyncOpenAI, model: str):
     assert reasoning
     args = json.loads(tool_args)
     get_current_weather(**args)
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_prompt_token_ids_skips_retokenization(client: openai.AsyncOpenAI,
+                                                     model: str):
+    """Guard the disagg-style optimization that reuses pre-tokenized Harmony
+    tokens forwarded from the context worker via `request.prompt_token_ids`.
+
+    Strategy: locally tokenize a "France" prompt with the same HarmonyAdapter
+    the server would use, then submit a chat request whose `messages` say
+    something entirely different ("a joke about cats") but whose `prompt_token_ids`
+    encode the France prompt. If the server skips re-tokenization, the response
+    should reflect the token-id prompt (mention Paris) rather than the messages.
+    If a future refactor breaks the `if request.prompt_token_ids is not None`
+    branch, the response will follow `messages` instead and this assertion fails.
+    """
+    from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
+
+    france_messages = [{
+        "role":
+        "user",
+        "content":
+        "What is the capital of France? Reply with just the city name."
+    }]
+    decoy_messages = [{
+        "role": "user",
+        "content": "Tell me a long joke about cats."
+    }]
+
+    adapter = get_harmony_adapter()
+    france_tokens = adapter.openai_to_harmony_tokens(france_messages, None)
+    assert isinstance(france_tokens, list) and len(france_tokens) > 0
+
+    response = await client.chat.completions.create(
+        model=model,
+        messages=decoy_messages,
+        extra_body={
+            "prompt_token_ids": france_tokens,
+            "top_k": 1,
+        },
+    )
+    content = response.choices[0].message.content or ""
+    reasoning = response.choices[0].message.reasoning or ""
+    combined = f"{content}\n{reasoning}".lower()
+    assert "paris" in combined, (
+        "Expected the response to follow the pre-tokenized France prompt "
+        "(mention 'Paris'), suggesting the server bypassed the Harmony "
+        "adapter via `request.prompt_token_ids`. Got:\n"
+        f"content={content!r}\nreasoning={reasoning!r}")
