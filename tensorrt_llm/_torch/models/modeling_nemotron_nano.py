@@ -3,7 +3,7 @@ import copy
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -54,6 +54,9 @@ from .modeling_multimodal_utils import (
 from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from .modeling_radio import RADIOVisionModel, calc_seq_lens
 from .modeling_utils import register_auto_model, register_vision_encoder
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
@@ -239,6 +242,24 @@ class DynamicResolutionParams:
     num_tiles: int
     num_embeddings: int
     patch_size: Tuple[int, int]  # (width_patches, height_patches)
+
+
+def _get_vision_encoder_cuda_graph_config(
+    mm_config: Optional["MultimodalConfig"],
+) -> Optional["MultimodalEncoderCudaGraphConfig"]:
+    if mm_config is None or mm_config.encoder_cuda_graph is None:
+        return None
+
+    # TODO: Add support for audio encoder CUDA graphs.
+    supported_modalities = {"vision"}
+    unknown_modalities = set(mm_config.encoder_cuda_graph) - supported_modalities
+    if unknown_modalities:
+        raise ValueError(
+            f"Unsupported multimodal encoder CUDA graph modalities: {sorted(unknown_modalities)}. "
+            f"Supported modalities: {sorted(supported_modalities)}."
+        )
+
+    return mm_config.encoder_cuda_graph.get("vision")
 
 
 class DynamicResolutionImageTiler:
@@ -481,7 +502,13 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         # Construct the vision encoder.
         vision_model_config = copy.deepcopy(model_config)
         vision_model_config.pretrained_config = vision_model_config.pretrained_config.vision_config
-        self.vision_model = RADIOVisionModel(vision_model_config, disable_quantization=True)
+        mm_config = model_config.multimodal_config
+        encoder_cuda_graph_config = _get_vision_encoder_cuda_graph_config(mm_config)
+        self.vision_model = RADIOVisionModel(
+            vision_model_config,
+            disable_quantization=True,
+            encoder_cuda_graph_config=encoder_cuda_graph_config,
+        )
 
     def load_weights(self, weights):
         # Load mlp1 weights.
@@ -497,6 +524,10 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             if k.startswith("vision_model.")
         }
         self.vision_model.load_weights(vision_encoder_weights)
+
+    def enable_radio_cuda_graph(self) -> None:
+        """Enable CUDA graph replay for RADIO transformer blocks."""
+        self.vision_model.enable_blocks_cuda_graph()
 
     @torch.compile
     def pixel_shuffle(self, x, scale_factor=0.5):
@@ -2606,6 +2637,16 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.video_context_token_id = config.video_context_token_id
         self.sound_context_token_id = getattr(config, "sound_context_token_id", None)
         self.post_config()
+        # Expose the in-vocab context tokens to the model engine so
+        # ``_prepare_multimodal_indices`` selects the torch.isin predicate
+        # instead of the OOV fallback. Without this, the executor produces
+        # empty mm_token_indices (img/sound IDs are < vocab_size), and the
+        # propagated indices then trip the count-equality check inside
+        # fuse_input_embeds against the encoder-provided rows.
+        _mm_token_ids = [self.img_context_token_id]
+        if self.sound_context_token_id is not None:
+            _mm_token_ids.append(self.sound_context_token_id)
+        self.mm_token_ids = torch.tensor(_mm_token_ids, dtype=torch.int32)
         self.is_loaded = True
         # Use config value if explicitly set (EVS enabled), otherwise default to 0.0 (EVS disabled)
         self.video_pruning_rate = (
@@ -2640,6 +2681,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         # Load vision encoder weights.
         if self.vision_encoder is not None:
             self.vision_encoder.load_weights(weights)
+            self.vision_encoder.enable_radio_cuda_graph()
 
         # Free vision encoder weights from the dict so the backing mmap pages can be released.
         if hasattr(weights, "mark_consumed"):
@@ -3149,14 +3191,13 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
             mm_embedding = find_input_mm_embeds(mm_embedding, ctx_params)
 
-        mm_token_ids_list = [self.img_context_token_id]
-        if self.sound_context_token_id is not None:
-            mm_token_ids_list.append(self.sound_context_token_id)
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
             mm_embedding,
-            mm_token_ids=torch.tensor(mm_token_ids_list, dtype=torch.int32),
+            mm_token_ids=self.mm_token_ids,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
 
         output_prob = self.llm.forward(

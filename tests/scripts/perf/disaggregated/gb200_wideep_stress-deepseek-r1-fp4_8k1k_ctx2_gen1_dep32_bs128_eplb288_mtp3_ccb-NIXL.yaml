@@ -41,7 +41,7 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
-  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 MIMALLOC_PURGE_DELAY=0 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 MIMALLOC_PURGE_DELAY=0 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes "
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false
@@ -97,6 +97,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 8448
       backend: NIXL
+      transceiver_runtime: PYTHON
     stream_interval: 20
     num_postprocess_workers: 4
     speculative_config:
@@ -121,6 +122,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 8448
       backend: NIXL
+      transceiver_runtime: PYTHON
     speculative_config:
       decoding_type: MTP
       num_nextn_predict_layers: 3

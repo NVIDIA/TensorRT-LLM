@@ -11,6 +11,13 @@
   "guidance_scale": 4.0,
   "seed": 42,
   "frame_rate": 24.0,
+  "torch_compile": false,
+  "deterministic_algorithms": true,
   "lpips_net": "alex",
-  "lpips_threshold": 0.05
+  "lpips_threshold": 0.05,
+  "diffusers_version": "0.38.0",
+  "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+  "tensorrt_llm_version": "1.3.0rc21",
+  "tensorrt_llm_commit": "87aeeffe38db433d718516e8c919dd65cc92eb0a",
+  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-26.04-py3-x86_64-ubuntu24.04-trt10.16.1.11-skip-tritondevel-202606292100-15694"
 }

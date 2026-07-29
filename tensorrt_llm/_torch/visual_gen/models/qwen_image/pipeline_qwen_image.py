@@ -486,6 +486,8 @@ class QwenImagePipeline(BasePipeline):
         # Denoise loop.
         timer.mark_denoise_start()
         logger.info("Denoising (%d steps)...", len(timesteps))
+        pipeline_config = getattr(self, "pipeline_config", None)
+        cuda_graph_enabled = getattr(getattr(pipeline_config, "cuda_graph", None), "enable", False)
         for i, t in enumerate(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
             noise_pred = self.transformer(
@@ -496,6 +498,11 @@ class QwenImagePipeline(BasePipeline):
                 img_shapes=img_shapes,
                 return_dict=False,
             )[0]
+
+            if do_true_cfg and cuda_graph_enabled:
+                # CUDA graph outputs are graph-owned buffers; the negative CFG
+                # replay may reuse the same pool before guidance consumes this one.
+                noise_pred = noise_pred.clone()
 
             if do_true_cfg:
                 neg_noise_pred = self.transformer(

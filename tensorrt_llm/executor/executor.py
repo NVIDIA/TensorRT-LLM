@@ -1,6 +1,8 @@
 import atexit
 import faulthandler
+import json
 import multiprocessing
+import os
 import platform
 import signal
 import traceback
@@ -20,7 +22,7 @@ from tensorrt_llm.logger import logger, set_level
 
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
-from ..builder import Engine
+from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
@@ -41,6 +43,7 @@ from .result import GenerationResult, IterationResult
 from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
 
 if TYPE_CHECKING:
+    from .._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
     from .proxy import GenerationExecutorProxy
     from .worker import GenerationExecutorWorker
 
@@ -134,6 +137,7 @@ class GenerationExecutor(ABC):
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[str] = None,
         arrival_time: Optional[float] = None,
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
@@ -164,6 +168,7 @@ class GenerationExecutor(ABC):
             trace_headers=trace_headers,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
+            conversation_params=conversation_params,
             cache_salt=cache_salt,
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
@@ -183,6 +188,7 @@ class GenerationExecutor(ABC):
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[Union[str, List[Optional[str]]]] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
@@ -218,6 +224,7 @@ class GenerationExecutor(ABC):
                 prompt_adapter_request=pa_req,
                 streaming=False,
                 disaggregated_params=disaggregated_params,
+                conversation_params=conversation_params,
                 cache_salt=cs)
             futures.append(future)
 
@@ -390,8 +397,8 @@ class GenerationExecutor(ABC):
         return self.postproc_config.enabled
 
     def get_stats(self, timeout: float) -> List[dict]:
-        """
-        Get iteration statistics from the runtime.
+        """Get iteration statistics from the runtime.
+
         Args:
             timeout (float): Max wait time in seconds when retrieving stats from queue.
         Returns:
@@ -406,9 +413,17 @@ class GenerationExecutor(ABC):
         self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result.get_results()
 
-    def aget_stats(self, timeout: float) -> IterationResult:
+    def get_kv_cache_capacity(self) -> dict:
+        """Get static primary/GPU KV cache capacity from the runtime.
+
+        Returns:
+            dict: Primary/GPU KV cache capacity.
         """
-        Get iteration statistics from the runtime.
+        return {}
+
+    def aget_stats(self, timeout: float) -> IterationResult:
+        """Get iteration statistics from the runtime.
+
         Returns:
             IterationResult: An async iterable object containing runtime stats.
         """
@@ -422,8 +437,8 @@ class GenerationExecutor(ABC):
         return self._iter_stats_result
 
     def get_kv_events(self, timeout: float) -> List[dict]:
-        """
-        Get iteration kv events from the runtime.
+        """Get iteration kv events from the runtime.
+
         Args:
             timeout (float): Max wait time in seconds when retrieving stats from queue.
         Returns:
@@ -435,8 +450,8 @@ class GenerationExecutor(ABC):
         return self._iter_kv_events_result.get_results()
 
     def aget_kv_events(self, timeout=None) -> IterationResult:
-        """
-        Get iteration kv events from the runtime.
+        """Get iteration kv events from the runtime.
+
         Args:
             timeout (float): Max wait time in seconds when retrieving stats from queue.
         Returns:
@@ -449,6 +464,12 @@ class GenerationExecutor(ABC):
 
     def get_disaggregated_params(self) -> dict:
         return {}
+
+    def get_cache_transceiver(self) -> Optional["KvCacheTransceiver"]:
+        return None
+
+    def get_data_transceiver_state(self) -> bytes:
+        return b""
 
     @staticmethod
     def _create_ray_executor(
@@ -516,7 +537,7 @@ class GenerationExecutor(ABC):
 
     @staticmethod
     def create(
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         model_world_size: int = 1,
@@ -547,6 +568,35 @@ class GenerationExecutor(ABC):
             logger_debug(
                 f"Using {postproc_worker_config.num_postprocess_workers} postprocess parallel processes.\n",
                 "green")
+
+        # Multi-frontend serving: attach to an already-running executor
+        # instead of launching one (set by trtllm-serve for attached
+        # frontend processes).
+        attach_env = os.getenv("TLLM_EXECUTOR_ATTACH_INFO")
+        if attach_env:
+            attach_info = json.loads(attach_env)
+            # Consumed: it carries the HMAC keys and must not leak into
+            # descendant processes.
+            os.environ.pop("TLLM_EXECUTOR_ATTACH_INFO", None)
+            if attach_info.get("mode") != "classic":
+                raise ValueError(
+                    "TLLM_EXECUTOR_ATTACH_INFO only supports the classic IPC "
+                    f"executor path, got mode={attach_info.get('mode')!r}")
+            from .proxy import GenerationExecutorFrontendProxy
+            frontend_id_env = os.getenv("TLLM_EXECUTOR_FRONTEND_ID")
+            if frontend_id_env is None:
+                raise ValueError(
+                    "TLLM_EXECUTOR_ATTACH_INFO is set but "
+                    "TLLM_EXECUTOR_FRONTEND_ID is not; both are set together "
+                    "by trtllm-serve when spawning attached frontends.")
+            frontend_id = int(frontend_id_env)
+            logger.info(f"Attaching executor frontend {frontend_id} to the "
+                        "running classic IPC worker")
+            return GenerationExecutorFrontendProxy(
+                attach_info,
+                frontend_id=frontend_id,
+                postproc_worker_config=postproc_worker_config,
+                is_llm_executor=is_llm_executor)
 
         worker_kwargs = {
             "engine": engine,
@@ -639,7 +689,7 @@ class GenerationExecutor(ABC):
             return GenerationExecutor._create_ipc_executor(
                 worker_kwargs,
                 model_world_size=model_world_size,
-                mpi_session=None,  # use mpi4py
+                mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
                 use_worker=False)
@@ -649,13 +699,17 @@ class GenerationExecutor(ABC):
             mpi_session = ProcessPoolExecutorSession(n_workers=1,
                                                      mp_context=ctx)
             # TODO: add rpc worker here
-            return GenerationExecutor._create_ipc_executor(
+            executor = GenerationExecutor._create_ipc_executor(
                 worker_kwargs,
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
                 use_worker=False)
+            # The session was created right here with no outer owner, so the
+            # proxy must shut it down despite it arriving as "external".
+            executor._owns_mpi_session = True
+            return executor
 
     def wait_first_completed(
         self, futures: List[GenerationResult]

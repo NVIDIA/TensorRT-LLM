@@ -81,7 +81,7 @@ class CudaGraphLoraManager:
         )
 
         # Pre-size routed-expert MoE-LoRA scratch on every MoE layer so the
-        # capture-safe device path never (re)allocates during graph capture.
+        # capture-safe grouped-GEMM core never (re)allocates during graph capture.
         # See CutlassFusedMoE.reserve_moe_lora_cuda_graph_workspace.
         self._reserve_moe_lora_workspaces(model)
 

@@ -49,7 +49,7 @@ make all
 
 ### Debug Mode
 
-Set `TLLM_KV_CACHE_MANAGER_V2_DEBUG=1` to enable debug assertions (`NDEBUG=False`). Default is release mode (`NDEBUG=True`).
+Set `TLLM_DEBUG_MODE=1` to enable debug assertions (`NDEBUG=False`). Default is release mode (`NDEBUG=True`).
 
 ## Architecture
 

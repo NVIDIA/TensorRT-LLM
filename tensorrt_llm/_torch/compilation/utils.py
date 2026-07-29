@@ -1,5 +1,5 @@
 import contextlib
-from typing import Callable, List, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 from torch.fx import Node
@@ -31,6 +31,13 @@ def is_call_function(node: Node, target: Union[List[Callable], Callable]):
         return node.op == "call_function" and node.target in target
     else:
         return node.op == "call_function" and node.target == target
+
+
+def get_optional_trtllm_op(op_name: str) -> Optional[Callable]:
+    try:
+        return getattr(torch.ops.trtllm, op_name).default
+    except AttributeError:
+        return None
 
 
 _enable_piecewise_cuda_graph_capture = False
@@ -66,15 +73,9 @@ def inplace_info():
             1: "out",
             2: "residual"
         },
-        torch.ops.trtllm.attn_custom_op_inplace.default: {
-            1: "output",
-            2: "output_sf"
-        },
-        torch.ops.trtllm.mla_custom_op_inplace.default: {
-            1: "output"
-        },
-        torch.ops.trtllm.mla_dsa_attn_inplace.default: {
-            1: "output"
+        torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8.default: {
+            1: "quant_q_out",
+            2: "q_pe_out"
         },
         torch.ops.trtllm.fused_qk_norm_rope.default: {
             1: "qkv"
@@ -102,6 +103,12 @@ def inplace_info():
         torch.ops.trtllm.moe_output_memset_inplace.default: {
             1: "input"
         },
+        torch.ops.trtllm.megamoe_prepare.default: {
+            1: "x_out",
+            2: "x_sf_out",
+            3: "topk_idx_out",
+            4: "topk_weights_out"
+        },
         torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell.default:
         {
             1: "output"
@@ -121,10 +128,77 @@ def inplace_info():
         torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell.default: {
             1: "output"
         },
+        torch.ops.trtllm.compressor_paged_kv_compress.default: {
+            1: "paged_kv",
+            2: "paged_score",
+            3: "output"
+        },
+        torch.ops.trtllm.compressor_prefill_reduction.default: {
+            1: "paged_kv",
+            2: "paged_score",
+            3: "output"
+        },
+        torch.ops.trtllm.compressor_postprocess_scatter.default: {
+            1: "kv_out",
+            2: "kv_cache",
+            3: "quant_output",
+            4: "scale_output"
+        },
+        torch.ops.trtllm.mhc_big_fuse.default: {
+            1: "post_mix",
+            2: "comb_mix",
+            3: "layer_input"
+        },
+        torch.ops.trtllm.mhc_gemm_sqrsum_fma.default: {
+            1: "y",
+            2: "r"
+        },
+        torch.ops.trtllm.mhc_hc_head_apply.default: {
+            1: "out"
+        },
+        torch.ops.trtllm.mhc_post_mapping.default: {
+            1: "out"
+        },
+        torch.ops.trtllm.mhc_fused_hc.default: {
+            1: "residual_cur",
+            2: "post_mix_cur",
+            3: "comb_mix_cur",
+            4: "layer_input_cur",
+            5: "y_acc_workspace",
+            6: "r_acc_workspace",
+            7: "done_counter_workspace"
+        },
         torch.ops.trtllm.inplace_slice_copy.default: {
             1: "dest"
+        },
+        torch.ops.trtllm.verify_dynamic_tree_rejection_out_op.default: {
+            5: "acceptIndex",
+            6: "acceptTokenNum",
+            7: "acceptToken"
         }
     }
+    optional_inplace_infos = {
+        "attn_custom_op_inplace": {
+            1: "output",
+            2: "output_sf"
+        },
+        "mla_custom_op_inplace": {
+            1: "output"
+        },
+        "mla_dsa_attn_inplace": {
+            1: "output"
+        },
+        "gdn_custom_op_inplace": {
+            1: "output"
+        },
+        "minimax_m3_attn_custom_op_inplace": {
+            1: "output"
+        },
+    }
+    for op_name, mutates_args in optional_inplace_infos.items():
+        op = get_optional_trtllm_op(op_name)
+        if op is not None:
+            inplace_map[op] = mutates_args
     if IS_CUDA_TILE_AVAILABLE:
         # cuda.tile availability depends on GPU capability thus runtime check.
         inplace_map[

@@ -185,6 +185,7 @@ exhaustive field table at docs build time under **Developer Guide > Telemetry**.
 | `kv_cache_config.enable_block_reuse` | Whether KV cache block reuse/prefix caching is enabled. |
 | `cuda_graph_config.batch_sizes` | CUDA graph batch sizes when configured. |
 | `scheduler_config.capacity_scheduler_policy` | Scheduler capacity policy. |
+| `scheduler_config.enable_prefix_aware_scheduling` | Whether scheduler admission and token budgeting use KV prefix-reuse estimates. |
 | `torch_compile_config.enable_inductor` | Whether Torch Inductor compilation is enabled. |
 | `moe_config.backend` | MoE backend selection (`AUTO`, `CUTLASS`, `TRTLLM`, ...), an annotation-derived categorical. |
 | `speculative_config.decoding_type` | Speculative decoding mode discriminator (e.g. `User_Provided`); other arms expose their own numeric/boolean knobs under `speculative_config.*`. |
@@ -249,8 +250,8 @@ Checklist for adding an LLM API config capture field inside `llmApiConfigJson`:
    coverage: assert the value is captured, and for a categorical bare-string
    field assert that an out-of-allowlist value is redacted (dropped) while an
    in-allowlist value is captured.
-6. **Regenerate the manifest golden** from `build_capture_manifest`:
-   `python -c "import json; from tensorrt_llm.usage.llmapi_config import golden_manifest; open('tensorrt_llm/usage/llm_args_golden_manifest.json','w').write(json.dumps(golden_manifest(), indent=2, sort_keys=True)+'\n')"`
+6. **Regenerate the manifest golden**:
+   `python3 scripts/generate_llm_args_golden_manifest.py`
    Review the golden diff — **it is the privacy review.** A newly captured field
    requires sign-off from the GitHub telemetry/privacy CODEOWNER (`.github/CODEOWNERS`).
 7. **`docs/source/developer-guide/telemetry.md` is generated** from the committed

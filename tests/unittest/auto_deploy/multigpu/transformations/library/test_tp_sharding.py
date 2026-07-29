@@ -30,6 +30,7 @@ from _torch_test_utils import fp4_compatible, trtllm_ops_available
 from torch._inductor.pattern_matcher import stable_topological_sort
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
+from tensorrt_llm._torch.auto_deploy._compat import AllReduceStrategy
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import _pad_nvfp4_weight
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHMamba2Mixer
@@ -38,10 +39,10 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     FP8WeightShardingInfo,
     LayerType,
     ShardingTransformConfig,
-    SplitDimension,
     WeightShardingInfo,
     _update_node_args,
 )
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import SplitDimension
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op, is_weight_node
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
@@ -49,7 +50,6 @@ from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     fp4_global_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
-from tensorrt_llm.functional import AllReduceStrategy
 
 
 class GQA_Block(nn.Module):

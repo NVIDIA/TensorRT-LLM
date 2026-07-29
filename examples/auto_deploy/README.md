@@ -2,7 +2,7 @@
 
 This folder contains runnable examples for **AutoDeploy** as it ships inside [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM). For general AutoDeploy documentation, motivation, support matrix, and feature overview, please see the [official docs](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html).
 
-> Looking for the lightweight standalone package (no TRT-LLM required)? See **LLM Compiler** at [github.com/NVIDIA/llm-compiler](https://github.com/NVIDIA/llm-compiler). That repo is generated from this source tree by [`llmc/create_standalone_package.py`](./llmc/create_standalone_package.py).
+> Looking for the lightweight standalone package (no TRT-LLM required)? See **Paragraf** at [github.com/NVIDIA/llm-compiler](https://github.com/NVIDIA/llm-compiler). That repo is generated from this source tree by [`paragraf/create_standalone_package.py`](./paragraf/create_standalone_package.py).
 
 ______________________________________________________________________
 
@@ -223,8 +223,8 @@ args:
   max_seq_len: 2048
   max_batch_size: 16
   transforms:
-    detect_sharding:
-      support_partial_config: true
+    apply_sharding_hints:
+      allreduce_strategy: SYMM_MEM
     insert_cached_attention:
       backend: triton
     compile_model:

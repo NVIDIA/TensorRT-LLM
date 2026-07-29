@@ -402,6 +402,7 @@ class Step3p7MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
     def apply(
         self,
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         scores = torch.sigmoid(router_logits.to(torch.float32))
         scores_with_bias = scores + self.router_bias.unsqueeze(0)

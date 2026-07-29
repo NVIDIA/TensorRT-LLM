@@ -197,3 +197,26 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             if isinstance(sparse_config, dict):
                 return sparse_config
         return None
+
+
+class VideoSparseAttentionConfig(StrictBaseModel):
+    """Video Sparse Attention (VSA) sparse-attention recipe (CUTEDSL backend only).
+
+    Two-stage hybrid attention: a coarse mean-pooled stage over (4,4,4) cubes
+    and a block-sparse fine stage over the top-K cubes selected per head.
+    vsa_sparsity controls the fraction of cubes dropped on the fine stage.
+    """
+
+    algorithm: Literal["vsa"] = PydanticField(
+        "vsa",
+        description="Sparse attention algorithm discriminator.",
+    )
+    vsa_sparsity: float = PydanticField(
+        0.9,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of cubes dropped on the fine stage. 0.0 keeps all cubes "
+            "(dense fine stage); values closer to 1.0 keep fewer cubes."
+        ),
+    )

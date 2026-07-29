@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """
 ConfigurableMoE: Composition-based Configurable MoE Module
 
@@ -73,7 +72,6 @@ class ConfigurableMoE(MoE):
     # authoritative check -- if the chosen inner backend doesn't opt in, its
     # ``MoE.__init__`` will still raise.
     _supports_non_divisible_ep: bool = True
-
     """
     Configurable MoE layer using composition pattern with automatic configuration
 
@@ -174,6 +172,8 @@ class ConfigurableMoE(MoE):
             layer_idx=layer_idx,  # ConfigurableMoE needs correct layer_idx for EPLB initialization
             **kwargs,
         )
+        if override_quant_config is not None:
+            self.quant_config = override_quant_config
 
         # Store model_config and aux_stream_dict for later use (e.g., backend setter)
         self.model_config = model_config
@@ -322,6 +322,7 @@ class ConfigurableMoE(MoE):
                 swiglu_alpha=kwargs.get("swiglu_alpha"),
                 swiglu_beta=kwargs.get("swiglu_beta"),
                 swiglu_limit=kwargs.get("swiglu_limit"),
+                swiglu_limit_scalar=kwargs.get("swiglu_limit_scalar"),
                 init_load_balancer=False,
                 without_comm=True,
                 activation_type=self.activation_type,
@@ -426,7 +427,12 @@ class ConfigurableMoE(MoE):
         if self.use_dp and self.comm is not None:
             num_rows = self._dp_padded_num_rows(all_rank_num_tokens)
         else:
-            num_rows = sum(all_rank_num_tokens)
+            # non-DP: no cross-rank dispatch. The scheduler fills all_rank_num_tokens
+            # from [x.shape[0]] before calling here, so it must be a single-element list.
+            assert len(all_rank_num_tokens) == 1, (
+                f"non-DP path expects a single-element list, got {len(all_rank_num_tokens)}"
+            )
+            num_rows = all_rank_num_tokens[0]
         return (num_rows + self.moe_max_num_tokens - 1) // self.moe_max_num_tokens
 
     def split_chunk(self, split_token_num: int, split_num_chunks: int) -> List[int]:
@@ -561,7 +567,7 @@ class ConfigurableMoE(MoE):
 
         DP-padding handling and chunking live in the scheduler.
         """
-        del kwargs
+        input_ids = kwargs.get("input_ids")
 
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -582,6 +588,7 @@ class ConfigurableMoE(MoE):
             output_dtype=output_dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
+            input_ids=input_ids,
             lora_params=lora_params,
         )
 
@@ -650,17 +657,33 @@ class ConfigurableMoE(MoE):
         assert hasattr(self.backend, "load_weights"), (
             f"Backend {self.backend.__class__.__name__} must implement load_weights()"
         )
-        return self.backend.load_weights(weights, allow_partial_loading)
+        result = self.backend.load_weights(weights, allow_partial_loading)
+        if weights:
+            self._weights_transformed = False
+        return result
 
-    def post_load_weights(self):
+    def transform_weights(self) -> None:
         """
-        Post load weights processing - delegated to backend
+        Transform weights - delegated to backend
 
         """
-        assert hasattr(self.backend, "post_load_weights"), (
-            f"Backend {self.backend.__class__.__name__} must implement post_load_weights()"
+        if getattr(self, "_weights_transformed", False):
+            return
+        assert hasattr(self.backend, "transform_weights"), (
+            f"Backend {self.backend.__class__.__name__} must implement transform_weights()"
         )
-        return self.backend.post_load_weights()
+        self.backend.transform_weights()
+        self._weights_transformed = True
+
+    def cache_derived_state(self) -> None:
+        """
+        Cache derived state - delegated to backend
+
+        """
+        assert hasattr(self.backend, "cache_derived_state"), (
+            f"Backend {self.backend.__class__.__name__} must implement cache_derived_state()"
+        )
+        self.backend.cache_derived_state()
 
     def process_weights_after_loading(self):
         """

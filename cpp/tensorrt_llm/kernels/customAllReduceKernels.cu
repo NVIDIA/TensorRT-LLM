@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cooperative_groups.h>
 #include <cstdint>
 #include <tuple>
@@ -1187,14 +1188,14 @@ bool is_lamport_supported(int token_num, int hidden_size)
     return true;
 }
 
-bool is_lamport_supported(nvinfer1::DataType dataType, int token_num, int hidden_size)
+bool is_lamport_supported(tensorrt_llm::DataType dataType, int token_num, int hidden_size)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kFLOAT: return is_lamport_supported<float>(token_num, hidden_size);
-    case nvinfer1::DataType::kHALF: return is_lamport_supported<half>(token_num, hidden_size);
+    case tensorrt_llm::DataType::kFLOAT: return is_lamport_supported<float>(token_num, hidden_size);
+    case tensorrt_llm::DataType::kHALF: return is_lamport_supported<half>(token_num, hidden_size);
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16: return is_lamport_supported<__nv_bfloat16>(token_num, hidden_size);
+    case tensorrt_llm::DataType::kBF16: return is_lamport_supported<__nv_bfloat16>(token_num, hidden_size);
 #endif
     default: return false;
     }
@@ -1658,7 +1659,7 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
     update_barrier_flag(params.barrier_flag_ptr, params.barrier_flag_counter_ptr);
 }
 
-bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type)
+bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, tensorrt_llm::DataType type)
 {
     size_t elts_per_thread = 16 / common::getDTypeSize(type);
     int const msg_align = (algo == AllReduceStrategyType::TWOSHOT) ? n_ranks * elts_per_thread : elts_per_thread;
@@ -1894,8 +1895,8 @@ void AllReduceDispatchType(AllReduceParams& params, AllReduceStrategyType strat,
     }
 }
 
-AllReduceParams AllReduceParams::deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, nvinfer1::DataType dataType,
-    int token_num, int hidden_size, AllReduceFusionOp op)
+AllReduceParams AllReduceParams::deserialize(int64_t* buffer, size_t tpSize, size_t tpRank,
+    tensorrt_llm::DataType dataType, int token_num, int hidden_size, AllReduceFusionOp op)
 {
     void* const* buffer_ptrs = reinterpret_cast<void* const*>(buffer);
     int flag_offset;
@@ -1933,7 +1934,7 @@ AllReduceParams AllReduceParams::deserialize(int64_t* buffer, size_t tpSize, siz
     return params;
 }
 
-void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataType, AllReduceStrategyType strat,
+void customAllReduce(kernels::AllReduceParams& params, tensorrt_llm::DataType dataType, AllReduceStrategyType strat,
     AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(configurationSupported(strat, params.elts_total, params.ranks_per_node, dataType),
@@ -1943,10 +1944,10 @@ void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataTy
 
     switch (dataType)
     {
-    case nvinfer1::DataType::kFLOAT: AllReduceDispatchType<float>(params, strat, config, fusionOp, stream); break;
-    case nvinfer1::DataType::kHALF: AllReduceDispatchType<half>(params, strat, config, fusionOp, stream); break;
+    case tensorrt_llm::DataType::kFLOAT: AllReduceDispatchType<float>(params, strat, config, fusionOp, stream); break;
+    case tensorrt_llm::DataType::kHALF: AllReduceDispatchType<half>(params, strat, config, fusionOp, stream); break;
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
         AllReduceDispatchType<__nv_bfloat16>(params, strat, config, fusionOp, stream);
         break;
 #endif
@@ -1991,22 +1992,22 @@ void launchResidualRmsNormKernel(kernels::AllReduceParams& params, cudaStream_t 
 }
 
 void residualRmsNorm(
-    kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp)
+    kernels::AllReduceParams& params, tensorrt_llm::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp)
 {
     sync_check_cuda_error(stream);
     switch (dataType)
     {
-    case nvinfer1::DataType::kFLOAT: launchResidualRmsNormKernel<float>(params, stream, fusionOp); break;
-    case nvinfer1::DataType::kHALF: launchResidualRmsNormKernel<half>(params, stream, fusionOp); break;
+    case tensorrt_llm::DataType::kFLOAT: launchResidualRmsNormKernel<float>(params, stream, fusionOp); break;
+    case tensorrt_llm::DataType::kHALF: launchResidualRmsNormKernel<half>(params, stream, fusionOp); break;
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16: launchResidualRmsNormKernel<__nv_bfloat16>(params, stream, fusionOp); break;
+    case tensorrt_llm::DataType::kBF16: launchResidualRmsNormKernel<__nv_bfloat16>(params, stream, fusionOp); break;
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
     }
     sync_check_cuda_error(stream);
 }
 
-void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream)
+void lamportInitialize(void* buffer, size_t size, tensorrt_llm::DataType dataType, cudaStream_t stream)
 {
     sync_check_cuda_error(stream);
     if (size == 0)
@@ -2015,14 +2016,14 @@ void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, c
     }
     switch (dataType)
     {
-    case nvinfer1::DataType::kFLOAT:
+    case tensorrt_llm::DataType::kFLOAT:
         reduce_fusion::lamport_initialize_kernel_launcher<float>(buffer, size, stream);
         break;
-    case nvinfer1::DataType::kHALF:
+    case tensorrt_llm::DataType::kHALF:
         reduce_fusion::lamport_initialize_kernel_launcher<half>(buffer, size, stream);
         break;
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
         reduce_fusion::lamport_initialize_kernel_launcher<__nv_bfloat16>(buffer, size, stream);
         break;
 #endif

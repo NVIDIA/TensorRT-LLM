@@ -57,7 +57,6 @@ tensorrt_llm/flash_mla/
 tensorrt_llm/flash_mla_cpp_tllm.*.so
 tensorrt_llm/flash_mla_cpp_tllm.pyi
 tensorrt_llm/runtime/kv_cache_manager_v2/**/*.so
-!tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/attention/cubins/**/*.so
 **/*__mypyc*.so
 tensorrt_llm/scripts
 *docs/cpp_docs*
@@ -113,6 +112,9 @@ enroot/tensorrt_llm.devel.sqsh
 
 # MacOSX Files
 .DS_Store
+
+# stress test aiperf output artifacts
+tests/integration/defs/stress_test/artifacts/
 
 # Agent related files
 .claude/agent-memory/

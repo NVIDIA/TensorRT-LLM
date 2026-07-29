@@ -20,6 +20,7 @@ import io
 import os
 import re
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -130,6 +131,22 @@ def temp_wd(path):
 
 def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     return cmd + ["--host", host, "--port", str(port)]
+
+
+def resolve_node_hostname() -> str:
+    """Node(s) that ran a case, recorded per-case (not per-run).
+
+    Parallel splits are submitted as separate SLURM allocations and can land on
+    different nodes within a single run, so a per-run hostname would be
+    ambiguous. We deliberately prefer the SLURM nodelist (a single string that
+    also covers multi-node allocations) over ``socket.gethostname()``: for a
+    single-node allocation it *is* the executing host, and for a multi-node one
+    it records the full allocation rather than one arbitrary rank. Falls back to
+    the local hostname for bare-metal / non-SLURM runs. Precedence:
+    ``SLURM_JOB_NODELIST`` -> ``SLURM_NODELIST`` -> ``socket.gethostname()``.
+    """
+    return (os.environ.get("SLURM_JOB_NODELIST")
+            or os.environ.get("SLURM_NODELIST") or socket.gethostname())
 
 
 #if hang time > 30 mins, it will be killed
@@ -407,6 +424,17 @@ class PerfServeScriptTestCmds:
             self._server_log_file.close()
             self._server_log_file = None
 
+    def get_server_log_content(self) -> str:
+        """Read back the server's captured stdout/stderr so far (e.g. to parse startup info like KV cache size)."""
+        if not self._server_log_path or not os.path.exists(
+                self._server_log_path):
+            return ""
+        with open(self._server_log_path,
+                  'r',
+                  encoding='utf-8',
+                  errors='replace') as f:
+            return f.read()
+
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
         if cmd_idx <= len(self.data_cmds) - 1:
@@ -430,6 +458,9 @@ class PerfServeScriptTestCmds:
                         f.write(output)
         elif cmd_idx == len(self.data_cmds):
             self.start_server()
+            # Return the startup log (e.g. KV cache size) so it can be regex-parsed,
+            # instead of an empty string.
+            output = self.get_server_log_content()
         else:
             client_cmd = self.client_cmds[cmd_idx - 1 - len(self.data_cmds)]
             client_cmd_with_port = client_cmd + [
@@ -702,6 +733,10 @@ class AbstractPerfScriptTestClass(abc.ABC):
         if self._gpu_clock_lock:
             device_subtype = self._gpu_clock_lock.get_device_subtype()
 
+        # Node(s) that ran this case (see resolve_node_hostname for why this is
+        # per-case and prefers the SLURM nodelist over socket.gethostname()).
+        node_hostname = resolve_node_hostname()
+
         test_description_dict = {
             "network_name": self.get_test_name(),
             "network_hash":
@@ -709,7 +744,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
             "sm_clk": gpu_clocks.get("gpu_clock__MHz", None),
             "mem_clk": gpu_clocks.get("memory_clock__MHz", None),
             "gpu_idx": gpu_idx,
-            "device_subtype": device_subtype
+            "device_subtype": device_subtype,
+            "hostname": node_hostname
         }
 
         # Serialize the commands.

@@ -3,7 +3,7 @@
 """Integration tests for the routed-expert MoE LoRA *CUDA-graph slot-table*
 Python wiring.
 
-The op-level tests (`test_moe_lora_op.py`, `test_moe_lora_device_path.py`)
+The op-level tests (`test_moe_lora_op.py`, `test_moe_lora_grouped_gemm.py`)
 exercise `torch.ops.trtllm.fused_moe` with hand-built slot kwargs, bypassing the
 plumbing that actually produces those kwargs at decode time. These tests cover
 that glue end-to-end on the Python side, without model weights or the built C++
@@ -39,8 +39,12 @@ _INTER = 256
 
 class _ExtractStub:
     """Minimal stand-in for a CutlassFusedMoE so the unbound extraction method
-    can run without constructing a full MoE layer. The method only reads
-    `self.layer_idx`."""
+    can run without constructing a full MoE layer. The method reads
+    `self.layer_idx` and the shared slot-gathering helpers, which we borrow from
+    CutlassFusedMoE."""
+
+    _gather_moe_lora_slots = CutlassFusedMoE._gather_moe_lora_slots
+    _empty_kernel_slot_dict = staticmethod(CutlassFusedMoE._empty_kernel_slot_dict)
 
     def __init__(self, layer_idx):
         self.layer_idx = layer_idx

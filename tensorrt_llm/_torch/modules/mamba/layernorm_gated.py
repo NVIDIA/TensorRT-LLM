@@ -19,7 +19,9 @@
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as tldevice
 
+from ...._utils import get_sm_version
 from ...utils import Fp4QuantizedTensor
 
 
@@ -42,6 +44,7 @@ def fused_gated_rmsnorm_quant_shape_ok(hidden_size: int,
 
 @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
 @triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})
+@triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
 @triton.jit
 def _layer_norm_fwd_1pass_kernel(
     X,  # pointer to the input
@@ -51,6 +54,7 @@ def _layer_norm_fwd_1pass_kernel(
     Z,  # pointer to the other branch
     Mean,  # pointer to the mean
     Rstd,  # pointer to the 1/std
+    FP8_SCALE,  # static scale for an optional FP8 output
     stride_x_row,  # how much to increase the pointer when moving by 1 row
     stride_y_row,
     stride_z_row,
@@ -62,6 +66,7 @@ def _layer_norm_fwd_1pass_kernel(
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
+    OUTPUT_FP8: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
@@ -104,8 +109,143 @@ def _layer_norm_fwd_1pass_kernel(
     if HAS_Z and NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
         y *= z * tl.sigmoid(z)
+    if OUTPUT_FP8:
+        # Match the existing two-kernel path: RMSNorm first stores to the
+        # input dtype, then static quantization reloads and multiplies by the
+        # rounded reciprocal of its input scale.
+        y = y.to(X.dtype.element_ty).to(tl.float32)
+        y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
     # Write output
-    tl.store(Y + cols, y, mask=mask)
+    tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
+
+
+# Rows per program of the multi-row gated-RMSNorm kernel. At the GDN decode
+# shape (thousands of 128-element rows) one row per CTA leaves the kernel
+# launch-limited; 4 rows with 4 warps reproduces the single-row kernel's
+# reduction order (bitwise-identical output) at ~2x the throughput.
+_MULTIROW_ROWS = 4
+_MULTIROW_NUM_WARPS = 4
+_MULTIROW_MAX_N = 256
+
+
+@triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
+@triton.jit
+def _rms_norm_gated_fwd_multirow_kernel(
+    X,  # pointer to the input
+    Y,  # pointer to the output
+    W,  # pointer to the weights
+    Z,  # pointer to the gate branch
+    Rstd,  # pointer to the 1/std
+    FP8_SCALE,  # static scale for an optional FP8 output
+    stride_x_row,
+    stride_y_row,
+    stride_z_tok,
+    M,  # number of rows in X
+    eps,
+    N: tl.constexpr,  # row length; power of two, whole row per program
+    ROWS: tl.constexpr,  # rows per program
+    HEADS_PER_TOK: tl.constexpr,
+    OUTPUT_FP8: tl.constexpr,
+):
+    """rmsnorm(x) * silu(z), several short rows per program.
+
+    Z is addressed token-major: row r reads z at
+    (r // HEADS_PER_TOK) * stride_z_tok + (r % HEADS_PER_TOK) * N. With
+    HEADS_PER_TOK == 1 and stride_z_tok == z's row stride this is a plain
+    [M, N] z; with HEADS_PER_TOK == heads it reads a [num_tokens, heads, N]
+    view whose (heads, N) block is contiguous per token, e.g. a column slice
+    of a wider projection.
+    """
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    row_mask = rows < M
+    cols = tl.arange(0, N)
+    mask2d = row_mask[:, None]
+    x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
+    x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=1) / N
+    rstd = 1.0 / tl.sqrt(var + eps)
+    tl.store(Rstd + rows, rstd, mask=row_mask)
+    w = tl.load(W + cols).to(tl.float32)
+    y = x * rstd[:, None] * w[None, :]
+    tok = rows // HEADS_PER_TOK
+    head = rows % HEADS_PER_TOK
+    z_off = (tok[:, None].to(tl.int64) * stride_z_tok + head[:, None] * N +
+             cols[None, :])
+    z = tl.load(Z + z_off, mask=mask2d, other=0.0).to(tl.float32)
+    y *= z * tl.sigmoid(z)
+    if OUTPUT_FP8:
+        # Match the existing two-kernel path: RMSNorm first stores to the
+        # input dtype, then static quantization reloads and multiplies by the
+        # rounded reciprocal of its input scale.
+        y = y.to(X.dtype.element_ty).to(tl.float32)
+        y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
+    y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
+    tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
+
+
+def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
+                                     is_rms_norm):
+    return (is_rms_norm and norm_before_gate and z is not None and bias is None
+            and ngroups == 1 and N <= _MULTIROW_MAX_N and (N & (N - 1)) == 0)
+
+
+def rms_norm_gated_token_major(x, z, weight, eps, out=None, fp8_scale=None):
+    """rmsnorm(x) * silu(z) with z read in place from a 3D token-major view.
+
+    x: [num_tokens * heads, N] with contiguous rows. z: [num_tokens, heads, N]
+    whose (heads, N) block is contiguous per token and whose token stride is
+    arbitrary (e.g. a column slice of a wider per-token projection). Falls
+    back to the generic kernel on a packed copy of z when the shape is not
+    eligible for the multi-row kernel.
+
+    When fp8_scale (a scalar fp32 tensor holding the downstream static input
+    scale) is given, the output is quantized to float8_e4m3fn in the same
+    kernel.
+    """
+    M, N = x.shape
+    num_tokens, heads, n_z = z.shape
+    assert n_z == N and num_tokens * heads == M, (
+        f"z shape {tuple(z.shape)} does not match x shape {tuple(x.shape)}")
+    weight = weight.contiguous()
+    eligible = (x.stride(-1) == 1 and z.stride(2) == 1 and z.stride(1) == N
+                and N <= _MULTIROW_MAX_N and (N & (N - 1)) == 0)
+    if not eligible:
+        y, _, _ = _layer_norm_fwd(
+            x,
+            weight,
+            None,
+            eps,
+            z=z.reshape(M, N),
+            out=out,
+            norm_before_gate=True,
+            is_rms_norm=True,
+            fp8_scale=fp8_scale,
+        )
+        return y
+    if out is None:
+        out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
+        out = torch.empty_like(x, dtype=out_dtype)
+    rstd = torch.empty((M, ), dtype=torch.float32, device=x.device)
+    grid = (triton.cdiv(M, _MULTIROW_ROWS), )
+    with torch.cuda.device(x.device.index):
+        _rms_norm_gated_fwd_multirow_kernel[grid](
+            x,
+            out,
+            weight,
+            z,
+            rstd,
+            fp8_scale,
+            x.stride(0),
+            out.stride(0),
+            z.stride(0),
+            M,
+            eps,
+            N=N,
+            ROWS=_MULTIROW_ROWS,
+            HEADS_PER_TOK=heads,
+            num_warps=_MULTIROW_NUM_WARPS,
+        )
+    return out
 
 
 def _layer_norm_fwd(
@@ -118,6 +258,7 @@ def _layer_norm_fwd(
     group_size=None,
     norm_before_gate=True,
     is_rms_norm=False,
+    fp8_scale=None,
 ):
     M, N = x.shape
     if group_size is None:
@@ -137,11 +278,38 @@ def _layer_norm_fwd(
     if out is not None:
         assert out.shape == x.shape
     else:
-        out = torch.empty_like(x)
+        out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
+        out = torch.empty_like(x, dtype=out_dtype)
     assert out.stride(-1) == 1
+    if fp8_scale is not None:
+        assert fp8_scale.dtype == torch.float32
+        assert fp8_scale.numel() == 1
+        assert out.dtype == torch.float8_e4m3fn
     mean = (torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
             if not is_rms_norm else None)
     rstd = torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
+    if _multirow_gated_rmsnorm_eligible(group_size, ngroups, bias, z,
+                                        norm_before_gate, is_rms_norm):
+        grid = (triton.cdiv(M, _MULTIROW_ROWS), )
+        with torch.cuda.device(x.device.index):
+            _rms_norm_gated_fwd_multirow_kernel[grid](
+                x,
+                out,
+                weight,
+                z,
+                rstd,
+                fp8_scale,
+                x.stride(0),
+                out.stride(0),
+                z.stride(0),
+                M,
+                eps,
+                N=group_size,
+                ROWS=_MULTIROW_ROWS,
+                HEADS_PER_TOK=1,
+                num_warps=_MULTIROW_NUM_WARPS,
+            )
+        return out, mean, rstd
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
@@ -160,6 +328,7 @@ def _layer_norm_fwd(
             z,
             mean,
             rstd,
+            fp8_scale,
             x.stride(0),
             out.stride(0),
             z.stride(0) if z is not None else 0,
@@ -202,11 +371,14 @@ class RMSNorm(torch.nn.Module):
         self.is_nvfp4 = is_nvfp4
         # nvfp4_scale will be set externally if is_nvfp4 is True
         self.nvfp4_scale: torch.Tensor | None = None
+        # fp8_scale will be attached from the downstream static FP8 linear.
+        self.fp8_scale: torch.Tensor | None = None
 
     def forward(
-            self,
-            x: torch.Tensor,
-            z: torch.Tensor | None = None) -> torch.Tensor | Fp4QuantizedTensor:
+        self,
+        x: torch.Tensor,
+        z: torch.Tensor | None = None,
+    ) -> torch.Tensor | Fp4QuantizedTensor:
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
         x_shape_og = x.shape
         # reshape input data into 2D tensor
@@ -223,9 +395,16 @@ class RMSNorm(torch.nn.Module):
         if self.bias is not None:
             bias = self.bias.contiguous()
 
+        fp8_scale = self.fp8_scale
+        if fp8_scale is not None:
+            if self.is_nvfp4:
+                raise ValueError(
+                    "FP8 and NVFP4 RMSNorm outputs are mutually exclusive")
+
         # NVFP4 quantized path - uses optimized fused CUDA kernel
         # Fuses: SiLU gating + Group RMSNorm + FP4 quantization
         if self.is_nvfp4 and z is not None and not self.norm_before_gate and \
+            get_sm_version() >= 100 and \
            fused_gated_rmsnorm_quant_shape_ok(self.hidden_size, self.group_size):
             if self.nvfp4_scale is None:
                 raise ValueError(
@@ -255,5 +434,6 @@ class RMSNorm(torch.nn.Module):
             group_size=self.group_size,
             norm_before_gate=self.norm_before_gate,
             is_rms_norm=True,
+            fp8_scale=fp8_scale,
         )
         return y.reshape(x_shape_og)

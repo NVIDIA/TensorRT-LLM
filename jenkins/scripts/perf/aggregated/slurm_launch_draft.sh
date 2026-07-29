@@ -12,7 +12,7 @@ chmod +x $runScript
 # Run aggregated test
 echo "Starting aggregated test..."
 world_size=${world_size:-$((totalNodes * gpusPerNodePerServer))}
-if ! srun "${srunArgs[@]}" --mpi=pmi2 --kill-on-bad-exit=1 \
+if ! srun "${srunArgs[@]}" --mpi=pmix --kill-on-bad-exit=1 \
     -N $totalNodes \
     --ntasks=$world_size \
     --ntasks-per-node=$gpusPerNodePerServer \

@@ -43,9 +43,11 @@ from .eager import (
     _parse_profiler_events_moe,
     _time_moe_forward_eager,
 )
+from .nsys import _NsysProfiler, measured_range
 
 __all__ = [
     "_CuptiContext",
+    "_NsysProfiler",
     "_build_cuda_graph_kernel_stats_cupti",
     "_demangle_names",
     "_kernel_times_to_summary_list",
@@ -55,4 +57,5 @@ __all__ = [
     "_time_moe_forward_cuda_graph",
     "_time_moe_forward_eager",
     "_try_init_cupti",
+    "measured_range",
 ]

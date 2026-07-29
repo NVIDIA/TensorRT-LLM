@@ -39,6 +39,13 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+// Radix histogram bin count, used by topKPerRowJob's per-step distribution
+// pass. 2048 = 2^11 maps directly to the fp16 fast path's 11-bit bin index
+// (sign + exponent + top mantissa bits, mask 0x7FF). All file-scope dispatch
+// thresholds below derive from this so that a future change to the histogram
+// width does not require re-tuning the heuristics.
+constexpr int kNumBins = 2048;
+
 namespace
 {
 
@@ -169,6 +176,20 @@ __device__ bool processHistogramStep(int const* indices, InputT const* logits, i
     int& thresholdBinIdx, SmemOutputType& smemOutput, int* smemThresholdBinIdx, int* smemFinalDstIdx,
     int* smemFinalBinSize, int* smemFoundTopKValues, SmemFinalType& smemFinal, int stride1, int rowStart, int topK)
 {
+    // Step 0 is the fp16 fast path; if it could not resolve top-K (threshold bin
+    // exceeded kNumFinalItems) we restart the fp32 radix from scratch in steps 1-3.
+    // Discard any candidates step 0 wrote into smemOutput so step 1 doesn't
+    // double-count valid entries that fall under both fp16 and fp32 thresholds
+    // (this is what produced 2x duplicated indices when many -FLT_MAX padding
+    // entries dominated the threshold bin in the multi-block merge path).
+    if constexpr (step == 1)
+    {
+        if (threadIdx.x == 0)
+        {
+            smemFoundTopKValues[0] = 0;
+            smemFinalDstIdx[0] = 0;
+        }
+    }
     // Clear the histogram.
 #pragma unroll
     for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock)
@@ -271,18 +292,13 @@ __device__ bool processHistogramStep(int const* indices, InputT const* logits, i
     // The threshold bin.
     thresholdBinIdx = smemThresholdBinIdx[0];
 
-    // Skip auto-promote at step 0 when we'll continue: half-precision bins
-    // don't align with step 2's full-precision bit-pattern filter, so a
-    // step-0 promote would be double-counted at step 2.
-    bool const step0WillContinue = (step == 0) && (smemFinalBinSize[0] > kNumFinalItems);
-
     auto processBins = [&](InputT logitIn, int idx)
     {
         float const logit = static_cast<float>(logitIn);
         if (isPartialMatch<patternShift>(logit, logitPattern))
         {
             uint32_t binIdx = extractBinIdx<step>(logit);
-            if (binIdx < thresholdBinIdx && !step0WillContinue)
+            if (binIdx < thresholdBinIdx)
             {
                 // The element is part of the top-k selection
                 int dstIdx = atomicAdd(&smemFoundTopKValues[0], 1);
@@ -368,21 +384,28 @@ __device__ bool processHistogramStep(int const* indices, InputT const* logits, i
     return smemFinalBinSize[0] > kNumFinalItems;
 }
 
-// Smem holder for topKPerRowJob's final-sort. Always reserves
-// BlockRadixSort::TempStorage so the sort algorithm can be picked at runtime
-// (the union's size is dominated by FinalItems = 16 KB at our shapes).
-template <int kNumThreadsPerBlock, int kNumBins>
-struct TopKSmem
+// Follows half - 11 - 11 - 10 bit iterations
+template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort, bool multipleBlocksPerRow = false,
+    bool mergeBlocks = false, typename InputT = float>
+static __device__ void topKPerRowJob(int const* indices, InputT const* logits, int rowStart, int rowEnd,
+    int* outIndices, float* outLogits, int stride1, int topK)
 {
+    // The number of slots for the final pass.
     static constexpr int kNumFinalItems = 2048;
+    // The number of elements per thread for the final sort.
     static constexpr int kNumFinalItemsPerThread = kNumFinalItems / kNumThreadsPerBlock;
+    // The class to sort the elements during the final pass.
     using FinalSort = cub::BlockRadixSort<float, kNumThreadsPerBlock, kNumFinalItemsPerThread, int>;
-    using FinalSortTempStorage = typename FinalSort::TempStorage;
+    using FinalSortTempStorage = std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
+    // The class to compute the inclusive prefix-sum over the histogram.
     using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
 
+    // The structure to store the final items (for the final pass).
     struct FinalItems
     {
+        // Shared memory to store the indices for the final pass.
         int indices[kNumFinalItems];
+        // Shared memory to store the logits for the final pass.
         float logits[kNumFinalItems];
     };
 
@@ -392,47 +415,34 @@ struct TopKSmem
         int data[kNumBins];
     };
 
-    union Final
+    // Shared memory to compute the block sort.
+    __shared__ union
     {
         FinalItems items;
         FinalSortTempStorage finalSort;
         Histogram histo;
-    };
-
-    Final smemFinal;
-    int smemThresholdBinIdx[1];
-    int smemFinalDstIdx[1];
-    int smemFinalBinSize[1];
-    int smemFoundTopKValues[1];
-};
-
-// Follows half - 11 - 11 - 10 bit iterations
-template <int kNumThreadsPerBlock, int kNumBins, bool multipleBlocksPerRow = false, bool mergeBlocks = false,
-    typename InputT = float>
-static __device__ void topKPerRowJob(int const* indices, InputT const* logits, int rowStart, int rowEnd,
-    int* outIndices, float* outLogits, int stride1, int topK, TopKSmem<kNumThreadsPerBlock, kNumBins>& smem)
-{
-    static constexpr int kNumFinalItems = TopKSmem<kNumThreadsPerBlock, kNumBins>::kNumFinalItems;
-    static constexpr int kNumFinalItemsPerThread = TopKSmem<kNumThreadsPerBlock, kNumBins>::kNumFinalItemsPerThread;
-    using FinalSort = typename TopKSmem<kNumThreadsPerBlock, kNumBins>::FinalSort;
-
-    auto& smemFinal = smem.smemFinal;
-    int* smemThresholdBinIdx = smem.smemThresholdBinIdx;
-    int* smemFinalDstIdx = smem.smemFinalDstIdx;
-    int* smemFinalBinSize = smem.smemFinalBinSize;
-    int* smemFoundTopKValues = smem.smemFoundTopKValues;
+    } smemFinal;
 
     // Shared memory to store the selected indices.
     // If we are processing using multiple blocks, we need to store the logits and
     // indices.
     extern __shared__ int32_t smemOutput[];
 
+    // Shared memory to store the threshold bin.
+    __shared__ int smemThresholdBinIdx[1];
+    // Shared memory counter to register the candidates for the final phase.
+    __shared__ int smemFinalDstIdx[1];
+    // Shared memory to determine if the threshold bin fits in the final items.
+    __shared__ int smemFinalBinSize[1];
+    // Shared memory to keep track of the top-k values found so far by the
+    // previous iterations
+    __shared__ int smemFoundTopKValues[1];
+
     // The length of the row.
     int rowLen = rowEnd - rowStart;
 
     // Shortcut if the length of the row is smaller than Top-K. Indices are not
-    // sorted by their corresponding logit. Unreachable when mergeBlocks=true:
-    // both merge callers pass rowLen = numBlocksPerRow * topK > topK.
+    // sorted by their corresponding logit.
     if (rowLen <= topK)
     {
         for (int rowIt = threadIdx.x; rowIt < rowLen; rowIt += kNumThreadsPerBlock)
@@ -502,12 +512,10 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
 
     if (!continueToNextStep)
     {
-        // Sort the threshold-bin candidates. Insertion sort wins below ~512
-        // items (O(n^2/T) with no fixed cost); BlockRadixSort wins above
-        // (constant cost padded to kNumFinalItems = 2048).
-        constexpr int kInsertionSortBranchThreshold = 512;
-        int const finalCount = smemFinalDstIdx[0];
-        if (finalCount > kInsertionSortBranchThreshold)
+        // The histogram did not proceed to the final 10 bits, therefore we need to
+        // sort the final items The logits of the elements to be sorted in the final
+        // pass.
+        if constexpr (useRadixSort)
         {
             // Sorting with radix sort
             float finalLogits[kNumFinalItemsPerThread];
@@ -518,6 +526,12 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
             for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
             {
                 finalLogits[ii] = -FLT_MAX;
+                // Indices must be paired with the -FLT_MAX sentinel logit so unused
+                // slots survive SortDescendingBlockedToStriped and the post-sort copy
+                // as -1 rather than garbage. Without this, when the threshold bin is
+                // dominated by -FLT_MAX padding (multi-block merge path) the trailing
+                // top-K slots receive arbitrary register contents.
+                finalIndices[ii] = -1;
             }
 
             // Read the elements from SMEM.
@@ -525,7 +539,7 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
             for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
             {
                 int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
-                if (srcIdx < finalCount)
+                if (srcIdx < smemFinalDstIdx[0])
                 {
                     finalLogits[ii] = smemFinal.items.logits[srcIdx];
                     finalIndices[ii] = smemFinal.items.indices[srcIdx];
@@ -558,13 +572,13 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
         }
         else
         {
-            // Sorting with insertion sort.
+            // Sorting with insertion sort
             auto baseIdx = smemFoundTopKValues[0];
-            for (int i = threadIdx.x; i < finalCount; i += kNumThreadsPerBlock)
+            for (int i = threadIdx.x; i < smemFinalDstIdx[0]; i += kNumThreadsPerBlock)
             {
                 int outIndex = 0;
                 auto logit = smemFinal.items.logits[i];
-                for (int j = 0; j < finalCount; j++)
+                for (int j = 0; j < smemFinalDstIdx[0]; j++)
                 {
                     auto otherLogit = smemFinal.items.logits[j];
                     if (logit < otherLogit || (logit == otherLogit && i < j))
@@ -572,6 +586,7 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
                         outIndex++;
                     }
                 }
+                // Store if outIndex is in bounds
                 if (outIndex + baseIdx < topK)
                 {
                     smemOutput[outIndex + baseIdx] = smemFinal.items.indices[i];
@@ -593,10 +608,6 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
             outIndices[i] = smemOutput[i];
             outLogits[i] = reinterpret_cast<float*>(smemOutput + topK)[i];
         }
-        else if constexpr (mergeBlocks)
-        {
-            outIndices[i] = smemOutput[i];
-        }
         else
         {
             if (stride1 == 1)
@@ -613,7 +624,7 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
 }
 } // namespace
 
-template <int kNumThreadsPerBlock, typename InputT = float>
+template <int kNumThreadsPerBlock, bool useRadixSort, typename InputT = float>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(InputT const* logits,
     int const* rowStarts, int const* rowEnds, int* outIndices, int stride0, int stride1, int const topK,
     int const offsetIndex)
@@ -621,9 +632,6 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
-    // The number of bins in the histogram.
-    static constexpr int kNumBins = 2048;
-
     // The row computed by this block.
     int rowIdx = blockIdx.x + offsetIndex;
 
@@ -635,32 +643,30 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
     outIndices += static_cast<int64_t>(rowIdx) * topK;
     logits += static_cast<int64_t>(rowIdx) * stride0;
 
-    __shared__ TopKSmem<kNumThreadsPerBlock, kNumBins> smem;
-    topKPerRowJob<kNumThreadsPerBlock, kNumBins>(
-        nullptr, logits, rowStart, rowEnd, outIndices, nullptr, stride1, topK, smem);
+    topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort>(
+        nullptr, logits, rowStart, rowEnd, outIndices, nullptr, stride1, topK);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
-template <int kNumThreadsPerBlock, bool multipleBlocksPerRow = false, bool mergeBlocks = false, typename InputT = float>
+template <int kNumThreadsPerBlock, bool useRadixSort, bool multipleBlocksPerRow = false, bool mergeBlocks = false,
+    typename InputT = float>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(InputT const* logits, int const* seqLens,
-    int* outIndices, int stride0, int stride1, int const topK, int next_n, float* outLogits = nullptr,
-    int const numBlocksToMerge = 0, int const* indices = nullptr)
+    int* outIndices, int stride0, int stride1, int const topK, int next_n, int compressRatio,
+    float* outLogits = nullptr, int const numBlocksToMerge = 0, int const* indices = nullptr)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
-    // The number of bins in the histogram.
-    static constexpr int kNumBins = 2048;
-
     // The row computed by this block.
     int rowIdx = blockIdx.x;
 
     // The range of logits within the row.
     int rowStart = 0;
     int seq_len = seqLens[rowIdx / next_n];
-    int rowEnd = seq_len - next_n + (rowIdx % next_n) + 1;
+    int actual_kv_len = seq_len - next_n + (rowIdx % next_n) + 1;
+    int rowEnd = actual_kv_len / compressRatio;
 
     // Local pointers to this block
     if constexpr (!multipleBlocksPerRow && !mergeBlocks)
@@ -683,9 +689,8 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
     }
     logits += static_cast<int64_t>(rowIdx) * stride0;
 
-    __shared__ TopKSmem<kNumThreadsPerBlock, kNumBins> smem;
-    topKPerRowJob<kNumThreadsPerBlock, kNumBins, multipleBlocksPerRow, mergeBlocks>(
-        indices, logits, rowStart, rowEnd, outIndices, outLogits, stride1, topK, smem);
+    topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort, multipleBlocksPerRow, mergeBlocks>(
+        indices, logits, rowStart, rowEnd, outIndices, outLogits, stride1, topK);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -694,415 +699,29 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
 namespace
 {
 
-// Multi-pass radix: 4 launches (half-precision top-11 bits, then float bits
-// [21..32), [10..21), [0..10)). Per-row state lives in DRAM scratch; candidate
-// data uses two ping-pong buffers. Pass 3's last block emits the final top-K.
-static constexpr int kRadixBins = 2048;
+// Insertion vs radix crossover for the single-block path. Radix always pays a
+// histogram-clear + per-step scan over kNumBins bins (~4 refinement passes);
+// insertion only maintains a topK SMEM array. The crossover is where insertion's
+// O(numColumns * lg topK) catches up to radix's O(numColumns + kNumBins) per
+// pass — measured empirically around 6 histograms of work.
+constexpr int kSortingAlgorithmThreshold = 6 * kNumBins;
+// Force the multi-block split-and-merge path above this column count: per-block
+// work would otherwise dwarf the merge-pass cost. Callers may override via the
+// splitWorkThreshold parameter. Tuned empirically; below this width the merge
+// launch overhead isn't worth saving the per-block radix cost.
+constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
+// Cap blocks-per-row in the multi-block path. Bounds the aux-buffer size
+// (numRows * blocksPerRow * topK * sizeof(int32)) and the merge-step input width
+// so the second-pass merge kernel stays SMEM-resident.
+constexpr int kMaxBlocksPerRowDecode = 10;
+// Each sub-block must amortize the radix histogram overhead, i.e. cover at least
+// one full histogram pass worth of columns.
+constexpr int kDecodeMinColsPerSubBlock = kNumBins;
 
-// Per-row scratch state. The last block of each pass (picked via
-// `finishedBlocks`) scans the global histogram and writes the next pass's
-// threshold.
-struct alignas(64) RadixState
-{
-    int candCount;      // candidates entering current pass
-    int outIdx;         // running outIndices write position
-    int kRemaining;     // topK - outIdx
-    int filterCnt;      // running candidate-buf write position
-    int thresholdBin;   // prior pass's threshold; overwritten this pass's last block
-    int finishedBlocks; // last-block atomic, reset between passes
-    int thresholdLess;  // count of bins below thresholdBin; pass-3 emit routes
-                        // ties (bin == threshold) into a disjoint slot range.
-    int padding[1];
-};
-
-// Common last-block trailer: prefix-scan the merged global histogram, locate
-// the bin where the running count crosses kRemaining, stash to state for the
-// next pass. step < 3 also resets the per-row global histogram. In step 1
-// the trailer writes st.candCount = full row length for pass 2 to consume
-// (pass 1 reads the length inline from seqLens, so no init kernel is needed).
-template <int kThreads, int step>
-__device__ __forceinline__ void radixLastBlockTrailer(int* gHist, RadixState& st, int topK, int rowFullLen)
-{
-    using Scan = cub::BlockScan<int, kThreads>;
-    __shared__ typename Scan::TempStorage scanStorage;
-    __shared__ int s_thresholdBin;
-    __shared__ int s_runningBefore;
-    __shared__ int s_thresholdCount;
-
-    if (threadIdx.x == 0)
-    {
-        s_thresholdBin = -1;
-        s_runningBefore = 0;
-        s_thresholdCount = 0;
-    }
-    __syncthreads();
-
-    // kRemaining for THIS pass:
-    //   step 1: topK (no auto-promotes have happened yet).
-    //   step 2/3: topK - outIdx (where outIdx was atomic-incremented during
-    //             the filter loop). The histogram for the next pass's
-    //             threshold pick must target this fresh value, not the
-    //             stale state.kRemaining left over from the previous pass.
-    int const kRem = (step == 1) ? topK : (topK - st.outIdx);
-    if (kRem <= 0)
-    {
-        // All top-k slots already filled by auto-promotes in this pass —
-        // no need for a next pass to emit anything.
-        if (threadIdx.x == 0)
-        {
-            st.thresholdBin = -1;
-            st.candCount = 0;
-            st.kRemaining = 0;
-            st.finishedBlocks = 0;
-            st.filterCnt = 0;
-            (void) rowFullLen;
-        }
-        if constexpr (step < 3)
-        {
-            __syncthreads();
-            for (int i = threadIdx.x; i < kRadixBins; i += kThreads)
-                gHist[i] = 0;
-        }
-        return;
-    }
-    constexpr int kRoundsPerScan = kRadixBins / kThreads;
-    int running = 0;
-    for (int r = 0; r < kRoundsPerScan; ++r)
-    {
-        int bin = r * kThreads + threadIdx.x;
-        int c = gHist[bin];
-        int prefix, total;
-        Scan(scanStorage).ExclusiveSum(c, prefix, total);
-        prefix += running;
-        int next = prefix + c;
-        if (prefix < kRem && next >= kRem && s_thresholdBin == -1)
-        {
-            atomicCAS(&s_thresholdBin, -1, bin);
-            if (s_thresholdBin == bin)
-            {
-                s_runningBefore = prefix;
-                s_thresholdCount = c;
-            }
-        }
-        running += total;
-        __syncthreads();
-        if (s_thresholdBin != -1)
-            break;
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0)
-    {
-        // If the cumsum over the whole histogram never reached kRem the row
-        // has fewer items than we still need (e.g. decode rows shorter than
-        // topK). Set thresholdBin to a sentinel above any valid bin so the
-        // next pass's `bin < thresholdBin` test accepts every surviving
-        // candidate as auto-promote.
-        st.thresholdBin = (s_thresholdBin == -1) ? kRadixBins : s_thresholdBin;
-        // s_runningBefore is the count of histogram items in bins < threshold.
-        // In the sentinel case it stays at its init 0; that's fine because
-        // pass-3's inline final-emit only uses thresholdLess to position the
-        // ties (bin == threshold) write base, and the sentinel branch has
-        // no items in the threshold bin (the sentinel is above all valid bins).
-        st.thresholdLess = s_runningBefore;
-        st.finishedBlocks = 0;
-        if constexpr (step == 1)
-        {
-            // Pass 2 also scans the full row from `logits`, so it reads
-            // st.candCount = full row length. Pass 1 did not write to it
-            // and the state struct started at zero (cudaMemsetAsync).
-            st.candCount = rowFullLen;
-            (void) s_thresholdCount;
-            (void) kRem;
-        }
-        else
-        {
-            st.candCount = st.filterCnt;
-            int newKRem = topK - st.outIdx;
-            if (newKRem < 0)
-                newKRem = 0;
-            st.kRemaining = newKRem;
-            st.filterCnt = 0;
-        }
-    }
-    if constexpr (step < 3)
-    {
-        __syncthreads();
-        for (int i = threadIdx.x; i < kRadixBins; i += kThreads)
-            gHist[i] = 0;
-    }
-}
-
-// Fused histogram + filter pass kernel.
-//
-//   step == 1: pass 1, no filter, just histogram top-11 bits of the row.
-//   step == 2: pass 2 reads `logits` (pass 1 didn't write a candidate buffer),
-//              for each item:
-//                bin1 < thresholdBin1 → write to outIndices (auto-promote)
-//                bin1 == thresholdBin1 → append to candBufOut, count its bin2
-//                                        in the histogram for pass 2
-//                else                 → drop
-//   step == 3: same as step 2 but reads `candBufIn` (pass 2's output) and
-//              uses extractBinIdx<2> for the prior-bits check, extractBinIdx<3>
-//              for the histogram.
-//
-// Last block of every pass runs `radixLastBlockTrailer` to compute the
-// next pass's threshold and reset cross-pass state.
-template <int kThreads, int step, typename InputT = float>
-static __global__ __launch_bounds__(kThreads) void radixPassKernel(InputT const* logits, int const* seqLens,
-    int* outIndices, int const* candBufIn, int* candBufOut, int* histograms, RadixState* state, int stride0, int next_n,
-    int topK)
-{
-    int rowIdx = blockIdx.y;
-    int blockInRow = blockIdx.x;
-    int blocksPerRow = gridDim.x;
-
-    RadixState& st = state[rowIdx];
-    int* gHist = histograms + static_cast<int64_t>(rowIdx) * kRadixBins;
-
-    __shared__ int sHist[kRadixBins];
-    for (int i = threadIdx.x; i < kRadixBins; i += kThreads)
-        sHist[i] = 0;
-    __syncthreads();
-
-    if constexpr (step == 1)
-    {
-        // Read seqLen inline so pass 1 does not depend on st.candCount being
-        // pre-initialised by a separate init kernel; the cudaMemsetAsync that
-        // zeroes state+histograms together is enough. Pass-1 trailer below
-        // writes st.candCount = seqLens[rowIdx] for pass 2 to consume.
-        int const rowEnd = seqLens[rowIdx / next_n] - next_n + (rowIdx % next_n) + 1;
-        InputT const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
-        size_t threadRank = static_cast<size_t>(blockInRow) * kThreads + threadIdx.x;
-        size_t numThreads = static_cast<size_t>(blocksPerRow) * kThreads;
-        auto f = [&](InputT vIn, size_t /*idx*/)
-        {
-            float const v = static_cast<float>(vIn);
-            uint32_t bin = extractBinIdx<step>(v);
-            atomicAdd(&sHist[bin], 1);
-        };
-        vectorized_process(threadRank, numThreads, in, static_cast<int>(rowEnd), f);
-    }
-    else if constexpr (step == 2)
-    {
-        int const rowEnd = st.candCount;
-        InputT const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
-        int* outIdxArr = outIndices + static_cast<int64_t>(rowIdx) * topK;
-        int* candArr = candBufOut + static_cast<int64_t>(rowIdx) * stride0;
-        int const prevThresh = st.thresholdBin;
-        size_t threadRank = static_cast<size_t>(blockInRow) * kThreads + threadIdx.x;
-        size_t numThreads = static_cast<size_t>(blocksPerRow) * kThreads;
-        auto f = [&](InputT vIn, size_t i)
-        {
-            float const v = static_cast<float>(vIn);
-            int bin1 = static_cast<int>(extractBinIdx<1>(v));
-            if (bin1 < prevThresh)
-            {
-                int pos = atomicAdd(&st.outIdx, 1);
-                if (pos < topK)
-                    outIdxArr[pos] = static_cast<int>(i);
-            }
-            else if (bin1 == prevThresh)
-            {
-                int pos = atomicAdd(&st.filterCnt, 1);
-                candArr[pos] = static_cast<int>(i);
-                uint32_t bin2 = extractBinIdx<step>(v);
-                atomicAdd(&sHist[bin2], 1);
-            }
-        };
-        vectorized_process(threadRank, numThreads, in, static_cast<int>(rowEnd), f);
-    }
-    else // step == 3
-    {
-        int const candCnt = st.candCount;
-        int const* candArrIn = candBufIn + static_cast<int64_t>(rowIdx) * stride0;
-        InputT const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
-        int* outIdxArr = outIndices + static_cast<int64_t>(rowIdx) * topK;
-        int* candArrOut = candBufOut + static_cast<int64_t>(rowIdx) * stride0;
-        int const prevThresh = st.thresholdBin;
-        for (int i = blockInRow * kThreads + threadIdx.x; i < candCnt; i += blocksPerRow * kThreads)
-        {
-            int srcIdx = candArrIn[i];
-            float v = static_cast<float>(in[srcIdx]);
-            int bin2 = static_cast<int>(extractBinIdx<2>(v));
-            if (bin2 < prevThresh)
-            {
-                int pos = atomicAdd(&st.outIdx, 1);
-                if (pos < topK)
-                    outIdxArr[pos] = srcIdx;
-            }
-            else if (bin2 == prevThresh)
-            {
-                int pos = atomicAdd(&st.filterCnt, 1);
-                candArrOut[pos] = srcIdx;
-                uint32_t bin3 = extractBinIdx<step>(v);
-                atomicAdd(&sHist[bin3], 1);
-            }
-        }
-    }
-    __syncthreads();
-
-    for (int i = threadIdx.x; i < kRadixBins; i += kThreads)
-    {
-        int c = sHist[i];
-        if (c)
-            atomicAdd(&gHist[i], c);
-    }
-
-    __threadfence();
-    __shared__ int isLast;
-    if (threadIdx.x == 0)
-    {
-        int prev = atomicAdd(&st.finishedBlocks, 1);
-        isLast = (prev == blocksPerRow - 1) ? 1 : 0;
-    }
-    __syncthreads();
-    if (!isLast)
-        return;
-
-    int const rowFullLen = (step == 1) ? (seqLens[rowIdx / next_n] - next_n + (rowIdx % next_n) + 1) : 0;
-    radixLastBlockTrailer<kThreads, step>(gHist, st, topK, rowFullLen);
-
-    if constexpr (step == 3)
-    {
-        // Final emit, folded into the last block of pass 3. Scan candBufOut
-        // (top 22 bits == thresholdBin2) and route items into outIndices by
-        // bin3 vs thresholdBin3. Two-counter scheme so threshold-bin ties
-        // don't race definite top-k items on the same atomic:
-        //   bin3 <  thresh3  → slots [ltBase,           ltBase + prefix3)
-        //   bin3 == thresh3  → slots [ltBase + prefix3, topK)
-        __syncthreads();
-        int const filterCnt = st.candCount;
-        int const thresh3 = st.thresholdBin;
-        int const prefix3 = st.thresholdLess;
-        int const* candArr = candBufOut + static_cast<int64_t>(rowIdx) * stride0;
-        InputT const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
-        int* outIdxArr = outIndices + static_cast<int64_t>(rowIdx) * topK;
-        int const ltBase = st.outIdx;    // already at outBase here
-        int const eqBase = ltBase + prefix3;
-        int const eqCap = topK - eqBase; // ≥ 0 by trailer invariant
-        __shared__ int sEqEmitted;
-        if (threadIdx.x == 0)
-            sEqEmitted = 0;
-        __syncthreads();
-        for (int i = threadIdx.x; i < filterCnt; i += kThreads)
-        {
-            int srcIdx = candArr[i];
-            float v = static_cast<float>(in[srcIdx]);
-            int bin3 = static_cast<int>(extractBinIdx<3>(v));
-            if (bin3 < thresh3)
-            {
-                // atomicAdd on st.outIdx is safe: by construction exactly
-                // prefix3 items fall in this branch, so pos stays in
-                // [ltBase, eqBase) which is strictly inside [0, topK).
-                int pos = atomicAdd(&st.outIdx, 1);
-                outIdxArr[pos] = srcIdx;
-            }
-            else if (bin3 == thresh3)
-            {
-                int pos = atomicAdd(&sEqEmitted, 1);
-                if (pos < eqCap)
-                    outIdxArr[eqBase + pos] = srcIdx;
-            }
-        }
-        __syncthreads();
-        if (threadIdx.x == 0)
-        {
-            int eq = sEqEmitted < eqCap ? sEqEmitted : eqCap;
-            int filled = eqBase + eq;
-            if (filled > topK)
-                filled = topK;
-            for (int i = filled; i < topK; ++i)
-                outIdxArr[i] = -1;
-        }
-        // Reset the per-row global histogram and st.outIdx so the next call
-        // sees a clean state without a per-call cudaMemsetAsync. Caller must
-        // zero-initialize the scratch buffer before the first call.
-        __syncthreads();
-        for (int i = threadIdx.x; i < kRadixBins; i += kThreads)
-            gHist[i] = 0;
-        if (threadIdx.x == 0)
-            st.outIdx = 0;
-    }
-}
-
-// Scratch layout (uint8 buffer, 64-byte aligned regions):
-//   RadixState[numRows]
-//   int histograms[numRows * kRadixBins]    (zeroed on first call by
-//                                           torch::zeros allocator; pass-3
-//                                           trailer zeroes for subsequent
-//                                           calls)
-//   int candBuf1[numRows * stride0]         (pass 2 → pass 3 input)
-//   int candBuf2[numRows * stride0]         (pass 3 → fused final filter)
-static size_t radixScratchBytes(int numRows, int numColumns)
-{
-    auto roundUp = [](size_t x) { return (x + 63) & ~size_t(63); };
-    size_t s = 0;
-    s += roundUp(sizeof(RadixState) * numRows);
-    s += roundUp(sizeof(int) * static_cast<size_t>(numRows) * kRadixBins);
-    s += roundUp(sizeof(int) * static_cast<size_t>(numRows) * numColumns);
-    s += roundUp(sizeof(int) * static_cast<size_t>(numRows) * numColumns);
-    return s;
-}
-
-template <typename InputT>
-static void launchMultiPassRadix(void* scratch, InputT const* logits, int const* seqLens, int* outIndices, int numRows,
-    int numColumns, int topK, int stride0, int next_n, cudaLaunchAttribute const* attrs, cudaStream_t stream)
-{
-    auto roundUp = [](size_t x) { return (x + 63) & ~size_t(63); };
-    char* base = static_cast<char*>(scratch);
-    RadixState* state = reinterpret_cast<RadixState*>(base);
-    base += roundUp(sizeof(RadixState) * numRows);
-    int* histograms = reinterpret_cast<int*>(base);
-    base += roundUp(sizeof(int) * static_cast<size_t>(numRows) * kRadixBins);
-    int* candBuf1 = reinterpret_cast<int*>(base);
-    base += roundUp(sizeof(int) * static_cast<size_t>(numRows) * numColumns);
-    int* candBuf2 = reinterpret_cast<int*>(base);
-
-    int sm_cnt = 132;
-    {
-        int dev = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&sm_cnt, cudaDevAttrMultiProcessorCount, dev);
-    }
-    // Block fan-out heuristic: target ~4 active blocks/SM (one wave at the
-    // achievable occupancy of radixPassKernel<512, 1>), with a per-block work
-    // floor of 2048 items (4 items/thread at 512-wide).
-    int targetTotalBlocks = sm_cnt * 4;
-    int numBlocksPerRow = (targetTotalBlocks + numRows - 1) / numRows;
-    int maxByCols = numColumns / 2048;
-    if (numBlocksPerRow > maxByCols)
-        numBlocksPerRow = maxByCols;
-    if (numBlocksPerRow < 1)
-        numBlocksPerRow = 1;
-
-    constexpr int kPassThreads = 512;
-
-    auto launchPass = [&](void const* kernel, int const* candIn, int* candOut)
-    {
-        cudaLaunchConfig_t cfg{};
-        cfg.gridDim = dim3(numBlocksPerRow, numRows);
-        cfg.blockDim = kPassThreads;
-        cfg.dynamicSmemBytes = 0;
-        cfg.stream = stream;
-        cfg.numAttrs = 1;
-        cfg.attrs = const_cast<cudaLaunchAttribute*>(attrs);
-        void* args[] = {(void*) &logits, (void*) &seqLens, (void*) &outIndices, (void*) &candIn, (void*) &candOut,
-            (void*) &histograms, (void*) &state, (void*) &stride0, (void*) &next_n, (void*) &topK};
-        cudaLaunchKernelExC(&cfg, kernel, args);
-    };
-
-    launchPass(
-        reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 1, InputT>), (int const*) nullptr, (int*) nullptr);
-    launchPass(
-        reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 2, InputT>), (int const*) nullptr, candBuf1);
-    // Pass 3 emits the final top-K inline in its last-block trailer (see
-    // radixPassKernel<step=3>) instead of requiring a separate filter launch.
-    launchPass(
-        reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 3, InputT>), (int const*) candBuf1, candBuf2);
-}
-
-// Architecture-derived GVR eligibility bounds (cached per-process).
+// Scheme X bound calculator — shared between fp32 and bf16/fp16 dispatchers.
+// Caches hardware attrs (SM count, L2 capacity) and the small-N threshold
+// once per process via std::call_once. Per-call cost is just two reads
+// from cached static variables plus a small arithmetic block, no syscalls.
 struct SchemeXBounds
 {
     int smCount;
@@ -1113,12 +732,53 @@ struct SchemeXBounds
     int kSeqSmall;
 };
 
-inline SchemeXBounds getSchemeXBounds(int numColumns, int bytesPerElem)
+// Uniform small-N lower bound for the Heuristic GVR path across all K.
+// Aligns the GVR routing boundary with the Radix multi-CTA split-work
+// threshold (maxByCols = N / kDecodeMinColsPerSubBlock(=2048) ≥ 2 at
+// N ≥ 4096), so the dispatcher's algorithmic-handoff point is consistent:
+// below 4096 the Radix path resolves to single-CTA insertion-sort and GVR
+// is not attempted; at or above 4096 GVR may be considered.
+// DSv4 swe-bench synth sweeps on B200/B300 (V3.2-Q19c protocol, May 2026):
+//   N=4K cells across K ∈ {512, 1024, 2048} all win — GVR R/H bf16 = 3.07×
+//   (K=512) / 2.57× (K=1024) / 1.34× (K=2048).
+//   N=2K cells across the same 9 (K × dtype) combos all show GVR R/H < 1
+//   (0.55× – 0.84×), justifying 4K as the floor.
+inline int kSeqSmallDefaultForK(int /*topK*/)
+{
+    return 4096;
+}
+
+inline SchemeXBounds getSchemeXBounds(int numColumns, int bytesPerElem, int topK)
 {
     static std::once_flag sOnce;
     static int sSm = 0;
     static int sL2 = 0;
-    static int sNMin = 0;
+    // -----------------------------------------------------------------------
+    // Diagnostic / tuning escape-hatch env overrides. Both are OFF by default
+    // and the K-aware / hardware-derived defaults below are expected to be
+    // optimal for production. Use only for microbenchmarks, regression
+    // bisection, or workload-specific tuning where the defaults are clearly
+    // suboptimal.
+    //
+    //   TRTLLM_HEURISTIC_NMIN (valid range [1024, 200000])
+    //     Overrides `kSeqSmall` (Heuristic small-N threshold) for ALL K.
+    //     Lower risk: only shifts a perf threshold; the kernel still
+    //     produces an exact top-K either way. Setting it too low routes
+    //     more N → Heuristic and may be slower than the fallback for
+    //     small N; correctness is preserved.
+    //
+    //   TRTLLM_HEURISTIC_BSMAX (valid range [1, 65536])
+    //     Overrides `kBsLarge` (BS upper bound for Heuristic) past the
+    //     hardware-derived min(kBsWave, kBsL2). Higher risk: bypasses
+    //     L2/occupancy safety bounds, so heuristic may run in working-set
+    //     ranges where it has not been tuned (L2 thrash, suboptimal grid
+    //     configs). Primary use is indexer microbenchmarks that need a
+    //     BS-scaling comparison against the Radix path on identical inputs.
+    // -----------------------------------------------------------------------
+    // sNMinEnv > 0 iff TRTLLM_HEURISTIC_NMIN is set to a valid value. When set,
+    // it overrides the per-K default for ALL K.
+    static int sNMinEnv = 0;
+    static int sBsMax = 0;
     std::call_once(sOnce,
         []()
         {
@@ -1126,16 +786,17 @@ inline SchemeXBounds getSchemeXBounds(int numColumns, int bytesPerElem)
             cudaGetDevice(&dev);
             cudaDeviceGetAttribute(&sSm, cudaDevAttrMultiProcessorCount, dev);
             cudaDeviceGetAttribute(&sL2, cudaDevAttrL2CacheSize, dev);
-            constexpr int kSeqSmallDefault = 12288;
             char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
             if (env != nullptr)
             {
                 int const v = std::atoi(env);
-                sNMin = (v >= 1024 && v <= 200000) ? v : kSeqSmallDefault;
+                sNMinEnv = (v >= 1024 && v <= 200000) ? v : 0;
             }
-            else
+            char const* env_bsmax = std::getenv("TRTLLM_HEURISTIC_BSMAX");
+            if (env_bsmax != nullptr)
             {
-                sNMin = kSeqSmallDefault;
+                int const v = std::atoi(env_bsmax);
+                sBsMax = (v >= 1 && v <= 65536) ? v : 0;
             }
         });
 
@@ -1147,37 +808,163 @@ inline SchemeXBounds getSchemeXBounds(int numColumns, int bytesPerElem)
         ? static_cast<int>(static_cast<int64_t>(sL2) * 9 / 10 / (static_cast<int64_t>(numColumns) * bytesPerElem))
         : b.kBsWave;
     b.kBsLarge = std::min(b.kBsWave, b.kBsL2 > 0 ? b.kBsL2 : b.kBsWave);
-    b.kSeqSmall = sNMin;
+    if (sBsMax > 0)
+    {
+        // BSMAX env override bypasses the hardware-derived L2/occupancy bound
+        // (see the BSMAX section in the call_once block above for risk notes).
+        b.kBsLarge = sBsMax;
+    }
+    // NMIN env override (if set) wins over the per-K default for ALL K.
+    b.kSeqSmall = (sNMinEnv > 0) ? sNMinEnv : kSeqSmallDefaultForK(topK);
     return b;
 }
 
-// Unified dispatcher (fp32 / bf16 / fp16). Each tier's kernel is templated on
-// InputT and casts to float at HBM-read sites; the scratch buffer is uint8.
-template <typename InputT>
-void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
-    int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
-    int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch,
-    cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
+} // namespace
+
+int computeIndexerTopKDecodeBlocksPerRow(int numRows, int numColumns, int splitWorkThreshold)
 {
-    // Split-work cutoff: matches main's 200k default. is_prefill forces
-    // single-block via a 1<<30 threshold no shape can reach: prefill chunks are
-    // bounded by max_num_tokens, well below the multi-pass radix crossover at
-    // any practical setting.
-    int const adaptiveSplitWorkThreshold = is_prefill ? (1 << 30) : 200 * 1000;
-    int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : adaptiveSplitWorkThreshold;
+    if (numRows <= 0)
+    {
+        return 1;
+    }
+
+    int const forceSplitThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
+
+    // Preserve original behavior for very long sequences.
+    if (numColumns >= forceSplitThreshold)
+    {
+        return kMaxBlocksPerRowDecode;
+    }
+
+    // Query the actual SM count from the driver so the dispatch tracks the
+    // hardware rather than a baked-in target (H100=132, B200=148, …).
+    // topK=0: blocks-per-row computation is K-agnostic; kSeqSmall is uniform
+    // 4096 across K, so the topK arg is unused for the kSeqSmall lookup as
+    // well, and only smCount/kBsWave/kBsL2 are consumed here.
+    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/4, /*topK=*/0);
+    TLLM_CHECK_WITH_INFO(bounds.smCount > 0, "indexerTopK: failed to query device SM count");
+    int const smCount = bounds.smCount;
+    int const maxByCols = std::max(1, numColumns / kDecodeMinColsPerSubBlock);
+    int const maxBp = std::min(maxByCols, kMaxBlocksPerRowDecode);
+
+    int blocksPerRow;
+    if (numRows < smCount / 2)
+    {
+        // Sub-half-wave band: bp=2 by itself leaves SMs idle (numRows × 2 < smCount),
+        // so sweep bp ∈ [2, maxBp] for the choice that minimizes waves(bp) / bp,
+        // where waves(bp) = ceil(numRows * bp / smCount). The wave-quantization-aware
+        // sweep avoids spilling one extra block per row across a wave boundary, which
+        // is what a naive ceil(smCount / numRows) target would do.
+        int bestBp = 1;
+        int bestWaves = 1; // numRows < smCount/2 → bp=1 always fits in a single wave
+        for (int bp = 2; bp <= maxBp; ++bp)
+        {
+            int const totalBlocks = numRows * bp;
+            int const waves = (totalBlocks + smCount - 1) / smCount;
+            // waves / bp < bestWaves / bestBp  ⇔  waves * bestBp < bestWaves * bp
+            if (waves * bestBp < bestWaves * bp)
+            {
+                bestWaves = waves;
+                bestBp = bp;
+            }
+        }
+        blocksPerRow = bestBp;
+    }
+    else
+    {
+        // numRows >= smCount/2: bp=2 saturates SMs with one wave (numRows*2 >= smCount)
+        // and stays on the multi-block split+merge path. Crucially this path uses
+        // a different kernel instantiation than bp=1, and only the bp=1 single-block
+        // radix kernel pays the wave-scheduling cliff when gridDim.x approaches
+        // smCount (measured on B200, cols=196608, topK=2048: BS=131=125us,
+        // BS=132=312us, BS=148=390us — the cliff disappears entirely with bp=2).
+        // bp=2 is also the cheapest split (smallest merge input); larger bp piles
+        // on merge-pass overhead without proportional gain on the shapes measured.
+        // Falls back to 1 only when maxByCols caps it at 1 for very narrow rows
+        // (numColumns < kDecodeMinColsPerSubBlock).
+        blocksPerRow = std::min(2, maxByCols);
+    }
+    return std::max(1, blocksPerRow);
+}
+
+void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
+    int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
+    int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
+    int const preIdxCount, float* heuristicScratch, int const compressRatio, cudaStream_t const stream)
+{
     constexpr int kNumThreadsPerBlock = 512;
+    int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
 
-    // GVR eligibility (matches main's rule): supported K, stride1 contiguous,
-    // preIdx + scratch provided, numColumns in [kSeqSmall, splitWorkThreshold),
-    // and numRows below the architecture-derived wave/L2 bound. is_prefill
-    // suppresses GVR through effectiveSplitWorkThreshold being huge.
-    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/static_cast<int>(sizeof(InputT)));
+    // ========================================================================
+    // Small-N dispatch axis.
+    //
+    // GVR Heuristic Top-K has a *fixed* per-launch overhead from Phase-1
+    // (preIdx stats reduction over M=2048) and Phase-4 (2048-bin histogram
+    // snap), totaling ~11 µs regardless of N. For small N (≤16K), this
+    // fixed cost dominates and the kernel loses to the existing
+    // insertion-sort/radix path. Empirically (random data, B200 BS=1):
+    //   N=8192   : Heuristic 16.5 µs vs Radix 11.2 µs (radix 1.47× faster)
+    //   N=16384  : Heuristic 21.9 µs vs Radix 22.0 µs (parity)
+    //   N=32768  : Heuristic 26.1 µs vs Radix 32.9 µs (heuristic 1.26× faster)
+    //   N=131072 : Heuristic 43.4 µs vs Radix 76.1 µs (heuristic 1.75× faster)
+    //
+    // Route N < kSeqSmall to the existing Radix/Insertion path (which itself
+    // splits at kSortingAlgorithmThreshold=12288). kSeqSmall is set at the
+    // empirical crossover point.
+    //
+    // ========================================================================
+    // Architecture-derived BS-threshold dispatch — jointly bounded by
+    // occupancy AND L2 cache capacity.
+    //
+    // Two physical constraints bound when the per-row heuristic kernel
+    // remains faster than a radix streaming kernel:
+    //
+    //   (A) Occupancy bound — 3·SM − SM/8 (wave geometry + setup margin)
+    //        Each CTA uses ~58 KB SMEM (fixed, independent of N), so B200's
+    //        228 KB dynamic SMEM allows max 3 CTA/SM. Above 3·SM rows per
+    //        launch, tail-wave imbalance causes stragglers. The -SM/8 margin
+    //        (~1/8 wave) covers CTA setup + L2 ingestion overhead.
+    //        On B200(148 SM): 3×148 − 18 = 426.
+    //
+    //   (B) L2 cache bound — 0.9·L2 / (4·N) per-CTA logits fit
+    //        Each CTA streams its row (N×4B) through L2 per Phase-2 iter.
+    //        With num_concurrent_CTAs × N × 4B > L2, eviction dominates.
+    //        On B200(126 MB L2) with N=70K: 0.9·126MB/(4·70690) ≈ 440,
+    //        which is ~ equal to (A)=426 — the two constraints cross over
+    //        near the SWE-Bench data point.
+    //        For N > 73K the L2 bound tightens below (A) and must take
+    //        over; e.g. N=128K → kBsL2=238, N=196K → kBsL2=155.
+    //
+    // Dispatch threshold = min(kBsWave, kBsL2), still data-agnostic (only
+    // queries hardware attrs). At N≈70K both bounds produce ~426, so the
+    // L2 axis is a no-op there; for larger N it auto-tightens the threshold.
+    //
+    // Small-N lower bound `kSeqSmall` is uniform 4096 across all K (see
+    // kSeqSmallDefaultForK). 4K is the dispatcher's algorithmic-handoff
+    // point: below 4096 the Radix path resolves to single-CTA insertion-sort
+    // (maxByCols = N/2048 = 1 → bp=1; useRadixSort = N≥12288 = false), and
+    // GVR is empirically slower than insertion-sort below 4K across all
+    // K ∈ {512, 1024, 2048} × dtype ∈ {fp32, bf16, fp16} (R/H ∈ [0.55, 0.84]
+    // at N=2K; DSv4 V3.2-Q19c synth sweeps May 2026). Configurable via
+    // TRTLLM_HEURISTIC_NMIN env (>=1024), which overrides the default.
+    // ========================================================================
+    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/4, topK);
+    int const kBsWave = bounds.kBsWave;
+    int const kBsL2 = bounds.kBsL2;
+    int const kBsLarge = bounds.kBsLarge;
+    int const kSeqSmall = bounds.kSeqSmall;
+
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
-    bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
-        && preIdxStride >= preIdxCount && heuristicScratch != nullptr && numColumns >= bounds.kSeqSmall
-        && numColumns < effectiveSplitWorkThreshold && numRows < bounds.kBsLarge;
+    // compressRatio == 1: DSv3.2 indexer (no compressor).
+    // compressRatio == 4: DSv4 indexer (overlap compressor); logits/preIdx in
+    //   compressed-token-index space. Kernel handles N = actual_kv_len/cr and
+    //   forces preIdxOffset=0 internally for cr != 1.
+    bool const compressRatioOk = (compressRatio == 1 || compressRatio == 4);
+    bool const canUseHeuristic = compressRatioOk && preIdx != nullptr && stride1 == 1 && isSupportedTopK
+        && preIdxCount == topK && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
+        && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
 
-    // Env-gated dispatch trace (TRTLLM_SCHEMEX_DEBUG=1).
+    // Optional env-gated dispatch trace (set TRTLLM_SCHEMEX_DEBUG=1 to enable)
     {
         static std::once_flag sDebugOnceFlag;
         static bool sDebug = false;
@@ -1189,21 +976,141 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
             });
         if (sDebug)
         {
-            fprintf(stderr, "[Scheme X] numRows=%d numColumns=%d kBsLarge=%d kSeqSmall=%d -> %s path\n", numRows,
-                numColumns, bounds.kBsLarge, bounds.kSeqSmall, canUseHeuristic ? "Heuristic" : "Radix");
+            fprintf(stderr,
+                "[Scheme X] numRows=%d numColumns=%d kBsWave=%d kBsL2=%d kBsLarge=%d kSeqSmall=%d smCount=%d "
+                "L2=%dMB -> %s path%s\n",
+                numRows, numColumns, kBsWave, kBsL2, kBsLarge, kSeqSmall, bounds.smCount,
+                bounds.l2Bytes / (1024 * 1024), canUseHeuristic ? "Heuristic" : "Radix",
+                (numColumns < kSeqSmall) ? " (small-N route)" : "");
         }
     }
 
     if (canUseHeuristic)
     {
         launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
-            preIdxStride, preIdxCount, numRows, stream);
+            preIdxStride, preIdxCount, numRows, compressRatio, stream);
+        sync_check_cuda_error(stream);
+        return;
     }
-    else if (numColumns < effectiveSplitWorkThreshold)
+
+    int const blocksPerRow = computeIndexerTopKDecodeBlocksPerRow(numRows, numColumns, splitWorkThreshold);
+
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+
+    if (blocksPerRow == 1)
     {
-        // Single-block tier: one CTA per row.
-        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*multipleBlocksPerRow=*/false,
-            /*mergeBlocks=*/false, InputT>;
+        // Single block per row. Below kSortingAlgorithmThreshold use insertion sort,
+        // above use the histogram-radix path.
+        bool const useRadixSort = numColumns >= kSortingAlgorithmThreshold;
+        auto* kernel_instance = useRadixSort ? &topKPerRowDecode<kNumThreadsPerBlock, true>
+                                             : &topKPerRowDecode<kNumThreadsPerBlock, false>;
+
+        cudaLaunchConfig_t config;
+        config.gridDim = numRows;
+        config.blockDim = kNumThreadsPerBlock;
+        config.dynamicSmemBytes = topK * sizeof(int32_t);
+        config.stream = stream;
+        config.numAttrs = 1;
+        config.attrs = attrs;
+
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
+            compressRatio, nullptr, 0, nullptr);
+    }
+    else
+    {
+        // Split each row across `blocksPerRow` blocks, then merge with a second pass.
+        auto* kernel_instance_part1 = &topKPerRowDecode<kNumThreadsPerBlock, true, true>;
+        cudaLaunchConfig_t config_part1;
+        config_part1.gridDim = dim3(numRows, blocksPerRow);
+        config_part1.blockDim = kNumThreadsPerBlock;
+        config_part1.dynamicSmemBytes = 2 * topK * sizeof(int32_t);
+        config_part1.stream = stream;
+        config_part1.numAttrs = 1;
+        config_part1.attrs = attrs;
+
+        cudaLaunchKernelEx(&config_part1, kernel_instance_part1, logits, seqLens, outIndicesAux, stride0, stride1, topK,
+            next_n, compressRatio, outLogitsAux, 0, nullptr);
+
+        constexpr int kNumThreadsPerBlockMerge = 1024;
+        auto* kernel_instance_part2 = &topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>;
+        cudaLaunchConfig_t config_part2;
+        config_part2.gridDim = numRows;
+        config_part2.blockDim = kNumThreadsPerBlockMerge;
+        config_part2.dynamicSmemBytes = topK * sizeof(int32_t);
+        config_part2.stream = stream;
+        config_part2.numAttrs = 1;
+        config_part2.attrs = attrs;
+
+        cudaLaunchKernelEx(&config_part2, kernel_instance_part2, outLogitsAux, seqLens, indices, blocksPerRow * topK, 1,
+            topK, next_n, 1, nullptr, blocksPerRow, outIndicesAux);
+    }
+    sync_check_cuda_error(stream);
+}
+
+// ============================================================================
+// bf16 / fp16 dispatcher overloads
+// ============================================================================
+// Reuses the BS-threshold + small-N dispatch axes (kBsLarge, kSeqSmall) from
+// the fp32 dispatcher, except kBsL2 uses sizeof(InputT) bytes/element instead
+// of 4 — L2 footprint is half, so bf16/fp16 path remains valid for larger BS
+// than fp32 at the same N.
+//
+// Fallback chain when GVR-Heuristic preconditions are not met (preIdx
+// missing, BS too large, or numColumns < kSeqSmall):
+//   numColumns < kSortingAlgorithmThreshold (12288)            → insertion sort
+//   kSortingAlgorithmThreshold ≤ numColumns < splitWorkThreshold → radix sort
+//   numColumns ≥ splitWorkThreshold (200K default)             → unsupported
+//
+// Insertion + radix tiers use the same topKPerRowDecode kernel as fp32 with
+// InputT propagated through; the histogram and sort steps operate on float
+// keys after a static_cast<float>(InputT) at HBM-read sites, so accuracy is
+// identical to casting input to fp32 before the kernel.
+//
+// The split-work tier requires float aux buffers (outLogitsAux /
+// outIndicesAux) that the bf16/fp16 entry does not expose; callers in that
+// regime must use the fp32 entry.
+
+namespace
+{
+
+template <typename InputT>
+void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
+    int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
+    int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch, int const compressRatio,
+    cudaStream_t const stream)
+{
+    static_assert(std::is_same_v<InputT, __nv_bfloat16> || std::is_same_v<InputT, __half>,
+        "invokeIndexerTopKDecodeDtype is for bf16/fp16 only");
+
+    constexpr int kNumThreadsPerBlock = 512;
+    int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
+
+    // bf16/fp16: bytes_per_element = sizeof(InputT) = 2 → kBsL2 doubles vs fp32.
+    // K-aware kSeqSmall — see fp32 dispatcher for rationale.
+    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/static_cast<int>(sizeof(InputT)), topK);
+    int const kBsLarge = bounds.kBsLarge;
+    int const kSeqSmall = bounds.kSeqSmall;
+
+    bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
+    // See fp32 path: cr==1 (V3.2) and cr==4 (V4 indexer) are both supported.
+    bool const compressRatioOk = (compressRatio == 1 || compressRatio == 4);
+    bool const canUseHeuristic = compressRatioOk && preIdx != nullptr && stride1 == 1 && isSupportedTopK
+        && preIdxCount == topK && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
+        && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
+
+    if (canUseHeuristic)
+    {
+        launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
+            preIdxStride, preIdxCount, numRows, compressRatio, stream);
+    }
+    else if (numColumns < kSortingAlgorithmThreshold)
+    {
+        // Insertion sort path — InputT propagated; histogram/sort run on float keys.
+        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/false,
+            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
+
         cudaLaunchConfig_t config;
         config.gridDim = numRows;
         config.blockDim = kNumThreadsPerBlock;
@@ -1214,62 +1121,60 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
         attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
         config.numAttrs = 1;
         config.attrs = attrs;
+
         cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
-            /*outLogits=*/nullptr, /*numBlocksToMerge=*/0, /*indices=*/nullptr);
+            compressRatio, nullptr, 0, nullptr);
+    }
+    else if (numColumns < effectiveSplitWorkThreshold)
+    {
+        // Radix sort path — InputT propagated; histogram/sort run on float keys.
+        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/true,
+            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
+
+        cudaLaunchConfig_t config;
+        config.gridDim = numRows;
+        config.blockDim = kNumThreadsPerBlock;
+        config.dynamicSmemBytes = topK * sizeof(int32_t);
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
+            compressRatio, nullptr, 0, nullptr);
     }
     else
     {
-        // Multi-pass radix. radixPassKernel reads logits contiguously, so
-        // strided inputs would rank the wrong values — gate on stride1 == 1.
-        // (The single-block tier handles stride1 != 1 via topKPerRowJob's
-        // strided fallback.)
-        TLLM_CHECK_WITH_INFO(stride1 == 1, "indexer top-k split-work tier (multi-pass radix) requires stride1 == 1.");
-        TLLM_CHECK_WITH_INFO(scratch != nullptr && scratchBytes >= radixScratchBytes(numRows, numColumns),
-            "indexer top-k split-work tier: scratch buffer missing or too small.");
-        cudaLaunchAttribute radixAttrs[1];
-        radixAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        radixAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-        launchMultiPassRadix<InputT>(
-            scratch, logits, seqLens, indices, numRows, numColumns, topK, stride0, next_n, radixAttrs, stream);
+        TLLM_CHECK_WITH_INFO(false,
+            "indexer_topk_decode bf16/fp16 path does not support numColumns >= splitWorkThreshold "
+            "(split-work path requires float aux buffers not exposed in the bf16/fp16 entry). "
+            "Got numColumns=%d splitWorkThreshold=%d. Use the fp32 entry for this regime.",
+            numColumns, effectiveSplitWorkThreshold);
     }
+
     sync_check_cuda_error(stream);
 }
 
 } // anonymous namespace
 
-void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
-    int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
-    int const* preIdx, int const preIdxStride, int const preIdxCount, float* heuristicScratch,
-    cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
-{
-    invokeIndexerTopKDecodeImpl<float>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns, stride0,
-        stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream, scratch, scratchBytes,
-        is_prefill);
-}
-
-size_t indexerTopKDecodeScratchBytes(int numRows, int numColumns, int /*topK*/)
-{
-    return radixScratchBytes(numRows, numColumns);
-}
-
 void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices,
     int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
     int const next_n, int const topK, int const* preIdx, int const preIdxStride, int const preIdxCount,
-    __nv_bfloat16* heuristicScratch, cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
+    __nv_bfloat16* heuristicScratch, int const compressRatio, cudaStream_t const stream)
 {
-    invokeIndexerTopKDecodeImpl<__nv_bfloat16>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns,
-        stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream, scratch,
-        scratchBytes, is_prefill);
+    invokeIndexerTopKDecodeDtype<__nv_bfloat16>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns,
+        stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, compressRatio, stream);
 }
 
 void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
-    int const* preIdx, int const preIdxStride, int const preIdxCount, __half* heuristicScratch,
-    cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
+    int const* preIdx, int const preIdxStride, int const preIdxCount, __half* heuristicScratch, int const compressRatio,
+    cudaStream_t const stream)
 {
-    invokeIndexerTopKDecodeImpl<__half>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns, stride0,
-        stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream, scratch, scratchBytes,
-        is_prefill);
+    invokeIndexerTopKDecodeDtype<__half>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns, stride0,
+        stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, compressRatio, stream);
 }
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,
@@ -1278,10 +1183,18 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
 {
     constexpr int kNumThreadsPerBlock = 512;
 
-    // One launch over all rows; the per-row sort algorithm is picked at
-    // runtime inside topKPerRowJob.
-    topKPerRowPrefill<kNumThreadsPerBlock><<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-        logits, rowStarts, rowEnds, indices, stride0, stride1, topK, 0);
+    int numInsertionBlocks = std::min(numRows, kSortingAlgorithmThreshold);
+    topKPerRowPrefill<kNumThreadsPerBlock, false>
+        <<<numInsertionBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+            logits, rowStarts, rowEnds, indices, stride0, stride1, topK, 0);
+
+    if (numRows > kSortingAlgorithmThreshold)
+    {
+        int numRadixBlocks = numRows - kSortingAlgorithmThreshold;
+        topKPerRowPrefill<kNumThreadsPerBlock, true>
+            <<<numRadixBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+                logits, rowStarts, rowEnds, indices, stride0, stride1, topK, kSortingAlgorithmThreshold);
+    }
 
     sync_check_cuda_error(stream);
 }
@@ -1293,9 +1206,7 @@ bool canIndexerTopKDecodeUseGvr(int numRows, int numColumns, int topK, int bytes
     {
         return false;
     }
-    // Mirrors the dispatcher's effectiveSplitWorkThreshold default.
-    constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
-    auto const bounds = getSchemeXBounds(numColumns, bytesPerElem);
+    auto const bounds = getSchemeXBounds(numColumns, bytesPerElem, topK);
     return numColumns >= bounds.kSeqSmall && numColumns < kDefaultSplitWorkThreshold && numRows < bounds.kBsLarge;
 }
 

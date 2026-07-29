@@ -42,6 +42,7 @@ from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.modules.fused_moe import (
     CuteDslFusedMoE,
     CutlassFusedMoE,
+    MarlinFusedMoE,
     TRTLLMGenFusedMoE,
 )
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
@@ -78,6 +79,7 @@ class MoeBackendType(str, Enum):
     MEGAMOE_DEEPGEMM = "MEGAMOE_DEEPGEMM"
     MEGAMOE_CUTEDSL = "MEGAMOE_CUTEDSL"
     CUTE_DSL_B12X = "CUTE_DSL_B12X"
+    MARLIN = "MARLIN"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -91,6 +93,7 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
         MoeBackendType.MEGAMOE_CUTEDSL: MegaMoECuteDsl,
         MoeBackendType.CUTE_DSL_B12X: CuteDslB12xFusedMoE,
+        MoeBackendType.MARLIN: MarlinFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -299,6 +302,44 @@ def should_skip_trtllm(
             "not covered by the partial blacklist "
             "[tileN=32, configIndex=5] in PR #13964 head 5629e0dff9; "
             "see the comment above for reproduction."
+        )
+
+    # [nvbug 6165866] The same uninitialized-trtllm-gen-scratch IMA cascade
+    # described above also poisons the whole `-k "TRTLLM"` pytest process on
+    # Blackwell (both SM100/B200 and SM103/B300) through two broader case
+    # families. They are skipped here (in addition to the specific SM103 case
+    # above) so the single-process run stays clean until the kernel is fixed.
+    # See https://nvbugspro.nvidia.com/bug/6165866
+    #
+    # (1) quant=None (BF16): the flashinfer BF16 GEMM
+    #     (`bmm_Bfloat16_..._sm100f`, trtllm_batched_gemm_runner.cu:305) is the
+    #     cascade victim once a block-scale case has run earlier in the same
+    #     process. Minimal repro (reproduces on both SM100 and SM103):
+    #       e60_k4_h2048_i1408-seq=1-quant=None,
+    #       e60_k4_h2048_i1408-seq=1-quant=FP8_BLOCK_SCALES,
+    #       e60_k4_h2048_i1408-seq=1-quant=W4A8_MXFP4_FP8,
+    #       then e8_k1_h512_i512-seq=1-quant=None  -> IMA on the last case.
+    #
+    # (2) e128 W4A16_MXFP4 (all seq / plain+gptoss): the four e128 shape
+    #     (num_experts=128, top_k=4, hidden=intermediate=2880) W4A16_MXFP4
+    #     cases poison each other (the SM103 gptoss-seq8 case above is one of
+    #     them; on SM100 the first observed FAIL is e128-seq1-W4A16_MXFP4).
+    is_e128_w4a16_mxfp4 = (
+        quant_algo == QuantAlgo.W4A16_MXFP4
+        and model_config is not None
+        and model_config.num_experts == 128
+        and model_config.top_k == 4
+        and model_config.hidden_size == 2880
+        and model_config.intermediate_size == 2880
+    )
+    if get_sm_version() in (100, 103) and (quant_algo is None or is_e128_w4a16_mxfp4):
+        return (
+            "[nvbug 6165866] TRTLLM-Gen MoE on Blackwell (SM100/SM103) hits a "
+            "CUDA illegal memory access that cascades across the whole pytest "
+            "process; the quant=None (flashinfer BF16 GEMM victim) and e128 "
+            "W4A16_MXFP4 (self-cascading tileN=32 tactic) families are skipped "
+            "until the kernel is fixed. "
+            "See https://nvbugspro.nvidia.com/bug/6165866"
         )
 
     # Routing method compatibility check (used by test_moe_module.py)
@@ -688,19 +729,24 @@ def should_skip_cutlass(
     if backend_type != MoeBackendType.CUTLASS:
         return None
 
-    # TP per-shard alignment: W8A16, NVFP4, and W4A8_AWQ require 128-aligned
-    # per-shard intermediate_size. W8A16 fails in preprocess_weights_for_mixed_gemm
-    # (num_rows % rows_per_tile != 0). NVFP4 pads to 128-alignment
-    # (NVFP4_ROW_ALIGNMENT in quantization.py:2312) but zero-padding +
-    # blockwise quantization interaction causes ~6-7% mismatch.
+    # TP per-shard alignment: W8A16, NVFP4, W4A8_AWQ, and MXFP8 require
+    # 128-aligned per-shard intermediate_size. W8A16 fails in
+    # preprocess_weights_for_mixed_gemm (num_rows % rows_per_tile != 0). NVFP4
+    # pads to 128-alignment (NVFP4_ROW_ALIGNMENT in quantization.py:2312) but
+    # zero-padding + blockwise quantization interaction causes ~6-7% mismatch.
     # W4A8_AWQ (WInt4AFP8FusedMoEMethod) requires K dimensions to be multiples
     # of 128 on SM90 for interleave factor selection (quantization.py:1310-1324).
+    # MXFP8 (MXFP8CutlassFusedMoEMethod) hard-asserts
+    # intermediate_size_per_partition % 128 == 0 in create_weights for its
+    # int32 UE8M0 SF packing, so a non-128-aligned per-shard intermediate
+    # raises AssertionError.
     # W4A8_MXFP4_MXFP8 uses MXFP4 auto-padding that handles this correctly.
     if moe_tp_size > 1 and model_config is not None:
         tp_alignment_quants = {
             QuantAlgo.W8A16,
             QuantAlgo.NVFP4,
             QuantAlgo.W4A8_AWQ,
+            QuantAlgo.MXFP8,
         }
         # FP8_BLOCK_SCALES has this issue only on Hopper (SM90)
         if torch.cuda.get_device_capability(0) == (9, 0):
@@ -1097,7 +1143,7 @@ def supports_autotuner_capture(
     Returns:
         True if autotuner capture/replay is supported, False otherwise
     """
-    # DEEPGEMM, both MegaMoE backends, and CUTE_DSL_B12X do not support
+    # DEEPGEMM, both MegaMoE backends, CUTE_DSL_B12X, and MARLIN do not support
     # autotuner capture (fused kernels own dispatch+combine, b12x has its own
     # dispatch/replay state).
     if backend_type in (
@@ -1105,6 +1151,7 @@ def supports_autotuner_capture(
         MoeBackendType.MEGAMOE_DEEPGEMM,
         MoeBackendType.MEGAMOE_CUTEDSL,
         MoeBackendType.CUTE_DSL_B12X,
+        MoeBackendType.MARLIN,
     ):
         return False
 
@@ -1379,6 +1426,8 @@ def should_skip_to_accelerate_ci(
     Rules applied (in order):
     0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16
        unquantized coverage enabled.
+    0a. MARLIN backend: only NVFP4 on Hopper (SM90); skip all other
+        quant_algo / architecture combinations.
     1. e256 model: only DeepSeekV3 routing, bfloat16, seq=1, non-gptoss
     2. Multi-GPU: only DEP and TTP parallel modes
     3. Routing: full 6 routing methods only on (CUTLASS or TRTLLM) with NVFP4;
@@ -1412,6 +1461,16 @@ def should_skip_to_accelerate_ci(
         and not (backend_type == MoeBackendType.TRTLLM and dtype == torch.bfloat16)
     ):
         return "[CI accel] Skip unquantized (quant=None) in CI"
+
+    # --- Rule 0a: MARLIN backend only runs NVFP4 on Hopper (SM90) ---
+    if backend_type == MoeBackendType.MARLIN:
+        from tensorrt_llm._utils import get_sm_version
+
+        if quant_algo != QuantAlgo.NVFP4:
+            return f"[CI accel] MARLIN only tests NVFP4 in CI (got {quant_algo})"
+        sm_version = get_sm_version()
+        if sm_version != 90:
+            return f"[CI accel] MARLIN only runs on Hopper (SM90) in CI (got SM{sm_version})"
 
     # Any e256-class model_config triggers CI Rule-1 minimal coverage:
     # the full dtype x seq_len x swiglu x routing matrix on e256 models

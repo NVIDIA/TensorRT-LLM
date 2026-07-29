@@ -24,10 +24,6 @@ def parse_arguments() -> _ap.Namespace:
     parser = _ap.ArgumentParser(
         description="Rename Docker images based on the given instructions.")
     parser.add_argument(
-        'src_branch',
-        type=str,
-        help="The name of the source branch releasing the Docker image.")
-    parser.add_argument(
         'src_build_id',
         type=int,
         help="The name of the source build id release the Docker image.")
@@ -52,12 +48,36 @@ def parse_arguments() -> _ap.Namespace:
         help=
         "The new stage part of the destination image name (default: tritondevel)."
     )
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument(
+        "--commit",
+        type=str,
+        default=None,
+        help=
+        "GitHub mode: short commit SHA embedded in the source image tag (default: `git rev-parse --short HEAD`)."
+    )
+    source_group.add_argument(
+        "--src-branch",
+        dest="src_branch",
+        type=str,
+        default=None,
+        help="GitLab mode: source branch name embedded in the source image tag. "
+        "When set, the tag is built as `<prefix>-<src_branch>-<src_build_id>` instead of the GitHub-PR layout."
+    )
     return parser.parse_args()
 
 
 def get_current_timestamp() -> str:
     """Get the current timestamp in YYYYMMDDhhmm format."""
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d%H%M")
+
+
+def get_current_commit() -> str:
+    """Return the 7-char short SHA of the current git HEAD."""
+    return _sp.run(["git", "rev-parse", "--short=7", "HEAD"],
+                   check=True,
+                   text=True,
+                   capture_output=True).stdout.strip()[:7]
 
 
 def run_shell_command(command: str, dry_run: bool) -> None:
@@ -178,29 +198,37 @@ def find_and_replace_in_files(directory, file_extension: str,
 
 
 def rename_images(*,
-                  src_branch: str,
                   src_build_id: int,
                   dst_mr: int,
                   stage: str,
+                  commit: str | None = None,
+                  src_branch: str | None = None,
                   timestamp: str | None = None,
                   dry_run: bool = False) -> None:
-    print(
-        f"Renaming images for branch {src_branch} and build id {src_build_id} to {dst_mr}"
-    )
+    if src_branch is not None:
+        src_branch_sanitized = src_branch.replace("/", "_")
+        src_suffix = f"{src_branch_sanitized}-{src_build_id}"
+        print(
+            f"Renaming images (GitLab mode) from branch {src_branch} build id {src_build_id} to MR {dst_mr}"
+        )
+    else:
+        commit = (commit or get_current_commit())[:7]
+        src_suffix = f"{commit}-github-pr-{dst_mr}-{src_build_id}"
+        print(
+            f"Renaming images (GitHub mode) at commit {commit} build id {src_build_id} to MR {dst_mr}"
+        )
     if dry_run:
         print("Dry-run mode enabled. No actual changes will be made.")
     else:
         print("Renaming images...")
 
     timestamp = timestamp or get_current_timestamp()
-    src_branch_sanitized = src_branch.replace("/", "_")
     base_dir = find_script_directory().parent
     current_tags_path = base_dir / "jenkins" / CURRENT_TAG_FILE
 
     for dst_key, src_pattern in IMAGE_MAPPING.items():
         print(f"Processing {dst_key} ...")
-        src_image = f"{src_pattern}-{src_branch_sanitized}-{src_build_id}".replace(
-            "__stage__", stage)
+        src_image = f"{src_pattern}-{src_suffix}".replace("__stage__", stage)
         dst_image_old = extract_line_after_prefix(current_tags_path,
                                                   dst_key + "=").strip('"')
         dst_image = replace_text_between_dashes(

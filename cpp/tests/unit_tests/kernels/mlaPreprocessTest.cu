@@ -23,6 +23,7 @@
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include <random>
 
@@ -232,18 +233,18 @@ protected:
         using tensorrt_llm::runtime::ITensor;
         using tensorrt_llm::runtime::bufferCast;
 
-        auto dtype = nvinfer1::DataType::kHALF;
+        auto dtype = tensorrt_llm::DataType::kHALF;
         if constexpr (std::is_same_v<DataType, float>)
         {
-            dtype = nvinfer1::DataType::kFLOAT;
+            dtype = tensorrt_llm::DataType::kFLOAT;
         }
         else if constexpr (std::is_same_v<DataType, half>)
         {
-            dtype = nvinfer1::DataType::kHALF;
+            dtype = tensorrt_llm::DataType::kHALF;
         }
         else if constexpr (std::is_same_v<DataType, __nv_bfloat16>)
         {
-            dtype = nvinfer1::DataType::kBF16;
+            dtype = tensorrt_llm::DataType::kBF16;
         }
         else
         {
@@ -252,15 +253,15 @@ protected:
         auto cache_dtype = dtype;
         if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
         {
-            cache_dtype = nvinfer1::DataType::kFP8;
+            cache_dtype = tensorrt_llm::DataType::kFP8;
             this->h_kv_scale_orig_quant
-                = tensorrt_llm::runtime::BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
-            this->d_kv_scale_orig_quant
-                = tensorrt_llm::runtime::BufferManager::gpuSync(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
+                = tensorrt_llm::runtime::BufferManager::pinned(ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
+            this->d_kv_scale_orig_quant = tensorrt_llm::runtime::BufferManager::gpuSync(
+                ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
             this->h_kv_scale_quant_orig
-                = tensorrt_llm::runtime::BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
-            this->d_kv_scale_quant_orig
-                = tensorrt_llm::runtime::BufferManager::gpuSync(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
+                = tensorrt_llm::runtime::BufferManager::pinned(ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
+            this->d_kv_scale_quant_orig = tensorrt_llm::runtime::BufferManager::gpuSync(
+                ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
             auto* kv_scale_orig_quant_ptr = bufferCast<float>(*(this->h_kv_scale_orig_quant));
             auto* kv_scale_quant_orig_ptr = bufferCast<float>(*(this->h_kv_scale_quant_orig));
             float kv_scale_orig_quant = 2.0f;
@@ -276,13 +277,13 @@ protected:
             static_assert(std::is_same_v<DataType, TCache>, "TCache must be the same type as DataType");
         }
         this->h_cu_seq_lens = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({this->mNumRequests + 1}), nvinfer1::DataType::kINT64);
+            ITensor::makeShape({this->mNumRequests + 1}), tensorrt_llm::DataType::kINT64);
         this->h_cu_ctx_cached_kv_lens = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({this->mNumRequests + 1}), nvinfer1::DataType::kINT64);
+            ITensor::makeShape({this->mNumRequests + 1}), tensorrt_llm::DataType::kINT64);
         this->d_cu_seq_lens = tensorrt_llm::runtime::BufferManager::gpuSync(
-            ITensor::makeShape({this->mNumRequests + 1}), nvinfer1::DataType::kINT64);
+            ITensor::makeShape({this->mNumRequests + 1}), tensorrt_llm::DataType::kINT64);
         this->d_cu_ctx_cached_kv_lens = tensorrt_llm::runtime::BufferManager::gpuSync(
-            ITensor::makeShape({this->mNumRequests + 1}), nvinfer1::DataType::kINT64);
+            ITensor::makeShape({this->mNumRequests + 1}), tensorrt_llm::DataType::kINT64);
         {
             // set random sequence length
             auto* cu_seq_lens_temp_ptr = bufferCast<int64_t>(*(this->h_cu_seq_lens));
@@ -333,9 +334,9 @@ protected:
                 this->mTokensPerBlock, this->mLoraSize + this->mRopeSize}),
             cache_dtype);
         this->h_offset_tensor = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({this->mNumRequests, 2, this->mMaxBlockPerSeq}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({this->mNumRequests, 2, this->mMaxBlockPerSeq}), tensorrt_llm::DataType::kINT32);
         this->h_compressed_offset_tensor = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({this->mNumRequests, 2, this->mMaxBlockPerSeq}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({this->mNumRequests, 2, this->mMaxBlockPerSeq}), tensorrt_llm::DataType::kINT32);
         this->d_kv_cache_tensor = tensorrt_llm::runtime::BufferManager::gpuSync(
             ITensor::makeShape({this->mNumRequests, 2, this->mMaxBlockPerSeq, this->mNumHeadsUncompressed,
                 this->mTokensPerBlock, this->mUncompressedHeadSize + this->mRopeSize}),
@@ -349,9 +350,9 @@ protected:
                 this->mTokensPerBlock, this->mLoraSize + this->mRopeSize}),
             cache_dtype);
         this->d_offset_tensor = tensorrt_llm::runtime::BufferManager::gpuSync(
-            ITensor::makeShape({this->mNumRequests, 2, this->mMaxBlockPerSeq}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({this->mNumRequests, 2, this->mMaxBlockPerSeq}), tensorrt_llm::DataType::kINT32);
         this->d_compressed_offset_tensor = tensorrt_llm::runtime::BufferManager::gpuSync(
-            ITensor::makeShape({this->mNumRequests, 2, this->mMaxBlockPerSeq}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({this->mNumRequests, 2, this->mMaxBlockPerSeq}), tensorrt_llm::DataType::kINT32);
         {
             auto* kv_cache_ptr = bufferCast<DataType>(*(this->h_kv_cache_tensor));
             auto* kv_cache_ref_ptr = bufferCast<DataType>(*(this->h_kv_cache_tensor_ref));
