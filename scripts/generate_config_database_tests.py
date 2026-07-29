@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,17 @@ from pathlib import Path
 
 import yaml
 
+
+class _DoubleQuoted(str):
+    """str subclass that yaml.dump emits with double quotes."""
+
+
+def _double_quoted_representer(dumper, data):
+    return dumper.represent_scalar("tag:yaml.org,2002:str", str(data), style='"')
+
+
+yaml.add_representer(_DoubleQuoted, _double_quoted_representer)
+
 SCRIPT_DIR = Path(__file__).parent.resolve()
 _REPO_ROOT = SCRIPT_DIR.parent
 
@@ -42,7 +53,7 @@ from examples.configs.database.database import (  # noqa: E402
 )
 
 REPO_ROOT = _REPO_ROOT
-PERF_SANITY_DIR = REPO_ROOT / "tests" / "scripts" / "perf-sanity"
+PERF_SANITY_DIR = REPO_ROOT / "tests" / "scripts" / "perf-sanity" / "aggregated"
 TEST_LIST_PATH = (
     REPO_ROOT / "tests" / "integration" / "test_lists" / "qa" / "llm_config_database.yml"
 )
@@ -71,12 +82,17 @@ def generate_server_name(recipe: Recipe) -> str:
     """Generate a unique server name from recipe."""
     model_slug = recipe.model.replace("/", "_").replace("-", "_").replace(".", "_")
     name = f"{model_slug}_{recipe.isl}_{recipe.osl}_conc{recipe.concurrency}_gpu{recipe.num_gpus}"
+    if recipe.profile:
+        name = f"{name}_{recipe.profile}"
     return name
 
 
 def generate_client_name(recipe: Recipe) -> str:
     """Generate client config name."""
-    return f"con{recipe.concurrency}_isl{recipe.isl}_osl{recipe.osl}"
+    name = f"con{recipe.concurrency}_isl{recipe.isl}_osl{recipe.osl}"
+    if recipe.profile:
+        name = f"{name}_{recipe.profile}"
+    return name
 
 
 def recipe_to_server_config(recipe: Recipe, llm_api_config: dict) -> dict:
@@ -85,8 +101,22 @@ def recipe_to_server_config(recipe: Recipe, llm_api_config: dict) -> dict:
     if not model_name:
         raise ValueError(f"Model not found in MODEL_NAME_MAPPING: {recipe.model}")
 
+    # Force a fixed number of accepted speculative-decoding tokens so perf
+    # measurements are deterministic across recipes that enable spec decoding.
+    max_draft_len = (llm_api_config.get("speculative_config") or {}).get("max_draft_len")
+    spec_env = (
+        {
+            "server_env_var": _DoubleQuoted(
+                f"TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS={max_draft_len}"
+            )
+        }
+        if max_draft_len is not None
+        else {}
+    )
+
     server_config = {
         "name": generate_server_name(recipe),
+        **spec_env,
         "model_name": model_name,
         "gpus": recipe.num_gpus,
         # Enable scenario-only matching for baseline comparison

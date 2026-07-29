@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Tuple
 
 import pytest
 import yaml
@@ -29,44 +29,15 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
 
 from .common import get_mmlu_accuracy, venv_check_call
 from .conftest import (get_device_count, get_sm_version, llm_models_root,
-                       skip_no_sm120, skip_nvlink_inactive, skip_post_blackwell,
-                       skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
-                       tests_path, unittest_path)
+                       skip_no_sm120, skip_post_blackwell, skip_pre_ada,
+                       skip_pre_blackwell, skip_pre_hopper, tests_path,
+                       unittest_path)
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
 _MEM_FRACTION_50 = 0.5
 _MEM_FRACTION_80 = 0.8
 _MEM_FRACTION_95 = 0.95
-
-
-def test_gpt3_175b_1layers_build_only(llm_root, llm_venv, engine_dir):
-    """Build GPT-3 175B: 96 layer w/ plugins"""
-    example_root = os.path.join(llm_root, "examples", "models", "core", "gpt")
-    engine_dir = os.path.join(engine_dir, "gpt-175-96layers-build-only")
-
-    dtype = 'float16'
-    convert_cmd = [
-        f"{example_root}/../../../generate_checkpoint_config.py",
-        f"--output_path={engine_dir}/ckpt_config.json",
-        "--architecture=GPTForCausalLM", f"--dtype={dtype}",
-        "--num_hidden_layers=1", "--num_attention_heads=96",
-        "--hidden_size=12288", "--vocab_size=51200", "--tp_size=8"
-    ]
-    venv_check_call(llm_venv, convert_cmd)
-
-    print("Building engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--model_config={engine_dir}/ckpt_config.json",
-        f"--output_dir={engine_dir}",
-        "--max_batch_size=256",
-        "--max_input_len=200",
-        "--max_seq_len=400",
-        "--max_beam_width=1",
-        f"--gpt_attention_plugin={dtype}",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.parametrize("model_name,model_path", [
@@ -107,9 +78,6 @@ class BenchRunner:
                  model_name: str,
                  streaming: bool,
                  tp_size: int,
-                 use_pytorch_backend: bool = False,
-                 skip_engine_build: bool = False,
-                 quant: Optional[str] = None,
                  extra_llm_api_options: Optional[str] = None,
                  use_mpirun: bool = False,
                  concurrency: Optional[int] = None,
@@ -132,13 +100,9 @@ class BenchRunner:
         self.llm_venv = llm_venv
         self.model_path = Path(llm_models, model_subdir).absolute()
         self.model_name = model_name
-        self.quant = quant
         self.streaming = streaming
-        self.skip_engine_build = skip_engine_build
-        self.use_pytorch_backend = use_pytorch_backend
         self.use_mpirun = use_mpirun
         self.tp_size = tp_size
-        self.quant_name = self.quant if self.quant is not None else "FP16"
         self.extra_llm_api_options = extra_llm_api_options
 
         self.work_dir = Path(tempfile.TemporaryDirectory().name)
@@ -148,7 +112,6 @@ class BenchRunner:
             self.mpirun_cmd = f"mpirun --allow-run-as-root -n {self.tp_size} trtllm-llmapi-launch"
         else:
             self.mpirun_cmd = ""
-        self.engine_path = None
         self.concurrency = concurrency
         self.num_requests = num_requests
         self.ep_size = ep_size
@@ -165,8 +128,6 @@ class BenchRunner:
 
     def __call__(self):
         self.prepare_dataset()
-        if not (self.skip_engine_build or self.use_pytorch_backend):
-            self.build_engine()
         return self.run_bench()
 
     def prepare_dataset(self):
@@ -194,31 +155,6 @@ class BenchRunner:
         print(f"Running command: {' '.join(command)}")
         check_call(" ".join(command), shell=True, env=self.llm_venv._new_env)
 
-    def build_engine(self):
-        if self.skip_engine_build:
-            return
-
-        build_cmd = \
-            f"{self.mpirun_cmd} " \
-            f"trtllm-bench " \
-            f"--model {self.model_name} " \
-            f"--model_path {self.model_path} " \
-            f"--workspace {self.work_dir} " \
-            f"build --tp_size {self.tp_size}"
-
-        if self.quant is not None:
-            build_cmd = f"{build_cmd} --quantization {self.quant}"
-
-        build_cmd = f"{build_cmd} --dataset {self.dataset_path}"
-        build_output = check_output(build_cmd,
-                                    shell=True,
-                                    env=self.llm_venv._new_env)
-
-        for line in build_output.split("\n")[::-1]:
-            if line.startswith("ENGINE SAVED:"):
-                self.engine_path = Path(line.split(":")[1])
-                break
-
     def run_bench(self):
         streaming = "--streaming" if self.streaming else ""
         benchmark_cmd = \
@@ -226,14 +162,9 @@ class BenchRunner:
             f"trtllm-bench --model {self.model_name} --model_path {self.model_path} " \
             f"throughput " \
             f"--tp {self.tp_size} "
-        if self.engine_path:
-            benchmark_cmd += f"--engine_dir {self.engine_path} "
         benchmark_cmd += f" --dataset {self.dataset_path} {streaming}"
 
-        if self.use_pytorch_backend:
-            benchmark_cmd += " --backend pytorch"
-        else:
-            benchmark_cmd += " --backend tensorrt"
+        benchmark_cmd += " --backend pytorch"
 
         if self.extra_llm_api_options:
             benchmark_cmd += f" --extra_llm_api_options {self.extra_llm_api_options}"
@@ -299,8 +230,7 @@ class BenchRunner:
 @pytest.mark.parametrize("model_subdir",
                          ["llama-models-v3/llama-v3-8b-instruct-hf"],
                          ids=["llama-v3"])
-@pytest.mark.parametrize("use_pytorch_backend", [True, False],
-                         ids=["pytorch_backend", "trt_backend"])
+@pytest.mark.parametrize("use_pytorch_backend", [True], ids=["pytorch_backend"])
 def test_trtllm_bench_llmapi_launch(llm_root, llm_venv, model_name,
                                     model_subdir, use_pytorch_backend):
     runner = BenchRunner(llm_root=llm_root,
@@ -308,7 +238,6 @@ def test_trtllm_bench_llmapi_launch(llm_root, llm_venv, model_name,
                          model_name=model_name,
                          model_subdir=model_subdir,
                          streaming=False,
-                         use_pytorch_backend=use_pytorch_backend,
                          use_mpirun=True,
                          tp_size=2)
     runner()
@@ -321,14 +250,12 @@ def test_trtllm_bench_llmapi_launch(llm_root, llm_venv, model_name,
 def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv, model_name,
                                             llama_model_root):
     # Prepare dataset with invalid tokens
-    _, _, dataset_path = trtllm_bench_prolog(llm_root,
-                                             llm_venv,
-                                             engine_dir=None,
-                                             model_subdir=llama_model_root,
-                                             model_name=model_name,
-                                             quant=None,
-                                             streaming=False,
-                                             skip_engine_build=True)
+    _, dataset_path = trtllm_bench_prolog(llm_root,
+                                          llm_venv,
+                                          model_subdir=llama_model_root,
+                                          model_name=model_name,
+                                          quant=None,
+                                          streaming=False)
     with open(dataset_path) as f:
         dataset = [json.loads(line) for line in f.readlines()]
     dataset[0]["input_ids"][-1] = -1
@@ -367,22 +294,12 @@ def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv, model_name,
     assert "Requests failed: Token ID out of range (1 requests)" in stdout
 
 
-def trtllm_bench_prolog(
-        llm_root,
-        llm_venv,
-        engine_dir: Optional[str],
-        model_subdir,
-        model_name: str,
-        quant: str,
-        streaming: bool,
-        skip_engine_build: bool = False
-) -> Union[Tuple[Path, Path, Path], Path]:
-    """Optionally build engine and generate dataset for benchmark.
+def trtllm_bench_prolog(llm_root, llm_venv, model_subdir, model_name: str,
+                        quant: str, streaming: bool) -> Tuple[Path, Path]:
+    """Generate dataset for benchmark.
 
     Returns:
-        Union[Tuple[Path, Path, Path], Path]:
-            - Tuple containing model_path, engine_path, and dataset_path.
-            - A single dataset_path object if skip_engine_build is True.
+        Tuple[Path, Path]: model_path and dataset_path.
     """
     llm_models = llm_models_root()
     # skip when llm_models_root is None
@@ -390,14 +307,11 @@ def trtllm_bench_prolog(
         return
 
     model_path = Path(llm_models, model_subdir).absolute()
-    engine_path = None
     quant_name = quant if quant is not None else "FP16"
     stream_mode = "streaming" if streaming else "non-streaming"
     benchmark_name = f"trtllm-bench-sanity-{quant_name}-{stream_mode}"
-    benchmark_name += "-pytorch-backend" if skip_engine_build else benchmark_name
 
-    work_dir = Path(tempfile.TemporaryDirectory().name
-                    ) if skip_engine_build else Path(engine_dir)
+    work_dir = Path(tempfile.TemporaryDirectory().name)
     dataset_path = Path(work_dir, f"{benchmark_name}.txt")
     # Clean up an existing directory if it exists
     shutil.rmtree(work_dir, ignore_errors=True)
@@ -424,26 +338,7 @@ def trtllm_bench_prolog(
     ]
     check_output(" ".join(dataset_cmd), shell=True)
 
-    if not skip_engine_build:
-        build_cmd = \
-            f"trtllm-bench " \
-            f"--model {model_name} " \
-            f"--model_path {model_path} " \
-            f"--workspace {work_dir} " \
-            f"build --tp_size 1"
-
-        if quant is not None:
-            build_cmd = f"{build_cmd} --quantization {quant}"
-
-        build_cmd = f"{build_cmd} --dataset {dataset_path}"
-        build_output = check_output(build_cmd, shell=True)
-
-        for line in build_output.split("\n")[::-1]:
-            if line.startswith("ENGINE SAVED:"):
-                engine_path = Path(line.split(":")[1])
-                break
-
-    return model_path, engine_path, dataset_path
+    return model_path, dataset_path
 
 
 @pytest.fixture
@@ -490,47 +385,6 @@ def temp_extra_llm_api_options_file(request):
         yield None
 
 
-@pytest.mark.parametrize("model_subdir", [
-    "llama-3.1-model/Meta-Llama-3.1-8B",
-],
-                         ids=lambda x: x.strip("-"))
-@pytest.mark.parametrize(
-    "model_name",
-    [
-        "meta-llama/Llama-3.1-8B",
-    ],
-)
-@pytest.mark.parametrize("quant", [None, "FP8"], ids=["FP16", "FP8"])
-@pytest.mark.parametrize("streaming", ["", "--streaming"],
-                         ids=["non-streaming", "streaming"])
-@pytest.mark.parametrize("use_extra_config", [True, False],
-                         ids=["extra_config", ""])
-@pytest.mark.parametrize("pytorch_backend_config", [False], ids=[""])
-def test_trtllm_bench_sanity(llm_root, llm_venv, engine_dir, model_subdir,
-                             model_name, quant, streaming, use_extra_config,
-                             pytorch_backend_config,
-                             temp_extra_llm_api_options_file):
-    """Sanity check on the new benchmark script to make sure it works.
-
-    - meta-llama/Llama-3.1-8B for baseline
-    - fp16 and fp8 to test quantization
-    """
-    model_path, engine_path, dataset_path = trtllm_bench_prolog(
-        llm_root, llm_venv, engine_dir, model_subdir, model_name, quant,
-        "streaming" in streaming)
-
-    benchmark_cmd = \
-        f"trtllm-bench --model {model_name} --model_path {model_path} " \
-        f"throughput --engine_dir {engine_path} " \
-        f"--backend tensorrt " \
-        f"--dataset {dataset_path} {streaming}"
-
-    assert not pytorch_backend_config
-    if use_extra_config:
-        benchmark_cmd += f" --config {temp_extra_llm_api_options_file}"
-    check_call(benchmark_cmd, shell=True)
-
-
 @pytest.mark.parametrize(
     "model_name, llama_model_root, use_extra_config, pytorch_backend_config",
     [('meta-llama/Llama-3.1-8B', 'llama-3.1-8b', False, False),
@@ -557,14 +411,9 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
                                              temp_extra_llm_api_options_file):
     """Sanity check on latency benchmark for LLM API with PyTorch backend
     """
-    model_path, _, dataset_path = trtllm_bench_prolog(llm_root,
-                                                      llm_venv,
-                                                      None,
-                                                      llama_model_root,
-                                                      model_name,
-                                                      False,
-                                                      False,
-                                                      skip_engine_build=True)
+    model_path, dataset_path = trtllm_bench_prolog(llm_root, llm_venv,
+                                                   llama_model_root, model_name,
+                                                   False, False)
 
     benchmark_cmd = \
         f"trtllm-bench --model {model_name} --model_path {model_path} " \
@@ -590,14 +439,12 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
     model_name = "meta-llama/Llama-3.1-8B"
     llama_model_dir = Path(
         llm_models_root()) / "llama-3.1-model/Llama-3.1-8B-Instruct"
-    _, _, dataset_path = trtllm_bench_prolog(llm_root,
-                                             llm_venv,
-                                             engine_dir=None,
-                                             model_subdir=llama_model_dir,
-                                             model_name=model_name,
-                                             quant=None,
-                                             streaming=False,
-                                             skip_engine_build=True)
+    _, dataset_path = trtllm_bench_prolog(llm_root,
+                                          llm_venv,
+                                          model_subdir=llama_model_dir,
+                                          model_name=model_name,
+                                          quant=None,
+                                          streaming=False)
 
     benchmark_cmd = \
             f"mpirun --allow-run-as-root -n 2 trtllm-llmapi-launch trtllm-bench --model {model_name} " \
@@ -606,38 +453,6 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
             f"--dataset {str(dataset_path)} --backend pytorch --tp 2"
 
     check_call(benchmark_cmd, shell=True, env=llm_venv._new_env)
-
-
-@pytest.mark.parametrize("model_subdir", [
-    "llama-3.1-model/Meta-Llama-3.1-8B",
-],
-                         ids=lambda x: x.strip("-"))
-@pytest.mark.parametrize(
-    "model_name",
-    [
-        "meta-llama/Llama-3.1-8B",
-    ],
-)
-@pytest.mark.parametrize("quant", [None, "FP8"], ids=["FP16", "FP8"])
-def test_trtllm_bench_latency_sanity(llm_root, llm_venv, engine_dir,
-                                     model_subdir, model_name, quant):
-    """Sanity check on the new benchmark script to make sure it works.
-
-    - meta-llama/Llama-3.1-8B for baseline
-    - fp16 and fp8 to test quantization
-    """
-    model_path, engine_path, dataset_path = trtllm_bench_prolog(llm_root,
-                                                                llm_venv,
-                                                                engine_dir,
-                                                                model_subdir,
-                                                                model_name,
-                                                                quant,
-                                                                streaming=True)
-
-    benchmark_cmd = \
-        f"trtllm-bench --model {model_name} --model_path {model_path} latency " \
-        f"--engine_dir {engine_path} --dataset {dataset_path} --backend tensorrt"
-    check_call(benchmark_cmd, shell=True)
 
 
 @pytest.mark.parametrize(
@@ -650,7 +465,6 @@ def test_trtllm_bench_help_sanity(model_name):
     """Sanity check that the options are defined properly by printing out help
     """
     check_call("trtllm-bench --help", shell=True)
-    check_call(f"trtllm-bench --model {model_name} build --help", shell=True)
     check_call(f"trtllm-bench --model {model_name} throughput --help",
                shell=True)
     check_call(f"trtllm-bench --model {model_name} latency --help", shell=True)
@@ -661,24 +475,22 @@ def test_trtllm_bench_help_sanity(model_name):
 @pytest.mark.parametrize("concurrency", [False, True],
                          ids=["", "enable_concurrency"])
 def test_trtllm_bench_request_rate_and_concurrency(llm_root, llm_venv,
-                                                   engine_dir, request_rate,
-                                                   concurrency):
+                                                   request_rate, concurrency):
     """Sanity check on the trtllm-bench new request rate and concurrency API
     """
     model_subdir = "llama-3.1-model/Meta-Llama-3.1-8B"
     model_name = "meta-llama/Llama-3.1-8B"
 
-    model_path, engine_path, dataset_path = trtllm_bench_prolog(llm_root,
-                                                                llm_venv,
-                                                                engine_dir,
-                                                                model_subdir,
-                                                                model_name,
-                                                                quant=None,
-                                                                streaming=False)
+    model_path, dataset_path = trtllm_bench_prolog(llm_root,
+                                                   llm_venv,
+                                                   model_subdir,
+                                                   model_name,
+                                                   quant=None,
+                                                   streaming=False)
 
     benchmark_cmd = \
         f"trtllm-bench --model {model_name} --model_path {model_path} throughput " \
-        f"--engine_dir {engine_path} --dataset {dataset_path} --backend tensorrt"
+        f"--dataset {dataset_path} --backend pytorch"
 
     if request_rate:
         benchmark_cmd += " --request_rate 100"
@@ -706,30 +518,22 @@ def test_trtllm_bench_request_rate_and_concurrency(llm_root, llm_venv,
 )
 @pytest.mark.parametrize("streaming", [True, False],
                          ids=["non-streaming", "streaming"])
-@pytest.mark.parametrize("backend", ["tensorrt", "pytorch"],
-                         ids=["TRT", "PyTorch"])
+@pytest.mark.parametrize("backend", ["pytorch"], ids=["PyTorch"])
 def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
                                     model_subdir, streaming, backend):
     """Test the iteration log functionality with necessary options
     """
     iteration_log = None
-    engine_dir = None
 
     try:
-        skip_engine_build = backend != "tensorrt"
         iteration_log = tempfile.mkstemp(dir="/tmp", suffix=".txt")[1]
-        if not skip_engine_build:
-            engine_dir = tempfile.mkdtemp(dir="/tmp")
 
-        model_path, engine_path, dataset_path = trtllm_bench_prolog(
-            llm_root,
-            llm_venv,
-            engine_dir,
-            model_subdir,
-            model_name,
-            quant=None,
-            skip_engine_build=skip_engine_build,
-            streaming=streaming)
+        model_path, dataset_path = trtllm_bench_prolog(llm_root,
+                                                       llm_venv,
+                                                       model_subdir,
+                                                       model_name,
+                                                       quant=None,
+                                                       streaming=streaming)
 
         benchmark_cmd = \
             f"trtllm-bench --model {model_name} --model_path {model_path} " \
@@ -739,11 +543,6 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
             benchmark_cmd += " --streaming"
 
         benchmark_cmd += f" --backend {backend}"
-        if skip_engine_build:
-            assert engine_path is None, "Engine path should be None"
-        else:
-            assert engine_path is not None, "Engine path should not be None"
-            benchmark_cmd += f" --engine_dir {engine_path}"
 
         check_call(benchmark_cmd, shell=True)
 
@@ -756,8 +555,6 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
     finally:
         if iteration_log:
             shutil.rmtree(iteration_log, ignore_errors=True)
-        if engine_dir:
-            shutil.rmtree(engine_dir, ignore_errors=True)
 
 
 def test_trtllm_serve_example(llm_root, llm_venv):
@@ -797,7 +594,7 @@ def test_trtllm_serve_lora_example(llm_root, llm_venv):
          str(test_root / "_test_trtllm_serve_lora.py")])
 
 
-@pytest.mark.parametrize("backend", ["pytorch", "trt"])
+@pytest.mark.parametrize("backend", ["pytorch"])
 def test_trtllm_serve_top_logprobs(llm_root, llm_venv, backend: str):
     example_root = Path(os.path.join(llm_root, "examples", "serve"))
     test_root = unittest_path() / "llmapi" / "apps"
@@ -811,7 +608,7 @@ def test_trtllm_serve_top_logprobs(llm_root, llm_venv, backend: str):
     ])
 
 
-@pytest.mark.parametrize("backend", ["pytorch", "trt"])
+@pytest.mark.parametrize("backend", ["pytorch"])
 def test_openai_misc_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -833,7 +630,7 @@ def test_openai_kv_cache_contamination(llm_root, llm_venv):
     ])
 
 
-@pytest.mark.parametrize("backend", ["pytorch", "trt"])
+@pytest.mark.parametrize("backend", ["pytorch"])
 def test_openai_completions_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     filter_expr = f"{backend} and not sampler"
@@ -843,7 +640,7 @@ def test_openai_completions_example(llm_root, llm_venv, backend: str):
     ])
 
 
-@pytest.mark.parametrize("backend", ["pytorch", "trt"])
+@pytest.mark.parametrize("backend", ["pytorch"])
 def test_openai_chat_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     filter_expr = f"{backend} and not sampler"
@@ -853,7 +650,7 @@ def test_openai_chat_example(llm_root, llm_venv, backend: str):
     ])
 
 
-@pytest.mark.parametrize("backend", ["pytorch", "trt"])
+@pytest.mark.parametrize("backend", ["pytorch"])
 def test_openai_reasoning(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -984,25 +781,6 @@ def test_openai_chat_guided_decoding(llm_root, llm_venv, model_name: str):
     ])
 
 
-@pytest.mark.skip_less_device(2)
-@pytest.mark.skip_less_device_memory(40000)
-def test_openai_multi_chat_example(llm_root, llm_venv):
-    test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_multi_chat.py")])
-
-
-@skip_nvlink_inactive
-@pytest.mark.skip_less_device(4)
-@pytest.mark.skip_less_device_memory(80000)
-def test_openai_consistent_chat(llm_root, llm_venv):
-    test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_consistent_chat.py")])
-
-
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name", [
     "llama-3.1-model/Meta-Llama-3.1-8B",
@@ -1015,15 +793,6 @@ def test_trtllm_benchmark_serving(llm_venv, model_name):
         str(test_root /
             f"_test_trtllm_serve_benchmark.py::test_trtllm_serve_benchmark[{model_name}]"
             )
-    ])
-
-
-def test_build_time_benchmark_sanity(llm_root, llm_venv):
-    temp = tempfile.TemporaryDirectory()
-    llm_venv.run_cmd([
-        str(Path(llm_root) / "tests/microbenchmarks/build_time_dashboard.py"),
-        '-m',
-        temp.name,
     ])
 
 
@@ -1614,7 +1383,6 @@ def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
             model_name=model_name,
             model_subdir=model_path,
             streaming=False,
-            use_pytorch_backend=True,
             use_mpirun=False,
             tp_size=8,
             ep_size=8,
@@ -2115,7 +1883,6 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
                  marks=skip_pre_blackwell),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
     pytest.param('Kimi-K2-Thinking-NVFP4', marks=skip_pre_blackwell),
-    pytest.param('MiniMax-M2', marks=skip_pre_hopper),
     pytest.param('MiniMax-M3', marks=skip_pre_blackwell),
 ])
 def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
@@ -2179,28 +1946,33 @@ def test_ptp_quickstart_advanced_multinode(llm_root, llm_venv, model_path,
         f"Testing quickstart {model_path} with tp_size={tp_size}, pp_size={pp_size}."
     )
 
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+
+    model_dir = f"{llm_models_root()}/{model_path}"
     prompt = "Explain why New York is great city to live in, in 1 short paragraph"
-    run_cmd = [
-        "python3",
-        str(example_root / "quickstart_advanced.py"),
-        f"--model_dir={llm_models_root()}/{model_path}",
-        f"--tp_size={tp_size}",
-        f"--pp_size={pp_size}",
-        "--max_num_tokens=4096",
-        "--max_batch_size=1",
-        "--use_cuda_graph",
-        f"--kv_cache_fraction={_MEM_FRACTION_50}",
-        "--prompt",
-        prompt,
-    ]
 
-    if ("Llama-4" in model_path or "Qwen3" in model_path) and tp_size > 1:
-        run_cmd.append(f"--moe_ep_size={tp_size}")
+    moe_ep_size = tp_size if ("Llama-4" in model_path
+                              or "Qwen3" in model_path) and tp_size > 1 else -1
 
-    output = check_output(run_cmd, env=llm_venv._new_env)
-    print(output)
-    assert "Generated text:" in output, output[-4000:]
+    with LLM(
+            model=model_dir,
+            backend='pytorch',
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            max_num_tokens=4096,
+            max_batch_size=1,
+            cuda_graph_config=CudaGraphConfig(),
+            kv_cache_config=KvCacheConfig(
+                free_gpu_memory_fraction=_MEM_FRACTION_50),
+            moe_expert_parallel_size=moe_ep_size,
+    ) as llm:
+        outputs = llm.generate([prompt], SamplingParams(max_tokens=64))
+
+    for output in outputs:
+        generated_text = output.outputs[0].text
+        print(f"Generated text: {generated_text}")
+        assert generated_text, f"No text generated for {model_path}"
 
 
 @pytest.mark.skip_less_device(4)
@@ -2313,7 +2085,6 @@ def test_trtllm_bench_mig_launch(llm_root, llm_venv, model_name, model_subdir):
                              model_name=model_name,
                              model_subdir=model_subdir,
                              streaming=False,
-                             use_pytorch_backend=True,
                              use_mpirun=False,
                              tp_size=1,
                              concurrency=concurrency,

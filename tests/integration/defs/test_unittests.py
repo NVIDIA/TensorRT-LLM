@@ -66,7 +66,12 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
-    pynvml.nvmlInit()
+    try:
+        pynvml.nvmlInit()
+        gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        gpu_name = pynvml.nvmlDeviceGetName(gpu_handle)
+    except pynvml.NVMLError:
+        gpu_name = "CPU"
 
     test_root = tests_path()
     dry_run = False
@@ -79,18 +84,23 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     waives_file = request.config.getoption("--waives-file")
     run_ray = request.config.getoption("--run-ray")
+    unittest_markexpr = request.config.getoption("--unittest-markexpr")
 
     num_workers = 1
 
     # This dataframe is not manually edited. Infra team will regularly generate this dataframe based on test execution results.
     # If you need to override this policy, please use postprocess code as below.
-    agg_unit_mem_df = pd.read_csv(
-        f'{test_root}/integration/defs/agg_unit_mem_df.csv')
-    gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-    gpu_name = pynvml.nvmlDeviceGetName(gpu_handle)
+    agg_unit_mem_path = f'{test_root}/integration/defs/agg_unit_mem_df.csv'
+    print(f'Loading unittest parallel config from: {agg_unit_mem_path}')
+    agg_unit_mem_df = pd.read_csv(agg_unit_mem_path)
     if isinstance(gpu_name, bytes):
         gpu_name = gpu_name.decode()
+    print(f'GPU name from NVML (index 0): {gpu_name!r}')
+    print(f'GPU names available in parallel config: '
+          f'{sorted(agg_unit_mem_df["gpu"].dropna().unique().tolist())}')
     agg_unit_mem_df = agg_unit_mem_df[agg_unit_mem_df['gpu'] == gpu_name]
+    print(f'Matched parallel config rows for GPU {gpu_name!r}: '
+          f'{len(agg_unit_mem_df)}')
     print(agg_unit_mem_df)
 
     parallel_dict = {}
@@ -101,6 +111,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     print(parallel_dict)
 
     cur_key = (gpu_name, case)
+    print(f'Parallel config lookup key: {cur_key!r}')
     if cur_key in parallel_dict:
         num_workers = parallel_dict[cur_key]
         num_workers = min(num_workers, 8)
@@ -160,6 +171,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if run_ray:
         command += ["--run-ray"]
 
+    if unittest_markexpr:
+        command += ["-m", unittest_markexpr]
+
     s3_secret_key = None
     s3_upload_path = request.config.getoption("--s3-upload-path", default=None)
     if s3_upload_path:
@@ -169,7 +183,6 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             "-s",
             f"--output-dir={inner_output_dir}",
             f"--s3-upload-path={inner_upload_path}",
-            "--s3-capture-mode=direct",
             "--s3-upload-mode=deferred",
         ]
         inline_output_max_bytes = request.config.getoption(

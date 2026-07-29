@@ -65,6 +65,7 @@ Welcome to TensorRT LLM's Documentation!
    features/feature-combination-matrix.md
    features/attention.md
    features/disagg-serving.md
+   features/embeddings.md
    features/kvcache.md
    features/long-sequence.md
    features/lora.md
@@ -79,6 +80,7 @@ Welcome to TensorRT LLM's Documentation!
    features/guided-decoding.md
    features/speculative-decoding.md
    features/checkpoint-loading.md
+   features/model-express.md
    features/auto_deploy/auto-deploy.md
    features/auto_deploy/transforms.rst
    features/ray-orchestrator.md

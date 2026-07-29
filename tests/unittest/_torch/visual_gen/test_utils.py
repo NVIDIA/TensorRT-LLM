@@ -62,16 +62,6 @@ class TestSequenceSharderInactive:
         rope = (cos, cos)
         assert s.shard_rope(rope, seq_len=4, seq_dim=1) is rope
 
-    def test_disable_enable_no_collectives(self):
-        s = SequenceSharder(size=4, rank=0, group=None)
-        assert s.is_active
-        s.disable()
-        assert not s.is_active
-        x = torch.randn(1, 8, 2)
-        assert s.shard(x, dim=1) is x
-        s.enable()
-        assert s.is_active
-
 
 class TestSequenceSharderShardSlices:
     """Active sharder: block slice math without ``gather``."""

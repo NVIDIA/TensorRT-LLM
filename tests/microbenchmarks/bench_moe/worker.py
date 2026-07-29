@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib
 import json
 import os
@@ -487,6 +488,15 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
     args = _maybe_load_config_file(args)
     ctx = _resolve_benchmark_context(args)
 
+    # nsys capture and the CUPTI kernel breakdown both use CUPTI and cannot run
+    # at the same time; --nsys wins and disables the kernel breakdown.
+    if getattr(args, "nsys", False) and "kernels" in ctx.analysis:
+        _maybe_print_rank0(
+            "[bench_moe] --nsys disables the CUPTI kernel breakdown (--analysis kernels); "
+            "the profiled region is captured by nsys instead."
+        )
+        ctx = dataclasses.replace(ctx, analysis=tuple(a for a in ctx.analysis if a != "kernels"))
+
     # CUPTI MUST be initialized before the CUDA context is created.
     _early_cupti_ctx: Optional[_CuptiContext] = None
     if args.cuda_graph and "kernels" in ctx.analysis:
@@ -631,6 +641,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
                     random_seed=int(args.random_seed),
                     input_cache=input_cache,
                     enable_perfect_router_requested=bool(args.enable_perfect_router),
+                    nsys=bool(getattr(args, "nsys", False)),
                 )
         # Candidate finished normally: replace the pre-written placeholder (the
         # last row) with the real result.

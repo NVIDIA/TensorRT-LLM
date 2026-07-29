@@ -1,4 +1,5 @@
 import base64
+import gc
 import importlib.util
 import multiprocessing
 import pickle
@@ -36,6 +37,19 @@ from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
+@pytest.fixture(autouse=True)
+def release_shared_cuda_memory():
+    """Reclaim producer-side CUDA IPC memory between parametrize IDs."""
+    yield
+    # Break reference cycles so the test-local hf_model actually dies now.
+    gc.collect()
+    # Free sent IPC storages whose consumers have already closed them.
+    torch.cuda.ipc_collect()
+    # Return freed cached segments to the driver so other processes
+    # (the next test's Ray workers) can allocate them.
+    torch.cuda.empty_cache()
+
+
 @pytest.mark.part0
 @skip_pre_blackwell
 @pytest.mark.parametrize(
@@ -53,6 +67,11 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
         additional_kwargs["moe_config"] = {
             "backend": "DEEPGEMM",
         }
+        # moe_intermediate_size is 768, and FP8 block scaling needs each
+        # MoE TP shard to stay a multiple of the 128 block size, so MoE TP
+        # is capped at 2 (768 / 2 = 384) and EP covers the rest of tp=4.
+        additional_kwargs["moe_tensor_parallel_size"] = 2
+        additional_kwargs["moe_expert_parallel_size"] = 2
     num_hidden_layers = 1
     hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
@@ -60,7 +79,7 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
@@ -88,7 +107,7 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
             temperature=0, return_generation_logits=True, max_tokens=1024
         )
 
-        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1, 2, 3])
 
         llm._collective_rpc("update_weights", (ipc_handles,))
         # Finalize the update weights
@@ -96,6 +115,8 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
 
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         compare_logits(llm_logits, ref_logits)
+
+    del hf_model
 
 
 @pytest.mark.part1
@@ -115,6 +136,11 @@ def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
         additional_kwargs["moe_config"] = {
             "backend": "DEEPGEMM",
         }
+        # moe_intermediate_size is 768, and FP8 block scaling needs each
+        # MoE TP shard to stay a multiple of the 128 block size, so MoE TP
+        # is capped at 2 (768 / 2 = 384) and EP covers the rest of tp=4.
+        additional_kwargs["moe_tensor_parallel_size"] = 2
+        additional_kwargs["moe_expert_parallel_size"] = 2
     num_hidden_layers = 1
     hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
@@ -122,7 +148,7 @@ def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
@@ -169,7 +195,7 @@ def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
         for filter_name in filter_list:
             weight_filter = common_filter(filter_name=filter_name)
             ipc_handles = hf_model.get_weight_ipc_handles_serialized(
-                [0, 1], weight_filter=weight_filter
+                [0, 1, 2, 3], weight_filter=weight_filter
             )
             llm._collective_rpc("update_weights", (ipc_handles,))
         # Finalize the update weights
@@ -177,6 +203,8 @@ def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
 
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         compare_logits(llm_logits, ref_logits)
+
+    del hf_model
 
 
 class RefNVFP4ModelWithIPCHandles(RefHFModel):
@@ -330,10 +358,11 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
 
         assert not fusion_buffer, f"Incomplete fusion groups: {list(fusion_buffer.keys())}"
 
+        # Only populate the owning device. Extra replicas are materialized
+        # lazily by ``get_weight_ipc_handles_serialized`` so that GPUs never
+        # asked for via IPC don't hold NVFP4 quantized tensors that persist
+        # across parametrize IDs.
         self.all_weights[self.device_id] = model_weights
-        for i in range(torch.cuda.device_count()):
-            if i != self.device_id:
-                self.all_weights[i] = [(n, p.to(f"cuda:{i}")) for n, p in model_weights]
 
         with torch.no_grad():
             param_dict = dict(self.model.named_parameters())
@@ -435,6 +464,10 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
         device_list = list(range(torch.cuda.device_count())) if device_ids is None else device_ids
 
         for device in device_list:
+            if device not in self.all_weights:
+                src = self.all_weights[self.device_id]
+                self.all_weights[device] = [(n, p.to(f"cuda:{device}")) for n, p in src]
+
             all_handles = []
             for item in self.all_weights[device]:
                 name, p = item
@@ -476,7 +509,7 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
@@ -501,13 +534,15 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
             temperature=0, return_generation_logits=True, max_tokens=1024
         )
 
-        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1, 2, 3])
         llm._collective_rpc("update_weights", (ipc_handles,))
         llm._collective_rpc("update_weights", (None,))
 
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
         compare_logits(llm_logits, ref_logits, threshold=0.8)
+
+    del hf_model
 
 
 @pytest.mark.part3
@@ -537,7 +572,7 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
@@ -580,7 +615,7 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
         for filter_name in filter_list:
             weight_filter = common_filter(filter_name=filter_name)
             ipc_handles = hf_model.get_weight_ipc_handles_serialized(
-                [0, 1], weight_filter=weight_filter
+                [0, 1, 2, 3], weight_filter=weight_filter
             )
             llm._collective_rpc("update_weights", (ipc_handles,))
         llm._collective_rpc("update_weights", (None,))
@@ -588,6 +623,8 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
         compare_logits(llm_logits, ref_logits, threshold=0.8)
+
+    del hf_model
 
 
 @pytest.fixture
@@ -725,6 +762,8 @@ def _nemotron_h_body():
 
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         compare_logits(llm_logits, ref_logits)
+
+    del hf_model
 
 
 def _nemotron_h_subprocess_entry(result_queue):

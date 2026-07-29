@@ -190,6 +190,7 @@ class FunctionCall:
 
 class ToolCall:
     def __init__(self, name: str, arguments: dict):
+        self.id = f"call_{name}"
         self.function = FunctionCall(name, arguments)
 
 

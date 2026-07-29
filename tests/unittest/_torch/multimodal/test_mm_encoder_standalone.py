@@ -1034,9 +1034,10 @@ def test_multi_request_batch_chat(
                                                    inputs_with_embeddings):
                 assert isinstance(input, dict)
                 assert isinstance(input_with_embedding, dict)
-                assert list(
-                    set(input.keys())
-                    ^ set(input_with_embedding.keys())) == ["multi_modal_data"]
+                assert (set(input.keys())
+                        ^ set(input_with_embedding.keys())) == {
+                            "multi_modal_data", "mm_item_order"
+                        }
                 assert set(input_with_embedding.keys()) == set(
                     ["prompt", "multi_modal_embeddings"])
                 assert input["prompt"] == input_with_embedding["prompt"]

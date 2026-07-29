@@ -640,7 +640,7 @@ def _build_dsa_mla_module(case: AttnCase, model_config, device: torch.device):
     Random-normal weights (std 0.02) are fine: the microbench measures kernel
     structure/time, not numerical correctness.
     """
-    from tensorrt_llm._torch.modules.attention import MLA
+    from tensorrt_llm._torch.modules.mla import MLA
 
     pos_embd_params, _ = _mla_pos_embd_and_scaling(case)
     mla = MLA(

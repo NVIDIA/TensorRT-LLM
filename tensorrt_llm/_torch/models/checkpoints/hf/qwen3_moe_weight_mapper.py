@@ -1,20 +1,15 @@
-from typing import Union
-
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
-from tensorrt_llm.models.modeling_utils import DecoderModelForCausalLM
 
 
 @register_mapper("HF", "Qwen3MoeForCausalLM")
 class Qwen3MoeHfWeightMapper(Qwen2MoeHfWeightMapper):
 
-    def init_model_and_config(self, model: Union[nn.Module,
-                                                 DecoderModelForCausalLM],
-                              config: ModelConfig):
+    def init_model_and_config(self, model: nn.Module, config: ModelConfig):
         super().init_model_and_config(model, config)
 
     def should_skip_module(self, module_name: str) -> bool:

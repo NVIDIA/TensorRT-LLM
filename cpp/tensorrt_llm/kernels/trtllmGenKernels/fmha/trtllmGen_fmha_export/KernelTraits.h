@@ -207,8 +207,14 @@ struct KernelConfig : public KernelConfigBase {
 
     // Set numStagesQ for headDim > 128 kernels.
     if (mNumInstsQ * mNumInstsKv == 1) {
-      TLLM_CHECK_INFO(mTileSizeQ == 64 || (mHeadDimQk > 128 && mHeadDimV > 128),
-                      "Consider using numInstsQ = 2 for better performance.");
+      // Whether the kernel is a generation kernel that skips softmax when possible.
+      bool isGenerationSkipsSoftmax =
+        options.mSkipsSoftmaxWhenPossible && !isContextKernel(options.mFmhaKernelType);
+      // Skip the check for skipsSoftmax generation kernels because this is intended.
+      if (!isGenerationSkipsSoftmax) {
+        TLLM_CHECK_INFO(mTileSizeQ == 64 || (mHeadDimQk > 128 && mHeadDimV > 128),
+                        "Consider using numInstsQ = 2 for better performance.");
+      }
       // There is no enough shared memory for 2 stages when the headDim is not split into multiple
       // stages.
       if (mHeadDimPerStageKv == 0 && keepsMmaAbForDsMlaGen) {
@@ -748,8 +754,8 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
       mSeparateSmemKv = true;
     }
 
-    // The tile size for the correction step.
-    mCorrTileSize = std::min(mValidTilePvN, 64);
+    // Use the largest power-of-two tile up to 64 that exactly divides the correction width.
+    mCorrTileSize = std::gcd(mValidTilePvN, 64);
 
     // The number of keys per tile.
     mNumKeysPerTile = std::min(mNumTokensPerPage, mTileSizeKv);
