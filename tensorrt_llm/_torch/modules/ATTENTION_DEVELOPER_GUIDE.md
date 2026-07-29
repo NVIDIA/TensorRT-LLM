@@ -260,8 +260,9 @@ library exposes `is_available()` for module/static environment checks and
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
-- `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
-  requests and can dispatch each phase to a different ordered FMHA provider.
+- `fmha/phased.py` defines phase-specific FMHA entry points.
+- `fmha/combined.py` combines different context and generation implementations
+  for non-MLA mixed batches.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
@@ -269,8 +270,9 @@ The FMHA package is split by role:
 - `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
 
 Use `PhasedFmha` for libraries that need separate context/generation or MHA/MLA
-entry points. Use `Fmha` directly for libraries that already own the full
-request shape.
+entry points. Its no-argument `is_*_supported()` methods report implemented
+phases. Use `Fmha` directly for libraries that already own the full request
+shape.
 
 #### 3.2.3 MLA cached-context semantics
 

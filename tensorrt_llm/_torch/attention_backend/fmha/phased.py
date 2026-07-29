@@ -13,8 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, replace
-from functools import lru_cache
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, cast
 
 import torch
@@ -25,7 +24,6 @@ from tensorrt_llm._torch.attention_backend.interface import (
     CustomAttentionMask,
     PredefinedAttentionMask,
 )
-from tensorrt_llm.bindings.internal import thop
 
 from .interface import Fmha
 
@@ -34,32 +32,6 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
-
-
-@lru_cache(maxsize=128)
-def get_trtllm_gen_context_workspace_size(
-    dtype: torch.dtype,
-    max_num_seq: int,
-    max_num_tokens: int,
-    num_heads: int,
-    head_size: int,
-    rotary_embedding_dim: int,
-    fp8_context_fmha: bool,
-) -> int:
-    """Return the fused context-preprocessing workspace size in bytes."""
-    if max_num_tokens == 0:
-        return 0
-    layout = thop.get_trtllm_gen_context_workspace_layout(
-        dtype,
-        max_num_seq,
-        max_num_tokens,
-        num_heads,
-        head_size,
-        rotary_embedding_dim,
-        True,
-        fp8_context_fmha,
-    )
-    return int(layout["total_size"])
 
 
 @dataclass(slots=True)
@@ -101,7 +73,6 @@ class PhasedFmha(Fmha):
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
-        self._followup_fmhas: tuple[PhasedFmha, ...] = ()
         self.kv_factor = 1 if attn.is_mla_enable else 2
         kv_lora_rank = attn.kv_lora_rank or 0
         self.generation_out_head_size = (
@@ -140,199 +111,21 @@ class PhasedFmha(Fmha):
             return 0
         return int(blocks_in_primary_pool) * kv_cache_manager.num_local_layers * self.kv_factor
 
-    def set_followup_fmhas(self, followup_fmhas: tuple["PhasedFmha", ...]) -> None:
-        """Set later phased libraries that may provide an unsupported phase."""
-        self._followup_fmhas = followup_fmhas
+    def is_context_supported(self) -> bool:
+        """Return whether this library implements context attention."""
+        return type(self).run_context is not PhasedFmha.run_context
 
-    @staticmethod
-    def _phase_forward_args(
-        forward_args: AttentionForwardArgs,
-        input_type: AttentionInputType,
-        is_cross: bool,
-    ) -> AttentionForwardArgs:
-        updates: dict[str, object] = {"attention_input_type": input_type}
-        if (
-            input_type == AttentionInputType.generation_only
-            and not is_cross
-            and forward_args.attention_mask == CustomAttentionMask.CUSTOM
-        ):
-            # Custom multimodal masks describe context tokens only. Generation
-            # uses the regular causal decode semantics.
-            updates.update(
-                attention_mask=PredefinedAttentionMask.CAUSAL,
-                attention_mask_data=None,
-            )
-        return replace(forward_args, **updates)
+    def is_generation_supported(self) -> bool:
+        """Return whether this library implements generation attention."""
+        return type(self).run_generation is not PhasedFmha.run_generation
 
-    def is_context_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> bool:
-        return False
+    def is_mla_context_supported(self) -> bool:
+        """Return whether this library implements MLA context attention."""
+        return type(self).run_mla_context is not PhasedFmha.run_mla_context
 
-    def is_generation_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> bool:
-        return False
-
-    def is_mla_context_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> bool:
-        return False
-
-    def is_mla_generation_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> bool:
-        return False
-
-    def _select_phase_fmha(
-        self,
-        phase: str,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> Optional["PhasedFmha"]:
-        is_mla = self.attn.is_mla_enable
-        support_method_name = f"is_{'mla_' if is_mla else ''}{phase}_supported"
-        for fmha in (self, *self._followup_fmhas):
-            support_method = getattr(fmha, support_method_name)
-            if support_method(q, k, v, metadata, forward_args):
-                return fmha
-        return None
-
-    def _select_phase_fmhas(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> tuple[
-        Optional["PhasedFmha"],
-        Optional["PhasedFmha"],
-        AttentionForwardArgs,
-        AttentionForwardArgs,
-    ]:
-        context_args = self._phase_forward_args(
-            forward_args,
-            AttentionInputType.context_only,
-            metadata.is_cross,
-        )
-        generation_args = self._phase_forward_args(
-            forward_args,
-            AttentionInputType.generation_only,
-            metadata.is_cross,
-        )
-        has_context = (
-            metadata.num_contexts > 0
-            and forward_args.attention_input_type != AttentionInputType.generation_only
-        )
-        has_generation = (
-            metadata.num_generations > 0
-            and forward_args.attention_input_type != AttentionInputType.context_only
-        )
-        context_fmha = (
-            self._select_phase_fmha("context", q, k, v, metadata, context_args)
-            if has_context
-            else None
-        )
-        generation_fmha = (
-            self._select_phase_fmha("generation", q, k, v, metadata, generation_args)
-            if has_generation
-            else None
-        )
-        return context_fmha, generation_fmha, context_args, generation_args
-
-    def is_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> bool:
-        context_fmha, generation_fmha, _, _ = self._select_phase_fmhas(
-            q,
-            k,
-            v,
-            metadata,
-            forward_args,
-        )
-        return self._selected_phases_support_request(
-            context_fmha,
-            generation_fmha,
-            metadata,
-            forward_args,
-        )
-
-    @staticmethod
-    def _selected_phases_support_request(
-        context_fmha: Optional["PhasedFmha"],
-        generation_fmha: Optional["PhasedFmha"],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> bool:
-        has_context = (
-            metadata.num_contexts > 0
-            and forward_args.attention_input_type != AttentionInputType.generation_only
-        )
-        has_generation = (
-            metadata.num_generations > 0
-            and forward_args.attention_input_type != AttentionInputType.context_only
-        )
-        return (
-            (has_context or has_generation)
-            and (not has_context or context_fmha is not None)
-            and (not has_generation or generation_fmha is not None)
-        )
-
-    def try_forward(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> bool:
-        """Run a supported phased request after selecting each provider once."""
-        phase_selection = self._select_phase_fmhas(q, k, v, metadata, forward_args)
-        if not self._selected_phases_support_request(
-            phase_selection[0],
-            phase_selection[1],
-            metadata,
-            forward_args,
-        ):
-            return False
-        self._forward_with_selected_phases(
-            q,
-            k,
-            v,
-            metadata,
-            forward_args,
-            *phase_selection,
-        )
-        return True
+    def is_mla_generation_supported(self) -> bool:
+        """Return whether this library implements MLA generation attention."""
+        return type(self).run_mla_generation is not PhasedFmha.run_mla_generation
 
     def get_fp8_context_fmha(
         self,
@@ -363,35 +156,6 @@ class PhasedFmha(Fmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
     ) -> None:
-        phase_selection = self._select_phase_fmhas(q, k, v, metadata, forward_args)
-        if not self._selected_phases_support_request(
-            phase_selection[0],
-            phase_selection[1],
-            metadata,
-            forward_args,
-        ):
-            raise RuntimeError(f"{type(self).__name__} does not support this phased request.")
-        self._forward_with_selected_phases(
-            q,
-            k,
-            v,
-            metadata,
-            forward_args,
-            *phase_selection,
-        )
-
-    def _forward_with_selected_phases(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        context_fmha: Optional["PhasedFmha"],
-        generation_fmha: Optional["PhasedFmha"],
-        context_args: AttentionForwardArgs,
-        generation_args: AttentionForwardArgs,
-    ) -> None:
         attn = self.attn
         output = forward_args.output
         if output is None:
@@ -415,21 +179,14 @@ class PhasedFmha(Fmha):
                 f"num_ctx_tokens={num_ctx_tokens}, attention_input_type={attention_input_type}."
             )
 
-        fp8_fmha = context_fmha if context_fmha is not None else generation_fmha
-        fp8_args = context_args if context_fmha is not None else generation_args
-        fp8_context_fmha = (
-            fp8_fmha.get_fp8_context_fmha(q, output, metadata, fp8_args, is_gen_only)
-            if fp8_fmha is not None
-            else False
+        fp8_context_fmha = self.get_fp8_context_fmha(
+            q,
+            output,
+            metadata,
+            forward_args,
+            is_gen_only,
         )
-        prepared_fmhas: set[PhasedFmha] = set()
-        for fmha, phase_args in (
-            (context_fmha, context_args),
-            (generation_fmha, generation_args),
-        ):
-            if fmha is not None and fmha not in prepared_fmhas:
-                fmha.prepare_workspace(q, k, v, metadata, phase_args, workspace)
-                prepared_fmhas.add(fmha)
+        self.prepare_workspace(q, k, v, metadata, forward_args, workspace)
 
         out_head_size = self.generation_out_head_size if is_gen_only else self.context_out_head_size
         out_tensor = output.view(num_tokens, attn.num_heads, out_head_size)
@@ -495,13 +252,9 @@ class PhasedFmha(Fmha):
             params.input_seq_length = max_context_q_len
             params.batch_size = num_seqs
             if attn.is_mla_enable:
-                if context_fmha is None:
-                    raise RuntimeError("No phased FMHA library supports MLA context attention.")
-                context_fmha.run_mla_context(replace(params, fwd=context_args))
+                self.run_mla_context(params)
             else:
-                if context_fmha is None:
-                    raise RuntimeError("No phased FMHA library supports context attention.")
-                context_fmha.run_context(replace(params, fwd=context_args))
+                self.run_context(params)
 
         if num_generations > 0 and attention_input_type != AttentionInputType.context_only:
             seq_offset = num_contexts
@@ -543,13 +296,16 @@ class PhasedFmha(Fmha):
             params.spec_decoding_generation_lengths = spec_gen_lengths
             params.spec_decoding_position_offsets = spec_pos_offsets
             if attn.is_mla_enable:
-                if generation_fmha is None:
-                    raise RuntimeError("No phased FMHA library supports MLA generation attention.")
-                generation_fmha.run_mla_generation(replace(params, fwd=generation_args))
+                self.run_mla_generation(params)
             else:
-                if generation_fmha is None:
-                    raise RuntimeError("No phased FMHA library supports generation attention.")
-                generation_fmha.run_generation(replace(params, fwd=generation_args))
+                # The custom mask covers only the context portion of a mixed batch.
+                if (
+                    not metadata.is_cross
+                    and params.fwd.attention_mask == CustomAttentionMask.CUSTOM
+                ):
+                    params.fwd.attention_mask = PredefinedAttentionMask.CAUSAL
+                    params.fwd.attention_mask_data = None
+                self.run_generation(params)
 
     def run_context(self, params: FmhaParams) -> None:
         raise NotImplementedError(f"{type(self).__name__} does not support context attention.")

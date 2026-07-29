@@ -58,7 +58,8 @@ from tensorrt_llm.functional import AttentionMaskType, PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
-from .phased import FmhaParams, PhasedFmha, get_trtllm_gen_context_workspace_size
+from .phased import FmhaParams, PhasedFmha
+from .trtllm_gen_utils import get_trtllm_gen_context_workspace_size
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -507,14 +508,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         return True, ""
 
-    def _is_phase_supported(
+    def is_supported(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
-        phase: str,
     ) -> bool:
         supported, reason = self._is_supported_with_reason(
             q,
@@ -525,38 +525,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             forward_args,
         )
         if not supported:
-            logger.debug(f"FlashInfer trtllm-gen fmha library does not support {phase}: {reason}")
+            logger.debug(f"FlashInfer trtllm-gen fmha library does not support request: {reason}")
         return supported
-
-    def is_context_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> bool:
-        return self._is_phase_supported(q, k, v, metadata, forward_args, "context")
-
-    def is_generation_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> bool:
-        return self._is_phase_supported(q, k, v, metadata, forward_args, "generation")
-
-    def is_mla_generation_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> bool:
-        return self._is_phase_supported(q, k, v, metadata, forward_args, "MLA generation")
 
     def _is_supported_with_reason(
         self,

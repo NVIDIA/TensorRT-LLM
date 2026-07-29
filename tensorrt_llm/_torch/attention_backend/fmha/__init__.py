@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .combined import CombinedFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
@@ -23,6 +24,7 @@ from .triton_custom_mask import TritonCustomMaskFmha
 __all__ = [
     "DEFAULT_FMHA_LIBS",
     "FMHA_LIBS",
+    "CombinedFmha",
     "FallbackFmha",
     "FlashInferTrtllmGenFmha",
     "Fmha",
