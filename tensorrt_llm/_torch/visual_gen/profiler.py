@@ -52,8 +52,8 @@ def parse_profile_range() -> ProfileRange:
     * ``predenoise``     – profile from request start through denoise-loop
                            setup, including text encoding and latent
                            preparation. Single-shot.
-    * ``postdenoise``    – profile from the end of the last denoise loop to
-                           request completion, covering VAE decode. Single-shot.
+    * ``postdenoise``    – profile from the end of a denoise loop to request
+                           completion, covering VAE decode. Single-shot.
     * ``all``            – profile the full request, from text encoding through
                            VAE decode; skip warmup
     * (unset)            – no profiler API calls; plain ``nsys profile`` captures everything
@@ -75,7 +75,12 @@ def parse_profile_range() -> ProfileRange:
 
        ``predenoise`` and ``postdenoise`` are **single-shot per process**:
        they fire once around the first user request after warmup and do not
-       re-arm on subsequent requests. Pair either mode with
+       re-arm on subsequent requests. Known limitation: ``postdenoise`` arms
+       after the *first* denoise loop, so on a multi-stage pipeline its
+       window is a superset of VAE decode — on LTX-2 two-stage it also holds
+       the spatial upsample and all of stage 2. Isolating decode there needs
+       the profiler to know which loop is last; no mode does it today. Pair
+       either mode with
        ``nsys --capture-range-end=stop`` (keeps the app running cleanly after
        collection ends). ``all`` and numeric ranges re-arm for each request;
        use ``--capture-range-end=repeat:N`` to collect multiple requests.
@@ -112,8 +117,8 @@ class VisualGenProfiler:
       out, including after an exception.
     * :meth:`steps` wraps one denoise loop's iterator. It closes the
       ``predenoise`` window before the first step, opens and closes windows
-      on the step indices a numeric range names, and opens the
-      ``postdenoise`` window after the last step.
+      on the step indices a numeric range names, and arms the
+      ``postdenoise`` window after the loop's last step.
 
     Callers are responsible for skipping warmup passes. Each closed window
     exports its own trace file, so repeated windows in one process never

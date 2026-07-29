@@ -355,6 +355,32 @@ def test_numeric_window_does_not_outlive_a_short_denoise_loop(
     ]
 
 
+def test_postdenoise_arms_after_the_first_loop_on_multi_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pins the documented LTX-2 two-stage limitation.
+
+    ``postdenoise`` is single-shot and arms at the first loop's end, so on a
+    multi-stage pipeline the window is a superset of VAE decode: it also holds
+    the inter-stage work and every later stage. Isolating decode would require
+    the profiler to know which loop is last. Documented in
+    ``parse_profile_range`` and the perf-analysis guide; this test exists so
+    the behavior cannot change silently.
+    """
+    profiler, events = _recording_profiler(monkeypatch, "postdenoise")
+
+    with profiler.request_scope():
+        for i, _ in profiler.steps(range(10)):  # stage 1
+            events.append(f"s1_step{i}")
+        events.append("upsample")
+        for i, _ in profiler.steps(range(3)):  # stage 2
+            events.append(f"s2_step{i}")
+        events.append("vae_decode")
+
+    captured = events[events.index("start") + 1 : events.index("stop")]
+    assert captured == ["upsample", "s2_step0", "s2_step1", "s2_step2", "vae_decode"]
+
+
 class _StubPipeline:
     """Minimal stand-in exercising ``BasePipeline.run_inference`` glue."""
 

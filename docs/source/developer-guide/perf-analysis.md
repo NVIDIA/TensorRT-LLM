@@ -76,10 +76,11 @@ captures text encoding, latent preparation, and denoise-loop setup;
 `postdenoise` captures VAE decode and the remaining request work.
 
 Multi-stage pipelines (LTX-2 two-stage) run more than one denoise loop per
-request, which affects the per-loop modes: a numeric range captures the named
-steps of *every* stage, one trace file per stage, and `postdenoise` opens at
-the end of the first stage, so its window also covers the later stages'
-denoising. `all` and `predenoise` are unaffected.
+request, which affects the per-loop modes. A numeric range captures the named
+steps of *every* stage, one trace file per stage. `postdenoise` arms after the
+**first** stage, so its window is a superset of VAE decode — on LTX-2 two-stage
+it also holds the spatial upsample and all of stage 2. No mode isolates decode
+alone there; `all` and `predenoise` behave normally.
 
 A numeric range never extends past the denoise loop it selects. If its stop
 index is beyond the loop's last step — for example `0-4` against a stage that
