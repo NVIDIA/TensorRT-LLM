@@ -32,24 +32,16 @@ import zmq
 
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import (
-    KVCacheCreatedData,
-    KVCacheEvent,
-    KVCacheEventDiff,
-    KVCacheEventManager,
-    KVCacheRemovedData,
-    KVCacheStoredData,
-    KVCacheUpdatedData,
-)
+from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEvent, KVCacheEventDiff
 
 ExternalBlockHash = bytes | int
 
 
 class EventBatch(
-        msgspec.Struct,
-        array_like=True,  # type: ignore[call-arg]
-        omit_defaults=True,  # type: ignore[call-arg]
-        gc=False,  # type: ignore[call-arg]
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,  # type: ignore[call-arg]
 ):
     """vLLM-compatible event batch envelope."""
 
@@ -59,10 +51,10 @@ class EventBatch(
 
 
 class KVCacheWireEvent(
-        msgspec.Struct,
-        omit_defaults=True,  # type: ignore[call-arg]
-        gc=False,  # type: ignore[call-arg]
-        tag=True,
+    msgspec.Struct,
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,  # type: ignore[call-arg]
+    tag=True,
 ):
     """Base class for vLLM-compatible KV cache events."""
 
@@ -152,8 +144,7 @@ class ZmqEventPublisher(EventPublisher):
         self._replay: Optional[zmq.Socket] = None
         self._rank = data_parallel_rank
         self._endpoint = self.offset_endpoint_port(endpoint, self._rank)
-        self._replay_endpoint = self.offset_endpoint_port(
-            replay_endpoint, self._rank)
+        self._replay_endpoint = self.offset_endpoint_port(replay_endpoint, self._rank)
         self._hwm = hwm
         self._seq_gen = count()
         self._topic_bytes = topic.encode("utf-8")
@@ -169,8 +160,10 @@ class ZmqEventPublisher(EventPublisher):
             name=f"trtllm-kv-events-rank-{self._rank}",
         )
         self._thread.start()
-        logger.info(f"Started native KV event publisher rank={self._rank} "
-                    f"endpoint={self._endpoint} topic={topic!r}")
+        logger.info(
+            f"Started native KV event publisher rank={self._rank} "
+            f"endpoint={self._endpoint} topic={topic!r}"
+        )
 
     def publish(self, events: EventBatch) -> bool:
         if not self._running:
@@ -183,12 +176,14 @@ class ZmqEventPublisher(EventPublisher):
             return True
         except queue.Full:
             self.dropped_batches += 1
-            if self.dropped_batches == 1 or (self.dropped_batches &
-                                             (self.dropped_batches - 1) == 0):
+            if self.dropped_batches == 1 or (
+                self.dropped_batches & (self.dropped_batches - 1) == 0
+            ):
                 logger.warning(
                     f"Dropping native KV event batch on rank={self._rank} because "
                     "the publisher queue is full; "
-                    f"dropped_batches={self.dropped_batches}")
+                    f"dropped_batches={self.dropped_batches}"
+                )
             return False
 
     def shutdown(self) -> None:
@@ -205,19 +200,25 @@ class ZmqEventPublisher(EventPublisher):
         if self._thread.is_alive():
             logger.warning(
                 f"Native KV event publisher rank={self._rank} did not stop "
-                f"within {self.SHUTDOWN_TIMEOUT:.1f}s")
-        logger.info(f"Stopped native KV event publisher rank={self._rank} "
-                    f"enqueued_batches={self.enqueued_batches} "
-                    f"published_batches={self.published_batches} "
-                    f"dropped_batches={self.dropped_batches}")
+                f"within {self.SHUTDOWN_TIMEOUT:.1f}s"
+            )
+        logger.info(
+            f"Stopped native KV event publisher rank={self._rank} "
+            f"enqueued_batches={self.enqueued_batches} "
+            f"published_batches={self.published_batches} "
+            f"dropped_batches={self.dropped_batches}"
+        )
 
     def _socket_setup(self) -> None:
         self._pub = self._ctx.socket(zmq.PUB)
         self._pub.set_hwm(self._hwm)
         if self._endpoint is None:
             raise ValueError("KV event publisher endpoint must not be empty")
-        if ("*" in self._endpoint or "::" in self._endpoint
-                or self._endpoint.startswith(("ipc://", "inproc://"))):
+        if (
+            "*" in self._endpoint
+            or "::" in self._endpoint
+            or self._endpoint.startswith(("ipc://", "inproc://"))
+        ):
             self._pub.bind(self._endpoint)
         else:
             self._pub.connect(self._endpoint)
@@ -235,8 +236,7 @@ class ZmqEventPublisher(EventPublisher):
                     try:
                         self._service_replay()
                     except Exception:
-                        logger.exception(
-                            "Failed to service native KV event replay request")
+                        logger.exception("Failed to service native KV event replay request")
                 try:
                     event = self._event_queue.get(timeout=0.1)
                 except queue.Empty:
@@ -247,17 +247,20 @@ class ZmqEventPublisher(EventPublisher):
                 seq = next(self._seq_gen)
                 try:
                     payload = encoder.encode(event)
-                    self._pub.send_multipart((
-                        self._topic_bytes,
-                        seq.to_bytes(8, "big"),
-                        payload,
-                    ))
+                    self._pub.send_multipart(
+                        (
+                            self._topic_bytes,
+                            seq.to_bytes(8, "big"),
+                            payload,
+                        )
+                    )
                     self._buffer.append((seq, payload))
                     self.published_batches += 1
                 except Exception:
                     self.dropped_batches += 1
-                    logger.exception(f"Failed to publish native KV event batch "
-                                     f"rank={self._rank} seq={seq}")
+                    logger.exception(
+                        f"Failed to publish native KV event batch rank={self._rank} seq={seq}"
+                    )
                     time.sleep(0.1)
                 finally:
                     self._event_queue.task_done()
@@ -276,18 +279,19 @@ class ZmqEventPublisher(EventPublisher):
         start_seq = int.from_bytes(start_seq_bytes, "big")
         for seq, payload in self._buffer:
             if seq >= start_seq:
-                self._replay.send_multipart((
-                    client_id,
-                    b"",
-                    self._topic_bytes,
-                    seq.to_bytes(8, "big"),
-                    payload,
-                ))
+                self._replay.send_multipart(
+                    (
+                        client_id,
+                        b"",
+                        self._topic_bytes,
+                        seq.to_bytes(8, "big"),
+                        payload,
+                    )
+                )
         self._replay.send_multipart((client_id, b"", b"", self.END_SEQ, b""))
 
     @staticmethod
-    def offset_endpoint_port(endpoint: str | None,
-                             data_parallel_rank: int) -> str | None:
+    def offset_endpoint_port(endpoint: str | None, data_parallel_rank: int) -> str | None:
         """Apply vLLM's base-port-plus-rank endpoint convention."""
         if not endpoint or data_parallel_rank == 0:
             return endpoint
@@ -296,7 +300,7 @@ class ZmqEventPublisher(EventPublisher):
         if "tcp" in endpoint and ":" in endpoint:
             last_colon_idx = endpoint.rfind(":")
             base_addr = endpoint[:last_colon_idx]
-            base_port = int(endpoint[last_colon_idx + 1:])
+            base_port = int(endpoint[last_colon_idx + 1 :])
             new_port = base_port + data_parallel_rank
             if new_port > 65_535:
                 raise ValueError(
@@ -306,8 +310,7 @@ class ZmqEventPublisher(EventPublisher):
         raise ValueError("Invalid endpoint: must contain 'inproc' or 'tcp'")
 
 
-def create_event_publisher(config: KVEventsConfig,
-                           data_parallel_rank: int) -> EventPublisher:
+def create_event_publisher(config: KVEventsConfig, data_parallel_rank: int) -> EventPublisher:
     """Create the configured publisher for one cache rank."""
     if config.publisher == "null":
         return NullEventPublisher(data_parallel_rank)
@@ -336,8 +339,7 @@ def _to_wire_hash(block_hash: int | str | None) -> ExternalBlockHash | None:
     try:
         return bytes.fromhex(block_hash)
     except ValueError as error:
-        raise ValueError(
-            f"Invalid hexadecimal KV block hash: {block_hash!r}") from error
+        raise ValueError(f"Invalid hexadecimal KV block hash: {block_hash!r}") from error
 
 
 def _vllm_wire_hash_from_radix_key(block_key: bytes) -> int:
@@ -358,50 +360,15 @@ class KVEventAdapter:
         config: KVEventsConfig,
         *,
         data_parallel_rank: int,
-        block_size: int,
-        max_window_size: int,
     ) -> None:
         self._rank = data_parallel_rank
-        self._block_size = block_size
-        self._max_window_size = max_window_size
         self._publisher = create_event_publisher(config, data_parallel_rank)
-        self._partial_block_hashes: set[int | str] = set()
         self._closed = False
         self.local_batches = 0
         self.local_events = 0
         self.enqueued_batches = 0
         self.enqueued_events = 0
         self.dropped_batches = 0
-
-    def publish_local_events(
-            self, events: list[KVCacheEvent]) -> list[list[KVCacheEvent]]:
-        """Publish local events and return no gathered events to the manager."""
-        if self._closed or not events:
-            return []
-        self.local_batches += 1
-        self.local_events += len(events)
-        try:
-            wire_events = [
-                wire_event for event in events
-                if (wire_event := self._convert_event(event)) is not None
-            ]
-            if wire_events:
-                batch = KVEventBatch(
-                    ts=time.time(),
-                    events=wire_events,
-                    data_parallel_rank=self._rank,
-                )
-                if self._publisher.publish(batch):
-                    self.enqueued_batches += 1
-                    self.enqueued_events += len(wire_events)
-                else:
-                    self.dropped_batches += 1
-        except Exception:
-            self.dropped_batches += 1
-            logger.exception(
-                f"Dropping native KV event iteration batch on rank={self._rank}"
-            )
-        return []
 
     def publish_wire_events(
         self,
@@ -425,63 +392,7 @@ class KVEventAdapter:
                 self.dropped_batches += 1
         except Exception:
             self.dropped_batches += 1
-            logger.exception(
-                f"Dropping native KV event iteration batch on rank={self._rank}"
-            )
-
-    def _convert_event(
-        self, event: KVCacheEvent
-    ) -> BlockStored | BlockRemoved | AllBlocksCleared | None:
-        if event.window_size != self._max_window_size:
-            return None
-        data = event.data
-        if isinstance(data, (KVCacheCreatedData, KVCacheUpdatedData)):
-            return None
-        if isinstance(data, KVCacheStoredData):
-            block_hashes: list[ExternalBlockHash] = []
-            token_ids: list[int] = []
-            for block in data.blocks:
-                num_tokens = len(block.tokens)
-                if num_tokens > self._block_size:
-                    raise ValueError(
-                        f"KV block has {num_tokens} tokens, expected at most "
-                        f"{self._block_size}")
-                if num_tokens < self._block_size:
-                    self._partial_block_hashes.add(block.block_hash)
-                    break
-                block_token_ids = [token.token_id for token in block.tokens]
-                if any(not isinstance(token_id, int)
-                       for token_id in block_token_ids):
-                    raise ValueError(
-                        "vLLM-compatible KV events require integer token IDs")
-                wire_hash = _to_wire_hash(block.block_hash)
-                assert wire_hash is not None
-                block_hashes.append(wire_hash)
-                token_ids.extend(block_token_ids)
-            if not block_hashes:
-                return None
-            return BlockStored(
-                block_hashes=block_hashes,
-                parent_block_hash=_to_wire_hash(data.parent_hash),
-                token_ids=token_ids,
-                block_size=self._block_size,
-                lora_id=None,
-                medium="GPU",
-                lora_name=None,
-            )
-        if isinstance(data, KVCacheRemovedData):
-            block_hashes: list[ExternalBlockHash] = []
-            for block_hash in data.block_hashes:
-                if block_hash in self._partial_block_hashes:
-                    self._partial_block_hashes.remove(block_hash)
-                    continue
-                wire_hash = _to_wire_hash(block_hash)
-                assert wire_hash is not None
-                block_hashes.append(wire_hash)
-            if not block_hashes:
-                return None
-            return BlockRemoved(block_hashes=block_hashes, medium="GPU")
-        return None
+            logger.exception(f"Dropping native KV event iteration batch on rank={self._rank}")
 
     def shutdown(self) -> None:
         """Close the publisher once and report direct-path counters."""
@@ -495,18 +406,26 @@ class KVEventAdapter:
             f"local_events={self.local_events} "
             f"enqueued_batches={self.enqueued_batches} "
             f"enqueued_events={self.enqueued_events} "
-            f"dropped_batches={self.dropped_batches} kv_event_allgathers=0")
+            f"dropped_batches={self.dropped_batches}"
+        )
 
 
 class _NativeStoredBlockState:
-    __slots__ = ("block_hash", )
+    __slots__ = ("block_hash",)
 
     def __init__(self, block_hash: int) -> None:
         self.block_hash = block_hash
 
 
-class NativeKVCacheEventManager(KVCacheEventManager):
-    """Scheduler-local fast path that produces vLLM wire events directly."""
+class NativeKVCacheEventManager:
+    """Scheduler-local fast path that produces vLLM wire events directly.
+
+    Implements the V2 KV-cache-manager event-sink hook interface by duck
+    typing rather than inheriting ``KVCacheEventManager``: it fully replaces
+    event production (reusing the radix block hashes) and shares none of the
+    base manager's state, so subclassing would only risk partially initialised
+    base attributes.
+    """
 
     def __init__(
         self,
@@ -522,8 +441,7 @@ class NativeKVCacheEventManager(KVCacheEventManager):
         self._max_entries = max_entries
         self._target_life_cycle_id: int | None = None
         self._stored_blocks: dict[bytes, _NativeStoredBlockState] = {}
-        self._pending_events: list[
-            BlockStored | BlockRemoved | AllBlocksCleared] = []
+        self._pending_events: list[BlockStored | BlockRemoved | AllBlocksCleared] = []
         self._pending_entries = 0
         self._closed = False
         self.stored_blocks = 0
@@ -532,8 +450,7 @@ class NativeKVCacheEventManager(KVCacheEventManager):
         self.non_target_life_cycles_ignored = 0
         self.dropped_events = 0
 
-    def set_layer_group_window_sizes(self,
-                                     window_sizes: dict[int, int]) -> None:
+    def set_layer_group_window_sizes(self, window_sizes: dict[int, int]) -> None:
         target_ids = [
             int(life_cycle_id)
             for life_cycle_id, window_size in window_sizes.items()
@@ -547,19 +464,24 @@ class NativeKVCacheEventManager(KVCacheEventManager):
                 if window_size == largest_window
             ]
         if not target_ids:
-            raise ValueError(
-                "Native KV events require an attention KV cache life cycle")
+            raise ValueError("Native KV events require an attention KV cache life cycle")
         self._target_life_cycle_id = min(target_ids)
         logger.info(
             "Native KV event fast path selected "
             f"lifecycle_id={self._target_life_cycle_id} "
-            f"window_size={self._max_window_size}")
+            f"window_size={self._max_window_size}"
+        )
 
     def add_created_event(
         self,
         num_blocks_per_cache_level: Any,
         layer_group_ids: Any = None,
     ) -> None:
+        return
+
+    def add_stored_event(self, *args: Any, **kwargs: Any) -> None:
+        # Native publishing derives stored events from the per-block hooks
+        # below; the aggregate stored-event hook is intentionally unused.
         return
 
     def add_stored_block_event_from_block(self, block: Any) -> None:
@@ -573,8 +495,7 @@ class NativeKVCacheEventManager(KVCacheEventManager):
             return
         self._add_full_block(block)
 
-    def add_stored_life_cycle_event_from_block(self, block: Any,
-                                                life_cycle_id: int) -> None:
+    def add_stored_life_cycle_event_from_block(self, block: Any, life_cycle_id: int) -> None:
         if int(life_cycle_id) != self._target_life_cycle_id:
             self.non_target_life_cycles_ignored += 1
             return
@@ -595,15 +516,12 @@ class NativeKVCacheEventManager(KVCacheEventManager):
         except ValueError:
             self.dropped_events += 1
             self._pending_entries -= 1
-            logger.exception(
-                "Dropping native KV store event with unsupported token data")
+            logger.exception("Dropping native KV store event with unsupported token data")
             return
         self._stored_blocks[key] = state
-        if self._pending_events and isinstance(self._pending_events[-1],
-                                               BlockStored):
+        if self._pending_events and isinstance(self._pending_events[-1], BlockStored):
             previous = self._pending_events[-1]
-            if previous.block_hashes and previous.block_hashes[
-                    -1] == parent_hash:
+            if previous.block_hashes and previous.block_hashes[-1] == parent_hash:
                 previous.block_hashes.append(block_hash)
                 previous.token_ids.extend(token_ids)
                 self.stored_blocks += 1
@@ -617,7 +535,8 @@ class NativeKVCacheEventManager(KVCacheEventManager):
                 lora_id=None,
                 medium="GPU",
                 lora_name=None,
-            ))
+            )
+        )
         self.stored_blocks += 1
 
     @staticmethod
@@ -625,8 +544,7 @@ class NativeKVCacheEventManager(KVCacheEventManager):
         token_ids: list[int] = []
         for token in tokens:
             if type(token) is not int:
-                raise ValueError(
-                    "vLLM-compatible KV events require integer token IDs")
+                raise ValueError("vLLM-compatible KV events require integer token IDs")
             token_ids.append(token)
         return token_ids
 
@@ -637,13 +555,12 @@ class NativeKVCacheEventManager(KVCacheEventManager):
         parent = block.prev
         is_root_child = getattr(parent, "ordinal", -1) == -1
         block_hash = _vllm_wire_hash_from_radix_key(bytes(block.key))
-        parent_hash = None if is_root_child else _vllm_wire_hash_from_radix_key(
-            bytes(parent.key))
+        parent_hash = None if is_root_child else _vllm_wire_hash_from_radix_key(bytes(parent.key))
         return block_hash, parent_hash, _NativeStoredBlockState(block_hash)
 
     def add_removed_event(self, block_hashes: Any) -> None:
         if isinstance(block_hashes, (bytes, str, int)):
-            block_hashes = (block_hashes, )
+            block_hashes = (block_hashes,)
         removed_hashes: list[ExternalBlockHash] = []
         for block_key in block_hashes:
             if not isinstance(block_key, bytes):
@@ -653,8 +570,7 @@ class NativeKVCacheEventManager(KVCacheEventManager):
                 removed_hashes.append(state.block_hash)
         self._add_removed_hashes(removed_hashes)
 
-    def add_removed_life_cycle_event(self, block_hash: bytes,
-                                     life_cycle_id: int) -> None:
+    def add_removed_life_cycle_event(self, block_hash: bytes, life_cycle_id: int) -> None:
         if int(life_cycle_id) != self._target_life_cycle_id:
             self.non_target_life_cycles_ignored += 1
             return
@@ -662,18 +578,15 @@ class NativeKVCacheEventManager(KVCacheEventManager):
         if state is not None:
             self._add_removed_hashes([state.block_hash])
 
-    def _add_removed_hashes(
-            self, block_hashes: list[ExternalBlockHash]) -> None:
+    def _add_removed_hashes(self, block_hashes: list[ExternalBlockHash]) -> None:
         if not block_hashes:
             return
         if not self._reserve_entries(len(block_hashes)):
             return
-        if self._pending_events and isinstance(self._pending_events[-1],
-                                               BlockRemoved):
+        if self._pending_events and isinstance(self._pending_events[-1], BlockRemoved):
             self._pending_events[-1].block_hashes.extend(block_hashes)
         else:
-            self._pending_events.append(
-                BlockRemoved(block_hashes=block_hashes, medium="GPU"))
+            self._pending_events.append(BlockRemoved(block_hashes=block_hashes, medium="GPU"))
         self.removed_blocks += len(block_hashes)
 
     def add_updated_event(
@@ -692,10 +605,12 @@ class NativeKVCacheEventManager(KVCacheEventManager):
             return True
         self.dropped_events += num_entries
         if self.dropped_events == num_entries or (
-                self.dropped_events & (self.dropped_events - 1) == 0):
+            self.dropped_events & (self.dropped_events - 1) == 0
+        ):
             logger.warning(
                 "Dropping native KV events because the per-iteration safety "
-                f"cap was exceeded; dropped_events={self.dropped_events}")
+                f"cap was exceeded; dropped_events={self.dropped_events}"
+            )
         return False
 
     def flush_iteration_events(self) -> None:
@@ -706,11 +621,11 @@ class NativeKVCacheEventManager(KVCacheEventManager):
         self._pending_entries = 0
         self._adapter.publish_wire_events(events)
 
-    def get_latest_events(
-            self, timeout_ms: float | None = None) -> list[KVCacheEvent]:
-        raise RuntimeError(
-            "KV cache event polling is unavailable while native publishing "
-            "is enabled")
+    def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]:
+        # Native publishing pushes events out-of-band, so the pull API has
+        # nothing to return. Return empty instead of raising so callers of the
+        # legacy polling path degrade cleanly rather than erroring.
+        return []
 
     def shutdown(self) -> None:
         if self._closed:
@@ -724,5 +639,5 @@ class NativeKVCacheEventManager(KVCacheEventManager):
             f"partial_blocks_suppressed={self.partial_blocks_suppressed} "
             f"non_target_life_cycles_ignored="
             f"{self.non_target_life_cycles_ignored} "
-            f"dropped_events={self.dropped_events} "
-            f"kv_event_allgathers=0")
+            f"dropped_events={self.dropped_events}"
+        )

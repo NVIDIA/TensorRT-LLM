@@ -37,7 +37,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     IndexMapper,
     copy_batch_block_offsets_to_device,
 )
-from tensorrt_llm.llmapi.llm_args import KVEventsConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
@@ -868,35 +868,29 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_seq_len if window_size is None else int(window_size)
             for window_size in self.max_attention_window_vec
         )
-        self.event_manager: Optional[KVCacheEventManager] = None
+        self.event_manager: Optional[KVCacheEventManager | NativeKVCacheEventManager] = None
         self.kv_event_adapter: Optional[KVEventAdapter] = None
         native_events_enabled = (
-            kv_events_config is not None
-            and kv_events_config.enable_kv_cache_events
+            kv_events_config is not None and kv_events_config.enable_kv_cache_events
         )
         if native_events_enabled:
             if mapping.pp_size > 1:
-                raise ValueError(
-                    "Native KV events do not support pipeline parallelism")
+                raise ValueError("Native KV events do not support pipeline parallelism")
             if mapping.cp_size > 1:
-                raise ValueError(
-                    "Native KV events do not support context parallelism")
+                raise ValueError("Native KV events do not support context parallelism")
             assert kv_events_config is not None
             if mapping.enable_attention_dp or mpi_rank() == 0:
                 event_rank = mapping.rank if mapping.enable_attention_dp else 0
                 self.kv_event_adapter = KVEventAdapter(
                     kv_events_config,
                     data_parallel_rank=event_rank,
-                    block_size=self.tokens_per_block,
-                    max_window_size=event_window_size,
                 )
                 self.event_manager = NativeKVCacheEventManager(
                     self.kv_event_adapter,
                     block_size=self.tokens_per_block,
                     max_window_size=event_window_size,
                 )
-                logger.info(
-                    "Native KV event fast path reuses V2 radix block hashes")
+                logger.info("Native KV event fast path reuses V2 radix block hashes")
         elif self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
                 self.event_manager = KVCacheEventManager(

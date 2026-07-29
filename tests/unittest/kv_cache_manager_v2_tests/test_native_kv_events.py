@@ -20,10 +20,7 @@ from types import SimpleNamespace
 import msgspec
 import zmq
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
-    KVEventAdapter,
-    NativeKVCacheEventManager,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache_events import KVEventAdapter, NativeKVCacheEventManager
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 
 
@@ -53,8 +50,6 @@ def test_native_fast_path_publishes_only_full_max_window_blocks():
             max_queue_size=8,
         ),
         data_parallel_rank=0,
-        block_size=4,
-        max_window_size=128,
     )
     manager = NativeKVCacheEventManager(
         adapter,
@@ -89,16 +84,8 @@ def test_native_fast_path_publishes_only_full_max_window_blocks():
     second_hash = b"\x33" * 24 + b"\x00\x00\x00\x00\x00\x00\x00\x02"
     first_wire_hash = int.from_bytes(first_hash[-8:], "big")
     second_wire_hash = int.from_bytes(second_hash[-8:], "big")
-    first_wire_hash = (
-        first_wire_hash - 2**64
-        if first_wire_hash >= 2**63
-        else first_wire_hash
-    )
-    second_wire_hash = (
-        second_wire_hash - 2**64
-        if second_wire_hash >= 2**63
-        else second_wire_hash
-    )
+    first_wire_hash = first_wire_hash - 2**64 if first_wire_hash >= 2**63 else first_wire_hash
+    second_wire_hash = second_wire_hash - 2**64 if second_wire_hash >= 2**63 else second_wire_hash
     first = block(first_hash, [1, 2, 3, 4], root)
     partial = block(partial_hash, [5, 6], first)
     second = block(second_hash, [5, 6, 7, 8], first)
@@ -145,6 +132,10 @@ def test_native_fast_path_publishes_only_full_max_window_blocks():
     assert manager.partial_blocks_suppressed == 1
     assert manager.non_target_life_cycles_ignored == 1
     assert manager.dropped_events == 0
+
+    # Native publishing pushes events out-of-band, so the legacy pull API must
+    # degrade to an empty result rather than raising.
+    assert manager.get_latest_events() == []
 
     manager.shutdown()
     manager.shutdown()
