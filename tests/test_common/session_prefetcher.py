@@ -279,8 +279,10 @@ class _Built(NamedTuple):
 class SessionPrefetcher:
     def __init__(self):
         self._lock = threading.Lock()
+        self._drain_lock = threading.Lock()
         self._thread = None
         self._building_spec = None  # spec of the in-flight build, while _thread is set
+        self._build_timed_out = False
         self._build_gen = 0  # bumped when a pending build is abandoned
         self._built = None  # Optional[_Built], set only by _publish()
         self._patched = set()
@@ -366,8 +368,10 @@ class SessionPrefetcher:
         """Start building a spare ``spec``-worker pool in the background.
 
         Heuristic: the next test most likely needs a pool of the same size as
-        the current one. A miss is discarded at ``take()`` and the sync build
-        is no slower than without prefetch.
+        the current one. A mismatched in-flight build is drained before a
+        synchronous miss to preserve allocation-wide single-flight. This can
+        add latency when the size prediction is wrong, but avoids two MPI
+        bootstraps contending on the same allocation.
 
         ``env_overlay``: extra env vars to freeze into the WORKERS at spawn
         (session_reuse restocks shadows with its worker-side weight cache
@@ -381,6 +385,7 @@ class SessionPrefetcher:
             if self._thread is not None or (self._built is not None and self._built.spec == spec):
                 return  # already building / built
             self._building_spec = spec
+            self._build_timed_out = False
             self._thread = threading.Thread(
                 target=self._build,
                 args=(spec, self._build_gen, env_overlay),
@@ -432,39 +437,54 @@ class SessionPrefetcher:
         print("[session-prefetch] discarding superseded background build", flush=True)
         session.shutdown()
 
-    def _drain(self, timeout: float | None = None):
+    def _drain(self, timeout: float | None = None) -> _Built | None:
         """Join a pending build and pop the completed shadow slot.
 
-        A live build is kept registered on timeout. Callers must fail closed
-        instead of starting a second pool while the first bootstrap is still
-        running; a later call can drain it after the thread exits.
+        A live build is kept registered and marked terminal on timeout.
+        Callers fail closed instead of starting a second pool while the first
+        bootstrap is still running; later calls fail immediately until the
+        thread exits, then clear the terminal state.
         """
-        # Read _thread under the lock: schedule_shadow() assigns-then-starts
-        # inside its critical section, and an unlocked read here can observe
-        # the assigned-but-not-yet-started thread ("cannot join thread before
-        # it is started" when a test creates LLMs concurrently).
-        with self._lock:
-            thread = self._thread
-        if thread is not None:
-            if timeout is None:
-                timeout = _shadow_build_wait_timeout()
-            thread.join(timeout=timeout)
-        with self._lock:
-            if thread is not None and thread.is_alive():
-                # Invalidate a late publish but retain _thread so
-                # schedule_shadow() cannot start another build alongside it.
-                self._build_gen += 1
-                self.stats["pool_build_timeouts"] += 1
-                raise TimeoutError(
-                    "session-prefetch shadow build did not finish within "
-                    f"{timeout}s; refusing to start a concurrent MPI pool"
-                )
-            self._thread = None
-            self._building_spec = None
-            built, self._built = self._built, None
-        return built
+        # Serialize drains so concurrent LLM construction cannot make multiple
+        # callers wait through the full deadline before one records the
+        # terminal timeout.
+        with self._drain_lock:
+            # Read _thread under the lock: schedule_shadow() assigns-then-starts
+            # inside its critical section, and an unlocked read here can observe
+            # the assigned-but-not-yet-started thread ("cannot join thread before
+            # it is started" when a test creates LLMs concurrently).
+            with self._lock:
+                thread = self._thread
+                build_timed_out = self._build_timed_out
+            if thread is not None:
+                if build_timed_out and thread.is_alive():
+                    raise TimeoutError(
+                        "session-prefetch shadow build previously timed out and "
+                        "is still running; refusing to start a concurrent MPI pool"
+                    )
+                if not build_timed_out:
+                    if timeout is None:
+                        timeout = _shadow_build_wait_timeout()
+                    thread.join(timeout=timeout)
+            with self._lock:
+                if thread is not None and thread.is_alive():
+                    # Invalidate a late publish but retain _thread so
+                    # schedule_shadow() cannot start another build alongside it.
+                    if not self._build_timed_out:
+                        self._build_timed_out = True
+                        self._build_gen += 1
+                        self.stats["pool_build_timeouts"] += 1
+                    raise TimeoutError(
+                        "session-prefetch shadow build did not finish within "
+                        f"{timeout}s; refusing to start a concurrent MPI pool"
+                    )
+                self._thread = None
+                self._building_spec = None
+                self._build_timed_out = False
+                built, self._built = self._built, None
+            return built
 
-    def take(self, spec: int):
+    def take(self, spec: int) -> object | None:
         """Return a prefetched session for ``spec``, or None to build sync."""
         if not self.enabled:
             return None

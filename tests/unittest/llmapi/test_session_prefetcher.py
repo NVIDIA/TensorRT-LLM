@@ -200,15 +200,17 @@ def test_shadow_wait_budget_handles_partially_loaded_mpi_module(monkeypatch):
     )
 
 
-def test_take_timeout_keeps_in_flight_build_registered(prefetcher, monkeypatch):
+def test_take_timeout_is_terminal_until_build_exits(prefetcher, monkeypatch):
     join_timeouts = []
 
     class _HungBuild:
+        alive = True
+
         def join(self, timeout):
             join_timeouts.append(timeout)
 
         def is_alive(self):
-            return True
+            return self.alive
 
     thread = _HungBuild()
     prefetcher._thread = thread
@@ -217,10 +219,60 @@ def test_take_timeout_keeps_in_flight_build_registered(prefetcher, monkeypatch):
 
     with pytest.raises(TimeoutError, match="refusing to start a concurrent MPI pool"):
         prefetcher.take(2)
+    with pytest.raises(TimeoutError, match="previously timed out"):
+        prefetcher.take(2)
 
+    # Only the first call spends the full wait budget and records a timeout.
+    # Later calls fail fast until the abandoned build actually exits.
     assert join_timeouts == [321.0]
     assert prefetcher._thread is thread
     assert prefetcher._build_gen == 1
+    assert prefetcher.stats["pool_build_timeouts"] == 1
+
+    thread.alive = False
+    assert prefetcher.take(2) is None
+    assert prefetcher._thread is None
+    assert not prefetcher._build_timed_out
+
+
+def test_concurrent_take_timeout_waits_only_once(prefetcher, monkeypatch):
+    join_started = threading.Event()
+    release_join = threading.Event()
+    join_timeouts = []
+    errors = []
+
+    class _HungBuild:
+        def join(self, timeout):
+            join_timeouts.append(timeout)
+            join_started.set()
+            release_join.wait()
+
+        def is_alive(self):
+            return True
+
+    prefetcher._thread = _HungBuild()
+    prefetcher._building_spec = 2
+    monkeypatch.setattr(session_prefetcher, "_shadow_build_wait_timeout", lambda: 321.0)
+
+    def _take():
+        try:
+            prefetcher.take(2)
+        except TimeoutError as e:
+            errors.append(e)
+
+    first = threading.Thread(target=_take)
+    second = threading.Thread(target=_take)
+    first.start()
+    assert join_started.wait(timeout=5)
+    second.start()
+    release_join.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert len(errors) == 2
+    assert join_timeouts == [321.0]
+    assert prefetcher._build_gen == 1
+    assert prefetcher.stats["pool_build_timeouts"] == 1
 
 
 def test_factory_spawn_failure_propagates_without_retry(prefetcher):

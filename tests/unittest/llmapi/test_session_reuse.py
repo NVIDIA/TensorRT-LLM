@@ -155,6 +155,25 @@ def test_shadow_timeout_does_not_start_sync_pool(reuse_cache):
     assert reuse_cache.prefetch.restocks == []
 
 
+def test_prefetcher_programming_error_propagates(reuse_cache):
+    calls = []
+
+    def _fail(_n_workers):
+        raise ValueError("prefetch lifecycle bug")
+
+    reuse_cache.prefetch.take = _fail
+
+    class _RecordingPool(_FakePool):
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            super().__init__(*args, **kwargs)
+
+    with pytest.raises(ValueError, match="prefetch lifecycle bug"):
+        reuse_cache.acquire(_RecordingPool, 2)
+    assert calls == []
+    assert reuse_cache.prefetch.restocks == []
+
+
 def test_spawn_failure_propagates_without_retry(reuse_cache):
     # The attempt already waited for the full bootstrap deadline. Retrying
     # could overlap workers that the failed identity barrier could not reap.

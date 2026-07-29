@@ -365,16 +365,11 @@ class SessionReuseCache:
         real = None
         prefetcher = _prefetcher()
         if prefetcher is not None:
-            try:
-                real = prefetcher.take(n_workers)
-            except TimeoutError:
-                # The shadow bootstrap is still alive. Starting a synchronous
-                # replacement now would create two MPI pools concurrently on
-                # the same allocation, making a busy node even slower.
-                raise
-            except Exception as e:  # prefetch is an optimization: fall back
-                print(f"[session-reuse] prefetched-pool take failed: {e}", flush=True)
-                real = None
+            # A timeout must fail closed: starting a synchronous replacement
+            # would create two MPI pools concurrently on the same allocation.
+            # Unexpected prefetcher errors also propagate instead of silently
+            # hiding lifecycle bugs behind a synchronous fallback.
+            real = prefetcher.take(n_workers)
         if real is None:
             # One attempt gets the full worker-bootstrap deadline. If identity
             # collection still fails, unidentified workers may remain alive;

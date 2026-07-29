@@ -325,3 +325,9 @@ def test_identity_timeout_covers_worker_bootstrap(monkeypatch):
 def test_identity_timeout_env_override(monkeypatch, raw, expected):
     monkeypatch.setenv("TRTLLM_MPI_IDENTITY_TIMEOUT", raw)
     assert _identity_barrier_timeout() == expected
+
+
+def test_prefetch_fallback_identity_timeout_matches_mpi_default():
+    from test_common.session_prefetcher import _FALLBACK_IDENTITY_TIMEOUT
+
+    assert _FALLBACK_IDENTITY_TIMEOUT == _DEFAULT_IDENTITY_TIMEOUT
