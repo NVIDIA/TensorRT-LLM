@@ -50,6 +50,16 @@ _RequestCache = Dict[
 ]
 
 
+@pytest.mark.parametrize(("avg_seq_len", "expected"), [(None, 1024), (256, 256)])
+def test_typical_seq_len_preserves_deepseek_v4_fallback(
+    avg_seq_len: int | None, expected: int
+) -> None:
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager.max_seq_len = 1024
+
+    assert manager._get_typical_seq_len(KvCacheConfig(avg_seq_len=avg_seq_len)) == expected
+
+
 def test_cache_size_estimation_uses_model_attention_layer_count():
     class FakeModelConfig:
         sparse_attention_config = SimpleNamespace(

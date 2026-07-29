@@ -33,6 +33,7 @@ The following is a table of supported models for the PyTorch backend:
 | `LagunaForCausalLM`                  | Laguna-XS                          | `poolside/laguna-XS.2`                       |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
+| `MiniCPMV4_6ForConditionalGeneration` [^14]| MiniCPM-V 4.6                    | `openbmb/MiniCPM-V-4.6`                      |
 | `MiniMaxM2ForCausalLM` [^5]          | MiniMax M2/M2.1/M2.7              | `MiniMaxAI/MiniMax-M2.7`                    |
 | `MiniMaxM3SparseForConditionalGeneration` [^12]| MiniMax-M3                       | `MiniMaxAI/MiniMax-M3`                      |
 | `MistralForCausalLM`                 | Mistral                            | `mistralai/Mistral-7B-v0.1`                  |
@@ -92,6 +93,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^11]: DeepSeek-V4 is only supported on Blackwell GPUs (`SM100+`). See the [DeepSeek-V4 example README](../../../examples/models/core/deepseek_v4/README.md) for setup and parallelism.
 [^12]: Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release. One-model linear EAGLE-3 is supported; combining it with CUDA graphs requires the MSA kernels (`sparse_use_msa=True`, SM100).
 [^13]: The Cosmos 3 family also supports visual generation through the VisualGen API. See [Visual Generation Models](#visual-generation-models).
+[^14]: Requires `transformers>=5.7.0`: MiniCPM-V 4.6 was upstreamed into transformers as a native model type (`minicpmv4_6`) and the checkpoint ships no remote code (`auto_map`) to fall back on. The Qwen3.5-hybrid text tower runs in BF16. Image, video, and text inputs are supported in this release (video reuses the same NaViT-packed vision path as image via `MiniCPMV4_6InputProcessor`).
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
 
@@ -105,6 +107,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `LlavaLlamaModel (VILA)`             | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        | L + I + V |
 | `LlavaNextForConditionalGeneration`  | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I     |
 | `Llama4ForConditionalGeneration`     | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        | L + I     |
+| `MiniCPMV4_6ForConditionalGeneration` [^14] | Yes               | Untested   | Untested        | Yes           | Untested         | Untested       | Untested              | No                        | L + I + V |
 | `Mistral3ForConditionalGeneration`   | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | No                        | L + I     |
 | `NemotronH_Nano_VL_V2`               | Yes               | Yes        | Yes             | Yes           | Yes              | N/A            | Yes                   | Yes                       | L + I + V + A [^10] |
 | `Phi4MMForCausalLM`                  | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | No                        | L + I + A |
@@ -165,6 +168,8 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
+| `Qwen/Qwen-Image-Layered` | Image-to-Image |
+| `Qwen/Qwen-Image-Edit-2511` | Image Editing (text+images-to-image) |
 | `nvidia/Cosmos3-Nano` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
 
@@ -178,6 +183,9 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
 | **Qwen-Image** [^2] | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
+| **Qwen-Image-Layered** [^3] | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | No | No | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 
 [^vg1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
+[^3]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition. FP8 blockwise, NVFP4, `trtllm-serve` image-edit routing, and attention-parallel backends are not enabled yet.
