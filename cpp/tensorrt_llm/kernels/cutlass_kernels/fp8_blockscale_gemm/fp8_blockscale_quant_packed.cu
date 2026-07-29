@@ -71,8 +71,8 @@ __global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict_
     int const packed_sf_k_idx = static_cast<int>(blockIdx.x);
     int const warp_id = static_cast<int>(threadIdx.x) >> 5;
     int const lane_id = static_cast<int>(threadIdx.x) & 31;
-    int const mBlockIdx = static_cast<int>(blockIdx.z * gridDim.y + blockIdx.y);
-    int const m_idx = mBlockIdx * WarpsPerBlock + warp_id;
+    int64_t const mBlockIdx = static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y;
+    int64_t const m_idx = mBlockIdx * WarpsPerBlock + warp_id;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     cudaGridDependencySynchronize();
