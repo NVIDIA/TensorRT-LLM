@@ -3634,8 +3634,8 @@ class KVEventsConfig(StrictBaseModel):
         description="Base ZeroMQ endpoint used to publish KV cache events.")
     replay_endpoint: Optional[str] = Field(
         default=None,
-        description="Optional base ZeroMQ endpoint used to replay KV cache events."
-    )
+        description=
+        "Optional base ZeroMQ endpoint used to replay KV cache events.")
     buffer_steps: int = Field(
         default=10_000,
         ge=0,
@@ -3651,7 +3651,8 @@ class KVEventsConfig(StrictBaseModel):
     )
     topic: str = Field(
         default="",
-        description="ZeroMQ subscription topic used for KV cache event batches.")
+        description="ZeroMQ subscription topic used for KV cache event batches."
+    )
 
     def model_post_init(self, __context) -> None:
         if self.publisher is None:
@@ -3725,6 +3726,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The period in milliseconds to gather attention DP events across ranks."
     )
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    kv_events_config: Optional[KVEventsConfig] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Native KV cache event publishing (KV cache manager V2 only). When set, "
+        "each rank publishes its own events directly (e.g. over ZeroMQ) instead "
+        "of the legacy event_buffer_max_size gather/poll path.")
     enable_partial_reuse: bool = Field(
         default=True,
         description=
@@ -4375,10 +4384,6 @@ class BaseLlmArgs(StrictBaseModel):
     # Several options from ExecutorConfig, expanded here for less hierarchy
     kv_cache_config: KvCacheConfig = Field(default_factory=KvCacheConfig,
                                            description="KV cache config.")
-
-    kv_events_config: Optional[KVEventsConfig] = Field(
-        default=None,
-        description="Native KV cache event publishing configuration.")
 
     enable_chunked_prefill: bool = Field(default=False,
                                          description="Enable chunked prefill.")
@@ -6116,7 +6121,6 @@ def update_llm_args_with_extra_dict(
         "attention_dp_config": AttentionDpConfig,
         "reorder_policy_config": ReorderRequestPolicyConfig,
         "kv_cache_config": KvCacheConfig,
-        "kv_events_config": KVEventsConfig,
         "dwdp_config": DwdpConfig,
         "multimodal_config": MultimodalConfig,
         "telemetry_config": TelemetryConfig,

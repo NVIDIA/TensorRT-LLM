@@ -1144,7 +1144,7 @@ class KvCacheCreator:
             is_disagg=self._is_disagg,
             kv_events_config=None
             if estimating_kv_cache or model_engine.is_draft_model else
-            self._llm_args.kv_events_config,
+            self._llm_args.kv_cache_config.kv_events_config,
         )
 
         if not self._skip_est:
@@ -1994,6 +1994,11 @@ def _create_kv_cache_manager(
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs["kv_events_config"] = kv_events_config
+    elif kv_events_config is not None and kv_events_config.enable_kv_cache_events:
+        logger.warning(
+            "kv_cache_config.kv_events_config is set but native KV event "
+            "publishing requires KV cache manager V2; events will not be "
+            f"published for {kv_cache_manager_cls.__name__}.")
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
