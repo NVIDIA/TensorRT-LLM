@@ -1,11 +1,15 @@
 import asyncio
 import base64
+import binascii
 import os
+import shutil
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from tensorrt_llm.inputs.media_io import is_isobmff_image_bytes, sniff_media_kind
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
+from tensorrt_llm.serve.openai_protocol import (
+    ImageEditRequest, ImageGenerationRequest, VideoGenerationRequest)
 from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
 # Per-field warnings for OpenAI-shaped knobs that the engine has no
@@ -98,11 +102,69 @@ def _read_reference_payload(reference) -> bytes:
         except ValueError as exc:
             # binascii.Error subclasses ValueError.
             raise ValueError("input_reference is not valid base64 data.") from exc
-    return reference.file.read()
+      return reference.file.read()
+
+
+def _decode_base64_media(value: str) -> Optional[bytes]:
+    payload = value
+    if value.startswith("data:"):
+        _, sep, payload = value.partition(",")
+        if not sep:
+            return None
+    try:
+        return base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _materialize_conditioning_input(
+    value: Any,
+    path: str,
+) -> str:
+    """Return a file path for upload/base64 inputs or pass paths/URLs through."""
+    if isinstance(value, str):
+        parsed = urlparse(value)
+        if os.path.exists(value) or parsed.scheme in ("http", "https", "file"):
+            return value
+        decoded = _decode_base64_media(value)
+        if decoded is None:
+            return value
+        with open(path, "wb") as f:
+            f.write(decoded)
+        return path
+
+    if isinstance(value, bytes):
+        with open(path, "wb") as f:
+            f.write(value)
+        return path
+
+    if hasattr(value, "file"):
+        with open(path, "wb") as f:
+            shutil.copyfileobj(value.file, f)
+        return path
+
+    raise ValueError(f"Unsupported conditioning input type: {type(value)}")
+
+
+def _materialize_conditioning_inputs(
+    value: Any,
+    *,
+    id: str,
+    field_name: str,
+    media_storage_path: str,
+) -> str | List[str]:
+    values = value if isinstance(value, list) else [value]
+    paths = [
+        _materialize_conditioning_input(
+            item,
+            os.path.join(media_storage_path, f"{id}_{field_name}_{i}.png"),
+        ) for i, item in enumerate(values)
+    ]
+      return paths if isinstance(value, list) else paths[0]
 
 
 def parse_visual_gen_params(
-    request: ImageGenerationRequest | VideoGenerationRequest,
+    request: ImageGenerationRequest | ImageEditRequest | VideoGenerationRequest,
     id: str,
     generator: VisualGen,
     media_storage_path: Optional[str] = None,
@@ -141,9 +203,27 @@ def parse_visual_gen_params(
     if request.seed is not None:
         params.seed = int(request.seed)
 
-    if isinstance(request, ImageGenerationRequest):
+    if isinstance(request, (ImageGenerationRequest, ImageEditRequest)):
         if request.n is not None:
             params.num_images_per_prompt = request.n
+        if isinstance(request, ImageEditRequest):
+            if media_storage_path is None:
+                raise ValueError(
+                    "media_storage_path is required when image edit inputs are provided"
+                )
+            params.image = _materialize_conditioning_inputs(
+                request.image,
+                id=id,
+                field_name="image",
+                media_storage_path=media_storage_path,
+            )
+            if request.mask is not None:
+                params.mask = _materialize_conditioning_inputs(
+                    request.mask,
+                    id=id,
+                    field_name="mask",
+                    media_storage_path=media_storage_path,
+                )
 
     elif isinstance(request, VideoGenerationRequest):
         if request.frame_rate is not None:

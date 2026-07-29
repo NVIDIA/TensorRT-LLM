@@ -369,6 +369,7 @@ class DiffusionExecutor:
                         "status": "READY",
                         "default_generation_params": self.pipeline.default_generation_params,
                         "extra_param_specs": self.pipeline.extra_param_specs,
+                        "supported_tasks": self.pipeline.supported_tasks,
                     },
                 )
             )
@@ -673,6 +674,7 @@ class DiffusionRemoteClient:
         # Pipeline metadata — populated by _wait_ready from the READY signal.
         self.default_generation_params: Dict = {}
         self.extra_param_specs: Dict = {}
+        self.supported_tasks: tuple[str, ...] = ()
 
         # --- Launch workers ---
         self.worker_processes = []
@@ -1028,6 +1030,7 @@ class DiffusionRemoteClient:
                             "default_generation_params", {}
                         )
                         self.extra_param_specs = payload.get("extra_param_specs", {})
+                        self.supported_tasks = tuple(payload.get("supported_tasks", ()))
                     elapsed = time.time() - start_time
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return

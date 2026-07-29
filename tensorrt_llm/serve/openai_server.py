@@ -74,7 +74,7 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatMessage, CompletionRequest, CompletionResponse,
     CompletionResponseChoice, EmbeddingRequest, EmbeddingResponse,
     EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
-    ImageGenerationRequest, ImageGenerationResponse, ImageObject,
+    ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse, ImageObject,
     MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
     ResponseFormat, ResponsesRequest, ResponsesResponse, TokenizeRequest,
     TokenizeResponse, UpdateWeightsRequest, UsageInfo,
@@ -2351,6 +2351,87 @@ class OpenAIServer(_VideoRoutesMixin):
                         "tokens_per_block"] = kv_cache_config.tokens_per_block
         return JSONResponse(content=content)
 
+    def _create_image_response(
+        self,
+        *,
+        output,
+        request: ImageGenerationRequest | ImageEditRequest,
+        raw_request: Request,
+        image_id: str,
+        params,
+    ) -> ImageGenerationResponse:
+        if is_tensor_format(request.format):
+            # Tensor payloads carry every populated modality in a
+            # single file. Match the image-encoder fan-out by
+            # emitting one ``ImageObject`` per batch item.
+            from tensorrt_llm.media.tensor_payload import infer_batch_size
+
+            ext = f".{request.format}"
+            batch_size = infer_batch_size(output)
+            if request.response_format == "b64_json":
+                data = [
+                    ImageObject(
+                        b64_json=base64.b64encode(
+                            output._save_bytes(
+                                request.format,
+                                batch_index=i)).decode("utf-8"),
+                        revised_prompt=request.prompt,
+                    ) for i in range(batch_size)
+                ]
+            else:
+                paths_in = [
+                    self.media_storage_path / f"{image_id}_{i}{ext}"
+                    for i in range(batch_size)
+                ]
+                output.save(paths_in, format=request.format)
+                data = [
+                    ImageObject(
+                        url=self._build_image_content_url(
+                            raw_request, image_id, i),
+                        revised_prompt=request.prompt,
+                    ) for i in range(batch_size)
+                ]
+            return ImageGenerationResponse(
+                created=int(time.time()),
+                data=data,
+                output_format=request.format,
+                size=f"{params.width}x{params.height}",
+            )
+
+        output_images = _normalize_image_output(output.image)
+        # Pillow's format name is the upper-case form of our request
+        # token. The on-disk extension matches the request token
+        # directly; ``.jpeg`` is interchangeable with ``.jpg`` for
+        # Pillow, the OS, and the OpenAI API.
+        pil_format = request.format.upper()
+        ext = f".{request.format}"
+        if request.response_format == "b64_json":
+            data = [
+                ImageObject(
+                    b64_json=base64.b64encode(
+                        image_to_bytes(image,
+                                       format=pil_format)).decode("utf-8"),
+                    revised_prompt=request.prompt,
+                ) for image in output_images
+            ]
+        else:
+            data = []
+            for i, image in enumerate(output_images):
+                path = self.media_storage_path / f"{image_id}_{i}{ext}"
+                path.write_bytes(image_to_bytes(image, format=pil_format))
+                data.append(
+                    ImageObject(
+                        url=self._build_image_content_url(
+                            raw_request, image_id, i),
+                        revised_prompt=request.prompt,
+                    ))
+        return ImageGenerationResponse(
+            created=int(time.time()),
+            data=data,
+            output_format=request.format,
+            size=f"{params.width}x{params.height}",
+        )
+
     async def openai_image_generation(self, request: ImageGenerationRequest,
                                       raw_request: Request) -> Response:
         """OpenAI-compatible image generation endpoint.
@@ -2390,78 +2471,13 @@ class OpenAIServer(_VideoRoutesMixin):
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            if is_tensor_format(request.format):
-                # Tensor payloads carry every populated modality in a
-                # single file. Match the image-encoder fan-out by
-                # emitting one ``ImageObject`` per batch item.
-                from tensorrt_llm.media.tensor_payload import infer_batch_size
-
-                ext = f".{request.format}"
-                batch_size = infer_batch_size(output)
-                if request.response_format == "b64_json":
-                    data = [
-                        ImageObject(
-                            b64_json=base64.b64encode(
-                                output._save_bytes(
-                                    request.format,
-                                    batch_index=i)).decode("utf-8"),
-                            revised_prompt=request.prompt,
-                        ) for i in range(batch_size)
-                    ]
-                else:
-                    paths_in = [
-                        self.media_storage_path / f"{image_id}_{i}{ext}"
-                        for i in range(batch_size)
-                    ]
-                    output.save(paths_in, format=request.format)
-                    data = [
-                        ImageObject(
-                            url=self._build_image_content_url(
-                                raw_request, image_id, i),
-                            revised_prompt=request.prompt,
-                        ) for i in range(batch_size)
-                    ]
-                response = ImageGenerationResponse(
-                    created=int(time.time()),
-                    data=data,
-                    output_format=request.format,
-                    size=f"{params.width}x{params.height}",
-                )
-            else:
-                output_images = _normalize_image_output(output.image)
-                # Pillow's format name is the upper-case form of our
-                # request token. The on-disk extension matches the
-                # request token directly; ``.jpeg`` is interchangeable
-                # with ``.jpg`` for Pillow, the OS, and the OpenAI API.
-                pil_format = request.format.upper()
-                ext = f".{request.format}"
-                if request.response_format == "b64_json":
-                    data = [
-                        ImageObject(
-                            b64_json=base64.b64encode(
-                                image_to_bytes(
-                                    image, format=pil_format)).decode("utf-8"),
-                            revised_prompt=request.prompt,
-                        ) for image in output_images
-                    ]
-                else:
-                    data = []
-                    for i, image in enumerate(output_images):
-                        path = self.media_storage_path / f"{image_id}_{i}{ext}"
-                        path.write_bytes(
-                            image_to_bytes(image, format=pil_format))
-                        data.append(
-                            ImageObject(
-                                url=self._build_image_content_url(
-                                    raw_request, image_id, i),
-                                revised_prompt=request.prompt,
-                            ))
-                response = ImageGenerationResponse(
-                    created=int(time.time()),
-                    data=data,
-                    output_format=request.format,
-                    size=f"{params.width}x{params.height}",
-                )
+            response = self._create_image_response(
+                output=output,
+                request=request,
+                raw_request=raw_request,
+                image_id=image_id,
+                params=params,
+            )
 
             latency = time.perf_counter() - image_gen_start  # seconds
             metrics = output.metrics
@@ -2520,18 +2536,121 @@ class OpenAIServer(_VideoRoutesMixin):
         base = str(raw_request.base_url).rstrip("/")
         return f"{base}/v1/images/{image_id}/content?i={i}"
 
-    async def openai_image_edit(self, raw_request: Request) -> Response:
-        """OpenAI-compatible image editing endpoint — returns HTTP 501.
+    async def _parse_image_edit_request(
+        self,
+        raw_request: Request,
+    ) -> ImageEditRequest:
+        """Parse an image edit request from JSON or multipart form data."""
+        content_type = raw_request.headers.get("content-type", "")
 
-        No in-tree pipeline implements image editing today: Flux/Flux2 are
-        text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
-        video, not edited images. The route is registered so callers get an
-        honest NotImplemented signal instead of a 404. The request body is
-        not parsed because no schema is committed for this endpoint yet —
-        bring a typed request model back when an edit-capable pipeline lands.
-        """
-        return self._create_not_supported_error(
-            "Image editing is not supported by any in-tree pipeline yet.")
+        if "application/json" in content_type:
+            body = await raw_request.json()
+            return ImageEditRequest(**body)
+
+        if "multipart/form-data" in content_type:
+            form = await raw_request.form()
+            data = {}
+            for key in form:
+                values = form.getlist(key)
+                if key in ("image", "mask"):
+                    values = [
+                        value for value in values
+                        if not (isinstance(value, str) and value == "")
+                    ]
+                    if not values:
+                        continue
+                    data[key] = values if key == "image" and len(
+                        values) > 1 else values[-1]
+                    continue
+
+                value = values[-1]
+                if key == "extra_params":
+                    if value == "":
+                        continue
+                    try:
+                        data[key] = json.loads(value)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"'extra_params' must be a JSON object string; {exc}"
+                        ) from exc
+                    continue
+                if value == "":
+                    continue
+                data[key] = value
+            return ImageEditRequest(**data)
+
+        raise ValueError(
+            f"Unsupported content-type: {content_type}. Use 'application/json' or 'multipart/form-data'"
+        )
+
+    async def openai_image_edit(self, raw_request: Request) -> Response:
+        """OpenAI-compatible image editing endpoint."""
+        if "image_edit" not in getattr(self.generator, "supported_tasks", ()):
+            return self._create_not_supported_error(
+                "Image editing is not supported by the loaded visual generation pipeline."
+            )
+
+        try:
+            image_id = f"image_{uuid.uuid4().hex}"
+
+            try:
+                request = await self._parse_image_edit_request(raw_request)
+                params = parse_visual_gen_params(
+                    request,
+                    image_id,
+                    self.generator,
+                    media_storage_path=str(self.media_storage_path),
+                )
+                logger.info(
+                    f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
+                )
+                image_edit_start = time.perf_counter()
+                output = self.generator.generate(inputs=request.prompt,
+                                                 params=params)
+            except ValidationError as exc:
+                return self._render_pydantic_validation_error(exc)
+            except ValueError as exc:
+                logger.error(f"Image edit request error: {exc}")
+                return self.create_error_response(
+                    message=str(exc),
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+
+            if output.image is None:
+                return self.create_error_response(
+                    message="Image editing failed",
+                    err_type="InternalServerError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+
+            response = self._create_image_response(
+                output=output,
+                request=request,
+                raw_request=raw_request,
+                image_id=image_id,
+                params=params,
+            )
+
+            latency = time.perf_counter() - image_edit_start
+            metrics = output.metrics
+            generation = metrics.generation if metrics is not None else 0.0
+            denoise = metrics.denoise if metrics is not None else 0.0
+            logger.info(f"Image {image_id} edited and encoded: "
+                        f"latency={latency:.3f}s generation={generation:.3f}s "
+                        f"denoise={denoise:.3f}s")
+            headers = build_visual_gen_timing_headers(metrics)
+
+            return JSONResponse(content=response.model_dump(), headers=headers)
+
+        except ValidationError as exc:
+            return self._render_pydantic_validation_error(exc)
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return self.create_error_response(
+                message=str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     async def __call__(self,
                        host,
