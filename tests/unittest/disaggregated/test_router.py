@@ -2,6 +2,8 @@ import asyncio
 import copy
 import random
 import threading
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import aiohttp
@@ -1766,7 +1768,9 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
     DeepSeek-V3 Metaspace, ``_fallback_to_fast_tokenizer`` for DeepSeek-V3.2
     on transformers >= 5.x). Without this routing, ``trtllm-serve`` would
     tokenize prompts differently from the rest of TRT-LLM when computing
-    block hashes for cache hits.
+    block hashes for cache hits. The request's model is client-controlled, so
+    it must not enable remote tokenizer code unless an operator configured a
+    fixed tokenizer directory.
     """
 
     class _Probe(BlockHashMixin):
@@ -1782,11 +1786,25 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
             return_value=wrapper) as routed:
         out = probe._get_tokenizer("dummy/model")
 
-    routed.assert_called_once_with("dummy/model", trust_remote_code=True)
+    routed.assert_called_once_with("dummy/model", trust_remote_code=False)
     # The cached tokenizer must be the raw HF tokenizer used by _tokenize,
     # not the TransformersTokenizer wrapper.
     assert out is inner
     assert probe._tokenizers["dummy/model"] is inner
+
+    fixed_probe = _Probe()
+    fixed_probe._init_block_hashing(tokenizer_dir="/trusted/tokenizer")
+
+    fixed_inner = mock.MagicMock()
+    fixed_wrapper = mock.MagicMock(tokenizer=fixed_inner)
+    with mock.patch(
+            "tensorrt_llm.tokenizer.TransformersTokenizer.from_pretrained",
+            return_value=fixed_wrapper) as routed:
+        fixed_out = fixed_probe._get_tokenizer("dummy/model")
+
+    routed.assert_called_once_with("/trusted/tokenizer", trust_remote_code=True)
+    assert fixed_out is fixed_inner
+    assert fixed_probe._tokenizers["dummy/model"] is fixed_inner
 
 
 @pytest.mark.asyncio
@@ -1861,6 +1879,169 @@ def _mock_tokenizer(token_ids=None):
     return tok
 
 
+def test_router_model_type_uses_checkpoint_config(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text('{"model_type": "gpt_oss"}',
+                                          encoding="utf-8")
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                model_path=str(tmp_path))
+
+    assert router._get_model_type() == "gpt_oss"
+
+
+@pytest.mark.asyncio
+async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
+    """KV-cache routing must hash the same Harmony tokens used by the server."""
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32,
+                                model_path="/models/gpt-oss-checkpoint")
+    router_tokenizer = _mock_tokenizer(token_ids=[900, 901, 902])
+    harmony_tokens = [100, 101, 102, 103]
+    harmony_adapter = mock.MagicMock()
+    harmony_adapter.openai_to_harmony_tokens.return_value = harmony_tokens
+    harmony_adapter.get_stop_tokens.return_value = [42]
+    promise = mock.MagicMock()
+    promise.prompt_token_ids = []
+
+    request = ChatCompletionRequest(
+        model="my-model",
+        messages=[{
+            "role": "developer",
+            "content": "Use tools when useful."
+        }, {
+            "role": "user",
+            "content": "weather in Paris?"
+        }],
+        tools=[_get_weather_tool()],
+        tool_choice="auto",
+        reasoning_effort="medium",
+        stream=True,
+        max_completion_tokens=1,
+    )
+    router_request = copy.deepcopy(request)
+    server_request = copy.deepcopy(request)
+
+    server = OpenAIServer.__new__(OpenAIServer)
+    server.allow_request_chat_template = False
+    server.await_disconnected = mock.AsyncMock()
+    server.generator = SimpleNamespace(
+        args=SimpleNamespace(num_postprocess_workers=0),
+        generate_async=mock.MagicMock(return_value=promise),
+    )
+    server.harmony_adapter = harmony_adapter
+    server.model_config = SimpleNamespace(vocab_size=1000)
+    server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(
+        vocab_size=1000))
+
+    with mock.patch.object(
+            router, "_get_tokenizer",
+            return_value=router_tokenizer), mock.patch(
+                "tensorrt_llm.serve.harmony_adapter."
+                "get_harmony_adapter",
+                return_value=harmony_adapter), mock.patch(
+                    "tensorrt_llm.serve.router_utils."
+                    "resolve_model_type_from_config",
+                    return_value="gpt_oss") as resolve_model_type:
+        router_token_ids = router._tokenize(router_request)[0]
+        await server.chat_harmony(server_request, raw_request=None)
+
+    server_token_ids = server.generator.generate_async.call_args.kwargs[
+        "inputs"]
+    assert router_token_ids == server_token_ids
+    assert router_request.prompt_token_ids == harmony_tokens
+    first_call, second_call = harmony_adapter.openai_to_harmony_tokens.call_args_list
+    assert first_call.args == second_call.args
+    assert first_call.kwargs == second_call.kwargs
+    resolve_model_type.assert_called_once_with("/models/gpt-oss-checkpoint")
+    router_tokenizer.apply_chat_template.assert_not_called()
+
+
+def test_gpt_oss_router_respects_disable_harmony_adapter(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Router follows the same DISABLE_HARMONY_ADAPTER gate as the server."""
+    monkeypatch.setenv("DISABLE_HARMONY_ADAPTER", "1")
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32,
+                                model_path="/models/gpt-oss-checkpoint")
+    router_tokenizer = _mock_tokenizer(token_ids=[900, 901, 902])
+    harmony_adapter = mock.MagicMock()
+
+    request = ChatCompletionRequest(
+        model="openai/gpt-oss-20b",
+        messages=[{
+            "role": "user",
+            "content": "weather in Paris?"
+        }],
+        tools=[_get_weather_tool()],
+    )
+
+    with mock.patch.object(
+            router, "_get_tokenizer",
+            return_value=router_tokenizer), mock.patch(
+                "tensorrt_llm.serve.harmony_adapter."
+                "get_harmony_adapter",
+                return_value=harmony_adapter), mock.patch(
+                    "tensorrt_llm.serve.router_utils."
+                    "resolve_model_type_from_config",
+                    side_effect=AssertionError(
+                        "disabled Harmony must not load model config")):
+        assert router._tokenize(request) == [[900, 901, 902]]
+
+    harmony_adapter.openai_to_harmony_tokens.assert_not_called()
+    router_tokenizer.apply_chat_template.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_harmony_preserves_original_tool_conversion_error() -> None:
+    """Harmony diagnostics must not rerun the conversion that already failed."""
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    original_error = RuntimeError("original tool conversion failure")
+    diagnostic_error = RuntimeError("diagnostic tool conversion failure")
+
+    class FailingTool:
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def model_dump(self) -> dict[str, object]:
+            self.calls += 1
+            if self.calls == 1:
+                raise original_error
+            raise diagnostic_error
+
+    failing_tool = FailingTool()
+    request = ChatCompletionRequest(
+        model="my-model",
+        messages=[{
+            "role": "user",
+            "content": "weather in Paris?"
+        }],
+    )
+    object.__setattr__(request, "tools", [failing_tool])
+
+    server = OpenAIServer.__new__(OpenAIServer)
+    server.allow_request_chat_template = False
+    server.harmony_adapter = mock.MagicMock()
+    server.create_error_response = mock.MagicMock(
+        return_value=str(original_error))
+
+    response = await server.chat_harmony(request, raw_request=None)
+
+    assert response == str(original_error)
+    assert failing_tool.calls == 1
+    server.create_error_response.assert_called_once_with(
+        message=str(original_error), err_type="internal_error")
+
+
 @pytest.mark.parametrize("router_class",
                          [KvCacheAwareRouter, ConversationRouter])
 def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
@@ -1880,6 +2061,8 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
                           tokens_per_block=32)
 
     tok = _mock_tokenizer()
+    documents = [{"title": "Paris", "text": "Paris is in France."}]
+    chat_template = "{% for message in messages %}{{ message.content }}{% endfor %}"
     with mock.patch.object(router, "_get_tokenizer", return_value=tok):
         req = ChatCompletionRequest(
             model="TinyLlama",
@@ -1888,6 +2071,8 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
                 "content": "what's the weather in Paris?"
             }],
             tools=[_get_weather_tool()],
+            documents=documents,
+            chat_template=chat_template,
             chat_template_kwargs={"thinking": True},
         )
         router._tokenize(req)
@@ -1904,6 +2089,8 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
     assert "parameters" in tool_dict["function"]
     # chat_template_kwargs must be forwarded as **kwargs (not nested).
     assert kwargs.get("thinking") is True
+    assert kwargs["documents"] == documents
+    assert kwargs["chat_template"] == chat_template
 
 
 @pytest.mark.parametrize("router_class",

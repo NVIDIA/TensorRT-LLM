@@ -204,7 +204,9 @@ class CUDAGraphRunner:
                 num_draft_tokens = self.spec_config.max_draft_len if is_spec_request else 0
                 # First draft
                 if request.py_is_first_draft:
-                    total_seq_len = len(request.get_tokens(0))
+                    # get_num_tokens is O(1); len(get_tokens(0)) marshals the
+                    # whole O(seq_len) VecTokens into a Python list just for len.
+                    total_seq_len = request.get_num_tokens(0)
                 # With overlap scheduler disabled or dummy request or not assigned to a batch,
                 elif not overlap_scheduler_enabled or request.is_dummy or request.py_batch_idx is None:
                     total_seq_len = request.max_beam_num_tokens + num_draft_tokens

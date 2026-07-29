@@ -1276,6 +1276,21 @@ class PyExecutor:
     def _set_global_steady_clock_offset(self):
         assert self.global_rank >= 0, "rank should be >= 0"
 
+        # First calibration wins (mirrors the C++ guard in CacheTransceiver).
+        # PyExecutor is constructed twice per process (memory-profiling dry run,
+        # then the real executor), so this method runs twice. Recalibration is
+        # idempotent as long as the measurement below reads the raw
+        # steady_clock, but skipping it avoids a redundant barrier+allgather
+        # and protects the offset if the measurement path ever becomes
+        # offset-aware (which would make a second pass observe ~zero skew and
+        # wipe the correct value).
+        if LlmRequest.global_steady_clock_offset is not None:
+            logger.info(
+                f"global_steady_clock_offset already set "
+                f"({LlmRequest.global_steady_clock_offset}); skipping recalibration "
+                f"for rank {self.global_rank}")
+            return
+
         # Sync all ranks
         self.dist.barrier()
         # Immediately take the local steady clock timestamp
@@ -2013,6 +2028,9 @@ class PyExecutor:
 
             # Aggregate stats from all generation requests
             for req in scheduled_batch.generation_requests:
+                # exclude attention dp dummy / CUDA Graph padding requests from AL calculation
+                if getattr(req, 'is_dummy', False):
+                    continue
                 draft_len = getattr(req, 'num_draft_tokens', 0)
                 py_draft_tokens = getattr(req, 'py_draft_tokens', None)
                 py_num_accepted = getattr(req, 'py_num_accepted_draft_tokens',
