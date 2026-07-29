@@ -21,8 +21,23 @@ import argparse
 import math
 import os
 import re
+import sys
 
 import yaml
+
+
+def _import_precheck_config(llm_src):
+    """Import the pure-stdlib precheck config module from the repo tree.
+
+    It is the single owner of the gate's enable policy and timeout formulas.
+    """
+    path = os.path.join(llm_src, "tests", "scripts", "perf-sanity", "cache_transceiver_precheck")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import precheck_config
+
+    return precheck_config
+
 
 AGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/aggregated"
 DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
@@ -287,6 +302,25 @@ def get_benchmark_config(config):
         "mode": benchmark.get("mode", ""),
         "concurrency": concurrency,
     }
+
+
+def get_benchmark_request_queue_size(config, concurrency):
+    """Cap the gen-only fill target to the GEN executor's active capacity."""
+    gen_config = (config.get("worker_config", {}) or {}).get("gen", {}) or {}
+    concurrency = int(concurrency)
+    max_batch_size = int(gen_config.get("max_batch_size", concurrency))
+    enable_attention_dp = gen_config.get("enable_attention_dp", False)
+    tp_size = int(gen_config.get("tensor_parallel_size", 1))
+    max_capacity = max_batch_size * tp_size if enable_attention_dp else max_batch_size
+    queue_size = min(max_capacity, concurrency)
+    if queue_size < concurrency:
+        print(
+            "[WARNING] TLLM_BENCHMARK_REQ_QUEUES_SIZE capped to "
+            f"{queue_size} (max_batch_size={max_batch_size}, tp_size={tp_size}, "
+            f"attention_dp={enable_attention_dp}) instead of concurrency={concurrency}. "
+            "The fill loop cannot reach a target above the GEN executor capacity."
+        )
+    return queue_size
 
 
 # --------------------------------------------------------------------------- #
@@ -554,12 +588,13 @@ def main():
             srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
         elif benchmark_mode == "gen_only":
             concurrency = benchmark_config.get("concurrency", 1)
+            queue_size = get_benchmark_request_queue_size(config, concurrency)
             ctx_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 {ctx_worker_env_vars}"
             )
             gen_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
-                f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
+                f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_size} {gen_worker_env_vars}"
             )
 
         if is_gb300:
@@ -606,6 +641,27 @@ def main():
                 f"export testOutputDir={test_output_dir}",
             ]
         )
+
+        # Cache-transceiver network precheck: runs BEFORE the real ctx/gen
+        # servers with the same instance topology, and reuses the exact
+        # $ucx_tls_cmd / $CTX_WORKER_ENV_VARS / $GEN_WORKER_ENV_VARS strings
+        # of the worker steps so the UCX environment matches by construction.
+        # Enable/kill-switch policy and timeouts live in precheck_config
+        # (single owner, shared with the local flow).
+        pcfg = _import_precheck_config(args.llm_src)
+        script_prefix_lines.extend(
+            pcfg.precheck_prefix_lines(
+                config,
+                benchmark_mode,
+                config_path_expr=f"$llmSrcNode/{os.path.relpath(config_yaml, args.llm_src)}",
+                ucx_tls_cmd=ucx_tls_cmd,
+                max_world=max(
+                    hardware_config["gpus_per_ctx_server"],
+                    hardware_config["gpus_per_gen_server"],
+                ),
+                stage_name=args.stage_name,
+            )
+        )
         srun_args_lines.extend(
             [
                 "--container-env=DISAGG_SERVING_TYPE",
@@ -625,8 +681,14 @@ def main():
     draft_launch_lines = remove_whitespace_lines(draft_launch_content.split("\n"))
     draft_launch_content = "\n".join(draft_launch_lines)
 
+    # The disagg draft calls run_cache_transceiver_precheck; splice in the gate
+    # function library ahead of it (single owner: precheck_config).
+    gate_content = ""
+    if runtime_mode == "disaggregated":
+        gate_content = pcfg.gate_library_content(args.draft_launch_sh, args.llm_src)
+
     with open(args.launch_sh, "w") as f:
-        f.write(f"{script_prefix}\n{srun_args}\n{draft_launch_content}")
+        f.write(f"{script_prefix}\n{srun_args}\n{gate_content}{draft_launch_content}")
 
     print(f"Launch script generated at: {args.launch_sh}")
     print(f"Launch script:\n{script_prefix}\n{srun_args}\n{draft_launch_content}")
