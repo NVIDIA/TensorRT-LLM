@@ -251,7 +251,7 @@ def test_moe_sort(num_tokens: int, top_k: int, ep_size: int, tile_size: int):
 def test_moe_metadata_from_expert_counts_matches_sort_and_permute_output(
     tile_size: int, slot_start: int, all_zero: bool
 ):
-    """Direct expert-major metadata must match sorting the DeepEP adapter tensors."""
+    """Direct expert-major metadata must be semantically equivalent to sorting."""
     capacity = tile_size + 1
     counts_host = [0, tile_size - 1, tile_size, capacity]
     if all_zero:
@@ -298,14 +298,31 @@ def test_moe_metadata_from_expert_counts_matches_sort_and_permute_output(
     torch.testing.assert_close(
         direct_metadata[1][:num_valid_tiles], old_metadata[1][:num_valid_tiles]
     )
-    torch.testing.assert_close(direct_metadata[2], old_metadata[2])
-    valid_permuted = direct_metadata[3][:num_valid_permuted_tokens] >= 0
-    torch.testing.assert_close(
-        direct_metadata[3][:num_valid_permuted_tokens][valid_permuted],
-        old_metadata[3][:num_valid_permuted_tokens][valid_permuted],
-    )
     torch.testing.assert_close(direct_metadata[4], old_metadata[4])
     torch.testing.assert_close(direct_metadata[5], old_metadata[5])
+
+    old_live_sources = old_metadata[2].flatten() >= 0
+    direct_live_sources = direct_metadata[2].flatten() >= 0
+    torch.testing.assert_close(direct_live_sources, old_live_sources)
+
+    # Legacy routing may assign rows within one expert in a different order
+    # because it obtains per-CTA offsets atomically. Validate each permutation
+    # as a bijection instead of requiring identical physical row order.
+    expanded_indices = torch.arange(
+        direct_live_sources.numel(),
+        dtype=torch.int32,
+        device=direct_live_sources.device,
+    )
+    for metadata, live_sources in (
+        (old_metadata, old_live_sources),
+        (direct_metadata, direct_live_sources),
+    ):
+        live_destinations = metadata[2].flatten()[live_sources]
+        torch.testing.assert_close(
+            metadata[3][live_destinations],
+            expanded_indices[live_sources],
+        )
+        assert torch.unique(live_destinations).numel() == live_destinations.numel()
 
     assert (direct_metadata[0][num_valid_tiles:] == -1).all()
     assert (direct_metadata[1][num_valid_tiles:] == 0).all()
@@ -324,10 +341,12 @@ def test_moe_metadata_from_expert_counts_matches_sort_and_permute_output(
     direct_permuted, _ = torch.ops.trtllm.moe_permute(
         x, None, direct_metadata[1], direct_metadata[3], direct_metadata[5], tile_size, 1
     )
-    live_sources = direct_metadata[2].flatten() >= 0
-    live_destinations = direct_metadata[2].flatten()[live_sources]
-    torch.testing.assert_close(direct_permuted[live_destinations], old_permuted[live_destinations])
-    torch.testing.assert_close(direct_permuted[live_destinations], x[live_sources])
+    for metadata, permuted, live_sources in (
+        (old_metadata, old_permuted, old_live_sources),
+        (direct_metadata, direct_permuted, direct_live_sources),
+    ):
+        live_destinations = metadata[2].flatten()[live_sources]
+        torch.testing.assert_close(permuted[live_destinations], x[live_sources])
 
     old_output = torch.ops.trtllm.moe_unpermute(old_permuted, old_metadata[2], token_final_scales)
     direct_output = torch.ops.trtllm.moe_unpermute(
