@@ -423,7 +423,7 @@ class KvCacheCreator:
         self._skip_est = skip_est
         self._maybe_enable_fabric_memory_for_python_transceiver()
 
-    def _maybe_enable_fabric_memory_for_python_transceiver(self):
+    def _maybe_enable_fabric_memory_for_python_transceiver(self) -> None:
         """Default TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1 for the Python
         transceiver on the C++ V1 KV cache manager.
 
