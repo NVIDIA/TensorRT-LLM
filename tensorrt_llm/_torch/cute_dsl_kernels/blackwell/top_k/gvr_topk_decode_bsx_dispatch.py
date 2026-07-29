@@ -95,12 +95,18 @@ def _thresholds(npad):
 # Keys are the nearest power-of-two of npad; values are inclusive bs
 # ranges. TRTLLM_BSX_FALLBACK_BANDS=0 disables the table (bsx serves
 # every guarded shape).
+# 2026-07-29 recalibration: the 131072 band lower bound moved 16 -> 8.
+# The original calibration run measured the reg tier with a faster
+# experimental streaming phase1 inherited from a side branch; on this
+# branch's reg tier the 128K x BS8 shapes dip to 0.82-0.91x vs the
+# in-tree kernel (5 production layers), so they are routed as well
+# (full-grid gm 1.397 -> 1.390).
 _FALLBACK_BANDS = {
     8192: (256, 1 << 30),
     16384: (256, 1 << 30),
     32768: (16, 1 << 30),
     65536: (16, 1 << 30),
-    131072: (16, 255),
+    131072: (8, 255),
     262144: (16, 127),
 }
 

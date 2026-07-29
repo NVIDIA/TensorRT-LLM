@@ -113,7 +113,8 @@ def test_bsx_cuda_graph_capture_replay(monkeypatch, bands):
 def test_bsx_fallback_band_table(monkeypatch):
     """The measured (npad, bs) fallback buckets route to the in-tree kernel
     by default; the kill-switch restores bsx service; neighbours are not
-    over-routed. Bands: op43-pr6 full-grid verdict (2026-07-28)."""
+    over-routed. Bands: op43-pr6 full-grid verdict (2026-07-28), 131072
+    lower bound recalibrated to 8 (2026-07-29)."""
     monkeypatch.delenv("TRTLLM_BSX_FALLBACK_BANDS", raising=False)
     bsx_dispatch._reset_env_cache()
     inb = bsx_dispatch._in_fallback_band
@@ -121,6 +122,7 @@ def test_bsx_fallback_band_table(monkeypatch):
     assert inb(256, 8192) and inb(1024, 8192)
     assert inb(16, 32768) and inb(1024, 65536)
     assert inb(128, 131072) and inb(64, 262144)
+    assert inb(8, 131072)  # 128K x BS8 recalibration (reg-tier floor)
     assert inb(48, 40960)  # off-grid npad resolves to the nearest pow2
     # neighbours stay on bsx
     assert not inb(128, 8192)  # direct/tp win band
