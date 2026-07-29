@@ -15,10 +15,16 @@
 
 from typing import Optional
 
+import cutlass
+import cutlass.cute as cute
 import pytest
 import torch
+from cutlass.cute import runtime as _crt
 
 import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops  # noqa: F401
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode import (
+    GvrTopKKernel as _GvrTopKKernel,
+)
 from tensorrt_llm._utils import get_sm_version
 
 skip_not_sm100 = pytest.mark.skipif(
@@ -27,7 +33,7 @@ skip_not_sm100 = pytest.mark.skipif(
 )
 
 
-def _make_inputs(
+def _make_inputs_impl(
     num_rows: int,
     N: int,
     top_k: int,
@@ -96,8 +102,7 @@ def _make_inputs(
 
     if preidx_hit_rate <= 0.0:
         # Worst-case: only slot 0 is meaningful, rest are junk arange.
-        for j in range(1, top_k):
-            pre_idx[:, j] = j
+        pre_idx[:, 1:] = torch.arange(1, top_k, dtype=torch.int32, device="cuda")
     else:
         # Realistic: mix ``preidx_hit_rate`` real torch.topk indices with
         # random in-range fillers. Tests the Guess-phase short-circuit
@@ -112,6 +117,66 @@ def _make_inputs(
         pre_idx[:, :] = guess
 
     return logits, pre_idx, seq_lens
+
+
+# Module-level input memoization. ``_make_inputs_impl`` is fully deterministic
+# (seed-keyed RNG), and the parametrized sweeps below request the same
+# (shape, dtype, hit-rate, ...) combination once per cluster_size / dispatch
+# variant — regenerating logits + the reference topk dominated suite
+# wall-clock, not the kernel under test. Cached tensors are returned WITHOUT
+# cloning under a strict read-only convention: the op writes only
+# ``out_indices`` (allocated fresh by every test), never its inputs.
+_inputs_cache: dict = {}
+# Reference top-K values memoized per cached-inputs identity (see
+# ``_tie_aware_check``). Keyed on object ids, which is safe only because the
+# keying tensors are pinned for the process lifetime by ``_inputs_cache``.
+_ref_vals_cache: dict = {}
+
+
+def _make_inputs(
+    num_rows: int,
+    N: int,
+    top_k: int,
+    dtype: torch.dtype,
+    next_n: int,
+    seed: int,
+    compress_ratio: int = 1,
+    preidx_hit_rate: float = 0.0,
+    varlen: bool = False,
+    seq_lens: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Memoizing wrapper around ``_make_inputs_impl`` (same signature).
+
+    Caller-provided ``seq_lens`` bypasses the cache (the tensor identity is
+    not part of a hashable key).
+    """
+    if seq_lens is not None:
+        return _make_inputs_impl(
+            num_rows,
+            N,
+            top_k,
+            dtype,
+            next_n,
+            seed,
+            compress_ratio=compress_ratio,
+            preidx_hit_rate=preidx_hit_rate,
+            varlen=varlen,
+            seq_lens=seq_lens,
+        )
+    key = (num_rows, N, top_k, dtype, next_n, seed, compress_ratio, preidx_hit_rate, varlen)
+    if key not in _inputs_cache:
+        _inputs_cache[key] = _make_inputs_impl(
+            num_rows,
+            N,
+            top_k,
+            dtype,
+            next_n,
+            seed,
+            compress_ratio=compress_ratio,
+            preidx_hit_rate=preidx_hit_rate,
+            varlen=varlen,
+        )
+    return _inputs_cache[key]
 
 
 def _tie_aware_check(
@@ -154,13 +219,23 @@ def _tie_aware_check(
     actual_kv_len = seq_lens_per_row - next_n + ofs + 1
     N_eff = actual_kv_len // compress_ratio  # [num_rows]
 
-    # Mask logits beyond per-row N_eff to -inf so torch.topk ignores tails.
-    col_idx = torch.arange(N, device=device)
-    in_range_mask = col_idx[None, :] < N_eff[:, None]  # [num_rows, N]
-    masked_logits = torch.where(in_range_mask, logits_f32, float("-inf"))
-
-    # Reference per-row top-K, sorted descending.
-    ref_vals, _ = torch.topk(masked_logits, k=top_k, largest=True, sorted=True, dim=-1)
+    # Reference per-row top-K, sorted descending, over logits masked beyond
+    # per-row N_eff. Memoized when (logits, seq_lens) come from the pinned
+    # ``_inputs_cache`` (identity match), since the reference only depends on
+    # (logits, seq_lens, top_k, next_n, compress_ratio) — not on the launch
+    # variant (cluster_size / order_row / ...) the test is exercising.
+    ref_key = None
+    if any(logits is v[0] and seq_lens is v[2] for v in _inputs_cache.values()):
+        ref_key = (id(logits), id(seq_lens), top_k, next_n, compress_ratio)
+    if ref_key is not None and ref_key in _ref_vals_cache:
+        ref_vals = _ref_vals_cache[ref_key]
+    else:
+        col_idx = torch.arange(N, device=device)
+        in_range_mask = col_idx[None, :] < N_eff[:, None]  # [num_rows, N]
+        masked_logits = torch.where(in_range_mask, logits_f32, float("-inf"))
+        ref_vals, _ = torch.topk(masked_logits, k=top_k, largest=True, sorted=True, dim=-1)
+        if ref_key is not None:
+            _ref_vals_cache[ref_key] = ref_vals
 
     # ---- 1. Out-of-range / -1 placeholder check (single fused mask) ----
     out_of_range = (out_indices < 0) | (out_indices >= N_eff[:, None])
@@ -227,7 +302,6 @@ def _tie_aware_check(
 @pytest.mark.parametrize("compress_ratio", [1, 4])
 @pytest.mark.parametrize("preidx_hit_rate", [0.0, 0.5])
 @pytest.mark.parametrize("cluster_size", [1, 4])
-@pytest.mark.parametrize("seqlen_sorted", [False, True])
 def test_cute_dsl_gvr_topk_decode(
     dtype,
     top_k,
@@ -238,7 +312,6 @@ def test_cute_dsl_gvr_topk_decode(
     compress_ratio,
     preidx_hit_rate,
     cluster_size,
-    seqlen_sorted,
 ):
     """Compare custom op output against torch.topk reference (tie-aware).
 
@@ -250,14 +323,9 @@ def test_cute_dsl_gvr_topk_decode(
     ``varlen=False`` uses uniform seq_lens=N*cr across the batch;
     ``varlen=True`` draws per-row seq_lens uniformly in [N/2, N]*cr.
 
-    ``seqlen_sorted=True`` exercises the LJF host-side dispatch order:
-    we build ``order_row`` as a descending argsort over ``seq_lens`` and
-    pass it through the custom op. The
-    kernel must produce the same per-row top-K (rows are still written
-    back at their original positions, since the kernel uses
-    ``row_idx = order_row[req] * next_n + nn`` for both reads and
-    writes). The reference comparison is unchanged — it asserts that
-    each row's output is a valid top-K of that row's masked logits.
+    The LJF host-side dispatch order (``order_row``) is covered by the
+    dedicated ``test_cute_dsl_gvr_topk_decode_seqlen_sorted`` below on
+    representative cells instead of doubling this whole sweep.
     """
     if N - next_n + 1 < top_k:
         pytest.skip(f"N_eff < top_k ({N - next_n + 1} < {top_k}) is a degenerate path")
@@ -279,12 +347,66 @@ def test_cute_dsl_gvr_topk_decode(
 
     out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
 
-    # LJF dispatch order — request-level descending argsort of seq_lens.
-    order_row = (
-        torch.argsort(seq_lens, descending=True, stable=False).to(torch.int32)
-        if seqlen_sorted
-        else None
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        cluster_size=cluster_size,
     )
+    torch.cuda.synchronize()
+
+    _tie_aware_check(out_indices, logits, seq_lens, top_k, next_n, compress_ratio=compress_ratio)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "dtype,top_k,N,batch_size,varlen,next_n,compress_ratio,cluster_size",
+    [
+        # Representative cells for the LJF host-side dispatch order
+        # (previously a full extra dimension on the sweep above): varlen
+        # batches so the argsort is a real permutation, both SMEM layout
+        # endpoints (bf16/K=512, fp32/K=2048), next_n=2 for the
+        # ``order_row[req] * next_n + nn`` row expansion, cr=4 for the
+        # order_row + compressed seq_lens interaction, cluster and
+        # single-CTA paths, and a batch_size=1 trivial-permutation smoke.
+        (torch.bfloat16, 512, 65536, 32, True, 1, 1, 4),
+        (torch.float32, 2048, 65536, 32, True, 2, 1, 1),
+        (torch.bfloat16, 1024, 4096, 32, True, 2, 4, 1),
+        (torch.float16, 1024, 65536, 1, False, 1, 1, 1),
+    ],
+)
+def test_cute_dsl_gvr_topk_decode_seqlen_sorted(
+    dtype, top_k, N, batch_size, varlen, next_n, compress_ratio, cluster_size
+):
+    """LJF host-side dispatch order: ``order_row`` = descending argsort of
+    ``seq_lens`` passed through the custom op.
+
+    The kernel must produce the same per-row top-K as the unsorted launch
+    (rows are still written back at their original positions, since the
+    kernel uses ``row_idx = order_row[req] * next_n + nn`` for both reads
+    and writes). The reference comparison is unchanged — it asserts that
+    each row's output is a valid top-K of that row's masked logits.
+    """
+    num_rows = batch_size * next_n
+    logits, pre_idx, seq_lens = _make_inputs(
+        num_rows,
+        N,
+        top_k,
+        dtype,
+        next_n,
+        seed=42,
+        compress_ratio=compress_ratio,
+        preidx_hit_rate=0.5,
+        varlen=varlen,
+    )
+    out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+
+    # LJF dispatch order — request-level descending argsort of seq_lens.
+    order_row = torch.argsort(seq_lens, descending=True, stable=False).to(torch.int32)
 
     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
         logits,
@@ -588,9 +710,11 @@ def test_lb_main_branches(dtype, top_k, scenario, N, seq_lens_mode, batch_size, 
 @pytest.mark.parametrize(
     "dtype,top_k",
     [
+        # SMEM-layout endpoints only. LB dispatch (prepare partition +
+        # long/short branch selection) is dtype-insensitive; the full
+        # dtype x K production map stays covered by the main sweep above
+        # and by test_cute_dsl_gvr_topk_decode_r0_equivalence.
         (torch.bfloat16, 512),
-        (torch.bfloat16, 1024),
-        (torch.float16, 1024),
         (torch.float32, 2048),
     ],
 )
@@ -663,3 +787,351 @@ def test_lb_vs_reference(
         next_n,
         compress_ratio=compress_ratio,
     )
+
+
+# ===========================================================================
+# R0 histogram-ladder admission equivalence tests.
+#
+# ``enable_r0=True`` (the GvrTopKKernel default) replaces the Phase-2 secant
+# threshold search with a single-pass multi-threshold "rung ladder" admission
+# seeded by a 256-bin histogram over the prev-topK gathered values. This must
+# select the SAME top-K as the retained secant baseline (``enable_r0=False``).
+#
+# top-K is order-independent, so correctness is checked by INDEX SET (not
+# position): for continuous fp32 logits (tie-free with probability 1) the R0
+# and base index sets must be identical; for bf16/fp16 boundary value-ties can
+# make two equally-valid selections differ in index, so there the guarantee is
+# value-set (multiset) equality against the tie-aware torch.topk reference.
+#
+# The custom op does not plumb ``enable_r0`` (activation / dispatch land in a
+# follow-up PR), so these tests drive ``GvrTopKKernel`` directly. This is also
+# the only remaining coverage of the secant fallback path, since every op-level
+# test above now inherits the ``enable_r0=True`` default.
+# ===========================================================================
+
+_R0_DT = {
+    torch.float32: cutlass.Float32,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float16: cutlass.Float16,
+}
+# Compiled-kernel cache keyed on (enable_r0, dtype, top_k, cluster_size, T,
+# min_blocks_per_mp). Shapes (num_rows / N / batch) are symbolic, so one
+# compile covers every N and batch_size within a bucket (mirrors the runner).
+_r0_kernel_cache: dict = {}
+
+
+def _compile_gvr_direct(kernel):
+    """Compile a ``GvrTopKKernel`` with symbolic shapes, mirroring the
+    production runner's fake-tensor construction (128-bit loads, no
+    ``order_row`` / ``output_values``)."""
+    n_rows, n_cols, n_batch = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    in_f = _crt.make_fake_compact_tensor(
+        kernel.dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=16
+    )
+    pi_f = _crt.make_fake_compact_tensor(
+        cutlass.Int32, (n_batch, kernel.top_k), stride_order=(1, 0), assumed_align=16
+    )
+    sl_f = _crt.make_fake_compact_tensor(cutlass.Int32, (n_batch,), stride_order=(0,))
+    oi_f = _crt.make_fake_compact_tensor(
+        cutlass.Int32, (n_rows, kernel.top_k), stride_order=(1, 0), assumed_align=16
+    )
+    fs = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
+    # __call__(input, pre_idx, seq_lens, output_values, output_indices, order_row, stream)
+    return cute.compile(
+        kernel, in_f, pi_f, sl_f, None, oi_f, None, stream=fs, options="--enable-tvm-ffi"
+    )
+
+
+def _run_gvr_direct(logits, pre_idx, seq_lens, top_k, enable_r0, cluster_size):
+    """Drive ``GvrTopKKernel`` directly (bypassing the custom op, which does
+    not expose ``enable_r0``). Fixed at ``next_n=1``, ``compress_ratio=1``,
+    128-bit loads. When ``enable_r0=True`` the ctor auto-derives the shipped
+    R0 config (r0_qfracs=M2D, cs-aware p1b_cache, K512 kC-diet, P4
+    rank-scatter) — i.e. the exact default arm. Returns int32
+    ``[num_rows, top_k]`` indices."""
+    num_rows, N = logits.shape
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_threads = 1024 if (num_rows <= num_sms and N >= 65536) else 512
+    min_blocks_per_mp = 1 if num_rows <= num_sms else 3
+    key = (enable_r0, logits.dtype, top_k, cluster_size, num_threads, min_blocks_per_mp)
+    if key not in _r0_kernel_cache:
+        kernel = _GvrTopKKernel(
+            dtype=_R0_DT[logits.dtype],
+            top_k=top_k,
+            next_n=1,
+            num_threads=num_threads,
+            compress_ratio=1,
+            use_256bit_load=False,
+            min_blocks_per_mp=min_blocks_per_mp,
+            cluster_size=cluster_size,
+            return_output_values=False,
+            enable_r0=enable_r0,
+        )
+        _r0_kernel_cache[key] = _compile_gvr_direct(kernel)
+    out = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    _r0_kernel_cache[key](logits, pre_idx, seq_lens, None, out, None)
+    torch.cuda.synchronize()
+    return out
+
+
+def _assert_index_sets_equal_tie_aware(out_base, out_r0, logits):
+    """Assert two arms' top-K index sets match, modulo boundary value-ties.
+
+    fp32 randn logits DO collide bit-exactly at these sample counts; when the
+    duplicated value sits on the top-K boundary, each arm may legitimately
+    keep a different member of the tie class. Indices in the symmetric
+    difference must all carry the row's boundary (minimum kept) value —
+    anything else is a genuine divergence.
+    """
+    base_sorted, _ = out_base.sort(dim=-1)
+    r0_sorted, _ = out_r0.sort(dim=-1)
+    mismatch = (base_sorted != r0_sorted).any(dim=-1)
+    for bad in mismatch.nonzero().flatten().tolist():
+        base_set = set(out_base[bad].tolist())
+        r0_set = set(out_r0[bad].tolist())
+        diff = sorted(base_set.symmetric_difference(r0_set))
+        row_vals = logits[bad].float()
+        kth = row_vals[out_base[bad].long()].min()
+        diff_vals = row_vals[torch.tensor(diff, device=logits.device, dtype=torch.long)]
+        if not bool((diff_vals == kth).all().item()):
+            raise AssertionError(
+                f"row={bad}: R0 index set != secant-base index set beyond a "
+                f"boundary value-tie (kth={kth.item()}, "
+                f"diff={[(i, row_vals[i].item()) for i in diff]}, "
+                f"base={sorted(base_set)}, r0={sorted(r0_set)})"
+            )
+
+
+def _make_r0_pre_idx(logits, top_k, hint, seed):
+    """Build ``pre_idx`` in the kernel's native cr=1 convention: the kernel
+    reads ``logits[pre_idx + 1]``, so store ``true_index - 1``.
+
+    ``hint='real'`` seeds a warm hint (near-topK indices) so R0's admission
+    ladder hits on the first pass; ``hint='rand'`` seeds a cold hint (random
+    in-range indices) that misses admission and forces the R0-miss inline
+    log-falsi (R1) + fb_fix fallback."""
+    num_rows, N = logits.shape
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    if hint == "real":
+        noised = logits.float() + 0.15 * torch.randn(num_rows, N, generator=g, device="cuda")
+        pre = noised.topk(top_k, dim=1).indices.int()
+    else:
+        pre = torch.randint(0, N, (num_rows, top_k), generator=g, device="cuda").int()
+    return (pre - 1).contiguous()
+
+
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "dtype,top_k",
+    [
+        (torch.bfloat16, 512),
+        (torch.bfloat16, 1024),
+        (torch.float16, 1024),
+        (torch.float32, 2048),
+    ],
+)
+@pytest.mark.parametrize("N", [8192, 65536])
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("hint", ["real", "rand"])
+@pytest.mark.parametrize("cluster_size", [1, 4, 8])
+def test_cute_dsl_gvr_topk_decode_r0_equivalence(dtype, top_k, N, batch_size, hint, cluster_size):
+    """R0 admission (``enable_r0=True``, the new default) selects the same
+    top-K as the secant baseline (``enable_r0=False``), by index set.
+
+    ``hint='real'`` exercises the R0 admission-hit fast path; ``hint='rand'``
+    forces the R0-miss log-falsi (R1) + fb_fix fallback. ``cluster_size=4``
+    confirms R0 gates to single-CTA and the ``None`` R0 buffers propagate
+    cleanly through the cluster path; ``cluster_size=8`` covers the runner's
+    tiny-grid large-N pick (BS<=4, N>=128K -> cs=8): 7-peer DSMEM
+    aggregation, large-N only (per-CTA slice too short below 64K).
+    """
+    if N < top_k * 2:
+        pytest.skip(f"N ({N}) < 2*top_k ({2 * top_k}): GVR histogram bucket too coarse")
+    if cluster_size == 8 and N < 65536:
+        pytest.skip("cs=8 is a large-N production config (runner picks it only at N >= 131072)")
+
+    num_rows = batch_size  # next_n = 1
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+    logits = (torch.randn(num_rows, N, device="cuda") * 2.0).to(dtype).contiguous()
+    seq_lens = torch.full((num_rows,), N, dtype=torch.int32, device="cuda")
+    pre_idx = _make_r0_pre_idx(logits, top_k, hint, seed=1)
+
+    out_base = _run_gvr_direct(
+        logits, pre_idx, seq_lens, top_k, enable_r0=False, cluster_size=cluster_size
+    )
+    out_r0 = _run_gvr_direct(
+        logits, pre_idx, seq_lens, top_k, enable_r0=True, cluster_size=cluster_size
+    )
+
+    # 1. Both arms independently produce a valid top-K (tie-aware value set).
+    _tie_aware_check(out_base, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
+    _tie_aware_check(out_r0, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
+
+    # 2. Equivalence. fp32 logits are ALMOST tie-free, so R0 and base must
+    #    return the identical index set (order-independent) — but randn
+    #    quantized to fp32 does collide (bs=16, N=8192, seed 0:
+    #    logits[3,2956] == logits[3,4949] bit-exactly, straddling the K=2048
+    #    boundary), and a boundary value-tie makes the arms' distinct index
+    #    picks equally valid. Where the sets differ, require every differing
+    #    index to carry the row's boundary (k-th) value; anything else is a
+    #    real divergence. bf16/fp16 boundary ties are common, so equivalence
+    #    there is the value-set equality already established in step 1
+    #    (both == torch.topk reference).
+    if dtype == torch.float32:
+        _assert_index_sets_equal_tie_aware(out_base, out_r0, logits)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "dtype,top_k,N,batch_size,cluster_size",
+    [
+        # Multi-wave single-CTA grids (batch_size > num_sms): exercises the
+        # occupancy regime where rows alone oversubscribe the device.
+        (torch.bfloat16, 512, 16384, 256, 1),
+        (torch.float32, 2048, 65536, 256, 1),
+        # Multi-wave cluster grid (batch_size * cs > num_sms): DSMEM handoff
+        # correctness across wave boundaries.
+        (torch.bfloat16, 512, 65536, 64, 4),
+    ],
+)
+@pytest.mark.parametrize("hint", ["real", "rand"])
+def test_cute_dsl_gvr_topk_decode_r0_equivalence_bigbs(
+    dtype, top_k, N, batch_size, hint, cluster_size
+):
+    """Big-batch R0-vs-secant equivalence: multi-wave grids only.
+
+    The main equivalence grid tops out at batch_size=16 (single wave).
+    These cells lock R0 + cluster correctness when the grid spans several
+    waves — the throughput-bound regime of the BS-scaling study."""
+    num_rows = batch_size
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+    logits = (torch.randn(num_rows, N, device="cuda") * 2.0).to(dtype).contiguous()
+    seq_lens = torch.full((num_rows,), N, dtype=torch.int32, device="cuda")
+    pre_idx = _make_r0_pre_idx(logits, top_k, hint, seed=1)
+
+    out_base = _run_gvr_direct(
+        logits, pre_idx, seq_lens, top_k, enable_r0=False, cluster_size=cluster_size
+    )
+    out_r0 = _run_gvr_direct(
+        logits, pre_idx, seq_lens, top_k, enable_r0=True, cluster_size=cluster_size
+    )
+    _tie_aware_check(out_base, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
+    _tie_aware_check(out_r0, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
+    if dtype == torch.float32:
+        _assert_index_sets_equal_tie_aware(out_base, out_r0, logits)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "top_k,N,cluster_size",
+    [(512, 16384, 1), (1024, 131072, 4), (2048, 131072, 4)],
+)
+@pytest.mark.parametrize("band", ["sub_resolution", "one_ulp"])
+def test_cute_dsl_gvr_topk_decode_p4_exact_tail_ties(top_k, N, cluster_size, band):
+    """fp32 near-tie adversarial exactness (``p4_exact_tail``).
+
+    The P4 rank-scatter fine recursion resolves candidate values to
+    range/(kNumBins*256); distinct values spaced below that which straddle
+    the top-K boundary land in ONE fine bin and were previously kept in
+    arrival order (observed on real DSv4-Pro 512k-ISL captures as |miss|=1
+    with dv ~ 3e-6). ``sub_resolution`` plants ~2.4k distinct values spaced
+    5e-8 around the boundary; ``one_ulp`` plants a two-value bitwise plateau
+    (``nextafter`` pairs). Both stay within the kC candidate budget (tie
+    sets wider than kC are outside the kernel's contract). The default fp32
+    kernel must return the exact top-K value set; natural random data never
+    triggers this, so the adversarial construction is the only regression
+    coverage."""
+    torch.manual_seed(3)
+    torch.cuda.manual_seed(3)
+    logits = (torch.randn(1, N, device="cuda") * 2.0).float().contiguous()
+    boundary = torch.topk(logits[0], top_k).values[top_k - 1].item()
+    n_tie = 2400 if band == "sub_resolution" else 2000
+    plant = torch.randperm(N)[:n_tie]
+    if band == "sub_resolution":
+        tie_vals = (
+            boundary + (torch.arange(n_tie, dtype=torch.float32, device="cuda") - n_tie // 2) * 5e-8
+        )
+    else:
+        tie_vals = torch.full((n_tie,), boundary, device="cuda")
+        tie_vals[::2] = torch.nextafter(tie_vals[::2], torch.tensor(float("inf"), device="cuda"))
+    logits[0, plant] = tie_vals
+    seq_lens = torch.full((1,), N, dtype=torch.int32, device="cuda")
+    pre_idx = _make_r0_pre_idx(logits, top_k, "real", seed=4)
+
+    out = _run_gvr_direct(
+        logits, pre_idx, seq_lens, top_k, enable_r0=True, cluster_size=cluster_size
+    )
+
+    # Value-multiset exactness (the boundary index set is not unique under
+    # bitwise plateaus, so indices are compared through their values).
+    sel = logits[0][out[0].long()].sort().values
+    ref = torch.topk(logits[0], top_k).values.sort().values
+    torch.testing.assert_close(sel, ref, rtol=0.0, atol=0.0)
+
+
+@skip_not_sm100
+def test_cute_dsl_gvr_topk_decode_pick_config_policy():
+    """``pick_config`` returns the runner-equivalent launch shapes.
+
+    Locks the (BS, N) -> cluster_size map and the BS-aware occupancy knobs
+    (the 2026-07-15 big-BS triage: a config frozen at the BS=1 optimum is
+    geomean 2.27x slower than these picks at BS in {64, 256, 1024})."""
+    sms = 148  # policy is expressed against a fixed SM count for determinism
+    pc = _GvrTopKKernel.pick_config
+
+    # cluster_size policy: N<64K -> 1; tiny grid large-N -> 8; single-wave
+    # -> 4/2; multi-wave -> 1.
+    assert pc(torch.float32, 1, 32768, num_sms=sms)["cluster_size"] == 1
+    assert pc(torch.float32, 2, 131072, num_sms=sms)["cluster_size"] == 8
+    assert pc(torch.float32, 16, 65536, num_sms=sms)["cluster_size"] == 4
+    assert pc(torch.float32, 64, 65536, num_sms=sms)["cluster_size"] == 2
+    assert pc(torch.float32, 256, 65536, num_sms=sms)["cluster_size"] == 1
+
+    # Occupancy knobs at multi-wave BS: T=512 + mbpm>=2 (NOT the BS=1
+    # frozen T=1024/mbpm=1 that loses 2.3-6x at big BS).
+    big = pc(torch.float32, 1024, 65536, num_sms=sms)
+    assert big["num_threads"] == 512 and big["min_blocks_per_mp"] == 2
+    big16 = pc(torch.bfloat16, 1024, 65536, num_sms=sms)
+    assert big16["num_threads"] == 512 and big16["min_blocks_per_mp"] == 3
+
+    # Graph-capture contract: max_seq_len (peak N) overrides the capture N.
+    cap = pc(torch.bfloat16, 1, 8192, max_seq_len=131072, num_sms=sms)
+    assert cap["cluster_size"] == 8  # picked for the replay shape
+
+
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "dtype,top_k,N,batch_size",
+    [
+        (torch.float32, 2048, 32768, 1),  # cs=1 small-N
+        (torch.bfloat16, 512, 65536, 16),  # cs=4 single-wave
+        (torch.float32, 1024, 131072, 2),  # cs=8 tiny grid large-N
+        (torch.bfloat16, 1024, 65536, 256),  # cs=1 multi-wave big-BS
+    ],
+)
+def test_cute_dsl_gvr_topk_decode_launch_autoconfig(dtype, top_k, N, batch_size):
+    """``GvrTopKKernel.launch`` (pick_config + variant cache) produces a
+    valid top-K at every launch-shape regime the policy can pick, including
+    cluster_size=8. Direct-drive users get production-equivalent shapes."""
+    num_rows = batch_size
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+    logits = (torch.randn(num_rows, N, device="cuda") * 2.0).to(dtype).contiguous()
+    seq_lens = torch.full((num_rows,), N, dtype=torch.int32, device="cuda")
+    pre_idx = _make_r0_pre_idx(logits, top_k, "real", seed=1)
+    out = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+
+    _GvrTopKKernel.launch(logits, pre_idx, seq_lens, out, top_k)
+    torch.cuda.synchronize()
+    _tie_aware_check(out, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
+
+    # Override path: forcing the secant arm through launch() must also be a
+    # valid top-K and (fp32, tie-free) the identical index set.
+    out_sec = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    _GvrTopKKernel.launch(logits, pre_idx, seq_lens, out_sec, top_k, enable_r0=False)
+    torch.cuda.synchronize()
+    _tie_aware_check(out_sec, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
+    if dtype == torch.float32:
+        assert torch.equal(out.sort(dim=-1).values, out_sec.sort(dim=-1).values)

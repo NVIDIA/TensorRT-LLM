@@ -24,7 +24,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm._utils import local_mpi_rank, mpi_barrier, mpi_rank
+from tensorrt_llm._utils import local_mpi_rank, mpi_barrier, mpi_comm, mpi_rank
 
 from .backend import MoeBackendType
 
@@ -65,14 +65,23 @@ def _get_free_tcp_port() -> int:
 
 def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> None:
     """Initialize the torch.distributed NCCL ProcessGroup for MegaMoE."""
-    if moe_backend.upper() != MoeBackendType.MEGAMOE_DEEPGEMM.value:
+    if moe_backend.upper() not in (
+        MoeBackendType.MEGAMOE_DEEPGEMM.value,
+        MoeBackendType.MEGAMOE_CUTEDSL.value,
+    ):
         return
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required for MegaMoE backend")
     if dist.is_initialized():
         return
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", str(_get_free_tcp_port()))
+    rendezvous = None
+    if rank == 0:
+        master_addr = os.environ.get("MASTER_ADDR") or "127.0.0.1"
+        master_port = os.environ.get("MASTER_PORT") or str(_get_free_tcp_port())
+        rendezvous = (master_addr, master_port)
+    master_addr, master_port = mpi_comm().bcast(rendezvous, root=0)
+    os.environ["MASTER_ADDR"] = str(master_addr)
+    os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(local_mpi_rank())

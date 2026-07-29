@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -39,6 +39,7 @@ add_custom_target(google-tests)
 
 function(add_gtest test_name test_src)
   set(options NO_GTEST_MAIN NO_TLLM_LINKAGE)
+  set(oneValueArgs TIMEOUT)
   cmake_parse_arguments(ARGS "${options}" "${oneValueArgs}" "${multiValueArgs}"
                         ${ARGN})
   add_executable(${test_name} ${test_src})
@@ -61,12 +62,19 @@ function(add_gtest test_name test_src)
   target_compile_definitions(${test_name}
                              PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
+  set(test_properties ENVIRONMENT "CUDA_MODULE_LOADING=LAZY")
+  if(ARGS_TIMEOUT)
+    list(APPEND test_properties TIMEOUT "${ARGS_TIMEOUT}")
+  endif()
+
   gtest_discover_tests(
     ${test_name}
-    PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY" DISCOVERY_MODE
+    PROPERTIES ${test_properties}
+               DISCOVERY_MODE
                PRE_TEST # WAR for DLL discovery on windows.
-               DISCOVERY_TIMEOUT 30) # Longer timeout needed because discovery
-                                     # can be slow on Windows
+               DISCOVERY_TIMEOUT
+               30) # Longer timeout needed because discovery can be slow on
+                   # Windows
   add_dependencies(google-tests ${test_name})
 endfunction()
 

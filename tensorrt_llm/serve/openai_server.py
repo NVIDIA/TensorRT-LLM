@@ -35,6 +35,7 @@ from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
+from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import BaseMediaIO
@@ -492,13 +493,21 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.tokenizer.tokenizer, "name_or_path", None) or getattr(
                     self.tokenizer, "name_or_path", None)
         trust_remote_code = self.generator.args.trust_remote_code
-        try:
-            self.processor = AutoProcessor.from_pretrained(
-                hf_tokenizer_path, trust_remote_code=trust_remote_code)
-        except Exception:
-            logger.debug("Failed to load AutoProcessor or AutoConfig for %s",
-                         hf_tokenizer_path)
+        checkpoint_format = getattr(self.generator.args, "checkpoint_format",
+                                    None)
+        if checkpoint_format in ("mistral", "mistral_large_3"):
+            # Do not load HF processor for mistral native checkpoints
+            # even if it is available
             self.processor = None
+        else:
+            try:
+                self.processor = AutoProcessor.from_pretrained(
+                    hf_tokenizer_path, trust_remote_code=trust_remote_code)
+            except Exception:
+                logger.debug(
+                    "Failed to load AutoProcessor or AutoConfig for %s",
+                    hf_tokenizer_path)
+                self.processor = None
 
         # load model config
         try:
@@ -1547,7 +1556,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
@@ -1556,7 +1566,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                )
 
             # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
             if request.prompt_token_ids is None and request.prompt_token_ids_b64:
@@ -1643,6 +1654,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 cache_salt=request.cache_salt,
                 trace_headers=trace_headers,
                 scheduling_params=scheduling_params,
+                priority=request.priority
+                if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -1735,7 +1748,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
@@ -1744,7 +1758,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                )
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
@@ -1971,7 +1986,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
                     conversation_params=conversation_params,
-                    trace_headers=trace_headers)
+                    trace_headers=trace_headers,
+                    priority=request.priority if request.priority is not None
+                    else DEFAULT_REQUEST_PRIORITY)
                 asyncio.create_task(
                     self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
@@ -2116,6 +2133,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 disaggregated_params=disaggregated_params,
                 conversation_params=conversation_params,
                 trace_headers=trace_headers,
+                priority=request.priority
+                if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
             if not self.postproc_worker_enabled:
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
