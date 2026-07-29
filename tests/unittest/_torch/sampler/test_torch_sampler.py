@@ -47,6 +47,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _request_get_sampling_params,
     _request_strategy,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     GREEDY,
     BeamSearch,
@@ -876,11 +877,9 @@ class TestFinishReasons:
         @contextmanager
         def raising_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
+                patch_ctx.setattr(FinishReasonsHandler, "_are_stop_words", stop_words_that_raises)
                 patch_ctx.setattr(
-                    TorchSampler.FinishReasonsHandler, "_are_stop_words", stop_words_that_raises
-                )
-                patch_ctx.setattr(
-                    TorchSampler.FinishReasonsHandler,
+                    FinishReasonsHandler,
                     "_are_stop_words_single_token",
                     stop_words_that_raises,
                 )
@@ -932,7 +931,7 @@ class TestFinishReasons:
         def raising_single_token_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
                 patch_ctx.setattr(
-                    TorchSampler.FinishReasonsHandler,
+                    FinishReasonsHandler,
                     "_are_stop_words_single_token",
                     stop_words_that_raises,
                 )
