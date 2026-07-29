@@ -42,7 +42,7 @@ Non-CBTS stages get an empty `.coveragerc` and run uninstrumented.
 
 ## Output
 
-- Per-process `.cbtscov.<stage>.<host>.pid<N>.X<rand>.sqlite` files ride back in the standard `results-<stage>.tar.gz` under `cbts/`. Riding inside a compressed tarball keeps their plaintext product paths away from the artifact guardword/secret scanner, which byte-matches raw files but does not recurse into archives.
+- Per-process `.cbtscov.<stage>.<host>.X<rand>.pid<N>.sqlite` files ride back in the standard `results-<stage>.tar.gz` under `cbts/`. Riding inside a compressed tarball keeps their plaintext product paths away from the artifact guardword/secret scanner, which byte-matches raw files but does not recurse into archives.
 - `L0_MergeRequest.groovy`'s Test Coverage stage merges all stages' files via `pystart_report.py` and uploads one tarball to `${UPLOAD_PATH}/cbts-coverage/`:
   - `cbts_pystart_report.tar.gz` — contains `cbts_touchmap.sqlite` (indexed touch DB / selector artifact, with a `meta` table holding the coverage rate) and `cbts_report/` (the split HTML report; open `cbts_report/index.html` after extracting). Bundled compressed so the touch DB's plaintext paths never reach the guardword scanner.
 

@@ -46,7 +46,9 @@ class PyStartTracker:
         return _MON is not None and bool(self.source_roots)
 
     def _new_suffix(self):
-        self._suffix = f"{socket.gethostname()}.pid{os.getpid()}.X{secrets.token_urlsafe(6)}"
+        # No pid here: save() adds the live pid, so a forked child writes to a distinct file without
+        # an os.register_at_fork handler (which is unsafe to run in an MPI/UCX/Ray process's fork).
+        self._suffix = f"{socket.gethostname()}.X{secrets.token_urlsafe(6)}"
 
     def _in_source(self, filename):
         if not filename or filename[0] == "<":
@@ -89,23 +91,7 @@ class PyStartTracker:
                 pass
             return False
         self._active = True
-        try:
-            os.register_at_fork(after_in_child=self._after_fork_child)
-        except (AttributeError, ValueError):
-            pass
         return True
-
-    def _after_fork_child(self):
-        # The child writes its own data file and rediscovers what it runs.
-        self._new_suffix()
-        self._data = {}
-        self._outcomes = {}
-        self._expected = {}
-        if self._active:
-            try:
-                _MON.restart_events()
-            except Exception:
-                pass
 
     def switch_test_context(self, nodeid):
         self._ctx = nodeid or ""
@@ -132,7 +118,9 @@ class PyStartTracker:
         # shared temp file (a concurrent os.remove(tmp) mid-write surfaces as a sqlite disk I/O error).
         with self._save_lock:
             os.makedirs(self.data_dir, exist_ok=True)
-            path = os.path.join(self.data_dir, f".cbtscov.{self.stage}.{self._suffix}.sqlite")
+            path = os.path.join(
+                self.data_dir, f".cbtscov.{self.stage}.{self._suffix}.pid{os.getpid()}.sqlite"
+            )
             tmp = path + ".tmp"
             if os.path.exists(tmp):
                 os.remove(tmp)
