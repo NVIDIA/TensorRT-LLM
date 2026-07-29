@@ -5084,6 +5084,9 @@ def launchTestJobs(pipeline, testFilter)
     // mapping between test names and Jenkins stage names. Any changes to this syntax
     // may break the mapping functionality.
 
+    // [TEST] Only doc build for fast testing. Revert before merge.
+    x86TestConfigs = [:]
+    /*
     x86TestConfigs = [
         "CPU-Generic-x86-1": ["cpu", "l0_cpu_x86", 1, 1],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
@@ -5133,6 +5136,7 @@ def launchTestJobs(pipeline, testFilter)
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
+    */ // [/TEST]
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), { attemptTag, isFinalAttempt, retryContext = null ->
@@ -5147,6 +5151,11 @@ def launchTestJobs(pipeline, testFilter)
     }]]}
     fullSet = parallelJobs.keySet()
 
+    // [TEST] Keep only one multi-GPU stage to trigger marker. Revert before merge.
+    x86SlurmTestConfigs = [
+        "DGX_H100-4_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
+    ]
+    /*
     x86SlurmTestConfigs = [
         "DGX_H100-PyTorch-1": ["auto:dgx-h100-x1", "l0_h100", 1, 6],
         "DGX_H100-PyTorch-2": ["auto:dgx-h100-x1", "l0_h100", 2, 6],
@@ -5236,6 +5245,7 @@ def launchTestJobs(pipeline, testFilter)
         16,
         2
     )
+    */ // [/TEST]
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
 

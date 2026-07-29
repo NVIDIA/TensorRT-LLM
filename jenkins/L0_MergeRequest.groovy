@@ -666,7 +666,8 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
     }
     def prNumber = prMatch[0][1]
 
-    def result = trtllm_utils.validatePRLabelApproval(pipeline, prNumber, "ci: full pre-merge approved")
+    // [TEST] Temporarily use trt-llm-infra-devs for testing. Revert to default before merge.
+    def result = trtllm_utils.validatePRLabelApproval(pipeline, prNumber, "ci: full pre-merge approved", "trt-llm-infra-devs")
     if (!result.checkCompleted) {
         // API error — fail-open: do not block CI if the label check itself fails
         echo "[requireMultiGpuApprovalLabel] Label validation incomplete (${result.error}). Failing open."
@@ -685,9 +686,9 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
         "</span>"
     def reason = !result.labelExists
         ? "label 'ci: full pre-merge approved' is not present on this PR"
-        : "label 'ci: full pre-merge approved' was applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
+        : "label 'ci: full pre-merge approved' was applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-infra-devs"
     def blockMsg = "${arch} Multi-GPU tests blocked: ${reason}. " +
-         "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, then re-trigger CI."
+         "Ask a member of NVIDIA/trt-llm-infra-devs to add the label, then re-trigger CI."
     echo "[requireMultiGpuApprovalLabel] ${blockMsg}"
     return blockMsg
 }
