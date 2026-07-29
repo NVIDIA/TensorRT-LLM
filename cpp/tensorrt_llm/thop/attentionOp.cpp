@@ -1062,8 +1062,7 @@ static std::shared_ptr<AttentionOp> get_attention_op(
     std::unique_lock<std::shared_mutex> lock{op_cache_mutex};
     op->initialize();
     runner->prepare(*op);
-    auto [iter, is_inserted] = op_cache.try_emplace(cache_key, op);
-    (void) is_inserted;
+    auto [iter, _] = op_cache.try_emplace(cache_key, op);
     return iter->second;
 }
 
