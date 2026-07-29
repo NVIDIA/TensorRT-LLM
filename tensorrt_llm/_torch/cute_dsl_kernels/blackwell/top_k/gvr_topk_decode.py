@@ -2539,11 +2539,7 @@ class GvrTopKKernel:
             fdw = cutlass.const_expr(256 // self.num_warps)
             wsum2 = cutlass.Int32(0)
             for jd in cutlass.range_constexpr(fdw):
-                dix = (
-                    cutlass.Int32(255)
-                    - warp_id * cutlass.Int32(fdw)
-                    - cutlass.Int32(jd)
-                )
+                dix = cutlass.Int32(255) - warp_id * cutlass.Int32(fdw) - cutlass.Int32(jd)
                 wsum2 = wsum2 + smem_hist[dix]
             if lane == cutlass.Int32(0):
                 smem_wcnt[warp_id] = wsum2
@@ -2574,11 +2570,7 @@ class GvrTopKKernel:
                 above_d = pre4
                 sd4 = cutlass.Int32(0)
                 for jd2 in cutlass.range_constexpr(fdw):
-                    dix2 = (
-                        cutlass.Int32(255)
-                        - tw4 * cutlass.Int32(fdw)
-                        - cutlass.Int32(jd2)
-                    )
+                    dix2 = cutlass.Int32(255) - tw4 * cutlass.Int32(fdw) - cutlass.Int32(jd2)
                     ra4 = base4
                     base4 = base4 + smem_hist[dix2]
                     if base4 >= needl2 and sd4 == cutlass.Int32(0):
@@ -4778,8 +4770,7 @@ class GvrTopKKernel:
         is_fp32 = torch_dtype == torch.float32
         # T=1024 needs a 1 CTA/SM grid AND enough per-CTA vec work.
         n_thresh_t = 131072 if (graph_capture and not is_fp32) else 65536
-        num_threads = 1024 if (num_rows <= num_sms
-                               and n_per_cta >= n_thresh_t) else 512
+        num_threads = 1024 if (num_rows <= num_sms and n_per_cta >= n_thresh_t) else 512
         # V=256-bit only helps fp32 at large N; half-prec cvt doubles reg
         # pressure. Requires a 32B-aligned contiguous tensor (see the
         # shell-divergence note above).
