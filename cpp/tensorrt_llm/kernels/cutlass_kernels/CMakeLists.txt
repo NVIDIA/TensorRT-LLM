@@ -28,17 +28,6 @@ if(NOT Python3_EXECUTABLE)
 endif()
 
 set(cutlass_source_dir ${CMAKE_BINARY_DIR}/_deps/cutlass-src)
-execute_process(
-  WORKING_DIRECTORY ${cutlass_source_dir}/python/
-  COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user
-  RESULT_VARIABLE _CUTLASS_LIBRARY_SUCCESS)
-
-if(NOT _CUTLASS_LIBRARY_SUCCESS EQUAL 0)
-  message(
-    FATAL_ERROR
-      "Failed to set up the CUTLASS library in ${cutlass_source_dir} due to"
-      " ${_CUTLASS_LIBRARY_SUCCESS}.")
-endif()
 
 set(GENERATE_KERNELS_SCRIPT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/python)
 set_directory_properties(
@@ -50,8 +39,10 @@ set(INSTANTIATION_GENERATION_DIR
 
 execute_process(
   WORKING_DIRECTORY ${GENERATE_KERNELS_SCRIPT_DIR}
-  COMMAND ${Python3_EXECUTABLE} generate_kernels.py -a
-          "${CMAKE_CUDA_ARCHITECTURES_ORIG}" -o ${INSTANTIATION_GENERATION_DIR}
+  COMMAND
+    ${CMAKE_COMMAND} -E env "PYTHONPATH=${cutlass_source_dir}/python"
+    ${Python3_EXECUTABLE} generate_kernels.py -a
+    "${CMAKE_CUDA_ARCHITECTURES_ORIG}" -o ${INSTANTIATION_GENERATION_DIR}
   RESULT_VARIABLE _KERNEL_GEN_SUCCESS)
 
 if(NOT _KERNEL_GEN_SUCCESS EQUAL 0)
