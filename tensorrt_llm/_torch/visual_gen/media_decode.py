@@ -31,33 +31,20 @@ import os
 import torch
 
 
-class MediaDecodeError(ValueError):
-    """Client-class failure: the reference itself is unusable.
-
-    Corrupt/undecodable content, unsupported codec, zero frames, or the
-    decode-work limit. Maps to HTTP 400 / a plain ``ValueError`` at the
-    public Python boundary.
-    """
-
-
-class VisualGenCapacityError(RuntimeError):
-    """Capacity-class failure: a valid request does not fit this deployment.
-
-    CUDA/NVDEC allocation or session-init failure. Maps to HTTP 503; never
-    a client error — the input is not malformed.
-    """
-
-
 def classify_worker_error(exc: BaseException) -> str | None:
     """Failure class for the response channel: "client", "capacity", or None.
 
-    Only the two dedicated classes are mapped — a bare ``ValueError`` from a
-    model bug must stay an unclassified runtime failure, not become a 400.
+    Keyed off built-in exception types rather than a VisualGen-specific
+    hierarchy: ``ValueError`` means the request's content was unusable
+    (400), ``MemoryError`` means a valid request did not fit (503), and
+    anything else is an unclassified runtime failure (500). Detail travels
+    in the message. ``torch.cuda.OutOfMemoryError`` is spelled out because
+    it derives from ``RuntimeError``, not ``MemoryError``.
     """
-    if isinstance(exc, MediaDecodeError):
-        return "client"
-    if isinstance(exc, (VisualGenCapacityError, torch.cuda.OutOfMemoryError)):
+    if isinstance(exc, (MemoryError, torch.cuda.OutOfMemoryError)):
         return "capacity"
+    if isinstance(exc, ValueError):
+        return "client"
     return None
 
 
@@ -99,9 +86,9 @@ def synchronize_media_prepare_status(exc: Exception | None) -> None:
     kind, message = payload[0]
     message = f"[rank {failing_rank}] {message}"
     if kind == "client":
-        raise MediaDecodeError(message)
+        raise ValueError(message)
     if kind == "capacity":
-        raise VisualGenCapacityError(message)
+        raise MemoryError(message)
     raise RuntimeError(message)
 
 
@@ -231,7 +218,7 @@ def decode_video_reference_window(
 
     frame_cap = max_reference_decode_frames()
     if frame_cap is not None and keep == "first" and window > frame_cap:
-        raise MediaDecodeError(
+        raise ValueError(
             f"Conditioning window of {window} frames exceeds the reference "
             f"decode limit of {frame_cap} (TRTLLM_MAX_REFERENCE_DECODE_FRAMES)."
         )
@@ -253,7 +240,7 @@ def decode_video_reference_window(
             # readable stream — a content problem, not a capacity one.
             demuxer = nvc.CreateDemuxer(_read)
         except nvc.PyNvVCException as exc:
-            raise MediaDecodeError(
+            raise ValueError(
                 f"Video reference could not be demuxed (corrupt or not a "
                 f"supported container): {exc}"
             ) from exc
@@ -283,7 +270,7 @@ def decode_video_reference_window(
             for packet in demuxer:
                 for frame in decoder.Decode(packet):
                     if frame_cap is not None and count >= frame_cap:
-                        raise MediaDecodeError(
+                        raise ValueError(
                             f"Video reference exceeds the decode limit of "
                             f"{frame_cap} frames "
                             f"(TRTLLM_MAX_REFERENCE_DECODE_FRAMES); trim the "
@@ -301,18 +288,18 @@ def decode_video_reference_window(
                 if keep == "first" and count >= window:
                     break
         except torch.cuda.OutOfMemoryError as exc:
-            raise VisualGenCapacityError(
+            raise MemoryError(
                 f"Out of device memory while decoding the video reference "
                 f"({window} frames @ {target_w}x{target_h} retained): {exc}"
             ) from exc
         except nvc.PyNvVCException as exc:
-            raise MediaDecodeError(
+            raise ValueError(
                 f"Video reference failed to decode (corrupt or unsupported "
                 f"stream for this deployment's decoder): {exc}"
             ) from exc
 
         if count == 0:
-            raise MediaDecodeError(
+            raise ValueError(
                 "Video reference contains no decodable frames; the payload "
                 "may be corrupt or use an unsupported codec."
             )

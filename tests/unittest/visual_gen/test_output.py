@@ -796,24 +796,19 @@ def test_media_output_unimportable():
     "error_type, expected",
     [
         ("client", ValueError),
-        ("capacity", "capacity"),  # resolved below; avoids a module-level import
+        ("capacity", MemoryError),
         (None, RuntimeError),
     ],
     ids=["client", "capacity", "unclassified"],
 )
 def test_single_prompt_failure_raises_by_error_class(error_type, expected):
-    """The worker's failure class survives to the public API.
+    """The worker's failure class survives to the public API as a built-in.
 
-    ``VisualGenCapacityError`` subclasses ``RuntimeError``, so these assert the
-    *exact* type — otherwise the unclassified case would pass for a capacity
-    failure and the distinction the routes rely on (400 vs 503) would be
-    untested.
+    Asserts the *exact* type: the routes map these three to 400 / 503 / 500,
+    so a subclass relationship creeping back in would silently collapse two
+    of the cases into one.
     """
-    from tensorrt_llm._torch.visual_gen.media_decode import VisualGenCapacityError
     from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
-
-    if expected == "capacity":
-        expected = VisualGenCapacityError
 
     resp = DiffusionResponse(request_id=20, error_msg="boom", error_type=error_type)
     fx = _FakeExecutor(resp)

@@ -24,7 +24,6 @@ import torch
 from PIL import Image
 
 from tensorrt_llm._torch.visual_gen.media_decode import (
-    MediaDecodeError,
     _lanczos_taps,
     decode_video_reference_window,
     max_reference_decode_frames,
@@ -116,20 +115,17 @@ def _status_protocol_rank(rank: int, world_size: int, init_file: str, results_di
 
     import torch.distributed as dist
 
-    from tensorrt_llm._torch.visual_gen.media_decode import (
-        MediaDecodeError,
-        synchronize_media_prepare_status,
-    )
+    from tensorrt_llm._torch.visual_gen.media_decode import synchronize_media_prepare_status
 
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
     )
     try:
-        local_error = MediaDecodeError("rank-local decode failure") if rank == 1 else None
+        local_error = ValueError("rank-local decode failure") if rank == 1 else None
         try:
             synchronize_media_prepare_status(local_error)
             outcome = "no-error"
-        except MediaDecodeError as exc:
+        except ValueError as exc:
             outcome = f"client:{exc}"
         except Exception as exc:  # pragma: no cover - diagnostic path
             outcome = f"unexpected:{type(exc).__name__}:{exc}"
@@ -140,8 +136,8 @@ def _status_protocol_rank(rank: int, world_size: int, init_file: str, results_di
 
 class TestPrepareStatusProtocol:
     def test_local_failure_is_reraised_without_group(self):
-        err = MediaDecodeError("boom")
-        with pytest.raises(MediaDecodeError, match="boom"):
+        err = ValueError("boom")
+        with pytest.raises(ValueError, match="boom"):
             synchronize_media_prepare_status(err)
 
     def test_success_passes_through_without_group(self):
@@ -243,12 +239,12 @@ class TestDecodeVideoReferenceWindow:
 
     def test_corrupt_bytes_with_valid_magic_is_client_error(self):
         payload = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64
-        with pytest.raises(MediaDecodeError):
+        with pytest.raises(ValueError):
             self._decode(payload)
 
     def test_frame_limit_trips_on_emitted_frames(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_MAX_REFERENCE_DECODE_FRAMES", "4")
-        with pytest.raises(MediaDecodeError, match="decode limit"):
+        with pytest.raises(ValueError, match="decode limit"):
             self._decode(_MP4.read_bytes(), keep="last")
 
     def test_frame_limit_disabled(self, monkeypatch):

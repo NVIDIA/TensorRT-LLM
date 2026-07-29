@@ -24,7 +24,6 @@ from fastapi import Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import ValidationError
 
-from tensorrt_llm._torch.visual_gen.media_decode import VisualGenCapacityError
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
@@ -125,7 +124,7 @@ class _VideoRoutesMixin:
             except ValueError as exc:
                 logger.error(f"Video request error: {exc}")
                 return self.create_error_response(str(exc), status_code=HTTPStatus.BAD_REQUEST)
-            except VisualGenCapacityError as exc:
+            except MemoryError as exc:
                 # Valid request that does not fit this deployment (decode /
                 # allocation capacity) — a server condition, not client error.
                 logger.error(f"Video request capacity error: {exc}")

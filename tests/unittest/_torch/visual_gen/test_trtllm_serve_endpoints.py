@@ -134,6 +134,7 @@ class MockVisualGen:
         should_fail: bool = False,
         batch_aware: bool = True,
         validation_error: Optional[ValueError] = None,
+        generate_error: Optional[BaseException] = None,
     ):
         from types import SimpleNamespace
 
@@ -143,6 +144,9 @@ class MockVisualGen:
         self._should_fail = should_fail
         self._batch_aware = batch_aware
         self._validation_error = validation_error
+        # Raised out of generate(): models an engine-side failure class,
+        # where validation_error models a coordinator preflight rejection.
+        self._generate_error = generate_error
         self._healthy = True
         self._req_counter = 0
         # Captured arguments of the most recent generate / generate_async call,
@@ -187,6 +191,8 @@ class MockVisualGen:
         self.last_params = params
         if self._validation_error is not None:
             raise self._validation_error
+        if self._generate_error is not None:
+            raise self._generate_error
         if self._should_fail:
             raise RuntimeError("Generation intentionally failed")
         n = getattr(params, "num_images_per_prompt", 1) if params else 1
@@ -912,6 +918,43 @@ class TestVideoGenerationSync:
         )
         assert resp.status_code == 500
         os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    def test_sync_video_capacity_failure_is_503(self, tmp_path, monkeypatch):
+        """A valid request the deployment cannot fit is retryable (503).
+
+        The engine signals capacity with ``MemoryError`` — a built-in, so the
+        error contract carries no VisualGen-specific exception type — and the
+        route must not fold it into the generic 500.
+        """
+        gen = MockVisualGen(
+            generate_error=MemoryError("Out of device memory while preparing generation")
+        )
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        client = _create_server(gen)
+        resp = client.post(
+            "/v1/videos/generations",
+            json={"prompt": "big", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 503
+        assert "Out of device memory" in resp.text
+
+    def test_sync_video_client_failure_is_400(self, tmp_path, monkeypatch):
+        """Engine-side client errors stay 400, distinct from capacity.
+
+        The detail rides in the message — that is what a primitive exception
+        type buys instead of a taxonomy — so it must reach the client.
+        """
+        gen = MockVisualGen(generate_error=ValueError("reference has no decodable frames"))
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        client = _create_server(gen)
+        resp = client.post(
+            "/v1/videos/generations",
+            json={"prompt": "bad ref", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 400
+        assert "no decodable frames" in resp.text
 
     def test_sync_video_unsupported_content_type(self, video_client):
         resp = video_client.post(

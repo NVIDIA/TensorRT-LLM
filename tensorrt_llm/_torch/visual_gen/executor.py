@@ -257,8 +257,8 @@ class DiffusionResponse:
         error_type: Failure class when ``error_msg`` is set: ``"client"``
             (unusable request content → 400 / ``ValueError``), ``"capacity"``
             (valid request does not fit the deployment → 503 /
-            ``RuntimeError``), or ``None`` for unclassified runtime failures
-            (500).
+            ``MemoryError``), or ``None`` for unclassified runtime failures
+            (500 / ``RuntimeError``).
         generation: Wall-clock time the executor measured around the
             engine's inference call (host ``time.perf_counter()``), in
             seconds. Default ``0.0`` so the dataclass round-trips through

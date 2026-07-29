@@ -51,6 +51,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
     Cosmos3OmniMoTPipeline,
     _condition_pixel_frame_count,
+    _load_reference_image,
     _normalize_condition_video_latent_indexes,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -564,6 +565,42 @@ class TestCosmos3V2VConditioningParams:
     def test_invalid_condition_video_keep_raises(self):
         with pytest.raises(ValueError, match="first or last"):
             _normalize_condition_video_keep("middle")
+
+
+class TestReferenceImageLoad:
+    """The worker's image load is the acceptance check for an I2V reference.
+
+    The serve boundary only routes on the container signature, so unreadable
+    content has to surface here as a client error (``ValueError`` → 400) and
+    not as a server fault.
+    """
+
+    def test_truncated_image_is_a_client_error(self, tmp_path):
+        # Incompressible content, so half the file is genuinely half the image.
+        noise = PIL.Image.frombytes("RGB", (64, 64), os.urandom(64 * 64 * 3))
+        whole = tmp_path / "whole.png"
+        noise.save(whole, format="PNG")
+        data = whole.read_bytes()
+        path = tmp_path / "truncated.png"
+        path.write_bytes(data[: len(data) // 2])
+
+        with pytest.raises(ValueError, match="could not be decoded"):
+            _load_reference_image(str(path))
+
+    def test_unidentifiable_content_is_a_client_error(self, tmp_path):
+        path = tmp_path / "notreally.png"
+        path.write_bytes(b"not an image at all")
+        with pytest.raises(ValueError, match="could not be decoded"):
+            _load_reference_image(str(path))
+
+    def test_missing_file_is_a_client_error(self, tmp_path):
+        with pytest.raises(ValueError, match="could not be decoded"):
+            _load_reference_image(str(tmp_path / "nope.png"))
+
+    def test_valid_image_loads(self, tmp_path):
+        path = tmp_path / "ok.png"
+        PIL.Image.new("RGB", (8, 8), (1, 2, 3)).save(path, format="PNG")
+        assert _load_reference_image(str(path)).size == (8, 8)
 
 
 _V2V_FIXTURE_MP4 = Path(__file__).parent / "test_data" / "cosmos3_v2v_ref_9f_bframes.mp4"

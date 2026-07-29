@@ -51,12 +51,12 @@ class VisualGenResult:
     A single instance backs both single-prompt and batch-prompt requests:
 
     - Single prompt: ``await handle`` resolves to a :class:`VisualGenOutput`.
-      Underlying-request failure raises by failure class:
-      :class:`ValueError` for client errors (unusable request content — an
-      undecodable media reference, out-of-range conditioning),
-      ``VisualGenCapacityError`` for capacity failures (a valid request that
-      does not fit this deployment), and :class:`RuntimeError` for anything
-      unclassified.
+      Underlying-request failure raises a built-in exception carrying the
+      detail in its message: :class:`ValueError` for client errors (unusable
+      request content — an undecodable media reference, out-of-range
+      conditioning), :class:`MemoryError` for capacity failures (a valid
+      request that does not fit this deployment), and :class:`RuntimeError`
+      for anything unclassified.
     - Batch prompt: ``await handle`` resolves to ``List[VisualGenOutput]``.
       Per-item or whole-batch failure never raises; failed items carry
       ``error != None`` (Option B semantics).
@@ -97,7 +97,7 @@ class VisualGenResult:
 
         For single-prompt requests, returns a :class:`VisualGenOutput`.
         Underlying-request failure raises :class:`ValueError` (client),
-        ``VisualGenCapacityError`` (capacity), or :class:`RuntimeError`
+        :class:`MemoryError` (capacity), or :class:`RuntimeError`
         (unclassified) — see the class docstring.
 
         For batch-prompt requests, returns ``List[VisualGenOutput]``. Never
@@ -171,14 +171,13 @@ class VisualGenResult:
         return split_visual_gen_output(response, self._batch_size)
 
     def _resolved_value(self):
-        # For single prompts, surface engine-side failure typed by class:
-        # worker-classified client errors (unusable reference content,
-        # conditioning bounds) raise ``ValueError`` — uniform with the
-        # synchronous parameter validation at ``generate_async`` entry —
-        # and capacity failures raise ``RuntimeError``
-        # (``VisualGenCapacityError``), like any unclassified runtime
-        # failure. For batches, return the list as-is so callers iterate
-        # per-item ``error``.
+        # For single prompts, surface engine-side failure as a built-in
+        # exception carrying the detail in its message: ``ValueError`` for
+        # client errors (unusable reference content, conditioning bounds) —
+        # uniform with the synchronous parameter validation at
+        # ``generate_async`` entry — ``MemoryError`` for capacity, and
+        # ``RuntimeError`` for anything unclassified. For batches, return the
+        # list as-is so callers iterate per-item ``error``.
         if self._batch_size is None and isinstance(self._resolved, VisualGenOutput):
             if self._resolved.error is not None:
                 message = f"Generation failed: {self._resolved.error}"
@@ -186,9 +185,7 @@ class VisualGenResult:
                 if error_type == "client":
                     raise ValueError(message)
                 if error_type == "capacity":
-                    from tensorrt_llm._torch.visual_gen.media_decode import VisualGenCapacityError
-
-                    raise VisualGenCapacityError(message)
+                    raise MemoryError(message)
                 raise RuntimeError(message)
         return self._resolved
 
@@ -347,9 +344,13 @@ class VisualGen:
             prompts, ``List[VisualGenOutput]`` of the same length.
 
         Raises:
-            RuntimeError: Single-prompt path on underlying-request failure.
-                The batch path never raises on per-item or whole-batch
-                failure; failed items carry ``error != None``.
+            ValueError: Single-prompt path, client-class failure (unusable
+                request content).
+            MemoryError: Single-prompt path, capacity failure (a valid
+                request that does not fit this deployment).
+            RuntimeError: Single-prompt path, any unclassified failure. The
+                batch path never raises on per-item or whole-batch failure;
+                failed items carry ``error != None``.
             NotImplementedError: ``params`` is a list (per-item parameters
                 are not yet supported).
         """

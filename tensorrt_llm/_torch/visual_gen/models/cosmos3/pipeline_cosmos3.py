@@ -27,7 +27,6 @@ from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
 
 from tensorrt_llm._torch.visual_gen.media_decode import (
-    MediaDecodeError,
     decode_video_reference_window,
     synchronize_media_prepare_status,
 )
@@ -71,6 +70,24 @@ def _condition_pixel_frame_count(
     temporal_compression: int,
 ) -> int:
     return max(condition_video_latent_indexes) * int(temporal_compression) + 1
+
+
+def _load_reference_image(path: str):
+    """Load an I2V reference, reporting unreadable content as a client error.
+
+    The worker's load is the acceptance check — the serve boundary only
+    routes on the container signature — so PIL's ``OSError``
+    (``UnidentifiedImageError`` for a bad header, plain ``OSError`` partway
+    through a truncated file) has to become a ``ValueError`` here, or a bad
+    upload would be reported as a server fault.
+    """
+    try:
+        return load_image(path, format="pil")
+    except OSError as exc:
+        raise ValueError(
+            f"Image reference could not be decoded; it may be truncated, "
+            f"corrupt, or in an unsupported format: {exc}"
+        ) from exc
 
 
 @register_pipeline(
@@ -609,7 +626,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         decode (``decode_video_reference_window``) retains.
         """
         if frames.shape[0] < 1:
-            raise MediaDecodeError("Cosmos3 condition video must contain at least one frame.")
+            raise ValueError("Cosmos3 condition video must contain at least one frame.")
         x = frames.to(torch.float32).div_(255.0).mul_(2.0).sub_(1.0)
         return x.permute(3, 0, 1, 2).unsqueeze(0).contiguous()
 
@@ -674,7 +691,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if out_of_range:
             # Mode-aware bound (num_frames may be a mode-deferred default, so
             # this cannot run at coordinator preflight); client error class.
-            raise MediaDecodeError(
+            raise ValueError(
                 "Cosmos3 condition_video_latent_indexes contains indexes outside the latent video: "
                 f"indexes={indexes}, latent_frames={T_lat}."
             )
@@ -921,21 +938,29 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         velocity_mask = None
 
         if image is not None:
-            if isinstance(image, str):
-                image = load_image(image, format="pil")
+            prepare_error: Optional[Exception] = None
+            try:
+                if isinstance(image, str):
+                    image = _load_reference_image(image)
 
-            if isinstance(image, PIL.Image.Image):
-                image = image.convert("RGB")
-                image = self._resize_and_center_crop_image(image, height=height, width=width)
-                image = self.video_processor.preprocess(
-                    image,
-                    height=height,
-                    width=width,
+                if isinstance(image, PIL.Image.Image):
+                    image = image.convert("RGB")
+                    image = self._resize_and_center_crop_image(image, height=height, width=width)
+                    image = self.video_processor.preprocess(
+                        image,
+                        height=height,
+                        width=width,
+                    )
+
+                latents, velocity_mask, image_latent = self._prepare_latents_i2v(
+                    image, height=height, width=width, num_frames=num_frames, generator=generator
                 )
-
-            latents, velocity_mask, image_latent = self._prepare_latents_i2v(
-                image, height=height, width=width, num_frames=num_frames, generator=generator
-            )
+            except Exception as exc:
+                prepare_error = exc
+            # Same convergence as the V2V branch: every rank loads the image
+            # independently, so a rank that failed while others entered the
+            # transformer's collectives would hang the job.
+            synchronize_media_prepare_status(prepare_error)
         elif video is not None:
             prepare_error: Optional[Exception] = None
             try:
@@ -950,7 +975,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
                 out_of_range = [i for i in condition_video_latent_indexes if i >= num_latent_frames]
                 if out_of_range:
-                    raise MediaDecodeError(
+                    raise ValueError(
                         f"Cosmos3 condition_video_latent_indexes {out_of_range} are out "
                         f"of range for a {num_frames}-frame output "
                         f"({num_latent_frames} latent frames)."
@@ -968,7 +993,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                         device=self.device,
                     )
                 else:
-                    raise MediaDecodeError(
+                    raise ValueError(
                         "Cosmos3 V2V reference must be encoded MP4/AVI bytes "
                         f"(the 'video' extra-param contract), got "
                         f"{type(video).__name__}."
