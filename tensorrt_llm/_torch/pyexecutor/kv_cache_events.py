@@ -152,7 +152,8 @@ class ZmqEventPublisher(EventPublisher):
         self._shutdown_lock = threading.Lock()
         self.enqueued_batches = 0
         self.published_batches = 0
-        self.dropped_batches = 0
+        self._queue_full_drops = 0
+        self._send_error_drops = 0
         self._socket_setup()
         self._thread = threading.Thread(
             target=self._publisher_thread,
@@ -165,6 +166,13 @@ class ZmqEventPublisher(EventPublisher):
             f"endpoint={self._endpoint} topic={topic!r}"
         )
 
+    @property
+    def dropped_batches(self) -> int:
+        # Two independent writers: the scheduler thread bumps _queue_full_drops
+        # (queue full) and the publisher thread bumps _send_error_drops (send
+        # failure). Each counter has a single writer, so the sum needs no lock.
+        return self._queue_full_drops + self._send_error_drops
+
     def publish(self, events: EventBatch) -> bool:
         if not self._running:
             return False
@@ -175,10 +183,9 @@ class ZmqEventPublisher(EventPublisher):
             self.enqueued_batches += 1
             return True
         except queue.Full:
-            self.dropped_batches += 1
-            if self.dropped_batches == 1 or (
-                self.dropped_batches & (self.dropped_batches - 1) == 0
-            ):
+            self._queue_full_drops += 1
+            drops = self._queue_full_drops
+            if drops == 1 or (drops & (drops - 1) == 0):
                 logger.warning(
                     f"Dropping native KV event batch on rank={self._rank} because "
                     "the publisher queue is full; "
@@ -212,16 +219,15 @@ class ZmqEventPublisher(EventPublisher):
     def _socket_setup(self) -> None:
         self._pub = self._ctx.socket(zmq.PUB)
         self._pub.set_hwm(self._hwm)
-        if self._endpoint is None:
+        if not self._endpoint:
             raise ValueError("KV event publisher endpoint must not be empty")
-        if (
-            "*" in self._endpoint
-            or "::" in self._endpoint
-            or self._endpoint.startswith(("ipc://", "inproc://"))
-        ):
-            self._pub.bind(self._endpoint)
-        else:
-            self._pub.connect(self._endpoint)
+        if not self._endpoint.startswith(("tcp://", "ipc://", "inproc://")):
+            raise ValueError(f"Unsupported KV event endpoint scheme: {self._endpoint!r}")
+        # The publisher owns its endpoint and subscribers connect to it, so the
+        # PUB socket always binds -- including explicit-host TCP binds like
+        # tcp://0.0.0.0:5557 that the previous '*'-only heuristic wrongly
+        # treated as connect targets (silently dropping every event).
+        self._pub.bind(self._endpoint)
 
         if self._replay_endpoint is not None:
             self._replay = self._ctx.socket(zmq.ROUTER)
@@ -257,7 +263,7 @@ class ZmqEventPublisher(EventPublisher):
                     self._buffer.append((seq, payload))
                     self.published_batches += 1
                 except Exception:
-                    self.dropped_batches += 1
+                    self._send_error_drops += 1
                     logger.exception(
                         f"Failed to publish native KV event batch rank={self._rank} seq={seq}"
                     )
@@ -295,7 +301,8 @@ class ZmqEventPublisher(EventPublisher):
         """Apply vLLM's base-port-plus-rank endpoint convention."""
         if not endpoint or data_parallel_rank == 0:
             return endpoint
-        if "inproc" in endpoint:
+        # ipc/inproc have no port; give each rank a distinct suffix instead.
+        if "inproc" in endpoint or "ipc" in endpoint:
             return f"{endpoint}_dp{data_parallel_rank}"
         if "tcp" in endpoint and ":" in endpoint:
             last_colon_idx = endpoint.rfind(":")
@@ -307,7 +314,7 @@ class ZmqEventPublisher(EventPublisher):
                     f"KV event endpoint port exceeds 65535 for rank {data_parallel_rank}"
                 )
             return f"{base_addr}:{new_port}"
-        raise ValueError("Invalid endpoint: must contain 'inproc' or 'tcp'")
+        raise ValueError("Invalid endpoint: must contain 'inproc', 'ipc', or 'tcp'")
 
 
 def create_event_publisher(config: KVEventsConfig, data_parallel_rank: int) -> EventPublisher:
@@ -490,6 +497,8 @@ class NativeKVCacheEventManager:
         return block_hash, parent_hash, _NativeStoredBlockState(block_hash)
 
     def add_removed_event(self, block_hashes: Any) -> None:
+        if self._closed:
+            return
         if isinstance(block_hashes, (bytes, str, int)):
             block_hashes = (block_hashes,)
         removed_hashes: list[ExternalBlockHash] = []
@@ -502,6 +511,8 @@ class NativeKVCacheEventManager:
         self._add_removed_hashes(removed_hashes)
 
     def add_removed_life_cycle_event(self, block_hash: bytes, life_cycle_id: int) -> None:
+        if self._closed:
+            return
         if int(life_cycle_id) != self._target_life_cycle_id:
             self.non_target_life_cycles_ignored += 1
             return
@@ -512,11 +523,11 @@ class NativeKVCacheEventManager:
     def _add_removed_hashes(self, block_hashes: list[ExternalBlockHash]) -> None:
         if not block_hashes:
             return
-        # Removals are never dropped by the per-iteration cap: each hash was
-        # already reported as stored, so dropping its removal would leave the
-        # consumer believing the block is resident forever. They are bounded by
-        # the previously-stored set, so they cannot run away.
-        self._pending_entries += len(block_hashes)
+        # Removals are never dropped by the per-iteration cap and, unlike stores,
+        # do not consume the _pending_entries budget: each hash was already
+        # reported as stored (so removals are bounded by the stored set), and
+        # counting them against the store budget would starve legitimate
+        # BlockStored events in a removal-heavy iteration.
         if self._pending_events and isinstance(self._pending_events[-1], BlockRemoved):
             self._pending_events[-1].block_hashes.extend(block_hashes)
         else:

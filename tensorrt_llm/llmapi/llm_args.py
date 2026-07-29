@@ -3631,24 +3631,29 @@ class KVEventsConfig(StrictBaseModel):
     )
     endpoint: str = Field(
         default="tcp://*:5557",
-        description="Base ZeroMQ endpoint used to publish KV cache events.")
+        min_length=1,
+        description=
+        "Base ZeroMQ endpoint the publisher binds. Each attention-DP rank binds "
+        "base_port+rank, so co-located engines (e.g. disaggregated prefill and "
+        "decode on one host) must use distinct base ports.")
     replay_endpoint: Optional[str] = Field(
         default=None,
         description=
         "Optional base ZeroMQ endpoint used to replay KV cache events.")
     buffer_steps: int = Field(
         default=10_000,
-        ge=0,
+        gt=0,
         description="Number of previously published batches retained for replay."
     )
     hwm: int = Field(default=100_000,
-                     ge=0,
-                     description="ZeroMQ publisher socket high-water mark.")
+                     gt=0,
+                     description="ZeroMQ publisher socket high-water mark. "
+                     "0 means unlimited in ZeroMQ, so it is disallowed here.")
     max_queue_size: int = Field(
         default=100_000,
-        ge=0,
-        description="Maximum number of batches queued for background publishing."
-    )
+        gt=0,
+        description="Maximum number of batches queued for background publishing. "
+        "Must be positive; 0 would make the queue unbounded.")
     topic: str = Field(
         default="",
         description="ZeroMQ subscription topic used for KV cache event batches."

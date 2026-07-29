@@ -873,6 +873,13 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_events_config is not None and kv_events_config.enable_kv_cache_events
         )
         if native_events_enabled:
+            if self.event_buffer_max_size > 0:
+                logger.warning(
+                    "Both kv_cache_config.event_buffer_max_size and native "
+                    "kv_events_config are enabled; native publishing takes "
+                    "precedence and the legacy get_kv_cache_events() poll path "
+                    "will return no events."
+                )
             if mapping.pp_size > 1:
                 raise ValueError("Native KV events do not support pipeline parallelism")
             if mapping.cp_size > 1:
@@ -1066,30 +1073,41 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
 
+        # The native event manager has already bound its ZMQ socket and started
+        # its background thread, so tear it down if impl construction or
+        # event-manager setup fails here -- otherwise the socket and daemon
+        # thread leak and an in-process retry cannot rebind the same endpoint.
         try:
-            self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
-        except (CuError, KVCacheOutOfMemoryError):
-            if len(cache_tiers) > 1:
-                logger.warning(
-                    "Failed to initialize KV cache manager with host cache "
-                    "tier (cuMemHostRegister may have failed). "
-                    "Retrying without host cache tier."
-                )
-                cache_tiers_gpu_only = [t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)]
-                config = replace(config, cache_tiers=cache_tiers_gpu_only)
-                cache_tiers = cache_tiers_gpu_only
-                self.kv_cache_manager_py_config = config
+            try:
                 self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
-            else:
-                raise
-        if self.event_manager is not None:
-            self.event_manager.set_layer_group_window_sizes(
-                self._get_event_window_sizes_by_layer_group()
-            )
-            self.event_manager.add_created_event(
-                self._get_event_num_blocks_per_cache_level(cache_tiers, tokens_per_block),
-                self._get_event_layer_group_ids(),
-            )
+            except (CuError, KVCacheOutOfMemoryError):
+                if len(cache_tiers) > 1:
+                    logger.warning(
+                        "Failed to initialize KV cache manager with host cache "
+                        "tier (cuMemHostRegister may have failed). "
+                        "Retrying without host cache tier."
+                    )
+                    cache_tiers_gpu_only = [
+                        t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)
+                    ]
+                    config = replace(config, cache_tiers=cache_tiers_gpu_only)
+                    cache_tiers = cache_tiers_gpu_only
+                    self.kv_cache_manager_py_config = config
+                    self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
+                else:
+                    raise
+            if self.event_manager is not None:
+                self.event_manager.set_layer_group_window_sizes(
+                    self._get_event_window_sizes_by_layer_group()
+                )
+                self.event_manager.add_created_event(
+                    self._get_event_num_blocks_per_cache_level(cache_tiers, tokens_per_block),
+                    self._get_event_layer_group_ids(),
+                )
+        except Exception:
+            if isinstance(self.event_manager, NativeKVCacheEventManager):
+                self.event_manager.shutdown()
+            raise
 
         self.num_pools = len(self.impl.layer_grouping)
         # num_pools is the physical pool count owned by the KV cache manager.
@@ -1486,10 +1504,17 @@ class KVCacheManagerV2(BaseResourceManager):
             window_size = getattr(layer_config, "sliding_window_size", None)
             return self.max_seq_len if window_size is None else int(window_size)
 
-        return {
-            int(layer_group_id): get_event_window_size(int(layer_ids[0]))
-            for layer_group_id, layer_ids in enumerate(self.impl.layer_grouping)
-        }
+        window_sizes: Dict[int, int] = {}
+        for layer_group_id, layer_ids in enumerate(self.impl.layer_grouping):
+            life_cycle = self.impl._life_cycles.get_life_cycle(LifeCycleId(layer_group_id))
+            # Native KV events track attention prefix reuse only. Excluding SSM
+            # and other non-attention life cycles prevents a state life cycle
+            # (which reports max_seq_len as its window) from tying with the
+            # attention life cycle and being selected as the event target.
+            if not isinstance(life_cycle, AttnLifeCycle):
+                continue
+            window_sizes[int(layer_group_id)] = get_event_window_size(int(layer_ids[0]))
+        return window_sizes
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
         attr = self.impl._storage.get_buffer_attr(layer_id, role)
@@ -2913,16 +2938,19 @@ class KVCacheManagerV2(BaseResourceManager):
         return kv_cache_stats
 
     def flush_iteration_events(self):
-        if self.event_manager is not None:
-            self.event_manager.flush_iteration_events()
+        event_manager = self.event_manager
+        if event_manager is not None:
+            event_manager.flush_iteration_events()
 
     def get_latest_events(self, timeout_ms: Optional[float] = None):
         # Native publishing pushes events out-of-band; in that mode the event
         # manager's get_latest_events returns [], so the legacy pull path
-        # degrades cleanly instead of raising.
-        if self.event_manager is None:
+        # degrades cleanly instead of raising. Snapshot event_manager once so a
+        # concurrent shutdown cannot turn it into None between the check and use.
+        event_manager = self.event_manager
+        if event_manager is None:
             return []
-        return self.event_manager.get_latest_events(timeout_ms)
+        return event_manager.get_latest_events(timeout_ms)
 
     @property
     def native_kv_events_enabled(self) -> bool:
@@ -3450,13 +3478,17 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
-        if isinstance(self.event_manager, NativeKVCacheEventManager):
-            self.event_manager.shutdown()
-            self.event_manager = None
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
         self.impl.shutdown()
+        # Shut the native event manager down last so removals emitted during
+        # cache / impl teardown (via the radix tree's own event-manager
+        # reference) are still flushed before the publisher stops. Do not null
+        # event_manager: get_latest_events/flush snapshot it and operate safely
+        # on a closed manager, so there is no teardown-time None race.
+        if isinstance(self.event_manager, NativeKVCacheEventManager):
+            self.event_manager.shutdown()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
 
