@@ -330,6 +330,11 @@ class BasePipeline(nn.Module):
         return {}
 
     @property
+    def supported_tasks(self) -> tuple[str, ...]:
+        """Visual generation tasks supported by this pipeline."""
+        return ()
+
+    @property
     def default_generation_params(self) -> dict:
         """Model-specific defaults for ``None`` fields in ``VisualGenParams``.
 

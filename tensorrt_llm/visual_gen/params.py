@@ -72,6 +72,10 @@ class VisualGenParams(StrictBaseModel):
     image: Optional[Union[str, bytes, List[Union[str, bytes]]]] = Field(
         default=None, description="Reference image(s) for I2V/I2I."
     )
+    mask: Optional[Union[str, bytes]] = Field(
+        default=None, description="Optional mask image for image editing."
+    )
+
     # Per-prompt multiplier
     num_images_per_prompt: int = Field(default=1, description="Number of images per prompt.")
 
@@ -98,7 +102,7 @@ _TYPE_MAP = {
 # Generation config fields that pipelines declare defaults for. If a user
 # sets one of these but the pipeline doesn't declare it in
 # ``default_generation_params``, the request is rejected so unsupported
-# knobs don't get silently dropped. Conditioning inputs ``image`` and
+# knobs don't get silently dropped. Conditioning inputs ``image``, ``mask`` and
 # ``negative_prompt`` are validated at runtime by the pipeline's
 # ``infer()`` and stay out of this set.
 _GENERATION_CONFIG_FIELDS: tuple = (

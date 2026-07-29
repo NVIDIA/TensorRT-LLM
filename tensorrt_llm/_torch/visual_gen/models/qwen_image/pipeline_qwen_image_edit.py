@@ -127,6 +127,10 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
         return dict(_EDIT_DEFAULT_GENERATION_PARAMS)
 
     @property
+    def supported_tasks(self) -> tuple[str, ...]:
+        return ("image_edit", )
+
+    @property
     def default_warmup_resolutions(self) -> list[tuple[int, int]]:
         return [(1024, 1024)]
 

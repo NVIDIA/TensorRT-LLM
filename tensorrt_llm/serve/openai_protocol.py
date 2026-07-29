@@ -1693,6 +1693,68 @@ class ImageGenerationRequest(OpenAIBaseModel):
         return self
 
 
+class ImageEditRequest(OpenAIBaseModel):
+    """OpenAI-compatible image editing request.
+
+    The server accepts the OpenAI multipart shape and a JSON/base64
+    shape for tests and non-SDK clients. Model-specific knobs travel
+    through ``extra_params`` and are validated by the loaded visual
+    generation pipeline.
+    """
+
+    prompt: str
+    image: Union[str, UploadFile, List[Union[str, UploadFile]]] = Field(
+        description="Input image or images to edit.")
+    mask: Optional[Union[str, UploadFile]] = Field(
+        default=None, description="Optional edit mask image.")
+    response_format: Literal["url", "b64_json"] = "url"
+    format: Literal["png", "webp", "jpeg", "safetensors", "pt"] = Field(
+        default="png",
+        description=(
+            "Edited image content encoding format. Image encoders write "
+            "``png``/``webp``/``jpeg``; tensor encoders write "
+            "``safetensors``/``pt`` for programmatic post-processing."),
+    )
+    seed: Optional[int] = Field(default=None,
+                                ge=0,
+                                description="Random seed for reproducibility.")
+
+    size: Optional[str] = Field(default=None, pattern=r"^(\d+x\d+|auto)$")
+    width: Optional[int] = Field(default=None, gt=0)
+    height: Optional[int] = Field(default=None, gt=0)
+
+    num_inference_steps: Optional[int] = Field(default=None, gt=0)
+    guidance_scale: Optional[float] = Field(default=None, gt=0)
+    max_sequence_length: Optional[int] = Field(default=None, gt=0)
+    negative_prompt: Optional[str] = None
+    n: Optional[int] = Field(
+        default=None,
+        gt=0,
+        le=10,
+        description=("Number of edited images to generate. Capped at 10 to "
+                     "match the OpenAI images API and bound resource usage."),
+    )
+
+    extra_params: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Model-specific parameters forwarded to the underlying pipeline. "
+            "See per-model docs for accepted keys."),
+    )
+
+    model: Optional[str] = None
+    quality: Optional[Literal["standard", "hd"]] = None
+    user: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_paired_dimensions(self):
+        if (self.width is None) != (self.height is None):
+            raise ValueError(
+                "width and height must be sent together; got width="
+                f"{self.width!r}, height={self.height!r}")
+        return self
+
+
 class ImageObject(OpenAIBaseModel):
     """Generated image object in the response."""
     b64_json: Optional[str] = None
