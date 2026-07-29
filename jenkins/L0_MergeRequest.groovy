@@ -151,7 +151,7 @@ def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
     (ENABLE_SKIP_TEST): gitlabParamsFromBot.get((ENABLE_SKIP_TEST), false),
-    (TEST_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((TEST_STAGE_LIST), null)?.tokenize(',')),
+    (TEST_STAGE_LIST): ["*PackageSanityCheck*"],
     (GPU_TYPE_LIST): trimForStageList(gitlabParamsFromBot.get((GPU_TYPE_LIST), null)?.tokenize(',')),
     (TEST_BACKEND): trimForStageList(gitlabParamsFromBot.get((TEST_BACKEND), null)?.tokenize(',')),
     (IS_POST_MERGE): (env.JOB_NAME ==~ /.*PostMerge.*/) || gitlabParamsFromBot.get((IS_POST_MERGE), false),
@@ -1501,9 +1501,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     launchJob(pipeline, "/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
 
-                echo "Skipping x86_64 tests (For 1.3.0rc23)"
-                return
-
                 if (GEN_POST_MERGE_BUILDS_ONLY) {
                     echo "Skipping x86_64 tests (GenPostMergeBuilds mode: builds only)"
                     return
@@ -1619,9 +1616,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     ]
                     launchJob(pipeline, "/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
                 }
-
-                echo "Skipping SBSA tests (For 1.3.0rc23)"
-                return
 
                 if (GEN_POST_MERGE_BUILDS_ONLY) {
                     echo "Skipping SBSA tests (GenPostMergeBuilds mode: builds only)"
