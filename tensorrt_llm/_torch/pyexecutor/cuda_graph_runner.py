@@ -751,6 +751,7 @@ class EncoderCUDAGraphRunner:
     """
 
     WARMUP_STEPS = 1
+    MAX_FEATURE_PADDING_RATIO = 9 / 8
 
     def __init__(self, config: EncoderCUDAGraphRunnerConfig):
         self.config = config
@@ -944,9 +945,14 @@ class EncoderCUDAGraphRunner:
 
         if self.feature_mode:
             # A feature pad slot is a full fixed_seq_len request of compute
-            # (zero-filled input rows, outputs discarded at scatter) — unlike
-            # the 1-token pads of the token path. Documented as expensive;
-            # dense batch_sizes lists keep the pad distance small.
+            # (zero-filled input rows, outputs discarded at scatter), unlike
+            # the 1-token pads of the token path. Fall back to eager across
+            # large bucket gaps so graph replay cannot add more than 12.5%
+            # encoder work.
+            if (batch_size == 0 or padded_batch_size
+                    > batch_size * self.MAX_FEATURE_PADDING_RATIO):
+                yield inputs
+                return
             padded_inputs = dict(inputs)
             padded_inputs['seq_lens'] = (list(inputs['seq_lens']) +
                                          [self.config.fixed_seq_len] *
