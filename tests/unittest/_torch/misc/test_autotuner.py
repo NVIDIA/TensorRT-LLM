@@ -525,6 +525,63 @@ def test_autotuner_tuning_configs():
     runner_0([x, w], tactic=deserialized_tactic)
 
 
+def test_load_cache_skips_non_literal_tactic():
+    """Regression: a non-literal tactic repr must be skipped on load, not crash it.
+
+    ``_deserialize_cache_data`` reconstructs tactics with ``ast.literal_eval``,
+    which raises ``SyntaxError`` on non-literal reprs (e.g. enum tactic reprs,
+    until #16782 serializes enums by value). It must skip such entries -- once
+    ``SyntaxError`` was uncaught and had no ``continue``, crashing the load.
+    """
+    import ast
+
+    class _NonLiteralTactic:
+
+        def __repr__(self):
+            return "<_NonLiteralTactic object nvfp4>"
+
+    poisoned_repr = repr(_NonLiteralTactic())  # non-literal object repr
+    # Precondition: confirm this repr really does raise SyntaxError.
+    with pytest.raises(SyntaxError):
+        ast.literal_eval(poisoned_repr)
+
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    good_key = "('op_good', 'R', '0', ((1, 128),))"
+    bad_key = "('op_bad', 'R', '0', ((2, 128),))"
+    doc = {
+        "metadata": cache._serialize_metadata(),
+        "shared": {},
+        "rank_0": {
+            good_key: {
+                "runner_id": 0,
+                "tactic": "7",
+                "min_time": 0.001
+            },
+            bad_key: {
+                "runner_id": 1,
+                "tactic": poisoned_repr,
+                "min_time": 0.002
+            },
+        },
+    }
+    temp_dir = tempfile.TemporaryDirectory()
+    cache_path = os.path.join(temp_dir.name, "poisoned_cache.json")
+    with open(cache_path, "w") as f:
+        json.dump(doc, f)
+
+    # Must not raise (previously raised SyntaxError out of load_cache).
+    cache.load_cache(cache_path, rank=0)
+
+    # The literal-safe entry survived with its exact tactic ...
+    good = ("op_good", "R", "0", ((1, 128), ))
+    assert good in cache.cache
+    assert cache.cache[good][1] == 7
+    # ... and the non-literal entry was skipped, not silently mis-decoded.
+    bad = ("op_bad", "R", "0", ((2, 128), ))
+    assert bad not in cache.cache
+
+
 def test_kernel_testing_single_context():
     """Test kernel testing with a single choose_one context"""
     x, w = torch.randn(16, 64), torch.randn(64, 128)

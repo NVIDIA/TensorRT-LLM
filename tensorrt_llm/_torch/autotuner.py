@@ -840,10 +840,16 @@ class AutoTunerProfilingCache:
                 continue
             try:
                 tactic = ast.literal_eval(value["tactic"])
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, SyntaxError):
+                # Skip any tactic whose repr is not a Python literal so one bad
+                # entry can't crash the whole load; the op just re-profiles.
+                # (#16782 removes the current enum trigger at the serialize side.)
+                # SyntaxError is caught too; `continue` is required, else the
+                # entry reuses the previous tactic.
                 logger.warning_once(
-                    f"[AutoTuner] Could not deserialize tactic: {value['tactic']} for cache key {key_str}",
+                    f"[AutoTuner] Could not deserialize tactic: {value['tactic']} for cache key {key_str}; skipping entry.",
                     key=value["tactic"])
+                continue
 
             runner_id = value["runner_id"]
             min_time = value["min_time"]
