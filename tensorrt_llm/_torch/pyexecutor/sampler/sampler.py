@@ -4574,40 +4574,38 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                         if isinstance(proc_lp_temperature_cuda, torch.Tensor):
                             proc_lp_temperature_cuda = proc_lp_temperature_cuda.unsqueeze(-1)
                     else:
-                        proc_lp_steps = req_num_generated_tokens[
-                            need_processed_logprobs_req_indices
-                        ]
+                        proc_lp_group_steps = req_num_generated_tokens[group_req_indices]
                         proc_lp_step_mask_cuda = torch.repeat_interleave(
                             group_need_processed_logprobs.to(
                                 device=logits_cuda.device, non_blocking=True
                             ),
-                            proc_lp_steps.to(device=logits_cuda.device, non_blocking=True),
-                            output_size=cast(int, proc_lp_steps.sum().item()),
+                            proc_lp_group_steps.to(device=logits_cuda.device, non_blocking=True),
+                            output_size=cast(int, proc_lp_group_steps.sum().item()),
                         )
-                        proc_lp_steps_selected = cast(
+                        proc_lp_steps_num_selected = cast(
                             int,
                             (
-                                group_need_processed_logprobs.to(dtype=proc_lp_steps.dtype)
-                                * proc_lp_steps
+                                group_need_processed_logprobs.to(dtype=proc_lp_group_steps.dtype)
+                                * proc_lp_group_steps
                             )
                             .sum()
                             .item(),
                         )
                         proc_lp_logits_cuda = group_logits_cuda.new_empty(
-                            (proc_lp_steps_selected, *group_logits_cuda.shape[1:]),
+                            (proc_lp_steps_num_selected, *group_logits_cuda.shape[1:]),
                         )
                         torch.masked_select(
                             group_logits_cuda, proc_lp_step_mask_cuda, out=proc_lp_logits_cuda
                         )
                         proc_lp_softmax_cuda = group_softmax_cuda.new_empty(
-                            (proc_lp_steps_selected, *group_softmax_cuda.shape[1:]),
+                            (proc_lp_steps_num_selected, *group_softmax_cuda.shape[1:]),
                         )
                         torch.masked_select(
                             group_softmax_cuda, proc_lp_step_mask_cuda, out=proc_lp_softmax_cuda
                         )
                         if isinstance(group_temperature_cuda, torch.Tensor):
                             proc_lp_temperature_cuda = group_temperature_cuda.new_empty(
-                                (proc_lp_steps_selected, *group_temperature_cuda.shape[1:]),
+                                (proc_lp_steps_num_selected, *group_temperature_cuda.shape[1:]),
                             )
                             torch.masked_select(
                                 group_temperature_cuda,
