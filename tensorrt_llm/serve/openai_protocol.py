@@ -1705,15 +1705,10 @@ class ImageEditRequest(OpenAIBaseModel):
     prompt: str
     image: Union[str, UploadFile, List[Union[str, UploadFile]]] = Field(
         description="Input image or images to edit.")
-    mask: Optional[Union[str, UploadFile]] = Field(
-        default=None, description="Optional edit mask image.")
     response_format: Literal["url", "b64_json"] = "url"
-    format: Literal["png", "webp", "jpeg", "safetensors", "pt"] = Field(
+    format: Literal["png", "webp", "jpeg"] = Field(
         default="png",
-        description=(
-            "Edited image content encoding format. Image encoders write "
-            "``png``/``webp``/``jpeg``; tensor encoders write "
-            "``safetensors``/``pt`` for programmatic post-processing."),
+        description="Edited image content encoding format.",
     )
     seed: Optional[int] = Field(default=None,
                                 ge=0,
@@ -1727,13 +1722,6 @@ class ImageEditRequest(OpenAIBaseModel):
     guidance_scale: Optional[float] = Field(default=None, gt=0)
     max_sequence_length: Optional[int] = Field(default=None, gt=0)
     negative_prompt: Optional[str] = None
-    n: Optional[int] = Field(
-        default=None,
-        gt=0,
-        le=10,
-        description=("Number of edited images to generate. Capped at 10 to "
-                     "match the OpenAI images API and bound resource usage."),
-    )
 
     extra_params: Optional[Dict[str, Any]] = Field(
         default=None,

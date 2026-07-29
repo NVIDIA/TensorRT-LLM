@@ -111,7 +111,7 @@ def _read_reference_payload(reference) -> bytes:
         except ValueError as exc:
             # binascii.Error subclasses ValueError.
             raise ValueError("input_reference is not valid base64 data.") from exc
-      return reference.file.read()
+    return reference.file.read()
 
 
 def _decode_base64_media(value: str) -> Optional[bytes]:
@@ -169,7 +169,7 @@ def _materialize_conditioning_inputs(
             os.path.join(media_storage_path, f"{id}_{field_name}_{i}.png"),
         ) for i, item in enumerate(values)
     ]
-      return paths if isinstance(value, list) else paths[0]
+    return paths if isinstance(value, list) else paths[0]
 
 
 def parse_visual_gen_params(
@@ -212,27 +212,21 @@ def parse_visual_gen_params(
     if request.seed is not None:
         params.seed = int(request.seed)
 
-    if isinstance(request, (ImageGenerationRequest, ImageEditRequest)):
+    if isinstance(request, ImageGenerationRequest):
         if request.n is not None:
             params.num_images_per_prompt = request.n
-        if isinstance(request, ImageEditRequest):
-            if media_storage_path is None:
-                raise ValueError(
-                    "media_storage_path is required when image edit inputs are provided"
-                )
-            params.image = _materialize_conditioning_inputs(
-                request.image,
-                id=id,
-                field_name="image",
-                media_storage_path=media_storage_path,
+
+    elif isinstance(request, ImageEditRequest):
+        if media_storage_path is None:
+            raise ValueError(
+                "media_storage_path is required when image edit inputs are provided"
             )
-            if request.mask is not None:
-                params.mask = _materialize_conditioning_inputs(
-                    request.mask,
-                    id=id,
-                    field_name="mask",
-                    media_storage_path=media_storage_path,
-                )
+        params.image = _materialize_conditioning_inputs(
+            request.image,
+            id=id,
+            field_name="image",
+            media_storage_path=media_storage_path,
+        )
 
     elif isinstance(request, VideoGenerationRequest):
         if request.frame_rate is not None:

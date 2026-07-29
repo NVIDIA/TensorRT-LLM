@@ -292,11 +292,6 @@ class VisualGen:
         return self.executor.extra_param_specs
 
     @property
-    def supported_tasks(self) -> tuple[str, ...]:
-        """Returns visual generation tasks supported by the loaded pipeline."""
-        return tuple(getattr(self.executor, "supported_tasks", ()))
-
-    @property
     def default_params(self) -> "VisualGenParams":
         """Returns a ``VisualGenParams`` with all defaults resolved for the loaded pipeline.
 
