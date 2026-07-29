@@ -14,17 +14,10 @@
 
 """Sampling strategies: what to draw, and how to get there from a request.
 
-Two layers live here. The bulk of the module -- strategy resolution, the
-strategy implementations and the grouped samplers -- operates purely on logits
-and probs. At the end sits ``_request_strategy``, the one helper that maps an
-``LlmRequest`` onto a :data:`Strategy`; it is here rather than in
-``sampler_common`` because deciding a strategy is precisely what this module
-does.
-
-The plain per-request queries it builds on (``_request_get_sampling_params``
-and friends) live in ``sampler_common``, so feature modules that only need to
-read a request's sampling config -- token bans, top-p decay, penalties -- can
-do so without importing this module.
+Holds the :data:`Strategy` types, their implementations and the grouped
+samplers, which operate on logits and probs; ``_request_strategy`` maps an
+``LlmRequest`` onto a strategy, reading its sampling config via
+``sampler_common``.
 """
 
 import abc

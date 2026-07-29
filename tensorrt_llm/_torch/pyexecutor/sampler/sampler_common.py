@@ -14,18 +14,11 @@
 
 """Shared building blocks for the sampler package.
 
-This is the base layer: it imports nothing else from the sampler package, so
-every module above it -- the feature modules, ``sampler_strategy`` and
-``sampler`` itself -- may depend on it without creating a cycle. Anything a
-feature module needs from a request that does not require resolving a sampling
-*strategy* belongs here.
+The package's base layer: tensor helpers, the shared step/beam index constants,
+and the per-request queries that read an ``LlmRequest``'s sampling config into
+:class:`UtilsSamplingParams`. Imports nothing else from the package.
 
-Deciding a request's ``Strategy`` is deliberately NOT here: that lives in
-``sampler_strategy._request_strategy``, the only request-facing helper that has
-to know what a strategy is. :class:`UtilsSamplingParams` -- the plain scalar
-view of a request's sampling config -- does live here, because it is the
-*input* to that decision and several features (top-p decay, token bans,
-penalties) read it without ever resolving a strategy.
+Resolving a request's ``Strategy`` lives in ``sampler_strategy``.
 """
 
 from dataclasses import dataclass
@@ -47,7 +40,7 @@ FinishReasonsList: TypeAlias = list[list[list[int]]]
 
 @dataclass(frozen=True, kw_only=True)
 class UtilsSamplingParams:
-    """Subset of tensorrt_llm::runtime::SamplingConfig supported by sampling_utils.
+    """Subset of tensorrt_llm::runtime::SamplingConfig supported by the torch sampler.
 
     Args:
         temperature: The temperature to use for sampling.

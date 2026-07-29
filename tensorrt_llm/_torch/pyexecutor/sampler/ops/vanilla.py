@@ -15,7 +15,7 @@
 """PyTorch-native sampling kernels.
 
 Pure tensor functions that operate on logits and probabilities with no
-dependency on the sampling_utils interface or other backend implementation modules.
+dependency on the sampler_strategy interface or other backend implementation modules.
 """
 
 from dataclasses import dataclass
@@ -288,25 +288,6 @@ def sample_rejected(
 # normalized to a sentinel temperature strictly below this threshold (see
 # DISABLE_TEMP_VAL in speculative/interface.py, which derives from it).
 GREEDY_TEMPERATURE_THRESHOLD = 1e-4
-
-
-def safely_apply_temperature_inplace(
-    logits_inout: torch.Tensor, temp: torch.Tensor
-) -> torch.Tensor:
-    """Divide logits by per-row temperature in place, guarding the greedy sentinel.
-
-    Greedy requests carry a temperature of 0 / <= ``GREEDY_TEMPERATURE_THRESHOLD``.
-    Dividing by it would blow logits up to inf/nan and corrupt downstream sampling
-    (argmax / softmax / multinomial). Those rows are clamped to a temperature of 1.0
-    so the division is numerically safe; callers are expected to overwrite the greedy
-    rows with their argmax result afterwards (e.g. via ``torch.where(is_greedy, ...)``),
-    so the value used for the clamped rows here does not affect the final output.
-
-    ``logits_inout`` is modified in place (``div_``) and also returned for
-    convenience; ``temp`` is left untouched.
-    """
-    safe_temp = torch.where(temp <= GREEDY_TEMPERATURE_THRESHOLD, torch.ones_like(temp), temp)
-    return logits_inout.div_(safe_temp.unsqueeze(dim=1))
 
 
 class Fusions:

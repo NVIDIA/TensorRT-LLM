@@ -14,29 +14,16 @@
 
 """FlashInfer-accelerated sampling kernels.
 
-These ops depend on flashinfer; the import is guarded so the module stays
-importable without it (sampling_utils imports it unconditionally, and the
-vanilla/TRTLLM sampler paths must keep working without flashinfer). Without
-flashinfer, calling any op raises an ImportError with installation guidance.
-Components that will invoke these ops are expected to fail fast at startup
-instead of relying on that call-time error: TorchSampler enforces flashinfer
+The flashinfer import is guarded so this module stays importable without it;
+each op then raises an ImportError when called. ``TorchSampler`` checks
 availability in its constructor.
 
-Randomness can be supplied either way (flashinfer accepts both in one
-signature; explicit ``seed``/``offset`` take precedence over ``generator``):
+Randomness is supplied either as a ``generator`` (host-side ``torch.Generator``,
+for eager paths) or as stateless ``seed``/``offset`` device tensors, which are
+required under CUDA graph capture. Explicit ``seed``/``offset`` take precedence.
 
-- ``generator``: stateful host-side ``torch.Generator``, for eager paths.
-- ``seed``/``offset``: stateless device tensors, required under CUDA graph
-  capture (a ``torch.Generator`` advances host-side at launch time, so its
-  state would be frozen into the graph and every replay would reuse the same
-  random values).
-
-Every op is ``@_compiler_disable``d: nothing inside flashinfer is opaque to
-Dynamo (its kernels sit behind a ``functools.cache``-d lazy JIT bootstrap and
-its own custom-op registration is a no-op), so tracing in turns each
-untraceable builtin of the bootstrap into a warn-once plus a permanent
-per-call graph break. Disabling keeps one clean graph break per op and
-preserves the bootstrap's cache fast path.
+Every op is ``@_compiler_disable``d to keep one clean Dynamo graph break per op
+instead of a per-call break from tracing flashinfer's lazy JIT bootstrap.
 """
 
 from typing import Any, Callable, Optional, TypeVar, Union, cast
@@ -45,7 +32,7 @@ import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 
-from . import vanilla
+from .vanilla import GREEDY_TEMPERATURE_THRESHOLD
 
 _OpT = TypeVar("_OpT", bound=Callable[..., Any])
 
@@ -243,9 +230,10 @@ def compute_probs_from_logits_op(
 
 
 # ---------------------------------------------------------------------------
-# Speculative-decoding samplers (per-request tensor params). These combine the
-# flashinfer ops above with vanilla's temperature helpers; used by the
-# speculative-decoding paths (one-model draft sampling, rejection sampling).
+# Speculative-decoding samplers (per-request tensor params). These build on the
+# flashinfer ops above, sharing only vanilla's greedy-temperature threshold;
+# used by the speculative-decoding paths (one-model draft sampling, rejection
+# sampling).
 # ---------------------------------------------------------------------------
 
 
@@ -291,15 +279,18 @@ def sampling_batch_spec_dec_one_model(
 ) -> torch.Tensor:
     """CUDA-graph compatible sampling; supports mixed sampling params. Returns sampled tokens."""
     top_k = sanitize_top_k(top_k, logits.shape[-1])
-    # Greedy rows (temperature <= threshold) reduce to top_k=1 sampling: with the
-    # divisor clamped to 1.0 by safely_apply_temperature_inplace (order-preserving
-    # for those rows), flashinfer deterministically returns the max-probability
-    # token, i.e. the argmax of the original logits. All ops remain branch-free
-    # (no data-dependent control flow), so this stays CUDA-graph safe.
-    is_greedy = temperatures <= vanilla.GREEDY_TEMPERATURE_THRESHOLD
+    # Greedy rows (temperature <= threshold) reduce to top_k=1 sampling: their
+    # divisor is clamped to 1.0 below (order-preserving for those rows), so
+    # flashinfer deterministically returns the max-probability token, i.e. the
+    # argmax of the original logits. All ops remain branch-free (no
+    # data-dependent control flow), so this stays CUDA-graph safe.
+    is_greedy = temperatures <= GREEDY_TEMPERATURE_THRESHOLD
     top_k = torch.where(is_greedy, torch.ones_like(top_k), top_k)
     top_p = torch.where(is_greedy, torch.ones_like(top_p), top_p)
-    logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
+    # Dividing by a greedy row's temperature (0 / <= threshold) would blow the
+    # logits up to inf/nan; clamp those rows to 1.0 to keep the division safe.
+    safe_temp = torch.where(is_greedy, torch.ones_like(temperatures), temperatures)
+    logits = logits.div_(safe_temp.unsqueeze(dim=1))
     return top_k_top_p_sampling_from_logits_op(logits, top_k, top_p, seed=seed, offset=offset)
 
 
