@@ -54,6 +54,11 @@ SUPPORTED_GPU_MAPPING = {
 BENCH_SERVING_REPO = "https://github.com/kedarpotdar-nv/bench_serving.git"
 BENCH_SERVING_COMMIT = "f3ea022a5780de5d0babc5fffa53634e2023d28f"
 BENCH_SERVING_DIR = "/tmp/bench_serving"
+KV_TRANSFER_TRACE_OUTPUT_DIR_ENV = "TLLM_KV_TRANSFER_TRACE_OUTPUT_DIR"
+KV_TRANSFER_TRACE_REQUIRED_ENV = "TLLM_KV_TRANSFER_TRACE_REQUIRED"
+KV_TRANSFER_TRACE_EXPECTED_CTX_FILES_ENV = "TLLM_KV_TRANSFER_TRACE_EXPECTED_CTX_FILES"
+KV_TRANSFER_TRACE_EXPECTED_GEN_FILES_ENV = "TLLM_KV_TRANSFER_TRACE_EXPECTED_GEN_FILES"
+KV_TRANSFER_TRACE_READY_TIMEOUT_SECONDS = 60
 
 
 def ensure_bench_serving_repo() -> str:
@@ -1384,6 +1389,98 @@ class DisaggTestCmds(NamedTuple):
             )
             time.sleep(poll_interval)
 
+    @staticmethod
+    def _wait_for_kv_transfer_trace_files(
+        timeout: int = KV_TRANSFER_TRACE_READY_TIMEOUT_SECONDS,
+    ) -> None:
+        """Require every traced external rank to emit its startup record."""
+        if os.getenv(KV_TRANSFER_TRACE_REQUIRED_ENV, "0") != "1":
+            return
+
+        trace_output_dir = os.getenv(KV_TRANSFER_TRACE_OUTPUT_DIR_ENV)
+        if not trace_output_dir:
+            raise RuntimeError(
+                f"{KV_TRANSFER_TRACE_OUTPUT_DIR_ENV} is missing while "
+                f"{KV_TRANSFER_TRACE_REQUIRED_ENV}=1"
+            )
+
+        try:
+            expected_by_side = {
+                "ctx": int(os.environ[KV_TRANSFER_TRACE_EXPECTED_CTX_FILES_ENV]),
+                "gen": int(os.environ[KV_TRANSFER_TRACE_EXPECTED_GEN_FILES_ENV]),
+            }
+        except (KeyError, ValueError) as error:
+            raise RuntimeError("Invalid expected KV transfer trace file counts") from error
+
+        if any(count < 0 for count in expected_by_side.values()):
+            raise RuntimeError(
+                f"Expected KV transfer trace file counts must be non-negative: {expected_by_side}"
+            )
+        if sum(expected_by_side.values()) == 0:
+            raise RuntimeError("At least one KV transfer trace file must be expected")
+
+        start_time = time.time()
+        ready_by_side = {"ctx": [], "gen": []}
+        files_without_startup_record = []
+        while True:
+            ready_by_side = {"ctx": [], "gen": []}
+            files_without_startup_record = []
+            trace_paths = sorted(
+                glob.glob(os.path.join(trace_output_dir, "kv_transfer_trace.*.log"))
+            )
+            for trace_path in trace_paths:
+                filename = os.path.basename(trace_path)
+                side = next(
+                    (
+                        candidate
+                        for candidate in ready_by_side
+                        if filename.startswith(f"kv_transfer_trace.{candidate}.")
+                    ),
+                    None,
+                )
+                if side is None:
+                    continue
+                try:
+                    with open(trace_path, encoding="utf-8") as trace_file:
+                        has_startup_record = (
+                            "KV_TRANSFER_TRACE event=trace_enabled" in trace_file.read()
+                        )
+                except OSError:
+                    has_startup_record = False
+                if has_startup_record:
+                    ready_by_side[side].append(trace_path)
+                else:
+                    files_without_startup_record.append(trace_path)
+
+            if all(
+                len(ready_by_side[side]) >= expected for side, expected in expected_by_side.items()
+            ):
+                print_info(
+                    "KV transfer trace startup handshake complete: "
+                    f"ctx={len(ready_by_side['ctx'])}/{expected_by_side['ctx']}, "
+                    f"gen={len(ready_by_side['gen'])}/{expected_by_side['gen']}, "
+                    f"output_dir={trace_output_dir}"
+                )
+                return
+
+            elapsed_time = time.time() - start_time
+            if elapsed_time > timeout:
+                ready_names = {
+                    side: [os.path.basename(path) for path in paths]
+                    for side, paths in ready_by_side.items()
+                }
+                missing_startup_names = [
+                    os.path.basename(path) for path in files_without_startup_record
+                ]
+                raise RuntimeError(
+                    "Timed out waiting for required KV transfer trace startup records "
+                    f"after {timeout}s: expected={expected_by_side}, "
+                    f"ready={ready_names}, "
+                    f"files_without_startup_record={missing_startup_names}, "
+                    f"output_dir={trace_output_dir}"
+                )
+            time.sleep(1)
+
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
         for i in range(self.num_ctx_servers):
@@ -1449,12 +1546,6 @@ class DisaggTestCmds(NamedTuple):
                 if configs_for_idx is not None:
                     ctx_cfg, gen_cfg, _ = configs_for_idx
                     worker_env.update((ctx_cfg if is_ctx else gen_cfg).to_env())
-                if worker_env.get("TLLM_ENABLE_KV_TRANSFER_TRACE") == "1":
-                    worker_env["TLLM_KV_TRANSFER_TRACE_OUTPUT_DIR"] = self.test_output_dir
-                    print_info(
-                        "KV transfer tracing is enabled; rank-local trace files "
-                        f"will be written to {self.test_output_dir}"
-                    )
                 with open(server_file_path, "w") as server_ctx:
                     server_proc = subprocess.Popen(
                         server_cmd,
@@ -1522,6 +1613,7 @@ class DisaggTestCmds(NamedTuple):
                     ),
                     check_files=self.get_server_logs(server_idx),
                 )
+                self._wait_for_kv_transfer_trace_files()
 
                 client_configs = self.client_configs.get(server_idx, [])
 

@@ -18,6 +18,8 @@ import tempfile
 import time
 from unittest.mock import patch
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # PerfTimer tests
@@ -243,6 +245,29 @@ class TestKvTransferTrace:
             )
 
         log_info.assert_not_called()
+
+    @patch.dict(
+        "os.environ",
+        {
+            "TLLM_ENABLE_KV_TRANSFER_TRACE": "1",
+            "TLLM_KV_TRANSFER_TRACE_REQUIRED": "1",
+        },
+        clear=True,
+    )
+    def test_required_trace_rejects_missing_output_directory(self):
+        from tensorrt_llm._torch.disaggregation.native import perf_logger
+
+        with pytest.raises(
+            RuntimeError,
+            match="TLLM_KV_TRANSFER_TRACE_OUTPUT_DIR must be set",
+        ):
+            perf_logger.log_kv_transfer_trace(
+                "trace_enabled",
+                -1,
+                "gen",
+                "test-instance",
+                0,
+            )
 
     def test_writes_and_flushes_rank_local_trace_file(self):
         from tensorrt_llm._torch.disaggregation.native import perf_logger

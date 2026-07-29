@@ -42,6 +42,14 @@ def submit_module(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatc
     return module
 
 
+@pytest.fixture
+def ci_submit_module():
+    spec = importlib.util.spec_from_file_location("perf_submit_ci", SUBMIT_PATHS[0])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.mark.parametrize(
     ("config_name", "expected_queue_size"),
     (
@@ -85,3 +93,41 @@ def test_gen_only_queue_size_preserves_reachable_concurrency(submit_module):
     }
 
     assert submit_module.get_benchmark_request_queue_size(config, 16) == 16
+
+
+def test_kv_transfer_trace_common_vars_cover_all_external_ranks(ci_submit_module):
+    trace_vars = ci_submit_module.get_kv_transfer_trace_common_vars(
+        "TLLM_ENABLE_KV_TRANSFER_TRACE=1 CTX_ONLY=1",
+        "TLLM_ENABLE_KV_TRANSFER_TRACE=1 GEN_ONLY=1",
+        "/tmp/results/disagg-kimi",
+        {
+            "num_ctx_servers": 1,
+            "gpus_per_ctx_server": 4,
+            "num_gen_servers": 1,
+            "gpus_per_gen_server": 16,
+        },
+    )
+
+    assert (
+        "TLLM_KV_TRANSFER_TRACE_OUTPUT_DIR=/tmp/results/disagg-kimi/kv_transfer_traces"
+    ) in trace_vars
+    assert "TLLM_KV_TRANSFER_TRACE_REQUIRED=1" in trace_vars
+    assert "TLLM_KV_TRANSFER_TRACE_EXPECTED_CTX_FILES=4" in trace_vars
+    assert "TLLM_KV_TRANSFER_TRACE_EXPECTED_GEN_FILES=16" in trace_vars
+
+
+def test_kv_transfer_trace_common_vars_disabled_by_default(ci_submit_module):
+    assert (
+        ci_submit_module.get_kv_transfer_trace_common_vars(
+            "CTX_ONLY=1",
+            "GEN_ONLY=1",
+            "/tmp/results/disagg-kimi",
+            {
+                "num_ctx_servers": 1,
+                "gpus_per_ctx_server": 4,
+                "num_gen_servers": 1,
+                "gpus_per_gen_server": 16,
+            },
+        )
+        == ""
+    )

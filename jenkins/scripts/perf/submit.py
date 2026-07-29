@@ -42,6 +42,11 @@ def _import_precheck_config(llm_src):
 
 AGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/aggregated"
 DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
+KV_TRANSFER_TRACE_ENABLE_ENV = "TLLM_ENABLE_KV_TRANSFER_TRACE"
+KV_TRANSFER_TRACE_OUTPUT_DIR_ENV = "TLLM_KV_TRANSFER_TRACE_OUTPUT_DIR"
+KV_TRANSFER_TRACE_REQUIRED_ENV = "TLLM_KV_TRANSFER_TRACE_REQUIRED"
+KV_TRANSFER_TRACE_EXPECTED_CTX_FILES_ENV = "TLLM_KV_TRANSFER_TRACE_EXPECTED_CTX_FILES"
+KV_TRANSFER_TRACE_EXPECTED_GEN_FILES_ENV = "TLLM_KV_TRANSFER_TRACE_EXPECTED_GEN_FILES"
 
 
 # --------------------------------------------------------------------------- #
@@ -322,6 +327,51 @@ def get_benchmark_request_queue_size(config, concurrency):
             "The fill loop cannot reach a target above the GEN executor capacity."
         )
     return queue_size
+
+
+def _env_flag_enabled(env_vars, name):
+    """Return whether an environment assignment enables ``name``."""
+    return re.search(rf"(?:^|\s){re.escape(name)}=1(?:\s|$)", env_vars) is not None
+
+
+def get_kv_transfer_trace_common_vars(
+    ctx_worker_env_vars,
+    gen_worker_env_vars,
+    test_output_dir,
+    hardware_config,
+):
+    """Build trace settings inherited by external workers and the benchmark.
+
+    External executor ranks are created by ``trtllm-llmapi-launch``. Therefore,
+    the output directory must be present in their original SLURM command rather
+    than being added later to the ``trtllm-serve`` proxy environment.
+    """
+    ctx_trace_enabled = _env_flag_enabled(ctx_worker_env_vars, KV_TRANSFER_TRACE_ENABLE_ENV)
+    gen_trace_enabled = _env_flag_enabled(gen_worker_env_vars, KV_TRANSFER_TRACE_ENABLE_ENV)
+    if not ctx_trace_enabled and not gen_trace_enabled:
+        return ""
+    if not test_output_dir:
+        raise ValueError("KV transfer tracing requires a non-empty test output directory")
+
+    expected_ctx_files = (
+        hardware_config["num_ctx_servers"] * hardware_config["gpus_per_ctx_server"]
+        if ctx_trace_enabled
+        else 0
+    )
+    expected_gen_files = (
+        hardware_config["num_gen_servers"] * hardware_config["gpus_per_gen_server"]
+        if gen_trace_enabled
+        else 0
+    )
+    trace_output_dir = os.path.join(test_output_dir, "kv_transfer_traces")
+    return " ".join(
+        [
+            f"{KV_TRANSFER_TRACE_OUTPUT_DIR_ENV}={trace_output_dir}",
+            f"{KV_TRANSFER_TRACE_REQUIRED_ENV}=1",
+            f"{KV_TRANSFER_TRACE_EXPECTED_CTX_FILES_ENV}={expected_ctx_files}",
+            f"{KV_TRANSFER_TRACE_EXPECTED_GEN_FILES_ENV}={expected_gen_files}",
+        ]
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -608,7 +658,12 @@ def main():
         print(f"UCX env: cluster={args.cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
         ucx_tls_server_cmd = ucx_tls_cmd
 
-        pytest_common_vars = ""
+        pytest_common_vars = get_kv_transfer_trace_common_vars(
+            ctx_worker_env_vars,
+            gen_worker_env_vars,
+            test_output_dir,
+            hardware_config,
+        )
         script_prefix_lines.extend(
             [
                 worker_pytest_command,

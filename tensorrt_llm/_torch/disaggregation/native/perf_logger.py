@@ -30,6 +30,7 @@ _PERF_CSV_HEADER = (
 )
 _KV_TRANSFER_TRACE_ENV = "TLLM_ENABLE_KV_TRANSFER_TRACE"
 _KV_TRANSFER_TRACE_OUTPUT_DIR_ENV = "TLLM_KV_TRANSFER_TRACE_OUTPUT_DIR"
+_KV_TRANSFER_TRACE_REQUIRED_ENV = "TLLM_KV_TRANSFER_TRACE_REQUIRED"
 _KV_TRANSFER_TRACE_FILES = {}
 _KV_TRANSFER_TRACE_FAILED_PATHS = set()
 _KV_TRANSFER_TRACE_FILE_LOCK = threading.Lock()
@@ -51,6 +52,11 @@ def _write_kv_transfer_trace_file(
     """Write and flush one lifecycle event to this rank's dedicated trace file."""
     output_dir = os.getenv(_KV_TRANSFER_TRACE_OUTPUT_DIR_ENV)
     if not output_dir:
+        if os.getenv(_KV_TRANSFER_TRACE_REQUIRED_ENV, "0") == "1":
+            raise RuntimeError(
+                f"{_KV_TRANSFER_TRACE_OUTPUT_DIR_ENV} must be set when "
+                f"{_KV_TRANSFER_TRACE_REQUIRED_ENV}=1"
+            )
         return
 
     filename = (
@@ -72,6 +78,10 @@ def _write_kv_transfer_trace_file(
             # not strand the most useful diagnostic records in user-space buffers.
             trace_file.flush()
         except (OSError, ValueError) as error:
+            if os.getenv(_KV_TRANSFER_TRACE_REQUIRED_ENV, "0") == "1":
+                raise RuntimeError(
+                    f"Failed to write required KV transfer trace file {trace_path}"
+                ) from error
             _KV_TRANSFER_TRACE_FAILED_PATHS.add(trace_path)
             sys.stderr.write(f"Failed to write KV transfer trace file {trace_path}: {error}\n")
             sys.stderr.flush()
