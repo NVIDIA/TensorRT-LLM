@@ -2051,14 +2051,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${progressTar}"
                 def remoteWorkspaceTrk = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
                 def trackCmd = Utils.sshUserCmd(remote, scriptTrackPathNode)
-                // ls -la on the specific file forces LOOKUP+GETATTR on the NFS server,
-                // bypassing any stale per-file attribute cache on the login node.
-                // This is more reliable than ls on the directory (READDIR/READDIRPLUS),
-                // which is affected by the rdirplus/nordirplus mount option.
-                def sshStatCmd = Utils.sshUserCmd(remote, "\"ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1; stat -c %Y '${remoteWorkspaceTrk}/results.xml' 2>/dev/null || echo 0\"")
+                // Two-stage NFS cache flush:
+                // 1. ls on the directory (READDIR) makes newly created files visible
+                //    when the login node has a negative dcache entry for results.xml.
+                // 2. ls -la on the file (LOOKUP+GETATTR) refreshes the per-file
+                //    attribute cache for an already-known file whose mtime changed.
+                // Both are needed: the file-only ls does nothing when the file is new.
+                def sshStatCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1; stat -c %Y '${remoteWorkspaceTrk}/results.xml' 2>/dev/null || echo 0\"")
                 def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
                 def scpUnfinishedCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/unfinished_test.txt", "${stageName}/")
-                def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
+                def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
                 def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
                 def scpPerfTemplate = scpFromRemoteCmd(remote, "PERF_FOLDER_PLACEHOLDER", "${stageName}/")
                 sh "rm -f ${pytestDoneFile}"
