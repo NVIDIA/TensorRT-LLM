@@ -15,6 +15,8 @@
 import ctypes
 import sys
 import types
+from collections.abc import Generator
+from typing import Protocol
 
 import pytest
 
@@ -36,6 +38,10 @@ class _ConfComputeSettings(ctypes.Structure):
     ]
 
 
+class _ConfComputeSettingsPointer(Protocol):
+    _obj: _ConfComputeSettings
+
+
 def _make_pynvml(
     *,
     cc_feature: int,
@@ -55,7 +61,7 @@ def _make_pynvml(
     pynvml._nvmlCheckReturn = lambda _: None
     pynvml.settings_queries = 0
 
-    def get_settings(settings_ptr):
+    def get_settings(settings_ptr: _ConfComputeSettingsPointer) -> int:
         pynvml.settings_queries += 1
         if not settings_supported:
             raise _NvmlErrorNotSupported
@@ -71,10 +77,16 @@ def _make_pynvml(
 
 
 @pytest.fixture(autouse=True)
-def clear_confidential_compute_status_cache():
+def clear_confidential_compute_status_cache() -> Generator[None, None, None]:
     get_cc_and_nvle_status.cache_clear()
     yield
     get_cc_and_nvle_status.cache_clear()
+
+
+def test_get_cc_and_nvle_status_without_pynvml(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "pynvml", None)
+
+    assert get_cc_and_nvle_status() == (False, False)
 
 
 @pytest.mark.parametrize(
@@ -86,7 +98,12 @@ def clear_confidential_compute_status_cache():
         (1, 2, (True, True)),
     ],
 )
-def test_get_cc_and_nvle_status(monkeypatch, cc_feature, multi_gpu_mode, expected):
+def test_get_cc_and_nvle_status(
+    monkeypatch: pytest.MonkeyPatch,
+    cc_feature: int,
+    multi_gpu_mode: int,
+    expected: tuple[bool, bool],
+) -> None:
     pynvml = _make_pynvml(
         cc_feature=cc_feature,
         multi_gpu_mode=multi_gpu_mode,
@@ -96,7 +113,7 @@ def test_get_cc_and_nvle_status(monkeypatch, cc_feature, multi_gpu_mode, expecte
     assert get_cc_and_nvle_status() == expected
 
 
-def test_get_cc_and_nvle_status_is_cached(monkeypatch):
+def test_get_cc_and_nvle_status_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     pynvml = _make_pynvml(cc_feature=0, multi_gpu_mode=2)
     monkeypatch.setitem(sys.modules, "pynvml", pynvml)
 
@@ -106,25 +123,42 @@ def test_get_cc_and_nvle_status_is_cached(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "cc_feature,multi_gpu_mode,expected",
+    "status",
     [
-        (0, 0, False),
-        (0, 1, True),
-        (0, 2, False),
-        (1, 2, True),
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
     ],
 )
-def test_confidential_compute_enabled(monkeypatch, cc_feature, multi_gpu_mode, expected):
-    pynvml = _make_pynvml(
-        cc_feature=cc_feature,
-        multi_gpu_mode=multi_gpu_mode,
-    )
+def test_confidential_compute_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    status: tuple[bool, bool],
+) -> None:
+    def get_status() -> tuple[bool, bool]:
+        return status
+
+    monkeypatch.setattr("tensorrt_llm._utils.get_cc_and_nvle_status", get_status)
+
+    assert confidential_compute_enabled() is status[0]
+
+
+def test_get_cc_and_nvle_status_propagates_unexpected_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pynvml = _make_pynvml(cc_feature=0, multi_gpu_mode=0)
+
+    def raise_unexpected_error(_settings_ptr: _ConfComputeSettingsPointer) -> int:
+        raise RuntimeError("unexpected NVML API mismatch")
+
+    pynvml.nvmlSystemGetConfComputeSettings = raise_unexpected_error
     monkeypatch.setitem(sys.modules, "pynvml", pynvml)
 
-    assert confidential_compute_enabled() is expected
+    with pytest.raises(RuntimeError, match="unexpected NVML API mismatch"):
+        get_cc_and_nvle_status()
 
 
-def test_get_cc_and_nvle_status_uses_legacy_cc_fallback(monkeypatch):
+def test_get_cc_and_nvle_status_uses_legacy_cc_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     pynvml = _make_pynvml(
         cc_feature=0,
         multi_gpu_mode=0,

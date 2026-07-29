@@ -1209,10 +1209,10 @@ def get_cc_and_nvle_status() -> tuple[bool, bool]:
             cc_state = pynvml.nvmlSystemGetConfComputeState()
             cc_enabled = (
                 cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED)
-        except Exception as e:
-            logger.error(f"Error querying CC and NVLE state: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error querying CC and NVLE state: {str(e)}")
+        except pynvml.NVMLError as error:
+            logger.error(f"Error querying CC and NVLE state: {error!s}")
+    except pynvml.NVMLError as error:
+        logger.error(f"Error querying CC and NVLE state: {error!s}")
     finally:
         # Shutdown
         try:
