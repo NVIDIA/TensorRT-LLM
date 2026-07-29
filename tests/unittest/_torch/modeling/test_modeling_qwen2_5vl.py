@@ -562,7 +562,7 @@ def test_qwen2_5_window_attention_uses_tighter_fixed_max_seq_len() -> None:
     hf_config = Qwen2_5_VLConfig.from_dict(copy.deepcopy(QWEN2_5_VL_7B_CONFIG))
     model_config = ModelConfig(pretrained_config=hf_config,
                                skip_create_weights_in_init=True)
-    model = Qwen2_5_VisionModel(model_config)
+    model = Qwen2VisionModelBase(model_config, Qwen2_5_VisionModel).visual
     model.metadata_cls = _StubVisionAttentionMetadata
 
     max_num_requests = 8

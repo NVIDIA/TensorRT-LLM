@@ -11,6 +11,8 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
+    MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
     MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
