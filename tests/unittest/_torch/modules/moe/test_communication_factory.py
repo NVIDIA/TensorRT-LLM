@@ -284,6 +284,47 @@ def test_nccl_ep_ll_combine_smem_requirement() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "device_properties",
+    [
+        SimpleNamespace(
+            multi_processor_count=72,
+            shared_memory_per_block_optin=200704,
+            shared_memory_per_block=102400,
+        ),
+        SimpleNamespace(
+            multi_processor_count=72,
+            shared_memory_per_block=200704,
+        ),
+    ],
+    ids=["optin_shared_memory", "legacy_shared_memory"],
+)
+def test_forced_nccl_ep_accepts_supported_ll_combine_dynamic_smem(
+    monkeypatch: pytest.MonkeyPatch,
+    device_properties: SimpleNamespace,
+) -> None:
+    model_config = _make_model_config()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: device_properties)
+    monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
+
+    strategy = communication_factory.CommunicationFactory._create_forced_method(
+        "NCCL_EP",
+        model_config,
+        num_experts=72,
+        num_slots=72,
+        top_k=6,
+        expert_size_per_partition=18,
+        payload_in_workspace=False,
+        alltoall_result_do_sum=True,
+        use_flashinfer=False,
+        hidden_size=2560,
+    )
+
+    assert isinstance(strategy, _FakeNcclEP)
+
+
 def test_auto_selection_skips_nccl_ep_when_ll_combine_exceeds_dynamic_smem(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
