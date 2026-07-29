@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDis
 # kernel size 3, i.e. 2 frames of left context) stays continuous when encode /
 # decode run frame-by-frame.
 CACHE_T = 2
+_FUSED_DUP_UP3D_ENV = "TRTLLM_WAN_VAE_FUSE_DUP_UP3D"
 
 # Default latent normalization statistics, copied verbatim from the diffusers
 # AutoencoderKLWan constructor defaults (the 16-channel Wan2.1 values). They are
@@ -98,6 +100,10 @@ def _to_device_if_needed(x: torch.Tensor, device: torch.device) -> torch.Tensor:
     if x.device == device:
         return x
     return x.to(device)
+
+
+def _fused_dup_up3d_enabled() -> bool:
+    return os.environ.get(_FUSED_DUP_UP3D_ENV, "0").lower() not in ("0", "", "false", "no")
 
 
 def _causal_conv_with_cache(
@@ -261,8 +267,20 @@ class DupUp3D(nn.Module):
         if out_channels * self.factor % in_channels != 0:
             raise ValueError("DupUp3D channel repeat count must divide evenly")
         self.repeats = out_channels * self.factor // in_channels
+        self._fused = _fused_dup_up3d_enabled()
 
     def forward(self, x: torch.Tensor, first_chunk: bool = False) -> torch.Tensor:
+        if self._fused and x.is_cuda:
+            from .dup_up3d import dup_up3d
+
+            return dup_up3d(
+                x,
+                self.out_channels,
+                self.repeats,
+                self.factor_t,
+                self.factor_s,
+                first_chunk,
+            )
         x = x if self.repeats == 1 else x.repeat_interleave(self.repeats, dim=1)
         x = x.reshape(
             x.size(0),
