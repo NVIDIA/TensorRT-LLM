@@ -1079,10 +1079,11 @@ class LoraManager(object):
 
                     effective_rank = t_in.shape[rank_dim]
                     is_fp8 = t_out.dtype == torch.float8_e4m3fn
+                    # TODO: Enable SM120/SM121 after validating the native FP8 LoRA kernel there.
                     use_fp8_kernel = (
                         is_fp8
                         and not has_expert_indices
-                        and torch.cuda.get_device_capability()[0] >= 9
+                        and torch.cuda.get_device_capability() == (9, 0)
                     )
                     if use_fp8_kernel:
                         if t_in.dtype != t_out.dtype:

@@ -218,8 +218,8 @@ class TestLoraManagerRetainDeviceTensors(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9,
-    "FP8 LoRA requires Hopper or newer",
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0),
+    "Native FP8 LoRA requires Hopper (SM90)",
 )
 class TestLoraManagerFp8(unittest.TestCase):
     def test_fp8_dora_is_rejected(self):
@@ -301,6 +301,33 @@ class TestLoraManagerFp8(unittest.TestCase):
             )
 
         self.assertEqual(manager.cpp_lora_weights["fp8-e5m2"].dtype, torch.bfloat16)
+
+    def test_fp8_e4m3_weights_on_sm100_are_converted_to_model_dtype(self):
+        model_config = MockModelConfig(dtype="bfloat16")
+        manager = LoraManager(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            model_config=model_config,
+            cpp_peft_cache_manager=MagicMock(),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+            _create_dummy_hf_lora_adapter(
+                adapter_dir,
+                rank=16,
+                num_layers=1,
+                dtype=torch.float8_e4m3fn,
+            )
+
+            with patch("torch.cuda.get_device_capability", return_value=(10, 0)):
+                manager.load_from_hf(
+                    model_dirs=[str(adapter_dir)],
+                    model_config=model_config,
+                    uids=["fp8-e4m3-sm100"],
+                )
+
+        self.assertEqual(manager.cpp_lora_weights["fp8-e4m3-sm100"].dtype, torch.bfloat16)
 
     def test_fp8_e4m3_input_output_dtype_mismatch_is_rejected(self):
         model_config = MockModelConfig()
