@@ -111,7 +111,13 @@ class WanCausalConvHalo(HaloExchangeConv):
         spatial_padding[spatial_axis] = 0
         return tuple(spatial_padding)
 
-    def forward(self, x, cache_x=None, *args, **kwargs):
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache_x: torch.Tensor | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
         if self.halo_left == 0 and self.halo_right == 0:
             return self.module(x, cache_x, *args, **kwargs)
 
