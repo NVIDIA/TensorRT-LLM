@@ -274,6 +274,7 @@ class GvrTopKKernel:
         smem_cache_elems: int = 32768,
         seqlen_sorted: bool = False,
         kc_diet: Optional[bool] = None,
+        pdl_wait_late: bool = True,
         enable_r0: bool = True,
         accept_cap: "int | None" = None,
         kc_override: "int | None" = None,
@@ -527,6 +528,13 @@ class GvrTopKKernel:
         # kernel passes False for BOTH member instances so their SMEM layouts
         # stay byte-identical (the DSL sizes the launch from the last-traced
         # SmemAllocator only; see GvrTopKLBKernel).
+        # pdl_wait_late: place the PDL wait after the prologue (row
+        # resolution + SMEM allocation + config folding) instead of at
+        # kernel entry, so that work - and its cold instruction fetch -
+        # overlaps the producer's tail. Kept as a knob so both
+        # placements can be A/B'd inside one process (cross-run cold
+        # drift on shared nodes is larger than the effect).
+        self.pdl_wait_late = bool(pdl_wait_late)
         if kc_diet is None:
             kc_diet = cluster_size == 1
         if enable_r0 and top_k == 512 and kc_diet and self.kC > 3072:
@@ -4990,7 +4998,8 @@ class GvrTopKKernel:
         output_indices_row = output_indices[row_idx, None]
         pre_idx_count = pre_idx.shape[1]
 
-        griddepcontrol_wait()
+        if cutlass.const_expr(not self.pdl_wait_late):
+            griddepcontrol_wait()
 
         # ---- Shared memory allocation ----
         smem = SmemAllocator()
@@ -5216,6 +5225,19 @@ class GvrTopKKernel:
             s_r0col = None
             s_cluster_partial_m = None
             smem_gath = None
+
+        # PDL wait placed as late as possible: everything above (row
+        # resolution, SMEM allocation, config folding - and, on a cold
+        # call, the instruction fetch for all of it) overlaps with the
+        # producer indexer's tail, because dependent CTAs stage onto SMs
+        # as producer CTAs retire. Nothing above reads producer-written
+        # data: seq_lens/pre_idx come from the host-side metadata and the
+        # feedback buffer, while logits / block_max / seed_thr / cand are
+        # first touched below. Instruction-fetch starvation is 37-44% of
+        # this kernel's stall cycles on the small-N cells, so warming it
+        # under the producer's shadow is the point.
+        if cutlass.const_expr(self.pdl_wait_late):
+            griddepcontrol_wait()
 
         # ---- Per-row dispatch ----
         # Three branches:
