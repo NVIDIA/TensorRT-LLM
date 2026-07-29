@@ -6,7 +6,9 @@ import fcntl
 import inspect
 import itertools
 import json
+import math
 import os
+import socket
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -883,6 +885,321 @@ def _spec_in_bounds(spec, shapes_list) -> bool:
     return True
 
 
+class _AutotunerJsonlProfiler:
+    """Best-effort structured JSONL sink for autotuner device-time measurements.
+
+    Writes one JSON object per line (JSONL) capturing, for every profiled
+    ``(custom_op, opt_shape, tactic)`` combination, the measured device time in
+    milliseconds — plus one ``selection`` record per ``(custom_op, opt_shape)``
+    naming the winning tactic. The intended consumer is a disaggregated-serving
+    sweep where **each rank of each worker (gen / ctx) emits its own file**, so
+    the identity of the emitting rank and worker role is stamped on every line
+    and the files can be concatenated and grouped with ``cat *.jsonl | jq``.
+
+    Activation is env-gated and entirely opt-in: unless
+    ``TLLM_AUTOTUNER_PROFILE_JSONL_DIR`` is set the profiler is a no-op with
+    zero overhead (callers still gate on ``.enabled`` so the record-building
+    work is skipped as well). Every public method is wrapped in a best-effort
+    guard: any failure disables the profiler for the rest of the process rather
+    than perturbing the tuning run it is only observing.
+
+    Env vars:
+        TLLM_AUTOTUNER_PROFILE_JSONL_DIR : output directory (enables the sink).
+        TLLM_AUTOTUNER_PROFILE_ROLE      : worker role tag, e.g. "gen"/"ctx"
+                                           (default "unknown").
+        TLLM_AUTOTUNER_PROFILE_RUN_ID    : correlation id shared by all ranks of
+                                           one run (default: $SLURM_JOB_ID or
+                                           "local").
+
+    Identity (rank / world_size / parallel ranks) is resolved lazily on the
+    first emitted record, NOT at construction: ``AutoTuner.mapping`` is a
+    rank-0 default until ``setup_distributed_state()`` runs, so opening the file
+    eagerly would mislabel every rank as rank 0.
+    """
+
+    _SCHEMA_VERSION = 1
+
+    def __init__(self, tuner: "AutoTuner"):
+        self._tuner = tuner
+        self._dir = os.getenv("TLLM_AUTOTUNER_PROFILE_JSONL_DIR", "").strip()
+        self.enabled = bool(self._dir)
+        self._role = os.getenv("TLLM_AUTOTUNER_PROFILE_ROLE",
+                               "unknown").strip() or "unknown"
+        self._run_id = (os.getenv("TLLM_AUTOTUNER_PROFILE_RUN_ID", "").strip()
+                        or os.getenv("SLURM_JOB_ID", "").strip() or "local")
+        self._fh = None
+        self._opened = False
+        self._seq = 0
+        # Identity fields, populated on first emit.
+        self._ident: Dict[str, Any] = {}
+
+    # ---- internal helpers ------------------------------------------------
+
+    def _disable(self, exc: Exception, where: str) -> None:
+        """Permanently disable the sink after an unexpected failure."""
+        self.enabled = False
+        try:
+            if self._fh is not None:
+                self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+        logger.warning_once(
+            f"[Autotuner] JSONL profiler disabled after error in {where}: {exc}",
+            key=("autotuner_jsonl_profiler_disabled", ),
+        )
+
+    def _resolve_identity(self) -> Dict[str, Any]:
+        mapping = getattr(self._tuner, "mapping", None)
+
+        def _attr(name, default=0):
+            try:
+                val = getattr(mapping, name)
+                return int(val)
+            except Exception:
+                return default
+
+        try:
+            lib_version = tensorrt_llm.__version__
+        except Exception:
+            lib_version = "unknown"
+
+        device_name, device_capability = "unknown", None
+        try:
+            if torch.cuda.is_available():
+                idx = torch.cuda.current_device()
+                device_name = torch.cuda.get_device_name(idx)
+                cap = torch.cuda.get_device_capability(idx)
+                device_capability = [int(cap[0]), int(cap[1])]
+        except Exception:
+            pass
+
+        return {
+            "run_id":
+            self._run_id,
+            "role":
+            self._role,
+            "global_rank":
+            _attr("rank", 0),
+            "world_size":
+            _attr("world_size", 1),
+            "tp_rank":
+            _attr("tp_rank", 0),
+            "tp_size":
+            _attr("tp_size", 1),
+            "pp_rank":
+            _attr("pp_rank", 0),
+            "pp_size":
+            _attr("pp_size", 1),
+            "cp_rank":
+            _attr("cp_rank", 0),
+            "cp_size":
+            _attr("cp_size", 1),
+            "hostname":
+            socket.gethostname(),
+            "pid":
+            os.getpid(),
+            "device_name":
+            device_name,
+            "device_capability":
+            device_capability,
+            "lib_version":
+            lib_version,
+            "timer_backend":
+            ("globaltimer" if self._tuner._use_global_timer else "cuda_event"),
+            "warmup":
+            int(self._tuner.warmup),
+            "repeat":
+            int(self._tuner.repeat),
+        }
+
+    def _ensure_open(self) -> bool:
+        """Lazily resolve identity and open the per-rank file. Returns enabled."""
+        if self._opened:
+            return self.enabled
+        self._opened = True  # attempt exactly once regardless of outcome
+        try:
+            self._ident = self._resolve_identity()
+            os.makedirs(self._dir, exist_ok=True)
+            rank = self._ident["global_rank"]
+            host = self._ident["hostname"]
+            pid = self._ident["pid"]
+            fname = (f"autotuner.{self._role}.r{rank}.{host}.pid{pid}.jsonl")
+            path = os.path.join(self._dir, fname)
+            # Line-buffered so a crash mid-run still leaves complete records.
+            self._fh = open(path, "a", buffering=1)
+            meta = {"type": "meta", "schema_version": self._SCHEMA_VERSION}
+            meta.update(self._ident)
+            meta["start_ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                             time.gmtime())
+            self._write(meta)
+        except Exception as e:
+            self._disable(e, "_ensure_open")
+        return self.enabled
+
+    def _write(self, record: Dict[str, Any]) -> None:
+        self._fh.write(json.dumps(record, default=str))
+        self._fh.write("\n")
+
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    @staticmethod
+    def _finite_ms(value: Any) -> Optional[float]:
+        """Return a JSON-safe float, or None for inf/nan/non-numeric."""
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isinf(f) or math.isnan(f):
+            return None
+        return f
+
+    @staticmethod
+    def _shapes_to_lists(shapes) -> List[List[int]]:
+        out = []
+        for s in shapes:
+            try:
+                out.append([int(d) for d in s])
+            except Exception:
+                out.append([])
+        return out
+
+    def _tactic_repr(self, tactic: Any) -> str:
+        try:
+            return repr(tactic)
+        except Exception:
+            return "<unrepr-able>"
+
+    def _base(self, custom_op: str) -> Dict[str, Any]:
+        return {
+            "run_id": self._ident["run_id"],
+            "role": self._ident["role"],
+            "global_rank": self._ident["global_rank"],
+            "custom_op": custom_op,
+        }
+
+    # ---- public API ------------------------------------------------------
+
+    def record_measurement(
+        self,
+        *,
+        custom_op: str,
+        runner: "TunableRunner",
+        runner_id: int,
+        opt_shapes,
+        input_tensors: List[torch.Tensor],
+        tactic: Any,
+        device_time_ms: Any,
+        measured: bool,
+        status: str,
+        error: Optional[str] = None,
+    ) -> None:
+        """Emit one ``measurement`` line for a single profiled tactic."""
+        if not self.enabled or not self._ensure_open():
+            return
+        try:
+            sizes = self._tuner._get_input_sizes(input_tensors)
+            dtypes = []
+            for t in input_tensors:
+                dtypes.append(
+                    str(t.dtype).replace("torch.", "") if isinstance(
+                        t, torch.Tensor) else None)
+            record = self._base(custom_op)
+            record.update({
+                "type":
+                "measurement",
+                "runner":
+                runner.__class__.__name__,
+                "runner_id":
+                int(runner_id),
+                "runner_uid":
+                self._safe_uid(runner),
+                "opt_shapes":
+                self._shapes_to_lists(opt_shapes),
+                "input_shapes":
+                self._shapes_to_lists(sizes),
+                "input_dtypes":
+                dtypes,
+                "tactic":
+                tactic if isinstance(tactic, (int, float, str, bool)) else None,
+                "tactic_repr":
+                self._tactic_repr(tactic),
+                "is_fallback":
+                tactic == -1,
+                "device_time_ms":
+                self._finite_ms(device_time_ms),
+                "measured":
+                bool(measured),
+                "status":
+                status,
+                "error":
+                error,
+                "seq":
+                self._next_seq(),
+            })
+            self._write(record)
+        except Exception as e:
+            self._disable(e, "record_measurement")
+
+    def record_selection(
+        self,
+        *,
+        custom_op: str,
+        runner: Optional["TunableRunner"],
+        runner_id: Optional[int],
+        opt_shapes,
+        best_tactic: Any,
+        best_device_time_ms: Any,
+        num_considered: int,
+        num_failed: int,
+        cache_key: Any,
+    ) -> None:
+        """Emit one ``selection`` line naming the winner for an (op, shape)."""
+        if not self.enabled or not self._ensure_open():
+            return
+        try:
+            record = self._base(custom_op)
+            record.update({
+                "type":
+                "selection",
+                "runner":
+                runner.__class__.__name__ if runner is not None else None,
+                "runner_id":
+                int(runner_id) if runner_id is not None else None,
+                "runner_uid":
+                self._safe_uid(runner) if runner is not None else None,
+                "opt_shapes":
+                self._shapes_to_lists(opt_shapes),
+                "best_tactic":
+                best_tactic if isinstance(best_tactic,
+                                          (int, float, str, bool)) else None,
+                "best_tactic_repr":
+                self._tactic_repr(best_tactic)
+                if best_tactic is not None else None,
+                "best_device_time_ms":
+                self._finite_ms(best_device_time_ms),
+                "num_tactics_considered":
+                int(num_considered),
+                "num_tactics_failed":
+                int(num_failed),
+                "cache_key":
+                str(cache_key),
+                "seq":
+                self._next_seq(),
+            })
+            self._write(record)
+        except Exception as e:
+            self._disable(e, "record_selection")
+
+    def _safe_uid(self, runner: "TunableRunner") -> Optional[str]:
+        try:
+            return str(runner.unique_id())
+        except Exception:
+            return None
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT LLM operations.
 
@@ -937,6 +1254,12 @@ class AutoTuner:
         self._dist: Optional[Distributed] = None
         self._has_received_cache: bool = False
         self.mapping: Mapping = Mapping()
+
+        # Optional structured per-(op, shape, tactic) device-time sink. No-op
+        # unless TLLM_AUTOTUNER_PROFILE_JSONL_DIR is set. Identity (rank/role)
+        # is resolved lazily on first emit — see _AutotunerJsonlProfiler — so
+        # constructing it here (before setup_distributed_state) is safe.
+        self._jsonl_profiler = _AutotunerJsonlProfiler(self)
 
     @classmethod
     def get(cls):
@@ -1233,6 +1556,17 @@ class AutoTuner:
         min_time = float('inf')
         has_tuning_failure_occurred = False
         best_runner_id, best_tactic = None, None
+
+        # Structured JSONL device-time logging (no-op unless enabled). Counters
+        # feed the per-(op, shape) `selection` record; `single_pair_winner`
+        # tracks whether the winner came from the untimed shortcut so the
+        # selection reports a null device time rather than the 0.0 sentinel.
+        prof = self._jsonl_profiler
+        opt_shapes_for_emit = profile.get_opt_shapes() if prof.enabled else None
+        num_considered = 0
+        num_failed = 0
+        single_pair_winner = False
+
         # If the inputs_pre_hook is provided, it will be called before profiling.
         if tuning_config.inputs_pre_hook is not None:
             input_tensors = tuning_config.inputs_pre_hook(input_tensors)
@@ -1276,6 +1610,7 @@ class AutoTuner:
             tac = valid_tactics[0]
             if "do_preparation" in runner_arg_names:
                 runner(input_tensors, tactic=-1, do_preparation=True, **kwargs)
+            num_considered += 1
             try:
                 with nvtx_range(f"r{runner_id}, tactic {tac} (single-pair)"):
                     runner(input_tensors, tactic=tac, **kwargs)
@@ -1284,6 +1619,22 @@ class AutoTuner:
                 # distinguish "recorded without profiling" from a real
                 # timing.
                 min_time = 0.0
+                single_pair_winner = True
+                if prof.enabled:
+                    # Untimed shortcut: record the pair but flag it as not
+                    # measured so downstream analysis never mistakes the 0.0
+                    # sentinel for a real device time.
+                    prof.record_measurement(
+                        custom_op=custom_op,
+                        runner=runner,
+                        runner_id=runner_id,
+                        opt_shapes=opt_shapes_for_emit,
+                        input_tensors=input_tensors,
+                        tactic=tac,
+                        device_time_ms=None,
+                        measured=False,
+                        status="not_measured",
+                    )
             except Exception as e:
                 shapes = self._get_input_sizes(input_tensors)
                 logger.warning_once(
@@ -1298,6 +1649,20 @@ class AutoTuner:
                         tuning_config,
                         apply_map_to_tuning_buckets=False))
                 has_tuning_failure_occurred = True
+                num_failed += 1
+                if prof.enabled:
+                    prof.record_measurement(
+                        custom_op=custom_op,
+                        runner=runner,
+                        runner_id=runner_id,
+                        opt_shapes=opt_shapes_for_emit,
+                        input_tensors=input_tensors,
+                        tactic=tac,
+                        device_time_ms=None,
+                        measured=False,
+                        status="failed",
+                        error=repr(e),
+                    )
         else:
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
                 valid_tactics = self._maybe_parallelize_tactics(
@@ -1313,6 +1678,7 @@ class AutoTuner:
                     )
 
                 for tac in valid_tactics:
+                    num_considered += 1
                     try:
                         with nvtx_range(f"r{runner_id}, tactic {tac}"):
                             time_measured = self._profile_single_kernel(
@@ -1322,6 +1688,18 @@ class AutoTuner:
                                 tuning_config=tuning_config,
                                 use_cuda_graph=tuning_config.use_cuda_graph,
                                 **kwargs,
+                            )
+                        if prof.enabled:
+                            prof.record_measurement(
+                                custom_op=custom_op,
+                                runner=runner,
+                                runner_id=runner_id,
+                                opt_shapes=opt_shapes_for_emit,
+                                input_tensors=input_tensors,
+                                tactic=tac,
+                                device_time_ms=time_measured,
+                                measured=True,
+                                status="ok",
                             )
                     except Exception as e:
                         # Synchronize to clear any pending CUDA errors left by the
@@ -1354,6 +1732,22 @@ class AutoTuner:
                         # or some runtime error occurs during profiling.
                         time_measured = float('inf')
                         has_tuning_failure_occurred = True
+                        num_failed += 1
+                        if prof.enabled:
+                            # Never serialize inf: a failed tactic is recorded
+                            # with a null device time plus an explicit status.
+                            prof.record_measurement(
+                                custom_op=custom_op,
+                                runner=runner,
+                                runner_id=runner_id,
+                                opt_shapes=opt_shapes_for_emit,
+                                input_tensors=input_tensors,
+                                tactic=tac,
+                                device_time_ms=None,
+                                measured=True,
+                                status="failed",
+                                error=repr(e),
+                            )
                     if time_measured < min_time:
                         min_time = time_measured
                         best_runner_id, best_tactic = runner_id, tac
@@ -1376,6 +1770,23 @@ class AutoTuner:
                                                min_time)
 
             self.stats.tuned_op_profiled_configs[custom_op] += 1
+
+            if prof.enabled:
+                # `min_time` is the 0.0 sentinel for the untimed single-pair
+                # winner; report null there so the selection carries no
+                # spurious device time.
+                prof.record_selection(
+                    custom_op=custom_op,
+                    runner=runners[best_runner_id],
+                    runner_id=best_runner_id,
+                    opt_shapes=opt_shapes_for_emit,
+                    best_tactic=best_tactic,
+                    best_device_time_ms=(None
+                                         if single_pair_winner else min_time),
+                    num_considered=num_considered,
+                    num_failed=num_failed,
+                    cache_key=cache_key,
+                )
         else:
             logger.warning_once(
                 f"[Autotuner] No valid runner/tactic was found for custom_op={custom_op}, input_shapes={profile.get_opt_shapes()}. "
@@ -1384,6 +1795,18 @@ class AutoTuner:
                 f"and should not occurs during the inference stage, or fallback tactic is implemented. Otherwise, the the tuning process will crash.",
                 key=(custom_op, "warning_autotuning_no_valid_tactic"),
             )
+            if prof.enabled:
+                prof.record_selection(
+                    custom_op=custom_op,
+                    runner=None,
+                    runner_id=None,
+                    opt_shapes=opt_shapes_for_emit,
+                    best_tactic=None,
+                    best_device_time_ms=None,
+                    num_considered=num_considered,
+                    num_failed=num_failed,
+                    cache_key=None,
+                )
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occurred
 
