@@ -18,6 +18,7 @@ import pytest
 
 import tensorrt_llm._torch.disaggregation.native.peer as peer_module
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
+from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     HNDHeadMismatchMapper,
     IntactMapper,
@@ -382,6 +383,59 @@ def test_peer_registrar_unregister():
     reg.unregister(peer_ri.instance_name, peer_ri.instance_rank)
     with pytest.raises(KeyError):
         reg.get_peer_rank_info("peer", 1)
+
+
+def test_peer_registrar_caches_and_invalidates_aux_transfer_layout():
+    self_rankinfo = make_rankinfo(instance_name="local")
+    self_rankinfo.aux_meta = AuxBufferMeta(
+        ptrs=np.array([0x1000, 0, 0x3000, 0x4000], dtype=np.int64),
+        size=np.array([1024, 0, 128, 128], dtype=np.int64),
+        item_sizes=np.array([4, 0, 8, 8], dtype=np.int64),
+    )
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    peer_ri.aux_meta = AuxBufferMeta(
+        ptrs=np.array([0x5000, 0, 0x7000, 0x8000], dtype=np.int64),
+        size=np.array([1024, 0, 128, 128], dtype=np.int64),
+        item_sizes=np.array([4, 0, 8, 8], dtype=np.int64),
+    )
+
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+    layout = reg.get_aux_transfer_layout("peer", 1)
+    np.testing.assert_array_equal(layout.src_base_ptrs, [0x1000, 0x3000, 0x4000])
+    np.testing.assert_array_equal(layout.dst_base_ptrs, [0x5000, 0x7000, 0x8000])
+    assert reg.get_aux_transfer_layout("peer", 1) is layout
+
+    replacement_peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    replacement_peer_ri.aux_meta = AuxBufferMeta(
+        ptrs=np.array([0x9000, 0, 0xB000, 0xC000], dtype=np.int64),
+        size=np.array([1024, 0, 128, 128], dtype=np.int64),
+        item_sizes=np.array([4, 0, 8, 8], dtype=np.int64),
+    )
+    reg.register(
+        replacement_peer_ri.instance_name,
+        replacement_peer_ri.instance_rank,
+        replacement_peer_ri,
+    )
+
+    replacement_layout = reg.get_aux_transfer_layout("peer", 1)
+    assert replacement_layout is not layout
+    np.testing.assert_array_equal(replacement_layout.dst_base_ptrs, [0x9000, 0xB000, 0xC000])
+
+    reg.unregister("peer", 1)
+    with pytest.raises(KeyError):
+        reg.get_aux_transfer_layout("peer", 1)
 
 
 def test_peer_registrar_incompatible_peer_raises():

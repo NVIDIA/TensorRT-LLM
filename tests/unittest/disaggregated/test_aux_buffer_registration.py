@@ -27,7 +27,11 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer, AuxBufferMeta
+from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+    AuxBuffer,
+    AuxBufferMeta,
+    build_aux_transfer_layout,
+)
 from tensorrt_llm._torch.disaggregation.native.transfer import Sender, TransferWorker, WriteMeta
 
 
@@ -61,6 +65,9 @@ def _build_aux_write_meta(src_buffer: AuxBuffer, dst_buffer: AuxBuffer) -> Write
     registrar.get_peer_rank_info.return_value = peer_rank_info
     registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
     registrar.should_send_aux.return_value = True
+    registrar.get_aux_transfer_layout.return_value = build_aux_transfer_layout(
+        src_buffer.meta, dst_buffer.meta
+    )
     sender = SimpleNamespace(_registrar=registrar)
     task = SimpleNamespace(_perf_timer=None, _slot=0, _unique_rid=7)
     req_info = SimpleNamespace(instance_name="peer", instance_rank=1, aux_slot=0, unique_rid=7)

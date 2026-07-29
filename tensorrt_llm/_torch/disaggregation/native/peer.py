@@ -21,6 +21,10 @@ import numpy as np
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
+from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+    AuxTransferLayout,
+    build_aux_transfer_layout,
+)
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -60,6 +64,7 @@ class PeerRegistrar:
         self._self_ext_cache = self_extractor
         self._peer_ext_cache: Dict[str, KVRegionExtractorV1] = {}
         self._overlap_cache: Dict[str, PeerOverlap] = {}
+        self._aux_transfer_layout_cache: Dict[str, AuxTransferLayout] = {}
         self._lg_pool_mapping_cache: Dict[
             str, Dict[LGPoolKey, LGPoolKey]
         ] = {}  # peer_key -> {(self_lg, self_pi) -> (peer_lg, peer_pi)}
@@ -71,7 +76,19 @@ class PeerRegistrar:
                 f"PeerRegistrar.register: peer {peer_name} (rank={peer_rank}) is incompatible with local rank."
             )
         key = self._unique_key(peer_name, peer_rank)
+        aux_transfer_layout = None
+        if (
+            self._ri.aux_meta is not None
+            and peer_ri.aux_meta is not None
+            and self.should_send_aux(peer_ri)
+        ):
+            aux_transfer_layout = build_aux_transfer_layout(self._ri.aux_meta, peer_ri.aux_meta)
+
         self._peer_ri_cache[key] = peer_ri
+        if aux_transfer_layout is None:
+            self._aux_transfer_layout_cache.pop(key, None)
+        else:
+            self._aux_transfer_layout_cache[key] = aux_transfer_layout
         peer_ri = self.get_peer_rank_info(peer_name, peer_rank)
         extractor = KVRegionExtractorV1(peer_ri.page_table)
         self._peer_ext_cache[key] = extractor
@@ -117,6 +134,7 @@ class PeerRegistrar:
             del self._peer_ri_cache[key]
         if key in self._peer_ext_cache:
             del self._peer_ext_cache[key]
+        self._aux_transfer_layout_cache.pop(key, None)
         # Clean up kv_map_cache entries for this peer
         keys_to_remove = [k for k in self._kv_map_cache if k[0] == key]
         for k in keys_to_remove:
@@ -126,6 +144,9 @@ class PeerRegistrar:
 
     def get_peer_rank_info(self, peer_name: str, peer_rank: int):
         return self._peer_ri_cache[self._unique_key(peer_name, peer_rank)]
+
+    def get_aux_transfer_layout(self, peer_name: str, peer_rank: int) -> AuxTransferLayout:
+        return self._aux_transfer_layout_cache[self._unique_key(peer_name, peer_rank)]
 
     @property
     def self_rank_info(self) -> RankInfo:
