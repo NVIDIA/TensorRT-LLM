@@ -13,46 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-_PHYSICAL_LAYOUT_HALO_CAT_ENV = "TRTLLM_VAE_PHYSICAL_LAYOUT_HALO_CAT"
-_PHYSICAL_LAYOUT_HALO_WIRE_ENV = "TRTLLM_VAE_PHYSICAL_LAYOUT_HALO_WIRE"
-
-
-def _physical_layout_halo_cat_enabled() -> bool:
-    return os.environ.get(_PHYSICAL_LAYOUT_HALO_CAT_ENV, "0").lower() not in (
-        "0",
-        "",
-        "false",
-        "no",
-    )
-
-
-def _physical_layout_halo_wire_enabled() -> bool:
-    return os.environ.get(_PHYSICAL_LAYOUT_HALO_WIRE_ENV, "0").lower() not in (
-        "0",
-        "",
-        "false",
-        "no",
-    )
-
 
 def _spatial_channels_last_format(x: torch.Tensor) -> Optional[torch.memory_format]:
     """Return ``x``'s channels-last memory format (2D or 3D), or ``None``.
 
-    The halo exchange builds row-major send/recv buffers and concatenates them
-    with ``x`` along the split dimension. When ``x`` is channels-last (as the
-    native Wan VAE convs require and produce), a mixed-format ``torch.cat`` falls
-    back to row-major, so every downstream conv re-converts via a full-tensor
-    ``channels_last`` copy. Materialising the halo slices in ``x``'s format
-    before the ``cat`` lets it preserve channels-last, making the conv's
-    ``_channels_last_*_if_needed`` a no-op. Returns ``None`` when ``x`` is not
-    unambiguously channels-last, in which case the caller leaves layout untouched.
+    Halo exchange uses this to select physical NHWC/NDHWC wire buffers and
+    concatenation. Returns ``None`` when ``x`` is not unambiguously
+    channels-last, in which case the existing row-major path is preserved.
     """
     if x.dim() == 5 and x.is_contiguous(memory_format=torch.channels_last_3d):
         return torch.channels_last_3d
@@ -145,11 +118,6 @@ class HaloExchangeConv(nn.Module):
         self.adj_groups = adj_groups
         self.rank = rank
         self.world_size = world_size
-        self._physical_layout_halo_cat = _physical_layout_halo_cat_enabled()
-        self._physical_layout_halo_wire = (
-            self._physical_layout_halo_cat and _physical_layout_halo_wire_enabled()
-        )
-
         # Derive halo size from kernel_size along chunk_dim
         kernel_size = module.kernel_size
         if isinstance(kernel_size, int):
@@ -191,20 +159,21 @@ class HaloExchangeConv(nn.Module):
 
         dim = self.chunk_dim
         exchange_size = max(self.halo_left, self.halo_right)
+        memory_format = _spatial_channels_last_format(x)
 
         send_left = _pack_spatial_halo(
             x,
             dim,
             0,
             exchange_size,
-            self._physical_layout_halo_wire,
+            memory_format is not None,
         )
         send_right = _pack_spatial_halo(
             x,
             dim,
             x.shape[dim] - exchange_size,
             exchange_size,
-            self._physical_layout_halo_wire,
+            memory_format is not None,
         )
 
         recv_from_left = torch.zeros_like(send_left)
@@ -233,7 +202,7 @@ class HaloExchangeConv(nn.Module):
         # only the last halo_left of those.
         # recv_from_right holds the right neighbor's left-edge slices; we need
         # only the first halo_right of those.
-        receive_dim = dim - 1 if self._physical_layout_halo_wire else dim
+        receive_dim = dim - 1 if memory_format is not None else dim
         if self.halo_left < exchange_size:
             recv_from_left = torch.narrow(
                 recv_from_left,
@@ -248,23 +217,13 @@ class HaloExchangeConv(nn.Module):
                 0,
                 self.halo_right,
             )
-        if self._physical_layout_halo_wire:
+        if memory_format is not None:
             recv_from_left = _physical_to_logical_channels_last(recv_from_left.contiguous())
             recv_from_right = _physical_to_logical_channels_last(recv_from_right.contiguous())
-
-        mf = _spatial_channels_last_format(x)
-        if mf is not None and not self._physical_layout_halo_cat:
-            recv_from_left = recv_from_left.contiguous(memory_format=mf)
-            recv_from_right = recv_from_right.contiguous(memory_format=mf)
-
-        if self._physical_layout_halo_cat:
-            output_format = mf
-            if output_format is None:
-                output_format = torch.channels_last_3d if x.dim() == 5 else torch.channels_last
             return _cat_spatial_halos(
                 [recv_from_left, x, recv_from_right],
                 dim,
-                output_format,
+                memory_format,
             )
         return torch.cat([recv_from_left, x, recv_from_right], dim=dim)
 
@@ -329,11 +288,6 @@ class HaloExchangeConv2dStride2(nn.Module):
         self.adj_groups = adj_groups
         self.rank = rank
         self.world_size = world_size
-        self._physical_layout_halo_cat = _physical_layout_halo_cat_enabled()
-        self._physical_layout_halo_wire = (
-            self._physical_layout_halo_cat and _physical_layout_halo_wire_enabled()
-        )
-
         kernel_size = module.kernel_size
         if isinstance(kernel_size, int):
             chunk_kernel = kernel_size
@@ -380,12 +334,13 @@ class HaloExchangeConv2dStride2(nn.Module):
             return x
 
         dim = self.chunk_dim
+        memory_format = _spatial_channels_last_format(x)
         send_left = _pack_spatial_halo(
             x,
             dim,
             0,
             self.halo_left,
-            self._physical_layout_halo_wire,
+            memory_format is not None,
         )
 
         right_context = None
@@ -400,16 +355,9 @@ class HaloExchangeConv2dStride2(nn.Module):
             dist.send(send_left, dst=left_global_rank, group=left_group)
 
         if right_context is not None:
-            if self._physical_layout_halo_wire:
+            if memory_format is not None:
                 right_context = _physical_to_logical_channels_last(right_context)
-            # Match the halo slice's layout to ``x`` so the cat preserves
-            # channels-last (see ``_spatial_channels_last_format``).
-            mf = _spatial_channels_last_format(x)
-            if mf is not None and not self._physical_layout_halo_cat:
-                right_context = right_context.contiguous(memory_format=mf)
-            if self._physical_layout_halo_cat:
-                output_format = mf if mf is not None else torch.channels_last
-                x = _cat_spatial_halos([x, right_context], dim, output_format)
+                x = _cat_spatial_halos([x, right_context], dim, memory_format)
             else:
                 x = torch.cat([x, right_context], dim=dim)
 
