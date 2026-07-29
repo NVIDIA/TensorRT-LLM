@@ -22,18 +22,18 @@ import tempfile
 DEFAULT_MARKER_FILE = os.path.join(tempfile.gettempdir(), f"cbts-{os.getuid()}", "current_test.txt")
 MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", DEFAULT_MARKER_FILE)
 
-_ENV_WHITELIST_PREFIXES = ("TRTLLM", "TLLM", "COVERAGE_", "CBTS_", "PYTHONPATH")
-
 _POOL_PATCHED_MARKER = "_cbts_patched_pool_init"
 
 
 def install_expected_workers_patch():
-    """Patch ``MPIPoolExecutor.__init__`` for worker accounting + coverage-env propagation.
+    """Patch ``MPIPoolExecutor.__init__`` to count each test's spawned pool workers; idempotent.
 
-    Counts the workers each test spawns and widens the workers' env so they inherit the coverage
-    bootstrap; idempotent. Patching the constructor rather than ``MpiPoolSession._start_mpi_pool``
-    leaves the product's pool setup (``env_overrides``, the wait_shutdown worker-identity barrier,
-    …) intact.
+    Patching the constructor rather than ``MpiPoolSession._start_mpi_pool`` catches every pool
+    (product ``MpiPoolSession`` and disagg's own raw ``MPIPoolExecutor``) while leaving the
+    product's pool setup — ``env_overrides``, the ``wait_shutdown`` worker-identity barrier, … —
+    intact. Coverage-env reaches workers via default OS-level env inheritance (``CBTS_COVERAGE_CONFIG``,
+    ``PYTHONPATH``, ``CBTS_MARKER_FILE``); ``mpi4py.futures``'s ``env=`` kwarg is applied via
+    ``os.environ.update`` *after* Python startup, so it can't affect sitecustomize activation anyway.
     """
     try:
         from mpi4py.futures import MPIPoolExecutor
@@ -45,22 +45,12 @@ def install_expected_workers_patch():
         return False
 
     def _patched_init(self, *args, **kwargs):
-        # Attribute the workers to the test running now; disagg's raw pool is counted here too.
         try:
             max_workers = kwargs.get("max_workers", args[0] if args else None)
             n = int(max_workers) if max_workers else 1
         except (ValueError, TypeError):
             n = 1
         _sitecustomize_call("note_expected_workers", os.environ.get("CBTS_TEST_ID", ""), n)
-        # Widen the env only for pools that also propagate the coordinator's sys.path (TRT-LLM's
-        # MpiPoolSession passes path=sys.path). A path-less raw MPIPoolExecutor — e.g. the
-        # disaggregated test's own ctx/gen server pool — is left uninstrumented: instrumenting those
-        # UCX/Ray servers hangs them. The count above still runs, so disagg is flagged incomplete and
-        # force-run. The caller's env dict wins on conflict here (preserving env_overrides).
-        env = kwargs.get("env")
-        if env is not None and kwargs.get("path") is not None:
-            cov = {k: v for k, v in os.environ.items() if k.startswith(_ENV_WHITELIST_PREFIXES)}
-            kwargs["env"] = {**cov, **env}
         return init(self, *args, **kwargs)
 
     setattr(_patched_init, _POOL_PATCHED_MARKER, True)

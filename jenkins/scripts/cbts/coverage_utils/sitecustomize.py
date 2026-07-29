@@ -40,8 +40,42 @@ def _is_dependency_build_process():
     return any(n in joined for n in ("-m pip", "-m build", "_in_process", "pyproject_hooks"))
 
 
-# Drop the gate var so build tooling and everything it spawns opts out of instrumentation.
-if os.getenv("CBTS_COVERAGE_CONFIG") and _is_dependency_build_process():
+def _is_ray_infra_process():
+    """Return True for Ray infrastructure / worker processes, which opt the subtree out.
+
+    The Ray stage (TLLM_DISABLE_MPI=1) nests Ray under mpi4py pool workers: each pool worker
+    calls ``ray.init(address="local")`` which spawns ``raylet``, ``gcs_server``, dashboard,
+    log_monitor, autoscaler.monitor, runtime_env.agent, and pre-starts up to 224 ``default_worker.py``
+    processes. All of them inherit ``CBTS_COVERAGE_CONFIG``/``PYTHONPATH`` via default env inheritance.
+
+    Activating CBTS in ``default_worker.py`` adds enough Python startup / sys.monitoring PY_START
+    overhead that the workers can't register with raylet before its ``worker_pool.cc:600`` timeout,
+    so raylet keeps spawning more, and the driver's ``ray.init()`` hangs in ``RegisterClient`` forever
+    (observed in test_disaggregated_* under the Ray orchestrator stage). Opt out here so Ray's
+    hot spawn path stays fast; the mpi4py pool worker still records coverage for the LLM API surface,
+    and the RayGPUWorker actor itself lives inside a ``default_worker.py`` so it's uninstrumented too.
+    """
+    argv = getattr(sys, "orig_argv", sys.argv) or [""]
+    # Match on filename / module tokens Ray uses when it spawns Python children.
+    indicators = (
+        "default_worker.py",
+        "setup_worker.py",
+        "ray.autoscaler",
+        "ray.dashboard",
+        "ray._private.log_monitor",
+        "ray._private.runtime_env.agent",
+        "ray._private.workers",
+        "/ray/dashboard/",
+        "/ray/autoscaler/",
+    )
+    joined = " ".join(argv)
+    return any(ind in joined for ind in indicators)
+
+
+# Drop the gate var so build tooling / Ray infra and everything they spawn opt out of instrumentation.
+if os.getenv("CBTS_COVERAGE_CONFIG") and (
+    _is_dependency_build_process() or _is_ray_infra_process()
+):
     os.environ.pop("CBTS_COVERAGE_CONFIG", None)
 
 
