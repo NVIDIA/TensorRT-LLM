@@ -67,7 +67,7 @@ worker_config:
       max_tokens_in_buffer: 32832
       backend: NIXL
       transceiver_runtime: PYTHON
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     speculative_config: &id001
       decoding_type: MTP
       num_nextn_predict_layers: 3
@@ -104,5 +104,5 @@ worker_config:
       max_tokens_in_buffer: 32832
       backend: NIXL
       transceiver_runtime: PYTHON
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     speculative_config: *id001

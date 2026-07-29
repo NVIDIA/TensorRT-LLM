@@ -68,7 +68,7 @@ worker_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
       transceiver_runtime: PYTHON
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     num_postprocess_workers: 4
     stream_interval: 20
     nvfp4_gemm_config:
@@ -100,4 +100,4 @@ worker_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
       transceiver_runtime: PYTHON
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false

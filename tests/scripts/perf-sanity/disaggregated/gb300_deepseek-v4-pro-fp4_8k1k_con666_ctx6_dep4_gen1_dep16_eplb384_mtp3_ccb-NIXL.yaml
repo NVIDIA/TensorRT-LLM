@@ -101,5 +101,5 @@ worker_config:
       kv_transfer_timeout_ms: 600000
       backend: NIXL
       transceiver_runtime: PYTHON
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     speculative_config: *id001
